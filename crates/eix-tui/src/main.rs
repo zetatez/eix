@@ -12,6 +12,7 @@ use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use eix_core::config as core_config;
+use eix_core::sandbox as core_sandbox;
 use eix_core::{
     ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload, AttachResult, CancelResult,
     Config, Event, EventKind, HelloResult, Session, SessionList, SessionResult, SubmitResult,
@@ -37,11 +38,15 @@ async fn main() -> Result<()> {
         Command::New { name, cwd, model } => new_session(&cli, name, cwd, model).await,
         Command::Send { session, text } => send(&cli, session, text).await,
         Command::Tui { session } => {
+            let bell = Config::load(cli.config_path.as_deref())
+                .map(|config| config.notifications.bell)
+                .unwrap_or(false);
             tui::run(
                 cli.socket.clone(),
                 cli.data_dir.clone(),
                 cli.config_path.clone(),
                 session,
+                bell,
             )
             .await
         }
@@ -49,8 +54,8 @@ async fn main() -> Result<()> {
         Command::Log { session } => log(&cli, session).await,
         Command::Rename { session, name } => rename(&cli, session, name).await,
         Command::Cancel { session } => cancel(&cli, session).await,
-        Command::Approve { session } => approval(&cli, session, true).await,
-        Command::Deny { session } => approval(&cli, session, false).await,
+        Command::Approve { session, hunks } => approval(&cli, session, true, hunks).await,
+        Command::Deny { session } => approval(&cli, session, false, None).await,
     }
 }
 
@@ -91,6 +96,8 @@ enum Command {
     },
     Approve {
         session: Option<String>,
+        /// Hunk indices to apply; `None` applies the whole change.
+        hunks: Option<Vec<usize>>,
     },
     Deny {
         session: Option<String>,
@@ -134,8 +141,15 @@ impl Cli {
             }
         }
 
-        let command = if args.is_empty() {
-            Command::Chat { session: None }
+        let command = if args.is_empty() || args.first().is_some_and(|arg| arg == "--session") {
+            // Bare `eix` (or `eix --session ID`) opens the TUI. When stdout is
+            // piped, keep the non-interactive `chat` behavior.
+            let name = if io::stdout().is_terminal() {
+                "tui"
+            } else {
+                "chat"
+            };
+            parse_command(name.to_string(), args)?
         } else {
             let name = args.remove(0);
             parse_command(name, args)?
@@ -217,8 +231,11 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
         }
         "approve" => {
             let session = take_flag(&mut args, "--session")?;
+            let hunks = take_flag(&mut args, "--hunks")?
+                .map(|value| parse_hunks(&value))
+                .transpose()?;
             let session = session.or_else(|| args.first().cloned());
-            Ok(Command::Approve { session })
+            Ok(Command::Approve { session, hunks })
         }
         "deny" => {
             let session = take_flag(&mut args, "--session")?;
@@ -246,6 +263,24 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     Ok(Some(take_value(args, index, flag)?))
+}
+
+/// Parse the comma-separated hunk selection for `eix approve --hunks`.
+fn parse_hunks(value: &str) -> Result<Vec<usize>> {
+    let mut hunks = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            bail!("--hunks expects comma-separated indices, e.g. 0,2");
+        }
+        let index = part
+            .parse()
+            .with_context(|| format!("invalid hunk index {part:?}"))?;
+        hunks.push(index);
+    }
+    hunks.sort_unstable();
+    hunks.dedup();
+    Ok(hunks)
 }
 
 async fn sessions(cli: &Cli) -> Result<()> {
@@ -417,7 +452,12 @@ async fn cancel(cli: &Cli, session: Option<String>) -> Result<()> {
     Ok(())
 }
 
-async fn approval(cli: &Cli, session: Option<String>, approve: bool) -> Result<()> {
+async fn approval(
+    cli: &Cli,
+    session: Option<String>,
+    approve: bool,
+    hunks: Option<Vec<usize>>,
+) -> Result<()> {
     let mut client = cli.connect().await?;
     let session = resolve_session(&mut client, session.as_deref(), false).await?;
     let result: ApprovalResult = serde_json::from_value(
@@ -428,6 +468,7 @@ async fn approval(cli: &Cli, session: Option<String>, approve: bool) -> Result<(
                     "session_id": session.id,
                     "approval_id": "",
                     "decision": if approve { "approve" } else { "deny" },
+                    "hunks": hunks,
                 }),
             )
             .await?,
@@ -486,6 +527,15 @@ async fn doctor(cli: &Cli) -> Result<()> {
                     "present"
                 } else {
                     "absent (set EIX_API_KEY or the configured env var)"
+                }
+            );
+            println!(
+                "sandbox  {} ({})",
+                config.tools.sandbox.as_str(),
+                if core_sandbox::bwrap_available() {
+                    "bwrap available"
+                } else {
+                    "bwrap missing"
                 }
             );
         }
@@ -860,8 +910,8 @@ USAGE:
     eix [OPTIONS] [COMMAND]
 
 COMMANDS:
-    tui [--session ID]         full-screen terminal UI
-    chat [--session ID]        interactive chat (default command)
+    tui [--session ID]         full-screen terminal UI (default)
+    chat [--session ID]        interactive chat (non-TUI)
     send [--session ID] TEXT   send one prompt and stream the answer
     ls                         list sessions
     new [--name N] [--cwd P] [--model M]
@@ -869,7 +919,8 @@ COMMANDS:
     log [--session ID]         print the persisted transcript
     rename [--session ID] NAME
     cancel [--session ID]      cancel the running turn
-    approve [--session ID]     approve the pending tool call
+    approve [--session ID] [--hunks 0,2]
+                               approve the pending tool call (all or selected hunks)
     deny [--session ID]        deny the pending tool call
     doctor                     diagnose config, paths and daemon
     daemon                     start/attach the daemon and print its status
@@ -880,7 +931,8 @@ OPTIONS:
     --data-dir <path>   state directory (default: ~/.local/share/eix)
     --config <path>     config file (default: ~/.config/eix/config.toml)
 
-The daemon starts automatically. Prompt text after `--` is never parsed as a flag.
+The daemon starts automatically. With no command, `eix` opens the TUI; when stdout
+is piped it falls back to `eix chat`. Prompt text after `--` is never parsed as a flag.
 
 EXAMPLES:
     eix send 'explain the session model in DESIGN.md'
@@ -888,4 +940,41 @@ EXAMPLES:
     EIX_MODEL=qwen2.5-coder eix chat
     eix new --name auth --cwd ~/src/app"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_hunk_selection() {
+        assert_eq!(parse_hunks("0,2").unwrap(), vec![0, 2]);
+        assert_eq!(parse_hunks("2, 0, 2").unwrap(), vec![0, 2]);
+        assert_eq!(parse_hunks("1").unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn rejects_bad_hunk_selections() {
+        assert!(parse_hunks("").is_err());
+        assert!(parse_hunks("0,,1").is_err());
+        assert!(parse_hunks("x").is_err());
+        assert!(parse_hunks("-1").is_err());
+    }
+
+    #[test]
+    fn default_tui_command_takes_an_optional_session() {
+        match parse_command("tui".to_string(), Vec::new()).unwrap() {
+            Command::Tui { session } => assert!(session.is_none()),
+            _ => panic!("expected tui"),
+        }
+        match parse_command(
+            "tui".to_string(),
+            vec!["--session".to_string(), "abc".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Tui { session } => assert_eq!(session.as_deref(), Some("abc")),
+            _ => panic!("expected tui"),
+        }
+    }
 }

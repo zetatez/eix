@@ -420,14 +420,17 @@ prompt buffer 的 buffer-local mapping：
 
 - 多 session、picker、pane 分屏、attention 队列、通知、dwm/tmux 集成。
 
-> 实现快照（2026-10-18）：多 pane TUI 已落地（`eix tui`）。左侧 session 栏 + 右侧自动
+> 实现快照（2026-10-18）：多 pane TUI 已落地（`eix` 无命令默认打开，或 `eix tui`）。左侧 session 栏 + 右侧自动
 > 平铺 pane（1/2/3/4+ 分别全屏、左右、左大右二、网格），每个 pane 独立维护 session、
 > 转录、滚动与流式跟随；`o` 在新 pane 打开，`p`/`Ctrl-G` 切换聚焦 pane 的 session，
 > `C-w h/j/k/l/w` 切焦点、`C-w v/s` 分屏、`C-w c` 关闭；同一 session 只出现一次，
 > picker 选中已打开 session 会聚焦既有 pane。输入框暂由 ratatui 自绘（非嵌入 nvim）。
 > 后台 pane 的 attention 已接入：daemon 在进入 `awaiting_approval` / `error` 时发送
 > `session.attention`，TUI 标记边框/侧栏并支持 `a` 跳到下一个；重新 attach 会从事件日志
-> 恢复未完成的审批卡片。外部通知命令（dwm/tmux）仍待做。
+> 恢复未完成的审批卡片。外部通知也已接入：`[notifications] command` 由 daemon 在 attention
+> 时用 `sh -c` 执行并传入 `EIX_SESSION_ID` / `EIX_SESSION_NAME` / `EIX_SESSION_CWD` /
+> `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；`eix tui` 可用 `bell = true` 在后台
+> pane 需要 attention 时响终端铃。嵌入 nvim 输入仍待做。
 
 **Phase 2**
 
@@ -439,15 +442,19 @@ prompt buffer 的 buffer-local mapping：
 > `run_command` 带超时。provider 侧支持 OpenAI `tools` / `tool_calls` 的流式增量累积，
 > 一次 turn 最多 12 轮工具往返；每轮写入 `tool_call` / `approval_required` / `tool_result`
 > 事件并广播 `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
-> 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理。
+> 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
+> 选中的 hunk）。
 > 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。`write_file` 在审批前生成
 > unified diff 和逐 hunk 预览并随 `approval_required` 事件广播，TUI 卡片（`d` 全屏审阅）
 > 和 CLI 均会展示。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
 > 全不选、`y` 只应用选中的 hunk（全选时整文件），`n` 拒绝；`approval.respond` 新增可选
 > `hunks` 索引列表，daemon 用批准时的原文件内容拼出结果再落盘。写入前会重新校验文件
 > 内容，审阅期间被外部修改则拒绝本次写入。
-> **尚未做**：staged shadow workspace、bubblewrap 沙箱、执行前快照、context ledger、
-> process view。
+> `run_command` 默认用 bubblewrap 隔离（`[tools] sandbox = auto|bwrap|off`，`sandbox_network`
+> 控制是否 `--unshare-net`，`sandbox_read_home` 决定 `$HOME` 只读挂载还是隐藏）：宿主只读、
+> 仅 session workspace 可写、`/tmp` 为私有 tmpfs；bwrap 缺失时 `auto` 退回直接执行，
+> `bwrap` 模式则拒绝执行。
+> **尚未做**：staged shadow workspace、执行前快照、context ledger、process view。
 
 **Phase 3**
 
@@ -459,7 +466,6 @@ prompt buffer 的 buffer-local mapping：
 - `<leader>a` 命名空间是否与你现有映射冲突。
 - `@` 触发是否只在词首；是否需要转义。
 - 是否启用鼠标。
-- 通知命令与冷却时间。
 - session 自动命名规则（首条 prompt / branch / 手动）。
 - 是否支持远程 attach（TCP + token）。
 

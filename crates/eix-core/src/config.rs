@@ -31,6 +31,32 @@ pub enum ConfigError {
 pub struct Config {
     pub provider: ProviderConfig,
     pub tools: ToolsConfig,
+    pub notifications: NotificationsConfig,
+}
+
+/// External alerts when a session starts needing attention (approval, error).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NotificationsConfig {
+    /// Shell command run on attention. Empty disables it. The daemon exposes
+    /// `EIX_SESSION_ID`, `EIX_SESSION_NAME`, `EIX_SESSION_CWD`, and
+    /// `EIX_STATUS` (`awaiting_approval` / `error`).
+    pub command: Option<String>,
+    /// Ring the terminal bell in `eix tui` when a background pane needs
+    /// attention.
+    pub bell: bool,
+    /// Minimum seconds between notifications for the same session.
+    pub cooldown_secs: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            bell: false,
+            cooldown_secs: 10,
+        }
+    }
 }
 
 /// What the daemon does when a mutating tool is requested.
@@ -56,6 +82,29 @@ impl ToolPolicy {
     }
 }
 
+/// How `run_command` is isolated from the host filesystem.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SandboxMode {
+    /// Use bubblewrap when it is installed, otherwise run directly.
+    #[default]
+    Auto,
+    /// Require bubblewrap; fail the command when it is missing.
+    Bwrap,
+    /// Run without a sandbox.
+    Off,
+}
+
+impl SandboxMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Bwrap => "bwrap",
+            Self::Off => "off",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
@@ -64,6 +113,12 @@ pub struct ToolsConfig {
     pub max_output_bytes: usize,
     /// Wall-clock limit for `run_command`.
     pub command_timeout_secs: u64,
+    /// Filesystem isolation for `run_command`.
+    pub sandbox: SandboxMode,
+    /// Allow network access inside the sandbox.
+    pub sandbox_network: bool,
+    /// Mount the home directory read-only so toolchain caches stay usable.
+    pub sandbox_read_home: bool,
 }
 
 impl Default for ToolsConfig {
@@ -72,6 +127,9 @@ impl Default for ToolsConfig {
             policy: ToolPolicy::Ask,
             max_output_bytes: 20_000,
             command_timeout_secs: 60,
+            sandbox: SandboxMode::Auto,
+            sandbox_network: true,
+            sandbox_read_home: true,
         }
     }
 }
@@ -164,6 +222,29 @@ impl Config {
         }
         if let Some(value) = env_var("EIX_TOOL_TIMEOUT_SECS").and_then(|v| v.parse().ok()) {
             self.tools.command_timeout_secs = value;
+        }
+        if let Some(value) = env_var("EIX_TOOL_SANDBOX") {
+            match value.as_str() {
+                "auto" => self.tools.sandbox = SandboxMode::Auto,
+                "bwrap" => self.tools.sandbox = SandboxMode::Bwrap,
+                "off" => self.tools.sandbox = SandboxMode::Off,
+                _ => {}
+            }
+        }
+        if let Some(value) = env_var("EIX_TOOL_SANDBOX_NETWORK") {
+            self.tools.sandbox_network = matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Some(value) = env_var("EIX_TOOL_SANDBOX_READ_HOME") {
+            self.tools.sandbox_read_home = matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Some(value) = env_var("EIX_NOTIFY_COMMAND") {
+            self.notifications.command = Some(value);
+        }
+        if let Some(value) = env_var("EIX_NOTIFY_COOLDOWN_SECS").and_then(|v| v.parse().ok()) {
+            self.notifications.cooldown_secs = value;
+        }
+        if let Some(value) = env_var("EIX_NOTIFY_BELL") {
+            self.notifications.bell = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
     }
 
@@ -304,5 +385,40 @@ mod tests {
     #[test]
     fn default_model_is_not_empty() {
         assert!(!Config::default().provider.model.is_empty());
+    }
+
+    #[test]
+    fn tools_sandbox_defaults_and_parses() {
+        let default = Config::default();
+        assert_eq!(default.tools.sandbox, SandboxMode::Auto);
+        assert!(default.tools.sandbox_network);
+        assert!(default.tools.sandbox_read_home);
+
+        let parsed: Config = toml::from_str(
+            "[tools]\nsandbox = \"off\"\nsandbox_network = false\nsandbox_read_home = false\n",
+        )
+        .expect("tools config");
+        assert_eq!(parsed.tools.sandbox, SandboxMode::Off);
+        assert!(!parsed.tools.sandbox_network);
+        assert!(!parsed.tools.sandbox_read_home);
+    }
+
+    #[test]
+    fn notifications_parse_and_default_to_off() {
+        let default = Config::default();
+        assert!(default.notifications.command.is_none());
+        assert!(!default.notifications.bell);
+        assert_eq!(default.notifications.cooldown_secs, 10);
+
+        let parsed: Config = toml::from_str(
+            "[notifications]\ncommand = \"notify-send eix\"\nbell = true\ncooldown_secs = 3\n",
+        )
+        .expect("notifications config");
+        assert_eq!(
+            parsed.notifications.command.as_deref(),
+            Some("notify-send eix")
+        );
+        assert!(parsed.notifications.bell);
+        assert_eq!(parsed.notifications.cooldown_secs, 3);
     }
 }

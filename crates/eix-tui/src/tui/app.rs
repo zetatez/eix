@@ -346,6 +346,10 @@ pub struct App {
     error: Option<String>,
     connected: bool,
     tick: u64,
+    /// Ring the terminal bell when a background pane needs attention.
+    pub bell: bool,
+    /// Set when a notification should ring; cleared by the event loop.
+    ring: bool,
 }
 
 impl App {
@@ -376,7 +380,14 @@ impl App {
             error: None,
             connected: false,
             tick: 0,
+            bell: false,
+            ring: false,
         }
+    }
+
+    /// Take the pending bell request, if any.
+    pub fn take_ring(&mut self) -> bool {
+        std::mem::take(&mut self.ring)
     }
 
     pub fn tick(&mut self) {
@@ -582,6 +593,7 @@ impl App {
             }
             "session.attention" => {
                 if let Ok(params) = serde_json::from_value::<AttentionParams>(notification.params) {
+                    let mut alert = false;
                     if let Some((index, view)) = self
                         .views
                         .iter_mut()
@@ -596,7 +608,11 @@ impl App {
                                 params.status.as_str(),
                                 index + 1
                             );
+                            alert = true;
                         }
+                    }
+                    if alert && self.bell {
+                        self.ring = true;
                     }
                 }
             }
@@ -2775,6 +2791,42 @@ mod tests {
         assert_eq!(app.focused, 1);
         assert!(!app.pane_needs_attention(1));
         assert_eq!(app.attention_count(), 0);
+    }
+
+    #[test]
+    fn background_attention_rings_only_for_background_panes_when_enabled() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.views.push(SessionView::new(
+            Session::new("s2", "two", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+
+        let attention = |session: &str| {
+            Event::Notification(eix_core::Notification::new(
+                "session.attention",
+                serde_json::json!({"session_id": session, "status": "awaiting_approval"}),
+            ))
+        };
+
+        // Off by default.
+        app.handle_event(attention("s2"), &tx);
+        assert!(!app.take_ring());
+
+        app.bell = true;
+        // The focused pane is already visible.
+        app.handle_event(attention("s1"), &tx);
+        assert!(!app.take_ring());
+
+        // A background pane rings exactly once.
+        app.handle_event(attention("s2"), &tx);
+        assert!(app.take_ring());
+        assert!(!app.take_ring());
     }
 
     #[test]

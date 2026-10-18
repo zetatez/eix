@@ -411,6 +411,60 @@ async fn approval_applies_only_the_selected_hunks() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn attention_runs_the_notification_command() -> anyhow::Result<()> {
+    let dir = temp_dir("notify");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    let notified_path = dir.join("notified");
+    config.notifications.command = Some(format!(
+        "printf '%s %s' \"$EIX_SESSION_NAME\" \"$EIX_STATUS\" > {}",
+        notified_path.display()
+    ));
+    config.notifications.cooldown_secs = 0;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "notify", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write out.txt"}),
+        )
+        .await?;
+
+    // The command runs off the event loop, so poll briefly for its output.
+    let mut notified = String::new();
+    for _ in 0..100 {
+        if let Ok(text) = tokio::fs::read_to_string(&notified_path).await {
+            notified = text;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(notified, "notify awaiting_approval");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn approval_gate_denies_and_keeps_the_workspace_untouched() -> anyhow::Result<()> {
     let dir = temp_dir("deny");
     std::fs::create_dir_all(&dir)?;

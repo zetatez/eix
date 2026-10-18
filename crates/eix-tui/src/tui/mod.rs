@@ -33,12 +33,14 @@ pub async fn run(
     data_dir: PathBuf,
     config: Option<PathBuf>,
     initial_session: Option<String>,
+    bell: bool,
 ) -> Result<()> {
     if !io::stdout().is_terminal() {
         bail!("`eix tui` needs a terminal (stdout is not a tty)");
     }
     let mut terminal = init_terminal()?;
     let mut app = App::new(initial_session);
+    app.bell = bell;
     let (cmd_tx, mut ev_rx) = controller::spawn(socket, data_dir, config);
     let _ = cmd_tx.send(Command::Hello);
     let _ = cmd_tx.send(Command::List);
@@ -66,7 +68,15 @@ pub async fn run(
                 None => break,
             },
             maybe = ev_rx.recv() => match maybe {
-                Some(event) => app.handle_event(event, &cmd_tx),
+                Some(event) => {
+                    app.handle_event(event, &cmd_tx);
+                    if app.take_ring() {
+                        use std::io::Write;
+                        let mut stdout = io::stdout();
+                        let _ = stdout.write_all(b"\x07");
+                        let _ = stdout.flush();
+                    }
+                }
                 None => break,
             },
             _ = tokio::time::sleep(Duration::from_millis(200)) => app.tick(),

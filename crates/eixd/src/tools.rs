@@ -13,7 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use eix_core::{Config, HunkInfo, ToolDefinition};
+use eix_core::{sandbox, Config, HunkInfo, SandboxMode, ToolDefinition};
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 
@@ -429,7 +429,38 @@ async fn run_command(args: &Value, cwd: &Path, config: &Config) -> Result<String
         Some(raw) => resolve_path(cwd, raw)?,
         None => cwd.to_path_buf(),
     };
-    let child = tokio::process::Command::new("sh")
+    let command_cwd = command_cwd.canonicalize().unwrap_or(command_cwd);
+    let sandboxed = match config.tools.sandbox {
+        SandboxMode::Off => false,
+        SandboxMode::Bwrap => {
+            if !sandbox::bwrap_available() {
+                bail!("tools.sandbox = \"bwrap\" but bwrap is not installed");
+            }
+            true
+        }
+        SandboxMode::Auto => sandbox::bwrap_available(),
+    };
+
+    let mut cmd = if sandboxed {
+        let workspace = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let home = if config.tools.sandbox_read_home {
+            sandbox::home_dir()
+        } else {
+            None
+        };
+        let mut cmd = tokio::process::Command::new("bwrap");
+        cmd.args(sandbox::bwrap_args(
+            &workspace,
+            &command_cwd,
+            config.tools.sandbox_network,
+            home.as_deref(),
+        ));
+        cmd.arg("sh");
+        cmd
+    } else {
+        tokio::process::Command::new("sh")
+    };
+    let child = cmd
         .arg("-c")
         .arg(command)
         .current_dir(&command_cwd)
@@ -771,6 +802,78 @@ mod tests {
         assert!(failed.ok);
         assert!(failed.output.contains("[stderr]"));
         assert!(failed.output.contains("exit status: 3"));
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn sandbox_off_runs_directly() {
+        let cwd = temp_cwd("sandbox-off");
+        let mut config = Config::default();
+        config.tools.sandbox = SandboxMode::Off;
+        let out = execute(
+            "run_command",
+            &json!({"command": "printf hi"}),
+            &cwd,
+            &config,
+        )
+        .await;
+        assert!(out.ok);
+        assert_eq!(out.output, "hi");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn sandbox_keeps_writes_inside_the_workspace() {
+        if !sandbox::bwrap_available() {
+            return;
+        }
+        let cwd = temp_cwd("sandbox");
+        let config = Config::default();
+        let marker = std::env::temp_dir().join(format!("eix-sandbox-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let inside = execute(
+            "run_command",
+            &json!({"command": "touch inside.txt"}),
+            &cwd,
+            &config,
+        )
+        .await;
+        assert!(inside.ok, "{}", inside.output);
+        assert!(cwd.join("inside.txt").exists());
+
+        // Inside the sandbox `/tmp` is a private tmpfs, so this write must not
+        // reach the host even though the command appears to succeed.
+        let outside = execute(
+            "run_command",
+            &json!({"command": format!("touch {}", marker.display())}),
+            &cwd,
+            &config,
+        )
+        .await;
+        assert!(outside.ok, "{}", outside.output);
+        assert!(!marker.exists(), "sandbox leaked {}", marker.display());
+
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn sandbox_runs_in_the_requested_subdirectory() {
+        if !sandbox::bwrap_available() {
+            return;
+        }
+        let cwd = temp_cwd("sandbox-cwd");
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        std::fs::write(cwd.join("sub/marker.txt"), "x").unwrap();
+        let out = execute(
+            "run_command",
+            &json!({"command": "cat marker.txt", "cwd": "sub"}),
+            &cwd,
+            &Config::default(),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert_eq!(out.output, "x");
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

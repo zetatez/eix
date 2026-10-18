@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use eix_core::{
@@ -50,6 +50,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         bus,
         turns: Mutex::new(HashMap::new()),
         approvals: Mutex::new(HashMap::new()),
+        notified: std::sync::Mutex::new(HashMap::new()),
     });
     daemon.recover().await;
 
@@ -115,6 +116,8 @@ struct Daemon {
     turns: Mutex<HashMap<SessionId, Arc<AtomicBool>>>,
     /// Tool calls blocked on a user decision, keyed by session.
     approvals: Mutex<HashMap<SessionId, PendingApproval>>,
+    /// Last attention notification per session, for the cooldown.
+    notified: std::sync::Mutex<HashMap<SessionId, Instant>>,
 }
 
 struct PendingApproval {
@@ -493,8 +496,63 @@ impl Daemon {
                     "status": to.as_str(),
                 }),
             );
+            self.notify_attention(&session, to);
         }
         Ok(session)
+    }
+
+    /// Run the configured notification command for a session that just started
+    /// needing attention. Spawned on its own thread so a slow or hanging
+    /// command never blocks the event loop. Failures are logged, not fatal.
+    fn notify_attention(&self, session: &Session, status: SessionStatus) {
+        let Some(command) = self
+            .config
+            .notifications
+            .command
+            .as_deref()
+            .map(str::trim)
+            .filter(|command| !command.is_empty())
+            .map(str::to_string)
+        else {
+            return;
+        };
+        let cooldown = Duration::from_secs(self.config.notifications.cooldown_secs);
+        let now = Instant::now();
+        {
+            let mut notified = self
+                .notified
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if notified
+                .get(&session.id)
+                .is_some_and(|last| now.duration_since(*last) < cooldown)
+            {
+                return;
+            }
+            notified.insert(session.id.clone(), now);
+        }
+
+        let id = session.id.clone();
+        let name = session.name.clone();
+        let cwd = session.cwd.clone();
+        let status = status.as_str().to_string();
+        std::thread::spawn(move || {
+            let result = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&command)
+                .env("EIX_SESSION_ID", &id)
+                .env("EIX_SESSION_NAME", &name)
+                .env("EIX_SESSION_CWD", &cwd)
+                .env("EIX_STATUS", &status)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .and_then(|mut child| child.wait());
+            if let Err(err) = result {
+                eprintln!("eixd: notification command failed: {err}");
+            }
+        });
     }
 
     async fn run_turn(

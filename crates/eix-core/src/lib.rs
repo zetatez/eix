@@ -8,9 +8,12 @@ pub mod config;
 pub mod event;
 pub mod message;
 pub mod protocol;
+pub mod sandbox;
 pub mod session;
 
-pub use config::{Config, ConfigError, ProviderConfig, ToolPolicy, ToolsConfig};
+pub use config::{
+    Config, ConfigError, NotificationsConfig, ProviderConfig, SandboxMode, ToolPolicy, ToolsConfig,
+};
 pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ErrorPayload, Event, EventKind,
     HunkInfo, StatusChangedPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
