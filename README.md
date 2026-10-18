@@ -98,12 +98,16 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 
 | 键 | 行为 |
 | --- | --- |
-| `i` / `Enter` | 聚焦输入框 |
-| `Esc` | 从输入框回到转录区 |
+| `i` / `Enter` | 聚焦输入框（nvim 后端会进入 insert 模式） |
+| `Esc` / `Esc Esc` | nvim 后端：单次 `Esc` 回到 normal 模式并**保持输入框焦点**（可做完整 vim 编辑）；normal 模式下再按一次回到转录区（连按两次即离开）。native 后端单次 `Esc` 直接回转录区 |
 | `Enter` | 发送到聚焦 pane（输入框内） |
 | `Ctrl-J` | 换行（输入框内） |
 | `p` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（输入框内外都可用） |
 | `o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
+| `:` | 命令面板：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
+| `w` | worktree picker：选中后把路径插入聚焦 pane 的输入框 |
+| `b` | branch picker：选中后把分支名插入输入框 |
+| `@`（输入框内） | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发） |
 | `a` | 跳到下一个需要 attention 的 pane（审批/错误） |
 | `C-w h/j/k/l` | 按方向切换 pane 焦点（转录区） |
 | `C-w v` / `C-w s` | 打开新 pane |
@@ -124,9 +128,19 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 | `j` / `k` / `PgUp` / `PgDn` | 滚动聚焦 pane 的转录 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
 | `?` / `F1` | 帮助（F1 任意位置可用） |
-| `q` / `Ctrl-C` | 退出 |
+| `q` / `Ctrl-C` | 退出（转录区；nvim 输入框聚焦时 `Ctrl-C` 交给 vim） |
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
+所有 picker 共用同一个 overlay：上方输入框做模糊过滤，左侧是候选列表，右侧是预览
+（session 显示 id/status/cwd/worktree/permission/model；文件、worktree、branch、context
+显示 daemon 给出的详情）。files / worktrees / branches / context 由 daemon 的
+`picker.query` 提供，其余（sessions、命令面板）在客户端生成。
+
+输入框默认是真正的 Neovim buffer：单次 `Esc` 只退出 insert、焦点仍留在输入框，因此
+normal 模式下的 `d`/`c`/`w`/`:`、`Ctrl-J`、`Ctrl-C`、`F1` 等按键都会原样交给 vim
+（`Enter` 也只在 insert 模式下才提交）。TUI 只保留少量显式全局键：insert 模式下的
+`Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）和 `@`（文件
+picker）；normal 模式下这些键都归还给 vim。连续两次 `Esc` 回到转录区。
 `write_file` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现 `[y] apply / [n] reject`
 卡片并显示 unified diff（最多 10 行，超出标 `… diff truncated`）；按 `d` 可全屏审阅：
 `j/k` 滚动，`[`/`]` 跳 hunk，`Space` 勾选，`a` 全选/全不选，`y` 应用选中，`n` 拒绝。
@@ -192,6 +206,9 @@ TUI 默认拉起一个 `nvim --embed`（加载你的完整 `~/.config/nvim`）�
 - `Enter` 提交（nvim buffer-local mapping，带 `pumvisible()` / cmp / blink 守卫）
 - `Ctrl-J`（或 `Shift-Enter`）换行：host 直接让 nvim 插入字面换行，绕过补全插件对
   `<C-j>` 的映射（如 `cmp.select_next_item()`）
+- `@`（行首或空白后）打开 workspace 文件 picker，选中后插入 `@相对路径`；其余位置插入字面 `@`
+- `:q` / nvim 崩溃：host 自动重启输入条并从 daemon 恢复草稿；草稿镜像到 `draft.set`，切换
+  session 时回填 buffer
 - `Esc` 回到转录区；再按 `i` / `Enter` 重新聚焦并进入 insert
 - 聚焦时高度为 `clamp(行数, 3, 10)`，失焦时保留一行预览
 - 提交失败（请求错误或 turn 出错）会把 draft 放回输入条，不会丢字
@@ -426,13 +443,15 @@ eix nvim [--session ID]      # 也可用 EIX_NVIM 覆盖 nvim 可执行文件
 | 命令 | 作用 |
 | --- | --- |
 | `:Eix attach [ID\|name]` | attach（省略则第一个 session，没有就新建） |
-| `:Eix list` | 列出 session |
+| `:Eix list` / `:Eix pick [KIND]` | 列出 session / picker（`KIND` 省略为 session；可选 `files`/`worktrees`/`branches`/`context`，选中后把值插入光标处，`context` 在分屏显示条目详情） |
 | `:Eix new [NAME] [worktree]` | 新建 session（可选独立 worktree） |
-| `:Eix send TEXT` / `:Eix prompt` | 发送 prompt；`prompt` 开一个输入分屏，`<CR>` 发送 |
+| `:Eix send TEXT` / `:Eix prompt` | 发送 prompt；`prompt` 开一个输入分屏，`<CR>` 发送、`@` 文件 picker |
 | `:Eix fork [SEQ]` / `:Eix rewind [SEQ]` | 分叉 / 回滚并切到新 session |
 | `:Eix stop` | 取消当前 turn |
 | `:Eix ps` / `:Eix ledger` | 后台进程 / context ledger |
-| `<leader>a` | 动作 palette（list / new / worktree / prompt / stop / fork / rewind / ps / ledger） |
+| `:Eix permission [LEVEL]` / `:Eix doctor` | 权限级别 / 连接与版本诊断 |
+| `<C-g>` / `<C-g><C-g>` | session picker / 回到上一个 session |
+| `<leader>a` | 动作 palette（picker / list / new / worktree / file / branch / context / prompt / stop / fork / rewind / ps / ledger / permission / doctor） |
 
 每个 Neovim 进程是一个独立 client，共享同一个 daemon；daemon 会串行化同一 session 的
 turn，第二个 prompt 在忙时会被拒绝。attach 后前端会发 `session.subscribe`，只接收当前
@@ -534,3 +553,6 @@ spike 内：
 - [x] 自动批准规则（`[[tools.auto_approve]]`：工具名 + 路径 glob + 命令前缀/正则；只放宽 `ask`）
 - [x] nvim 配色 → TUI 主题桥接（启动与 `ColorScheme` 时读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete`，映射转录区/审批 diff 颜色）
 - [x] `ext_multigrid` 多窗口渲染（浮窗/消息区独立 grid，按 `compindex` 叠加）
+- [x] nvim 交互补齐：嵌入 nvim 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider），`:q`/崩溃后自动重启并从 daemon draft 恢复；独立前端 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`
+- [x] nvim 草稿镜像（prompt 内 `TextChanged` 同步到 `draft.set`，切 session 时从 daemon 回填 buffer）
+- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / worktrees / branches / context，`p`/`o`/`:`/`w`/`b`/`@` 入口；独立前端 `:Eix pick [KIND]`）

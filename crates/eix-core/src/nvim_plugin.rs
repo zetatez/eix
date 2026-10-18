@@ -58,6 +58,8 @@ local dispatch
 local redraw
 local attach_target
 local open_palette
+local attach
+local session_picker
 
 local function request(method, params, cb)
   local id = state.id
@@ -260,6 +262,14 @@ local function create_buffer(name)
         open_palette()
       end
     end, { buffer = state.buffer, desc = "eix actions" })
+    vim.keymap.set("n", "<C-g><C-g>", function()
+      if state.previous_session ~= nil then
+        attach(state.previous_session)
+      end
+    end, { buffer = state.buffer, desc = "eix previous session" })
+    vim.keymap.set("n", "<C-g>", function()
+      session_picker()
+    end, { buffer = state.buffer, desc = "eix sessions" })
   end
   redraw()
 end
@@ -277,11 +287,14 @@ local function show_buffer(name)
   end)
 end
 
-local function attach(id)
+attach = function(id)
   request("session.attach", { session_id = id }, function(result, err)
     if err then
       notify("attach: " .. tostring(err.message), vim.log.levels.ERROR)
       return
+    end
+    if state.session ~= nil and state.session.id ~= result.session.id then
+      state.previous_session = state.session.id
     end
     state.session = result.session
     state.attached = true
@@ -295,6 +308,110 @@ local function attach(id)
     end
     show_buffer("eix://" .. result.session.id:sub(1, 8))
   end)
+end
+
+-- `<C-g>` session picker and `<C-g><C-g>` back to the previous session.
+session_picker = function()
+  request("session.list", {}, function(result, err)
+    if err then
+      notify("sessions: " .. tostring(err.message), vim.log.levels.ERROR)
+      return
+    end
+    vim.schedule(function()
+      local sessions = result.sessions or {}
+      if #sessions == 0 then
+        notify("no sessions")
+        return
+      end
+      vim.ui.select(sessions, {
+        prompt = "eix sessions",
+        format_item = function(session)
+          local mark = (state.session ~= nil and session.id == state.session.id) and "* " or "  "
+          return string.format(
+            "%s%s %s  %s",
+            mark,
+            session.status,
+            session.name,
+            session.id:sub(1, 8)
+          )
+        end,
+      }, function(session)
+        if session ~= nil then
+          attach(session.id)
+        end
+      end)
+    end)
+  end)
+end
+
+-- Split a `picker.query` provider's rows into a `vim.ui.select`, then hand the
+-- chosen item back. Previews are not shown (nvim's select has no side pane);
+-- the TUI is the rich picker, this is the lightweight one.
+local function pick_data(kind, prompt, on_choice)
+  if state.session == nil then
+    notify("attach a session first", vim.log.levels.ERROR)
+    return
+  end
+  request("picker.query", {
+    kind = kind,
+    session_id = state.session.id,
+    limit = 2000,
+  }, function(result, err)
+    if err then
+      notify(kind .. ": " .. tostring(err.message), vim.log.levels.ERROR)
+      return
+    end
+    vim.schedule(function()
+      local items = result.items or {}
+      if #items == 0 then
+        notify("no " .. kind .. " rows in this workspace")
+        return
+      end
+      vim.ui.select(items, {
+        prompt = prompt,
+        format_item = function(item)
+          if item.detail ~= nil and item.detail ~= "" then
+            return string.format("%s  %s", item.label or item.value, item.detail)
+          end
+          return item.label or item.value
+        end,
+      }, function(item)
+        if item ~= nil then
+          on_choice(item)
+        end
+      end)
+    end)
+  end)
+end
+
+-- `@` file picker: ask the daemon for workspace files, then hand one back.
+local function pick_files(on_choice)
+  pick_data("files", "eix files", function(item)
+    on_choice(item.value)
+  end)
+end
+
+-- Insert a picked value at the cursor of the current buffer.
+local function insert_picked(text)
+  local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+  vim.api.nvim_buf_set_text(0, row - 1, col, row - 1, col, { text })
+  vim.api.nvim_win_set_cursor(0, { row, col + #text })
+end
+
+-- Pick a provider row and insert its value (worktrees, branches, files).
+local function pick_insert(kind, prompt)
+  pick_data(kind, prompt, function(item)
+    insert_picked(item.value)
+  end)
+end
+
+-- Render `lines` (with a `title` header) in a scratch split.
+local function show_scratch(title, lines)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.bo[buf].buftype = "nofile"
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, vim.list_extend({ title, "" }, lines))
+  vim.cmd("botright 12split")
+  vim.api.nvim_win_set_buf(0, buf)
 end
 
 local function create_session(descend)
@@ -386,6 +503,32 @@ local function open_prompt()
         end
       end,
     })
+    -- `@` at the start of a word opens the workspace file picker; mid-word it
+    -- stays literal.
+    local function insert_at(at)
+      local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+      vim.api.nvim_buf_set_text(buf, row - 1, col, row - 1, col, { at })
+      vim.api.nvim_win_set_cursor(0, { row, col + #at })
+      vim.cmd("startinsert")
+    end
+    vim.api.nvim_buf_set_keymap(buf, "i", "@", "", {
+      noremap = true,
+      silent = true,
+      callback = function()
+        local line = vim.api.nvim_get_current_line()
+        local col = vim.api.nvim_win_get_cursor(0)[2]
+        local head = line:sub(1, col)
+        if head == "" or head:match("%s$") ~= nil then
+          local win = vim.api.nvim_get_current_win()
+          pick_files(function(value)
+            vim.api.nvim_set_current_win(win)
+            insert_at("@" .. value)
+          end)
+        else
+          insert_at("@")
+        end
+      end,
+    })
     vim.cmd("startinsert")
   end)
 end
@@ -419,9 +562,14 @@ end
 -- `<leader>a` action palette for the eix buffer.
 open_palette = function()
   local actions = {
+    { label = "switch session (picker)", run = session_picker },
     { label = "list sessions", run = list_sessions },
     { label = "new session", run = function() create_session(false) end },
     { label = "new session in a worktree", run = function() create_session(true) end },
+    { label = "pick a file (insert path)", run = function() pick_insert("files", "eix files") end },
+    { label = "pick a worktree (insert path)", run = function() pick_insert("worktrees", "eix worktrees") end },
+    { label = "pick a branch (insert name)", run = function() pick_insert("branches", "eix branches") end },
+    { label = "browse context entries", run = function() vim.cmd("Eix pick context") end },
     { label = "send a prompt", run = open_prompt },
     { label = "stop the running turn", run = function()
         if require_session() then
@@ -433,6 +581,7 @@ open_palette = function()
     { label = "background processes", run = function() vim.cmd("Eix ps") end },
     { label = "context ledger", run = function() vim.cmd("Eix ledger") end },
     { label = "permission…", run = function() vim.cmd("Eix permission") end },
+    { label = "doctor", run = function() vim.cmd("Eix doctor") end },
   }
   vim.ui.select(actions, {
     prompt = "eix",
@@ -558,6 +707,54 @@ vim.api.nvim_create_user_command("Eix", function(opts)
         end)
       end)
     end
+  elseif sub == "pick" then
+    local kind = args[2] or "sessions"
+    if kind == "sessions" or kind == "" then
+      session_picker()
+    elseif kind == "files" then
+      pick_insert("files", "eix files")
+    elseif kind == "worktrees" then
+      pick_insert("worktrees", "eix worktrees")
+    elseif kind == "branches" then
+      pick_insert("branches", "eix branches")
+    elseif kind == "context" then
+      pick_data("context", "eix context", function(item)
+        show_scratch(
+          string.format("## context · %s", item.value),
+          vim.split(item.preview or item.label or item.value, "\n", { plain = true })
+        )
+      end)
+    else
+      notify("unknown picker kind: " .. kind .. " (sessions|files|worktrees|branches|context)")
+    end
+  elseif sub == "doctor" then
+    local endpoint = state.socket
+    if state.tcp ~= "" then
+      endpoint = "tcp://" .. state.tcp
+    end
+    local session = "-"
+    if state.session ~= nil then
+      session = string.format("%s (%s)", state.session.name, state.session.id:sub(1, 8))
+    end
+    local lines = {
+      "## eix doctor",
+      "nvim       " .. tostring(vim.version()),
+      "endpoint   " .. endpoint,
+      "connected  " .. tostring(state.connected),
+      "attached   " .. tostring(state.attached),
+      "auth       " .. (state.token ~= "" and "token" or "none"),
+      "session    " .. session,
+      "cwd        " .. state.cwd,
+      "buffer     " .. tostring(state.buffer),
+      "pending    " .. tostring(vim.tbl_count(state.pending)),
+    }
+    vim.schedule(function()
+      local buf = vim.api.nvim_create_buf(false, true)
+      vim.bo[buf].buftype = "nofile"
+      vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+      vim.cmd("botright 12split")
+      vim.api.nvim_win_set_buf(0, buf)
+    end)
   elseif sub == "permission" then
     if require_session() then
       local level = args[2]

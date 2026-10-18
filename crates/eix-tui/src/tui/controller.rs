@@ -72,6 +72,11 @@ pub enum Command {
         session_id: Option<String>,
         limit: Option<u32>,
     },
+    PickerData {
+        session_id: String,
+        /// Daemon provider (`files`, `worktrees`, `branches`, `context`).
+        kind: String,
+    },
     DraftGet {
         session_id: String,
     },
@@ -114,6 +119,7 @@ impl Command {
             Self::Fork { .. } => "fork",
             Self::Rewind { .. } => "rewind",
             Self::Search { .. } => "search",
+            Self::PickerData { .. } => "picker",
             Self::DraftGet { .. } => "draft",
             Self::DraftSet { .. } => "draft",
             Self::PatchGet { .. } => "patch",
@@ -151,6 +157,10 @@ pub enum Event {
     Forked(Session),
     Rewound(Box<RewindResult>),
     Search(SearchResult),
+    PickerData {
+        kind: String,
+        items: Vec<eix_core::PickerItem>,
+    },
     Draft {
         session_id: String,
         text: String,
@@ -419,6 +429,26 @@ async fn dispatch(
                 .await?;
             let result: SearchResult = decode(value)?;
             send(events, Event::Search(result))
+        }
+        Command::PickerData { session_id, kind } => {
+            let value = requester
+                .request(
+                    "picker.query",
+                    json!({
+                        "kind": kind,
+                        "session_id": session_id,
+                        "limit": 2000
+                    }),
+                )
+                .await?;
+            let result: eix_core::PickerResult = decode(value)?;
+            send(
+                events,
+                Event::PickerData {
+                    kind: result.kind,
+                    items: result.items,
+                },
+            )
         }
         Command::DraftGet { session_id } => {
             let value = requester

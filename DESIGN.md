@@ -180,26 +180,31 @@ prompt buffer 的 buffer-local mapping：
 
 | 键 | 行为 | 守卫 |
 |---|---|---|
-| `<CR>` | 提交 | `getcmdtype() != ""` → 原样；`pumvisible()` → 补全确认；否则 submit |
-| `<C-j>` | 换行 | `getcmdtype() != ""` → 原样；`pumvisible()` → 交还原 mapping（如 cmp 的 `select_next_item`）；否则插入换行 |
-| `<C-g>` | 打开 session picker | 无（planned） |
+| `<CR>` | 提交 | 仅 insert；`getcmdtype() != ""` → 原样；`pumvisible()` → 补全确认 |
+| `<C-j>` | 换行 | 仅 insert；`getcmdtype() != ""` → 原样；`pumvisible()` → 交还原 mapping（如 cmp 的 `select_next_item`）；否则插入换行 |
+| `<C-g>` | 打开 session picker（TUI 层拦截） | 仅 insert；normal 模式归还 vim 的 `<C-g>` |
+| `<Esc>` | insert → normal，**保持输入框焦点**；normal 下再按一次回到转录区（双击） | 双击窗口 500ms |
 | `<leader>a…` | eix 动作 palette（`vim.ui.select`） | 无 |
-| `<C-w>h/j/k/l/w` | 切换 TUI pane 焦点（仅 normal） | insert 下保持原生删词 |
-| `@` | 文件 picker（insert，词首） | 否则插入字面 `@`（planned） |
+| `<C-w>h/j/k/l/w` | 切换 TUI pane 焦点（仅 normal） | 暂未拦截；insert 下为原生删词 |
+| `@` | 文件 picker（insert，词首）；行首/空白后触发，否则插入字面 `@` | 补全菜单可见时保持字面 |
 | `:Eix …` | 用户命令 | 不是 vim 原生 `:` 的替代 |
+
+除上表外，输入框聚焦时 TUI **不再拦截**普通按键（`Ctrl-C`、`F1`、normal 模式的
+`Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 等均交给 Neovim），避免与 vim 编辑冲突。
 
 `<CR>` / `<C-j>` 都采用"先保存、后接管"策略：安装前用 `maparg()` 取回用户原有 mapping，补全菜单可见时把控制权交还。实测本机配置把 `<C-j>` 映射给了 `cmp.select_next_item()`，不接管的话输入框无法可靠换行。
 
 - **leader 镜像**：host 读取 `g:mapleader`（预期为空格）用于转录区/overlay 的同名前缀；用户配置里的 which-key 会自动把 `<leader>a` 组展示出来。
 - 已知冲突：`<CR>` 会覆盖 cmp 的确认键，所以必须走 `pumvisible()` 守卫；`<C-g>` 若已被用户映射，启动时告警并允许改键。
 - `<C-w>` 在 nvim 里是窗口命令前缀（嵌入的 nvim 只有一个窗口，原生动作基本是空操作）。在 prompt buffer 的 normal 模式里做 buffer-local 覆盖是安全的，但要在 doctor 里说明它在该 buffer 内不再能开/关窗口。
-- `:q` 会退出嵌入 nvim：host 监听退出并自动重启，draft 从 daemon 恢复；提示用户用 `<leader>a q` detach（spike 目前是直接退出，重启逻辑 planned）。
+- `:q` 会退出嵌入 nvim：host 监听 `VimLeavePre` 并自动重启，draft 从 daemon 恢复；提示用户用 `<leader>a q` detach（TUI 转录区 `q` 仍是退出程序）。
 - 粘贴：启用 bracketed paste，整段文本一次 `nvim_paste`；键盘输入里的 `<` 转义为 `<LT>`（`nvim_input` 用 `<...>` 记法）。
 
 ### 5.5 buffer 与 draft
 
 - 每个访问过的 session 在 nvim 内对应一个隐藏 scratch buffer，保留 undo 历史；上限 20 个，超出按 LRU 序列化到 daemon 后丢弃。
-- draft 变更 debounce 后同步到 daemon（TUI 的 native 输入按 200ms tick；nvim buffer 仍在子进程里）；
+- draft 变更 debounce 后同步到 daemon（TUI 的 native 输入按 200ms tick；nvim buffer 由 prompt 内的
+  `TextChanged` 把全文镜像给 host，host 再走 `draft.set`）；切换 pane 时从 daemon 回填 buffer。
   提交前用 RPC 读取最新文本，避免竞态。`draft.get` / `draft.set` 已实现，空文本即删除。
 - 切换 pane：`nvim_set_current_buf`，同时 `nvim_set_current_dir(session.cwd)`。
 - nvim 崩溃：host 显示提示，用 daemon 中的 draft 重建 buffer 并重启；连续失败两次则自动切 minimal。
@@ -229,8 +234,12 @@ prompt buffer 的 buffer-local mapping：
   `<data-dir>/eix-nvim.lua`，内容变化才重写），插件自己用 `vim.uv`（`vim.loop` 兼容）连 Unix socket
   或 TCP，说同一套换行 JSON-RPC。
 - 转录渲染进一个 `eix://<id8>` 的 scratch buffer（`botright` 分屏），用户自己的配置、配色和键位都在。
-- `:Eix` 命令：`attach [ID|name]` / `list` / `new [NAME] [worktree]` / `send TEXT` / `prompt`（输入分屏，
-  `<CR>` 发送）/ `fork [SEQ]` / `rewind [SEQ]` / `stop` / `ps` / `ledger`。
+- `:Eix` 命令：`attach [ID|name]` / `list` / `pick [KIND]`（`KIND` = `sessions`(默认)/`files`/`worktrees`/
+  `branches`/`context`；选中 files/branches/worktree 插入光标处，context 在分屏显示条目详情）/
+  `new [NAME] [worktree]` / `send TEXT` / `prompt`（输入分屏，`<CR>` 发送、`@` 文件 picker）/
+  `fork [SEQ]` / `rewind [SEQ]` / `stop` / `ps` / `ledger` / `permission [LEVEL]` / `doctor`。
+  eix buffer 里 `<C-g>` 打开 session picker，`<C-g><C-g>` 回到上一个 session；`<leader>a` palette
+  也含 file / worktree / branch / context 入口。
 - 连接和请求都由插件内的 libuv 处理；注意 **libuv 回调是 fast context**，`vim.env` / `vim.fn.*` /
   `nvim_buf_*` 都必须先 `vim.schedule` 或把环境值在加载时缓存进 `state`（实测坑）。
 - 每个 nvim 进程是独立 client，共享同一 daemon；daemon 串行化同一 session 的 turn，忙时拒绝。
@@ -243,7 +252,8 @@ prompt buffer 的 buffer-local mapping：
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
 - 全局输入条与 statusline；tabline 显示 session 状态，可隐藏（窄窗口默认隐藏）。
 - 焦点：`<C-w>h/j/k/l`（normal 模式与转录区一致）、`<C-w>w` 循环；转录区按 `i` 聚焦输入并进入 insert。
-- 双击 `Esc`（可配置）从输入回到转录；默认不强求。
+- `Esc`：nvim 后端先由 insert 回到 normal 并保持输入框焦点（可做完整 vim 编辑）；在 500ms 内
+  连按两次才把焦点交回转录区（已实现）。native 后端单次 `Esc` 即回转录区。
 
 ## 7. 键位总表
 
@@ -318,11 +328,23 @@ prompt buffer 的 buffer-local mapping：
 
 统一的 `查询 → 过滤 → 预览 → 动作` overlay，provider 可插拔：
 
-- sessions / files(`@`) / history / commands / models / worktrees / branches / diff hunks / context items。
-- 预览器：session → 最后消息 + 待审批摘要 + todo；file → 语法高亮；diff → 着色 diff；message → 完整渲染。
-- 排序：attention 优先，其余 frecency；`#` 模式按全文匹配度。
-- 多选：多文件插入、多 session 开 pane、多 hunk 审批。
-- 外挂：`agent pick` 输出会话列表，供 rofi/dmenu/fzf 使用；tmux 下可选 shell out 到 `tmux display-popup -E fzf`。
+- 规划：sessions / files(`@`) / history / commands / models / worktrees / branches / diff hunks / context items。
+- 已实现（2026-10-18，统一 picker 体系）：
+  - TUI 用单一 `Picker`（`kind` + `query` + `selected` + `items`）承载所有 provider，左侧列表、右侧预览
+    （session 显示 status/cwd/worktree/permission/model；data provider 显示 daemon 给的 `preview` 文本）。
+  - 入口：`p`/`<C-g>`（sessions，切换 pane）、`o`（sessions，新 pane）、`:`（commands，命令面板）、
+    `w`（worktrees）、`b`（branches）、prompt 内 `@`（files）、`Eix pick` 经独立前端选择。
+  - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`worktrees`
+    （`git worktree list --porcelain`）、`branches`（`git branch`）、`context`（session ledger 条目，
+    值为 entry id）。默认 500、上限 5000；跳过 `.git` / `target` 等派生目录。
+  - 动作：files → 在 prompt 光标处插入 `@path`；worktrees/branches → 插入对应值；sessions → 切换/新 pane；
+    context → 打开 ledger；commands → 执行（session / files / worktrees / branches / ledger / search /
+    processes / approvals / new / fork / cancel / help / quit）。
+  - 独立 nvim 前端：`:Eix pick [sessions|files|worktrees|branches|context]`（`sessions` 为默认），
+    文件/分支/worktree 选中后插入光标处，context 选中后在 scratch 分屏显示条目详情。
+- 仍待做：history 仍走独立的 `#` 全文搜索视图（未并入 picker）；models / diff hunks provider、
+  多选（多文件插入、多 session 开 pane、多 hunk 审批）、frecency 排序与 `#` 匹配度模式、外挂
+  `agent pick`/`fzf`、file 语法高亮预览。
 - 模糊匹配用 `fuzzy-matcher`（skim 算法）；不做自研打分。
 
 ## 9. 审批与工作区
@@ -417,7 +439,8 @@ prompt buffer 的 buffer-local mapping：
 - `context.drop|pin|compact`
 - `process.list|output|kill`
 - `search.query`（跨 session 全文搜索；`session_id` 可限定范围）
-- `picker.query`（需要跨 session 搜索时）
+- `picker.query {kind, session_id?, query?, limit?}`（provider：`files` / `worktrees` / `branches` / `context`；
+  返回 `{value, label, detail?, preview?}` 行；`context` 的 value 是 entry id）
 - `nvim.claim`（输入所有权；planned）
 
 所有事件带 `id`、`session_id`、`seq`、`ts`、`type`、`payload`；协议版本握手。
@@ -509,6 +532,19 @@ TCP 端点不会自动拉起本地 daemon。
 > 时用 `sh -c` 执行并传入 `EIX_SESSION_ID` / `EIX_SESSION_NAME` / `EIX_SESSION_CWD` /
 > `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；`eix tui` 可用 `bell = true` 在后台
 > pane 需要 attention 时响终端铃。嵌入 nvim 输入已接入（见上）。
+> nvim 交互补齐（2026-10-18）：prompt 内 `@`（词首）经 `rpcnotify` 打开 `picker.query` 的
+> files provider，选中后以 `@<相对路径>` 原样插入 buffer；`:q` / 崩溃由 `VimLeavePre`
+> 上报 `eix_quit`，host 在后台重启 nvim 并通过 `draft.set`/`draft.get` 回填草稿；
+> `TextChanged*` 把 buffer 全文镜像给 host，nvim 输入也具备按 session 的草稿持久化。
+> 独立前端补上 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick [KIND]` 与 `:Eix doctor`。
+> 统一 picker（2026-10-18）：TUI 用单一 overlay 承载 sessions / files / worktrees / branches /
+> context / commands，左侧列表右侧预览；`p`/`o`/`:`/`w`/`b`/`@` 为入口，files 插入 `@path`，
+> worktrees/branches 插入值，context 打开 ledger，commands 直接执行。daemon `picker.query` 新增
+> `worktrees`（porcelain）、`branches`（`git branch`）、`context`（ledger 条目）三个 provider；
+> 独立前端 `:Eix pick files|worktrees|branches|context` 用 `vim.ui.select` 选择。
+> 输入焦点（2026-10-18）：嵌入 nvim 聚焦时单次 `Esc` 只回到 normal 并保留焦点，500ms 内
+> 双击才回到转录；`<CR>` 只在 insert 提交；`<C-g>` 只在 insert 打开 picker；`Ctrl-J` /
+> `Ctrl-Enter` / `Shift-Enter` 只在 insert 换行；`Ctrl-C` / `F1` 在输入框聚焦时交给 vim。
 
 **Phase 2**
 
@@ -636,7 +672,7 @@ TCP 端点不会自动拉起本地 daemon。
 
 - 默认模型与具体的 OpenAI 兼容端点。
 - `<leader>a` 命名空间：独立 nvim 前端已用 buffer-local 映射实现动作 palette；若你的全局映射也叫 `<leader>a`，buffer-local 会优先。
-- `@` 触发是否只在词首；是否需要转义。
+- `@` 触发已定为「行首或空白后」，其余位置插入字面 `@`；暂不转义。
 - 是否启用鼠标。
 - session 自动命名规则（首条 prompt / branch / 手动）。
 - 远程 attach 的广播范围：已支持按连接 `session.subscribe` 收窄（默认仍全部）；是否把"只订阅自己打开的 session"设为默认白名单仍待定。

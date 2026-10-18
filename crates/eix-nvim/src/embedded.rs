@@ -59,6 +59,12 @@ pub struct Shared {
     pub fallback: bool,
     /// Highlight colors last reported by Neovim.
     pub theme: Theme,
+    /// The prompt asked the host to open its file picker.
+    pub file_picker: bool,
+    /// Last draft mirrored by the prompt (used for `draft.set` and recovery).
+    pub text: String,
+    /// Text captured when the prompt exited (`:q`, crash); `None` while alive.
+    pub quit: Option<String>,
 }
 
 impl Shared {
@@ -70,6 +76,9 @@ impl Shared {
             lines: 1,
             fallback: false,
             theme: Theme::default(),
+            file_picker: false,
+            text: String::new(),
+            quit: None,
         }
     }
 }
@@ -109,6 +118,31 @@ impl Handler for NvimHandler {
                     shared.theme = theme;
                 }
             }
+            "eix_file_picker" => {
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.file_picker = true;
+                }
+            }
+            "eix_text" => {
+                let text = args
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.text = text;
+                }
+            }
+            "eix_quit" => {
+                let text = args
+                    .first()
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.quit = Some(text);
+                }
+            }
             _ => {}
         }
     }
@@ -143,6 +177,21 @@ local text = ...
 local lines = vim.split(text, "\n", { plain = true })
 vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
 vim.api.nvim_win_set_cursor(0, { #lines, #lines[#lines] })
+vim.cmd("startinsert!")
+"#;
+
+/// Insert `text` literally at the cursor, without going through mappings or
+/// key notation (file paths may contain `<` or other special characters).
+const INSERT_TEXT_LUA: &str = r#"
+local text = ...
+local lines = vim.split(text, "\n", { plain = true })
+local row, col = unpack(vim.api.nvim_win_get_cursor(0))
+vim.api.nvim_buf_set_text(0, row - 1, col, row - 1, col, lines)
+if #lines == 1 then
+  vim.api.nvim_win_set_cursor(0, { row, col + #lines[1] })
+else
+  vim.api.nvim_win_set_cursor(0, { row + #lines - 1, #lines[#lines] })
+end
 vim.cmd("startinsert!")
 "#;
 
@@ -187,6 +236,7 @@ enum Cmd {
     StartInsert,
     Reset,
     SetText(String),
+    InsertText(String),
     Text(tokio::sync::oneshot::Sender<String>),
 }
 
@@ -344,6 +394,35 @@ impl NvimInput {
         let _ = self.tx.send(Cmd::SetText(text.to_string()));
     }
 
+    /// Insert text literally at the cursor (file picker selections).
+    pub fn insert_text(&self, text: &str) {
+        let _ = self.tx.send(Cmd::InsertText(text.to_string()));
+    }
+
+    /// Take a file-picker request raised by `@` in the prompt.
+    pub fn take_file_picker(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|mut shared| std::mem::take(&mut shared.file_picker))
+            .unwrap_or(false)
+    }
+
+    /// Text captured when the prompt exited, once. The caller owns the restart.
+    pub fn take_quit(&self) -> Option<String> {
+        self.shared
+            .lock()
+            .ok()
+            .and_then(|mut shared| shared.quit.take())
+    }
+
+    /// Last draft mirrored by the prompt (`TextChanged`).
+    pub fn draft_text(&self) -> String {
+        self.shared
+            .lock()
+            .map(|shared| shared.text.clone())
+            .unwrap_or_default()
+    }
+
     /// Resize the prompt grid, skipping no-op calls.
     pub fn resize(&mut self, width: u16, height: u16) {
         if (width, height) == (self.width, self.height) {
@@ -460,6 +539,10 @@ async fn worker(mut rx: UnboundedReceiver<Cmd>, nvim: Nvim, shared: Arc<Mutex<Sh
                 .exec_lua(SET_TEXT_LUA, vec![Value::from(text)])
                 .await
                 .is_ok(),
+            Cmd::InsertText(text) => nvim
+                .exec_lua(INSERT_TEXT_LUA, vec![Value::from(text)])
+                .await
+                .is_ok(),
             Cmd::Text(tx) => {
                 let text = nvim
                     .exec_lua(
@@ -475,6 +558,15 @@ async fn worker(mut rx: UnboundedReceiver<Cmd>, nvim: Nvim, shared: Arc<Mutex<Sh
             }
         };
         if !ok {
+            // The channel died (`:q`, crash). Keep the last mirrored draft so
+            // the host can rebuild the prompt after restarting Neovim.
+            let text = shared
+                .lock()
+                .map(|shared| shared.text.clone())
+                .unwrap_or_default();
+            if let Ok(mut shared) = shared.lock() {
+                shared.quit.get_or_insert(text);
+            }
             break;
         }
         refresh_lines(&nvim, &shared).await;
@@ -731,6 +823,74 @@ mod tests {
                 tokio::time::Instant::now() < deadline,
                 "command line was not composed: rows={rows:?} state={}",
                 nvim.debug_state()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn at_word_start_requests_the_file_picker() {
+        if !nvim_available() {
+            return;
+        }
+        let nvim = NvimInput::spawn(40, 3, true).await.expect("spawn nvim");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        nvim.raw_input("@");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !nvim.take_file_picker() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no file-picker request; text={:?}",
+                nvim.text().await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(nvim.text().await, "", "the trigger must not insert `@`");
+
+        // Mid-word `@` stays literal and does not open the picker.
+        nvim.raw_input("a@b");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while nvim.text().await != "a@b" {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "literal `@` was not inserted: {:?}",
+                nvim.text().await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!nvim.take_file_picker());
+    }
+
+    #[tokio::test]
+    async fn quit_reports_the_last_draft() {
+        if !nvim_available() {
+            return;
+        }
+        let nvim = NvimInput::spawn(40, 3, true).await.expect("spawn nvim");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        nvim.raw_input("draft text");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while nvim.draft_text() != "draft text" {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "draft was not mirrored: {:?}",
+                nvim.draft_text()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        nvim.raw_input("<Esc>:q<CR>");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(text) = nvim.take_quit() {
+                assert_eq!(text, "draft text");
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prompt exit was not reported"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

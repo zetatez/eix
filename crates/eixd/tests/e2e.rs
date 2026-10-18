@@ -2554,6 +2554,193 @@ async fn nvim_headless_renders_the_transcript() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn picker_query_lists_workspace_files() -> anyhow::Result<()> {
+    let dir = temp_dir("picker-files");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(workspace.join("src"))?;
+    std::fs::create_dir_all(workspace.join(".git"))?;
+    std::fs::create_dir_all(workspace.join("target/debug"))?;
+    std::fs::write(workspace.join("src/main.rs"), "fn main() {}")?;
+    std::fs::write(workspace.join("README.md"), "# eix")?;
+    std::fs::write(workspace.join(".git/config"), "secret")?;
+    std::fs::write(workspace.join("target/debug/eix"), "binary")?;
+
+    let config = Config::default();
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "picker", "cwd": workspace}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let result: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "files", "session_id": session_id}),
+        )
+        .await?;
+    assert_eq!(result.kind, eix_core::KIND_FILES);
+    let values: Vec<&str> = result
+        .items
+        .iter()
+        .map(|item| item.value.as_str())
+        .collect();
+    assert_eq!(values, vec!["README.md", "src/main.rs"]);
+
+    let filtered: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "files", "session_id": session_id, "query": "main"}),
+        )
+        .await?;
+    assert_eq!(filtered.items.len(), 1);
+    assert_eq!(filtered.items[0].value, "src/main.rs");
+
+    // The session must belong to the daemon, and the kind must be known.
+    assert_eq!(
+        client
+            .request_error(
+                "picker.query",
+                json!({"kind": "files", "session_id": "missing"}),
+            )
+            .await?,
+        "not_found"
+    );
+    assert_eq!(
+        client
+            .request_error(
+                "picker.query",
+                json!({"kind": "nope", "session_id": session_id})
+            )
+            .await?,
+        "invalid_params"
+    );
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn picker_query_lists_git_worktrees_and_branches() -> anyhow::Result<()> {
+    let dir = temp_dir("picker-git");
+    let workspace = dir.join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    let init = git(&workspace, &["init", "-q"]);
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let commit = git(&workspace, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    assert!(
+        commit.status.success(),
+        "git commit: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    assert!(git(&workspace, &["branch", "feature"]).status.success());
+    let linked = workspace.join("linked");
+    let add = git(
+        &workspace,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "eix/linked",
+            linked.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        add.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let config = Config::default();
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "git", "cwd": workspace}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let trees: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "worktrees", "session_id": session_id}),
+        )
+        .await?;
+    assert_eq!(trees.kind, eix_core::KIND_WORKTREES);
+    assert!(
+        trees
+            .items
+            .iter()
+            .any(|item| item.detail.as_deref() == Some("eix/linked")),
+        "linked worktree missing: {trees:?}"
+    );
+    assert!(trees.items.iter().all(|item| item.preview.is_some()));
+
+    let branches: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "branches", "session_id": session_id, "query": "feat"}),
+        )
+        .await?;
+    assert_eq!(branches.kind, eix_core::KIND_BRANCHES);
+    assert_eq!(branches.items.len(), 1);
+    assert_eq!(branches.items[0].value, "feature");
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn picker_query_lists_context_entries() -> anyhow::Result<()> {
+    let dir = temp_dir("picker-context");
+    std::fs::create_dir_all(&dir)?;
+    let config = Config::default();
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "context", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let result: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "context", "session_id": session_id}),
+        )
+        .await?;
+    assert_eq!(result.kind, eix_core::KIND_CONTEXT);
+    assert!(
+        result.items.iter().any(|item| item.value == "system"),
+        "system entry missing: {result:?}"
+    );
+    assert!(
+        result.items.iter().any(|item| item.value == "workspace"),
+        "workspace entry missing: {result:?}"
+    );
+    // Rows carry the ledger detail so the picker can preview them.
+    assert!(result.items.iter().all(|item| item.preview.is_some()));
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
 struct TestClient {
     reader: ClientReader,
     writer: WriteHalf<UnixStream>,

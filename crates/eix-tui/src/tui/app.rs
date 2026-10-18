@@ -4,14 +4,15 @@
 //! ratatui text box remains as the fallback (`[input] backend`).
 
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eix_core::{
     ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
     ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
-    PatchProposedPayload, PatchResultPayload, PermissionLevel, PermissionPayload, ProcessInfo,
-    ProcessList, ProcessOutput, ProcessStatus, RewindResult, SearchHit, Sector, Session,
-    SessionStatus, SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    PatchProposedPayload, PatchResultPayload, PermissionLevel, PermissionPayload, PickerItem,
+    ProcessInfo, ProcessList, ProcessOutput, ProcessStatus, RewindResult, SearchHit, Sector,
+    Session, SessionStatus, SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 use eix_nvim::embedded::{NvimInput, Theme};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -30,6 +31,16 @@ use super::controller::{Command, ContextOp, Event};
 enum Focus {
     Transcript,
     Input,
+}
+
+/// Two `Esc` presses within this window leave the embedded prompt.
+const ESC_WINDOW: Duration = Duration::from_millis(500);
+
+/// True when a Neovim `mode_change` string means text is being inserted. An
+/// empty string is the state before the first mode report, when the prompt is
+/// still in insert mode.
+fn nvim_is_insert(mode: &str) -> bool {
+    mode.is_empty() || mode.starts_with("insert") || mode.starts_with("replace")
 }
 
 struct Input {
@@ -320,17 +331,70 @@ struct StreamState {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum PickerMode {
+enum PickerKind {
     /// Replace the focused pane's session.
-    Switch,
+    Sessions,
     /// Open the chosen session in a new pane (or focus it if already open).
     NewPane,
+    /// Insert a workspace file after `@` in the prompt.
+    Files,
+    /// Insert a git worktree path into the prompt.
+    Worktrees,
+    /// Insert a git branch name into the prompt.
+    Branches,
+    /// Open the focused session's context ledger.
+    Context,
+    /// Client-side command palette (`:`).
+    Commands,
+}
+
+impl PickerKind {
+    /// Daemon provider backing this kind, if any.
+    fn data_kind(self) -> Option<&'static str> {
+        match self {
+            Self::Files => Some(eix_core::KIND_FILES),
+            Self::Worktrees => Some(eix_core::KIND_WORKTREES),
+            Self::Branches => Some(eix_core::KIND_BRANCHES),
+            Self::Context => Some(eix_core::KIND_CONTEXT),
+            Self::Sessions | Self::NewPane | Self::Commands => None,
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::Sessions => "sessions — switch focused pane",
+            Self::NewPane => "sessions — open in a new pane",
+            Self::Files => "files — insert after @",
+            Self::Worktrees => "worktrees — insert path",
+            Self::Branches => "branches — insert name",
+            Self::Context => "context — open ledger",
+            Self::Commands => "commands",
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::Sessions => "Enter open · ↑/↓ · Esc close",
+            Self::NewPane => "Enter split · ↑/↓ · Esc close",
+            Self::Files => "Enter insert · ↑/↓ · Esc close",
+            Self::Worktrees => "Enter insert path · ↑/↓ · Esc close",
+            Self::Branches => "Enter insert name · ↑/↓ · Esc close",
+            Self::Context => "Enter open ledger · ↑/↓ · Esc close",
+            Self::Commands => "Enter run · ↑/↓ · Esc close",
+        }
+    }
 }
 
 struct Picker {
+    kind: PickerKind,
     query: String,
     selected: usize,
-    mode: PickerMode,
+    /// Rows for data providers and the command palette. Session kinds read
+    /// `App::sessions` directly so live status changes show through.
+    items: Vec<PickerItem>,
+    /// True until the daemon answers a data kind, so the overlay can say
+    /// "loading" instead of "no matches".
+    loading: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -614,6 +678,12 @@ pub struct App {
     last_alert: Option<String>,
     /// Embedded Neovim prompt, when available.
     nvim: Option<NvimInput>,
+    /// In-flight restart after the prompt exited (`:q`, crash).
+    nvim_restart: Option<std::sync::mpsc::Receiver<Result<NvimInput, anyhow::Error>>>,
+    /// Draft captured when the prompt exited, restored after the restart.
+    pending_nvim_text: Option<String>,
+    /// Session whose daemon draft is being loaded into a fresh buffer.
+    draft_loading: Option<String>,
     /// Last draft submitted from the Neovim prompt (session id, text), kept so
     /// a failed turn can put it back into the buffer.
     nvim_draft: Option<(String, String)>,
@@ -629,6 +699,9 @@ pub struct App {
     inbox: Option<InboxView>,
     /// Colors sampled from the embedded Neovim's colorscheme.
     theme: Theme,
+    /// When the previous `Esc` reached the embedded prompt, for the double-Esc
+    /// "leave the input" gesture.
+    esc_at: Option<Instant>,
 }
 
 impl App {
@@ -667,6 +740,9 @@ impl App {
             ring: false,
             last_alert: None,
             nvim: None,
+            nvim_restart: None,
+            pending_nvim_text: None,
+            draft_loading: None,
             nvim_draft: None,
             input_session: None,
             last_saved_draft: String::new(),
@@ -674,6 +750,7 @@ impl App {
             force_clear: false,
             inbox: None,
             theme: Theme::default(),
+            esc_at: None,
         }
     }
 
@@ -686,15 +763,22 @@ impl App {
         self.nvim.is_some()
     }
 
-    /// Collect drafts submitted with `<CR>` in the embedded prompt.
+    /// Collect drafts submitted with `<CR>` in the embedded prompt, plus file
+    /// picker requests, and swap in a restarted prompt when it is ready.
     pub fn poll_nvim(&mut self, tx: &UnboundedSender<Command>) {
-        let theme = self.nvim.as_ref().map(NvimInput::theme);
-        if let Some(theme) = theme {
-            self.theme = theme;
-        }
-        let Some(drafts) = self.nvim.as_ref().map(NvimInput::take_submitted) else {
+        self.poll_nvim_restart(tx);
+
+        let Some((theme, file_picker, drafts)) = self
+            .nvim
+            .as_ref()
+            .map(|nvim| (nvim.theme(), nvim.take_file_picker(), nvim.take_submitted()))
+        else {
             return;
         };
+        self.theme = theme;
+        if file_picker && self.overlay_closed() {
+            self.open_picker(PickerKind::Files, tx);
+        }
         for draft in drafts {
             if draft.trim().is_empty() {
                 continue;
@@ -715,6 +799,85 @@ impl App {
                 }
             }
         }
+    }
+
+    /// True when no full-screen overlay owns the keyboard, so a prompt request
+    /// can safely open the picker.
+    fn overlay_closed(&self) -> bool {
+        self.picker.is_none()
+            && self.diff_view.is_none()
+            && self.ledger.is_none()
+            && self.process_view.is_none()
+            && self.search_view.is_none()
+            && self.inbox.is_none()
+            && self.reason_prompt.is_none()
+    }
+
+    /// Take an exit reported by the prompt and start a replacement Neovim.
+    fn poll_nvim_restart(&mut self, tx: &UnboundedSender<Command>) {
+        let quit = self.nvim.as_ref().and_then(NvimInput::take_quit);
+        if let Some(text) = quit {
+            self.restart_nvim(text, tx);
+            return;
+        }
+        let Some(rx) = &self.nvim_restart else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok(Ok(nvim)) => {
+                self.nvim_restart = None;
+                self.nvim = Some(nvim);
+                let text = self.pending_nvim_text.take().unwrap_or_default();
+                // Restore through the daemon so the buffer and its stored draft
+                // cannot diverge: `restart_nvim` already wrote `text`.
+                if let Some(session_id) = self.input_session.clone() {
+                    self.last_saved_draft.clear();
+                    self.draft_loading = Some(session_id.clone());
+                    let _ = tx.send(Command::DraftGet { session_id });
+                } else if let Some(nvim) = &self.nvim {
+                    if text.is_empty() {
+                        nvim.reset();
+                    } else {
+                        nvim.set_text(&text);
+                    }
+                    self.last_saved_draft = text;
+                }
+                self.status = "prompt restarted".into();
+            }
+            Ok(Err(err)) => {
+                self.nvim_restart = None;
+                self.error = Some(format!("nvim restart failed: {err:#}"));
+                self.status = "using the native prompt".into();
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                self.nvim_restart = None;
+                self.status = "prompt restart lost".into();
+            }
+        }
+    }
+
+    /// Drop the dead prompt and spawn a replacement in the background.
+    fn restart_nvim(&mut self, text: String, tx: &UnboundedSender<Command>) {
+        let Some(nvim) = self.nvim.take() else {
+            return;
+        };
+        let (width, height) = nvim.size();
+        let minimal = nvim.used_minimal_fallback();
+        // Persist the captured draft so another frontend can still recover it.
+        if let Some(session_id) = self.input_session.clone() {
+            let _ = tx.send(Command::DraftSet {
+                session_id,
+                text: text.clone(),
+            });
+        }
+        self.status = "prompt exited; restarting nvim…".into();
+        self.pending_nvim_text = Some(text);
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.nvim_restart = Some(rx);
+        tokio::spawn(async move {
+            let _ = tx.send(NvimInput::spawn(width, height, minimal).await);
+        });
     }
 
     /// Put the last Neovim draft back after a failed turn, if it belongs to
@@ -770,11 +933,13 @@ impl App {
         self.sync_draft(tx);
     }
 
-    /// Persist the native prompt as a per-session draft when the focused pane
-    /// changes or the text is edited. No-op with the Neovim prompt, whose text
-    /// lives in the child process.
+    /// Persist the prompt as a per-session draft when the focused pane changes
+    /// or the text is edited. Uses the Neovim buffer mirror when the embedded
+    /// prompt is active, the native text box otherwise.
     fn sync_draft(&mut self, tx: &UnboundedSender<Command>) {
-        if self.nvim.is_some() {
+        // Wait for the daemon draft to load before writing; otherwise stale
+        // buffer text would overwrite the new session's draft.
+        if self.draft_loading.is_some() {
             return;
         }
         let focused = self
@@ -783,7 +948,7 @@ impl App {
             .map(|view| view.session.id.clone());
         if focused != self.input_session {
             if let Some(previous) = self.input_session.take() {
-                let text = self.input.text();
+                let text = self.current_draft_text();
                 if text != self.last_saved_draft {
                     let _ = tx.send(Command::DraftSet {
                         session_id: previous,
@@ -795,6 +960,11 @@ impl App {
             self.last_saved_draft.clear();
             self.input_session = focused;
             if let Some(session_id) = self.input_session.clone() {
+                if let Some(nvim) = &self.nvim {
+                    // Clear the buffer so the daemon's draft can replace it.
+                    self.draft_loading = Some(session_id.clone());
+                    nvim.reset();
+                }
                 let _ = tx.send(Command::DraftGet { session_id });
             }
             return;
@@ -802,10 +972,18 @@ impl App {
         let Some(session_id) = self.input_session.clone() else {
             return;
         };
-        let text = self.input.text();
+        let text = self.current_draft_text();
         if text != self.last_saved_draft {
             self.last_saved_draft = text.clone();
             let _ = tx.send(Command::DraftSet { session_id, text });
+        }
+    }
+
+    /// Current prompt contents: the Neovim mirror or the native text box.
+    fn current_draft_text(&self) -> String {
+        match &self.nvim {
+            Some(nvim) => nvim.draft_text(),
+            None => self.input.text(),
         }
     }
 
@@ -949,12 +1127,37 @@ impl App {
                     format!("{count} hit(s) · Enter opens the selected session")
                 };
             }
+            Event::PickerData { kind, items } => {
+                let count = items.len();
+                if let Some(picker) = &mut self.picker {
+                    if picker.kind.data_kind() == Some(kind.as_str()) {
+                        picker.items = items;
+                        picker.selected = 0;
+                        picker.loading = false;
+                    }
+                }
+                if count == 0 {
+                    self.status = format!("no {kind} matched");
+                } else {
+                    self.status = format!("{count} {kind} row(s)");
+                }
+            }
             Event::Draft { session_id, text } => {
-                // Prefill only the prompt the draft belongs to, and only when
-                // the user has not already started typing.
-                if self.input_session.as_deref() == Some(session_id.as_str())
-                    && self.input.is_empty()
-                {
+                if self.input_session.as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+                if let Some(nvim) = &self.nvim {
+                    // The buffer was cleared on switch; load the daemon draft.
+                    if text.is_empty() {
+                        nvim.reset();
+                    } else {
+                        nvim.set_text(&text);
+                    }
+                    self.last_saved_draft = text;
+                    self.draft_loading = None;
+                } else if self.input.is_empty() {
+                    // Prefill only the prompt the draft belongs to, and only
+                    // when the user has not already started typing.
                     if !text.is_empty() {
                         self.input.set_text(&text);
                     }
@@ -1059,6 +1262,7 @@ impl App {
                         self.initialized = true;
                     }
                     "list" if !self.initialized => self.initialized = true,
+                    "draft" => self.draft_loading = None,
                     _ => {}
                 }
             }
@@ -1454,11 +1658,22 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
+            // With the embedded editor focused, `<C-c>` belongs to Neovim
+            // (leave insert / interrupt). Quitting stays a transcript binding
+            // so typing in the prompt cannot kill the app by accident.
+            if self.nvim_has_focus() {
+                self.handle_nvim_input_key(key);
+            } else {
+                self.should_quit = true;
+            }
             return;
         }
         if matches!(key.code, KeyCode::F(1)) {
-            self.help = true;
+            if self.nvim_has_focus() {
+                self.handle_nvim_input_key(key);
+            } else {
+                self.help = true;
+            }
             return;
         }
 
@@ -1538,8 +1753,15 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        // `<C-g>` is the cross-mode session picker, but a real editor in normal
+        // mode gets Neovim's own binding (file info) so Vim users are not
+        // surprised. In insert mode it still opens the picker.
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
-            self.open_picker(PickerMode::Switch);
+            if self.nvim.is_some() && !self.nvim_insert_mode() {
+                self.handle_nvim_input_key(key);
+            } else {
+                self.open_picker(PickerKind::Sessions, tx);
+            }
             return;
         }
 
@@ -1585,32 +1807,61 @@ impl App {
         }
     }
 
+    /// True when keys should go to the embedded editor rather than the TUI.
+    fn nvim_has_focus(&self) -> bool {
+        self.focus == Focus::Input && self.nvim.is_some() && !self.help && self.overlay_closed()
+    }
+
+    /// True when the embedded prompt is taking typed text (insert/replace).
+    fn nvim_insert_mode(&self) -> bool {
+        nvim_is_insert(&self.nvim.as_ref().map(NvimInput::mode).unwrap_or_default())
+    }
+
     fn handle_nvim_input_key(&mut self, key: KeyEvent) {
+        let inserting = self.nvim_insert_mode();
         match key.code {
+            // A single Esc leaves insert mode but keeps the prompt focused, so
+            // normal-mode Vim editing works. A second Esc within the window
+            // hands the keyboard back to the transcript.
             KeyCode::Esc => {
+                let now = Instant::now();
+                let double = self
+                    .esc_at
+                    .is_some_and(|last| now.duration_since(last) < ESC_WINDOW);
                 if let Some(nvim) = &self.nvim {
                     nvim.input(key);
                 }
-                self.focus = Focus::Transcript;
+                if double {
+                    self.esc_at = None;
+                    self.focus = Focus::Transcript;
+                } else {
+                    self.esc_at = Some(now);
+                }
             }
             // Shift/Ctrl-Enter and Ctrl-J insert a newline, matching the
-            // native prompt. Completion plugins often claim <C-j> for menu
-            // navigation, so ask Neovim for a literal newline instead.
+            // native prompt. They are only intercepted while inserting: in
+            // normal mode they are ordinary Vim motions. Completion plugins
+            // often claim <C-j> for menu navigation, so ask Neovim for a
+            // literal newline instead.
             KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+                if inserting
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
             {
+                self.esc_at = None;
                 if let Some(nvim) = &self.nvim {
                     nvim.newline();
                 }
             }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('j') if inserting && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.esc_at = None;
                 if let Some(nvim) = &self.nvim {
                     nvim.newline();
                 }
             }
             _ => {
+                self.esc_at = None;
                 if let Some(nvim) = &self.nvim {
                     nvim.input(key);
                 }
@@ -1620,6 +1871,7 @@ impl App {
 
     fn focus_input(&mut self) {
         self.focus = Focus::Input;
+        self.esc_at = None;
         if let Some(nvim) = &self.nvim {
             nvim.start_insert();
         }
@@ -1632,11 +1884,11 @@ impl App {
         }
         if self.pending_window {
             self.pending_window = false;
-            self.handle_window_key(key);
+            self.handle_window_key(key, tx);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
-            self.open_picker(PickerMode::Switch);
+            self.open_picker(PickerKind::Sessions, tx);
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
@@ -1680,8 +1932,11 @@ impl App {
             KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
             KeyCode::Char('n') => self.create_session(tx, false),
             KeyCode::Char('N') => self.create_session(tx, true),
-            KeyCode::Char('p') => self.open_picker(PickerMode::Switch),
-            KeyCode::Char('o') => self.open_picker(PickerMode::NewPane),
+            KeyCode::Char('p') => self.open_picker(PickerKind::Sessions, tx),
+            KeyCode::Char('o') => self.open_picker(PickerKind::NewPane, tx),
+            KeyCode::Char(':') => self.open_picker(PickerKind::Commands, tx),
+            KeyCode::Char('w') => self.open_picker(PickerKind::Worktrees, tx),
+            KeyCode::Char('b') => self.open_picker(PickerKind::Branches, tx),
             KeyCode::Char('c') => self.open_ledger(tx),
             KeyCode::Char('P') => self.open_processes(tx),
             KeyCode::Char('A') => self.open_inbox(),
@@ -2039,13 +2294,13 @@ impl App {
         }
     }
 
-    fn handle_window_key(&mut self, key: KeyEvent) {
+    fn handle_window_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
         match key.code {
             KeyCode::Char('h') | KeyCode::Left => self.focus_direction(Direction::Left),
             KeyCode::Char('l') | KeyCode::Right => self.focus_direction(Direction::Right),
             KeyCode::Char('j') | KeyCode::Down => self.focus_direction(Direction::Down),
             KeyCode::Char('k') | KeyCode::Up => self.focus_direction(Direction::Up),
-            KeyCode::Char('v') | KeyCode::Char('s') => self.open_picker(PickerMode::NewPane),
+            KeyCode::Char('v') | KeyCode::Char('s') => self.open_picker(PickerKind::NewPane, tx),
             KeyCode::Char('c') | KeyCode::Char('q') => self.close_focused_pane(),
             KeyCode::Char('w') => self.cycle_pane(1),
             KeyCode::Esc => self.status = "window command cancelled".into(),
@@ -2144,55 +2399,196 @@ impl App {
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
-        let filtered = self.filtered_sessions();
-        let Some(picker) = &mut self.picker else {
+        let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
             return;
         };
-        let mode = picker.mode;
         match key.code {
             KeyCode::Esc => self.picker = None,
-            KeyCode::Up => picker.selected = picker.selected.saturating_sub(1),
-            KeyCode::Down => {
-                if picker.selected + 1 < filtered.len() {
-                    picker.selected += 1;
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(index) = filtered.get(picker.selected).copied() {
-                    self.picker = None;
-                    match mode {
-                        PickerMode::Switch => self.select_session(index, tx),
-                        PickerMode::NewPane => self.open_in_new_pane(index, tx),
-                    }
-                }
-            }
-            KeyCode::Char('#') => {
+            KeyCode::Up => self.move_picker(-1),
+            KeyCode::Down => self.move_picker(1),
+            KeyCode::Enter => self.picker_enter(kind, tx),
+            KeyCode::Char('#') if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) => {
                 self.picker = None;
                 self.search_view = Some(SearchView::new());
                 self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
             }
             KeyCode::Backspace => {
-                picker.query.pop();
-                picker.selected = 0;
+                if let Some(picker) = &mut self.picker {
+                    picker.query.pop();
+                    picker.selected = 0;
+                }
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                picker.query.push(c);
-                picker.selected = 0;
+                if let Some(picker) = &mut self.picker {
+                    picker.query.push(c);
+                    picker.selected = 0;
+                }
             }
             _ => {}
         }
     }
 
-    fn open_picker(&mut self, mode: PickerMode) {
-        let selected = self.selected.min(self.sessions.len().saturating_sub(1));
-        self.picker = Some(Picker {
+    fn move_picker(&mut self, delta: i32) {
+        let len = self.picker_filtered().len();
+        if let Some(picker) = &mut self.picker {
+            if len == 0 {
+                picker.selected = 0;
+            } else {
+                let current = picker.selected.min(len - 1) as i32;
+                picker.selected = (current + delta).clamp(0, len as i32 - 1) as usize;
+            }
+        }
+    }
+
+    /// Rows for the open picker: session indices or item indices.
+    fn picker_filtered(&self) -> Vec<usize> {
+        match self.picker.as_ref().map(|picker| picker.kind) {
+            Some(PickerKind::Sessions | PickerKind::NewPane) => self.filtered_sessions(),
+            _ => self.filtered_items(),
+        }
+    }
+
+    fn filtered_items(&self) -> Vec<usize> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        let query = picker.query.trim().to_lowercase();
+        if query.is_empty() {
+            return (0..picker.items.len()).collect();
+        }
+        let mut hits: Vec<(i32, usize)> = picker
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let haystack = format!(
+                    "{} {} {}",
+                    item.label,
+                    item.value,
+                    item.detail.as_deref().unwrap_or_default()
+                )
+                .to_lowercase();
+                fuzzy_score(&query, &haystack).map(|score| (score, index))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        hits.into_iter().map(|(_, index)| index).collect()
+    }
+
+    fn picker_enter(&mut self, kind: PickerKind, tx: &UnboundedSender<Command>) {
+        let filtered = self.picker_filtered();
+        let Some(selected) = self.picker.as_ref().map(|picker| picker.selected) else {
+            return;
+        };
+        let Some(index) = filtered.get(selected).copied() else {
+            return;
+        };
+        let value = self
+            .picker
+            .as_ref()
+            .and_then(|picker| picker.items.get(index))
+            .map(|item| item.value.clone());
+        match kind {
+            PickerKind::Sessions => {
+                self.picker = None;
+                self.select_session(index, tx);
+            }
+            PickerKind::NewPane => {
+                self.picker = None;
+                self.open_in_new_pane(index, tx);
+            }
+            PickerKind::Files => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    self.insert_prompt(&format!("@{value}"));
+                }
+            }
+            PickerKind::Worktrees | PickerKind::Branches => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    self.insert_prompt(&value);
+                }
+            }
+            PickerKind::Context => {
+                self.picker = None;
+                self.open_ledger(tx);
+            }
+            PickerKind::Commands => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    self.run_picker_command(&value, tx);
+                }
+            }
+        }
+    }
+
+    /// Put `text` at the prompt cursor, using the embedded prompt when present.
+    fn insert_prompt(&mut self, text: &str) {
+        if let Some(nvim) = &self.nvim {
+            nvim.insert_text(text);
+        } else {
+            self.input.insert_str(text);
+        }
+        self.focus = Focus::Input;
+        self.status = format!("inserted {text}");
+    }
+
+    fn open_picker(&mut self, kind: PickerKind, tx: &UnboundedSender<Command>) {
+        // A picker opening clears any half-finished double-Esc gesture.
+        self.esc_at = None;
+        let mut picker = Picker {
+            kind,
             query: String::new(),
-            selected,
-            mode,
-        });
+            selected: 0,
+            items: Vec::new(),
+            loading: false,
+        };
+        if let Some(provider) = kind.data_kind() {
+            let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            picker.loading = true;
+            self.status = format!("{provider}: loading…");
+            let _ = tx.send(Command::PickerData {
+                session_id,
+                kind: provider.to_string(),
+            });
+        } else if kind == PickerKind::Commands {
+            picker.items = command_items();
+        } else {
+            picker.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+        }
+        self.picker = Some(picker);
+    }
+
+    /// Run a command-palette entry. Unknown ids are ignored.
+    fn run_picker_command(&mut self, id: &str, tx: &UnboundedSender<Command>) {
+        match id {
+            "sessions" => self.open_picker(PickerKind::Sessions, tx),
+            "new-pane" => self.open_picker(PickerKind::NewPane, tx),
+            "files" => self.open_picker(PickerKind::Files, tx),
+            "worktrees" => self.open_picker(PickerKind::Worktrees, tx),
+            "branches" => self.open_picker(PickerKind::Branches, tx),
+            "context" => self.open_picker(PickerKind::Context, tx),
+            "history" => {
+                self.search_view = Some(SearchView::new());
+                self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
+            }
+            "processes" => self.open_processes(tx),
+            "approvals" => self.open_inbox(),
+            "ledger" => self.open_ledger(tx),
+            "new" => self.create_session(tx, false),
+            "new-worktree" => self.create_session(tx, true),
+            "fork" => self.fork_focused(tx, None),
+            "cancel" => self.cancel(tx),
+            "help" => self.help = true,
+            "quit" => self.should_quit = true,
+            _ => {}
+        }
     }
 
     fn filtered_sessions(&self) -> Vec<usize> {
@@ -3412,7 +3808,7 @@ impl App {
             Span::styled(format!("[{mode}]"), accent),
         ]);
         let hint = if focused {
-            " Enter send  Ctrl-J newline  Esc transcript "
+            " Enter send  Ctrl-J newline  Esc normal  Esc Esc transcript "
         } else {
             " i to type "
         };
@@ -3882,46 +4278,41 @@ impl App {
     }
 
     fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
-        let filtered = self.filtered_sessions();
-        let open_panes: Vec<Option<usize>> = self
-            .sessions
-            .iter()
-            .map(|session| {
-                self.views
-                    .iter()
-                    .position(|view| view.session.id == session.id)
-            })
-            .collect();
-        let Some(picker) = &mut self.picker else {
+        let filtered = self.picker_filtered();
+        let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
             return;
         };
-        if !filtered.is_empty() {
-            picker.selected = picker.selected.min(filtered.len() - 1);
-        } else {
-            picker.selected = 0;
-        }
+        // Keep the cursor on a real row (the list may have shrunk under it).
+        let selected = {
+            let Some(picker) = &mut self.picker else {
+                return;
+            };
+            if filtered.is_empty() {
+                picker.selected = 0;
+            } else {
+                picker.selected = picker.selected.min(filtered.len() - 1);
+            }
+            picker.selected
+        };
+        let query = self
+            .picker
+            .as_ref()
+            .map(|picker| picker.query.clone())
+            .unwrap_or_default();
+        let loading = self.picker.as_ref().is_some_and(|picker| picker.loading);
 
-        let width = (area.width as u32 * 7 / 10).max(40).min(area.width as u32) as u16;
-        let height = (area.height as u32 * 6 / 10)
-            .max(10)
+        let width = (area.width as u32 * 8 / 10).max(44).min(area.width as u32) as u16;
+        let height = (area.height as u32 * 7 / 10)
+            .max(12)
             .min(area.height as u32) as u16;
         let rect = centered(area, width, height);
         frame.render_widget(Clear, rect);
-        let (title, hint) = match picker.mode {
-            PickerMode::Switch => (
-                " sessions — switch focused pane ",
-                " Enter open  Esc close ",
-            ),
-            PickerMode::NewPane => (
-                " sessions — open in a new pane ",
-                " Enter split  Esc close ",
-            ),
-        };
+        let title = format!(" {} ({}) ", kind.title(), filtered.len());
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(title)
-            .title_bottom(hint);
+            .title_bottom(format!(" {} ", kind.hint()));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let chunks = Layout::vertical([
@@ -3934,7 +4325,7 @@ impl App {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
                 Span::styled("❯ ", Style::default().fg(Color::Cyan)),
-                Span::raw(picker.query.clone()),
+                Span::raw(query.clone()),
             ])),
             chunks[0],
         );
@@ -3944,47 +4335,250 @@ impl App {
             chunks[1],
         );
 
-        let items: Vec<ListItem> = filtered
-            .iter()
-            .map(|&index| {
-                let session = &self.sessions[index];
-                let pane = match open_panes[index] {
-                    Some(pane) => {
-                        Span::styled(format!("{} ", pane + 1), Style::default().fg(Color::Cyan))
-                    }
-                    None => Span::styled("· ", Style::default().fg(Color::DarkGray)),
-                };
-                ListItem::new(Line::from(vec![
-                    pane,
-                    Span::styled(
-                        format!("{} ", session.status.symbol()),
-                        Style::default().fg(status_color(session.status)),
-                    ),
-                    Span::styled(
-                        truncate(&session.name, 28),
-                        Style::default().add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        format!("  {}  ", short_id(&session.id)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                    Span::styled(
-                        session.cwd.display().to_string(),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]))
-            })
-            .collect();
-        let list = List::new(items)
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("› ");
-        let mut state = ListState::default().with_selected(Some(picker.selected));
-        frame.render_stateful_widget(list, chunks[2], &mut state);
+        // A preview column is only worth it on a reasonably wide terminal.
+        let body = chunks[2];
+        let (list_area, preview_area) = if body.width >= 64 {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+                    .split(body);
+            (columns[0], Some(columns[1]))
+        } else {
+            (body, None)
+        };
+
+        if filtered.is_empty() {
+            let text = if loading { "loading…" } else { "no matches" };
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+                list_area,
+            );
+        } else {
+            let rows = self.picker_rows(kind, &filtered);
+            let list = List::new(rows)
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("› ");
+            let mut state = ListState::default().with_selected(Some(selected));
+            frame.render_stateful_widget(list, list_area, &mut state);
+        }
+
+        if let Some(preview_area) = preview_area {
+            let lines = self.picker_preview_lines(&filtered);
+            let width = preview_area.width.saturating_sub(2) as usize;
+            let body: Vec<Line> = lines
+                .into_iter()
+                .take(preview_area.height as usize)
+                .map(|line| Line::from(truncate(&line, width)))
+                .collect();
+            let preview = Paragraph::new(body)
+                .style(Style::default().fg(Color::Gray))
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT)
+                        .border_style(Style::default().fg(Color::DarkGray)),
+                )
+                .wrap(ratatui::widgets::Wrap { trim: false });
+            frame.render_widget(preview, preview_area);
+        }
     }
+
+    /// List rows for the open picker. Session kinds render live session state;
+    /// other kinds render the provider's label and detail.
+    fn picker_rows(&self, kind: PickerKind, filtered: &[usize]) -> Vec<ListItem<'_>> {
+        match kind {
+            PickerKind::Sessions | PickerKind::NewPane => {
+                let open_panes: Vec<Option<usize>> = self
+                    .sessions
+                    .iter()
+                    .map(|session| {
+                        self.views
+                            .iter()
+                            .position(|view| view.session.id == session.id)
+                    })
+                    .collect();
+                filtered
+                    .iter()
+                    .map(|&index| {
+                        let session = &self.sessions[index];
+                        let pane = match open_panes[index] {
+                            Some(pane) => Span::styled(
+                                format!("{} ", pane + 1),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            None => Span::styled("· ", Style::default().fg(Color::DarkGray)),
+                        };
+                        ListItem::new(Line::from(vec![
+                            pane,
+                            Span::styled(
+                                format!("{} ", session.status.symbol()),
+                                Style::default().fg(status_color(session.status)),
+                            ),
+                            Span::styled(
+                                truncate(&session.name, 28),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                format!("  {}  ", short_id(&session.id)),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                session.cwd.display().to_string(),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]))
+                    })
+                    .collect()
+            }
+            _ => {
+                let Some(picker) = &self.picker else {
+                    return Vec::new();
+                };
+                filtered
+                    .iter()
+                    .filter_map(|&index| picker.items.get(index))
+                    .map(|item| {
+                        let mut spans = vec![Span::styled(
+                            item.label.clone(),
+                            Style::default().add_modifier(Modifier::BOLD),
+                        )];
+                        if let Some(detail) = &item.detail {
+                            if !detail.is_empty() {
+                                spans.push(Span::styled(
+                                    format!("  {detail}"),
+                                    Style::default().fg(Color::DarkGray),
+                                ));
+                            }
+                        }
+                        ListItem::new(Line::from(spans))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Right-pane preview lines for the selected picker row.
+    fn picker_preview_lines(&self, filtered: &[usize]) -> Vec<String> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        let Some(&index) = filtered.get(picker.selected) else {
+            return Vec::new();
+        };
+        match picker.kind {
+            PickerKind::Sessions | PickerKind::NewPane => {
+                let Some(session) = self.sessions.get(index) else {
+                    return Vec::new();
+                };
+                let mut lines = vec![
+                    session.name.clone(),
+                    String::new(),
+                    format!("id          {}", session.id),
+                    format!("status      {}", session.status.as_str()),
+                    format!("cwd         {}", session.cwd.display()),
+                    format!("permission  {}", session.permission.as_str()),
+                ];
+                if let Some(worktree) = &session.worktree {
+                    lines.push(format!("worktree    {}", worktree.display()));
+                }
+                lines.push(format!(
+                    "model       {}",
+                    session.model.as_deref().unwrap_or("(daemon default)")
+                ));
+                lines
+            }
+            _ => {
+                let Some(item) = picker.items.get(index) else {
+                    return Vec::new();
+                };
+                if let Some(preview) = &item.preview {
+                    preview.lines().map(str::to_string).collect()
+                } else if let Some(detail) = &item.detail {
+                    vec![item.label.clone(), String::new(), detail.clone()]
+                } else {
+                    vec![item.label.clone()]
+                }
+            }
+        }
+    }
+}
+
+/// Rows for the `:` command palette. `value` is dispatched by
+/// [`App::run_picker_command`]; the label and help are only for display.
+fn command_items() -> Vec<PickerItem> {
+    const COMMANDS: &[(&str, &str, &str)] = &[
+        (
+            "sessions",
+            "switch session",
+            "Pick the focused pane's session (p)",
+        ),
+        (
+            "new-pane",
+            "open session in a new pane",
+            "Pick a session for a split (o)",
+        ),
+        (
+            "files",
+            "workspace files",
+            "Insert @path into the prompt (@)",
+        ),
+        (
+            "worktrees",
+            "git worktrees",
+            "Insert a worktree path into the prompt (w)",
+        ),
+        (
+            "branches",
+            "git branches",
+            "Insert a branch name into the prompt (b)",
+        ),
+        (
+            "context",
+            "context entries",
+            "Browse the context ledger with previews",
+        ),
+        ("ledger", "context ledger", "Open the full ledger (c)"),
+        (
+            "history",
+            "search history",
+            "Full-text search across sessions (#)",
+        ),
+        (
+            "processes",
+            "background processes",
+            "List and inspect processes (P)",
+        ),
+        ("approvals", "approval inbox", "Pending approvals (A)"),
+        ("new", "new session", "Create a session (n)"),
+        (
+            "new-worktree",
+            "new session in a worktree",
+            "Create an isolated session (N)",
+        ),
+        (
+            "fork",
+            "fork focused session",
+            "Fork at the current tail (F)",
+        ),
+        (
+            "cancel",
+            "cancel the running turn",
+            "Stop the focused session (x)",
+        ),
+        ("help", "key help", "Show the key map (?)"),
+        ("quit", "quit eix", "Leave the TUI (q)"),
+    ];
+    COMMANDS
+        .iter()
+        .map(|(id, label, help)| {
+            PickerItem::new(*id)
+                .with_label(*label)
+                .with_detail(*help)
+                .with_preview(format!("{label}\n\n{help}"))
+        })
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -4235,11 +4829,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         key_line("i / Enter", "focus the prompt"),
-        key_line("Esc", "leave the prompt"),
+        key_line("Esc", "leave the prompt (nvim: first Esc is normal mode)"),
+        key_line("Esc Esc", "from the nvim prompt back to the transcript"),
         key_line("Enter", "send (in prompt)"),
         key_line("Ctrl-J", "newline (in prompt)"),
         key_line("p / Ctrl-G", "session picker"),
         key_line("o", "open session in a new pane"),
+        key_line(":", "command palette (every action and provider)"),
+        key_line("w / b", "insert a git worktree path / branch name"),
+        key_line("@ (in prompt)", "workspace file picker"),
         key_line("a", "jump to the next pane needing attention"),
         key_line("C-w h/j/k/l", "focus pane left/down/up/right"),
         key_line("C-w v / s", "open a new pane"),
@@ -5600,5 +6198,153 @@ mod tests {
             _ => panic!("expected an attach command"),
         }
         assert!(app.pending_attach.is_some());
+    }
+
+    #[test]
+    fn picker_kinds_map_to_daemon_providers() {
+        assert_eq!(PickerKind::Files.data_kind(), Some(eix_core::KIND_FILES));
+        assert_eq!(
+            PickerKind::Worktrees.data_kind(),
+            Some(eix_core::KIND_WORKTREES)
+        );
+        assert_eq!(
+            PickerKind::Branches.data_kind(),
+            Some(eix_core::KIND_BRANCHES)
+        );
+        assert_eq!(
+            PickerKind::Context.data_kind(),
+            Some(eix_core::KIND_CONTEXT)
+        );
+        assert!(PickerKind::Sessions.data_kind().is_none());
+        assert!(PickerKind::Commands.data_kind().is_none());
+        assert!(!PickerKind::Files.title().is_empty());
+        assert!(!PickerKind::Commands.hint().is_empty());
+    }
+
+    #[test]
+    fn command_palette_ids_are_unique() {
+        let items = command_items();
+        assert!(items.len() >= 10);
+        let mut ids: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), items.len());
+        assert!(items.iter().all(|item| !item.label.is_empty()));
+        assert!(items.iter().any(|item| item.value == "quit"));
+    }
+
+    #[test]
+    fn file_picker_inserts_at_path_into_the_native_prompt() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.picker = Some(Picker {
+            kind: PickerKind::Files,
+            query: String::new(),
+            selected: 0,
+            items: vec![PickerItem::new("src/main.rs"), PickerItem::new("README.md")],
+            loading: false,
+        });
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        assert_eq!(app.input.text(), "@src/main.rs");
+        assert!(matches!(app.focus, Focus::Input));
+    }
+
+    #[test]
+    fn command_palette_enter_runs_the_command() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.open_picker(PickerKind::Commands, &tx);
+        let help = app
+            .picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .position(|item| item.value == "help")
+            .expect("help command");
+        app.picker.as_mut().unwrap().selected = help;
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.help);
+        assert!(app.picker.is_none());
+    }
+
+    #[test]
+    fn command_palette_filters_across_label_value_and_detail() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.open_picker(PickerKind::Commands, &tx);
+        for c in "git work".chars() {
+            app.handle_picker_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &tx);
+        }
+        let filtered = app.picker_filtered();
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(
+            app.picker.as_ref().unwrap().items[filtered[0]].value,
+            "worktrees"
+        );
+    }
+
+    #[test]
+    fn data_picker_requests_its_provider() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.open_picker(PickerKind::Branches, &tx);
+        assert!(app.picker.as_ref().unwrap().loading);
+        match rx.try_recv().expect("picker command") {
+            Command::PickerData { session_id, kind } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(kind, eix_core::KIND_BRANCHES);
+            }
+            _ => panic!("expected a picker command"),
+        }
+    }
+
+    #[test]
+    fn data_picker_without_a_session_stays_closed() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.open_picker(PickerKind::Files, &tx);
+        assert!(app.picker.is_none());
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn nvim_mode_strings_classify_insert() {
+        assert!(nvim_is_insert(""));
+        assert!(nvim_is_insert("insert"));
+        assert!(nvim_is_insert("replace"));
+        assert!(!nvim_is_insert("normal"));
+        assert!(!nvim_is_insert("visual"));
+        assert!(!nvim_is_insert("cmdline_normal"));
+    }
+
+    #[test]
+    fn esc_keeps_focus_in_the_prompt_until_a_double_press() {
+        let mut app = App::new(None);
+        app.focus = Focus::Input;
+
+        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.focus, Focus::Input));
+
+        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.focus, Focus::Transcript));
+        assert!(app.esc_at.is_none());
+    }
+
+    #[test]
+    fn other_keys_break_the_double_esc_gesture() {
+        let mut app = App::new(None);
+        app.focus = Focus::Input;
+
+        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
+        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.focus, Focus::Input));
     }
 }

@@ -320,7 +320,7 @@ fn capture_tree_blocking(
                 }
             };
             let name = entry.file_name();
-            if is_excluded(&name) {
+            if is_excluded_dir(&name) {
                 continue;
             }
             let path = entry.path();
@@ -437,7 +437,7 @@ fn restore_blocking(dir: &Path, cwd: &Path) -> Result<RestoreReport> {
                 continue;
             };
             for entry in read.flatten() {
-                if is_excluded(&entry.file_name()) {
+                if is_excluded_dir(&entry.file_name()) {
                     continue;
                 }
                 let path = entry.path();
@@ -536,7 +536,9 @@ fn canonical(path: &Path) -> PathBuf {
     path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
-fn is_excluded(name: &std::ffi::OsStr) -> bool {
+/// True for derived or metadata directories that are never listed or copied
+/// (`.git`, `target`, `node_modules`, ...). Shared with the file picker.
+pub fn is_excluded_dir(name: &std::ffi::OsStr) -> bool {
     EXCLUDED
         .iter()
         .any(|excluded| name == std::ffi::OsStr::new(excluded))

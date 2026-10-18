@@ -4,6 +4,7 @@
 //! talk to it over a Unix socket using the protocol in `eix-core`.
 
 pub mod context;
+pub mod picker;
 pub mod process;
 pub mod provider;
 pub mod server;

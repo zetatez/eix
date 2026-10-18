@@ -9,6 +9,7 @@ pub mod context;
 pub mod event;
 pub mod message;
 pub mod nvim_plugin;
+pub mod picker;
 pub mod process;
 pub mod protocol;
 pub mod redact;
@@ -30,6 +31,10 @@ pub use event::{
 };
 pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, Role, ToolCall, ToolDefinition, Usage,
+};
+pub use picker::{
+    is_data_kind, PickerItem, PickerParams, PickerResult, DATA_KINDS, KIND_BRANCHES, KIND_CONTEXT,
+    KIND_FILES, KIND_WORKTREES,
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{

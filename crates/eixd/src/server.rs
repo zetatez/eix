@@ -22,13 +22,13 @@ use eix_core::{
     EventKind, EventsParams, EventsResult, ForkParams, HelloResult, Notification, PatchApplyParams,
     PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
     PatchResultPayload, PatchReviseParams, PermissionLevel, PermissionParams, PermissionPayload,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    RenameParams, Request, Response, RewindParams, RewindResult, SearchParams, SearchResult,
-    ServerMessage, Session, SessionId, SessionList, SessionOrigin, SessionRef, SessionResult,
-    SessionStatus, SnapshotPayload, StatusChangedPayload, SubmitParams, SubmitResult,
-    SubscribeParams, SubscribeResult, ToolCall, ToolCallPayload, ToolDefinition, ToolPolicy,
-    ToolResultPayload, UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult,
-    PROTOCOL_VERSION,
+    PickerItem, PickerParams, PickerResult, ProcessKillParams, ProcessKillResult, ProcessList,
+    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
+    RewindResult, SearchParams, SearchResult, ServerMessage, Session, SessionId, SessionList,
+    SessionOrigin, SessionRef, SessionResult, SessionStatus, SnapshotPayload, StatusChangedPayload,
+    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, ToolCall, ToolCallPayload,
+    ToolDefinition, ToolPolicy, ToolResultPayload, UserMessagePayload, WorktreeRemoveParams,
+    WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -524,6 +524,47 @@ impl Daemon {
                     query: query.to_string(),
                     hits,
                 })?)
+            }
+            "picker.query" => {
+                let params: PickerParams = parse_params(request.params.clone())?;
+                if !eix_core::is_data_kind(&params.kind) {
+                    return Err(rpc(
+                        "invalid_params",
+                        format!("unknown picker kind {:?}", params.kind),
+                    ));
+                }
+                let session_id = params.session_id.as_deref().ok_or_else(|| {
+                    rpc(
+                        "invalid_params",
+                        format!("session_id is required for {}", params.kind),
+                    )
+                })?;
+                let session = self.require_session(session_id)?;
+                let result = match params.kind.as_str() {
+                    eix_core::KIND_FILES => {
+                        crate::picker::files(&session.cwd, params.query.as_deref(), params.limit)
+                            .await
+                    }
+                    eix_core::KIND_WORKTREES => {
+                        crate::picker::worktrees(
+                            &session.cwd,
+                            params.query.as_deref(),
+                            params.limit,
+                        )
+                        .await
+                    }
+                    eix_core::KIND_BRANCHES => {
+                        crate::picker::branches(&session.cwd, params.query.as_deref(), params.limit)
+                            .await
+                    }
+                    // `KIND_CONTEXT` is the only kind that needs the ledger, so
+                    // it is built here; the rest are pure workspace providers.
+                    _ => {
+                        let ledger = self.build_ledger(session_id).await?;
+                        picker_context_items(ledger.info(), params.query.as_deref(), params.limit)
+                    }
+                };
+                Ok(serde_json::to_value(result)?)
             }
             "process.list" => {
                 let params: ProcessListParams = parse_params(request.params.clone())?;
@@ -2933,6 +2974,62 @@ fn notification_session_id(notification: &Notification) -> Option<SessionId> {
 
 fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T> {
     serde_json::from_value(params).map_err(|err| rpc("invalid_params", err.to_string()))
+}
+
+/// Turn a context ledger into picker rows. The ledger entry id is the value so
+/// a frontend can target `context.drop` / `context.pin` directly.
+fn picker_context_items(
+    ledger: eix_core::ContextLedgerResult,
+    query: Option<&str>,
+    limit: Option<u32>,
+) -> PickerResult {
+    let needle = query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_lowercase);
+    let limit = limit.unwrap_or(500).clamp(1, 5_000) as usize;
+    let mut items = Vec::new();
+    for entry in ledger.entries {
+        let label = format!("{} · {}", entry.sector.as_str(), entry.preview);
+        if let Some(needle) = &needle {
+            let haystack =
+                format!("{} {} {} {}", entry.id, label, entry.kind, entry.detail).to_lowercase();
+            if !haystack.contains(needle) {
+                continue;
+            }
+        }
+        let mut flags = Vec::new();
+        if entry.pinned {
+            flags.push("pinned");
+        }
+        if entry.dropped {
+            flags.push("dropped");
+        }
+        if entry.compacted {
+            flags.push("compacted");
+        }
+        if entry.auto {
+            flags.push("auto");
+        }
+        let detail = if flags.is_empty() {
+            format!("{} tok", entry.tokens)
+        } else {
+            format!("{} tok · {}", entry.tokens, flags.join(" "))
+        };
+        items.push(
+            PickerItem::new(entry.id)
+                .with_label(label)
+                .with_detail(detail)
+                .with_preview(entry.detail),
+        );
+        if items.len() >= limit {
+            break;
+        }
+    }
+    PickerResult {
+        kind: eix_core::KIND_CONTEXT.to_string(),
+        items,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
