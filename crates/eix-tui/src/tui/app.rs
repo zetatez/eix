@@ -9,11 +9,11 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eix_core::{
     ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
     ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
-    PatchProposedPayload, PatchResultPayload, ProcessInfo, ProcessList, ProcessOutput,
-    ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult,
-    ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    PatchProposedPayload, PatchResultPayload, PermissionLevel, PermissionPayload, ProcessInfo,
+    ProcessList, ProcessOutput, ProcessStatus, RewindResult, SearchHit, Sector, Session,
+    SessionStatus, SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
-use eix_nvim::embedded::NvimInput;
+use eix_nvim::embedded::{NvimInput, Theme};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -627,6 +627,8 @@ pub struct App {
     force_clear: bool,
     /// Cross-session approvals overlay.
     inbox: Option<InboxView>,
+    /// Colors sampled from the embedded Neovim's colorscheme.
+    theme: Theme,
 }
 
 impl App {
@@ -671,6 +673,7 @@ impl App {
             reason_prompt: None,
             force_clear: false,
             inbox: None,
+            theme: Theme::default(),
         }
     }
 
@@ -685,6 +688,10 @@ impl App {
 
     /// Collect drafts submitted with `<CR>` in the embedded prompt.
     pub fn poll_nvim(&mut self, tx: &UnboundedSender<Command>) {
+        let theme = self.nvim.as_ref().map(NvimInput::theme);
+        if let Some(theme) = theme {
+            self.theme = theme;
+        }
         let Some(drafts) = self.nvim.as_ref().map(NvimInput::take_submitted) else {
             return;
         };
@@ -3026,10 +3033,11 @@ impl App {
         let attention = !focused
             && (self.views[index].session.status.needs_attention()
                 || self.approvals.contains_key(&session_id));
+        let theme = self.theme;
         let view = &mut self.views[index];
         let inner_width = area.width.saturating_sub(2) as usize;
         let inner_height = area.height.saturating_sub(2) as usize;
-        let lines = Self::transcript_lines(view, inner_width.max(1));
+        let lines = Self::transcript_lines(view, inner_width.max(1), theme);
         let max_scroll = lines.len().saturating_sub(inner_height);
         if view.follow {
             view.scroll = max_scroll;
@@ -3038,8 +3046,13 @@ impl App {
         }
         let name = truncate(&view.session.name, inner_width.saturating_sub(8).max(1));
         let marker = if attention { "!" } else { "" };
+        let permission = match view.session.permission {
+            PermissionLevel::ReadOnly => " [ro]",
+            PermissionLevel::Full => " [full]",
+            PermissionLevel::WorkspaceWrite => "",
+        };
         let title = format!(
-            " {}{marker} {} {} ",
+            " {}{marker} {} {}{permission} ",
             index + 1,
             view.session.status.symbol(),
             name
@@ -3062,7 +3075,7 @@ impl App {
         frame.render_widget(paragraph, area);
 
         if let Some(approval) = approval {
-            draw_approval_card(frame, area, &approval);
+            draw_approval_card(frame, area, &approval, theme);
         }
     }
 
@@ -3100,7 +3113,7 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
-    fn transcript_lines(view: &SessionView, width: usize) -> Vec<Line<'static>> {
+    fn transcript_lines(view: &SessionView, width: usize, theme: Theme) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for event in &view.events {
             match event.kind {
@@ -3108,7 +3121,14 @@ impl App {
                     if let Ok(payload) =
                         serde_json::from_value::<UserMessagePayload>(event.payload.clone())
                     {
-                        push_message(&mut lines, "you", Color::Cyan, &payload.text, "", width);
+                        push_message(
+                            &mut lines,
+                            "you",
+                            theme.string.unwrap_or(Color::Cyan),
+                            &payload.text,
+                            "",
+                            width,
+                        );
                     }
                 }
                 EventKind::AssistantMessage => {
@@ -3127,7 +3147,7 @@ impl App {
                         push_message(
                             &mut lines,
                             "eix",
-                            Color::Green,
+                            theme.function.unwrap_or(Color::Green),
                             &payload.text,
                             suffix,
                             width,
@@ -3139,7 +3159,14 @@ impl App {
                         serde_json::from_value::<ToolCallPayload>(event.payload.clone())
                     {
                         let text = tool_call_summary(&payload.tool, &payload.arguments);
-                        push_message(&mut lines, "tool", Color::Yellow, &text, "", width);
+                        push_message(
+                            &mut lines,
+                            "tool",
+                            theme.function.unwrap_or(Color::Yellow),
+                            &text,
+                            "",
+                            width,
+                        );
                     }
                 }
                 EventKind::ApprovalRequired => {
@@ -3147,7 +3174,14 @@ impl App {
                         serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
                     {
                         let text = format!("{} — y to approve, n to deny", payload.summary);
-                        push_message(&mut lines, "need", Color::Yellow, &text, "", width);
+                        push_message(
+                            &mut lines,
+                            "need",
+                            theme.function.unwrap_or(Color::Yellow),
+                            &text,
+                            "",
+                            width,
+                        );
                     }
                 }
                 EventKind::PatchProposed => {
@@ -3155,7 +3189,14 @@ impl App {
                         serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
                     {
                         let text = format!("{} — y to apply, n to reject", payload.summary);
-                        push_message(&mut lines, "patch", Color::Magenta, &text, "", width);
+                        push_message(
+                            &mut lines,
+                            "patch",
+                            theme.function.unwrap_or(Color::Magenta),
+                            &text,
+                            "",
+                            width,
+                        );
                     }
                 }
                 EventKind::PatchApplied => {
@@ -3165,7 +3206,7 @@ impl App {
                         push_message(
                             &mut lines,
                             "patch",
-                            Color::Green,
+                            theme.diff_add.unwrap_or(Color::Green),
                             &format!("applied {}", payload.path),
                             "",
                             width,
@@ -3179,7 +3220,7 @@ impl App {
                         push_message(
                             &mut lines,
                             "patch",
-                            Color::Red,
+                            theme.diff_delete.unwrap_or(Color::Red),
                             &format!("rejected {}", payload.path),
                             "",
                             width,
@@ -3193,7 +3234,7 @@ impl App {
                         push_message(
                             &mut lines,
                             "patch",
-                            Color::Red,
+                            theme.diff_delete.unwrap_or(Color::Red),
                             &format!("conflict on {}", payload.path),
                             "",
                             width,
@@ -3205,11 +3246,11 @@ impl App {
                         serde_json::from_value::<ToolResultPayload>(event.payload.clone())
                     {
                         let (label, color) = if payload.denied {
-                            ("denied", Color::Red)
+                            ("denied", theme.error.unwrap_or(Color::Red))
                         } else if payload.ok {
-                            ("ok", Color::Green)
+                            ("ok", theme.diff_add.unwrap_or(Color::Green))
                         } else {
-                            ("failed", Color::Red)
+                            ("failed", theme.error.unwrap_or(Color::Red))
                         };
                         let header = format!("{} → {label}", payload.tool);
                         push_message(&mut lines, "tool", color, &header, "", width);
@@ -3220,18 +3261,43 @@ impl App {
                                 for segment in wrap_text(line, width.saturating_sub(2).max(1)) {
                                     lines.push(Line::from(Span::styled(
                                         format!("  {segment}"),
-                                        Style::default().fg(Color::DarkGray),
+                                        Style::default()
+                                            .fg(theme.comment.unwrap_or(Color::DarkGray)),
                                     )));
                                 }
                             }
                             if output.lines().count() > max_lines {
                                 lines.push(Line::from(Span::styled(
                                     "  …",
-                                    Style::default().fg(Color::DarkGray),
+                                    Style::default().fg(theme.comment.unwrap_or(Color::DarkGray)),
                                 )));
                             }
                             lines.push(Line::from(""));
                         }
+                    }
+                }
+                EventKind::Permission => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<PermissionPayload>(event.payload.clone())
+                    {
+                        let text = format!(
+                            "permission {} → {}{}",
+                            payload.from.as_str(),
+                            payload.to.as_str(),
+                            if payload.temporary {
+                                " (temporary)"
+                            } else {
+                                ""
+                            }
+                        );
+                        push_message(
+                            &mut lines,
+                            "perm",
+                            theme.function.unwrap_or(Color::Yellow),
+                            &text,
+                            "",
+                            width,
+                        );
                     }
                 }
                 EventKind::Error => {
@@ -3240,7 +3306,14 @@ impl App {
                         .get("message")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown error");
-                    push_message(&mut lines, "error", Color::Red, message, "", width);
+                    push_message(
+                        &mut lines,
+                        "error",
+                        theme.error.unwrap_or(Color::Red),
+                        message,
+                        "",
+                        width,
+                    );
                 }
                 _ => {}
             }
@@ -3251,12 +3324,19 @@ impl App {
             } else {
                 stream.text.as_str()
             };
-            push_message(&mut lines, "eix", Color::Green, text, "", width);
+            push_message(
+                &mut lines,
+                "eix",
+                theme.function.unwrap_or(Color::Green),
+                text,
+                "",
+                width,
+            );
         }
         if lines.is_empty() {
             lines.push(Line::from(Span::styled(
                 "no messages yet — type a prompt below",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(theme.comment.unwrap_or(Color::DarkGray)),
             )));
         }
         lines
@@ -3415,6 +3495,7 @@ impl App {
     }
 
     fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme;
         let Some((session_id, scroll, cursor)) = self
             .diff_view
             .as_ref()
@@ -3462,7 +3543,7 @@ impl App {
                     } else {
                         body.push(Line::from(Span::styled(
                             truncate(&format!("    {line}"), inner_width),
-                            diff_line_style(line),
+                            diff_line_style(line, theme),
                         )));
                     }
                 }
@@ -3471,7 +3552,7 @@ impl App {
             for line in approval.diff.as_deref().unwrap_or("").lines() {
                 body.push(Line::from(Span::styled(
                     truncate(line, inner_width),
-                    diff_line_style(line),
+                    diff_line_style(line, theme),
                 )));
             }
         }
@@ -4494,7 +4575,7 @@ fn approval_risk(tool: &str) -> (&'static str, Color) {
     }
 }
 
-fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval) {
+fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval, theme: Theme) {
     if area.width < 20 || area.height < 6 {
         return;
     }
@@ -4528,7 +4609,7 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
     for line in diff_lines.iter().take(shown) {
         lines.push(Line::from(Span::styled(
             truncate(line, inner),
-            diff_line_style(line),
+            diff_line_style(line, theme),
         )));
     }
     if diff_lines.len() > shown {
@@ -4579,17 +4660,17 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
     );
 }
 
-fn diff_line_style(line: &str) -> Style {
+fn diff_line_style(line: &str, theme: Theme) -> Style {
     if line.starts_with("@@") {
-        Style::default().fg(Color::Cyan)
+        Style::default().fg(theme.function.unwrap_or(Color::Cyan))
     } else if line.starts_with("+++") || line.starts_with("---") {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme.comment.unwrap_or(Color::DarkGray))
     } else if line.starts_with('+') {
-        Style::default().fg(Color::Green)
+        Style::default().fg(theme.diff_add.unwrap_or(Color::Green))
     } else if line.starts_with('-') {
-        Style::default().fg(Color::Red)
+        Style::default().fg(theme.diff_delete.unwrap_or(Color::Red))
     } else {
-        Style::default().fg(Color::Gray)
+        Style::default().fg(theme.normal.unwrap_or(Color::Gray))
     }
 }
 
@@ -4812,7 +4893,7 @@ mod tests {
             ),
         ];
         let view = SessionView::new(session, events);
-        let text = App::transcript_lines(&view, 60)
+        let text = App::transcript_lines(&view, 60, Theme::default())
             .iter()
             .map(line_text)
             .collect::<Vec<_>>()

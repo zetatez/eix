@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Event, Session, SessionId};
+use crate::{Event, PermissionLevel, Session, SessionId};
 
 /// Bumped whenever a change breaks older clients.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -157,6 +157,20 @@ pub struct CreateSessionParams {
     /// (or the daemon's cwd) to be inside a git work tree.
     #[serde(default)]
     pub worktree: Option<bool>,
+    /// Per-session tool permission level. Defaults to `workspace-write`.
+    #[serde(default)]
+    pub permission: Option<PermissionLevel>,
+}
+
+/// `session.permission`: change a session's tool permission level.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionParams {
+    pub session_id: SessionId,
+    pub permission: PermissionLevel,
+    /// Hold the new level in memory only; it is not persisted and reverts on
+    /// daemon restart. Recorded as a `permission` event either way.
+    #[serde(default)]
+    pub temporary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

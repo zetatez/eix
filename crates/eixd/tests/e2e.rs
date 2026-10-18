@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AttachResult, Config, EventKind, HelloResult, Request, Response, SearchResult, ServerMessage,
-    SessionResult, SubmitResult, PROTOCOL_VERSION,
+    AttachResult, Config, EventKind, HelloResult, PermissionLevel, Request, Response, SearchResult,
+    ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -596,6 +596,150 @@ async fn staged_write_is_applied_after_approval() -> anyhow::Result<()> {
         "tool content was: {content}"
     );
     assert!(content.contains("not written yet"), "{content}");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_session_refuses_writes_and_permission_is_logged() -> anyhow::Result<()> {
+    let dir = temp_dir("read-only");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "read-only", "cwd": dir, "permission": "read-only"}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+    assert_eq!(created.session.permission, PermissionLevel::ReadOnly);
+
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write out.txt"}),
+        )
+        .await?;
+    assert!(!submitted.turn_id.is_empty());
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert!(completed["error"].is_null());
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(
+        !attached
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::PatchProposed),
+        "a read-only session must not stage writes"
+    );
+    let result = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolResult)
+        .expect("tool result event");
+    assert_eq!(result.payload["ok"], false);
+    assert_eq!(result.payload["denied"], true);
+    assert!(
+        result.payload["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("read-only"),
+        "tool output was: {}",
+        result.payload
+    );
+    assert!(!dir.join("out.txt").exists());
+    // The provider never got a mutating tool in its advertised list.
+    let first: Value = serde_json::from_str(&bodies.lock().await[0])?;
+    assert!(
+        first["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().all(|tool| {
+                !matches!(
+                    tool["function"]["name"].as_str(),
+                    Some("write_file" | "run_command" | "start_command")
+                )
+            })),
+        "read-only tools were: {}",
+        first["tools"]
+    );
+
+    // Persisted change: row + permission event.
+    let changed: SessionResult = client
+        .request(
+            "session.permission",
+            json!({"session_id": session_id, "permission": "workspace-write"}),
+        )
+        .await?;
+    assert_eq!(changed.session.permission, PermissionLevel::WorkspaceWrite);
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let event = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::Permission)
+        .expect("permission event");
+    assert_eq!(event.payload["from"], "read-only");
+    assert_eq!(event.payload["to"], "workspace-write");
+    assert_eq!(event.payload["temporary"], false);
+
+    // Temporary escalation applies immediately and is visible on reads...
+    let temporary: SessionResult = client
+        .request(
+            "session.permission",
+            json!({
+                "session_id": session_id,
+                "permission": "full",
+                "temporary": true,
+            }),
+        )
+        .await?;
+    assert_eq!(temporary.session.permission, PermissionLevel::Full);
+    let listed: eix_core::SessionList = client.request("session.list", Value::Null).await?;
+    let row = listed
+        .sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .expect("session row");
+    assert_eq!(row.permission, PermissionLevel::Full);
+    // ...and is announced as temporary in the event log.
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let temp_event = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::Permission)
+        .expect("temporary permission event");
+    assert_eq!(temp_event.payload["to"], "full");
+    assert_eq!(temp_event.payload["temporary"], true);
 
     daemon.abort();
     mock.abort();

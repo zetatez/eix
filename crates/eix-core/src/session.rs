@@ -111,6 +111,57 @@ impl std::str::FromStr for SessionOrigin {
     }
 }
 
+/// What a session is allowed to do to the workspace.
+///
+/// This is a per-session safety boundary on top of the global `[tools] policy`:
+/// the global policy can still be stricter (e.g. `read-only` always wins), but
+/// it can never widen a session's level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PermissionLevel {
+    /// Mutating tools are refused; reads are always allowed.
+    #[serde(rename = "read-only")]
+    ReadOnly,
+    /// The default: mutating tools are gated by `[tools] policy` and paths stay
+    /// inside the session workspace.
+    #[default]
+    #[serde(rename = "workspace-write")]
+    WorkspaceWrite,
+    /// Mutating tools run without asking (the workspace path check remains as
+    /// defense in depth). Intended for trusted, disposable sessions.
+    #[serde(rename = "full")]
+    Full,
+}
+
+impl PermissionLevel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::Full => "full",
+        }
+    }
+
+    /// True for levels that may mutate the workspace.
+    pub fn can_write(self) -> bool {
+        !matches!(self, Self::ReadOnly)
+    }
+}
+
+impl std::str::FromStr for PermissionLevel {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "read-only" | "readonly" | "read_only" => Ok(Self::ReadOnly),
+            "workspace-write" | "workspace_write" | "write" | "workspace" => {
+                Ok(Self::WorkspaceWrite)
+            }
+            "full" | "auto" => Ok(Self::Full),
+            _ => Err(()),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,
@@ -132,6 +183,9 @@ pub struct Session {
     /// How the session came to exist (`user` / `fork` / `agent`).
     #[serde(default)]
     pub origin: SessionOrigin,
+    /// Per-session tool permission level.
+    #[serde(default)]
+    pub permission: PermissionLevel,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -149,6 +203,7 @@ impl Session {
             forked_from_seq: None,
             worktree: None,
             origin: SessionOrigin::User,
+            permission: PermissionLevel::default(),
             created_at: now,
             updated_at: now,
         }
@@ -205,5 +260,28 @@ mod tests {
         for status in all {
             assert_eq!(status.as_str().parse::<SessionStatus>(), Ok(status));
         }
+    }
+
+    #[test]
+    fn permission_levels_round_trip_and_alias() {
+        let all = [
+            PermissionLevel::ReadOnly,
+            PermissionLevel::WorkspaceWrite,
+            PermissionLevel::Full,
+        ];
+        for level in all {
+            assert_eq!(level.as_str().parse::<PermissionLevel>(), Ok(level));
+        }
+        assert_eq!(
+            "readonly".parse::<PermissionLevel>(),
+            Ok(PermissionLevel::ReadOnly)
+        );
+        assert_eq!(
+            "workspace-write".parse::<PermissionLevel>(),
+            Ok(PermissionLevel::WorkspaceWrite)
+        );
+        assert!("nonsense".parse::<PermissionLevel>().is_err());
+        assert!(!PermissionLevel::ReadOnly.can_write());
+        assert!(PermissionLevel::Full.can_write());
     }
 }

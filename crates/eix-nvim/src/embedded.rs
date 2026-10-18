@@ -14,6 +14,7 @@ use nvim_rs::create::tokio as create_nvim;
 use nvim_rs::error::LoopError;
 use nvim_rs::{Handler, Neovim, UiAttachOptions, Value};
 use ratatui::layout::Rect;
+use ratatui::style::Color;
 use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
@@ -23,6 +24,27 @@ use crate::keys;
 use crate::prompt;
 
 pub type Nvim = Neovim<Compat<ChildStdin>>;
+
+/// Colors sampled from Neovim's highlight groups so the transcript can match
+/// the user's colorscheme. Every field is `None` until the theme arrives, so
+/// the host keeps its defaults if Neovim never reports one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Theme {
+    pub normal: Option<Color>,
+    pub comment: Option<Color>,
+    pub string: Option<Color>,
+    pub function: Option<Color>,
+    pub error: Option<Color>,
+    pub diff_add: Option<Color>,
+    pub diff_delete: Option<Color>,
+}
+
+impl Theme {
+    /// True when no group resolved (minimal nvim, or `nvim_get_hl` missing).
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+}
 
 /// State written by the RPC handler and read by the UI.
 pub struct Shared {
@@ -35,6 +57,8 @@ pub struct Shared {
     pub lines: u16,
     /// True when the user's config was skipped because it failed or hung.
     pub fallback: bool,
+    /// Highlight colors last reported by Neovim.
+    pub theme: Theme,
 }
 
 impl Shared {
@@ -45,6 +69,7 @@ impl Shared {
             frames: 0,
             lines: 1,
             fallback: false,
+            theme: Theme::default(),
         }
     }
 }
@@ -76,6 +101,12 @@ impl Handler for NvimHandler {
                     .to_string();
                 if let Ok(mut shared) = self.shared.lock() {
                     shared.submitted.push(text);
+                }
+            }
+            "eix_theme" => {
+                let theme = args.first().map(parse_theme).unwrap_or_default();
+                if let Ok(mut shared) = self.shared.lock() {
+                    shared.theme = theme;
                 }
             }
             _ => {}
@@ -113,6 +144,38 @@ local lines = vim.split(text, "\n", { plain = true })
 vim.api.nvim_buf_set_lines(0, 0, -1, false, lines)
 vim.api.nvim_win_set_cursor(0, { #lines, #lines[#lines] })
 vim.cmd("startinsert!")
+"#;
+
+/// Sample a few highlight groups and notify the host; re-run on `ColorScheme`.
+/// `nvim_get_hl` is 0.9+; older Neovim yields an empty theme via `pcall`.
+const THEME_LUA: &str = r#"
+local groups = {
+  normal = "Normal",
+  comment = "Comment",
+  string = "String",
+  ["function"] = "Function",
+  error = "ErrorMsg",
+  diff_add = "DiffAdd",
+  diff_delete = "DiffDelete",
+}
+local function eix_theme()
+  local out = {}
+  for key, group in pairs(groups) do
+    local ok, hl = pcall(vim.api.nvim_get_hl, 0, { name = group, link = false })
+    if ok and hl then
+      out[key] = { fg = hl.fg, bg = hl.bg, reverse = hl.reverse }
+    end
+  end
+  return out
+end
+if vim.g.eix_host_chan then
+  vim.api.nvim_create_autocmd("ColorScheme", {
+    callback = function()
+      pcall(vim.rpcnotify, vim.g.eix_host_chan, "eix_theme", eix_theme())
+    end,
+  })
+end
+return eix_theme()
 "#;
 
 /// Commands for the worker that owns the RPC connection.
@@ -212,6 +275,12 @@ impl NvimInput {
         // us RGB.
         run_lua(&nvim, "vim.o.termguicolors = true").await?;
         run_lua(&nvim, prompt::PROFILE_LUA).await?;
+        // Sample the colorscheme once; `ColorScheme` re-runs it via rpcnotify.
+        if let Ok(value) = run_lua(&nvim, THEME_LUA).await {
+            if let Ok(mut shared) = shared.lock() {
+                shared.theme = parse_theme(&value);
+            }
+        }
 
         let (tx, rx) = mpsc::unbounded_channel();
         let worker = tokio::spawn(worker(rx, nvim, Arc::clone(&shared)));
@@ -323,6 +392,14 @@ impl NvimInput {
             .unwrap_or(false)
     }
 
+    /// Highlight colors last reported by Neovim (default when unknown).
+    pub fn theme(&self) -> Theme {
+        self.shared
+            .lock()
+            .map(|shared| shared.theme)
+            .unwrap_or_default()
+    }
+
     fn mark_fallback(&mut self) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.fallback = true;
@@ -413,11 +490,115 @@ async fn run_lua(nvim: &Nvim, code: &str) -> Result<Value> {
         .map_err(|e| anyhow!("nvim_exec_lua failed: {e}"))
 }
 
+/// Convert the Lua table from [`THEME_LUA`] into a [`Theme`]. Unknown groups
+/// and missing keys are ignored; `reverse` swaps the foreground/background.
+fn parse_theme(value: &Value) -> Theme {
+    let mut theme = Theme::default();
+    let Some(map) = value.as_map() else {
+        return theme;
+    };
+    for (key, entry) in map {
+        let Some(name) = key.as_str() else {
+            continue;
+        };
+        let Some(fields) = entry.as_map() else {
+            continue;
+        };
+        let mut fg = None;
+        let mut bg = None;
+        let mut reverse = false;
+        for (field, field_value) in fields {
+            match field.as_str().unwrap_or("") {
+                "fg" => fg = grid::color(field_value),
+                "bg" => bg = grid::color(field_value),
+                "reverse" => reverse = field_value.as_bool().unwrap_or(false),
+                _ => {}
+            }
+        }
+        let color = if reverse { bg.or(fg) } else { fg };
+        let slot = match name {
+            "normal" => &mut theme.normal,
+            "comment" => &mut theme.comment,
+            "string" => &mut theme.string,
+            "function" => &mut theme.function,
+            "error" => &mut theme.error,
+            "diff_add" => &mut theme.diff_add,
+            "diff_delete" => &mut theme.diff_delete,
+            _ => continue,
+        };
+        *slot = color;
+    }
+    theme
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::time::Duration;
+
+    #[test]
+    fn parses_theme_groups() {
+        fn group(pairs: &[(&str, i64)]) -> Value {
+            Value::Map(
+                pairs
+                    .iter()
+                    .map(|(key, value)| (Value::from(*key), Value::from(*value)))
+                    .collect(),
+            )
+        }
+        let value = Value::Map(vec![
+            (Value::from("normal"), group(&[("fg", 0xff_8800)])),
+            (Value::from("comment"), group(&[("fg", 0x00_00ff)])),
+            (
+                Value::from("string"),
+                Value::Map(vec![
+                    (Value::from("fg"), Value::from(0x11_1111_i64)),
+                    (Value::from("bg"), Value::from(0x22_2222_i64)),
+                    (Value::from("reverse"), Value::from(true)),
+                ]),
+            ),
+            (Value::from("unknown"), group(&[("fg", 0x33_3333)])),
+        ]);
+        let theme = parse_theme(&value);
+        assert_eq!(theme.normal, Some(Color::Rgb(0xff, 0x88, 0x00)));
+        assert_eq!(theme.comment, Some(Color::Rgb(0x00, 0x00, 0xff)));
+        // `reverse` swaps foreground and background; text picks the old bg.
+        assert_eq!(theme.string, Some(Color::Rgb(0x22, 0x22, 0x22)));
+        assert_eq!(theme.function, None);
+        assert!(!theme.is_empty());
+    }
+
+    #[test]
+    fn empty_theme_keeps_defaults() {
+        let theme = parse_theme(&Value::Nil);
+        assert!(theme.is_empty());
+        assert_eq!(theme, Theme::default());
+    }
+
+    #[tokio::test]
+    async fn reports_colorscheme_changes() {
+        if !nvim_available() {
+            return;
+        }
+        let nvim = NvimInput::spawn(40, 3, true).await.expect("spawn nvim");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        nvim.raw_input(
+            "<Esc>:lua vim.api.nvim_set_hl(0, 'Comment', {fg = '#123456'}); \
+             vim.cmd('doautocmd ColorScheme')<CR>",
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while nvim.theme().comment != Some(Color::Rgb(0x12, 0x34, 0x56)) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "theme not refreshed after ColorScheme: {:?} text={:?}",
+                nvim.theme(),
+                nvim.text().await
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
 
     #[tokio::test]
     async fn types_and_submits_a_draft() {

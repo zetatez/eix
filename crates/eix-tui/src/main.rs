@@ -18,10 +18,10 @@ use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload,
     AttachResult, CancelResult, Config, ContextCompactedPayload, ContextDropPayload,
     ContextLedgerResult, ContextPinPayload, Endpoint, Event, EventKind, HelloResult,
-    PatchProposedPayload, PatchResultPayload, ProcessExitedPayload, ProcessKillResult, ProcessList,
-    ProcessOutput, ProcessStartedPayload, RewindResult, SearchResult, Sector, Session, SessionList,
-    SessionResult, SessionStatus, SnapshotPayload, SubmitResult, ToolCallPayload,
-    ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
+    PatchProposedPayload, PatchResultPayload, PermissionPayload, ProcessExitedPayload,
+    ProcessKillResult, ProcessList, ProcessOutput, ProcessStartedPayload, RewindResult,
+    SearchResult, Sector, Session, SessionList, SessionResult, SessionStatus, SnapshotPayload,
+    SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -45,7 +45,13 @@ async fn main() -> Result<()> {
             cwd,
             model,
             worktree,
-        } => new_session(&cli, name, cwd, model, worktree).await,
+            permission,
+        } => new_session(&cli, name, cwd, model, worktree, permission).await,
+        Command::Permission {
+            session,
+            level,
+            temporary,
+        } => permission(&cli, session, level, temporary).await,
         Command::Send { session, text } => send(&cli, session, text).await,
         Command::Tui { session } => {
             let config = Config::load(cli.config_path.as_deref()).unwrap_or_default();
@@ -118,6 +124,15 @@ enum Command {
         model: Option<String>,
         /// Create `.worktrees/<name>` and run there.
         worktree: bool,
+        /// Initial per-session permission level.
+        permission: Option<String>,
+    },
+    Permission {
+        session: Option<String>,
+        /// `read-only` / `workspace-write` / `full`.
+        level: String,
+        /// Do not persist the change (lost on daemon restart).
+        temporary: bool,
     },
     Send {
         session: Option<String>,
@@ -323,6 +338,7 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let cwd = take_flag(&mut args, "--cwd")?.map(PathBuf::from);
             let model = take_flag(&mut args, "--model")?;
             let worktree = take_switch(&mut args, "--worktree");
+            let permission = take_flag(&mut args, "--permission")?;
             let name = name.or_else(|| {
                 let joined = args.join(" ").trim().to_string();
                 (!joined.is_empty()).then_some(joined)
@@ -332,6 +348,22 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
                 cwd,
                 model,
                 worktree,
+                permission,
+            })
+        }
+        "permission" | "perm" => {
+            let session = take_flag(&mut args, "--session")?;
+            let temporary = take_switch(&mut args, "--temporary") || take_switch(&mut args, "-t");
+            let level = args
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!(
+                    "usage: eix permission <read-only|workspace-write|full> [--session ID] [--temporary]"
+                ))?;
+            Ok(Command::Permission {
+                session,
+                level,
+                temporary,
             })
         }
         "send" => {
@@ -576,10 +608,11 @@ async fn sessions(cli: &Cli) -> Result<()> {
     for session in list {
         let model = session.model.as_deref().unwrap_or("-");
         println!(
-            "{} {:<28} {:<8} {:<10} {}  {}",
+            "{} {:<28} {:<8} {:<15} {:<10} {}  {}",
             session.status.symbol(),
             truncate(&session.name, 28),
             short_id(&session.id),
+            session.permission.as_str(),
             model,
             session.cwd.display(),
             format_ts(session.updated_at),
@@ -594,14 +627,16 @@ async fn new_session(
     cwd: Option<PathBuf>,
     model: Option<String>,
     worktree: bool,
+    permission: Option<String>,
 ) -> Result<()> {
     let mut client = cli.connect().await?;
-    let session = create_session(&mut client, name, cwd, model, worktree).await?;
+    let session = create_session(&mut client, name, cwd, model, worktree, permission).await?;
     println!(
-        "{} {}  {}",
+        "{} {}  {}  [{}]",
         session.status.symbol(),
         session.name,
-        short_id(&session.id)
+        short_id(&session.id),
+        session.permission.as_str()
     );
     if session.has_worktree() {
         println!("worktree {}", session.cwd.display());
@@ -667,7 +702,7 @@ async fn chat(cli: &Cli, session: Option<String>) -> Result<()> {
                 }
             }
             "/new" => {
-                session = create_session(&mut client, None, None, None, false).await?;
+                session = create_session(&mut client, None, None, None, false, None).await?;
                 println!("new session {} ({})", session.name, short_id(&session.id));
             }
             "/log" => {
@@ -720,6 +755,35 @@ async fn rename(cli: &Cli, session: Option<String>, name: String) -> Result<()> 
             .await?,
     )?;
     println!("renamed to {}", result.session.name);
+    Ok(())
+}
+
+async fn permission(
+    cli: &Cli,
+    session: Option<String>,
+    level: String,
+    temporary: bool,
+) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result: SessionResult = serde_json::from_value(
+        client
+            .request(
+                "session.permission",
+                json!({
+                    "session_id": session.id,
+                    "permission": level,
+                    "temporary": temporary,
+                }),
+            )
+            .await?,
+    )?;
+    println!(
+        "{} is now {} ({})",
+        result.session.name,
+        result.session.permission.as_str(),
+        if temporary { "temporary" } else { "persisted" }
+    );
     Ok(())
 }
 
@@ -839,6 +903,7 @@ async fn status(cli: &Cli, json: bool) -> Result<()> {
                 "id": session.id,
                 "name": session.name,
                 "status": session.status.as_str(),
+                "permission": session.permission.as_str(),
                 "cwd": session.cwd,
             })).collect::<Vec<_>>(),
             "daemon": {
@@ -901,6 +966,7 @@ async fn pick(cli: &Cli, query: Option<String>, limit: Option<usize>, json: bool
                     "id": session.id,
                     "name": session.name,
                     "status": session.status.as_str(),
+                    "permission": session.permission.as_str(),
                     "cwd": session.cwd,
                 })
             })
@@ -1467,6 +1533,7 @@ async fn create_session(
     cwd: Option<PathBuf>,
     model: Option<String>,
     worktree: bool,
+    permission: Option<String>,
 ) -> Result<Session> {
     let cwd = match cwd {
         Some(cwd) => cwd,
@@ -1481,6 +1548,7 @@ async fn create_session(
                     "cwd": cwd,
                     "model": model,
                     "worktree": worktree,
+                    "permission": permission,
                 }),
             )
             .await?,
@@ -1509,7 +1577,7 @@ async fn resolve_session(
         return Ok(session.clone());
     }
     if create {
-        return create_session(client, None, None, None, false).await;
+        return create_session(client, None, None, None, false, None).await;
     }
     bail!("no sessions yet — run `eix new` first")
 }
@@ -1838,6 +1906,22 @@ fn render_events(events: &[Event]) {
                     );
                 }
             }
+            EventKind::Permission => {
+                if let Ok(payload) =
+                    serde_json::from_value::<PermissionPayload>(event.payload.clone())
+                {
+                    println!(
+                        "perm> {} -> {}{}",
+                        payload.from.as_str(),
+                        payload.to.as_str(),
+                        if payload.temporary {
+                            " (temporary)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
             EventKind::ContextCompacted => {
                 if let Ok(payload) =
                     serde_json::from_value::<ContextCompactedPayload>(event.payload.clone())
@@ -1966,8 +2050,10 @@ COMMANDS:
     chat [--session ID]        interactive chat (non-TUI)
     send [--session ID] TEXT   send one prompt and stream the answer
     ls                         list sessions
-    new [--name N] [--cwd P] [--model M] [--worktree]
+    new [--name N] [--cwd P] [--model M] [--worktree] [--permission LEVEL]
                                create a session (--worktree: .worktrees/<name>)
+    permission LEVEL [--session ID] [--temporary]
+                               set read-only / workspace-write / full for a session
     log [--session ID]         print the persisted transcript
     rename [--session ID] NAME
     cancel [--session ID]      cancel the running turn
@@ -2017,6 +2103,7 @@ EXAMPLES:
     echo 'review the diff' | eix send
     EIX_MODEL=qwen2.5-coder eix chat
     eix new --name auth --cwd ~/src/app --worktree
+    eix permission read-only --session 4f2a9c11
     eix context
     eix context --compact 3:9 --summary 'we settled on a SQLite event log'
     eix ps

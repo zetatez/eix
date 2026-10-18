@@ -377,7 +377,7 @@ fn u64_arg(args: &[Value], index: usize) -> Option<u64> {
     args.get(index).and_then(|v| v.as_u64())
 }
 
-fn color(value: &Value) -> Option<Color> {
+pub(crate) fn color(value: &Value) -> Option<Color> {
     let n = value.as_i64().filter(|n| *n >= 0)? as u32;
     Some(Color::Rgb(
         ((n >> 16) & 0xff) as u8,

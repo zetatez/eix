@@ -142,6 +142,13 @@ pending 审批/补丁或进入 `error` 时会标 `!`、边框和侧栏变黄/红
 按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的卡片，输入框
 里的未发送文字也会通过 daemon 草稿恢复。
 
+每个 session 有独立的权限级别：`workspace-write`（默认，受全局 `[tools] policy` 的
+approval 约束）、`read-only`（不向模型暴露写工具，运行时也拒绝写）和 `full`（跳过审批，
+路径仍限制在 workspace）。创建时用 `eix new --permission read-only`，运行时用
+`eix permission LEVEL [--session ID]` 切换；加 `--temporary` 只改内存并在事件日志留下
+`permission` 记录，daemon 重启后回到持久值。TUI pane 标题和 `eix ls` 会显示非默认级别，
+nvim 里可用 `:Eix permission [LEVEL]`。
+
 后台进程由 daemon 托管：`start_command`（与 `run_command` 共用沙箱与审批门禁）启动后
 立即返回进程 id，`process_output`（只读）读取最新/指定进程的尾部输出。`P` 打开全屏列表，
 下方实时跟随选中进程的输出（`j/k` 选择、`x` kill、`r` 刷新、`PgUp/PgDn` 回看）。
@@ -185,6 +192,9 @@ TUI 默认拉起一个 `nvim --embed`（加载你的完整 `~/.config/nvim`）�
 - `Esc` 回到转录区；再按 `i` / `Enter` 重新聚焦并进入 insert
 - 聚焦时高度为 `clamp(行数, 3, 10)`，失焦时保留一行预览
 - 提交失败（请求错误或 turn 出错）会把 draft 放回输入条，不会丢字
+- 转录区颜色跟随 nvim 的 colorscheme：启动和 `ColorScheme` 变化时读取
+  `Normal` / `Comment` / `String` / `Function` / `ErrorMsg` / `DiffAdd` / `DiffDelete`
+  并映射到消息标签、工具输出和审批 diff；读不到时（`minimal` 或旧版 nvim）用固定配色
 
 ```toml
 [input]
@@ -490,6 +500,6 @@ spike 内：
 - [x] nvim 对话框与启动兜底（完整配置 5s 超时回退 `-u NONE`、`:Eix` palette `<leader>a`）
 - [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
-- [ ] 按 session 权限级别（DESIGN 9.3 的 read-only / workspace-write / full 目前只有全局 `tools.policy`）
-- [ ] nvim 配色 → TUI 主题桥接
+- [x] 按 session 权限级别（`read-only` / `workspace-write` / `full`；`session.permission` 支持临时升级并记录事件）
+- [x] nvim 配色 → TUI 主题桥接（启动与 `ColorScheme` 时读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete`，映射转录区/审批 diff 颜色）
 - [ ] `ext_multigrid` 多窗口渲染

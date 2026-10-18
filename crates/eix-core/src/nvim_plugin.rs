@@ -432,6 +432,7 @@ open_palette = function()
     { label = "rewind this session", run = function() vim.cmd("Eix rewind") end },
     { label = "background processes", run = function() vim.cmd("Eix ps") end },
     { label = "context ledger", run = function() vim.cmd("Eix ledger") end },
+    { label = "permission…", run = function() vim.cmd("Eix permission") end },
   }
   vim.ui.select(actions, {
     prompt = "eix",
@@ -555,6 +556,25 @@ vim.api.nvim_create_user_command("Eix", function(opts)
           vim.cmd("botright 12split")
           vim.api.nvim_win_set_buf(0, buf)
         end)
+      end)
+    end
+  elseif sub == "permission" then
+    if require_session() then
+      local level = args[2]
+      if not level then
+        notify(string.format("permission: %s", state.session.permission or "workspace-write"))
+        return
+      end
+      request("session.permission", {
+        session_id = state.session.id,
+        permission = level,
+      }, function(result, err)
+        if err then
+          notify("permission: " .. tostring(err.message), vim.log.levels.ERROR)
+          return
+        end
+        state.session = result.session
+        notify(string.format("permission: %s", result.session.permission))
       end)
     end
   else

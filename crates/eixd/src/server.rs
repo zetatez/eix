@@ -21,13 +21,14 @@ use eix_core::{
     ContextPinPayload, CreateSessionParams, DraftParams, DraftResult, ErrorPayload, Event,
     EventKind, EventsParams, EventsResult, ForkParams, HelloResult, Notification, PatchApplyParams,
     PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
-    PatchResultPayload, PatchReviseParams, ProcessKillParams, ProcessKillResult, ProcessList,
-    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
-    RewindResult, SearchParams, SearchResult, ServerMessage, Session, SessionId, SessionList,
-    SessionOrigin, SessionRef, SessionResult, SessionStatus, SnapshotPayload, StatusChangedPayload,
-    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, ToolCall, ToolCallPayload,
-    ToolDefinition, ToolPolicy, ToolResultPayload, UserMessagePayload, WorktreeRemoveParams,
-    WorktreeRemoveResult, PROTOCOL_VERSION,
+    PatchResultPayload, PatchReviseParams, PermissionLevel, PermissionParams, PermissionPayload,
+    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
+    RenameParams, Request, Response, RewindParams, RewindResult, SearchParams, SearchResult,
+    ServerMessage, Session, SessionId, SessionList, SessionOrigin, SessionRef, SessionResult,
+    SessionStatus, SnapshotPayload, StatusChangedPayload, SubmitParams, SubmitResult,
+    SubscribeParams, SubscribeResult, ToolCall, ToolCallPayload, ToolDefinition, ToolPolicy,
+    ToolResultPayload, UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult,
+    PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -74,6 +75,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         turns: Mutex::new(HashMap::new()),
         approvals: Mutex::new(HashMap::new()),
         notified: std::sync::Mutex::new(HashMap::new()),
+        temporary_permissions: std::sync::Mutex::new(HashMap::new()),
     });
     let restored = daemon.staging.load();
     if restored > 0 {
@@ -185,6 +187,9 @@ struct Daemon {
     approvals: Mutex<HashMap<SessionId, PendingApproval>>,
     /// Last attention notification per session, for the cooldown.
     notified: std::sync::Mutex<HashMap<SessionId, Instant>>,
+    /// In-memory permission overrides set with `temporary: true`. They last
+    /// until the daemon restarts or the level is changed again.
+    temporary_permissions: std::sync::Mutex<HashMap<SessionId, PermissionLevel>>,
 }
 
 struct PendingApproval {
@@ -391,9 +396,11 @@ impl Daemon {
                 sessions: self.store.session_count()?,
             })?),
             "ping" => Ok(json!({ "pong": true, "ts": now_ms() })),
-            "session.list" => Ok(serde_json::to_value(SessionList {
-                sessions: self.store.list_sessions()?,
-            })?),
+            "session.list" => {
+                let mut sessions = self.store.list_sessions()?;
+                self.effective_permissions(&mut sessions);
+                Ok(serde_json::to_value(SessionList { sessions })?)
+            }
             "session.create" => {
                 let params: CreateSessionParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(SessionResult {
@@ -556,6 +563,11 @@ impl Daemon {
                         )
                     })?;
                 self.emit_session(&session);
+                Ok(serde_json::to_value(SessionResult { session })?)
+            }
+            "session.permission" => {
+                let params: PermissionParams = parse_params(request.params.clone())?;
+                let session = self.set_permission(params)?;
                 Ok(serde_json::to_value(SessionResult { session })?)
             }
             "draft.get" => {
@@ -822,12 +834,69 @@ impl Daemon {
             .model
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
+        if let Some(permission) = params.permission {
+            session.permission = permission;
+        }
         if params.worktree.unwrap_or(false) {
             let created = crate::worktree::create(&session.cwd, &session.name).await?;
             session.cwd = created.path.clone();
             session.worktree = Some(created.path);
         }
         self.store.create_session(&session)?;
+        self.emit_session(&session);
+        Ok(session)
+    }
+
+    /// The level that actually applies right now: a temporary in-memory
+    /// override wins over the persisted session row.
+    fn session_permission(&self, session: &Session) -> PermissionLevel {
+        self.temporary_permissions
+            .lock()
+            .ok()
+            .and_then(|overrides| overrides.get(&session.id).copied())
+            .unwrap_or(session.permission)
+    }
+
+    /// Apply `session.permission`. Persisted changes update the row; temporary
+    /// ones stay in memory. Both append a `permission` event so the change is
+    /// visible in the transcript and audit trail.
+    fn set_permission(&self, params: PermissionParams) -> Result<Session> {
+        let mut session = self.require_session(&params.session_id)?;
+        let from = self.session_permission(&session);
+        let to = params.permission;
+        if params.temporary {
+            if let Ok(mut overrides) = self.temporary_permissions.lock() {
+                overrides.insert(session.id.clone(), to);
+            }
+            // Report/broadcast the effective level; the row keeps the persisted
+            // one so a restart reverts the escalation.
+            session.permission = to;
+        } else {
+            if let Ok(mut overrides) = self.temporary_permissions.lock() {
+                overrides.remove(&session.id);
+            }
+            session = self
+                .store
+                .set_session_permission(&session.id, to)?
+                .ok_or_else(|| {
+                    rpc(
+                        "not_found",
+                        format!("unknown session {}", params.session_id),
+                    )
+                })?;
+        }
+        if from != to {
+            let event = self.store.append_event(
+                &session.id,
+                EventKind::Permission,
+                payload(&PermissionPayload {
+                    from,
+                    to,
+                    temporary: params.temporary,
+                }),
+            )?;
+            self.emit_event(&event);
+        }
         self.emit_session(&session);
         Ok(session)
     }
@@ -1070,9 +1139,33 @@ impl Daemon {
     }
 
     fn require_session(&self, id: &str) -> Result<Session> {
-        self.store
+        let mut session = self
+            .store
             .get_session(id)?
-            .ok_or_else(|| rpc("not_found", format!("unknown session {id}")))
+            .ok_or_else(|| rpc("not_found", format!("unknown session {id}")))?;
+        // Temporary escalations live only in memory; present them as the
+        // session's current level so every RPC sees the effective value.
+        if let Some(level) = self
+            .temporary_permissions
+            .lock()
+            .ok()
+            .and_then(|overrides| overrides.get(id).copied())
+        {
+            session.permission = level;
+        }
+        Ok(session)
+    }
+
+    /// Overlay in-memory permission overrides on a batch of rows.
+    fn effective_permissions(&self, sessions: &mut [Session]) {
+        let Ok(overrides) = self.temporary_permissions.lock() else {
+            return;
+        };
+        for session in sessions {
+            if let Some(level) = overrides.get(&session.id) {
+                session.permission = *level;
+            }
+        }
     }
 
     async fn submit_setup(&self, session_id: SessionId, text: String) -> Result<(Session, String)> {
@@ -1200,8 +1293,19 @@ impl Daemon {
         turn_id: String,
         cancel: Arc<AtomicBool>,
     ) {
+        // A read-only session is never shown mutating tools, even if the model
+        // would otherwise call one; `run_tool_call` enforces it again.
+        let definitions = match self.require_session(&session_id) {
+            Ok(session) if self.session_permission(&session) == PermissionLevel::ReadOnly => {
+                tools::definitions()
+                    .into_iter()
+                    .filter(|tool| !tools::requires_approval(&tool.function.name))
+                    .collect()
+            }
+            _ => tools::definitions(),
+        };
         if let Err(err) = self
-            .run_turn_inner(&session_id, &turn_id, &cancel, &tools::definitions())
+            .run_turn_inner(&session_id, &turn_id, &cancel, &definitions)
             .await
         {
             eprintln!(
@@ -1624,10 +1728,19 @@ impl Daemon {
         // Sub-agents inherit the parent's context, not its write access. Even
         // if the model ignores the read-only tool list, mutating tools are
         // refused here so a child can never change the shared workspace.
-        if self.require_session(session_id)?.origin == SessionOrigin::Agent
-            && tools::requires_approval(tool)
-        {
+        let session = self.require_session(session_id)?;
+        let permission = self.session_permission(&session);
+        if session.origin == SessionOrigin::Agent && tools::requires_approval(tool) {
             let output = "sub-agents are read-only; mutating tools are not available".to_string();
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        }
+
+        // The session-level level can only narrow what the global policy
+        // allows. `read-only` sessions never stage, ask, or auto-run a write.
+        if permission == PermissionLevel::ReadOnly && tools::requires_approval(tool) {
+            let output = "session permission is read-only; mutating tools are disabled".to_string();
             self.record_tool_result(session_id, call, false, true, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
@@ -1636,8 +1749,12 @@ impl Daemon {
         // Staged writes: under `ask` (the default) a `write_file` proposal goes
         // into the session's shadow workspace and returns at once. The user
         // applies or rejects it later with `patch.apply` / `patch.reject`.
-        // Reads and later writes see the staged contents.
-        if tool == "write_file" && self.config.tools.policy == ToolPolicy::Ask {
+        // Reads and later writes see the staged contents. `full` sessions skip
+        // the review step and write directly.
+        if tool == "write_file"
+            && self.config.tools.policy == ToolPolicy::Ask
+            && permission != PermissionLevel::Full
+        {
             return self
                 .stage_write(session_id, turn_id, call, &args, messages)
                 .await;
@@ -1653,6 +1770,7 @@ impl Daemon {
                     denial =
                         Some("tool policy is read-only; mutating tools are disabled".to_string())
                 }
+                ToolPolicy::Ask if permission == PermissionLevel::Full => {}
                 ToolPolicy::Ask => {
                     // `write_file` returned above; only blocking tools land here.
                     let reply = self
@@ -1870,9 +1988,10 @@ impl Daemon {
     async fn build_ledger(&self, session_id: &str) -> Result<Ledger> {
         let session = self.require_session(session_id)?;
         let events = self.store.events(session_id)?;
+        let permission = self.session_permission(&session);
         Ok(Ledger::build(
             &self.config,
-            system_prompt(&self.config, &session),
+            system_prompt(&self.config, &session, permission),
             &session.cwd,
             &events,
         )
@@ -2860,14 +2979,23 @@ fn auto_name(text: &str) -> String {
     }
 }
 
-fn system_prompt(config: &Config, session: &Session) -> String {
+fn system_prompt(config: &Config, session: &Session, permission: PermissionLevel) -> String {
     if let Some(prompt) = &config.provider.system_prompt {
         return prompt.clone();
     }
+    let permission = match permission {
+        PermissionLevel::ReadOnly => {
+            "\nThis session is read-only: do not attempt to modify files or run commands."
+        }
+        PermissionLevel::Full => {
+            "\nThis session may modify files without asking. Stay inside the workspace and be careful."
+        }
+        PermissionLevel::WorkspaceWrite => "",
+    };
     format!(
         "You are eix, a coding agent in the user's terminal. Work inside `{}`.\n\
          Be concise, concrete, and honest. If you are unsure, inspect the workspace or ask.\n\
-         Do not claim to have run commands or changed files unless you actually did.",
+         Do not claim to have run commands or changed files unless you actually did.{permission}",
         session.cwd.display()
     )
 }

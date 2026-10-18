@@ -163,7 +163,7 @@ end
 - 光标形状来自 `mode_info_set` + `mode_change`（block / vertical / horizontal），支持闪烁（planned；spike 只画位置）。
 - 输入条高度：聚焦时 `clamp(line_count, 3, 10)`、失焦时 1 行，布局变化时 `nvim_ui_try_resize`（已实现）。
   - 已知限制：单 grid 模式下，cmp/noice 等**浮动窗口会被输入条边界裁剪**，动画类浮窗（smear-cursor）还会留残影。v1 用"聚焦时给足高度 + `g:eix_prompt` 逃生"缓解；后续用 `ext_multigrid` 把浮窗作为独立 grid 叠加渲染。
-- **主题桥接**：启动及 `ColorScheme` 变化时，用 `nvim_get_hl` 读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete/Pmenu/Visual`，映射到主机 UI，让转录区与你的 colorscheme 一致。
+- **主题桥接**（已实现）：启动及 `ColorScheme` 变化时，用 `nvim_get_hl` 读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete`，映射转录区与审批 diff 的颜色；未取到（`--minimal` / 旧版 nvim）时回退到原来的固定配色。`Pmenu/Visual` 暂未接入主机浮层。
 
 ### 5.3.1 自检（`--probe`）
 
@@ -355,10 +355,16 @@ prompt buffer 的 buffer-local mapping：
 
 ### 9.3 权限策略
 
-- 级别：`read-only` / `workspace-write` / `full`；目前只有**全局** `[tools] policy`
-  （`ask` / `auto` / `read-only`），按 session 的级别与"本 session 全部批准到工具+路径模式"
-  仍待实现。
-- 自动批准规则：工具名 + 路径 glob + 命令前缀/正则；只读工具默认放行。
+- 级别（已实现，按 session）：`read-only` / `workspace-write` / `full`，存于 `sessions.permission`
+  （旧库自动迁移，默认 `workspace-write`）。`session.create` 可带 `permission`；
+  `session.permission` 可在运行时切换，`temporary: true` 只存内存并在事件日志留下
+  `permission` 事件，daemon 重启后回到持久值。
+  - `read-only`：不向模型暴露写工具，运行时也拒绝 `write_file` / `run_command` / `start_command`。
+  - `workspace-write`：仍受全局 `[tools] policy` 的 `ask` / `auto` 约束，路径限制在 workspace 内。
+  - `full`：跳过审批直接执行写工具（路径限制仍作为纵深防御保留）；全局 `read-only` 仍是硬上限。
+  - 子 agent 永远只读，与父 session 的级别无关。
+- 全局 `[tools] policy`（`ask` / `auto` / `read-only`）仍作为默认值与上限。
+- 自动批准规则：工具名 + 路径 glob + 命令前缀/正则；只读工具默认放行（仍待实现）。
 
 ## 10. Context ledger
 

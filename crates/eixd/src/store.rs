@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::{bail, Context, Result};
-use eix_core::{now_ms, Event, EventKind, SearchHit, Session, SessionStatus};
+use eix_core::{now_ms, Event, EventKind, PermissionLevel, SearchHit, Session, SessionStatus};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 
@@ -49,6 +49,7 @@ impl Store {
                 forked_from_seq INTEGER,
                 worktree   TEXT,
                 origin     TEXT NOT NULL DEFAULT 'user',
+                permission TEXT NOT NULL DEFAULT 'workspace-write',
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -111,6 +112,12 @@ impl Store {
         add_column(&conn, "sessions", "forked_from_seq", "INTEGER")?;
         add_column(&conn, "sessions", "worktree", "TEXT")?;
         add_column(&conn, "sessions", "origin", "TEXT NOT NULL DEFAULT 'user'")?;
+        add_column(
+            &conn,
+            "sessions",
+            "permission",
+            "TEXT NOT NULL DEFAULT 'workspace-write'",
+        )?;
         // Index messages written before the search tables existed. New events
         // are indexed by `append_event`; the UNIQUE key makes this a no-op on
         // later starts (only the scan cost remains).
@@ -135,8 +142,8 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions
                 (id, name, cwd, status, model, parent_id, forked_from_seq, worktree, origin,
-                 created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 permission, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 session.id,
                 session.name,
@@ -147,6 +154,7 @@ impl Store {
                 session.forked_from_seq.map(|seq| seq as i64),
                 session.worktree.as_ref().map(|path| path.to_string_lossy()),
                 session.origin.as_str(),
+                session.permission.as_str(),
                 session.created_at,
                 session.updated_at,
             ],
@@ -158,7 +166,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, name, cwd, status, model, created_at, updated_at,
-                    parent_id, forked_from_seq, worktree, origin
+                    parent_id, forked_from_seq, worktree, origin, permission
              FROM sessions ORDER BY updated_at DESC, created_at DESC",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -174,7 +182,33 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin
+                        parent_id, forked_from_seq, worktree, origin, permission
+                 FROM sessions WHERE id = ?1",
+                params![id],
+                row_to_session,
+            )
+            .optional()?)
+    }
+
+    /// Change a session's persisted permission level. Returns the updated row,
+    /// or `None` when the session does not exist.
+    pub fn set_session_permission(
+        &self,
+        id: &str,
+        permission: PermissionLevel,
+    ) -> Result<Option<Session>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET permission = ?1, updated_at = ?2 WHERE id = ?3",
+            params![permission.as_str(), now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT id, name, cwd, status, model, created_at, updated_at,
+                        parent_id, forked_from_seq, worktree, origin, permission
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -275,14 +309,14 @@ impl Store {
     ) -> Result<Option<Session>> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
-        let source: Option<(String, Option<String>)> = tx
+        let source: Option<(String, Option<String>, String)> = tx
             .query_row(
-                "SELECT cwd, model FROM sessions WHERE id = ?1",
+                "SELECT cwd, model, permission FROM sessions WHERE id = ?1",
                 params![source_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()?;
-        let Some((source_cwd, model)) = source else {
+        let Some((source_cwd, model, permission)) = source else {
             return Ok(None);
         };
         let max_seq: i64 = tx.query_row(
@@ -309,11 +343,12 @@ impl Store {
         session.forked_from_seq = Some(upto as u64);
         session.worktree = worktree.map(Path::to_path_buf);
         session.origin = eix_core::SessionOrigin::Fork;
+        session.permission = permission.parse().unwrap_or_default();
         tx.execute(
             "INSERT INTO sessions
                 (id, name, cwd, status, model, parent_id, forked_from_seq, worktree, origin,
-                 created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 permission, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 session.id,
                 session.name,
@@ -324,6 +359,7 @@ impl Store {
                 session.forked_from_seq.map(|seq| seq as i64),
                 session.worktree.as_ref().map(|path| path.to_string_lossy()),
                 session.origin.as_str(),
+                session.permission.as_str(),
                 session.created_at,
                 session.updated_at,
             ],
@@ -527,7 +563,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, name, cwd, status, model, created_at, updated_at,
-                    parent_id, forked_from_seq, worktree, origin
+                    parent_id, forked_from_seq, worktree, origin, permission
              FROM sessions WHERE status IN ('running', 'awaiting_approval', 'awaiting_input')",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -573,6 +609,10 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
         worktree: row.get::<_, Option<String>>(9)?.map(PathBuf::from),
         origin: row
             .get::<_, Option<String>>(10)?
+            .and_then(|value| value.parse().ok())
+            .unwrap_or_default(),
+        permission: row
+            .get::<_, Option<String>>(11)?
             .and_then(|value| value.parse().ok())
             .unwrap_or_default(),
     })
@@ -661,6 +701,35 @@ mod tests {
 
     fn session(id: &str) -> Session {
         Session::new(id, "test", "/tmp")
+    }
+
+    #[test]
+    fn permission_round_trips_and_fork_inherits_it() {
+        let store = Store::in_memory().unwrap();
+        let mut parent = session("s1");
+        parent.permission = PermissionLevel::ReadOnly;
+        store.create_session(&parent).unwrap();
+        assert_eq!(
+            store.get_session("s1").unwrap().unwrap().permission,
+            PermissionLevel::ReadOnly
+        );
+
+        let updated = store
+            .set_session_permission("s1", PermissionLevel::Full)
+            .unwrap()
+            .expect("updated row");
+        assert_eq!(updated.permission, PermissionLevel::Full);
+
+        let forked = store
+            .fork_session("s1", None, "fork", None, None)
+            .unwrap()
+            .expect("fork");
+        assert_eq!(forked.permission, PermissionLevel::Full);
+
+        assert!(store
+            .set_session_permission("missing", PermissionLevel::ReadOnly)
+            .unwrap()
+            .is_none());
     }
 
     #[test]

@@ -24,8 +24,9 @@ pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sect
 pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ContextCompactedPayload,
     ContextDropPayload, ContextPinPayload, ErrorPayload, Event, EventKind, HunkInfo,
-    PatchProposedPayload, PatchResultPayload, ProcessExitedPayload, ProcessStartedPayload,
-    SnapshotPayload, StatusChangedPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    PatchProposedPayload, PatchResultPayload, PermissionPayload, ProcessExitedPayload,
+    ProcessStartedPayload, SnapshotPayload, StatusChangedPayload, ToolCallPayload,
+    ToolResultPayload, UserMessagePayload,
 };
 pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, Role, ToolCall, ToolDefinition, Usage,
@@ -37,13 +38,13 @@ pub use protocol::{
     ContextDropParams, ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams,
     DraftResult, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult, Notification,
     PatchApplyParams, PatchGetParams, PatchGetResult, PatchRejectParams, PatchResult,
-    PatchReviseParams, ProcessKillParams, ProcessListParams, ProcessOutputParams, RenameParams,
-    Request, Response, RewindParams, RewindResult, ServerMessage, SessionList, SessionRef,
-    SessionResult, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
+    PatchReviseParams, PermissionParams, ProcessKillParams, ProcessListParams, ProcessOutputParams,
+    RenameParams, Request, Response, RewindParams, RewindResult, ServerMessage, SessionList,
+    SessionRef, SessionResult, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
     WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 pub use search::{SearchHit, SearchParams, SearchResult};
-pub use session::{Session, SessionId, SessionOrigin, SessionStatus};
+pub use session::{PermissionLevel, Session, SessionId, SessionOrigin, SessionStatus};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

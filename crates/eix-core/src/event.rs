@@ -5,7 +5,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{SessionId, SessionStatus, ToolCall, Usage};
+use crate::{PermissionLevel, SessionId, SessionStatus, ToolCall, Usage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -28,6 +28,8 @@ pub enum EventKind {
     ContextCompacted,
     ContextPinned,
     ContextDropped,
+    /// A session's permission level changed (including temporary escalation).
+    Permission,
     Error,
 }
 
@@ -50,6 +52,7 @@ impl EventKind {
             Self::ContextCompacted => "context_compacted",
             Self::ContextPinned => "context_pinned",
             Self::ContextDropped => "context_dropped",
+            Self::Permission => "permission",
             Self::Error => "error",
         }
     }
@@ -81,6 +84,7 @@ impl std::str::FromStr for EventKind {
             "context_compacted" => Self::ContextCompacted,
             "context_pinned" => Self::ContextPinned,
             "context_dropped" => Self::ContextDropped,
+            "permission" => Self::Permission,
             "error" => Self::Error,
             _ => return Err(()),
         })
@@ -242,6 +246,16 @@ pub struct SnapshotPayload {
 pub struct StatusChangedPayload {
     pub from: SessionStatus,
     pub to: SessionStatus,
+}
+
+/// A change to a session's permission level. `temporary` marks an in-memory
+/// escalation that will not survive a daemon restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionPayload {
+    pub from: PermissionLevel,
+    pub to: PermissionLevel,
+    #[serde(default)]
+    pub temporary: bool,
 }
 
 /// Pin (or unpin) one ledger entry so trimming never drops it.
