@@ -5,6 +5,7 @@
 //! submitted drafts, both behind a mutex the UI can read without awaiting.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use crossterm::event::KeyEvent;
@@ -32,6 +33,8 @@ pub struct Shared {
     pub frames: u64,
     /// Number of lines in the prompt buffer, refreshed after every command.
     pub lines: u16,
+    /// True when the user's config was skipped because it failed or hung.
+    pub fallback: bool,
 }
 
 impl Shared {
@@ -41,6 +44,7 @@ impl Shared {
             submitted: Vec::new(),
             frames: 0,
             lines: 1,
+            fallback: false,
         }
     }
 }
@@ -137,7 +141,39 @@ pub struct NvimInput {
 impl NvimInput {
     /// Spawn `nvim --embed`, attach `ext_linegrid`, and install the prompt
     /// profile. `minimal` starts Neovim with `-u NONE`.
+    ///
+    /// With a full config, startup is bounded by five seconds; a hang or an
+    /// early exit falls back to `-u NONE` so the user still gets a prompt. The
+    /// caller can detect the fallback with [`Self::used_minimal_fallback`].
     pub async fn spawn(width: u16, height: u16, minimal: bool) -> Result<Self> {
+        if minimal {
+            return Self::spawn_once(width, height, true).await;
+        }
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            Self::spawn_once(width, height, false),
+        )
+        .await
+        {
+            Ok(Ok(input)) => Ok(input),
+            Ok(Err(err)) => {
+                let mut fallback = Self::spawn_once(width, height, true)
+                    .await
+                    .with_context(|| format!("full nvim config failed: {err:#}"))?;
+                fallback.mark_fallback();
+                Ok(fallback)
+            }
+            Err(_) => {
+                let mut fallback = Self::spawn_once(width, height, true)
+                    .await
+                    .context("embedded nvim did not start within 5s")?;
+                fallback.mark_fallback();
+                Ok(fallback)
+            }
+        }
+    }
+
+    async fn spawn_once(width: u16, height: u16, minimal: bool) -> Result<Self> {
         let shared = Arc::new(Mutex::new(Shared::new(width, height)));
         let handler = NvimHandler {
             shared: Arc::clone(&shared),
@@ -150,6 +186,8 @@ impl NvimInput {
         cmd.arg("--cmd").arg("let g:eix_prompt = 1");
         // An embedded child has no real tty; give it a sane TERM.
         cmd.env("TERM", "xterm-256color");
+        // A startup timeout drops the future; make sure the child dies with it.
+        cmd.kill_on_drop(true);
         if minimal {
             cmd.arg("-u").arg("NONE");
         }
@@ -275,6 +313,20 @@ impl NvimInput {
     /// Prompt buffer line count, used to size the input area.
     pub fn line_count(&self) -> u16 {
         self.shared.lock().map(|shared| shared.lines).unwrap_or(1)
+    }
+
+    /// True when the user's config was skipped after a failed/slow start.
+    pub fn used_minimal_fallback(&self) -> bool {
+        self.shared
+            .lock()
+            .map(|shared| shared.fallback)
+            .unwrap_or(false)
+    }
+
+    fn mark_fallback(&mut self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.fallback = true;
+        }
     }
 
     /// Render the last received frame into `area`.

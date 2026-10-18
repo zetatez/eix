@@ -147,6 +147,33 @@ impl Staging {
         Ok(())
     }
 
+    /// Replace a patch's proposed content (an edit-before-approve). Returns the
+    /// updated patch, or `None` when the id is unknown.
+    pub fn update_content(
+        &self,
+        session_id: &str,
+        patch_id: &str,
+        new: String,
+    ) -> Result<Option<StagedPatch>> {
+        let mut pending = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(patches) = pending.get_mut(session_id) else {
+            return Ok(None);
+        };
+        let Some(patch) = patches.iter_mut().find(|patch| patch.patch_id == patch_id) else {
+            return Ok(None);
+        };
+        patch.new = new;
+        patch.created_ms = now_ms();
+        let updated = patch.clone();
+        let path = self.patch_path(&updated);
+        let bytes = serde_json::to_vec(&updated)?;
+        std::fs::write(&path, bytes).with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(Some(updated))
+    }
+
     /// All pending patches for a session, oldest first.
     pub fn pending(&self, session_id: &str) -> Vec<StagedPatch> {
         let mut patches = self
@@ -156,6 +183,19 @@ impl Staging {
             .get(session_id)
             .cloned()
             .unwrap_or_default();
+        patches.sort_by_key(|patch| patch.created_ms);
+        patches
+    }
+
+    /// Every pending patch across sessions, oldest first.
+    pub fn all(&self) -> Vec<StagedPatch> {
+        let mut patches: Vec<StagedPatch> = self
+            .pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .values()
+            .flat_map(|patches| patches.iter().cloned())
+            .collect();
         patches.sort_by_key(|patch| patch.created_ms);
         patches
     }

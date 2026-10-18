@@ -55,6 +55,7 @@ timeout_secs = 300
 [notifications]
 # command = "notify-send eix \"$EIX_SESSION_NAME $EIX_STATUS\""
 bell = false
+osc = true            # OSC 9/777 桌面通知 + 终端标题（不支持的终端会忽略）
 cooldown_secs = 10
 
 [context]
@@ -111,6 +112,9 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 | `Tab` / `S-Tab` | 聚焦 pane 切到下一个 / 上一个 session（转录区） |
 | `n` / `N` | 新建 session 并在新 pane 打开（有待审批时 `n` 先作为 deny；`N` 同时在 `.worktrees/<name>` 建 git worktree） |
 | `y` / `n` | 批准 / 拒绝聚焦 pane 的待审批工具调用 |
+| `e` / `o` | 编辑 staged 的新内容（改完重新 stage）/ 在 `$EDITOR` 打开真实文件 |
+| `r` | 输入理由并拒绝（Enter 发送，Esc 取消） |
+| `A` | 跨 session 审批 inbox（`j/k` 选择、`Enter` 跳转、`y/n` 处理、`Esc` 关闭） |
 | `d` | 全屏审阅待审批写入的 diff；有 hunk 时 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/全不选、`y` 应用选中、`n` 拒绝 |
 | `c` | context ledger：`j/k` 移动、`o` 展开、`p` pin、`d` drop/恢复、`m` 标记、`s` 压缩（单条或 mark 到光标的范围）、`f` fork、`w` rewind 并回滚工作区、`Esc` 关闭 |
 | `P` | 后台进程：`j/k` 选择、`x` kill、`r` 刷新、`PgUp`/`PgDn` 滚动输出、`Esc` 关闭 |
@@ -126,11 +130,17 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 `write_file` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现 `[y] apply / [n] reject`
 卡片并显示 unified diff（最多 10 行，超出标 `… diff truncated`）；按 `d` 可全屏审阅：
 `j/k` 滚动，`[`/`]` 跳 hunk，`Space` 勾选，`a` 全选/全不选，`y` 应用选中，`n` 拒绝。
-未勾选任何 hunk 时 `y` 会提示先选择。`run_command` 仍走阻塞式审批卡片。session 栏
-显示 `⚠`；也可以从命令行用
-`eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk）。后台 pane 有
+未勾选任何 hunk 时 `y` 会提示先选择。卡片还支持 `e`（把 staged 内容写进临时文件交给
+`$EDITOR`，保存后通过 `patch.revise` 更新 diff 再审批）、`o`（打开工作区里的真实文件）
+和 `r`（输入拒绝理由，随 `approval.respond` 一起发给模型）；卡片标题会标出
+`[shell]` / `[workspace-write]` / `[agent]` / `[read]` 风险级别。`run_command` 仍走阻塞式
+审批卡片。session 栏显示 `⚠`；也可以从命令行用
+`eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk，
+`eix deny --reason "..."` 会记录理由）。`A` 打开跨 session 的审批 inbox，`Enter` 跳到
+对应 pane，`y/n` 直接处理；`eix approvals --json` 供脚本使用。后台 pane 有
 pending 审批/补丁或进入 `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
-按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的卡片。
+按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的卡片，输入框
+里的未发送文字也会通过 daemon 草稿恢复。
 
 后台进程由 daemon 托管：`start_command`（与 `run_command` 共用沙箱与审批门禁）启动后
 立即返回进程 id，`process_output`（只读）读取最新/指定进程的尾部输出。`P` 打开全屏列表，
@@ -362,8 +372,9 @@ eix --tcp 127.0.0.1:7777 --token "$EIX_TOKEN" tui
 ```
 
 CLI/TUI 的 `--tcp`（或 `EIX_TCP`）会改用 TCP，`--token`（`EIX_TCP_TOKEN`）带上凭证；
-TCP 端点是远端，`eix` 不会尝试在本地拉起 daemon。注意：Unix 连接会收到所有 session 的
-广播，TCP 连接在认证后同样如此——按 session 过滤连接留待后续。
+TCP 端点是远端，`eix` 不会尝试在本地拉起 daemon。Unix 连接默认收到所有 session 的广播；
+任何连接（含认证后的 TCP）都可以用 `session.subscribe {session_ids}` 把广播收窄到指定
+session（`null` 恢复全部），`eix nvim` attach 后会自动只订阅当前 session。
 
 ### `eix nvim`：独立的 Neovim 前端
 
@@ -384,9 +395,14 @@ eix nvim [--session ID]      # 也可用 EIX_NVIM 覆盖 nvim 可执行文件
 | `:Eix fork [SEQ]` / `:Eix rewind [SEQ]` | 分叉 / 回滚并切到新 session |
 | `:Eix stop` | 取消当前 turn |
 | `:Eix ps` / `:Eix ledger` | 后台进程 / context ledger |
+| `<leader>a` | 动作 palette（list / new / worktree / prompt / stop / fork / rewind / ps / ledger） |
 
 每个 Neovim 进程是一个独立 client，共享同一个 daemon；daemon 会串行化同一 session 的
-turn，第二个 prompt 在忙时会被拒绝。`eix tui` 内嵌的 nvim 仍只负责输入条，二者互不影响。
+turn，第二个 prompt 在忙时会被拒绝。attach 后前端会发 `session.subscribe`，只接收当前
+session 的事件。`eix tui` 内嵌的 nvim 仍只负责输入条，二者互不影响。
+
+启动时如果完整配置（`~/.config/nvim`）超过 5 秒仍未就绪，TUI 会杀掉子进程并用
+`-u NONE` 重试，状态栏会显示 fallback 提示；嵌入输入不可用时退回内置文本框。
 
 ## Nvim spike
 
@@ -466,4 +482,14 @@ spike 内：
 - [x] daemon 化的 nvim 前端（内嵌 Lua 插件 + JSON-RPC、`:Eix` 命令、headless 测试）
 - [x] 远程 attach（TCP + 强制 token、首请求 `auth`、CLI `--tcp/--token`）
 - [x] 全文搜索（FTS5 trigram + 短查询子串回退、TUI `#`、`eix search`）
-- [ ] 按 session 过滤 TCP 广播、审批 `e`/`o`/reason UI、`eix pick`、`status --json`、CI
+- [x] 按连接过滤广播（`session.subscribe`，`null` = 全部；`eix nvim` 只订阅当前 session）
+- [x] 审批增强（`e` 编辑 staged 内容、`o` 打开真实文件、`r` 带理由拒绝、`A` 跨 session 审批 inbox、风险标签）
+- [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
+- [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）
+- [x] 客户端通知（`bell` + OSC 9/777 + 终端标题，`[notifications] osc`）
+- [x] nvim 对话框与启动兜底（完整配置 5s 超时回退 `-u NONE`、`:Eix` palette `<leader>a`）
+- [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）
+- [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
+- [ ] 按 session 权限级别（DESIGN 9.3 的 read-only / workspace-write / full 目前只有全局 `tools.policy`）
+- [ ] nvim 配色 → TUI 主题桥接
+- [ ] `ext_multigrid` 多窗口渲染

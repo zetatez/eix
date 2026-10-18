@@ -61,6 +61,19 @@ impl Input {
         *self = Self::default();
     }
 
+    fn set_text(&mut self, text: &str) {
+        *self = Self::default();
+        if text.is_empty() {
+            return;
+        }
+        self.lines = text.split('\n').map(str::to_string).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.row = self.lines.len() - 1;
+        self.col = self.lines[self.row].chars().count();
+    }
+
     fn line(&self) -> &str {
         &self.lines[self.row]
     }
@@ -262,17 +275,24 @@ impl SessionView {
                                 tool: payload.tool,
                                 summary: payload.summary,
                                 diff: payload.diff,
+                                path: payload
+                                    .arguments
+                                    .get("path")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_string),
                                 selected: vec![true; payload.hunks.len()],
                                 hunks: payload.hunks,
                             });
                         }
                     }
                 }
-                EventKind::PatchProposed if patch.is_none() => {
+                EventKind::PatchProposed => {
                     if let Ok(payload) =
                         serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
                     {
                         if !resolved_patches.contains(&payload.patch_id) {
+                            // A later proposal for the same patch (an edit
+                            // before approval) supersedes the earlier one.
                             patch = Some(PendingApproval {
                                 kind: PendingKind::Patch,
                                 approval_id: payload.patch_id,
@@ -280,6 +300,7 @@ impl SessionView {
                                 tool: payload.tool,
                                 summary: payload.summary,
                                 diff: payload.diff,
+                                path: Some(payload.path),
                                 selected: vec![true; payload.hunks.len()],
                                 hunks: payload.hunks,
                             });
@@ -342,10 +363,32 @@ struct PendingApproval {
     tool: String,
     summary: String,
     diff: Option<String>,
+    /// Workspace-relative target path, when the tool has one.
+    path: Option<String>,
     /// Per-hunk preview for file-writing tools.
     hunks: Vec<HunkInfo>,
     /// Whether each hunk is selected; parallel to `hunks`.
     selected: Vec<bool>,
+}
+
+/// Inline reason for denying an approval (`r` on the card).
+struct ReasonPrompt {
+    session_id: String,
+    text: String,
+}
+
+/// Cross-session list of pending approvals, opened with `A`.
+struct InboxView {
+    items: Vec<InboxItem>,
+    cursor: usize,
+}
+
+struct InboxItem {
+    session_id: String,
+    session_name: String,
+    tool: String,
+    summary: String,
+    kind: PendingKind,
 }
 
 /// Full-screen review of an approval's diff, opened with `d`.
@@ -563,13 +606,27 @@ pub struct App {
     tick: u64,
     /// Ring the terminal bell when a background pane needs attention.
     pub bell: bool,
+    /// Emit OSC 9/777 notifications and update the title on attention.
+    pub osc: bool,
     /// Set when a notification should ring; cleared by the event loop.
     ring: bool,
+    /// Text for the next alert (session name + status).
+    last_alert: Option<String>,
     /// Embedded Neovim prompt, when available.
     nvim: Option<NvimInput>,
     /// Last draft submitted from the Neovim prompt (session id, text), kept so
     /// a failed turn can put it back into the buffer.
     nvim_draft: Option<(String, String)>,
+    /// Session the native prompt currently belongs to, for daemon drafts.
+    input_session: Option<String>,
+    /// Text last written to the daemon, so `tick` only saves real changes.
+    last_saved_draft: String,
+    /// Open reason input for a denial.
+    reason_prompt: Option<ReasonPrompt>,
+    /// Ask the event loop to clear ratatui's cached frame after an editor.
+    force_clear: bool,
+    /// Cross-session approvals overlay.
+    inbox: Option<InboxView>,
 }
 
 impl App {
@@ -604,9 +661,16 @@ impl App {
             connected: false,
             tick: 0,
             bell: false,
+            osc: false,
             ring: false,
+            last_alert: None,
             nvim: None,
             nvim_draft: None,
+            input_session: None,
+            last_saved_draft: String::new(),
+            reason_prompt: None,
+            force_clear: false,
+            inbox: None,
         }
     }
 
@@ -684,8 +748,58 @@ impl App {
         std::mem::take(&mut self.ring)
     }
 
-    pub fn tick(&mut self) {
+    /// Text for the most recent background alert.
+    pub fn alert_message(&self) -> Option<String> {
+        self.last_alert.clone()
+    }
+
+    /// True once after an external editor ran, so the frame is fully repainted.
+    pub fn take_force_clear(&mut self) -> bool {
+        std::mem::take(&mut self.force_clear)
+    }
+
+    pub fn tick(&mut self, tx: &UnboundedSender<Command>) {
         self.tick = self.tick.wrapping_add(1);
+        self.sync_draft(tx);
+    }
+
+    /// Persist the native prompt as a per-session draft when the focused pane
+    /// changes or the text is edited. No-op with the Neovim prompt, whose text
+    /// lives in the child process.
+    fn sync_draft(&mut self, tx: &UnboundedSender<Command>) {
+        if self.nvim.is_some() {
+            return;
+        }
+        let focused = self
+            .views
+            .get(self.focused)
+            .map(|view| view.session.id.clone());
+        if focused != self.input_session {
+            if let Some(previous) = self.input_session.take() {
+                let text = self.input.text();
+                if text != self.last_saved_draft {
+                    let _ = tx.send(Command::DraftSet {
+                        session_id: previous,
+                        text,
+                    });
+                }
+            }
+            self.input.clear();
+            self.last_saved_draft.clear();
+            self.input_session = focused;
+            if let Some(session_id) = self.input_session.clone() {
+                let _ = tx.send(Command::DraftGet { session_id });
+            }
+            return;
+        }
+        let Some(session_id) = self.input_session.clone() else {
+            return;
+        };
+        let text = self.input.text();
+        if text != self.last_saved_draft {
+            self.last_saved_draft = text.clone();
+            let _ = tx.send(Command::DraftSet { session_id, text });
+        }
     }
 
     pub fn handle_paste(&mut self, text: &str) {
@@ -828,6 +942,23 @@ impl App {
                     format!("{count} hit(s) · Enter opens the selected session")
                 };
             }
+            Event::Draft { session_id, text } => {
+                // Prefill only the prompt the draft belongs to, and only when
+                // the user has not already started typing.
+                if self.input_session.as_deref() == Some(session_id.as_str())
+                    && self.input.is_empty()
+                {
+                    if !text.is_empty() {
+                        self.input.set_text(&text);
+                    }
+                    self.last_saved_draft = self.input.text();
+                }
+            }
+            Event::PatchEdit {
+                session_id,
+                patch_id,
+                text,
+            } => self.edit_patch(&session_id, &patch_id, &text, tx),
             Event::Submitted(submitted) => self.submitted(submitted),
             Event::Cancelled(cancelled) => {
                 self.status = if cancelled {
@@ -1032,8 +1163,17 @@ impl App {
                             alert = true;
                         }
                     }
-                    if alert && self.bell {
-                        self.ring = true;
+                    if alert {
+                        self.last_alert = self
+                            .views
+                            .iter()
+                            .find(|view| view.session.id == params.session_id)
+                            .map(|view| {
+                                format!("{} · {}", view.session.name, params.status.as_str())
+                            });
+                        if self.bell || self.osc {
+                            self.ring = true;
+                        }
                     }
                 }
             }
@@ -1124,6 +1264,11 @@ impl App {
                             tool: params.tool,
                             summary: params.summary,
                             selected: vec![true; params.hunks.len()],
+                            path: params
+                                .arguments
+                                .get("path")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string),
                             diff: params.diff,
                             hunks: params.hunks,
                         },
@@ -1320,6 +1465,39 @@ impl App {
             return;
         }
 
+        if self.reason_prompt.is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.reason_prompt = None;
+                    self.status = "denial cancelled".into();
+                }
+                KeyCode::Enter => {
+                    if let Some(prompt) = self.reason_prompt.take() {
+                        let reason = prompt.text.trim().to_string();
+                        self.respond_approval_for(
+                            &prompt.session_id,
+                            ApprovalDecision::Deny,
+                            None,
+                            (!reason.is_empty()).then_some(reason),
+                            tx,
+                        );
+                    }
+                }
+                KeyCode::Backspace => {
+                    if let Some(prompt) = self.reason_prompt.as_mut() {
+                        prompt.text.pop();
+                    }
+                }
+                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(prompt) = self.reason_prompt.as_mut() {
+                        prompt.text.push(ch);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.search_view.is_some() {
             self.handle_search_key(key, tx);
             return;
@@ -1332,6 +1510,11 @@ impl App {
 
         if self.process_view.is_some() {
             self.handle_process_key(key, tx);
+            return;
+        }
+
+        if self.inbox.is_some() {
+            self.handle_inbox_key(key, tx);
             return;
         }
 
@@ -1470,6 +1653,18 @@ impl App {
                     self.open_diff_view();
                     return;
                 }
+                KeyCode::Char('e') => {
+                    self.edit_proposed(tx);
+                    return;
+                }
+                KeyCode::Char('o') => {
+                    self.open_approval_file();
+                    return;
+                }
+                KeyCode::Char('r') => {
+                    self.start_reason_prompt();
+                    return;
+                }
                 _ => {}
             }
         }
@@ -1482,6 +1677,7 @@ impl App {
             KeyCode::Char('o') => self.open_picker(PickerMode::NewPane),
             KeyCode::Char('c') => self.open_ledger(tx),
             KeyCode::Char('P') => self.open_processes(tx),
+            KeyCode::Char('A') => self.open_inbox(),
             KeyCode::Char('#') => {
                 self.search_view = Some(SearchView::new());
                 self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
@@ -1683,6 +1879,98 @@ impl App {
         self.process_view = Some(ProcessView::new(session_id.clone()));
         self.status = "processes: loading…".into();
         let _ = tx.send(Command::ProcessList { session_id });
+    }
+
+    /// Open the cross-session approvals inbox from the approvals the TUI has
+    /// already seen; answering updates the per-session cards as usual.
+    fn open_inbox(&mut self) {
+        let mut items: Vec<InboxItem> = self
+            .approvals
+            .iter()
+            .map(|(session_id, pending)| {
+                let session_name = self
+                    .sessions
+                    .iter()
+                    .find(|session| &session.id == session_id)
+                    .map(|session| session.name.clone())
+                    .unwrap_or_else(|| session_id.chars().take(8).collect());
+                InboxItem {
+                    session_id: session_id.clone(),
+                    session_name,
+                    tool: pending.tool.clone(),
+                    summary: pending.summary.clone(),
+                    kind: pending.kind,
+                }
+            })
+            .collect();
+        items.sort_by(|a, b| a.session_name.cmp(&b.session_name));
+        if items.is_empty() {
+            self.status = "no pending approvals".into();
+            return;
+        }
+        self.inbox = Some(InboxView { items, cursor: 0 });
+        self.status = "approvals · Enter opens · y/n answer · Esc closes".into();
+    }
+
+    fn handle_inbox_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        let Some(inbox) = self.inbox.as_ref() else {
+            return;
+        };
+        let len = inbox.items.len();
+        let cursor = inbox.cursor;
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('A') => {
+                self.inbox = None;
+                self.status = "approvals closed".into();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if let Some(inbox) = self.inbox.as_mut() {
+                    inbox.cursor = (cursor + 1).min(len.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                if let Some(inbox) = self.inbox.as_mut() {
+                    inbox.cursor = cursor.saturating_sub(1);
+                }
+            }
+            KeyCode::Char('y') | KeyCode::Char('n') => {
+                let Some(item) = self
+                    .inbox
+                    .as_ref()
+                    .and_then(|inbox| inbox.items.get(cursor))
+                else {
+                    return;
+                };
+                let session_id = item.session_id.clone();
+                let decision = if key.code == KeyCode::Char('y') {
+                    ApprovalDecision::Approve
+                } else {
+                    ApprovalDecision::Deny
+                };
+                self.respond_approval_for(&session_id, decision, None, None, tx);
+            }
+            KeyCode::Enter => {
+                let session_id = self
+                    .inbox
+                    .as_ref()
+                    .and_then(|inbox| inbox.items.get(cursor))
+                    .map(|item| item.session_id.clone());
+                self.inbox = None;
+                let Some(session_id) = session_id else {
+                    return;
+                };
+                if let Some(index) = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == session_id)
+                {
+                    self.select_session(index, tx);
+                } else {
+                    self.status = "that session is no longer listed".into();
+                }
+            }
+            _ => {}
+        }
     }
 
     fn handle_process_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
@@ -2024,7 +2312,7 @@ impl App {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             return;
         };
-        self.respond_approval_for(&session_id, decision, None, tx);
+        self.respond_approval_for(&session_id, decision, None, None, tx);
     }
 
     fn respond_approval_for(
@@ -2032,6 +2320,7 @@ impl App {
         session_id: &str,
         decision: ApprovalDecision,
         hunks: Option<Vec<usize>>,
+        reason: Option<String>,
         tx: &UnboundedSender<Command>,
     ) {
         let Some(pending) = self.approvals.get(session_id) else {
@@ -2048,7 +2337,99 @@ impl App {
             approval_id,
             decision,
             hunks,
+            reason,
         });
+    }
+
+    fn edit_proposed(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            return;
+        };
+        let Some(pending) = self.approvals.get(&session_id) else {
+            return;
+        };
+        if pending.kind != PendingKind::Patch {
+            self.status = "only staged writes can be edited before approval".into();
+            return;
+        }
+        let patch_id = pending.approval_id.clone();
+        self.status = "loading staged content…".into();
+        let _ = tx.send(Command::PatchGet {
+            session_id,
+            patch_id,
+        });
+    }
+
+    fn open_approval_file(&mut self) {
+        let Some(view) = self.focused_view() else {
+            return;
+        };
+        let session_id = view.session.id.clone();
+        let cwd = view.session.cwd.clone();
+        let Some(pending) = self.approvals.get(&session_id) else {
+            return;
+        };
+        let Some(path) = pending.path.clone() else {
+            self.status = "this approval has no file to open".into();
+            return;
+        };
+        let full = cwd.join(&path);
+        if !full.exists() {
+            self.status = format!("{} does not exist yet", full.display());
+            return;
+        }
+        match run_editor(&full) {
+            Ok(()) => self.status = format!("opened {path}"),
+            Err(err) => self.status = format!("editor: {err:#}"),
+        }
+        self.force_clear = true;
+    }
+
+    fn start_reason_prompt(&mut self) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            return;
+        };
+        self.reason_prompt = Some(ReasonPrompt {
+            session_id,
+            text: String::new(),
+        });
+        self.status = "reason for denial · Enter to deny · Esc to cancel".into();
+    }
+
+    /// Write the staged content to a temp file, let the user edit it, and send
+    /// the result back to the daemon as a revised patch.
+    fn edit_patch(
+        &mut self,
+        session_id: &str,
+        patch_id: &str,
+        text: &str,
+        tx: &UnboundedSender<Command>,
+    ) {
+        let path = std::env::temp_dir().join(format!("eix-{patch_id}.txt"));
+        if let Err(err) = std::fs::write(&path, text) {
+            self.status = format!("cannot write {}: {err}", path.display());
+            return;
+        }
+        let outcome = run_editor(&path);
+        self.force_clear = true;
+        if let Err(err) = outcome {
+            self.status = format!("editor: {err:#}");
+            let _ = std::fs::remove_file(&path);
+            return;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(edited) if edited != text => {
+                let _ = tx.send(Command::PatchRevise {
+                    session_id: session_id.to_string(),
+                    patch_id: patch_id.to_string(),
+                    text: edited,
+                });
+                self.status = "updating the staged patch…".into();
+            }
+            Ok(_) => self.status = "no changes".into(),
+            Err(err) => self.status = format!("cannot read the edited file: {err}"),
+        }
+        let _ = std::fs::remove_file(&path);
     }
 
     fn open_diff_view(&mut self) {
@@ -2122,6 +2503,7 @@ impl App {
                             &session_id,
                             ApprovalDecision::Approve,
                             partial,
+                            None,
                             tx,
                         );
                     }
@@ -2130,7 +2512,7 @@ impl App {
             }
             KeyCode::Char('n') => {
                 self.diff_view = None;
-                self.respond_approval_for(&session_id, ApprovalDecision::Deny, None, tx);
+                self.respond_approval_for(&session_id, ApprovalDecision::Deny, None, None, tx);
             }
             KeyCode::Char(' ') => {
                 if let Some(approval) = self.approvals.get_mut(&session_id) {
@@ -2476,6 +2858,9 @@ impl App {
         }
         if self.process_view.is_some() {
             self.draw_processes(frame, area);
+        }
+        if self.inbox.is_some() {
+            self.draw_inbox(frame, area);
         }
         if self.search_view.is_some() {
             self.draw_search(frame, area);
@@ -2982,6 +3367,10 @@ impl App {
 
     fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
         let connected = if self.connected { "●" } else { "○" };
+        let status = match &self.reason_prompt {
+            Some(prompt) => format!("deny reason: {}▏ (Enter denies · Esc cancels)", prompt.text),
+            None => self.status.clone(),
+        };
         let message = match &self.error {
             Some(error) => format!(" error: {error}"),
             None => format!(
@@ -2990,7 +3379,7 @@ impl App {
                 self.model(),
                 self.views.len(),
                 self.sessions.len(),
-                self.status
+                status
             ),
         };
         let style = if self.error.is_some() {
@@ -3009,13 +3398,13 @@ impl App {
                 .as_deref()
                 .is_some_and(|diff| !diff.is_empty())
         }) {
-            " y approve  n deny  d review  ? help "
+            " y approve  n deny  e edit  o open  r reason  d review  ? help "
         } else if self.focused_approval().is_some() {
-            " y approve  n deny  x cancel  ? help "
+            " y approve  n deny  o open  r reason  x cancel  ? help "
         } else if self.attention_count() > 0 {
-            " a next attention  ? help  q quit "
+            " a next attention  A approvals  ? help  q quit "
         } else {
-            " c ctx  P ps  C-w pane  p picker  q quit "
+            " c ctx  P ps  A approvals  p picker  q quit "
         };
         frame.render_widget(
             Paragraph::new(hint)
@@ -3171,6 +3560,58 @@ impl App {
             .title(" context ledger ");
         frame.render_widget(
             Paragraph::new(body)
+                .block(block)
+                .style(Style::default().bg(Color::Black)),
+            rect,
+        );
+    }
+
+    fn draw_inbox(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(inbox) = &self.inbox else {
+            return;
+        };
+        let rows = (inbox.items.len() as u16 + 4).min(area.height.saturating_sub(2).max(5));
+        let rect = centered(area, area.width.saturating_sub(6).max(30), rows);
+        frame.render_widget(Clear, rect);
+        let inner = rect.width.saturating_sub(2) as usize;
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (index, item) in inbox.items.iter().enumerate() {
+            let marker = if index == inbox.cursor { "▸ " } else { "  " };
+            let kind = match item.kind {
+                PendingKind::Tool => "tool",
+                PendingKind::Patch => "patch",
+            };
+            let label = format!(
+                "{marker}{:<20} {:<5} {:<14} {}",
+                truncate(&item.session_name, 20),
+                kind,
+                item.tool,
+                item.summary
+            );
+            let style = if index == inbox.cursor {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(truncate(&label, inner), style)));
+        }
+        lines.push(Line::from(Span::styled(
+            truncate(
+                " Enter open · y approve · n deny · j/k select · Esc close ",
+                inner,
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(format!(" approvals · {} ", inbox.items.len()));
+        frame.render_widget(
+            Paragraph::new(lines)
                 .block(block)
                 .style(Style::default().bg(Color::Black)),
             rect,
@@ -3491,6 +3932,8 @@ struct ApprovalParams {
     tool: String,
     summary: String,
     #[serde(default)]
+    arguments: serde_json::Value,
+    #[serde(default)]
     diff: Option<String>,
     #[serde(default)]
     hunks: Vec<HunkInfo>,
@@ -3729,6 +4172,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             "d",
             "review the pending diff full screen (Space toggles hunks)",
         ),
+        key_line("e / o", "edit the staged content / open the real file"),
+        key_line("r", "deny the pending approval with a reason"),
+        key_line("A", "approvals inbox across sessions"),
         key_line("j / k", "scroll focused transcript"),
         key_line("g / G", "top / follow tail"),
         key_line("c", "context ledger (f fork here, w rewind + roll back)"),
@@ -4009,6 +4455,45 @@ fn review_total_lines(approval: &PendingApproval) -> usize {
     }
 }
 
+/// Hand the terminal to `$VISUAL`/`$EDITOR` (default `nvim`) and return to the
+/// alternate screen. The caller sets `force_clear` so ratatui repaints.
+fn run_editor(path: &std::path::Path) -> anyhow::Result<()> {
+    use crossterm::cursor::{Hide, Show};
+    use crossterm::terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    };
+    let editor = std::env::var("VISUAL")
+        .or_else(|_| std::env::var("EDITOR"))
+        .unwrap_or_else(|_| "nvim".to_string());
+    let mut parts = editor.split_whitespace();
+    let program = parts.next().unwrap_or("nvim");
+    let mut stdout = std::io::stdout();
+    disable_raw_mode().ok();
+    crossterm::execute!(stdout, LeaveAlternateScreen, Show).ok();
+    let status = std::process::Command::new(program)
+        .args(parts)
+        .arg(path)
+        .status();
+    enable_raw_mode().ok();
+    crossterm::execute!(stdout, EnterAlternateScreen, Hide).ok();
+    match status {
+        Ok(status) if status.success() => Ok(()),
+        Ok(status) => Err(anyhow::anyhow!("editor exited with {status}")),
+        Err(err) => Err(anyhow::anyhow!("cannot launch {program}: {err}")),
+    }
+}
+
+/// Risk label for an approval card (DESIGN 9.3): shell commands are called
+/// out separately from workspace writes and read-only tools.
+fn approval_risk(tool: &str) -> (&'static str, Color) {
+    match tool {
+        "run_command" => ("shell", Color::Red),
+        "write_file" | "edit_file" | "apply_patch" => ("workspace-write", Color::Yellow),
+        "spawn_agent" => ("agent", Color::Magenta),
+        _ => ("read", Color::Green),
+    }
+}
+
 fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval) {
     if area.width < 20 || area.height < 6 {
         return;
@@ -4028,6 +4513,7 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
     frame.render_widget(Clear, rect);
 
     let summary = truncate(&approval.summary, rect.width.saturating_sub(4) as usize);
+    let (risk, risk_color) = approval_risk(&approval.tool);
     let mut lines = vec![Line::from(vec![
         Span::styled(
             "⚠ ",
@@ -4036,6 +4522,7 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(summary, Style::default().fg(Color::Yellow)),
+        Span::styled(format!("  [{risk}]"), Style::default().fg(risk_color)),
     ])];
     let inner = rect.width.saturating_sub(2) as usize;
     for line in diff_lines.iter().take(shown) {
@@ -4054,6 +4541,16 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
         Span::styled("[y] approve  ", Style::default().fg(Color::Green)),
         Span::styled("[n] deny  ", Style::default().fg(Color::Red)),
     ];
+    if approval.path.is_some() {
+        keys.push(Span::styled("[o] open  ", Style::default().fg(Color::Cyan)));
+    }
+    if approval.kind == PendingKind::Patch {
+        keys.push(Span::styled("[e] edit  ", Style::default().fg(Color::Cyan)));
+    }
+    keys.push(Span::styled(
+        "[r] reason  ",
+        Style::default().fg(Color::DarkGray),
+    ));
     if !diff_lines.is_empty() {
         keys.push(Span::styled(
             if approval.hunks.is_empty() {
@@ -4452,6 +4949,7 @@ mod tests {
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: None,
+                path: None,
                 hunks: Vec::new(),
                 selected: Vec::new(),
             },
@@ -4464,11 +4962,13 @@ mod tests {
                 approval_id,
                 decision,
                 hunks,
+                reason,
             } => {
                 assert_eq!(session_id, "s1");
                 assert_eq!(approval_id, "a1");
                 assert_eq!(decision, ApprovalDecision::Approve);
                 assert!(hunks.is_none());
+                assert!(reason.is_none());
             }
             _ => panic!("expected an approval command"),
         }
@@ -4500,6 +5000,7 @@ mod tests {
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: diff.map(str::to_string),
+                path: None,
                 hunks: Vec::new(),
                 selected: Vec::new(),
             },
@@ -4532,11 +5033,83 @@ mod tests {
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: Some("unused".to_string()),
+                path: None,
                 selected: vec![true; hunks.len()],
                 hunks,
             },
         );
         app
+    }
+
+    #[test]
+    fn approval_reason_is_sent_with_a_denial() {
+        let (mut app, tx, mut rx) = app_with_diff(None);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &tx);
+        assert!(app.reason_prompt.is_some());
+        for ch in "scope".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.reason_prompt.is_none());
+
+        match rx.try_recv().expect("deny command") {
+            Command::Approval {
+                decision, reason, ..
+            } => {
+                assert_eq!(decision, ApprovalDecision::Deny);
+                assert_eq!(reason.as_deref(), Some("scope"));
+            }
+            _ => panic!("expected a denial"),
+        }
+    }
+
+    #[test]
+    fn editing_a_staged_patch_requests_its_content() {
+        let (mut app, tx, mut rx) = app_with_diff(Some("@@ -1 +1 @@\n-x\n+y\n"));
+        if let Some(approval) = app.approvals.get_mut("s1") {
+            approval.kind = PendingKind::Patch;
+            approval.path = Some("out.txt".to_string());
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('e'), KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("patch.get command") {
+            Command::PatchGet {
+                session_id,
+                patch_id,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(patch_id, "a1");
+            }
+            _ => panic!("expected a patch.get command"),
+        }
+    }
+
+    #[test]
+    fn inbox_lists_and_answers_pending_approvals() {
+        let (mut app, tx, mut rx) = app_with_diff(None);
+        app.sessions.push(Session::new("s1", "tools", "/tmp"));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE), &tx);
+        let inbox = app.inbox.as_ref().expect("inbox opened");
+        assert_eq!(inbox.items.len(), 1);
+        assert_eq!(inbox.items[0].session_name, "tools");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("approval command") {
+            Command::Approval {
+                session_id,
+                decision,
+                ..
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(decision, ApprovalDecision::Approve);
+            }
+            _ => panic!("expected an approval command"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.inbox.is_none());
     }
 
     #[test]
@@ -4567,11 +5140,13 @@ mod tests {
                 approval_id,
                 decision,
                 hunks,
+                reason,
             } => {
                 assert_eq!(session_id, "s1");
                 assert_eq!(approval_id, "a1");
                 assert_eq!(decision, ApprovalDecision::Approve);
                 assert!(hunks.is_none());
+                assert!(reason.is_none());
             }
             _ => panic!("expected an approval command"),
         }

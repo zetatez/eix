@@ -36,6 +36,7 @@ pub async fn run(
     config: Option<PathBuf>,
     initial_session: Option<String>,
     bell: bool,
+    osc: bool,
     input: InputConfig,
 ) -> Result<()> {
     if !io::stdout().is_terminal() {
@@ -50,12 +51,21 @@ pub async fn run(
         InputBackend::Native => None,
         InputBackend::Nvim | InputBackend::Auto => {
             match NvimInput::spawn(cols, 3, input.minimal).await {
-                Ok(nvim) => Some(nvim),
+                Ok(nvim) => {
+                    if nvim.used_minimal_fallback() {
+                        fallback_note = Some(
+                            "nvim config failed or timed out; started with -u NONE".to_string(),
+                        );
+                    }
+                    Some(nvim)
+                }
                 Err(err) if input.backend == InputBackend::Nvim => {
                     return Err(err).context("embedded nvim input");
                 }
                 Err(err) => {
-                    fallback_note = Some(format!("embedded nvim unavailable: {err:#}"));
+                    fallback_note = Some(format!(
+                        "embedded nvim unavailable: {err:#}; using the native prompt"
+                    ));
                     None
                 }
             }
@@ -65,11 +75,12 @@ pub async fn run(
     let mut terminal = init_terminal()?;
     let mut app = App::new(initial_session);
     app.bell = bell;
+    app.osc = osc;
     if let Some(nvim) = nvim {
         app.set_nvim_input(nvim);
     }
     if let Some(note) = fallback_note {
-        app.set_status(format!("{note}; using the native prompt"));
+        app.set_status(note);
     }
     let (cmd_tx, mut ev_rx) = controller::spawn(endpoint, data_dir, config);
     let _ = cmd_tx.send(Command::Hello);
@@ -84,6 +95,9 @@ pub async fn run(
     let mut outcome = Ok(());
     loop {
         app.poll_nvim(&cmd_tx);
+        if app.take_force_clear() {
+            terminal.clear().ok();
+        }
         if let Err(err) = terminal.draw(|frame| app.draw(frame)) {
             outcome = Err(err).context("cannot draw the tui");
             break;
@@ -108,14 +122,26 @@ pub async fn run(
                     app.handle_event(event, &cmd_tx);
                     if app.take_ring() {
                         use std::io::Write;
+                        let message = app
+                            .alert_message()
+                            .unwrap_or_else(|| "attention needed".to_string());
                         let mut stdout = io::stdout();
-                        let _ = stdout.write_all(b"\x07");
+                        if app.bell {
+                            let _ = stdout.write_all(b"\x07");
+                        }
+                        if app.osc {
+                            // OSC 9 (iTerm/kitty), OSC 777 (rxvt-unicode) and
+                            // a title update; unsupported terminals ignore them.
+                            let _ = write!(stdout, "\x1b]9;eix: {message}\x07");
+                            let _ = write!(stdout, "\x1b]777;notify;eix;{message}\x07");
+                            let _ = write!(stdout, "\x1b]2;eix · {message}\x07");
+                        }
                         let _ = stdout.flush();
                     }
                 }
                 None => break,
             },
-            _ = tokio::time::sleep(tick) => app.tick(),
+            _ = tokio::time::sleep(tick) => app.tick(&cmd_tx),
         }
     }
 

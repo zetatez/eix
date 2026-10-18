@@ -268,6 +268,64 @@ pub struct ApprovalResult {
     pub accepted: bool,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApprovalListParams {
+    /// Restrict to one session; `None` lists every session with a pending item.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+}
+
+/// One pending approval, either a blocking tool call or a staged write.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalInfo {
+    pub session_id: SessionId,
+    pub session_name: String,
+    pub approval_id: String,
+    /// `tool` for a blocking tool call, `patch` for a staged write.
+    pub kind: String,
+    pub tool: String,
+    pub summary: String,
+    #[serde(default)]
+    pub created_ms: i64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ApprovalListResult {
+    pub approvals: Vec<ApprovalInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubscribeParams {
+    /// Sessions this connection wants events for. `None` (or an omitted
+    /// field) means every session; an empty list silences broadcasts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_ids: Option<Vec<SessionId>>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SubscribeResult {
+    /// `None` = all sessions; otherwise the ids the connection subscribed to.
+    #[serde(default)]
+    pub session_ids: Option<Vec<SessionId>>,
+}
+
+/// `draft.get` reads the stored prompt; `draft.set` writes it. A `None` or
+/// empty `text` clears the draft.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftParams {
+    pub session_id: SessionId,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DraftResult {
+    pub session_id: SessionId,
+    pub text: String,
+    #[serde(default)]
+    pub updated_at: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PatchApplyParams {
     pub session_id: SessionId,
@@ -294,6 +352,29 @@ pub struct PatchResult {
     pub conflict: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchGetParams {
+    pub session_id: SessionId,
+    pub patch_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchGetResult {
+    pub session_id: SessionId,
+    pub patch_id: String,
+    /// Workspace-relative path shown in the UI.
+    pub path: String,
+    /// The proposed file content, for editing before approval.
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchReviseParams {
+    pub session_id: SessionId,
+    pub patch_id: String,
+    pub text: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

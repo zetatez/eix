@@ -604,6 +604,96 @@ async fn staged_write_is_applied_after_approval() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn staged_write_can_be_revised_before_approval() -> anyhow::Result<()> {
+    let dir = temp_dir("revise");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "before")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "revise", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write out.txt"}),
+        )
+        .await?;
+
+    let patch = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "patch.proposed" {
+            break notification.params.clone();
+        }
+    };
+    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
+
+    let staged: eix_core::PatchGetResult = client
+        .request(
+            "patch.get",
+            json!({"session_id": session_id, "patch_id": patch_id}),
+        )
+        .await?;
+    assert_eq!(staged.text, "hello");
+    assert_eq!(staged.path, "out.txt");
+
+    let revised: eix_core::PatchResult = client
+        .request(
+            "patch.revise",
+            json!({
+                "session_id": session_id,
+                "patch_id": patch_id,
+                "text": "edited before approval\n",
+            }),
+        )
+        .await?;
+    assert!(revised.accepted);
+    assert_eq!(revised.message.as_deref(), Some("patch updated"));
+
+    let staged: eix_core::PatchGetResult = client
+        .request(
+            "patch.get",
+            json!({"session_id": session_id, "patch_id": patch_id}),
+        )
+        .await?;
+    assert_eq!(staged.text, "edited before approval\n");
+    // Nothing has touched the workspace yet.
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
+
+    let applied: eix_core::PatchResult = client
+        .request(
+            "patch.apply",
+            json!({"session_id": session_id, "patch_id": patch_id}),
+        )
+        .await?;
+    assert!(applied.applied);
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.txt"))?,
+        "edited before approval\n"
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> {
     let dir = temp_dir("command-snapshot");
     std::fs::create_dir_all(dir.join("src"))?;
@@ -1809,6 +1899,165 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
     );
 
     daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_subscribe_filters_broadcasts_per_connection() -> anyhow::Result<()> {
+    let dir = temp_dir("subscribe");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir.clone()));
+
+    // Create the two sessions on one connection, then open a second one that
+    // only subscribes to `a` (a fresh connection has no backlog).
+    let mut worker = connect(&socket).await?;
+    let a: SessionResult = worker
+        .request("session.create", json!({"name": "a", "cwd": dir}))
+        .await?;
+    let b: SessionResult = worker
+        .request("session.create", json!({"name": "b", "cwd": dir}))
+        .await?;
+    let (a, b) = (a.session.id, b.session.id);
+
+    let mut watcher = connect(&socket).await?;
+    let subscribed: eix_core::SubscribeResult = watcher
+        .request("session.subscribe", json!({"session_ids": [a.clone()]}))
+        .await?;
+    assert_eq!(
+        subscribed.session_ids.as_deref(),
+        Some([a.clone()].as_slice())
+    );
+
+    // A turn on `b` must not reach the watcher.
+    let submitted: SubmitResult = worker
+        .request("prompt.submit", json!({"session_id": b, "text": "b turn"}))
+        .await?;
+    loop {
+        let notification = worker.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == b.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    // A turn on `a` does reach it, and nothing from `b` slips through: the
+    // broadcast bus is ordered, so `b`'s events would arrive first.
+    let submitted: SubmitResult = worker
+        .request("prompt.submit", json!({"session_id": a, "text": "a turn"}))
+        .await?;
+    loop {
+        let notification = watcher.next_notification().await?;
+        if let Some(session_id) = notification
+            .params
+            .get("session_id")
+            .and_then(Value::as_str)
+        {
+            assert_eq!(
+                session_id,
+                a.as_str(),
+                "unsubscribed event leaked: {notification:?}"
+            );
+        }
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == a.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    // `null` restores the full stream.
+    let all: eix_core::SubscribeResult = watcher
+        .request("session.subscribe", json!({"session_ids": null}))
+        .await?;
+    assert!(all.session_ids.is_none());
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn drafts_round_trip_and_clear() -> anyhow::Result<()> {
+    let dir = temp_dir("draft");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir.clone()));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "d", "cwd": dir}))
+        .await?;
+    let id = created.session.id;
+
+    let empty: eix_core::DraftResult = client
+        .request("draft.get", json!({"session_id": id}))
+        .await?;
+    assert_eq!(empty.text, "");
+    assert_eq!(empty.updated_at, 0);
+
+    let saved: eix_core::DraftResult = client
+        .request(
+            "draft.set",
+            json!({"session_id": id, "text": "half a thought"}),
+        )
+        .await?;
+    assert_eq!(saved.text, "half a thought");
+    assert!(saved.updated_at > 0);
+
+    let loaded: eix_core::DraftResult = client
+        .request("draft.get", json!({"session_id": id}))
+        .await?;
+    assert_eq!(loaded.text, "half a thought");
+
+    // An empty text deletes the draft.
+    let cleared: eix_core::DraftResult = client
+        .request("draft.set", json!({"session_id": id, "text": ""}))
+        .await?;
+    assert_eq!(cleared.updated_at, 0);
+    let loaded: eix_core::DraftResult = client
+        .request("draft.get", json!({"session_id": id}))
+        .await?;
+    assert_eq!(loaded.text, "");
+
+    // Unknown sessions are rejected.
+    let code = client
+        .request_error("draft.get", json!({"session_id": "nope"}))
+        .await?;
+    assert_eq!(code, "not_found");
+
+    daemon.abort();
+    mock.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
 }

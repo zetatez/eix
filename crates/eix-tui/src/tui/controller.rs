@@ -37,6 +37,7 @@ pub enum Command {
         decision: ApprovalDecision,
         /// Selected hunk indices; `None` applies the whole change.
         hunks: Option<Vec<usize>>,
+        reason: Option<String>,
     },
     ContextLedger {
         session_id: String,
@@ -71,6 +72,22 @@ pub enum Command {
         session_id: Option<String>,
         limit: Option<u32>,
     },
+    DraftGet {
+        session_id: String,
+    },
+    DraftSet {
+        session_id: String,
+        text: String,
+    },
+    PatchGet {
+        session_id: String,
+        patch_id: String,
+    },
+    PatchRevise {
+        session_id: String,
+        patch_id: String,
+        text: String,
+    },
 }
 
 /// Ledger edits map one-to-one onto `context.*` requests.
@@ -97,6 +114,10 @@ impl Command {
             Self::Fork { .. } => "fork",
             Self::Rewind { .. } => "rewind",
             Self::Search { .. } => "search",
+            Self::DraftGet { .. } => "draft",
+            Self::DraftSet { .. } => "draft",
+            Self::PatchGet { .. } => "patch",
+            Self::PatchRevise { .. } => "patch",
         }
     }
 }
@@ -130,6 +151,15 @@ pub enum Event {
     Forked(Session),
     Rewound(Box<RewindResult>),
     Search(SearchResult),
+    Draft {
+        session_id: String,
+        text: String,
+    },
+    PatchEdit {
+        session_id: String,
+        patch_id: String,
+        text: String,
+    },
     Notification(Notification),
     Error {
         context: String,
@@ -253,6 +283,7 @@ async fn dispatch(
             approval_id,
             decision,
             hunks,
+            reason,
         } => {
             let value = requester
                 .request(
@@ -262,6 +293,7 @@ async fn dispatch(
                         "approval_id": approval_id,
                         "decision": decision,
                         "hunks": hunks,
+                        "reason": reason,
                     }),
                 )
                 .await?;
@@ -387,6 +419,61 @@ async fn dispatch(
                 .await?;
             let result: SearchResult = decode(value)?;
             send(events, Event::Search(result))
+        }
+        Command::DraftGet { session_id } => {
+            let value = requester
+                .request("draft.get", json!({ "session_id": session_id }))
+                .await?;
+            let result: eix_core::DraftResult = decode(value)?;
+            send(
+                events,
+                Event::Draft {
+                    session_id: result.session_id,
+                    text: result.text,
+                },
+            )
+        }
+        Command::DraftSet { session_id, text } => {
+            requester
+                .request(
+                    "draft.set",
+                    json!({ "session_id": session_id, "text": text }),
+                )
+                .await?;
+            Ok(())
+        }
+        Command::PatchGet {
+            session_id,
+            patch_id,
+        } => {
+            let value = requester
+                .request(
+                    "patch.get",
+                    json!({ "session_id": session_id, "patch_id": patch_id }),
+                )
+                .await?;
+            let result: eix_core::PatchGetResult = decode(value)?;
+            send(
+                events,
+                Event::PatchEdit {
+                    session_id: result.session_id,
+                    patch_id: result.patch_id,
+                    text: result.text,
+                },
+            )
+        }
+        Command::PatchRevise {
+            session_id,
+            patch_id,
+            text,
+        } => {
+            requester
+                .request(
+                    "patch.revise",
+                    json!({ "session_id": session_id, "patch_id": patch_id, "text": text }),
+                )
+                .await?;
+            Ok(())
         }
     }
 }

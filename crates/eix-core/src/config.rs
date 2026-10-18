@@ -102,6 +102,8 @@ pub struct NotificationsConfig {
     /// Ring the terminal bell in `eix tui` when a background pane needs
     /// attention.
     pub bell: bool,
+    /// Send OSC 9/777 desktop notifications and update the terminal title.
+    pub osc: bool,
     /// Minimum seconds between notifications for the same session.
     pub cooldown_secs: u64,
 }
@@ -111,6 +113,7 @@ impl Default for NotificationsConfig {
         Self {
             command: None,
             bell: false,
+            osc: true,
             cooldown_secs: 10,
         }
     }

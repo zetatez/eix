@@ -14,25 +14,27 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use eix_core::{
-    now_ms, payload, ApprovalDecision, ApprovalRequiredPayload, ApprovalRespondParams,
-    ApprovalResult, AttachResult, AuthParams, CancelResult, ChatMessage, Config,
-    ContextCompactParams, ContextCompactedPayload, ContextDropParams, ContextDropPayload,
-    ContextLedgerParams, ContextPinParams, ContextPinPayload, CreateSessionParams, ErrorPayload,
-    Event, EventKind, EventsParams, EventsResult, ForkParams, HelloResult, Notification,
-    PatchApplyParams, PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    RenameParams, Request, Response, RewindParams, RewindResult, SearchParams, SearchResult,
-    ServerMessage, Session, SessionId, SessionList, SessionOrigin, SessionRef, SessionResult,
-    SessionStatus, SnapshotPayload, StatusChangedPayload, SubmitParams, SubmitResult, ToolCall,
-    ToolCallPayload, ToolDefinition, ToolPolicy, ToolResultPayload, UserMessagePayload,
-    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    now_ms, payload, ApprovalDecision, ApprovalInfo, ApprovalListParams, ApprovalListResult,
+    ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult, AttachResult, AuthParams,
+    CancelResult, ChatMessage, Config, ContextCompactParams, ContextCompactedPayload,
+    ContextDropParams, ContextDropPayload, ContextLedgerParams, ContextPinParams,
+    ContextPinPayload, CreateSessionParams, DraftParams, DraftResult, ErrorPayload, Event,
+    EventKind, EventsParams, EventsResult, ForkParams, HelloResult, Notification, PatchApplyParams,
+    PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
+    PatchResultPayload, PatchReviseParams, ProcessKillParams, ProcessKillResult, ProcessList,
+    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
+    RewindResult, SearchParams, SearchResult, ServerMessage, Session, SessionId, SessionList,
+    SessionOrigin, SessionRef, SessionResult, SessionStatus, SnapshotPayload, StatusChangedPayload,
+    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, ToolCall, ToolCallPayload,
+    ToolDefinition, ToolPolicy, ToolResultPayload, UserMessagePayload, WorktreeRemoveParams,
+    WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
 use crate::context::Ledger;
@@ -42,6 +44,7 @@ use crate::snapshot::{Scope, Snapshotter};
 use crate::staging::{StagedPatch, Staging};
 use crate::store::Store;
 use crate::tools;
+use eix_core::redact::redact;
 
 pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&data_dir)
@@ -89,7 +92,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         socket.display()
     );
     eprintln!("  model  {}", daemon.config.provider.model);
-    eprintln!("  api    {}", daemon.config.provider.base_url);
+    eprintln!("  api    {}", redact(&daemon.config.provider.base_url));
     eprintln!("  data   {}", db_path.display());
 
     // Optional remote attach. Off unless configured, because a TCP port does
@@ -186,6 +189,9 @@ struct Daemon {
 
 struct PendingApproval {
     approval_id: String,
+    tool: String,
+    summary: String,
+    created_ms: i64,
     responder: oneshot::Sender<ApprovalReply>,
 }
 
@@ -222,7 +228,10 @@ impl Daemon {
         let running = match self.store.running_sessions() {
             Ok(sessions) => sessions,
             Err(err) => {
-                eprintln!("eixd: cannot scan running sessions: {err:#}");
+                eprintln!(
+                    "eixd: cannot scan running sessions: {}",
+                    redact(&format!("{err:#}"))
+                );
                 return;
             }
         };
@@ -238,7 +247,11 @@ impl Daemon {
                 self.emit_event(&event);
             }
             if let Err(err) = self.transition(&session.id, SessionStatus::Error) {
-                eprintln!("eixd: cannot recover {}: {err:#}", session.id);
+                eprintln!(
+                    "eixd: cannot recover {}: {}",
+                    session.id,
+                    redact(&format!("{err:#}"))
+                );
             }
         }
     }
@@ -263,8 +276,11 @@ impl Daemon {
         // broadcast to every client. A TCP connection starts with no events at
         // all and only subscribes after a successful `auth`, so nothing leaks
         // before the token is checked.
-        let mut bus_task =
-            (transport == Transport::Unix).then(|| spawn_bus(self.bus.clone(), tx.clone()));
+        // Per-connection event filter; `None` means every session. It is
+        // shared with the bus task so `session.subscribe` can narrow it.
+        let filter = Arc::new(RwLock::new(None::<HashSet<SessionId>>));
+        let mut bus_task = (transport == Transport::Unix)
+            .then(|| spawn_bus(self.bus.clone(), tx.clone(), filter.clone()));
 
         let mut lines = BufReader::new(read).lines();
         // Unix sockets are already protected by filesystem permissions.
@@ -311,11 +327,34 @@ impl Daemon {
                 authorized = true;
                 // From here on this connection sees the same broadcast as a
                 // local client.
-                bus_task = Some(spawn_bus(self.bus.clone(), tx.clone()));
+                bus_task = Some(spawn_bus(self.bus.clone(), tx.clone(), filter.clone()));
                 let _ = tx.send(ServerMessage::Response(Response::ok(
                     request.id,
                     json!({ "authenticated": true }),
                 )));
+                continue;
+            }
+            // Connection-local: narrow which sessions this client hears about.
+            if request.method == "session.subscribe" {
+                let response =
+                    match serde_json::from_value::<SubscribeParams>(request.params.clone()) {
+                        Ok(params) => {
+                            *filter.write().await = params
+                                .session_ids
+                                .clone()
+                                .map(|ids| ids.into_iter().collect::<HashSet<_>>());
+                            Response::ok(
+                                request.id,
+                                json!(SubscribeResult {
+                                    session_ids: params.session_ids
+                                }),
+                            )
+                        }
+                        Err(err) => Response::err(request.id, "bad_request", err.to_string()),
+                    };
+                if tx.send(ServerMessage::Response(response)).is_err() {
+                    break;
+                }
                 continue;
             }
             let response = self.handle(&request).await;
@@ -519,6 +558,27 @@ impl Daemon {
                 self.emit_session(&session);
                 Ok(serde_json::to_value(SessionResult { session })?)
             }
+            "draft.get" => {
+                let params: DraftParams = parse_params(request.params.clone())?;
+                self.require_session(&params.session_id)?;
+                let (text, updated_at) = self.store.get_draft(&params.session_id)?;
+                Ok(serde_json::to_value(DraftResult {
+                    session_id: params.session_id,
+                    text,
+                    updated_at,
+                })?)
+            }
+            "draft.set" => {
+                let params: DraftParams = parse_params(request.params.clone())?;
+                self.require_session(&params.session_id)?;
+                let text = params.text.unwrap_or_default();
+                let updated_at = self.store.set_draft(&params.session_id, &text)?;
+                Ok(serde_json::to_value(DraftResult {
+                    session_id: params.session_id,
+                    text,
+                    updated_at,
+                })?)
+            }
             "prompt.submit" => {
                 let params: SubmitParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(self.submit(params).await?)?)
@@ -541,6 +601,10 @@ impl Daemon {
                 }
                 Ok(serde_json::to_value(CancelResult { cancelled })?)
             }
+            "approval.list" => {
+                let params: ApprovalListParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.list_approvals(params).await?)?)
+            }
             "approval.respond" => {
                 let params: ApprovalRespondParams = parse_params(request.params.clone())?;
                 let result = self.respond_approval(params).await?;
@@ -559,6 +623,83 @@ impl Daemon {
                     .await?;
                 Ok(serde_json::to_value(result)?)
             }
+            "patch.get" => {
+                let params: PatchGetParams = parse_params(request.params.clone())?;
+                let patch = self
+                    .staging
+                    .get(&params.session_id, &params.patch_id)
+                    .ok_or_else(|| {
+                        rpc("not_found", format!("unknown patch {}", params.patch_id))
+                    })?;
+                Ok(serde_json::to_value(PatchGetResult {
+                    session_id: params.session_id,
+                    patch_id: params.patch_id,
+                    path: patch.label,
+                    text: patch.new,
+                })?)
+            }
+            "patch.revise" => {
+                let params: PatchReviseParams = parse_params(request.params.clone())?;
+                let session = self.require_session(&params.session_id)?;
+                let Some(patch) = self.staging.get(&params.session_id, &params.patch_id) else {
+                    return Err(rpc(
+                        "not_found",
+                        format!("unknown patch {}", params.patch_id),
+                    ));
+                };
+                let plan = tools::build_plan(
+                    patch.path.clone(),
+                    patch.label.clone(),
+                    patch.old.clone(),
+                    params.text,
+                    &self.config,
+                );
+                let Some(updated) = self.staging.update_content(
+                    &params.session_id,
+                    &params.patch_id,
+                    plan.new_content().to_string(),
+                )?
+                else {
+                    return Err(rpc(
+                        "not_found",
+                        format!("unknown patch {}", params.patch_id),
+                    ));
+                };
+                let event = self.store.append_event(
+                    &params.session_id,
+                    EventKind::PatchProposed,
+                    payload(&PatchProposedPayload {
+                        patch_id: updated.patch_id.clone(),
+                        call_id: updated.call_id.clone(),
+                        tool: updated.tool.clone(),
+                        path: updated.label.clone(),
+                        summary: format!("{} (edited)", updated.label),
+                        diff: Some(plan.diff().to_string()),
+                        hunks: plan.hunk_infos(),
+                    }),
+                )?;
+                self.emit_event(&event);
+                self.emit_value(
+                    "patch.proposed",
+                    json!({
+                        "session_id": params.session_id,
+                        "patch_id": updated.patch_id,
+                        "call_id": updated.call_id,
+                        "tool": updated.tool,
+                        "path": updated.label,
+                        "summary": format!("{} (edited)", updated.label),
+                        "diff": plan.diff(),
+                        "hunks": plan.hunk_infos(),
+                    }),
+                );
+                self.announce_patch(&session);
+                Ok(serde_json::to_value(PatchResult {
+                    accepted: true,
+                    applied: false,
+                    conflict: false,
+                    message: Some("patch updated".to_string()),
+                })?)
+            }
             "patch.reject" => {
                 let params: PatchRejectParams = parse_params(request.params.clone())?;
                 let result = self
@@ -574,6 +715,62 @@ impl Daemon {
             }
             other => Err(rpc("method_not_found", format!("unknown method {other:?}"))),
         }
+    }
+
+    async fn list_approvals(&self, params: ApprovalListParams) -> Result<ApprovalListResult> {
+        let want = params.session_id.as_deref();
+        let mut approvals = Vec::new();
+        // Blocking tool calls, one per session.
+        let pending = {
+            let mut out = Vec::new();
+            for (session_id, item) in self.approvals.lock().await.iter() {
+                out.push((
+                    session_id.clone(),
+                    item.approval_id.clone(),
+                    item.tool.clone(),
+                    item.summary.clone(),
+                    item.created_ms,
+                ));
+            }
+            out
+        };
+        for (session_id, approval_id, tool, summary, created_ms) in pending {
+            if want.is_some_and(|want| want != session_id.as_str()) {
+                continue;
+            }
+            let Some(session) = self.store.get_session(&session_id)? else {
+                continue;
+            };
+            approvals.push(ApprovalInfo {
+                session_id,
+                session_name: session.name,
+                approval_id,
+                kind: "tool".to_string(),
+                tool,
+                summary,
+                created_ms,
+            });
+        }
+        // Staged writes survive across turns, so list them too.
+        for patch in self.staging.all() {
+            if want.is_some_and(|want| want != patch.session_id.as_str()) {
+                continue;
+            }
+            let Some(session) = self.store.get_session(&patch.session_id)? else {
+                continue;
+            };
+            approvals.push(ApprovalInfo {
+                session_id: patch.session_id,
+                session_name: session.name,
+                approval_id: patch.patch_id,
+                kind: "patch".to_string(),
+                tool: patch.tool,
+                summary: patch.label,
+                created_ms: patch.created_ms,
+            });
+        }
+        approvals.sort_by_key(|item| item.created_ms);
+        Ok(ApprovalListResult { approvals })
     }
 
     async fn respond_approval(&self, params: ApprovalRespondParams) -> Result<ApprovalResult> {
@@ -989,7 +1186,10 @@ impl Daemon {
                 .spawn()
                 .and_then(|mut child| child.wait());
             if let Err(err) = result {
-                eprintln!("eixd: notification command failed: {err}");
+                eprintln!(
+                    "eixd: notification command failed: {}",
+                    redact(&err.to_string())
+                );
             }
         });
     }
@@ -1004,7 +1204,10 @@ impl Daemon {
             .run_turn_inner(&session_id, &turn_id, &cancel, &tools::definitions())
             .await
         {
-            eprintln!("eixd: turn {turn_id} failed: {err:#}");
+            eprintln!(
+                "eixd: turn {turn_id} failed: {}",
+                redact(&format!("{err:#}"))
+            );
             let message = format!("{err:#}");
             self.fail_turn(&session_id, &turn_id, &message);
         }
@@ -2386,6 +2589,9 @@ impl Daemon {
             session_id.to_string(),
             PendingApproval {
                 approval_id: approval_id.clone(),
+                tool: tool.to_string(),
+                summary: summary.clone(),
+                created_ms: now_ms(),
                 responder,
             },
         );
@@ -2488,7 +2694,10 @@ impl Daemon {
             self.emit_event(&event);
         }
         if let Err(err) = self.transition(session_id, SessionStatus::Error) {
-            eprintln!("eixd: cannot mark {session_id} as errored: {err:#}");
+            eprintln!(
+                "eixd: cannot mark {session_id} as errored: {}",
+                redact(&format!("{err:#}"))
+            );
         }
         self.emit_value(
             "turn.completed",
@@ -2533,12 +2742,24 @@ where
 fn spawn_bus(
     bus: broadcast::Sender<Notification>,
     tx: mpsc::UnboundedSender<ServerMessage>,
+    filter: Arc<RwLock<Option<HashSet<SessionId>>>>,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = bus.subscribe();
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(notification) => {
+                    let allowed = {
+                        let filter = filter.read().await;
+                        match filter.as_ref() {
+                            None => true,
+                            Some(ids) => notification_session_id(&notification)
+                                .is_none_or(|id| ids.contains(&id)),
+                        }
+                    };
+                    if !allowed {
+                        continue;
+                    }
                     if tx.send(ServerMessage::Notification(notification)).is_err() {
                         break;
                     }
@@ -2553,6 +2774,18 @@ fn spawn_bus(
             }
         }
     })
+}
+
+/// Session a broadcast belongs to, if any. `session.updated` carries the
+/// session itself (`id`); every other event carries `session_id`. Notifications
+/// without either (e.g. `stream.lagged`) reach every subscriber.
+fn notification_session_id(notification: &Notification) -> Option<SessionId> {
+    notification
+        .params
+        .get("session_id")
+        .and_then(Value::as_str)
+        .or_else(|| notification.params.get("id").and_then(Value::as_str))
+        .map(str::to_string)
 }
 
 fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T> {

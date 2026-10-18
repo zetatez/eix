@@ -15,12 +15,13 @@ use anyhow::{bail, Context, Result};
 use eix_core::config as core_config;
 use eix_core::sandbox as core_sandbox;
 use eix_core::{
-    ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload, AttachResult, CancelResult,
-    Config, ContextCompactedPayload, ContextDropPayload, ContextLedgerResult, ContextPinPayload,
-    Endpoint, Event, EventKind, HelloResult, PatchProposedPayload, PatchResultPayload,
-    ProcessExitedPayload, ProcessKillResult, ProcessList, ProcessOutput, ProcessStartedPayload,
-    RewindResult, SearchResult, Sector, Session, SessionList, SessionResult, SnapshotPayload,
-    SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
+    ApprovalListResult, ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload,
+    AttachResult, CancelResult, Config, ContextCompactedPayload, ContextDropPayload,
+    ContextLedgerResult, ContextPinPayload, Endpoint, Event, EventKind, HelloResult,
+    PatchProposedPayload, PatchResultPayload, ProcessExitedPayload, ProcessKillResult, ProcessList,
+    ProcessOutput, ProcessStartedPayload, RewindResult, SearchResult, Sector, Session, SessionList,
+    SessionResult, SessionStatus, SnapshotPayload, SubmitResult, ToolCallPayload,
+    ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -54,6 +55,7 @@ async fn main() -> Result<()> {
                 cli.config_path.clone(),
                 session,
                 config.notifications.bell,
+                config.notifications.osc,
                 config.input,
             )
             .await
@@ -62,8 +64,15 @@ async fn main() -> Result<()> {
         Command::Log { session } => log(&cli, session).await,
         Command::Rename { session, name } => rename(&cli, session, name).await,
         Command::Cancel { session } => cancel(&cli, session).await,
-        Command::Approve { session, hunks } => approval(&cli, session, true, hunks).await,
-        Command::Deny { session } => approval(&cli, session, false, None).await,
+        Command::Approve {
+            session,
+            hunks,
+            reason,
+        } => approval(&cli, session, true, hunks, reason).await,
+        Command::Deny { session, reason } => approval(&cli, session, false, None, reason).await,
+        Command::Approvals { json } => approvals(&cli, json).await,
+        Command::Status { json } => status(&cli, json).await,
+        Command::Pick { query, limit, json } => pick(&cli, query, limit, json).await,
         Command::Context(args) => context(&cli, args).await,
         Command::Search {
             query,
@@ -128,9 +137,22 @@ enum Command {
         session: Option<String>,
         /// Hunk indices to apply; `None` applies the whole change.
         hunks: Option<Vec<usize>>,
+        reason: Option<String>,
     },
     Deny {
         session: Option<String>,
+        reason: Option<String>,
+    },
+    Approvals {
+        json: bool,
+    },
+    Status {
+        json: bool,
+    },
+    Pick {
+        query: Option<String>,
+        limit: Option<usize>,
+        json: bool,
     },
     Context(ContextArgs),
     Search {
@@ -342,13 +364,39 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let hunks = take_flag(&mut args, "--hunks")?
                 .map(|value| parse_hunks(&value))
                 .transpose()?;
+            let reason = take_flag(&mut args, "--reason")?;
             let session = session.or_else(|| args.first().cloned());
-            Ok(Command::Approve { session, hunks })
+            Ok(Command::Approve {
+                session,
+                hunks,
+                reason,
+            })
         }
         "deny" => {
             let session = take_flag(&mut args, "--session")?;
+            let reason = take_flag(&mut args, "--reason")?;
             let session = session.or_else(|| args.first().cloned());
-            Ok(Command::Deny { session })
+            Ok(Command::Deny { session, reason })
+        }
+        "approvals" | "inbox" => {
+            let json = take_switch(&mut args, "--json");
+            Ok(Command::Approvals { json })
+        }
+        "status" => {
+            let json = take_switch(&mut args, "--json");
+            Ok(Command::Status { json })
+        }
+        "pick" => {
+            let query = take_flag(&mut args, "--query")?;
+            let query = query.or_else(|| {
+                let joined = args.join(" ").trim().to_string();
+                (!joined.is_empty()).then_some(joined)
+            });
+            let limit = take_flag(&mut args, "--limit")?
+                .map(|value| value.parse::<usize>().context("invalid --limit"))
+                .transpose()?;
+            let json = take_switch(&mut args, "--json");
+            Ok(Command::Pick { query, limit, json })
         }
         "context" | "ctx" | "ledger" => {
             let session = take_flag(&mut args, "--session")?;
@@ -696,6 +744,7 @@ async fn approval(
     session: Option<String>,
     approve: bool,
     hunks: Option<Vec<usize>>,
+    reason: Option<String>,
 ) -> Result<()> {
     let mut client = cli.connect().await?;
     let session = resolve_session(&mut client, session.as_deref(), false).await?;
@@ -707,6 +756,7 @@ async fn approval(
                     "session_id": session.id,
                     "approval_id": "",
                     "decision": if approve { "approve" } else { "deny" },
+                    "reason": reason,
                     "hunks": hunks,
                 }),
             )
@@ -722,6 +772,171 @@ async fn approval(
         println!("{} has no pending approval", session.name);
     }
     Ok(())
+}
+
+async fn approvals(cli: &Cli, json: bool) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let result: ApprovalListResult = serde_json::from_value(
+        client
+            .request("approval.list", json!({"session_id": null}))
+            .await?,
+    )?;
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if result.approvals.is_empty() {
+        println!("no pending approvals");
+        return Ok(());
+    }
+    for item in &result.approvals {
+        println!(
+            "⚠ {:<24} {:<6} {:<12} {:<40} {}",
+            truncate(&item.session_name, 24),
+            item.kind,
+            item.tool,
+            truncate(&item.summary, 40),
+            short_id(&item.approval_id),
+        );
+    }
+    Ok(())
+}
+
+async fn status(cli: &Cli, json: bool) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let hello: HelloResult = serde_json::from_value(client.request("hello", Value::Null).await?)?;
+    let sessions = list_sessions(&mut client).await?;
+    let running = sessions
+        .iter()
+        .filter(|session| session.status == SessionStatus::Running)
+        .count();
+    let approval = sessions
+        .iter()
+        .filter(|session| session.status == SessionStatus::AwaitingApproval)
+        .count();
+    let input = sessions
+        .iter()
+        .filter(|session| session.status == SessionStatus::AwaitingInput)
+        .count();
+    let error = sessions
+        .iter()
+        .filter(|session| session.status == SessionStatus::Error)
+        .count();
+    let attention: Vec<&Session> = sessions
+        .iter()
+        .filter(|session| session.status.needs_attention())
+        .collect();
+
+    if json {
+        let value = json!({
+            // The first three keys are the documented dwmblocks contract.
+            "running": running > 0,
+            "approval": approval,
+            "error": error,
+            "input": input,
+            "sessions": sessions.len(),
+            "attention": attention.iter().map(|session| json!({
+                "id": session.id,
+                "name": session.name,
+                "status": session.status.as_str(),
+                "cwd": session.cwd,
+            })).collect::<Vec<_>>(),
+            "daemon": {
+                "version": hello.version,
+                "pid": hello.pid,
+                "endpoint": cli.endpoint.to_string(),
+                "model": hello.model,
+                "base_url": hello.base_url,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&value)?);
+        return Ok(());
+    }
+
+    println!(
+        "eixd {} pid {} on {}",
+        hello.version, hello.pid, cli.endpoint
+    );
+    println!(
+        "{} session(s): {} running, {} awaiting approval, {} awaiting input, {} error",
+        sessions.len(),
+        running,
+        approval,
+        input,
+        error
+    );
+    for session in attention {
+        println!(
+            "{} {:<28} {}  {}",
+            session.status.symbol(),
+            truncate(&session.name, 28),
+            short_id(&session.id),
+            session.cwd.display()
+        );
+    }
+    Ok(())
+}
+
+async fn pick(cli: &Cli, query: Option<String>, limit: Option<usize>, json: bool) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let mut sessions = list_sessions(&mut client).await?;
+    if let Some(query) = query.as_deref().filter(|query| !query.trim().is_empty()) {
+        sessions.retain(|session| pick_matches(query, session));
+    }
+    // Attention first, then most recently used.
+    sessions.sort_by_key(|session| {
+        (
+            !session.status.needs_attention(),
+            std::cmp::Reverse(session.updated_at),
+        )
+    });
+    if let Some(limit) = limit {
+        sessions.truncate(limit);
+    }
+    if json {
+        let rows: Vec<Value> = sessions
+            .iter()
+            .map(|session| {
+                json!({
+                    "id": session.id,
+                    "name": session.name,
+                    "status": session.status.as_str(),
+                    "cwd": session.cwd,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    // Tab-separated so rofi/dmenu/fzf can split on the first field.
+    for session in sessions {
+        println!(
+            "{}\t{}\t{}\t{}",
+            session.id,
+            session.name,
+            session.status.as_str(),
+            session.cwd.display()
+        );
+    }
+    Ok(())
+}
+
+/// Case-insensitive subsequence match across the id, name, status and cwd.
+fn pick_matches(query: &str, session: &Session) -> bool {
+    let haystack = format!(
+        "{} {} {} {}",
+        session.id,
+        session.name,
+        session.status.as_str(),
+        session.cwd.display()
+    )
+    .to_lowercase();
+    let mut chars = haystack.chars();
+    query
+        .to_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .all(|needle| chars.any(|ch| ch == needle))
 }
 
 async fn context(cli: &Cli, args: ContextArgs) -> Result<()> {
@@ -1756,9 +1971,14 @@ COMMANDS:
     log [--session ID]         print the persisted transcript
     rename [--session ID] NAME
     cancel [--session ID]      cancel the running turn
-    approve [--session ID] [--hunks 0,2]
+    approve [--session ID] [--hunks 0,2] [--reason TEXT]
                                approve the pending tool call (all or selected hunks)
-    deny [--session ID]        deny the pending tool call
+    deny [--session ID] [--reason TEXT]
+                               deny the pending tool call, optionally with a reason
+    approvals [--json]         list pending approvals across sessions
+    status [--json]            daemon and session summary (`--json` for dwmblocks)
+    pick [--query Q] [--limit N] [--json]
+                               print sessions for rofi/dmenu/fzf (id<TAB>name<TAB>status<TAB>cwd)
     context [--session ID]     show the context ledger (tokens per sector)
     context --drop ENTRY       drop an entry (e.g. e12, workspace, instructions:AGENTS.md)
     context --undrop ENTRY     restore a dropped entry

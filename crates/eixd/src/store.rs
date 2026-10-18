@@ -64,6 +64,13 @@ impl Store {
 
             CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq);
 
+            -- Unsent prompt text, so a reconnecting frontend can restore it.
+            CREATE TABLE IF NOT EXISTS drafts (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                text       TEXT NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
             -- Search index. `search_docs` is the content table (so snippets and
             -- metadata come from normal columns); `search_fts` mirrors its text.
             CREATE TABLE IF NOT EXISTS search_docs (
@@ -216,6 +223,39 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Unsent prompt for a session; `(text, updated_at)` with empty defaults.
+    pub fn get_draft(&self, session_id: &str) -> Result<(String, i64)> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT text, updated_at FROM drafts WHERE session_id = ?1",
+                params![session_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// Store a draft, or delete it when `text` is empty. Returns the new
+    /// `updated_at` (0 for a deletion).
+    pub fn set_draft(&self, session_id: &str, text: &str) -> Result<i64> {
+        let now = now_ms();
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        if text.is_empty() {
+            conn.execute(
+                "DELETE FROM drafts WHERE session_id = ?1",
+                params![session_id],
+            )?;
+            return Ok(0);
+        }
+        conn.execute(
+            "INSERT INTO drafts (session_id, text, updated_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET text = excluded.text, updated_at = excluded.updated_at",
+            params![session_id, text, now],
+        )?;
+        Ok(now)
     }
 
     /// Copy the prefix `seq < at_seq` of `source_id` (all of it when `at_seq`

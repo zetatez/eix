@@ -11,6 +11,7 @@ pub mod message;
 pub mod nvim_plugin;
 pub mod process;
 pub mod protocol;
+pub mod redact;
 pub mod sandbox;
 pub mod search;
 pub mod session;
@@ -31,13 +32,15 @@ pub use message::{
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{
-    ApprovalDecision, ApprovalRespondParams, ApprovalResult, AttachResult, AuthParams, AuthResult,
-    CancelResult, ContextCompactParams, ContextDropParams, ContextLedgerParams, ContextPinParams,
-    CreateSessionParams, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult,
-    Notification, PatchApplyParams, PatchRejectParams, PatchResult, ProcessKillParams,
-    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
-    RewindResult, ServerMessage, SessionList, SessionRef, SessionResult, SubmitParams,
-    SubmitResult, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    ApprovalDecision, ApprovalInfo, ApprovalListParams, ApprovalListResult, ApprovalRespondParams,
+    ApprovalResult, AttachResult, AuthParams, AuthResult, CancelResult, ContextCompactParams,
+    ContextDropParams, ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams,
+    DraftResult, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult, Notification,
+    PatchApplyParams, PatchGetParams, PatchGetResult, PatchRejectParams, PatchResult,
+    PatchReviseParams, ProcessKillParams, ProcessListParams, ProcessOutputParams, RenameParams,
+    Request, Response, RewindParams, RewindResult, ServerMessage, SessionList, SessionRef,
+    SessionResult, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
+    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 pub use search::{SearchHit, SearchParams, SearchResult};
 pub use session::{Session, SessionId, SessionOrigin, SessionStatus};

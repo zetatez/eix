@@ -180,7 +180,7 @@ prompt buffer 的 buffer-local mapping：
 | `<CR>` | 提交 | `getcmdtype() != ""` → 原样；`pumvisible()` → 补全确认；否则 submit |
 | `<C-j>` | 换行 | `getcmdtype() != ""` → 原样；`pumvisible()` → 交还原 mapping（如 cmp 的 `select_next_item`）；否则插入换行 |
 | `<C-g>` | 打开 session picker | 无（planned） |
-| `<leader>a…` | eix 命令组 | 无（planned） |
+| `<leader>a…` | eix 动作 palette（`vim.ui.select`） | 无 |
 | `<C-w>h/j/k/l/w` | 切换 TUI pane 焦点（仅 normal） | insert 下保持原生删词 |
 | `@` | 文件 picker（insert，词首） | 否则插入字面 `@`（planned） |
 | `:Eix …` | 用户命令 | 不是 vim 原生 `:` 的替代 |
@@ -196,7 +196,8 @@ prompt buffer 的 buffer-local mapping：
 ### 5.5 buffer 与 draft
 
 - 每个访问过的 session 在 nvim 内对应一个隐藏 scratch buffer，保留 undo 历史；上限 20 个，超出按 LRU 序列化到 daemon 后丢弃。
-- draft 变更 debounce 300ms 同步到 daemon；提交前用 RPC 读取最新文本，避免竞态。
+- draft 变更 debounce 后同步到 daemon（TUI 的 native 输入按 200ms tick；nvim buffer 仍在子进程里）；
+  提交前用 RPC 读取最新文本，避免竞态。`draft.get` / `draft.set` 已实现，空文本即删除。
 - 切换 pane：`nvim_set_current_buf`，同时 `nvim_set_current_dir(session.cwd)`。
 - nvim 崩溃：host 显示提示，用 daemon 中的 draft 重建 buffer 并重启；连续失败两次则自动切 minimal。
 
@@ -331,24 +332,33 @@ prompt buffer 的 buffer-local mapping：
 
 ### 9.2 审批 UI
 
-内联卡片：
+内联卡片（已实现）：
 
 ```
-⚠ 修改 src/auth.rs (+12 -4)
-[y] 批准  [n] 拒绝  [e] 编辑  [d] 全量 diff  [?] 理由
+⚠ 修改 src/auth.rs (+12 -4)  [workspace-write]
+[y] 批准  [n] 拒绝  [e] 编辑  [o] 打开  [r] 理由  [d] 全量 diff
 ```
 
-全量 diff 视图（`<leader>a d`）：
+- `e`：把 staged 的新内容写到临时文件，交给 `$VISUAL`/`$EDITOR`，保存后走
+  `patch.revise` 重算 diff/hunks 再审批（工作区在此前不动）。
+- `o`：在编辑器里打开工作区中的真实文件（仅查看/对照；写操作仍走审批）。
+- `r`：输入拒绝理由，随 `approval.respond` 记录并回传给模型。
+- 风险级别：`run_command` → `[shell]`，`write_file`/patch → `[workspace-write]`，
+  `spawn_agent` → `[agent]`，只读工具 → `[read]`。
+- `A` 打开跨 session 审批 inbox；`eix approvals [--json]` 是无头等价物。
+
+全量 diff 视图（`d`）：
 
 - 左文件树 / 右 hunk；`J/K` 跳 hunk，`Space` 选中，`[`/`]` 跳文件。
-- `y` 应用选中（未选中则全部），`n` 拒绝，`e` 在 nvim 打开真实文件，`o` 打开原文件。
+- `y` 应用选中（未选中则全部），`n` 拒绝。
 - 冲突检测：文件在 stage 后被外部修改 → 标红并要求重新 stage。
 
 ### 9.3 权限策略
 
-- 级别：`read-only` / `workspace-write` / `full`；按 session 设置，可临时提权（记入事件日志）。
+- 级别：`read-only` / `workspace-write` / `full`；目前只有**全局** `[tools] policy`
+  （`ask` / `auto` / `read-only`），按 session 的级别与"本 session 全部批准到工具+路径模式"
+  仍待实现。
 - 自动批准规则：工具名 + 路径 glob + 命令前缀/正则；只读工具默认放行。
-- "本 session 全部批准"必须限定到**具体工具 + 路径/命令模式**，不做无条件 blanket。
 
 ## 10. Context ledger
 
@@ -378,7 +388,8 @@ prompt buffer 的 buffer-local mapping：
 - `patch.proposed`、`patch.applied`、`patch.rejected`、`patch.conflict`
 - `process.started|output|exited`
 - `context.updated`、`context.compacted`
-- `draft.updated`
+- 广播可按连接收窄（`session.subscribe`）；`session.updated` 用 `id` 判定归属，其余事件用
+  `session_id`，两者都没有的事件（如 `stream.lagged`）发给所有订阅者。
 
 **client → daemon（request）**
 
@@ -386,8 +397,10 @@ prompt buffer 的 buffer-local mapping：
 - `auth {token}`（仅 TCP：必须是第一个请求）
 - `session.list|create|attach|detach|rename|archive|fork|rewind`
 - `session.worktree.remove {session_id, force?}`
+- `session.subscribe {session_ids?}`（连接级广播过滤；`null` = 全部）
 - `prompt.submit|cancel|queue`
-- `approval.respond`、`patch.apply|reject`
+- `approval.respond|list`、`patch.apply|reject|get|revise`
+- `draft.get|set`（按 session 的未发送输入；空文本删除）
 - `context.drop|pin|compact`
 - `process.list|output|kill`
 - `search.query`（跨 session 全文搜索；`session_id` 可限定范围）

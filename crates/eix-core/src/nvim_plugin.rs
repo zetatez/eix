@@ -57,6 +57,7 @@ local send_raw
 local dispatch
 local redraw
 local attach_target
+local open_palette
 
 local function request(method, params, cb)
   local id = state.id
@@ -253,6 +254,13 @@ local function create_buffer(name)
     noremap = true,
     silent = true,
   })
+  if vim.keymap and vim.keymap.set then
+    vim.keymap.set("n", "<leader>a", function()
+      if open_palette then
+        open_palette()
+      end
+    end, { buffer = state.buffer, desc = "eix actions" })
+  end
   redraw()
 end
 
@@ -277,6 +285,9 @@ local function attach(id)
     end
     state.session = result.session
     state.attached = true
+    -- This frontend only renders one session; stop the daemon from sending
+    -- every other session's events. `:Eix list` still fetches on demand.
+    request("session.subscribe", { session_ids = { result.session.id } }, function() end)
     state.lines = {}
     state.stream = nil
     for _, event in ipairs(result.events) do
@@ -403,6 +414,37 @@ local function require_session()
     return false
   end
   return true
+end
+
+-- `<leader>a` action palette for the eix buffer.
+open_palette = function()
+  local actions = {
+    { label = "list sessions", run = list_sessions },
+    { label = "new session", run = function() create_session(false) end },
+    { label = "new session in a worktree", run = function() create_session(true) end },
+    { label = "send a prompt", run = open_prompt },
+    { label = "stop the running turn", run = function()
+        if require_session() then
+          request("prompt.cancel", { session_id = state.session.id })
+        end
+      end },
+    { label = "fork this session", run = function() vim.cmd("Eix fork") end },
+    { label = "rewind this session", run = function() vim.cmd("Eix rewind") end },
+    { label = "background processes", run = function() vim.cmd("Eix ps") end },
+    { label = "context ledger", run = function() vim.cmd("Eix ledger") end },
+  }
+  vim.ui.select(actions, {
+    prompt = "eix",
+    format_item = function(item)
+      return item.label
+    end,
+  }, function(item)
+    if item then
+      vim.schedule(function()
+        item.run()
+      end)
+    end
+  end)
 end
 
 vim.api.nvim_create_user_command("Eix", function(opts)
