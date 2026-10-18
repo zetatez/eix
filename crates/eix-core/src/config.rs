@@ -32,6 +32,49 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub tools: ToolsConfig,
     pub notifications: NotificationsConfig,
+    pub input: InputConfig,
+}
+
+/// Which widget renders the prompt at the bottom of the TUI.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputBackend {
+    /// Embedded Neovim when it is installed, native text box otherwise.
+    #[default]
+    Auto,
+    /// Require embedded Neovim.
+    Nvim,
+    /// Always use the native text box.
+    Native,
+}
+
+impl InputBackend {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Nvim => "nvim",
+            Self::Native => "native",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct InputConfig {
+    /// Prompt backend. `auto` falls back to the native text box when Neovim
+    /// cannot be spawned.
+    pub backend: InputBackend,
+    /// Start the embedded Neovim with `-u NONE`, ignoring the user's config.
+    pub minimal: bool,
+}
+
+impl Default for InputConfig {
+    fn default() -> Self {
+        Self {
+            backend: InputBackend::Auto,
+            minimal: false,
+        }
+    }
 }
 
 /// External alerts when a session starts needing attention (approval, error).
@@ -119,6 +162,8 @@ pub struct ToolsConfig {
     pub sandbox_network: bool,
     /// Mount the home directory read-only so toolchain caches stay usable.
     pub sandbox_read_home: bool,
+    /// Copy what a mutating tool can change before it runs.
+    pub snapshots: bool,
 }
 
 impl Default for ToolsConfig {
@@ -130,6 +175,7 @@ impl Default for ToolsConfig {
             sandbox: SandboxMode::Auto,
             sandbox_network: true,
             sandbox_read_home: true,
+            snapshots: true,
         }
     }
 }
@@ -237,6 +283,9 @@ impl Config {
         if let Some(value) = env_var("EIX_TOOL_SANDBOX_READ_HOME") {
             self.tools.sandbox_read_home = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
+        if let Some(value) = env_var("EIX_TOOL_SNAPSHOTS") {
+            self.tools.snapshots = matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        }
         if let Some(value) = env_var("EIX_NOTIFY_COMMAND") {
             self.notifications.command = Some(value);
         }
@@ -245,6 +294,17 @@ impl Config {
         }
         if let Some(value) = env_var("EIX_NOTIFY_BELL") {
             self.notifications.bell = matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Some(value) = env_var("EIX_INPUT_BACKEND") {
+            match value.as_str() {
+                "auto" => self.input.backend = InputBackend::Auto,
+                "nvim" => self.input.backend = InputBackend::Nvim,
+                "native" => self.input.backend = InputBackend::Native,
+                _ => {}
+            }
+        }
+        if let Some(value) = env_var("EIX_INPUT_MINIMAL") {
+            self.input.minimal = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
     }
 
@@ -393,14 +453,28 @@ mod tests {
         assert_eq!(default.tools.sandbox, SandboxMode::Auto);
         assert!(default.tools.sandbox_network);
         assert!(default.tools.sandbox_read_home);
+        assert!(default.tools.snapshots);
 
         let parsed: Config = toml::from_str(
-            "[tools]\nsandbox = \"off\"\nsandbox_network = false\nsandbox_read_home = false\n",
+            "[tools]\nsandbox = \"off\"\nsandbox_network = false\nsandbox_read_home = false\nsnapshots = false\n",
         )
         .expect("tools config");
         assert_eq!(parsed.tools.sandbox, SandboxMode::Off);
         assert!(!parsed.tools.sandbox_network);
         assert!(!parsed.tools.sandbox_read_home);
+        assert!(!parsed.tools.snapshots);
+    }
+
+    #[test]
+    fn input_defaults_to_auto_and_parses() {
+        let default = Config::default();
+        assert_eq!(default.input.backend, InputBackend::Auto);
+        assert!(!default.input.minimal);
+
+        let parsed: Config = toml::from_str("[input]\nbackend = \"native\"\nminimal = true\n")
+            .expect("input config");
+        assert_eq!(parsed.input.backend, InputBackend::Native);
+        assert!(parsed.input.minimal);
     }
 
     #[test]

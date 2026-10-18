@@ -324,6 +324,7 @@ dependencies = [
  "chrono",
  "crossterm",
  "eix-core",
+ "eix-nvim",
  "futures-util",
  "ratatui",
  "serde",

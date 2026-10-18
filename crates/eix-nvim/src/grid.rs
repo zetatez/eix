@@ -305,6 +305,15 @@ impl Grid {
 }
 
 pub fn draw_in(frame: &mut ratatui::Frame, grid: &Grid, area: ratatui::layout::Rect) {
+    draw_in_with_cursor(frame, grid, area, true);
+}
+
+pub fn draw_in_with_cursor(
+    frame: &mut ratatui::Frame,
+    grid: &Grid,
+    area: ratatui::layout::Rect,
+    show_cursor: bool,
+) {
     let height = grid.height.min(area.height);
     let width = grid.width.min(area.width);
 
@@ -337,7 +346,7 @@ pub fn draw_in(frame: &mut ratatui::Frame, grid: &Grid, area: ratatui::layout::R
         }
     }
 
-    if width > 0 && height > 0 {
+    if show_cursor && width > 0 && height > 0 {
         let x = area.x + grid.cursor_col.min(width - 1);
         let y = area.y + grid.cursor_row.min(height - 1);
         frame.set_cursor_position((x, y));

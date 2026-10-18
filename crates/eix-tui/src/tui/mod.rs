@@ -19,6 +19,8 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use eix_core::{InputBackend, InputConfig};
+use eix_nvim::embedded::NvimInput;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -34,20 +36,54 @@ pub async fn run(
     config: Option<PathBuf>,
     initial_session: Option<String>,
     bell: bool,
+    input: InputConfig,
 ) -> Result<()> {
     if !io::stdout().is_terminal() {
         bail!("`eix tui` needs a terminal (stdout is not a tty)");
     }
+
+    // Spawn the prompt before entering the alternate screen so a required
+    // backend can fail without leaving the terminal in a broken state.
+    let (cols, _rows) = crossterm::terminal::size().unwrap_or((80, 24));
+    let mut fallback_note = None;
+    let nvim = match input.backend {
+        InputBackend::Native => None,
+        InputBackend::Nvim | InputBackend::Auto => {
+            match NvimInput::spawn(cols, 3, input.minimal).await {
+                Ok(nvim) => Some(nvim),
+                Err(err) if input.backend == InputBackend::Nvim => {
+                    return Err(err).context("embedded nvim input");
+                }
+                Err(err) => {
+                    fallback_note = Some(format!("embedded nvim unavailable: {err:#}"));
+                    None
+                }
+            }
+        }
+    };
+
     let mut terminal = init_terminal()?;
     let mut app = App::new(initial_session);
     app.bell = bell;
+    if let Some(nvim) = nvim {
+        app.set_nvim_input(nvim);
+    }
+    if let Some(note) = fallback_note {
+        app.set_status(format!("{note}; using the native prompt"));
+    }
     let (cmd_tx, mut ev_rx) = controller::spawn(socket, data_dir, config);
     let _ = cmd_tx.send(Command::Hello);
     let _ = cmd_tx.send(Command::List);
 
     let mut events = EventStream::new();
+    let tick = if app.has_nvim_input() {
+        Duration::from_millis(30)
+    } else {
+        Duration::from_millis(200)
+    };
     let mut outcome = Ok(());
     loop {
+        app.poll_nvim(&cmd_tx);
         if let Err(err) = terminal.draw(|frame| app.draw(frame)) {
             outcome = Err(err).context("cannot draw the tui");
             break;
@@ -79,7 +115,7 @@ pub async fn run(
                 }
                 None => break,
             },
-            _ = tokio::time::sleep(Duration::from_millis(200)) => app.tick(),
+            _ = tokio::time::sleep(tick) => app.tick(),
         }
     }
 

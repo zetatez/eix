@@ -140,6 +140,11 @@ impl WritePlan {
         &self.diff
     }
 
+    /// Absolute path of the file this plan will write.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub fn hunk_infos(&self) -> Vec<HunkInfo> {
         self.hunks.iter().map(|hunk| hunk.info.clone()).collect()
     }
@@ -201,6 +206,13 @@ impl WritePlan {
             .with_context(|| format!("cannot write {}", self.label))?;
         Ok(format!("wrote {} bytes to {}", content.len(), self.label))
     }
+}
+
+/// The file a `write_file` call targets, resolved inside `cwd`. Used for the
+/// pre-execution snapshot when no reviewed plan exists (policy `auto`).
+pub fn write_target(args: &Value, cwd: &Path) -> Option<PathBuf> {
+    let raw = args.get("path").and_then(Value::as_str)?;
+    resolve_path(cwd, raw).ok()
 }
 
 /// Build the review plan for a file-writing tool. `None` for tools without a

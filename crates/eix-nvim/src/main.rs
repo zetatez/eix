@@ -9,10 +9,6 @@
 //!   keys to Neovim via `nvim_input`, draw the grid with ratatui, and keep the
 //!   last terminal row for an `eix` status bar.
 
-mod grid;
-mod keys;
-mod prompt;
-
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -25,71 +21,16 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use grid::Grid;
-use nvim_rs::compat::tokio::Compat;
+use eix_nvim::embedded::{Nvim, NvimHandler, Shared};
+use eix_nvim::{grid, keys, prompt};
 use nvim_rs::create::tokio as create_nvim;
-use nvim_rs::{Handler, Neovim, UiAttachOptions, Value};
+use nvim_rs::{UiAttachOptions, Value};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
-use tokio::process::{ChildStdin, Command};
-
-type Nvim = Neovim<Compat<ChildStdin>>;
-
-/// Everything the RPC handler writes and the render loop reads.
-struct Shared {
-    grid: Grid,
-    /// Drafts submitted with `<CR>`, oldest first.
-    submitted: Vec<String>,
-    /// Frames observed by the host (mirrors `grid.frame`, kept for clarity).
-    frames: u64,
-}
-
-impl Shared {
-    fn new(width: u16, height: u16) -> Self {
-        Self {
-            grid: Grid::new(width, height),
-            submitted: Vec::new(),
-            frames: 0,
-        }
-    }
-}
-
-#[derive(Clone)]
-struct NvimHandler {
-    shared: Arc<Mutex<Shared>>,
-}
-
-#[async_trait::async_trait]
-impl Handler for NvimHandler {
-    type Writer = Compat<ChildStdin>;
-
-    async fn handle_notify(&self, name: String, args: Vec<Value>, _nvim: Nvim) {
-        match name.as_str() {
-            "redraw" => {
-                // Neovim packs the redraw events directly into the
-                // notification params: `redraw(event, event, ...)`.
-                if let Ok(mut shared) = self.shared.lock() {
-                    shared.grid.apply(&args);
-                    shared.frames = shared.grid.frame;
-                }
-            }
-            "eix_submit" => {
-                let text = args
-                    .first()
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default()
-                    .to_string();
-                if let Ok(mut shared) = self.shared.lock() {
-                    shared.submitted.push(text);
-                }
-            }
-            _ => {}
-        }
-    }
-}
+use tokio::process::Command;
 
 #[derive(Default)]
 struct Args {
@@ -433,7 +374,12 @@ async fn run_tui(nvim: Nvim, shared: Arc<Mutex<Shared>>, cols: u16, rows: u16) -
         match event::read().context("read failed")? {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 if std::env::var_os("EIX_DEBUG").is_some() {
-                    eprintln!("key: {:?} {:?} -> {:?}", key.code, key.modifiers, keys::encode(key));
+                    eprintln!(
+                        "key: {:?} {:?} -> {:?}",
+                        key.code,
+                        key.modifiers,
+                        keys::encode(key)
+                    );
                 }
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && matches!(key.code, KeyCode::Char('c'))

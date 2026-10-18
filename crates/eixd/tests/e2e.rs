@@ -199,6 +199,8 @@ async fn cancel_keeps_the_partial_answer_and_returns_to_idle() -> anyhow::Result
 async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<()> {
     let dir = temp_dir("approve");
     std::fs::create_dir_all(&dir)?;
+    // Pre-existing content so the snapshot has something to roll back to.
+    std::fs::write(dir.join("out.txt"), "before")?;
 
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -306,6 +308,26 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
         .events
         .iter()
         .any(|e| e.kind == EventKind::ApprovalRequired));
+    let snapshot = attached
+        .events
+        .iter()
+        .find(|e| e.kind == EventKind::Snapshot)
+        .expect("snapshot event");
+    assert_eq!(snapshot.payload["ok"], true);
+    assert_eq!(snapshot.payload["tool"], "write_file");
+    assert_eq!(snapshot.payload["scope"], "file");
+    assert_eq!(
+        snapshot.payload["files"], 1,
+        "snapshot was: {}",
+        snapshot.payload
+    );
+    let snapshot_id = snapshot.payload["snapshot_id"].as_str().unwrap();
+    let saved = dir
+        .join("data/snapshots")
+        .join(&session_id)
+        .join(snapshot_id)
+        .join("files/out.txt");
+    assert_eq!(std::fs::read_to_string(&saved)?, "before");
     let assistant = attached
         .events
         .iter()
@@ -326,6 +348,102 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
         .unwrap()
         .iter()
         .any(|m| m["role"] == "tool" && m["content"] == "wrote 5 bytes to out.txt"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> {
+    let dir = temp_dir("command-snapshot");
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("src/keep.txt"), "before")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(command_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    // The snapshot, not the filesystem sandbox, is under test here.
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "cmd", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let _: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "run it"}),
+        )
+        .await?;
+
+    let approval = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            break notification.params.clone();
+        }
+    };
+    assert_eq!(approval["tool"], "run_command");
+    let approval_id = approval["approval_id"].as_str().unwrap().to_string();
+
+    let answered: eix_core::ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "decision": "approve",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert!(completed["error"].is_null());
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let snapshot = attached
+        .events
+        .iter()
+        .find(|e| e.kind == EventKind::Snapshot)
+        .expect("snapshot event");
+    assert_eq!(snapshot.payload["ok"], true);
+    assert_eq!(snapshot.payload["tool"], "run_command");
+    assert_eq!(snapshot.payload["scope"], "tree");
+    assert!(
+        snapshot.payload["files"].as_u64().unwrap_or(0) >= 1,
+        "snapshot was: {}",
+        snapshot.payload
+    );
+
+    let snapshot_id = snapshot.payload["snapshot_id"].as_str().unwrap();
+    let saved = dir
+        .join("data/snapshots")
+        .join(&session_id)
+        .join(snapshot_id)
+        .join("files/src/keep.txt");
+    assert_eq!(std::fs::read_to_string(&saved)?, "before");
+    assert_eq!(std::fs::read_to_string(dir.join("src/keep.txt"))?, "after");
 
     daemon.abort();
     mock.abort();
@@ -868,7 +986,6 @@ async fn slow_provider(listener: TcpListener) {
 async fn tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
     tool_provider_with_content(listener, bodies, "hello".to_string()).await;
 }
-
 async fn tool_provider_with_content(
     listener: TcpListener,
     bodies: Arc<Mutex<Vec<String>>>,
@@ -908,6 +1025,51 @@ async fn tool_provider_with_content(
                                 "id": "call_1",
                                 "type": "function",
                                 "function": {"name": "write_file", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+async fn command_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            let events = if has_tool_result {
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else {
+                let arguments = json!({"command": "printf after > src/keep.txt"}).to_string();
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "run_command", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",

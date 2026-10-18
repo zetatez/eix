@@ -17,6 +17,8 @@ pub enum EventKind {
     PatchProposed,
     PatchApplied,
     ApprovalRequired,
+    /// Pre-execution snapshot of what a mutating tool is about to touch.
+    Snapshot,
     StatusChanged,
     ContextCompacted,
     Error,
@@ -32,6 +34,7 @@ impl EventKind {
             Self::PatchProposed => "patch_proposed",
             Self::PatchApplied => "patch_applied",
             Self::ApprovalRequired => "approval_required",
+            Self::Snapshot => "snapshot",
             Self::StatusChanged => "status_changed",
             Self::ContextCompacted => "context_compacted",
             Self::Error => "error",
@@ -56,6 +59,7 @@ impl std::str::FromStr for EventKind {
             "patch_proposed" => Self::PatchProposed,
             "patch_applied" => Self::PatchApplied,
             "approval_required" => Self::ApprovalRequired,
+            "snapshot" => Self::Snapshot,
             "status_changed" => Self::StatusChanged,
             "context_compacted" => Self::ContextCompacted,
             "error" => Self::Error,
@@ -154,6 +158,29 @@ pub struct ApprovalRequiredPayload {
     pub hunks: Vec<HunkInfo>,
 }
 
+/// Metadata for a pre-execution snapshot. The bytes live in
+/// `<data>/snapshots/<session>/<snapshot_id>/`; this event only records that
+/// the copy happened (or why it did not).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotPayload {
+    pub snapshot_id: String,
+    pub call_id: String,
+    pub tool: String,
+    /// `file` when a single write target was copied, `tree` for a workspace
+    /// snapshot taken before a shell command.
+    pub scope: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub bytes: u64,
+    /// Files that could not be copied (too large, over budget, symlinks, ...).
+    #[serde(default)]
+    pub skipped: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusChangedPayload {
     pub from: SessionStatus,
@@ -184,6 +211,7 @@ mod tests {
             EventKind::PatchProposed,
             EventKind::PatchApplied,
             EventKind::ApprovalRequired,
+            EventKind::Snapshot,
             EventKind::StatusChanged,
             EventKind::ContextCompacted,
             EventKind::Error,

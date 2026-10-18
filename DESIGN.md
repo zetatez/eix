@@ -148,7 +148,7 @@ end
 - `hl_attr_define` 映射为 ratatui style：reverse / bold / italic / underline / strikethrough；**undercurl 降级为 underline**（ratatui 没有下划波浪线）。
 - `grid_line` 的 cell 是 `[text, hl_id?, repeat?]`；`text == ""` 表示宽字符的右半格，**该格不能写空格**，否则会打掉半个字；但非宽字符来源的空 cell 必须显式清空，否则 diff 渲染会留下残影。
 - 光标形状来自 `mode_info_set` + `mode_change`（block / vertical / horizontal），支持闪烁（planned；spike 只画位置）。
-- 输入条高度：spike 固定占满 nvim 区域；目标形态是聚焦时 `clamp(line_count, 3, 10)`、失焦时 1 行，布局变化时 `nvim_ui_try_resize`（Phase 1）。
+- 输入条高度：聚焦时 `clamp(line_count, 3, 10)`、失焦时 1 行，布局变化时 `nvim_ui_try_resize`（已实现）。
   - 已知限制：单 grid 模式下，cmp/noice 等**浮动窗口会被输入条边界裁剪**，动画类浮窗（smear-cursor）还会留残影。v1 用"聚焦时给足高度 + `g:eix_prompt` 逃生"缓解；后续用 `ext_multigrid` 把浮窗作为独立 grid 叠加渲染。
 - **主题桥接**：启动及 `ColorScheme` 变化时，用 `nvim_get_hl` 读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete/Pmenu/Visual`，映射到主机 UI，让转录区与你的 colorscheme 一致。
 
@@ -424,13 +424,21 @@ prompt buffer 的 buffer-local mapping：
 > 平铺 pane（1/2/3/4+ 分别全屏、左右、左大右二、网格），每个 pane 独立维护 session、
 > 转录、滚动与流式跟随；`o` 在新 pane 打开，`p`/`Ctrl-G` 切换聚焦 pane 的 session，
 > `C-w h/j/k/l/w` 切焦点、`C-w v/s` 分屏、`C-w c` 关闭；同一 session 只出现一次，
-> picker 选中已打开 session 会聚焦既有 pane。输入框暂由 ratatui 自绘（非嵌入 nvim）。
+> picker 选中已打开 session 会聚焦既有 pane。输入框默认是嵌入的 Neovim：复用
+> `eix-nvim` 的 linegrid 渲染器与 prompt profile，`NvimInput` 把按键/粘贴/resize 排到
+> 一个持有 RPC 的 worker（TUI 本身保持同步），`<CR>` 由 nvim 的 buffer-local mapping
+> 提交，`<C-j>`/`Shift-Enter` 由 host 让 nvim 插入字面换行以绕过补全插件的抢占；
+> 聚焦高度 `clamp(line_count, 3, 10)`、失焦 1 行，提交失败会把 draft 放回 buffer。
+> `[input] backend = auto|nvim|native`（env `EIX_INPUT_BACKEND`）可强制 native 或
+> 要求 nvim；`minimal = true`（env `EIX_INPUT_MINIMAL`）用 `-u NONE`，找不到 nvim 时
+> auto 自动回退 ratatui 原生输入框。prompt profile 会停用 smear-cursor 等动画并消毒
+> 窗口选项；cmp 等浮动窗口仍可能被输入条裁剪（单 grid 限制）。
 > 后台 pane 的 attention 已接入：daemon 在进入 `awaiting_approval` / `error` 时发送
 > `session.attention`，TUI 标记边框/侧栏并支持 `a` 跳到下一个；重新 attach 会从事件日志
 > 恢复未完成的审批卡片。外部通知也已接入：`[notifications] command` 由 daemon 在 attention
 > 时用 `sh -c` 执行并传入 `EIX_SESSION_ID` / `EIX_SESSION_NAME` / `EIX_SESSION_CWD` /
 > `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；`eix tui` 可用 `bell = true` 在后台
-> pane 需要 attention 时响终端铃。嵌入 nvim 输入仍待做。
+> pane 需要 attention 时响终端铃。嵌入 nvim 输入已接入（见上）。
 
 **Phase 2**
 
@@ -454,7 +462,13 @@ prompt buffer 的 buffer-local mapping：
 > 控制是否 `--unshare-net`，`sandbox_read_home` 决定 `$HOME` 只读挂载还是隐藏）：宿主只读、
 > 仅 session workspace 可写、`/tmp` 为私有 tmpfs；bwrap 缺失时 `auto` 退回直接执行，
 > `bwrap` 模式则拒绝执行。
-> **尚未做**：staged shadow workspace、执行前快照、context ledger、process view。
+> 执行前快照已落地：`write_file` 复制目标文件（含“原本不存在”这一事实），`run_command`
+> 复制整个 workspace；排除 `.git` / `target` / `node_modules` / `.venv` / `dist` 等派生目录，
+> 单文件 8 MB、总量 200 MB、条目 5 万上限，跳过数与失败都记入 `snapshot` 事件（失败时工具
+> 输出也带一行说明），每个 session 保留 20 份。`Snapshotter::restore` 已实现并有测试覆盖，
+> 供 Phase 3 的 rewind 调用；事件日志只存索引，快照字节在 `<data>/snapshots/<session>/<id>/`。
+> `[tools] snapshots = false`（`EIX_TOOL_SNAPSHOTS=0`）可在大仓库里关闭。
+> **尚未做**：staged shadow workspace、context ledger、process view。
 
 **Phase 3**
 

@@ -85,6 +85,7 @@ local function sanitize_win()
   vim.wo.list = false
   vim.wo.conceallevel = 0
   vim.wo.spell = false
+  vim.wo.fillchars = "eob: "
 end
 
 sanitize_win()
@@ -103,12 +104,28 @@ vim.api.nvim_create_autocmd({ "InsertEnter", "InsertLeave", "TextChanged" }, {
 pcall(vim.diagnostic.enable, false, { buf = buf })
 vim.o.laststatus = 0
 vim.o.showtabline = 0
-vim.o.cmdheight = 1
+-- No message row: the whole grid belongs to the prompt (nvim >= 0.9).
+vim.o.cmdheight = vim.fn.has("nvim-0.9") == 1 and 0 or 1
 vim.o.showmode = false
 vim.o.ruler = false
 vim.o.mouse = ""
 -- Suppress the "intro" splash for an empty unnamed buffer.
 vim.opt.shortmess:append("I")
+
+-- Animation plugins repaint cells on a timer; in a single-grid embed those
+-- frames can outlive the prompt's own redraws and erase glyphs (smear-cursor
+-- is the common offender). Disable them for this instance, including the ones
+-- lazily loaded on `VeryLazy`.
+local function calm_animations()
+  pcall(function() require("smear_cursor").enabled = false end)
+end
+calm_animations()
+vim.api.nvim_create_autocmd("User", {
+  group = aug,
+  pattern = "VeryLazy",
+  callback = calm_animations,
+  desc = "eix: disable cursor animation in the embedded prompt",
+})
 
 local function on_cr()
   if M.menu_visible() then

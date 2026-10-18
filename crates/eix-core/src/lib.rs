@@ -12,11 +12,13 @@ pub mod sandbox;
 pub mod session;
 
 pub use config::{
-    Config, ConfigError, NotificationsConfig, ProviderConfig, SandboxMode, ToolPolicy, ToolsConfig,
+    Config, ConfigError, InputBackend, InputConfig, NotificationsConfig, ProviderConfig,
+    SandboxMode, ToolPolicy, ToolsConfig,
 };
 pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ErrorPayload, Event, EventKind,
-    HunkInfo, StatusChangedPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    HunkInfo, SnapshotPayload, StatusChangedPayload, ToolCallPayload, ToolResultPayload,
+    UserMessagePayload,
 };
 pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, Role, ToolCall, ToolDefinition, Usage,

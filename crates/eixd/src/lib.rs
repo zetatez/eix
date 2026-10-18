@@ -5,6 +5,7 @@
 
 pub mod provider;
 pub mod server;
+pub mod snapshot;
 pub mod store;
 pub mod tools;
 

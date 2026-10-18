@@ -61,8 +61,8 @@ cooldown_secs = 10
 环境变量覆盖：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、`EIX_API_KEY_ENV`、
 `EIX_SYSTEM_PROMPT`、`EIX_TIMEOUT_SECS`、`EIX_TOOL_POLICY`、`EIX_TOOL_MAX_OUTPUT`、
 `EIX_TOOL_TIMEOUT_SECS`、`EIX_TOOL_SANDBOX`、`EIX_TOOL_SANDBOX_NETWORK`、
-`EIX_TOOL_SANDBOX_READ_HOME`、`EIX_NOTIFY_COMMAND`、`EIX_NOTIFY_COOLDOWN_SECS`、
-`EIX_NOTIFY_BELL`、`EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`。
+`EIX_TOOL_SANDBOX_READ_HOME`、`EIX_TOOL_SNAPSHOTS`、`EIX_NOTIFY_COMMAND`、
+`EIX_NOTIFY_COOLDOWN_SECS`、`EIX_NOTIFY_BELL`、`EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`。
 
 协议是 Unix socket 上的 newline-delimited JSON：请求带 `id`/`method`/`params`，
 响应带 `id`，事件通知是 `session.updated`、`session.event`、`turn.started`、
@@ -73,7 +73,7 @@ cooldown_secs = 10
 选择（`d` 全屏审阅里 Space 勾选），审阅期间的文件改动会让本次写入被拒绝；但 staged
 shadow workspace 仍未做（bubblewrap 沙箱和 context ledger 也是 Phase 2 的后续项）。TUI 已支持多
 pane；后台 pane 的 attention 用边框/侧栏高亮和 `a` 跳转提示，外部通知命令（dwm/tmux）
-已接入（见 `[notifications]`），嵌入 nvim 输入尚未接上。
+已接入（见 `[notifications]`）；输入框已默认使用嵌入的 Neovim（见下）。
 
 ## TUI（v1）
 
@@ -118,8 +118,32 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 `eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk）。后台 pane 进入
 `awaiting_approval` / `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
 按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的审批卡片。
-输入框是 ratatui 自绘的临时方案；DESIGN 里的「一个 client 一个嵌入 nvim」会在 pane
-交互稳定后接入。
+### 输入框：嵌入 nvim
+
+TUI 默认拉起一个 `nvim --embed`（加载你的完整 `~/.config/nvim`），用 `ext_linegrid`
+把 buffer 画在输入条里；按键原样转发给 Neovim，模式、补全、撤销都由 Neovim 自己决定。
+一个 client 只跑一个 nvim，聚焦哪个 pane 就用它写哪个 session 的 prompt。
+
+- `Enter` 提交（nvim buffer-local mapping，带 `pumvisible()` / cmp / blink 守卫）
+- `Ctrl-J`（或 `Shift-Enter`）换行：host 直接让 nvim 插入字面换行，绕过补全插件对
+  `<C-j>` 的映射（如 `cmp.select_next_item()`）
+- `Esc` 回到转录区；再按 `i` / `Enter` 重新聚焦并进入 insert
+- 聚焦时高度为 `clamp(行数, 3, 10)`，失焦时保留一行预览
+- 提交失败（请求错误或 turn 出错）会把 draft 放回输入条，不会丢字
+
+```toml
+[input]
+backend = "auto"     # auto（默认，有 nvim 就用）/ nvim（强制，失败则退出）/ native
+minimal = false      # true 时用 `nvim -u NONE`，跳过用户配置
+```
+
+也支持 `EIX_INPUT_BACKEND=auto|nvim|native`、`EIX_INPUT_MINIMAL=1`。
+`eix doctor` 会显示当前 backend 和是否找到 `nvim`；找不到时 `auto` 自动退回
+ratatui 原生输入框并在状态栏提示。
+
+完整配置下会做输入条“消毒”：关闭行号/符号列/诊断/`list`，并停用
+smear-cursor（动画会留下残影）。cmp 等补全浮窗仍可能被输入条边界裁剪——这是单 grid
+模式的已知限制，需要干净输入条时用 `minimal = true`。
 
 ### 工具与审批
 
@@ -147,6 +171,7 @@ command_timeout_secs = 60
 sandbox = "auto"          # auto（默认，有 bwrap 就用）/ bwrap / off
 sandbox_network = true    # false 时加 --unshare-net
 sandbox_read_home = true  # false 时 $HOME 完全隐藏
+snapshots = true          # false 时跳过执行前快照（大仓库可关）
 ```
 
 `run_command` 在 `auto`/`bwrap` 下用 bubblewrap 隔离：宿主目录只读挂载，只有 session
@@ -157,6 +182,23 @@ workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具�
 
 `auto` 会跳过审批直接执行写操作（危险，显式选择才生效）；`read_only` 直接拒绝写工具
 并把原因回传给模型。一次 turn 最多 12 轮工具往返。
+
+### 执行前快照
+
+`write_file` 和 `run_command` 在真正执行前会先做一次快照，落在
+`<data-dir>/snapshots/<session>/<snapshot>/`：
+
+- `write_file`：只复制它要覆盖的那个文件；目标原本不存在也会记下来（回滚时删除）。
+- `run_command`：复制整个 workspace（session 的 `cwd`），因为 shell 能改任何东西。
+  `.git`、`target`、`node_modules`、`.venv`、`dist` 等派生目录不复制；单文件 > 8 MB、
+  总量 > 200 MB、条目 > 5 万时跳过并计数；符号链接跳过。
+- 每次快照写一条 `snapshot` 事件（`eix log` 显示为 `snap> file before call_1 — 1 file(s),
+  0 skipped`），记录文件数、字节数和跳过数；抓取失败也会记 `ok = false`，并在工具输出里
+  附一行 `[snapshot failed: ...]`。每个 session 保留最近 20 份，更早的自动清理。
+- 快照字节只存在 `snapshots/` 目录，事件日志只做索引。目前还没有 rewind 命令，这是
+  Phase 3 rewind / 回滚的基础；`Snapshotter::restore` 已实现并有测试覆盖。
+- 大仓库可以设 `[tools] snapshots = false`（或 `EIX_TOOL_SNAPSHOTS=0`）关掉；关闭后不再
+  记录 `snapshot` 事件。`eix doctor` 会显示当前开关。
 
 ### 外部通知
 
@@ -194,8 +236,8 @@ cargo run -p eix-nvim
 spike 内：
 
 - `Enter` 提交（nvim buffer-local mapping，带 `pumvisible()` / `getcmdtype()` / cmp / blink 守卫）
-- `Ctrl-J` 换行（nvim 原生行为；但如果自己的配置把 `<C-j>` 映射给了补全插件，例如
-  `cmp.mapping.select_next_item()`，那就按配置走 —— 语义归 nvim，host 不抢）
+- `Ctrl-J` 换行（spike 里按 nvim 配置走；TUI 的输入条直接让 nvim 插入字面换行，
+  避免被 `cmp.select_next_item()` 之类的映射抢走）
 - `Ctrl-C` 退出 spike
 - 退出后把提交过的 draft 打印到 stdout，用来验证往返
 
@@ -244,10 +286,10 @@ spike 内：
 - [x] hunk 级审批（TUI `d` 审阅里勾选 hunk，daemon 按选择应用部分改动）
 - [x] attention 标记（后台 pane 高亮、`a` 跳转、审批卡片重放）
 - [x] 外部 attention 通知（`[notifications]` command + TUI 终端铃、冷却、重放）
-- [ ] 嵌入 nvim 输入
+- [x] 嵌入 nvim 输入（ext_linegrid 渲染、按键转发、动态高度、失败回填、native 回退）
 - [x] bubblewrap 沙箱（`run_command` 默认隔离，`[tools] sandbox` 可配，写入只限 workspace）
 - [ ] staged shadow workspace（propose → stage → apply、`patch.apply` / `patch.reject`）
-- [ ] 执行前快照（rewind / 回滚的基础）
+- [x] 执行前快照（write_file 单文件 / run_command 整个 workspace，`snapshot` 事件，保留 20 份）
 - [ ] context ledger、process view
 - [ ] rewind / fork、全文搜索、worktree、子 agent
 - [ ] daemon 化的 nvim 前端（JSON-RPC over Unix socket）、远程 attach（TCP + token）

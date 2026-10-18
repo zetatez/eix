@@ -18,8 +18,9 @@ use eix_core::{
     ApprovalResult, AttachResult, CancelResult, ChatMessage, Config, CreateSessionParams,
     ErrorPayload, Event, EventKind, EventsParams, EventsResult, HelloResult, Notification,
     RenameParams, Request, Response, ServerMessage, Session, SessionId, SessionList, SessionRef,
-    SessionResult, SessionStatus, StatusChangedPayload, SubmitParams, SubmitResult, ToolCall,
-    ToolCallPayload, ToolPolicy, ToolResultPayload, UserMessagePayload, PROTOCOL_VERSION,
+    SessionResult, SessionStatus, SnapshotPayload, StatusChangedPayload, SubmitParams,
+    SubmitResult, ToolCall, ToolCallPayload, ToolPolicy, ToolResultPayload, UserMessagePayload,
+    PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -30,6 +31,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::provider::{Provider, ProviderError};
+use crate::snapshot::Snapshotter;
 use crate::store::Store;
 use crate::tools;
 
@@ -43,11 +45,13 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     Store::set_permissions(&db_path)?;
     let provider = Arc::new(Provider::new(&config).map_err(|e| anyhow::anyhow!("{e}"))?);
     let (bus, _) = broadcast::channel(2048);
+    let snapshots = Snapshotter::new(data_dir.join("snapshots"));
     let daemon = Arc::new(Daemon {
         store,
         provider,
         config: Arc::new(config),
         bus,
+        snapshots,
         turns: Mutex::new(HashMap::new()),
         approvals: Mutex::new(HashMap::new()),
         notified: std::sync::Mutex::new(HashMap::new()),
@@ -112,6 +116,8 @@ struct Daemon {
     provider: Arc<Provider>,
     config: Arc<Config>,
     bus: broadcast::Sender<Notification>,
+    /// Pre-execution snapshots for mutating tools.
+    snapshots: Snapshotter,
     /// In-flight turns, used for busy checks and cancellation.
     turns: Mutex<HashMap<SessionId, Arc<AtomicBool>>>,
     /// Tool calls blocked on a user decision, keyed by session.
@@ -763,7 +769,13 @@ impl Daemon {
         }
 
         let denied = denial.is_some();
-        let (ok, output, duration_ms) = match denial {
+        let snapshot_warning = if denied {
+            None
+        } else {
+            self.capture_snapshot(session_id, tool, call, &args, plan.as_ref())
+                .await?
+        };
+        let (ok, mut output, duration_ms) = match denial {
             Some(reason) => (false, reason, 0),
             None => {
                 self.emit_value(
@@ -785,6 +797,9 @@ impl Daemon {
                 (outcome.ok, outcome.output, outcome.duration_ms)
             }
         };
+        if let Some(warning) = snapshot_warning {
+            output.push_str(&format!("\n[snapshot failed: {warning}]"));
+        }
 
         self.record_tool_result(session_id, call, ok, denied, &output, duration_ms)?;
         self.emit_value(
@@ -801,6 +816,84 @@ impl Daemon {
         );
         messages.push(ChatMessage::tool(call.id.clone(), output));
         Ok(())
+    }
+
+    /// Copy what a mutating tool is about to change and record the result.
+    /// A failed snapshot never blocks the call; the tool output gets a short
+    /// note so the lost rollback safety is visible.
+    async fn capture_snapshot(
+        &self,
+        session_id: &str,
+        tool: &str,
+        call: &ToolCall,
+        args: &Value,
+        plan: Option<&tools::WritePlan>,
+    ) -> Result<Option<String>> {
+        if !tools::requires_approval(tool) || !self.config.tools.snapshots {
+            return Ok(None);
+        }
+        let cwd = self.require_session(session_id)?.cwd;
+        let scope = if tool == "write_file" { "file" } else { "tree" };
+        let result = match tool {
+            "write_file" => {
+                let path = plan
+                    .map(|plan| plan.path().to_path_buf())
+                    .or_else(|| tools::write_target(args, &cwd));
+                match path {
+                    Some(path) => {
+                        self.snapshots
+                            .capture_file(session_id, tool, &call.id, &cwd, &path)
+                            .await
+                    }
+                    None => Err(anyhow::anyhow!("cannot resolve the write target")),
+                }
+            }
+            "run_command" => {
+                self.snapshots
+                    .capture_tree(session_id, tool, &call.id, &cwd)
+                    .await
+            }
+            _ => return Ok(None),
+        };
+
+        let (event_payload, warning) = match result {
+            Ok(snapshot) => (
+                SnapshotPayload {
+                    snapshot_id: snapshot.id,
+                    call_id: call.id.clone(),
+                    tool: tool.to_string(),
+                    scope: snapshot.scope.as_str().to_string(),
+                    ok: true,
+                    files: snapshot.files,
+                    bytes: snapshot.bytes,
+                    skipped: snapshot.skipped,
+                    error: None,
+                },
+                None,
+            ),
+            Err(err) => {
+                let message = format!("{err:#}");
+                (
+                    SnapshotPayload {
+                        snapshot_id: String::new(),
+                        call_id: call.id.clone(),
+                        tool: tool.to_string(),
+                        scope: scope.to_string(),
+                        ok: false,
+                        files: 0,
+                        bytes: 0,
+                        skipped: 0,
+                        error: Some(message.clone()),
+                    },
+                    Some(message),
+                )
+            }
+        };
+        let event =
+            self.store
+                .append_event(session_id, EventKind::Snapshot, payload(&event_payload))?;
+        self.emit_event(&event);
+        Ok(warning)
     }
 
     fn record_tool_result(

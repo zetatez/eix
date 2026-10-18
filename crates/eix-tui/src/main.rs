@@ -15,8 +15,8 @@ use eix_core::config as core_config;
 use eix_core::sandbox as core_sandbox;
 use eix_core::{
     ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload, AttachResult, CancelResult,
-    Config, Event, EventKind, HelloResult, Session, SessionList, SessionResult, SubmitResult,
-    ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    Config, Event, EventKind, HelloResult, Session, SessionList, SessionResult, SnapshotPayload,
+    SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -38,15 +38,14 @@ async fn main() -> Result<()> {
         Command::New { name, cwd, model } => new_session(&cli, name, cwd, model).await,
         Command::Send { session, text } => send(&cli, session, text).await,
         Command::Tui { session } => {
-            let bell = Config::load(cli.config_path.as_deref())
-                .map(|config| config.notifications.bell)
-                .unwrap_or(false);
+            let config = Config::load(cli.config_path.as_deref()).unwrap_or_default();
             tui::run(
                 cli.socket.clone(),
                 cli.data_dir.clone(),
                 cli.config_path.clone(),
                 session,
-                bell,
+                config.notifications.bell,
+                config.input,
             )
             .await
         }
@@ -538,6 +537,23 @@ async fn doctor(cli: &Cli) -> Result<()> {
                     "bwrap missing"
                 }
             );
+            println!(
+                "input    {} (nvim {})",
+                config.input.backend.as_str(),
+                if eix_nvim::embedded::nvim_available() {
+                    "found"
+                } else {
+                    "missing"
+                }
+            );
+            println!(
+                "snapshot {}",
+                if config.tools.snapshots {
+                    "on (before write_file/run_command)"
+                } else {
+                    "off"
+                }
+            );
         }
         Err(err) => println!("config   ERROR: {err}"),
     }
@@ -809,6 +825,25 @@ fn render_events(events: &[Event]) {
                     .and_then(Value::as_str)
                     .unwrap_or("unknown error");
                 println!("error: {message}");
+            }
+            EventKind::Snapshot => {
+                if let Ok(payload) =
+                    serde_json::from_value::<SnapshotPayload>(event.payload.clone())
+                {
+                    if payload.ok {
+                        println!(
+                            "snap> {} before {} — {} file(s), {} skipped",
+                            payload.scope, payload.call_id, payload.files, payload.skipped
+                        );
+                    } else {
+                        println!(
+                            "snap> {} before {} failed: {}",
+                            payload.scope,
+                            payload.call_id,
+                            payload.error.as_deref().unwrap_or("unknown error")
+                        );
+                    }
+                }
             }
             EventKind::StatusChanged => {
                 let from = event

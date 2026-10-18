@@ -1,8 +1,7 @@
 //! TUI state and rendering.
 //!
-//! Phase 1 deliberately keeps the input box native (ratatui) instead of
-//! embedding Neovim: the daemon protocol and session UX need to settle before
-//! the real-nvim input layer is wired in.
+//! The prompt is an embedded Neovim when one can be spawned; the native
+//! ratatui text box remains as the fallback (`[input] backend`).
 
 use std::collections::{HashMap, HashSet};
 
@@ -12,6 +11,7 @@ use eix_core::{
     Event as SessionEvent, EventKind, HelloResult, HunkInfo, Session, SessionStatus, SubmitResult,
     ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
+use eix_nvim::embedded::NvimInput;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -350,6 +350,11 @@ pub struct App {
     pub bell: bool,
     /// Set when a notification should ring; cleared by the event loop.
     ring: bool,
+    /// Embedded Neovim prompt, when available.
+    nvim: Option<NvimInput>,
+    /// Last draft submitted from the Neovim prompt (session id, text), kept so
+    /// a failed turn can put it back into the buffer.
+    nvim_draft: Option<(String, String)>,
 }
 
 impl App {
@@ -382,7 +387,78 @@ impl App {
             tick: 0,
             bell: false,
             ring: false,
+            nvim: None,
+            nvim_draft: None,
         }
+    }
+
+    /// Attach an embedded-Neovim prompt, replacing the native text box.
+    pub fn set_nvim_input(&mut self, input: NvimInput) {
+        self.nvim = Some(input);
+    }
+
+    pub fn has_nvim_input(&self) -> bool {
+        self.nvim.is_some()
+    }
+
+    /// Collect drafts submitted with `<CR>` in the embedded prompt.
+    pub fn poll_nvim(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(drafts) = self.nvim.as_ref().map(NvimInput::take_submitted) else {
+            return;
+        };
+        for draft in drafts {
+            if draft.trim().is_empty() {
+                continue;
+            }
+            let session_id = self.focused_view().map(|view| view.session.id.clone());
+            match self.begin_submit(&draft, tx) {
+                Ok(()) => {
+                    if let Some(session_id) = session_id {
+                        self.nvim_draft = Some((session_id, draft));
+                    }
+                    if let Some(nvim) = &self.nvim {
+                        nvim.reset();
+                    }
+                }
+                Err(message) => {
+                    self.error = Some(message);
+                    self.status = "prompt kept".into();
+                }
+            }
+        }
+    }
+
+    /// Put the last Neovim draft back after a failed turn, if it belongs to
+    /// `session_id`.
+    fn restore_nvim_draft(&mut self, session_id: &str) {
+        let matches = self
+            .nvim_draft
+            .as_ref()
+            .is_some_and(|(id, _)| id == session_id);
+        if !matches {
+            return;
+        }
+        if let Some((_, draft)) = self.nvim_draft.take() {
+            if let Some(nvim) = &self.nvim {
+                nvim.set_text(&draft);
+            }
+        }
+    }
+
+    /// Drop the saved draft once its turn finishes successfully.
+    fn clear_nvim_draft(&mut self, session_id: &str) {
+        if self
+            .nvim_draft
+            .as_ref()
+            .is_some_and(|(id, _)| id == session_id)
+        {
+            self.nvim_draft = None;
+        }
+    }
+
+    /// Set the footer status line.
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status = message.into();
     }
 
     /// Take the pending bell request, if any.
@@ -397,7 +473,12 @@ impl App {
     pub fn handle_paste(&mut self, text: &str) {
         self.focus = Focus::Input;
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        self.input.insert_str(&normalized);
+        if let Some(nvim) = &self.nvim {
+            nvim.start_insert();
+            nvim.paste(&normalized);
+        } else {
+            self.input.insert_str(&normalized);
+        }
     }
 
     pub fn handle_event(&mut self, event: Event, tx: &UnboundedSender<Command>) {
@@ -484,6 +565,13 @@ impl App {
                     "submit" => {
                         self.submitting = false;
                         self.pending_prompt = None;
+                        // The prompt was cleared when the request was sent;
+                        // put the draft back so it can be edited or retried.
+                        if let Some((_, draft)) = self.nvim_draft.take() {
+                            if let Some(nvim) = &self.nvim {
+                                nvim.set_text(&draft);
+                            }
+                        }
                     }
                     "create" => self.creating = false,
                     "attach" => self.pending_attach = None,
@@ -721,10 +809,14 @@ impl App {
                     if let Some(error) = done.error {
                         self.error = Some(error);
                         self.status = "error".into();
+                        // The prompt was cleared on submit; restore the draft so
+                        // a provider failure does not lose it.
+                        self.restore_nvim_draft(&done.session_id);
                     } else if done.cancelled {
                         self.status = "cancelled".into();
                     } else {
                         self.status = "idle".into();
+                        self.clear_nvim_draft(&done.session_id);
                     }
                 }
             }
@@ -778,6 +870,11 @@ impl App {
             return;
         }
 
+        if self.nvim.is_some() {
+            self.handle_nvim_input_key(key);
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => self.focus = Focus::Transcript,
             KeyCode::Enter
@@ -812,6 +909,46 @@ impl App {
             KeyCode::End => self.input.end(),
             KeyCode::Tab => self.input.insert_str("    "),
             _ => {}
+        }
+    }
+
+    fn handle_nvim_input_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc => {
+                if let Some(nvim) = &self.nvim {
+                    nvim.input(key);
+                }
+                self.focus = Focus::Transcript;
+            }
+            // Shift/Ctrl-Enter and Ctrl-J insert a newline, matching the
+            // native prompt. Completion plugins often claim <C-j> for menu
+            // navigation, so ask Neovim for a literal newline instead.
+            KeyCode::Enter
+                if key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
+            {
+                if let Some(nvim) = &self.nvim {
+                    nvim.newline();
+                }
+            }
+            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if let Some(nvim) = &self.nvim {
+                    nvim.newline();
+                }
+            }
+            _ => {
+                if let Some(nvim) = &self.nvim {
+                    nvim.input(key);
+                }
+            }
+        }
+    }
+
+    fn focus_input(&mut self) {
+        self.focus = Focus::Input;
+        if let Some(nvim) = &self.nvim {
+            nvim.start_insert();
         }
     }
 
@@ -855,7 +992,7 @@ impl App {
         }
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('i') | KeyCode::Enter => self.focus = Focus::Input,
+            KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
             KeyCode::Char('n') => self.create_session(tx),
             KeyCode::Char('p') => self.open_picker(PickerMode::Switch),
             KeyCode::Char('o') => self.open_picker(PickerMode::NewPane),
@@ -984,28 +1121,41 @@ impl App {
     }
 
     fn submit(&mut self, tx: &UnboundedSender<Command>) {
-        if self.submitting {
-            self.status = "submit already in flight".into();
-            return;
-        }
         let text = self.input.text();
         if text.trim().is_empty() {
             return;
         }
+        if let Err(message) = self.begin_submit(&text, tx) {
+            self.status = message;
+        }
+    }
+
+    /// Ask the daemon to run `text` in the focused session. `Ok` means the
+    /// request was sent, so a caller may clear its own draft.
+    fn begin_submit(&mut self, text: &str, tx: &UnboundedSender<Command>) -> Result<(), String> {
+        if self.submitting {
+            return Err("submit already in flight".into());
+        }
+        if text.trim().is_empty() {
+            return Err("nothing to send".into());
+        }
         let Some(view) = self.focused_view() else {
-            self.status = "no session yet".into();
-            return;
+            return Err("no session yet".into());
         };
         if view.session.status.is_busy() {
             self.error = Some("session is running; press x to cancel".into());
-            return;
+            return Err("session is running".into());
         }
         let session_id = view.session.id.clone();
         self.submitting = true;
-        self.pending_prompt = Some(text.clone());
+        self.pending_prompt = Some(text.to_string());
         self.error = None;
         self.status = "submitting…".into();
-        let _ = tx.send(Command::Submit { session_id, text });
+        let _ = tx.send(Command::Submit {
+            session_id,
+            text: text.to_string(),
+        });
+        Ok(())
     }
 
     fn cancel(&mut self, tx: &UnboundedSender<Command>) {
@@ -1428,17 +1578,28 @@ impl App {
             return;
         }
 
-        let inner_width = area.width.saturating_sub(2).max(1) as usize;
-        let input_lines: usize = self
-            .input
-            .lines
-            .iter()
-            .map(|line| {
-                let width = UnicodeWidthStr::width(line.as_str());
-                width.div_ceil(inner_width).max(1)
-            })
-            .sum();
-        let input_height = (input_lines as u16 + 2).clamp(3, 10);
+        let input_height = if let Some(nvim) = &self.nvim {
+            // One header row plus the prompt grid: `clamp(lines, 3, 10)` while
+            // focused, a single line as a preview when the transcript has focus.
+            let rows = if self.focus == Focus::Input {
+                nvim.line_count().clamp(3, 10)
+            } else {
+                1
+            };
+            (rows + 1).min(area.height.saturating_sub(5).max(2))
+        } else {
+            let inner_width = area.width.saturating_sub(2).max(1) as usize;
+            let input_lines: usize = self
+                .input
+                .lines
+                .iter()
+                .map(|line| {
+                    let width = UnicodeWidthStr::width(line.as_str());
+                    width.div_ceil(inner_width).max(1)
+                })
+                .sum();
+            (input_lines as u16 + 2).clamp(3, 10)
+        };
         let chunks = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(3),
@@ -1806,6 +1967,10 @@ impl App {
     }
 
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
+        if self.nvim.is_some() {
+            self.draw_nvim_input(frame, area);
+            return;
+        }
         let focused = self.focus == Focus::Input;
         let block = Block::default()
             .borders(Borders::ALL)
@@ -1842,6 +2007,65 @@ impl App {
                 .min(inner_height.saturating_sub(1));
             let y = area.y + 1 + row as u16;
             frame.set_cursor_position((x, y));
+        }
+    }
+
+    fn draw_nvim_input(&mut self, frame: &mut Frame, area: Rect) {
+        let focused = self.focus == Focus::Input;
+        let mode = self
+            .nvim
+            .as_ref()
+            .map(NvimInput::mode)
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or_else(|| "--".to_string());
+        let accent = if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let title = Line::from(vec![
+            Span::styled(
+                " prompt ",
+                Style::default().fg(Color::Black).bg(if focused {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw(" "),
+            Span::styled(format!("[{mode}]"), accent),
+        ]);
+        let hint = if focused {
+            " Enter send  Ctrl-J newline  Esc transcript "
+        } else {
+            " i to type "
+        };
+        let columns = Layout::horizontal([Constraint::Min(20), Constraint::Length(44)]).split(area);
+        frame.render_widget(
+            Paragraph::new(title).style(accent),
+            Rect {
+                height: 1,
+                ..columns[0]
+            },
+        );
+        frame.render_widget(
+            Paragraph::new(hint)
+                .alignment(Alignment::Right)
+                .style(Style::default().fg(Color::DarkGray)),
+            Rect {
+                height: 1,
+                ..columns[1]
+            },
+        );
+
+        let grid = Rect {
+            y: area.y + 1,
+            height: area.height.saturating_sub(1),
+            ..area
+        };
+        if let Some(nvim) = self.nvim.as_mut() {
+            nvim.resize(grid.width, grid.height);
+            nvim.draw(frame, grid, focused);
         }
     }
 
