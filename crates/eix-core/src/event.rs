@@ -130,6 +130,14 @@ pub struct ToolResultPayload {
     pub duration_ms: Option<u64>,
 }
 
+/// One selectable hunk of a proposed write, including its rendered lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HunkInfo {
+    pub index: usize,
+    pub header: String,
+    pub lines: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequiredPayload {
     pub approval_id: String,
@@ -141,6 +149,9 @@ pub struct ApprovalRequiredPayload {
     /// cannot be previewed, such as shell commands.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff: Option<String>,
+    /// Per-hunk preview for file-writing tools, used for hunk-level approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<HunkInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

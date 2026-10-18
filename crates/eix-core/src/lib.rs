@@ -13,7 +13,7 @@ pub mod session;
 pub use config::{Config, ConfigError, ProviderConfig, ToolPolicy, ToolsConfig};
 pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ErrorPayload, Event, EventKind,
-    StatusChangedPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    HunkInfo, StatusChangedPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, Role, ToolCall, ToolDefinition, Usage,

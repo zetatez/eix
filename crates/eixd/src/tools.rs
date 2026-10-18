@@ -8,15 +8,14 @@
 //! described in DESIGN.md is a later step; until then the approval card is the
 //! safety boundary.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use eix_core::{Config, ToolDefinition};
+use eix_core::{Config, HunkInfo, ToolDefinition};
 use serde_json::{json, Value};
-use similar::TextDiff;
+use similar::{ChangeTag, TextDiff};
 
 /// Hard cap on provider <-> tool round trips for one user turn.
 pub const MAX_TOOL_ROUNDS: usize = 12;
@@ -116,23 +115,110 @@ pub fn summarize(tool: &str, args: &Value) -> String {
     }
 }
 
-/// A unified diff the user can review before approving. `None` means the tool
-/// has no reviewable diff (for example shell commands). This runs before
-/// execution, so the shown diff is advisory: the write still happens after the
-/// decision and conflict detection is not implemented yet.
-pub async fn preview(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Option<String> {
-    match tool {
-        "write_file" => match write_file_diff(args, cwd).await {
-            Ok(diff) => Some(cap_output(diff, config.tools.max_output_bytes)),
-            Err(err) => Some(format!("(cannot preview diff: {err:#})")),
-        },
-        _ => None,
+/// A proposed `write_file`, kept in memory between showing the diff and the
+/// user's decision. It carries the original contents (for the stale-write
+/// check and for unselected hunks) and the hunk boundaries.
+#[derive(Debug, Clone)]
+pub struct WritePlan {
+    path: PathBuf,
+    label: String,
+    old: String,
+    new: String,
+    hunks: Vec<Hunk>,
+    diff: String,
+}
+
+#[derive(Debug, Clone)]
+struct Hunk {
+    old: Range<usize>,
+    new: Range<usize>,
+    info: HunkInfo,
+}
+
+impl WritePlan {
+    pub fn diff(&self) -> &str {
+        &self.diff
+    }
+
+    pub fn hunk_infos(&self) -> Vec<HunkInfo> {
+        self.hunks.iter().map(|hunk| hunk.info.clone()).collect()
+    }
+
+    /// Refuse to write when the file changed after the diff was generated.
+    pub async fn verify_unchanged(&self) -> Result<()> {
+        let current = tokio::fs::read(&self.path).await.unwrap_or_default();
+        if current != self.old.as_bytes() {
+            bail!(
+                "{} changed after the diff was shown; review and approve again",
+                self.label
+            );
+        }
+        Ok(())
+    }
+
+    /// The result of applying `selected` hunks to the original contents.
+    /// `None` or an empty selection means the whole change.
+    pub fn apply(&self, selected: Option<&[usize]>) -> String {
+        let Some(selected) = selected.filter(|selected| !selected.is_empty()) else {
+            return self.new.clone();
+        };
+        if self.hunks.is_empty() {
+            return self.new.clone();
+        }
+        let old = split_lines(&self.old);
+        let new = split_lines(&self.new);
+        let mut out = String::with_capacity(self.new.len());
+        let mut cursor = 0;
+        for (index, hunk) in self.hunks.iter().enumerate() {
+            for line in &old[cursor..hunk.old.start] {
+                out.push_str(line);
+            }
+            let lines = if selected.contains(&index) {
+                &new[hunk.new.clone()]
+            } else {
+                &old[hunk.old.clone()]
+            };
+            for line in lines {
+                out.push_str(line);
+            }
+            cursor = hunk.old.end;
+        }
+        for line in &old[cursor..] {
+            out.push_str(line);
+        }
+        out
+    }
+
+    async fn write(&self, selected: Option<&[usize]>) -> Result<String> {
+        let content = self.apply(selected);
+        if let Some(parent) = self.path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("cannot create {}", display(parent, &self.path)))?;
+        }
+        tokio::fs::write(&self.path, content.as_bytes())
+            .await
+            .with_context(|| format!("cannot write {}", self.label))?;
+        Ok(format!("wrote {} bytes to {}", content.len(), self.label))
     }
 }
 
-/// Unified diff of a `write_file` call against the current file contents. A
-/// missing file is treated as an empty original (a pure addition).
-async fn write_file_diff(args: &Value, cwd: &Path) -> Result<String> {
+/// Build the review plan for a file-writing tool. `None` for tools without a
+/// file target (for example shell commands) or when the proposal cannot be
+/// prepared (the tool will report the real error after approval).
+pub async fn write_plan(
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    config: &Config,
+) -> Option<WritePlan> {
+    if tool != "write_file" {
+        return None;
+    }
+    write_plan_inner(args, cwd, config).await.ok()
+}
+
+async fn write_plan_inner(args: &Value, cwd: &Path, config: &Config) -> Result<WritePlan> {
     let raw = required_string(args, "path")?;
     let new = required_string(args, "content")?;
     let path = resolve_path(cwd, raw)?;
@@ -144,54 +230,104 @@ async fn write_file_diff(args: &Value, cwd: &Path) -> Result<String> {
         }
     };
     let label = display(&path, cwd);
-    if old.len() > 2_000_000 || new.len() > 2_000_000 {
-        return Ok(format!("{label}: diff omitted (file larger than 2 MB)\n"));
-    }
-    Ok(unified_diff(&label, &old, new))
-}
 
-/// Fingerprint of the file an approval diff was generated against. Re-checked
-/// just before writing so a change made while the user reviewed is not
-/// silently overwritten.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WriteGuard {
-    path: PathBuf,
-    label: String,
-    hash: u64,
-}
+    let mut hunks = Vec::new();
+    let diff = if old.len() > 2_000_000 || new.len() > 2_000_000 {
+        format!("{label}: diff omitted (file larger than 2 MB)\n")
+    } else {
+        let text_diff = TextDiff::from_lines(old.as_str(), new);
+        for (index, ops) in text_diff.grouped_ops(3).iter().enumerate() {
+            let old_start = ops.first().map(|op| op.old_range().start).unwrap_or(0);
+            let old_end = ops.last().map(|op| op.old_range().end).unwrap_or(old_start);
+            let new_start = ops.first().map(|op| op.new_range().start).unwrap_or(0);
+            let new_end = ops.last().map(|op| op.new_range().end).unwrap_or(new_start);
+            let header = format!(
+                "@@ -{},{} +{},{} @@",
+                old_start + 1,
+                old_end - old_start,
+                new_start + 1,
+                new_end - new_start
+            );
+            let mut lines = vec![header.clone()];
+            for op in ops {
+                for change in text_diff.iter_changes(op) {
+                    let sign = match change.tag() {
+                        ChangeTag::Delete => '-',
+                        ChangeTag::Insert => '+',
+                        ChangeTag::Equal => ' ',
+                    };
+                    let value = change.value();
+                    let value = value.strip_suffix('\n').unwrap_or(value);
+                    let value = value.strip_suffix('\r').unwrap_or(value);
+                    lines.push(format!("{sign}{value}"));
+                }
+            }
+            hunks.push(Hunk {
+                old: old_start..old_end,
+                new: new_start..new_end,
+                info: HunkInfo {
+                    index,
+                    header,
+                    lines,
+                },
+            });
+        }
+        unified_diff(&label, &old, new)
+    };
 
-/// Capture the current contents of a `write_file` target for conflict
-/// detection. `None` for tools without a file target (shell commands).
-pub async fn write_guard(tool: &str, args: &Value, cwd: &Path) -> Option<WriteGuard> {
-    if tool != "write_file" {
-        return None;
-    }
-    let raw = required_string(args, "path").ok()?;
-    let path = resolve_path(cwd, raw).ok()?;
-    let bytes = tokio::fs::read(&path).await.unwrap_or_default();
-    Some(WriteGuard {
-        label: display(&path, cwd),
+    Ok(WritePlan {
         path,
-        hash: hash_bytes(&bytes),
+        label,
+        old,
+        new: new.to_string(),
+        hunks,
+        diff: cap_output(diff, config.tools.max_output_bytes),
     })
 }
 
-/// Fail when the guarded file changed after the diff was shown.
-pub async fn verify_guard(guard: &WriteGuard) -> Result<()> {
-    let bytes = tokio::fs::read(&guard.path).await.unwrap_or_default();
-    if hash_bytes(&bytes) != guard.hash {
-        bail!(
-            "{} changed after the diff was shown; review and approve again",
-            guard.label
-        );
+/// Write the approved whole change or the selected hunks.
+pub async fn apply_plan(plan: &WritePlan, selected: Option<&[usize]>) -> ToolOutcome {
+    let started = Instant::now();
+    match plan.write(selected).await {
+        Ok(output) => ToolOutcome {
+            ok: true,
+            output,
+            duration_ms: elapsed_ms(started),
+        },
+        Err(err) => ToolOutcome {
+            ok: false,
+            output: format!("{err:#}"),
+            duration_ms: elapsed_ms(started),
+        },
     }
-    Ok(())
 }
 
-fn hash_bytes(bytes: &[u8]) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    bytes.hash(&mut hasher);
-    hasher.finish()
+/// Split text the same way `similar` does for `from_lines`: keep the line
+/// endings, and treat `\n`, `\r\n`, and a lone `\r` as separators.
+fn split_lines(text: &str) -> Vec<&str> {
+    let bytes = text.as_bytes();
+    let mut lines = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'\r' if bytes.get(index + 1) == Some(&b'\n') => {
+                index += 2;
+                lines.push(&text[start..index]);
+                start = index;
+            }
+            b'\r' | b'\n' => {
+                index += 1;
+                lines.push(&text[start..index]);
+                start = index;
+            }
+            _ => index += 1,
+        }
+    }
+    if start < text.len() {
+        lines.push(&text[start..]);
+    }
+    lines
 }
 
 fn unified_diff(path: &str, old: &str, new: &str) -> String {
@@ -514,36 +650,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preview_reports_a_unified_diff() {
+    async fn write_plan_reports_a_unified_diff_and_hunks() {
         let cwd = temp_cwd("diff");
         let config = Config::default();
         std::fs::write(cwd.join("a.txt"), "one\ntwo\nthree\n").unwrap();
 
-        let diff = preview(
+        let plan = write_plan(
             "write_file",
             &json!({"path": "a.txt", "content": "one\nTWO\nthree\n"}),
             &cwd,
             &config,
         )
         .await
-        .expect("diff preview");
+        .expect("write plan");
+        let diff = plan.diff();
         assert!(diff.contains("--- a/a.txt"), "{diff}");
         assert!(diff.contains("+++ b/a.txt"), "{diff}");
         assert!(diff.contains("-two"), "{diff}");
         assert!(diff.contains("+TWO"), "{diff}");
+        let hunks = plan.hunk_infos();
+        assert_eq!(hunks.len(), 1, "{hunks:?}");
+        assert!(hunks[0].header.starts_with("@@ -1,3 +1,3 @@"), "{hunks:?}");
 
-        let added = preview(
+        let added = write_plan(
             "write_file",
             &json!({"path": "new.txt", "content": "hello\n"}),
             &cwd,
             &config,
         )
         .await
-        .expect("diff preview");
-        assert!(added.contains("+hello"), "{added}");
+        .expect("write plan");
+        assert!(added.diff().contains("+hello"), "{}", added.diff());
 
         assert!(
-            preview("run_command", &json!({"command": "true"}), &cwd, &config)
+            write_plan("run_command", &json!({"command": "true"}), &cwd, &config)
                 .await
                 .is_none()
         );
@@ -551,23 +691,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_guard_detects_a_changed_file() {
+    async fn write_plan_applies_only_selected_hunks() {
+        let cwd = temp_cwd("hunks");
+        let config = Config::default();
+        let original = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty\n";
+        std::fs::write(cwd.join("a.txt"), original).unwrap();
+        // Two edits separated by enough context to stay distinct hunks.
+        let edited = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nEIGHTEEN\nnineteen\ntwenty\n";
+        let plan = write_plan(
+            "write_file",
+            &json!({"path": "a.txt", "content": edited}),
+            &cwd,
+            &config,
+        )
+        .await
+        .expect("write plan");
+        assert_eq!(plan.hunk_infos().len(), 2, "{:?}", plan.hunk_infos());
+
+        // Selecting only the first hunk keeps the second edit out.
+        let partial = plan.apply(Some(&[0]));
+        assert!(partial.contains("TWO"), "{partial}");
+        assert!(partial.contains("\neighteen\n"), "{partial}");
+        assert!(!partial.contains("EIGHTEEN"), "{partial}");
+        assert!(partial.ends_with("twenty\n"), "{partial}");
+
+        // No selection (and an empty selection) means the whole change.
+        assert_eq!(plan.apply(None), edited);
+        assert_eq!(plan.apply(Some(&[])), edited);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn write_plan_detects_a_changed_file() {
         let cwd = temp_cwd("guard");
+        let config = Config::default();
         std::fs::write(cwd.join("a.txt"), "one").unwrap();
-        let guard = write_guard(
+        let plan = write_plan(
             "write_file",
             &json!({"path": "a.txt", "content": "two"}),
             &cwd,
+            &config,
         )
         .await
-        .expect("guard");
-        assert!(verify_guard(&guard).await.is_ok());
+        .expect("write plan");
+        assert!(plan.verify_unchanged().await.is_ok());
 
         std::fs::write(cwd.join("a.txt"), "external").unwrap();
-        assert!(verify_guard(&guard).await.is_err());
+        assert!(plan.verify_unchanged().await.is_err());
 
         assert!(
-            write_guard("run_command", &json!({"command": "true"}), &cwd)
+            write_plan("run_command", &json!({"command": "true"}), &cwd, &config)
                 .await
                 .is_none()
         );

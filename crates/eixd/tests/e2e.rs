@@ -239,6 +239,16 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
     let diff = approval["diff"].as_str().expect("diff preview");
     assert!(diff.contains("+++ b/out.txt"), "diff was: {diff}");
     assert!(diff.contains("+hello"), "diff was: {diff}");
+    let hunks = approval["hunks"].as_array().expect("hunk preview");
+    assert_eq!(hunks.len(), 1, "hunks were: {hunks:?}");
+    assert_eq!(hunks[0]["index"], 0);
+    assert!(
+        hunks[0]["lines"]
+            .as_array()
+            .is_some_and(|lines| lines.iter().any(|line| line == "+hello")),
+        "hunk was: {:?}",
+        hunks[0]
+    );
     let approval_id = approval["approval_id"].as_str().unwrap().to_string();
 
     let waiting: AttachResult = client
@@ -316,6 +326,83 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
         .unwrap()
         .iter()
         .any(|m| m["role"] == "tool" && m["content"] == "wrote 5 bytes to out.txt"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn approval_applies_only_the_selected_hunks() -> anyhow::Result<()> {
+    let dir = temp_dir("hunks");
+    std::fs::create_dir_all(&dir)?;
+    let original = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty\n";
+    let edited = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nEIGHTEEN\nnineteen\ntwenty\n";
+    std::fs::write(dir.join("out.txt"), original)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(tool_provider_with_content(
+        listener,
+        Arc::clone(&bodies),
+        edited.to_string(),
+    ));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "hunks", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "edit out.txt"}),
+        )
+        .await?;
+
+    let approval = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            break notification.params.clone();
+        }
+    };
+    let hunks = approval["hunks"].as_array().expect("hunk preview");
+    assert_eq!(hunks.len(), 2, "hunks were: {hunks:?}");
+
+    // Approve only the first hunk; the second edit must not be written.
+    let answered: eix_core::ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": approval["approval_id"],
+                "decision": "approve",
+                "hunks": [0],
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break;
+        }
+    }
+
+    let expected = original.replacen("two\n", "TWO\n", 1);
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, expected);
 
     daemon.abort();
     mock.abort();
@@ -725,11 +812,20 @@ async fn slow_provider(listener: TcpListener) {
 }
 
 async fn tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    tool_provider_with_content(listener, bodies, "hello".to_string()).await;
+}
+
+async fn tool_provider_with_content(
+    listener: TcpListener,
+    bodies: Arc<Mutex<Vec<String>>>,
+    content: String,
+) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
         };
         let bodies = Arc::clone(&bodies);
+        let content = content.clone();
         tokio::spawn(async move {
             let Some(body) = read_http_body(&mut socket).await else {
                 return;
@@ -748,7 +844,7 @@ async fn tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
                 });
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else {
-                let arguments = json!({"path": "out.txt", "content": "hello"}).to_string();
+                let arguments = json!({"path": "out.txt", "content": content}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{

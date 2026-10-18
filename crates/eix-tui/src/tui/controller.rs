@@ -31,6 +31,8 @@ pub enum Command {
         session_id: String,
         approval_id: String,
         decision: ApprovalDecision,
+        /// Selected hunk indices; `None` applies the whole change.
+        hunks: Option<Vec<usize>>,
     },
 }
 
@@ -174,6 +176,7 @@ async fn dispatch(
             session_id,
             approval_id,
             decision,
+            hunks,
         } => {
             let value = requester
                 .request(
@@ -182,6 +185,7 @@ async fn dispatch(
                         "session_id": session_id,
                         "approval_id": approval_id,
                         "decision": decision,
+                        "hunks": hunks,
                     }),
                 )
                 .await?;

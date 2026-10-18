@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eix_core::{
     ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
-    Event as SessionEvent, EventKind, HelloResult, Session, SessionStatus, SubmitResult,
+    Event as SessionEvent, EventKind, HelloResult, HunkInfo, Session, SessionStatus, SubmitResult,
     ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -242,6 +242,8 @@ impl SessionView {
                                 tool: payload.tool,
                                 summary: payload.summary,
                                 diff: payload.diff,
+                                selected: vec![true; payload.hunks.len()],
+                                hunks: payload.hunks,
                             });
                         }
                     }
@@ -290,12 +292,18 @@ struct PendingApproval {
     tool: String,
     summary: String,
     diff: Option<String>,
+    /// Per-hunk preview for file-writing tools.
+    hunks: Vec<HunkInfo>,
+    /// Whether each hunk is selected; parallel to `hunks`.
+    selected: Vec<bool>,
 }
 
 /// Full-screen review of an approval's diff, opened with `d`.
 struct DiffView {
     session_id: String,
     scroll: usize,
+    /// Hunk under the selection cursor.
+    cursor: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -664,7 +672,9 @@ impl App {
                             approval_id: params.approval_id,
                             tool: params.tool,
                             summary: params.summary,
+                            selected: vec![true; params.hunks.len()],
                             diff: params.diff,
+                            hunks: params.hunks,
                         },
                     );
                 }
@@ -1001,13 +1011,14 @@ impl App {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             return;
         };
-        self.respond_approval_for(&session_id, decision, tx);
+        self.respond_approval_for(&session_id, decision, None, tx);
     }
 
     fn respond_approval_for(
         &mut self,
         session_id: &str,
         decision: ApprovalDecision,
+        hunks: Option<Vec<usize>>,
         tx: &UnboundedSender<Command>,
     ) {
         let Some(pending) = self.approvals.get(session_id) else {
@@ -1023,6 +1034,7 @@ impl App {
             session_id: session_id.to_string(),
             approval_id,
             decision,
+            hunks,
         });
     }
 
@@ -1030,49 +1042,106 @@ impl App {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             return;
         };
-        let has_diff = self
-            .approvals
-            .get(&session_id)
-            .and_then(|approval| approval.diff.as_deref())
-            .is_some_and(|diff| !diff.is_empty());
-        if !has_diff {
+        let (has_hunks, has_diff) = match self.approvals.get(&session_id) {
+            Some(approval) => (
+                !approval.hunks.is_empty(),
+                approval
+                    .diff
+                    .as_deref()
+                    .is_some_and(|diff| !diff.is_empty()),
+            ),
+            None => (false, false),
+        };
+        if !has_hunks && !has_diff {
             self.status = "no diff to review".into();
             return;
         }
         self.diff_view = Some(DiffView {
             session_id,
             scroll: 0,
+            cursor: 0,
         });
-        self.status = "diff review: j/k scroll · y approve · n deny · Esc close".into();
+        self.status = if has_hunks {
+            "diff review: j/k scroll · [ ] hunk · Space toggle · y apply · n deny".into()
+        } else {
+            "diff review: j/k scroll · y approve · n deny · Esc close".into()
+        };
     }
 
     fn handle_diff_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
-        let Some((session_id, scroll)) = self
+        let Some((session_id, scroll, cursor)) = self
             .diff_view
             .as_ref()
-            .map(|view| (view.session_id.clone(), view.scroll))
+            .map(|view| (view.session_id.clone(), view.scroll, view.cursor))
         else {
             return;
         };
-        let Some(total) = self
+        let Some((total, offsets)) = self
             .approvals
             .get(&session_id)
-            .and_then(|approval| approval.diff.as_deref())
-            .map(|diff| diff.lines().count())
+            .map(|approval| (review_total_lines(approval), review_hunk_offsets(approval)))
         else {
             // The approval was answered elsewhere; drop the overlay.
             self.diff_view = None;
             return;
         };
+        let hunk_count = offsets.len();
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('d') => self.diff_view = None,
             KeyCode::Char('y') => {
-                self.diff_view = None;
-                self.respond_approval_for(&session_id, ApprovalDecision::Approve, tx);
+                let selection = self.approvals.get(&session_id).map(|approval| {
+                    let selected: Vec<usize> = approval
+                        .selected
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, &on)| on.then_some(index))
+                        .collect();
+                    (selected, approval.hunks.len())
+                });
+                match selection {
+                    Some((selected, count)) if count > 0 && selected.is_empty() => {
+                        self.status = "no hunks selected; press a to select all".into();
+                    }
+                    Some((selected, count)) => {
+                        let partial = (selected.len() < count).then_some(selected);
+                        self.diff_view = None;
+                        self.respond_approval_for(
+                            &session_id,
+                            ApprovalDecision::Approve,
+                            partial,
+                            tx,
+                        );
+                    }
+                    None => self.diff_view = None,
+                }
             }
             KeyCode::Char('n') => {
                 self.diff_view = None;
-                self.respond_approval_for(&session_id, ApprovalDecision::Deny, tx);
+                self.respond_approval_for(&session_id, ApprovalDecision::Deny, None, tx);
+            }
+            KeyCode::Char(' ') => {
+                if let Some(approval) = self.approvals.get_mut(&session_id) {
+                    if let Some(flag) = approval.selected.get_mut(cursor) {
+                        *flag = !*flag;
+                    }
+                }
+            }
+            KeyCode::Char('a') => {
+                if let Some(approval) = self.approvals.get_mut(&session_id) {
+                    let all_on = approval.selected.iter().all(|&on| on);
+                    approval
+                        .selected
+                        .iter_mut()
+                        .for_each(|flag| *flag = !all_on);
+                }
+            }
+            KeyCode::Char(']') | KeyCode::Char('J') if hunk_count > 0 => {
+                let next = (cursor + 1) % hunk_count;
+                self.set_diff_cursor(next, offsets[next], total);
+            }
+            KeyCode::Char('[') | KeyCode::Char('K') if hunk_count > 0 => {
+                let prev = (cursor + hunk_count - 1) % hunk_count;
+                self.set_diff_cursor(prev, offsets[prev], total);
             }
             KeyCode::Char('j') | KeyCode::Down => self.set_diff_scroll(scroll + 1, total),
             KeyCode::Char('k') | KeyCode::Up => {
@@ -1089,6 +1158,13 @@ impl App {
     fn set_diff_scroll(&mut self, scroll: usize, total: usize) {
         if let Some(view) = &mut self.diff_view {
             view.scroll = scroll.min(total.saturating_sub(1));
+        }
+    }
+
+    fn set_diff_cursor(&mut self, cursor: usize, line: usize, total: usize) {
+        if let Some(view) = &mut self.diff_view {
+            view.cursor = cursor;
+            view.scroll = line.min(total.saturating_sub(1));
         }
     }
 
@@ -1799,21 +1875,17 @@ impl App {
     }
 
     fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
-        let Some((session_id, scroll)) = self
+        let Some((session_id, scroll, cursor)) = self
             .diff_view
             .as_ref()
-            .map(|view| (view.session_id.clone(), view.scroll))
+            .map(|view| (view.session_id.clone(), view.scroll, view.cursor))
         else {
             return;
         };
-        let Some((tool, diff)) = self.approvals.get(&session_id).and_then(|approval| {
-            approval
-                .diff
-                .clone()
-                .map(|diff| (approval.tool.clone(), diff))
-        }) else {
+        let Some(approval) = self.approvals.get(&session_id) else {
             return;
         };
+        let tool = approval.tool.clone();
 
         let rect = centered(
             area,
@@ -1823,22 +1895,58 @@ impl App {
         frame.render_widget(Clear, rect);
         let inner_width = rect.width.saturating_sub(2) as usize;
         let inner_height = rect.height.saturating_sub(3) as usize; // borders + hint
-        let lines: Vec<&str> = diff.lines().collect();
-        let max_scroll = lines.len().saturating_sub(inner_height);
-        let scroll = scroll.min(max_scroll);
-        let mut body: Vec<Line> = lines
-            .iter()
-            .skip(scroll)
-            .take(inner_height)
-            .map(|line| {
-                Line::from(Span::styled(
+
+        let interactive = !approval.hunks.is_empty();
+        let mut body: Vec<Line> = Vec::new();
+        if interactive {
+            for (index, hunk) in approval.hunks.iter().enumerate() {
+                let selected = approval.selected.get(index).copied().unwrap_or(true);
+                let focused = index == cursor;
+                for (line_index, line) in hunk.lines.iter().enumerate() {
+                    if line_index == 0 {
+                        let marker = if focused { "▸ " } else { "  " };
+                        let check = if selected { "[x] " } else { "[ ] " };
+                        let style = if focused {
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD)
+                        } else if selected {
+                            Style::default().fg(Color::Cyan)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        };
+                        body.push(Line::from(Span::styled(
+                            truncate(&format!("{marker}{check}{line}"), inner_width),
+                            style,
+                        )));
+                    } else {
+                        body.push(Line::from(Span::styled(
+                            truncate(&format!("    {line}"), inner_width),
+                            diff_line_style(line),
+                        )));
+                    }
+                }
+            }
+        } else {
+            for line in approval.diff.as_deref().unwrap_or("").lines() {
+                body.push(Line::from(Span::styled(
                     truncate(line, inner_width),
                     diff_line_style(line),
-                ))
-            })
-            .collect();
+                )));
+            }
+        }
+
+        let total = body.len();
+        let max_scroll = total.saturating_sub(inner_height);
+        let scroll = scroll.min(max_scroll);
+        let mut body: Vec<Line> = body.into_iter().skip(scroll).take(inner_height).collect();
+        let hint = if interactive {
+            " j/k scroll  [ ] hunk  Space toggle  a all  y apply  n deny  Esc close "
+        } else {
+            " j/k scroll  y approve  n deny  Esc close "
+        };
         body.push(Line::from(Span::styled(
-            " j/k scroll  y approve  n deny  Esc close ",
+            hint,
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -1988,6 +2096,8 @@ struct ApprovalParams {
     summary: String,
     #[serde(default)]
     diff: Option<String>,
+    #[serde(default)]
+    hunks: Vec<HunkInfo>,
 }
 
 #[derive(Deserialize)]
@@ -2182,7 +2292,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key_line("n", "new session (new pane)"),
         key_line("x", "cancel focused turn"),
         key_line("y / n", "approve / deny a pending tool call"),
-        key_line("d", "review the pending diff full screen"),
+        key_line(
+            "d",
+            "review the pending diff full screen (Space toggles hunks)",
+        ),
         key_line("j / k", "scroll focused transcript"),
         key_line("g / G", "top / follow tail"),
         key_line("? / F1", "open this help (F1 anywhere)"),
@@ -2301,6 +2414,34 @@ fn center_of(rect: Rect) -> (i64, i64) {
     )
 }
 
+/// Line index where each hunk starts in the review body.
+fn review_hunk_offsets(approval: &PendingApproval) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(approval.hunks.len());
+    let mut line = 0;
+    for hunk in &approval.hunks {
+        offsets.push(line);
+        line += hunk.lines.len().max(1);
+    }
+    offsets
+}
+
+/// Number of lines the review body renders.
+fn review_total_lines(approval: &PendingApproval) -> usize {
+    if approval.hunks.is_empty() {
+        approval
+            .diff
+            .as_deref()
+            .map(|diff| diff.lines().count())
+            .unwrap_or(0)
+    } else {
+        approval
+            .hunks
+            .iter()
+            .map(|hunk| hunk.lines.len().max(1))
+            .sum()
+    }
+}
+
 fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval) {
     if area.width < 20 || area.height < 6 {
         return;
@@ -2348,7 +2489,11 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
     ];
     if !diff_lines.is_empty() {
         keys.push(Span::styled(
-            "[d] review  ",
+            if approval.hunks.is_empty() {
+                "[d] review  "
+            } else {
+                "[d] review hunks  "
+            },
             Style::default().fg(Color::Cyan),
         ));
     }
@@ -2690,6 +2835,8 @@ mod tests {
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: None,
+                hunks: Vec::new(),
+                selected: Vec::new(),
             },
         );
 
@@ -2699,10 +2846,12 @@ mod tests {
                 session_id,
                 approval_id,
                 decision,
+                hunks,
             } => {
                 assert_eq!(session_id, "s1");
                 assert_eq!(approval_id, "a1");
                 assert_eq!(decision, ApprovalDecision::Approve);
+                assert!(hunks.is_none());
             }
             _ => panic!("expected an approval command"),
         }
@@ -2732,9 +2881,41 @@ mod tests {
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: diff.map(str::to_string),
+                hunks: Vec::new(),
+                selected: Vec::new(),
             },
         );
         (app, tx, rx)
+    }
+
+    fn hunk(index: usize, header: &str, lines: &[&str]) -> HunkInfo {
+        HunkInfo {
+            index,
+            header: header.to_string(),
+            lines: lines.iter().map(|line| line.to_string()).collect(),
+        }
+    }
+
+    fn app_with_hunks(hunks: Vec<HunkInfo>) -> App {
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "tools", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.approvals.insert(
+            "s1".to_string(),
+            PendingApproval {
+                approval_id: "a1".to_string(),
+                tool: "write_file".to_string(),
+                summary: "write_file out.txt".to_string(),
+                diff: Some("unused".to_string()),
+                selected: vec![true; hunks.len()],
+                hunks,
+            },
+        );
+        app
     }
 
     #[test]
@@ -2764,10 +2945,12 @@ mod tests {
                 session_id,
                 approval_id,
                 decision,
+                hunks,
             } => {
                 assert_eq!(session_id, "s1");
                 assert_eq!(approval_id, "a1");
                 assert_eq!(decision, ApprovalDecision::Approve);
+                assert!(hunks.is_none());
             }
             _ => panic!("expected an approval command"),
         }
@@ -2780,6 +2963,64 @@ mod tests {
             }
             _ => panic!("expected a deny command"),
         }
+    }
+
+    #[test]
+    fn diff_review_applies_only_selected_hunks() {
+        let hunks = vec![
+            hunk(0, "@@ -1,2 +1,2 @@", &["@@ -1,2 +1,2 @@", "-a", "+A"]),
+            hunk(1, "@@ -8,2 +8,2 @@", &["@@ -8,2 +8,2 @@", "-b", "+B"]),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_hunks(hunks);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        // Move to the second hunk and deselect it.
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+
+        match rx.try_recv().expect("approval command") {
+            Command::Approval {
+                decision, hunks, ..
+            } => {
+                assert_eq!(decision, ApprovalDecision::Approve);
+                assert_eq!(hunks, Some(vec![0]));
+            }
+            _ => panic!("expected an approval command"),
+        }
+    }
+
+    #[test]
+    fn diff_review_approves_everything_when_all_hunks_are_selected() {
+        let hunks = vec![
+            hunk(0, "@@ -1 +1 @@", &["@@ -1 +1 @@", "-a", "+A"]),
+            hunk(1, "@@ -8 +8 @@", &["@@ -8 +8 @@", "-b", "+B"]),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_hunks(hunks);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("approval command") {
+            Command::Approval { hunks, .. } => assert!(hunks.is_none()),
+            _ => panic!("expected an approval command"),
+        }
+    }
+
+    #[test]
+    fn diff_review_refuses_to_apply_with_no_hunks_selected() {
+        let hunks = vec![
+            hunk(0, "@@ -1 +1 @@", &["@@ -1 +1 @@", "-a", "+A"]),
+            hunk(1, "@@ -8 +8 @@", &["@@ -8 +8 @@", "-b", "+B"]),
+        ];
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_hunks(hunks);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        // `a` deselects everything because everything starts selected.
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+        assert!(rx.try_recv().is_err());
+        assert!(app.status.contains("no hunks selected"));
+        assert!(app.diff_view.is_some());
     }
 
     #[test]

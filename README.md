@@ -62,9 +62,9 @@ timeout_secs = 300
 `message.delta`、`tool.approval_required`、`tool.started`、`tool.completed`、
 `session.attention`、`turn.completed` 等。`eix-core/src/protocol.rs` 是唯一契约来源。
 
-当前限制：工具执行已接入，写入是审批后直接落盘；审批前会展示 unified diff，但按 hunk
-选择、冲突检测和 staged shadow workspace 仍未做（bubblewrap 沙箱和 context ledger 也是
-Phase 2 的后续项）。TUI 已支持多
+当前限制：工具执行已接入，写入是审批后直接落盘；审批前会展示 unified diff 并支持按 hunk
+选择（`d` 全屏审阅里 Space 勾选），审阅期间的文件改动会让本次写入被拒绝；但 staged
+shadow workspace 仍未做（bubblewrap 沙箱和 context ledger 也是 Phase 2 的后续项）。TUI 已支持多
 pane；后台 pane 的 attention 用边框/侧栏高亮和 `a` 跳转提示，外部通知命令（dwm/tmux）
 和嵌入 nvim 输入尚未接上。
 
@@ -94,7 +94,7 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 | `Tab` / `S-Tab` | 聚焦 pane 切到下一个 / 上一个 session（转录区） |
 | `n` | 新建 session 并在新 pane 打开（有待审批时先作为 deny） |
 | `y` / `n` | 批准 / 拒绝聚焦 pane 的待审批工具调用 |
-| `d` | 全屏审阅待审批写入的完整 diff（j/k 滚动，y/n 直接处理） |
+| `d` | 全屏审阅待审批写入的 diff；有 hunk 时 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/全不选、`y` 应用选中、`n` 拒绝 |
 | `x` | 取消聚焦 pane 的 turn |
 | `j` / `k` / `PgUp` / `PgDn` | 滚动聚焦 pane 的转录 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
@@ -103,8 +103,10 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
 有待审批的工具调用时，pane 底部会出现 `[y] approve / [n] deny` 卡片，`write_file`
-还会显示 unified diff（最多 10 行，超出标 `… diff truncated`），按 `d` 可全屏审阅
-（`j/k` 滚动，`y/n` 直接批准/拒绝）。session 栏显示 `⚠`；也可以从命令行用
+还会显示 unified diff（最多 10 行，超出标 `… diff truncated`），按 `d` 可全屏审阅：
+`j/k` 滚动，`[`/`]` 跳 hunk，`Space` 勾选，`a` 全选/全不选，`y` 应用选中（全选或非
+`write_file` 时按整文件），`n` 拒绝。未勾选任何 hunk 时 `y` 会提示先选择。session 栏
+显示 `⚠`；也可以从命令行用
 `eix approve` / `eix deny` 处理。后台 pane 进入
 `awaiting_approval` / `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
 按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的审批卡片。
@@ -123,8 +125,9 @@ daemon 目前向模型暴露四个工具：
 | `run_command` | 在 cwd 内用 `sh -c` 执行命令，带超时 | 需要审批 |
 
 所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出按
-`max_output_bytes` 截断。`write_file` 在审批前会读取原文件并生成 unified diff，
-TUI 审批卡片、`eix chat` 和 `eix log` 都会显示（整文件批准，暂不支持按 hunk 选择）。
+`max_output_bytes` 截断。`write_file` 在审批前会读取原文件并生成 unified diff 和逐 hunk
+预览，TUI 审批卡片、`eix chat` 和 `eix log` 都会显示；在 TUI 里用 `d` 全屏审阅可以按
+hunk 选择应用（`eix approve` 仍然整文件批准）。
 批准前会重新校验文件指纹：如果审阅期间文件被外部修改，本次写入会被拒绝并提示重新审阅。
 策略由 `[tools]` 配置或环境变量控制：
 
@@ -201,7 +204,8 @@ spike 内：
 - [x] 工具调用 + 审批门禁（read_file / list_dir / write_file / run_command、workspace 沙箱、审批卡片）
 - [x] 写入前 unified diff 预览（TUI 卡片、`d` 全屏审阅、`eix chat` / `eix log`）
 - [x] 审阅期间的 stale-write 冲突检测（批准时重新校验文件指纹）
+- [x] hunk 级审批（TUI `d` 审阅里勾选 hunk，daemon 按选择应用部分改动）
 - [x] attention 标记（后台 pane 高亮、`a` 跳转、审批卡片重放）
 - [ ] 嵌入 nvim 输入 + 外部 attention 通知（dwm/tmux/terminal bell）
-- [ ] staging / shadow workspace、hunk 级审批、沙箱、context ledger
+- [ ] staging / shadow workspace、bubblewrap 沙箱、context ledger、process view
 - [ ] daemon 化的 nvim 前端（JSON-RPC over Unix socket）

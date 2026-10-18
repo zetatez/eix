@@ -146,6 +146,10 @@ pub struct ApprovalRespondParams {
     pub decision: ApprovalDecision,
     #[serde(default)]
     pub reason: Option<String>,
+    /// Indices of hunks to apply when approving a write. Omitted or empty
+    /// means the whole change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<usize>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
