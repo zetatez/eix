@@ -668,6 +668,12 @@ async fn stream_turn(
                         .as_str()
                         .unwrap_or("tool call");
                     eprintln!("approval needed: {summary}");
+                    if let Some(diff) = notification.params["diff"]
+                        .as_str()
+                        .filter(|diff| !diff.is_empty())
+                    {
+                        eprintln!("{diff}");
+                    }
                     eprintln!("  run `eix approve` or `eix deny`");
                 }
             }
@@ -724,6 +730,9 @@ fn render_events(events: &[Event]) {
                         "need> {} (y/n in the TUI, or `eix approve/deny`)",
                         payload.summary
                     );
+                    if let Some(diff) = payload.diff.as_deref().filter(|diff| !diff.is_empty()) {
+                        print!("{diff}");
+                    }
                 }
             }
             EventKind::ToolResult => {

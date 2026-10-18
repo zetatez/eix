@@ -440,8 +440,10 @@ prompt buffer 的 buffer-local mapping：
 > 一次 turn 最多 12 轮工具往返；每轮写入 `tool_call` / `approval_required` / `tool_result`
 > 事件并广播 `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理。
-> 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。**尚未做**：staged shadow
-> workspace、diff hunk 审批、bubblewrap 沙箱、执行前快照、context ledger、process view。
+> 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。`write_file` 在审批前生成
+> unified diff 并随 `approval_required` 事件广播，TUI 卡片和 CLI 均会展示；目前是整文件
+> 批准。**尚未做**：staged shadow workspace、hunk 级选择、stage 后冲突检测、bubblewrap
+> 沙箱、执行前快照、context ledger、process view。
 
 **Phase 3**
 

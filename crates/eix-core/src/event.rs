@@ -137,6 +137,10 @@ pub struct ApprovalRequiredPayload {
     pub tool: String,
     pub summary: String,
     pub arguments: Value,
+    /// Unified diff preview for file-writing tools. Absent for tools that
+    /// cannot be previewed, such as shell commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

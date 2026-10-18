@@ -62,8 +62,9 @@ timeout_secs = 300
 `message.delta`、`tool.approval_required`、`tool.started`、`tool.completed`、
 `session.attention`、`turn.completed` 等。`eix-core/src/protocol.rs` 是唯一契约来源。
 
-当前限制：工具执行已接入，但写入是审批后直接落盘（DESIGN 里的 staged shadow workspace、
-diff hunk 审批、bubblewrap 沙箱和 context ledger 仍是 Phase 2 的后续项）。TUI 已支持多
+当前限制：工具执行已接入，写入是审批后直接落盘；审批前会展示 unified diff，但按 hunk
+选择、冲突检测和 staged shadow workspace 仍未做（bubblewrap 沙箱和 context ledger 也是
+Phase 2 的后续项）。TUI 已支持多
 pane；后台 pane 的 attention 用边框/侧栏高亮和 `a` 跳转提示，外部通知命令（dwm/tmux）
 和嵌入 nvim 输入尚未接上。
 
@@ -100,7 +101,8 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 | `q` / `Ctrl-C` | 退出 |
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
-有待审批的工具调用时，pane 底部会出现 `[y] approve / [n] deny` 卡片，session 栏显示
+有待审批的工具调用时，pane 底部会出现 `[y] approve / [n] deny` 卡片，`write_file`
+还会显示 unified diff（最多 10 行，超出标 `… diff truncated`），session 栏显示
 `⚠`；也可以从命令行用 `eix approve` / `eix deny` 处理。后台 pane 进入
 `awaiting_approval` / `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
 按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的审批卡片。
@@ -119,7 +121,9 @@ daemon 目前向模型暴露四个工具：
 | `run_command` | 在 cwd 内用 `sh -c` 执行命令，带超时 | 需要审批 |
 
 所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出按
-`max_output_bytes` 截断。策略由 `[tools]` 配置或环境变量控制：
+`max_output_bytes` 截断。`write_file` 在审批前会读取原文件并生成 unified diff，
+TUI 审批卡片、`eix chat` 和 `eix log` 都会显示（整文件批准，暂不支持按 hunk 选择）。
+策略由 `[tools]` 配置或环境变量控制：
 
 ```toml
 [tools]
@@ -192,7 +196,8 @@ spike 内：
 - [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve / deny / doctor）
 - [x] TUI v1（多 pane 自动平铺、焦点切换、转录、session 栏、fuzzy picker、多行输入、流式跟随）
 - [x] 工具调用 + 审批门禁（read_file / list_dir / write_file / run_command、workspace 沙箱、审批卡片）
+- [x] 写入前 unified diff 预览（TUI 卡片 / `eix chat` / `eix log`）
 - [x] attention 标记（后台 pane 高亮、`a` 跳转、审批卡片重放）
 - [ ] 嵌入 nvim 输入 + 外部 attention 通知（dwm/tmux/terminal bell）
-- [ ] staging / shadow workspace、diff hunk 审批、沙箱、context ledger
+- [ ] staging / shadow workspace、hunk 级审批、冲突检测、沙箱、context ledger
 - [ ] daemon 化的 nvim 前端（JSON-RPC over Unix socket）

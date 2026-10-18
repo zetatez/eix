@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use eix_core::{Config, ToolDefinition};
 use serde_json::{json, Value};
+use similar::TextDiff;
 
 /// Hard cap on provider <-> tool round trips for one user turn.
 pub const MAX_TOOL_ROUNDS: usize = 12;
@@ -111,6 +112,52 @@ pub fn summarize(tool: &str, args: &Value) -> String {
         }
         other => other.to_string(),
     }
+}
+
+/// A unified diff the user can review before approving. `None` means the tool
+/// has no reviewable diff (for example shell commands). This runs before
+/// execution, so the shown diff is advisory: the write still happens after the
+/// decision and conflict detection is not implemented yet.
+pub async fn preview(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Option<String> {
+    match tool {
+        "write_file" => match write_file_diff(args, cwd).await {
+            Ok(diff) => Some(cap_output(diff, config.tools.max_output_bytes)),
+            Err(err) => Some(format!("(cannot preview diff: {err:#})")),
+        },
+        _ => None,
+    }
+}
+
+/// Unified diff of a `write_file` call against the current file contents. A
+/// missing file is treated as an empty original (a pure addition).
+async fn write_file_diff(args: &Value, cwd: &Path) -> Result<String> {
+    let raw = required_string(args, "path")?;
+    let new = required_string(args, "content")?;
+    let path = resolve_path(cwd, raw)?;
+    let old = match tokio::fs::read(&path).await {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(err) => {
+            return Err(err).with_context(|| format!("cannot read {}", display(&path, cwd)))
+        }
+    };
+    let label = display(&path, cwd);
+    if old.len() > 2_000_000 || new.len() > 2_000_000 {
+        return Ok(format!("{label}: diff omitted (file larger than 2 MB)\n"));
+    }
+    Ok(unified_diff(&label, &old, new))
+}
+
+fn unified_diff(path: &str, old: &str, new: &str) -> String {
+    let mut out = TextDiff::from_lines(old, new)
+        .unified_diff()
+        .context_radius(3)
+        .header(&format!("a/{path}"), &format!("b/{path}"))
+        .to_string();
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 pub async fn execute(tool: &str, args: &Value, cwd: &Path, config: &Config) -> ToolOutcome {
@@ -417,6 +464,43 @@ mod tests {
         )
         .await;
         assert!(!escaped.ok);
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn preview_reports_a_unified_diff() {
+        let cwd = temp_cwd("diff");
+        let config = Config::default();
+        std::fs::write(cwd.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+
+        let diff = preview(
+            "write_file",
+            &json!({"path": "a.txt", "content": "one\nTWO\nthree\n"}),
+            &cwd,
+            &config,
+        )
+        .await
+        .expect("diff preview");
+        assert!(diff.contains("--- a/a.txt"), "{diff}");
+        assert!(diff.contains("+++ b/a.txt"), "{diff}");
+        assert!(diff.contains("-two"), "{diff}");
+        assert!(diff.contains("+TWO"), "{diff}");
+
+        let added = preview(
+            "write_file",
+            &json!({"path": "new.txt", "content": "hello\n"}),
+            &cwd,
+            &config,
+        )
+        .await
+        .expect("diff preview");
+        assert!(added.contains("+hello"), "{added}");
+
+        assert!(
+            preview("run_command", &json!({"command": "true"}), &cwd, &config)
+                .await
+                .is_none()
+        );
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

@@ -241,6 +241,7 @@ impl SessionView {
                                 approval_id: payload.approval_id,
                                 tool: payload.tool,
                                 summary: payload.summary,
+                                diff: payload.diff,
                             });
                         }
                     }
@@ -288,6 +289,7 @@ struct PendingApproval {
     approval_id: String,
     tool: String,
     summary: String,
+    diff: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -652,6 +654,7 @@ impl App {
                             approval_id: params.approval_id,
                             tool: params.tool,
                             summary: params.summary,
+                            diff: params.diff,
                         },
                     );
                 }
@@ -1809,6 +1812,8 @@ struct ApprovalParams {
     approval_id: String,
     tool: String,
     summary: String,
+    #[serde(default)]
+    diff: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2122,10 +2127,15 @@ fn center_of(rect: Rect) -> (i64, i64) {
 }
 
 fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval) {
-    let height = 4u16;
-    if area.width < 20 || area.height < height + 2 {
+    if area.width < 20 || area.height < 6 {
         return;
     }
+    // The card grows to fit a capped diff preview, never taller than the pane.
+    let max_diff = area.height.saturating_sub(5) as usize; // borders + summary + keys
+    let diff_lines: Vec<&str> = approval.diff.as_deref().unwrap_or("").lines().collect();
+    let max_diff = max_diff.min(10);
+    let shown = diff_lines.len().min(max_diff);
+    let height = (4 + shown + usize::from(diff_lines.len() > shown)) as u16;
     let rect = Rect {
         x: area.x + 1,
         y: area.y + area.height - height - 1,
@@ -2133,23 +2143,36 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
         height,
     };
     frame.render_widget(Clear, rect);
-    let summary = truncate(&approval.summary, rect.width.saturating_sub(14) as usize);
-    let lines = vec![
-        Line::from(vec![
-            Span::styled(
-                "⚠ ",
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(summary, Style::default().fg(Color::Yellow)),
-        ]),
-        Line::from(vec![
-            Span::styled("[y] approve  ", Style::default().fg(Color::Green)),
-            Span::styled("[n] deny  ", Style::default().fg(Color::Red)),
-            Span::styled("[x] cancel", Style::default().fg(Color::DarkGray)),
-        ]),
-    ];
+
+    let summary = truncate(&approval.summary, rect.width.saturating_sub(4) as usize);
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "⚠ ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(summary, Style::default().fg(Color::Yellow)),
+    ])];
+    let inner = rect.width.saturating_sub(2) as usize;
+    for line in diff_lines.iter().take(shown) {
+        lines.push(Line::from(Span::styled(
+            truncate(line, inner),
+            diff_line_style(line),
+        )));
+    }
+    if diff_lines.len() > shown {
+        lines.push(Line::from(Span::styled(
+            "… diff truncated",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    lines.push(Line::from(vec![
+        Span::styled("[y] approve  ", Style::default().fg(Color::Green)),
+        Span::styled("[n] deny  ", Style::default().fg(Color::Red)),
+        Span::styled("[x] cancel", Style::default().fg(Color::DarkGray)),
+    ]));
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Yellow))
@@ -2160,6 +2183,20 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
             .style(Style::default().bg(Color::Black)),
         rect,
     );
+}
+
+fn diff_line_style(line: &str) -> Style {
+    if line.starts_with("@@") {
+        Style::default().fg(Color::Cyan)
+    } else if line.starts_with("+++") || line.starts_with("---") {
+        Style::default().fg(Color::DarkGray)
+    } else if line.starts_with('+') {
+        Style::default().fg(Color::Green)
+    } else if line.starts_with('-') {
+        Style::default().fg(Color::Red)
+    } else {
+        Style::default().fg(Color::Gray)
+    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -2423,6 +2460,7 @@ mod tests {
                 "tool": "write_file",
                 "summary": "write_file out.txt",
                 "arguments": {"path": "out.txt", "content": "x"},
+                "diff": "--- a/out.txt\n+++ b/out.txt\n@@ -1 +1 @@\n-x\n+y\n",
             }),
         );
         let result = SessionEvent::new(
@@ -2439,7 +2477,12 @@ mod tests {
         );
 
         let pending = SessionView::new(session.clone(), vec![approval.clone()]).pending_approval();
-        assert_eq!(pending.as_ref().map(|p| p.approval_id.as_str()), Some("a1"));
+        let pending = pending.expect("restored approval");
+        assert_eq!(pending.approval_id, "a1");
+        assert!(pending
+            .diff
+            .as_deref()
+            .is_some_and(|diff| diff.contains("+y")));
 
         let resolved = SessionView::new(session, vec![approval, result]).pending_approval();
         assert!(resolved.is_none());
@@ -2461,6 +2504,7 @@ mod tests {
                 approval_id: "a1".to_string(),
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
+                diff: None,
             },
         );
 

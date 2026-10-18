@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
+similar = { workspace = true }
 eix-core = { path = "../eix-core" }
 tokio = { workspace = true }
 rusqlite = { workspace = true }

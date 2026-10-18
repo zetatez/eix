@@ -236,6 +236,9 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
     };
     assert_eq!(approval["tool"], "write_file");
     assert_eq!(approval["call_id"], "call_1");
+    let diff = approval["diff"].as_str().expect("diff preview");
+    assert!(diff.contains("+++ b/out.txt"), "diff was: {diff}");
+    assert!(diff.contains("+hello"), "diff was: {diff}");
     let approval_id = approval["approval_id"].as_str().unwrap().to_string();
 
     let waiting: AttachResult = client

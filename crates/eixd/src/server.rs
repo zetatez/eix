@@ -767,6 +767,8 @@ impl Daemon {
 
         let approval_id = Uuid::new_v4().to_string();
         let summary = tools::summarize(tool, args);
+        let cwd = self.require_session(session_id)?.cwd;
+        let diff = tools::preview(tool, args, &cwd, &self.config).await;
         let (responder, receiver) = oneshot::channel();
         self.approvals.lock().await.insert(
             session_id.to_string(),
@@ -785,6 +787,7 @@ impl Daemon {
                 tool: tool.to_string(),
                 summary: summary.clone(),
                 arguments: args.clone(),
+                diff: diff.clone(),
             }),
         )?;
         self.emit_event(&event);
@@ -798,6 +801,7 @@ impl Daemon {
                 "tool": tool,
                 "summary": summary,
                 "arguments": args,
+                "diff": diff,
             }),
         );
         self.transition(session_id, SessionStatus::AwaitingApproval)?;
