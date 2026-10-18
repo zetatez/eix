@@ -131,7 +131,7 @@ idle ──submit──> running ──tool──> tool_running ──> running 
 - `nvim_ui_attach(cols, rows, {ext_linegrid=true, rgb=true, ext_multigrid=false, ext_popupmenu=false, ext_cmdline=false, ext_messages=false})`。
 - 让 nvim 自己把 cmdline / popupmenu / 消息画进 grid，host 不实现这些组件，减少一半渲染工作量。
 - host 自己占终端最后一行画 eix 状态栏，因此 attach 给 nvim 的高度是 `rows - 1`。
-- 启动预热（planned）：client 启动即异步拉起 nvim；配置超时（5s）则回退 `-u NONE` + 内置 prompt profile，并提示用户。
+- 启动兜底（已实现超时回退）：client 启动时拉起 nvim，完整配置超过 5s 未就绪就杀掉子进程、回退 `-u NONE` + 内置 prompt profile，并在状态栏提示用户。完全异步预热（不阻塞 TUI 首帧）仍 planned。
 
 ### 5.2 配置与消毒（sanitize）
 
@@ -603,7 +603,10 @@ TCP 端点不会自动拉起本地 daemon。
 > 同时处理 Unix 和 TCP；TCP 连接首请求必须是 `auth {token}`，`secret_eq` 做常数时间比较，
 > 失败返回 `unauthorized` 并断开，认证前不广播任何事件。Unix 保持免认证。CLI/TUI 的
 > `--tcp` / `--token` 选择 `Endpoint::Tcp`，`ensure_daemon` 对 TCP 端点不自动拉起本地 daemon。
-> 已知限制：Unix 和认证后的 TCP 仍收到所有 session 的广播；按 session 过滤留待后续。
+> 广播过滤已落地（2026-10-18）：连接可发 `session.subscribe {session_ids?}` 把广播收窄到
+> 指定 session（`null` 恢复全部）；`session.updated` 用 `id`、其余事件用 `session_id` 判定归属，
+> 无归属的事件（如 `stream.lagged`）放行。默认（不订阅）仍收到所有 session；`eix nvim`
+> attach 后自动只订阅当前 session。
 >
 > 全文搜索已落地（2026-10-18）：`search_docs`（内容表）+ `search_fts`（FTS5 trigram，
 > 外部内容）+ 触发器在 `append_event` 写 `user_message` / `assistant_message` 时同步索引；
@@ -619,11 +622,11 @@ TCP 端点不会自动拉起本地 daemon。
 ## 17. 待定
 
 - 默认模型与具体的 OpenAI 兼容端点。
-- `<leader>a` 命名空间是否与你现有映射冲突。
+- `<leader>a` 命名空间：独立 nvim 前端已用 buffer-local 映射实现动作 palette；若你的全局映射也叫 `<leader>a`，buffer-local 会优先。
 - `@` 触发是否只在词首；是否需要转义。
 - 是否启用鼠标。
 - session 自动命名规则（首条 prompt / branch / 手动）。
-- 远程 attach 的广播范围：当前所有已认证连接收到所有 session 的事件，是否按 session 订阅。
+- 远程 attach 的广播范围：已支持按连接 `session.subscribe` 收窄（默认仍全部）；是否把"只订阅自己打开的 session"设为默认白名单仍待定。
 
 ## 18. 命名
 
