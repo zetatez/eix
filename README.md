@@ -12,8 +12,7 @@ fuzzy switching, and a **real Neovim** as the input box.
 crates/
 ├── eix-core   共享类型：session、事件、消息、协议、配置
 ├── eixd       daemon：session registry、SQLite 事件日志、agent runtime、OpenAI 兼容 provider
-├── eix-tui    `eix` 前端：TUI + chat / send / log / picker CLI
-└── eix-nvim   嵌入 nvim + multigrid 渲染 spike
+└── eix-tui    `eix` 前端：TUI + chat / send / log / picker CLI（内置 Vim 风格输入框）
 ```
 
 ## Phase 0：daemon + provider + CLI
@@ -82,8 +81,8 @@ workspace_summary = true       # top-level entries + git branch/status
 （以及后续写入）看到的是“真实工作区 + staged”合并视图；`run_command` 仍在审批处阻塞
 （shell 无法 stage）。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮和
-`a` 跳转提示，外部通知命令（dwm/tmux）已接入（见 `[notifications]`）；输入框已默认使用
-嵌入的 Neovim（见下）。
+`a` 跳转提示，外部通知命令（dwm/tmux）已接入（见 `[notifications]`）；输入框使用内置的
+Vim 风格编辑器（见下）。
 
 ## TUI（v1）
 
@@ -92,17 +91,20 @@ workspace_summary = true       # top-level entries + git branch/status
 ./target/debug/eix tui [--session ID]  # 显式打开
 ```
 
-自动拉起 daemon；没有 session 时自动创建一个。（stdout 被管道时 `eix` 会退回 `eix chat`。）布局是左侧 session 栏 + 右侧自动平铺的
-pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+ 个近似网格），每个 pane
+自动拉起 daemon；没有 session 时自动创建一个。（stdout 被管道时 `eix` 会退回 `eix chat`。）pane 自动平铺
+（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+ 个近似网格），每个 pane
 独立显示一个 session 的转录、滚动位置和流式输出。底部输入条只作用于当前聚焦 pane。
+历史 session 不再占用左侧栏：按 `p` 打开浮动 picker，输入即模糊搜索，`Enter` 选择、
+`Esc` 关闭。session 状态/模型/cwd/pane 的紧凑横幅直接显示在输入框上方（复用输入框标题行，
+不再单独占顶部一行），cwd 以 `~` 缩写、模型省略 provider 前缀。
 
 | 键 | 行为 |
 | --- | --- |
-| `i` / `Enter` | 聚焦输入框（nvim 后端会进入 insert 模式） |
-| `Esc` / `Esc Esc` | nvim 后端：单次 `Esc` 回到 normal 模式并**保持输入框焦点**（可做完整 vim 编辑）；normal 模式下再按一次回到转录区（连按两次即离开）。native 后端单次 `Esc` 直接回转录区 |
-| `Enter` | 发送到聚焦 pane（输入框内） |
-| `Ctrl-J` | 换行（输入框内） |
-| `p` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（输入框内外都可用） |
+| `i` / `Enter` | 聚焦输入框（进入 insert 模式） |
+| `Esc` / `Esc Esc` | 单次 `Esc` 回到 normal 模式并**保持输入框焦点**；normal 模式下 500ms 内再按一次回到转录区（连按两次即离开） |
+| `Enter` | 发送到聚焦 pane（仅 insert 模式） |
+| `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
+| `p` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
 | `o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
 | `:` | 命令面板：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
 | `w` | worktree picker：选中后把路径插入聚焦 pane 的输入框 |
@@ -128,19 +130,36 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 | `j` / `k` / `PgUp` / `PgDn` | 滚动聚焦 pane 的转录 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
 | `?` / `F1` | 帮助（F1 任意位置可用） |
-| `q` / `Ctrl-C` | 退出（转录区；nvim 输入框聚焦时 `Ctrl-C` 交给 vim） |
+| `q` / `Ctrl-C` | 退出（输入框内 `Ctrl-C` 是 vim 中断：回到 normal / 离开 insert，不会退出） |
+
+单字母快捷键作用于**转录区**；输入框聚焦时（normal 模式）单字母是 vim 命令，TUI 动作用
+`<Space>` leader（见下）。
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
 所有 picker 共用同一个 overlay：上方输入框做模糊过滤，左侧是候选列表，右侧是预览
 （session 显示 id/status/cwd/worktree/permission/model；文件、worktree、branch、context
 显示 daemon 给出的详情）。files / worktrees / branches / context 由 daemon 的
-`picker.query` 提供，其余（sessions、命令面板）在客户端生成。
+`picker.query` 提供，其余（sessions、命令面板）在客户端生成。历史 session 不在左侧栏
+常驻，只通过这个浮动 picker 打开（`p` / 输入框里的 `<Space>s`）。
 
-输入框默认是真正的 Neovim buffer：单次 `Esc` 只退出 insert、焦点仍留在输入框，因此
-normal 模式下的 `d`/`c`/`w`/`:`、`Ctrl-J`、`Ctrl-C`、`F1` 等按键都会原样交给 vim
-（`Enter` 也只在 insert 模式下才提交）。TUI 只保留少量显式全局键：insert 模式下的
-`Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）和 `@`（文件
-picker）；normal 模式下这些键都归还给 vim。连续两次 `Esc` 回到转录区。
+输入框是自研的 Vim 风格编辑器（不再内嵌 Neovim 进程，输入零往返延迟）。单次 `Esc`
+只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
+
+- 移动：`h j k l w W b B e E 0 ^ $ gg G f F t T ; ,`，可带计数（`3w`）
+- 编辑：`i a I A o O x X D C s S r ~ J p P u Ctrl-r`，操作符 `d c y` 可配合上面的
+  motion、双写整行（`dd cc yy`）或文本对象（`iw aw`）
+- visual：`v` / `V` 进入，`d x y c p ~ o` 操作；选中区域反色显示
+- `Enter` 只在 insert 模式提交；normal 模式下所有字母都归编辑器
+
+TUI 动作在 normal 模式下通过 **leader（空格）+ 键**打开：`<Space>s` session
+picker、`<Space>o` 新 pane、`<Space>f` 文件、`<Space>w`/`b` worktree/分支、
+`<Space>c` ledger、`<Space>C` context、`<Space>h` 历史、`<Space>p` 进程、
+`<Space>r` 审批、`<Space>n`/`N` 新建、`<Space>F` fork、`<Space>x` 取消、
+`<Space>a` 或 `<Space>:` 命令面板、`<Space>?` 帮助。insert 模式下保留
+`Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）和
+`@`（文件 picker）。连续两次 `Esc` 回到转录区。
+输入框固定高度（6 行内容 + 边框；终端过矮时优先让给转录区），不随焦点切换、
+草稿长度或 normal 模式折叠；更长的草稿在框内滚动。
 `write_file` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现 `[y] apply / [n] reject`
 卡片并显示 unified diff（最多 10 行，超出标 `… diff truncated`）；按 `d` 可全屏审阅：
 `j/k` 滚动，`[`/`]` 跳 hunk，`Space` 勾选，`a` 全选/全不选，`y` 应用选中，`n` 拒绝。
@@ -194,41 +213,23 @@ session，`eix worktree remove SESSION` 删除空闲 session 的 worktree；有�
 git 会拒绝，需显式加 `--force`。删除后 session 的 `cwd` 回到主仓库根目录，worktree
 字段清空。TUI 里 `N` 直接用新 worktree 开 session，`F` 在 repo 内 fork 时也会自动建。
 
-### 输入框：嵌入 nvim
+### 输入框：自研 Vim 风格编辑器
 
-TUI 默认拉起一个 `nvim --embed`（加载你的完整 `~/.config/nvim`），用 `ext_linegrid` +
-`ext_multigrid` 把 buffer 画在输入条里；按键原样转发给 Neovim，模式、补全、撤销都由 Neovim
-自己决定。一个 client 只跑一个 nvim，聚焦哪个 pane 就用它写哪个 session 的 prompt。
+输入框不再启动 Neovim 子进程，而是 `eix-tui` 内的一个模态编辑器
+（`crates/eix-tui/src/tui/editor.rs`）：没有 RPC、没有用户配置加载，按键即时生效。
+一个 client 只有一个 prompt，聚焦哪个 pane 就用它写哪个 session。
 
-多 grid 模式下每个窗口（含浮窗、消息区）都是独立 grid，host 按 `compindex` 把浮窗
-叠加到输入条上，所以 cmp / noice 等浮窗不再被输入条边界裁剪；光标跟随实际所在的 grid。
-
-- `Enter` 提交（nvim buffer-local mapping，带 `pumvisible()` / cmp / blink 守卫）
-- `Ctrl-J`（或 `Shift-Enter`）换行：host 直接让 nvim 插入字面换行，绕过补全插件对
-  `<C-j>` 的映射（如 `cmp.select_next_item()`）
+- 模式：insert / normal / visual / visual-line；标题栏显示当前模式
+- normal：常用 motion（`h j k l w b e 0 $ gg G f t` 等）、操作符
+  （`d c y` + motion / `dd` / `iw`）、`x D C s S r ~ J p P u Ctrl-r`
+- visual：`v` / `V` 选中后 `d x y c p ~ o`；选中区域反色显示
+- `Enter` 只在 insert 模式提交；`Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 换行
 - `@`（行首或空白后）打开 workspace 文件 picker，选中后插入 `@相对路径`；其余位置插入字面 `@`
-- `:q` / nvim 崩溃：host 自动重启输入条并从 daemon 恢复草稿；草稿镜像到 `draft.set`，切换
-  session 时回填 buffer
-- `Esc` 回到转录区；再按 `i` / `Enter` 重新聚焦并进入 insert
-- 聚焦时高度为 `clamp(行数, 3, 10)`，失焦时保留一行预览
-- 提交失败（请求错误或 turn 出错）会把 draft 放回输入条，不会丢字
-- 转录区颜色跟随 nvim 的 colorscheme：启动和 `ColorScheme` 变化时读取
-  `Normal` / `Comment` / `String` / `Function` / `ErrorMsg` / `DiffAdd` / `DiffDelete`
-  并映射到消息标签、工具输出和审批 diff；读不到时（`minimal` 或旧版 nvim）用固定配色
+- 草稿镜像到 `draft.set`，切换 session 时回填；提交失败会把 draft 放回输入框
+- 输入框固定 6 行内容高（加边框），长草稿在框内滚动，normal 模式也不会收缩
+- 转录区使用固定配色（不再从编辑器 colorscheme 采样）
 
-```toml
-[input]
-backend = "auto"     # auto（默认，有 nvim 就用）/ nvim（强制，失败则退出）/ native
-minimal = false      # true 时用 `nvim -u NONE`，跳过用户配置
-```
-
-也支持 `EIX_INPUT_BACKEND=auto|nvim|native`、`EIX_INPUT_MINIMAL=1`。
-`eix doctor` 会显示当前 backend 和是否找到 `nvim`；找不到时 `auto` 自动退回
-ratatui 原生输入框并在状态栏提示。
-
-完整配置下会做输入条“消毒”：关闭行号/符号列/诊断/`list`，并停用
-smear-cursor（动画会留下残影）。浮窗现在作为独立 grid 叠加渲染，不再被输入条边界裁剪；
-需要干净输入条时仍可用 `minimal = true`。
+`eix doctor` 的 `input` 一行显示 `native (built-in Vim editor)`。
 
 ### 工具与审批
 
@@ -455,70 +456,13 @@ eix nvim [--session ID]      # 也可用 EIX_NVIM 覆盖 nvim 可执行文件
 
 每个 Neovim 进程是一个独立 client，共享同一个 daemon；daemon 会串行化同一 session 的
 turn，第二个 prompt 在忙时会被拒绝。attach 后前端会发 `session.subscribe`，只接收当前
-session 的事件。`eix tui` 内嵌的 nvim 仍只负责输入条，二者互不影响。
-
-启动时如果完整配置（`~/.config/nvim`）超过 5 秒仍未就绪，TUI 会杀掉子进程并用
-`-u NONE` 重试，状态栏会显示 fallback 提示；嵌入输入不可用时退回内置文本框。
-
-## Nvim spike
-
-```sh
-# 最小配置，先验证链路
-cargo run -p eix-nvim -- --minimal
-
-# 无 TTY 的自检：attach、收帧、注入样例文本、打印网格、跑一次提交往返
-cargo run -p eix-nvim -- --probe --minimal
-
-# 加载你自己的 ~/.config/nvim
-cargo run -p eix-nvim
-```
-
-spike 内：
-
-- `Enter` 提交（nvim buffer-local mapping，带 `pumvisible()` / `getcmdtype()` / cmp / blink 守卫）
-- `Ctrl-J` 换行（spike 里按 nvim 配置走；TUI 的输入条直接让 nvim 插入字面换行，
-  避免被 `cmp.select_next_item()` 之类的映射抢走）
-- `Ctrl-C` 退出 spike
-- 退出后把提交过的 draft 打印到 stdout，用来验证往返
-
-其他参数：
-
-- `--width` / `--height` 覆盖上报尺寸（probe 默认 80x24）
-- `-- <args>` 后面的参数直接透传给 nvim，例如
-  `-- -c "lua require('smear_cursor').enabled = false"`
-- `EIX_DEBUG=1` 打印启动自检（colorscheme / config 路径 / 模式）与浮动窗口清单
-
-## Spike 结论（已验证）
-
-| 问题 | 结论 |
-| --- | --- |
-| `--embed` + msgpack RPC 链路 | 通。`nvim_get_api_info` → channel id → `nvim_set_var` |
-| `ext_linegrid` 自绘 | 通。`ui_attach` 后立刻收到 `redraw`，`flush` 计数正常 |
-| redraw 批次形状 | **不是**文档里的 `[[ev, ...]]`，而是 batch 直接展开成 params：`args[i]` 是 `[name, param_tuple, ...]`，同名连续事件会打包进同一个元素 —— 两种形状都要能解析 |
-| `grid_*` 坐标 | 每个事件第一个参数是 grid handle（不开 `ext_multigrid` 时恒为 1） |
-| `ext_multigrid` | 通。窗口/浮窗/消息区各占一个 grid；`win_pos` 给出窗口 grid，`win_float_pos` 给出浮窗位置与 `compindex` |
-| handle 编码 | `win_pos` 的 `win` 是 msgpack **ext type 1**（payload 再编码成整数），`Value::as_u64` 取不到，需要自己拆 |
-| 浮窗坐标是浮点 | nvim 0.12 的 `win_float_pos` 里 `anchor_row/col`、`screen_row/col` 是 f64，整数解析会拿到 `None` |
-| 宽字符 | 通。`grid_line` 用「宽字符 + 空串」两个 cell 表示，空串格不能再写空格，否则会打掉半个字 |
-| 中文 / emoji / 全角 | 通。`🌍` 占 2 格，`世界` 各占 2 格，对齐正确 |
-| `<CR>` 守卫 | 通。走的是真 Neovim 的 mapping，`nvim_input` 打进去的 `<CR>` 会命中它并 `rpcnotify` 回 host |
-| 加载完整 `~/.config/nvim` | 能跑，但会带出两个坑，见下 |
-
-### 完整配置的两个坑
-
-1. **插件自动命令会覆盖输入框外观**。本机配置里有 `InsertEnter` → `vim.wo.number = true`（"smart line number"），会把行号重新画进输入框。prompt profile 现在自己注册一个 buffer-local 的 `InsertEnter/InsertLeave/TextChanged` autocmd 重新消毒，因为后注册的先跑。
-2. **动画类浮动窗口会持续重绘**。`smear-cursor.nvim` 的 1x1 浮窗在光标被程序化移动后会不断刷帧；多 grid 下不再留残影，但仍会抢输入条的刷新。这正是 DESIGN 里预判的「插件 UI 干扰」。
-   缓解：启动时带 `g:eix_prompt = 1`，让配置自行关闭这类效果；用户在 init.lua 里写
-   ```lua
-   if vim.g.eix_prompt then require("smear_cursor").enabled = false end
-   ```
-   后续做成 `eix doctor` 检测 + 提示。`--minimal` 始终是干净回退。
+session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独立前端互不影响。
 
 ## Status
 
 - [x] 设计文档 v0.1
 - [x] workspace 骨架
-- [x] nvim linegrid spike（RPC + 自绘 + 宽字符 + 提交往返 + 完整配置）
+- [x] 自研 Vim 风格输入框（normal / insert / visual、motion + operator + count、undo/redo、leader `<Space>xx`，无子进程）
 - [x] daemon + OpenAI 兼容 provider（流式 SSE、取消、错误处理）
 - [x] session 事件日志 + SQLite 持久化 + attach 协议（事件流广播）
 - [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve[--hunks] / deny / doctor）
@@ -529,7 +473,6 @@ spike 内：
 - [x] hunk 级审批（TUI `d` 审阅里勾选 hunk，daemon 按选择应用部分改动）
 - [x] attention 标记（后台 pane 高亮、`a` 跳转、审批卡片重放）
 - [x] 外部 attention 通知（`[notifications]` command + TUI 终端铃、冷却、重放）
-- [x] 嵌入 nvim 输入（ext_linegrid 渲染、按键转发、动态高度、失败回填、native 回退）
 - [x] bubblewrap 沙箱（`run_command` 默认隔离，`[tools] sandbox` 可配，写入只限 workspace）
 - [x] staged shadow workspace（propose → stage → apply、合并读视图、`patch.apply` / `patch.reject`、跨重启恢复）
 - [x] 执行前快照（write_file 单文件 / run_command 整个 workspace，`snapshot` 事件，保留 20 份）
@@ -546,13 +489,11 @@ spike 内：
 - [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
 - [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）
 - [x] 客户端通知（`bell` + OSC 9/777 + 终端标题，`[notifications] osc`）
-- [x] nvim 对话框与启动兜底（完整配置 5s 超时回退 `-u NONE`、`:Eix` palette `<leader>a`）
 - [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
 - [x] 按 session 权限级别（`read-only` / `workspace-write` / `full`；`session.permission` 支持临时升级并记录事件）
 - [x] 自动批准规则（`[[tools.auto_approve]]`：工具名 + 路径 glob + 命令前缀/正则；只放宽 `ask`）
-- [x] nvim 配色 → TUI 主题桥接（启动与 `ColorScheme` 时读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete`，映射转录区/审批 diff 颜色）
-- [x] `ext_multigrid` 多窗口渲染（浮窗/消息区独立 grid，按 `compindex` 叠加）
-- [x] nvim 交互补齐：嵌入 nvim 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider），`:q`/崩溃后自动重启并从 daemon draft 恢复；独立前端 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`
-- [x] nvim 草稿镜像（prompt 内 `TextChanged` 同步到 `draft.set`，切 session 时从 daemon 回填 buffer）
+- [x] 独立 Neovim 前端交互：`<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`
+- [x] 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider）、两次 `Esc` 回转录区、固定高度
+- [x] 草稿镜像（编辑器变更同步到 `draft.set`，切 session 时从 daemon 回填）
 - [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / worktrees / branches / context，`p`/`o`/`:`/`w`/`b`/`@` 入口；独立前端 `:Eix pick [KIND]`）

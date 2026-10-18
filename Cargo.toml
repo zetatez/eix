@@ -4,7 +4,6 @@ members = [
     "crates/eix-core",
     "crates/eixd",
     "crates/eix-tui",
-    "crates/eix-nvim",
 ]
 
 [workspace.package]

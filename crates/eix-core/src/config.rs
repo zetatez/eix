@@ -34,7 +34,6 @@ pub struct Config {
     pub provider: ProviderConfig,
     pub tools: ToolsConfig,
     pub notifications: NotificationsConfig,
-    pub input: InputConfig,
     pub context: ContextConfig,
     pub server: ServerConfig,
 }
@@ -49,48 +48,6 @@ pub struct ServerConfig {
     /// Shared secret every TCP client must present (`auth` request). Required
     /// whenever `tcp` is set.
     pub token: Option<String>,
-}
-
-/// Which widget renders the prompt at the bottom of the TUI.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum InputBackend {
-    /// Embedded Neovim when it is installed, native text box otherwise.
-    #[default]
-    Auto,
-    /// Require embedded Neovim.
-    Nvim,
-    /// Always use the native text box.
-    Native,
-}
-
-impl InputBackend {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Nvim => "nvim",
-            Self::Native => "native",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct InputConfig {
-    /// Prompt backend. `auto` falls back to the native text box when Neovim
-    /// cannot be spawned.
-    pub backend: InputBackend,
-    /// Start the embedded Neovim with `-u NONE`, ignoring the user's config.
-    pub minimal: bool,
-}
-
-impl Default for InputConfig {
-    fn default() -> Self {
-        Self {
-            backend: InputBackend::Auto,
-            minimal: false,
-        }
-    }
 }
 
 /// External alerts when a session starts needing attention (approval, error).
@@ -487,17 +444,6 @@ impl Config {
         if let Some(value) = env_var("EIX_NOTIFY_BELL") {
             self.notifications.bell = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
-        if let Some(value) = env_var("EIX_INPUT_BACKEND") {
-            match value.as_str() {
-                "auto" => self.input.backend = InputBackend::Auto,
-                "nvim" => self.input.backend = InputBackend::Nvim,
-                "native" => self.input.backend = InputBackend::Native,
-                _ => {}
-            }
-        }
-        if let Some(value) = env_var("EIX_INPUT_MINIMAL") {
-            self.input.minimal = matches!(value.as_str(), "1" | "true" | "yes" | "on");
-        }
         if let Some(value) = env_var("EIX_CONTEXT_BUDGET").and_then(|v| v.parse().ok()) {
             self.context.budget_tokens = value;
         }
@@ -724,18 +670,6 @@ mod tests {
         assert!(!parsed.tools.sandbox_network);
         assert!(!parsed.tools.sandbox_read_home);
         assert!(!parsed.tools.snapshots);
-    }
-
-    #[test]
-    fn input_defaults_to_auto_and_parses() {
-        let default = Config::default();
-        assert_eq!(default.input.backend, InputBackend::Auto);
-        assert!(!default.input.minimal);
-
-        let parsed: Config = toml::from_str("[input]\nbackend = \"native\"\nminimal = true\n")
-            .expect("input config");
-        assert_eq!(parsed.input.backend, InputBackend::Native);
-        assert!(parsed.input.minimal);
     }
 
     #[test]

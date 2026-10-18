@@ -1,7 +1,7 @@
 //! TUI state and rendering.
 //!
-//! The prompt is an embedded Neovim when one can be spawned; the native
-//! ratatui text box remains as the fallback (`[input] backend`).
+//! The prompt is a self-contained Vim-style editor (see [`super::editor`]);
+//! there is no embedded editor process.
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
@@ -14,7 +14,6 @@ use eix_core::{
     ProcessInfo, ProcessList, ProcessOutput, ProcessStatus, RewindResult, SearchHit, Sector,
     Session, SessionStatus, SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
-use eix_nvim::embedded::{NvimInput, Theme};
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -26,6 +25,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::controller::{Command, ContextOp, Event};
+use super::editor::{Editor, Mode, Outcome};
+use super::theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -33,197 +34,13 @@ enum Focus {
     Input,
 }
 
-/// Two `Esc` presses within this window leave the embedded prompt.
+/// Two `Esc` presses within this window leave the prompt for the transcript.
 const ESC_WINDOW: Duration = Duration::from_millis(500);
 
-/// True when a Neovim `mode_change` string means text is being inserted. An
-/// empty string is the state before the first mode report, when the prompt is
-/// still in insert mode.
-fn nvim_is_insert(mode: &str) -> bool {
-    mode.is_empty() || mode.starts_with("insert") || mode.starts_with("replace")
-}
-
-struct Input {
-    lines: Vec<String>,
-    row: usize,
-    col: usize,
-}
-
-impl Default for Input {
-    fn default() -> Self {
-        Self {
-            lines: vec![String::new()],
-            row: 0,
-            col: 0,
-        }
-    }
-}
-
-impl Input {
-    fn text(&self) -> String {
-        self.lines.join("\n")
-    }
-
-    fn is_empty(&self) -> bool {
-        self.lines.iter().all(|line| line.is_empty())
-    }
-
-    fn clear(&mut self) {
-        *self = Self::default();
-    }
-
-    fn set_text(&mut self, text: &str) {
-        *self = Self::default();
-        if text.is_empty() {
-            return;
-        }
-        self.lines = text.split('\n').map(str::to_string).collect();
-        if self.lines.is_empty() {
-            self.lines.push(String::new());
-        }
-        self.row = self.lines.len() - 1;
-        self.col = self.lines[self.row].chars().count();
-    }
-
-    fn line(&self) -> &str {
-        &self.lines[self.row]
-    }
-
-    fn line_len(&self) -> usize {
-        self.line().chars().count()
-    }
-
-    fn insert_char(&mut self, ch: char) {
-        if ch == '\t' {
-            for _ in 0..4 {
-                self.insert_char(' ');
-            }
-            return;
-        }
-        if ch == '\n' {
-            self.newline();
-            return;
-        }
-        let index = char_to_byte(self.line(), self.col);
-        self.lines[self.row].insert(index, ch);
-        self.col += 1;
-    }
-
-    fn insert_str(&mut self, text: &str) {
-        for ch in text.chars() {
-            self.insert_char(ch);
-        }
-    }
-
-    fn newline(&mut self) {
-        let index = char_to_byte(self.line(), self.col);
-        let tail = self.lines[self.row].split_off(index);
-        self.row += 1;
-        self.col = 0;
-        self.lines.insert(self.row, tail);
-    }
-
-    fn backspace(&mut self) {
-        if self.col > 0 {
-            let end = char_to_byte(self.line(), self.col);
-            let start = char_to_byte(self.line(), self.col - 1);
-            self.lines[self.row].replace_range(start..end, "");
-            self.col -= 1;
-        } else if self.row > 0 {
-            let current = self.lines.remove(self.row);
-            self.row -= 1;
-            self.col = self.line_len();
-            self.lines[self.row].push_str(&current);
-        }
-    }
-
-    fn delete(&mut self) {
-        if self.col < self.line_len() {
-            let start = char_to_byte(self.line(), self.col);
-            let end = char_to_byte(self.line(), self.col + 1);
-            self.lines[self.row].replace_range(start..end, "");
-        } else if self.row + 1 < self.lines.len() {
-            let next = self.lines.remove(self.row + 1);
-            self.lines[self.row].push_str(&next);
-        }
-    }
-
-    fn left(&mut self) {
-        if self.col > 0 {
-            self.col -= 1;
-        } else if self.row > 0 {
-            self.row -= 1;
-            self.col = self.line_len();
-        }
-    }
-
-    fn right(&mut self) {
-        if self.col < self.line_len() {
-            self.col += 1;
-        } else if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = 0;
-        }
-    }
-
-    fn up(&mut self) {
-        if self.row > 0 {
-            self.row -= 1;
-            self.col = self.col.min(self.line_len());
-        }
-    }
-
-    fn down(&mut self) {
-        if self.row + 1 < self.lines.len() {
-            self.row += 1;
-            self.col = self.col.min(self.line_len());
-        }
-    }
-
-    fn home(&mut self) {
-        self.col = 0;
-    }
-
-    fn end(&mut self) {
-        self.col = self.line_len();
-    }
-
-    fn delete_to_start(&mut self) {
-        let end = char_to_byte(self.line(), self.col);
-        self.lines[self.row].replace_range(..end, "");
-        self.col = 0;
-    }
-
-    fn delete_to_end(&mut self) {
-        let start = char_to_byte(self.line(), self.col);
-        self.lines[self.row].truncate(start);
-    }
-
-    fn delete_word(&mut self) {
-        if self.col == 0 {
-            self.backspace();
-            return;
-        }
-        let chars: Vec<char> = self.line().chars().collect();
-        let mut start = self.col;
-        while start > 0 && chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        let from = char_to_byte(self.line(), start);
-        let to = char_to_byte(self.line(), self.col);
-        self.lines[self.row].replace_range(from..to, "");
-        self.col = start;
-    }
-}
-
-fn char_to_byte(text: &str, char_index: usize) -> usize {
-    text.char_indices()
-        .nth(char_index)
-        .map(|(byte, _)| byte)
-        .unwrap_or(text.len())
+/// Prompt height: [`super::editor::PROMPT_ROWS`] content rows plus the two
+/// borders, clamped so the transcript keeps a few rows on short terminals.
+fn prompt_input_height(area_height: u16) -> u16 {
+    (super::editor::PROMPT_ROWS + 2).min(area_height.saturating_sub(5).max(3))
 }
 
 struct SessionView {
@@ -646,7 +463,7 @@ pub struct App {
     creating: bool,
     submitting: bool,
     pending_prompt: Option<String>,
-    input: Input,
+    input: Editor,
     focus: Focus,
     picker: Option<Picker>,
     help: bool,
@@ -676,18 +493,12 @@ pub struct App {
     ring: bool,
     /// Text for the next alert (session name + status).
     last_alert: Option<String>,
-    /// Embedded Neovim prompt, when available.
-    nvim: Option<NvimInput>,
-    /// In-flight restart after the prompt exited (`:q`, crash).
-    nvim_restart: Option<std::sync::mpsc::Receiver<Result<NvimInput, anyhow::Error>>>,
-    /// Draft captured when the prompt exited, restored after the restart.
-    pending_nvim_text: Option<String>,
     /// Session whose daemon draft is being loaded into a fresh buffer.
     draft_loading: Option<String>,
-    /// Last draft submitted from the Neovim prompt (session id, text), kept so
-    /// a failed turn can put it back into the buffer.
-    nvim_draft: Option<(String, String)>,
-    /// Session the native prompt currently belongs to, for daemon drafts.
+    /// Last draft submitted from the prompt (session id, text), kept so a
+    /// failed turn can put it back into the buffer.
+    pending_draft: Option<(String, String)>,
+    /// Session the prompt currently belongs to, for daemon drafts.
     input_session: Option<String>,
     /// Text last written to the daemon, so `tick` only saves real changes.
     last_saved_draft: String,
@@ -697,9 +508,9 @@ pub struct App {
     force_clear: bool,
     /// Cross-session approvals overlay.
     inbox: Option<InboxView>,
-    /// Colors sampled from the embedded Neovim's colorscheme.
+    /// Colors used by the transcript and approval cards.
     theme: Theme,
-    /// When the previous `Esc` reached the embedded prompt, for the double-Esc
+    /// When the previous `Esc` reached the prompt, for the double-Esc
     /// "leave the input" gesture.
     esc_at: Option<Instant>,
 }
@@ -720,7 +531,7 @@ impl App {
             creating: false,
             submitting: false,
             pending_prompt: None,
-            input: Input::default(),
+            input: Editor::new(),
             focus: Focus::Input,
             picker: None,
             help: false,
@@ -739,11 +550,8 @@ impl App {
             osc: false,
             ring: false,
             last_alert: None,
-            nvim: None,
-            nvim_restart: None,
-            pending_nvim_text: None,
             draft_loading: None,
-            nvim_draft: None,
+            pending_draft: None,
             input_session: None,
             last_saved_draft: String::new(),
             reason_prompt: None,
@@ -751,53 +559,6 @@ impl App {
             inbox: None,
             theme: Theme::default(),
             esc_at: None,
-        }
-    }
-
-    /// Attach an embedded-Neovim prompt, replacing the native text box.
-    pub fn set_nvim_input(&mut self, input: NvimInput) {
-        self.nvim = Some(input);
-    }
-
-    pub fn has_nvim_input(&self) -> bool {
-        self.nvim.is_some()
-    }
-
-    /// Collect drafts submitted with `<CR>` in the embedded prompt, plus file
-    /// picker requests, and swap in a restarted prompt when it is ready.
-    pub fn poll_nvim(&mut self, tx: &UnboundedSender<Command>) {
-        self.poll_nvim_restart(tx);
-
-        let Some((theme, file_picker, drafts)) = self
-            .nvim
-            .as_ref()
-            .map(|nvim| (nvim.theme(), nvim.take_file_picker(), nvim.take_submitted()))
-        else {
-            return;
-        };
-        self.theme = theme;
-        if file_picker && self.overlay_closed() {
-            self.open_picker(PickerKind::Files, tx);
-        }
-        for draft in drafts {
-            if draft.trim().is_empty() {
-                continue;
-            }
-            let session_id = self.focused_view().map(|view| view.session.id.clone());
-            match self.begin_submit(&draft, tx) {
-                Ok(()) => {
-                    if let Some(session_id) = session_id {
-                        self.nvim_draft = Some((session_id, draft));
-                    }
-                    if let Some(nvim) = &self.nvim {
-                        nvim.reset();
-                    }
-                }
-                Err(message) => {
-                    self.error = Some(message);
-                    self.status = "prompt kept".into();
-                }
-            }
         }
     }
 
@@ -813,104 +574,30 @@ impl App {
             && self.reason_prompt.is_none()
     }
 
-    /// Take an exit reported by the prompt and start a replacement Neovim.
-    fn poll_nvim_restart(&mut self, tx: &UnboundedSender<Command>) {
-        let quit = self.nvim.as_ref().and_then(NvimInput::take_quit);
-        if let Some(text) = quit {
-            self.restart_nvim(text, tx);
-            return;
-        }
-        let Some(rx) = &self.nvim_restart else {
-            return;
-        };
-        match rx.try_recv() {
-            Ok(Ok(nvim)) => {
-                self.nvim_restart = None;
-                self.nvim = Some(nvim);
-                let text = self.pending_nvim_text.take().unwrap_or_default();
-                // Restore through the daemon so the buffer and its stored draft
-                // cannot diverge: `restart_nvim` already wrote `text`.
-                if let Some(session_id) = self.input_session.clone() {
-                    self.last_saved_draft.clear();
-                    self.draft_loading = Some(session_id.clone());
-                    let _ = tx.send(Command::DraftGet { session_id });
-                } else if let Some(nvim) = &self.nvim {
-                    if text.is_empty() {
-                        nvim.reset();
-                    } else {
-                        nvim.set_text(&text);
-                    }
-                    self.last_saved_draft = text;
-                }
-                self.status = "prompt restarted".into();
-            }
-            Ok(Err(err)) => {
-                self.nvim_restart = None;
-                self.error = Some(format!("nvim restart failed: {err:#}"));
-                self.status = "using the native prompt".into();
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => {}
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                self.nvim_restart = None;
-                self.status = "prompt restart lost".into();
-            }
-        }
-    }
-
-    /// Drop the dead prompt and spawn a replacement in the background.
-    fn restart_nvim(&mut self, text: String, tx: &UnboundedSender<Command>) {
-        let Some(nvim) = self.nvim.take() else {
-            return;
-        };
-        let (width, height) = nvim.size();
-        let minimal = nvim.used_minimal_fallback();
-        // Persist the captured draft so another frontend can still recover it.
-        if let Some(session_id) = self.input_session.clone() {
-            let _ = tx.send(Command::DraftSet {
-                session_id,
-                text: text.clone(),
-            });
-        }
-        self.status = "prompt exited; restarting nvim…".into();
-        self.pending_nvim_text = Some(text);
-        let (tx, rx) = std::sync::mpsc::channel();
-        self.nvim_restart = Some(rx);
-        tokio::spawn(async move {
-            let _ = tx.send(NvimInput::spawn(width, height, minimal).await);
-        });
-    }
-
-    /// Put the last Neovim draft back after a failed turn, if it belongs to
+    /// Put the last submitted draft back after a failed turn, if it belongs to
     /// `session_id`.
-    fn restore_nvim_draft(&mut self, session_id: &str) {
+    fn restore_pending_draft(&mut self, session_id: &str) {
         let matches = self
-            .nvim_draft
+            .pending_draft
             .as_ref()
             .is_some_and(|(id, _)| id == session_id);
         if !matches {
             return;
         }
-        if let Some((_, draft)) = self.nvim_draft.take() {
-            if let Some(nvim) = &self.nvim {
-                nvim.set_text(&draft);
-            }
+        if let Some((_, draft)) = self.pending_draft.take() {
+            self.input.set_text(&draft);
         }
     }
 
     /// Drop the saved draft once its turn finishes successfully.
-    fn clear_nvim_draft(&mut self, session_id: &str) {
+    fn clear_pending_draft(&mut self, session_id: &str) {
         if self
-            .nvim_draft
+            .pending_draft
             .as_ref()
             .is_some_and(|(id, _)| id == session_id)
         {
-            self.nvim_draft = None;
+            self.pending_draft = None;
         }
-    }
-
-    /// Set the footer status line.
-    pub fn set_status(&mut self, message: impl Into<String>) {
-        self.status = message.into();
     }
 
     /// Take the pending bell request, if any.
@@ -934,8 +621,7 @@ impl App {
     }
 
     /// Persist the prompt as a per-session draft when the focused pane changes
-    /// or the text is edited. Uses the Neovim buffer mirror when the embedded
-    /// prompt is active, the native text box otherwise.
+    /// or the text is edited.
     fn sync_draft(&mut self, tx: &UnboundedSender<Command>) {
         // Wait for the daemon draft to load before writing; otherwise stale
         // buffer text would overwrite the new session's draft.
@@ -960,11 +646,7 @@ impl App {
             self.last_saved_draft.clear();
             self.input_session = focused;
             if let Some(session_id) = self.input_session.clone() {
-                if let Some(nvim) = &self.nvim {
-                    // Clear the buffer so the daemon's draft can replace it.
-                    self.draft_loading = Some(session_id.clone());
-                    nvim.reset();
-                }
+                self.draft_loading = Some(session_id.clone());
                 let _ = tx.send(Command::DraftGet { session_id });
             }
             return;
@@ -979,23 +661,14 @@ impl App {
         }
     }
 
-    /// Current prompt contents: the Neovim mirror or the native text box.
+    /// Current prompt contents.
     fn current_draft_text(&self) -> String {
-        match &self.nvim {
-            Some(nvim) => nvim.draft_text(),
-            None => self.input.text(),
-        }
+        self.input.text()
     }
 
     pub fn handle_paste(&mut self, text: &str) {
         self.focus = Focus::Input;
-        let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-        if let Some(nvim) = &self.nvim {
-            nvim.start_insert();
-            nvim.paste(&normalized);
-        } else {
-            self.input.insert_str(&normalized);
-        }
+        self.input.paste(text);
     }
 
     pub fn handle_event(&mut self, event: Event, tx: &UnboundedSender<Command>) {
@@ -1146,23 +819,15 @@ impl App {
                 if self.input_session.as_deref() != Some(session_id.as_str()) {
                     return;
                 }
-                if let Some(nvim) = &self.nvim {
-                    // The buffer was cleared on switch; load the daemon draft.
-                    if text.is_empty() {
-                        nvim.reset();
-                    } else {
-                        nvim.set_text(&text);
-                    }
-                    self.last_saved_draft = text;
-                    self.draft_loading = None;
-                } else if self.input.is_empty() {
-                    // Prefill only the prompt the draft belongs to, and only
-                    // when the user has not already started typing.
+                // The prompt was cleared on switch; load the daemon draft, but
+                // never clobber text typed while the request was in flight.
+                if self.input.is_empty() {
                     if !text.is_empty() {
                         self.input.set_text(&text);
                     }
                     self.last_saved_draft = self.input.text();
                 }
+                self.draft_loading = None;
             }
             Event::PatchEdit {
                 session_id,
@@ -1249,10 +914,8 @@ impl App {
                         self.pending_prompt = None;
                         // The prompt was cleared when the request was sent;
                         // put the draft back so it can be edited or retried.
-                        if let Some((_, draft)) = self.nvim_draft.take() {
-                            if let Some(nvim) = &self.nvim {
-                                nvim.set_text(&draft);
-                            }
+                        if let Some((_, draft)) = self.pending_draft.take() {
+                            self.input.set_text(&draft);
                         }
                     }
                     "create" => self.creating = false,
@@ -1561,12 +1224,12 @@ impl App {
                         self.status = "error".into();
                         // The prompt was cleared on submit; restore the draft so
                         // a provider failure does not lose it.
-                        self.restore_nvim_draft(&done.session_id);
+                        self.restore_pending_draft(&done.session_id);
                     } else if done.cancelled {
                         self.status = "cancelled".into();
                     } else {
                         self.status = "idle".into();
-                        self.clear_nvim_draft(&done.session_id);
+                        self.clear_pending_draft(&done.session_id);
                     }
                 }
             }
@@ -1658,22 +1321,23 @@ impl App {
             return;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            // With the embedded editor focused, `<C-c>` belongs to Neovim
-            // (leave insert / interrupt). Quitting stays a transcript binding
-            // so typing in the prompt cannot kill the app by accident.
-            if self.nvim_has_focus() {
-                self.handle_nvim_input_key(key);
+            // In the prompt Ctrl-C is the vim "interrupt": leave insert /
+            // visual mode (or blur on a second press) instead of quitting while
+            // the user is typing. Everywhere else it stays the global quit.
+            let prompt_open = self.focus == Focus::Input
+                && self.overlay_closed()
+                && !self.help
+                && self.reason_prompt.is_none();
+            if prompt_open {
+                let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+                self.handle_input_key(esc, tx);
             } else {
                 self.should_quit = true;
             }
             return;
         }
         if matches!(key.code, KeyCode::F(1)) {
-            if self.nvim_has_focus() {
-                self.handle_nvim_input_key(key);
-            } else {
-                self.help = true;
-            }
+            self.help = true;
             return;
         }
 
@@ -1753,128 +1417,50 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
-        // `<C-g>` is the cross-mode session picker, but a real editor in normal
-        // mode gets Neovim's own binding (file info) so Vim users are not
-        // surprised. In insert mode it still opens the picker.
+        // Cross-mode session picker. It is a TUI binding, so it works in every
+        // editor mode (and does not consume a normal-mode letter).
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
-            if self.nvim.is_some() && !self.nvim_insert_mode() {
-                self.handle_nvim_input_key(key);
+            self.open_picker(PickerKind::Sessions, tx);
+            return;
+        }
+
+        // A single Esc returns to normal mode and keeps the prompt focused; a
+        // second Esc within the window hands the keyboard back to the
+        // transcript. Normal-mode Esc is otherwise a no-op, but still arms the
+        // gesture so `Esc Esc` always works.
+        if matches!(key.code, KeyCode::Esc) {
+            let editing = self.input.mode() != Mode::Normal;
+            let _ = self.input.handle_key(key);
+            if editing {
+                self.esc_at = Some(Instant::now());
+                return;
+            }
+            let now = Instant::now();
+            let double = self
+                .esc_at
+                .is_some_and(|last| now.duration_since(last) < ESC_WINDOW);
+            if double {
+                self.esc_at = None;
+                self.focus = Focus::Transcript;
             } else {
-                self.open_picker(PickerKind::Sessions, tx);
+                self.esc_at = Some(now);
             }
             return;
         }
 
-        if self.nvim.is_some() {
-            self.handle_nvim_input_key(key);
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc => self.focus = Focus::Transcript,
-            KeyCode::Enter
-                if key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
-            {
-                self.input.newline()
-            }
-            KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.input.newline()
-            }
-            KeyCode::Enter => self.submit(tx),
-            KeyCode::Char(c) if key.modifiers.contains(KeyModifiers::CONTROL) => match c {
-                'a' => self.input.home(),
-                'e' => self.input.end(),
-                'u' => self.input.delete_to_start(),
-                'k' => self.input.delete_to_end(),
-                'w' => self.input.delete_word(),
-                _ => {}
-            },
-            KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::ALT) => {
-                self.input.insert_char(c)
-            }
-            KeyCode::Backspace => self.input.backspace(),
-            KeyCode::Delete => self.input.delete(),
-            KeyCode::Left => self.input.left(),
-            KeyCode::Right => self.input.right(),
-            KeyCode::Up => self.input.up(),
-            KeyCode::Down => self.input.down(),
-            KeyCode::Home => self.input.home(),
-            KeyCode::End => self.input.end(),
-            KeyCode::Tab => self.input.insert_str("    "),
-            _ => {}
-        }
-    }
-
-    /// True when keys should go to the embedded editor rather than the TUI.
-    fn nvim_has_focus(&self) -> bool {
-        self.focus == Focus::Input && self.nvim.is_some() && !self.help && self.overlay_closed()
-    }
-
-    /// True when the embedded prompt is taking typed text (insert/replace).
-    fn nvim_insert_mode(&self) -> bool {
-        nvim_is_insert(&self.nvim.as_ref().map(NvimInput::mode).unwrap_or_default())
-    }
-
-    fn handle_nvim_input_key(&mut self, key: KeyEvent) {
-        let inserting = self.nvim_insert_mode();
-        match key.code {
-            // A single Esc leaves insert mode but keeps the prompt focused, so
-            // normal-mode Vim editing works. A second Esc within the window
-            // hands the keyboard back to the transcript.
-            KeyCode::Esc => {
-                let now = Instant::now();
-                let double = self
-                    .esc_at
-                    .is_some_and(|last| now.duration_since(last) < ESC_WINDOW);
-                if let Some(nvim) = &self.nvim {
-                    nvim.input(key);
-                }
-                if double {
-                    self.esc_at = None;
-                    self.focus = Focus::Transcript;
-                } else {
-                    self.esc_at = Some(now);
-                }
-            }
-            // Shift/Ctrl-Enter and Ctrl-J insert a newline, matching the
-            // native prompt. They are only intercepted while inserting: in
-            // normal mode they are ordinary Vim motions. Completion plugins
-            // often claim <C-j> for menu navigation, so ask Neovim for a
-            // literal newline instead.
-            KeyCode::Enter
-                if inserting
-                    && key
-                        .modifiers
-                        .intersects(KeyModifiers::CONTROL | KeyModifiers::SHIFT) =>
-            {
-                self.esc_at = None;
-                if let Some(nvim) = &self.nvim {
-                    nvim.newline();
-                }
-            }
-            KeyCode::Char('j') if inserting && key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.esc_at = None;
-                if let Some(nvim) = &self.nvim {
-                    nvim.newline();
-                }
-            }
-            _ => {
-                self.esc_at = None;
-                if let Some(nvim) = &self.nvim {
-                    nvim.input(key);
-                }
-            }
+        self.esc_at = None;
+        match self.input.handle_key(key) {
+            Outcome::Submit => self.submit(tx),
+            Outcome::FilePicker => self.open_picker(PickerKind::Files, tx),
+            Outcome::Action(id) if self.overlay_closed() => self.run_action(id, tx),
+            Outcome::Ignored | Outcome::Action(_) => {}
         }
     }
 
     fn focus_input(&mut self) {
         self.focus = Focus::Input;
         self.esc_at = None;
-        if let Some(nvim) = &self.nvim {
-            nvim.start_insert();
-        }
+        self.input.enter_insert();
     }
 
     fn handle_transcript_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
@@ -2519,7 +2105,7 @@ impl App {
             PickerKind::Commands => {
                 if let Some(value) = value {
                     self.picker = None;
-                    self.run_picker_command(&value, tx);
+                    self.run_action(&value, tx);
                 }
             }
         }
@@ -2527,11 +2113,7 @@ impl App {
 
     /// Put `text` at the prompt cursor, using the embedded prompt when present.
     fn insert_prompt(&mut self, text: &str) {
-        if let Some(nvim) = &self.nvim {
-            nvim.insert_text(text);
-        } else {
-            self.input.insert_str(text);
-        }
+        self.input.insert_text(text);
         self.focus = Focus::Input;
         self.status = format!("inserted {text}");
     }
@@ -2565,8 +2147,9 @@ impl App {
         self.picker = Some(picker);
     }
 
-    /// Run a command-palette entry. Unknown ids are ignored.
-    fn run_picker_command(&mut self, id: &str, tx: &UnboundedSender<Command>) {
+    /// Run a command-palette entry or a prompt leader action (`<Space>xx`).
+    /// Unknown ids are ignored.
+    fn run_action(&mut self, id: &str, tx: &UnboundedSender<Command>) {
         match id {
             "sessions" => self.open_picker(PickerKind::Sessions, tx),
             "new-pane" => self.open_picker(PickerKind::NewPane, tx),
@@ -3212,40 +2795,19 @@ impl App {
             return;
         }
 
-        let input_height = if let Some(nvim) = &self.nvim {
-            // One header row plus the prompt grid: `clamp(lines, 3, 10)` while
-            // focused, a single line as a preview when the transcript has focus.
-            let rows = if self.focus == Focus::Input {
-                nvim.line_count().clamp(3, 10)
-            } else {
-                1
-            };
-            (rows + 1).min(area.height.saturating_sub(5).max(2))
-        } else {
-            let inner_width = area.width.saturating_sub(2).max(1) as usize;
-            let input_lines: usize = self
-                .input
-                .lines
-                .iter()
-                .map(|line| {
-                    let width = UnicodeWidthStr::width(line.as_str());
-                    width.div_ceil(inner_width).max(1)
-                })
-                .sum();
-            (input_lines as u16 + 2).clamp(3, 10)
-        };
+        // Fixed prompt height: normal-mode editing and long drafts must never
+        // resize the box (the editor scrolls instead).
+        let input_height = prompt_input_height(area.height);
         let chunks = Layout::vertical([
-            Constraint::Length(1),
             Constraint::Min(3),
             Constraint::Length(input_height),
             Constraint::Length(1),
         ])
         .split(area);
 
-        self.draw_header(frame, chunks[0]);
-        self.draw_body(frame, chunks[1]);
-        self.draw_input(frame, chunks[2]);
-        self.draw_footer(frame, chunks[3]);
+        self.draw_body(frame, chunks[0]);
+        self.draw_input(frame, chunks[1]);
+        self.draw_footer(frame, chunks[2]);
 
         if self.picker.is_some() {
             self.draw_picker(frame, area);
@@ -3270,21 +2832,21 @@ impl App {
         }
     }
 
-    fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
+    /// Compact session banner, rendered on the line directly above the prompt
+    /// grid (the input box title) instead of a separate top row.
+    fn header_spans(&self) -> Vec<Span<'static>> {
         let session = self
             .focused_view()
             .map(|view| &view.session)
             .or_else(|| self.sessions.get(self.selected));
-        let mut spans = vec![
-            Span::styled(
-                " eix ",
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-        ];
+        let dim = Style::default().fg(Color::DarkGray);
+        let mut spans = vec![Span::styled(
+            " eix ",
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
         if let Some(session) = session {
             let spinner = if session.status == SessionStatus::Running {
                 SPINNER[(self.tick as usize / 2) % SPINNER.len()]
@@ -3292,110 +2854,47 @@ impl App {
                 session.status.symbol()
             };
             spans.push(Span::styled(
-                format!("{spinner} "),
+                format!(" {spinner} "),
                 Style::default().fg(status_color(session.status)),
             ));
             spans.push(Span::styled(
                 session.name.clone(),
                 Style::default().add_modifier(Modifier::BOLD),
             ));
+            spans.push(Span::styled(format!(" {} ", session.status.as_str()), dim));
             spans.push(Span::styled(
-                format!("  {}  ", session.status.as_str()),
-                Style::default().fg(Color::DarkGray),
-            ));
-            spans.push(Span::styled(
-                format!("{}  ", self.model()),
+                format!("{} ", short_model(self.model())),
                 Style::default().fg(Color::Magenta),
             ));
             spans.push(Span::styled(
-                session.cwd.display().to_string(),
-                Style::default().fg(Color::DarkGray),
+                compact_path(&session.cwd.display().to_string()),
+                dim,
             ));
         } else {
-            spans.push(Span::styled(
-                "no session",
-                Style::default().fg(Color::DarkGray),
-            ));
+            spans.push(Span::styled(" no session", dim));
         }
         if !self.views.is_empty() {
             spans.push(Span::styled(
-                format!("  pane {}/{}", self.focused + 1, self.views.len()),
-                Style::default().fg(Color::DarkGray),
+                format!(" {}/{}", self.focused + 1, self.views.len()),
+                dim,
             ));
         }
         let attention = self.attention_count();
         if attention > 0 {
             spans.push(Span::styled(
-                format!("  ⚠ {attention} attention"),
+                format!(" ⚠{attention}"),
                 Style::default()
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             ));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        spans
     }
 
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
-        let show_sidebar = area.width >= 100 && !self.sessions.is_empty();
-        let (sidebar, main) = if show_sidebar {
-            let chunks =
-                Layout::horizontal([Constraint::Length(30), Constraint::Min(40)]).split(area);
-            (Some(chunks[0]), chunks[1])
-        } else {
-            (None, area)
-        };
-        if let Some(sidebar) = sidebar {
-            self.draw_sidebar(frame, sidebar);
-        }
-        self.draw_panes(frame, main);
-    }
-
-    fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
-        let items: Vec<ListItem> = self
-            .sessions
-            .iter()
-            .map(|session| {
-                let open = self.open_session(&session.id);
-                let attention = open.is_some_and(|index| self.pane_needs_attention(index));
-                let name_style = if attention {
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default()
-                };
-                let pane = match open {
-                    Some(index) => {
-                        Span::styled(format!("{}", index + 1), Style::default().fg(Color::Cyan))
-                    }
-                    None => Span::styled("·", Style::default().fg(Color::DarkGray)),
-                };
-                ListItem::new(Line::from(vec![
-                    pane,
-                    Span::raw(" "),
-                    Span::styled(
-                        format!("{}{} ", origin_marker(session), session.status.symbol()),
-                        Style::default().fg(status_color(session.status)),
-                    ),
-                    Span::styled(truncate(&session.name, 12), name_style),
-                    Span::styled(
-                        format!(" {}", short_id(&session.id)),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]))
-            })
-            .collect();
-        let list = List::new(items)
-            .block(Block::default().borders(Borders::ALL).title(" sessions "))
-            .highlight_style(
-                Style::default()
-                    .bg(Color::DarkGray)
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            )
-            .highlight_symbol("› ");
-        let mut state = ListState::default().with_selected(Some(self.selected));
-        frame.render_stateful_widget(list, area, &mut state);
+        // Sessions live in the floating picker (`p` / `<Space>s`), not in a
+        // permanent sidebar: panes get the whole body.
+        self.draw_panes(frame, area);
     }
 
     fn draw_panes(&mut self, frame: &mut Frame, area: Rect) {
@@ -3739,20 +3238,33 @@ impl App {
     }
 
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
-        if self.nvim.is_some() {
-            self.draw_nvim_input(frame, area);
-            return;
-        }
         let focused = self.focus == Focus::Input;
+        let mode = self.input.mode();
+        let accent = if focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let title = Line::from({
+            let mut spans = self.header_spans();
+            spans.push(Span::styled(format!(" [{}] ", mode.label()), accent));
+            spans
+        });
+        let hint = if !focused {
+            " i to type "
+        } else {
+            match mode {
+                Mode::Insert => " ⏎ send · C-j newline · Esc normal ",
+                Mode::Normal => " i insert · v visual · Space actions ",
+                Mode::Visual | Mode::VisualLine => " d/y/c · o swap · Esc normal ",
+            }
+        };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(if focused {
-                Style::default().fg(Color::Cyan)
-            } else {
-                Style::default().fg(Color::DarkGray)
-            })
-            .title(" prompt ")
-            .title_bottom(" Enter send  Ctrl-J newline  Esc transcript ");
+            .border_style(accent)
+            .title(title)
+            .title_bottom(Span::styled(hint, Style::default().fg(Color::DarkGray)));
+
         let inner_width = area.width.saturating_sub(2).max(1) as usize;
         let inner_height = area.height.saturating_sub(2).max(1) as usize;
 
@@ -3766,8 +3278,13 @@ impl App {
             return;
         }
 
-        let layout = layout_input(&self.input, inner_width, inner_height);
-        let paragraph = Paragraph::new(layout.lines.join("\n"))
+        let layout = self.input.layout(inner_width, inner_height);
+        let lines: Vec<Line> = layout
+            .segments
+            .iter()
+            .map(|segment| self.input_line(segment))
+            .collect();
+        let paragraph = Paragraph::new(lines)
             .block(block)
             .scroll((layout.offset.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(paragraph, area);
@@ -3782,63 +3299,28 @@ impl App {
         }
     }
 
-    fn draw_nvim_input(&mut self, frame: &mut Frame, area: Rect) {
-        let focused = self.focus == Focus::Input;
-        let mode = self
-            .nvim
-            .as_ref()
-            .map(NvimInput::mode)
-            .filter(|mode| !mode.is_empty())
-            .unwrap_or_else(|| "--".to_string());
-        let accent = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let title = Line::from(vec![
-            Span::styled(
-                " prompt ",
-                Style::default().fg(Color::Black).bg(if focused {
-                    Color::Cyan
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-            Span::raw(" "),
-            Span::styled(format!("[{mode}]"), accent),
-        ]);
-        let hint = if focused {
-            " Enter send  Ctrl-J newline  Esc normal  Esc Esc transcript "
-        } else {
-            " i to type "
-        };
-        let columns = Layout::horizontal([Constraint::Min(20), Constraint::Length(44)]).split(area);
-        frame.render_widget(
-            Paragraph::new(title).style(accent),
-            Rect {
-                height: 1,
-                ..columns[0]
-            },
-        );
-        frame.render_widget(
-            Paragraph::new(hint)
-                .alignment(Alignment::Right)
-                .style(Style::default().fg(Color::DarkGray)),
-            Rect {
-                height: 1,
-                ..columns[1]
-            },
-        );
-
-        let grid = Rect {
-            y: area.y + 1,
-            height: area.height.saturating_sub(1),
-            ..area
-        };
-        if let Some(nvim) = self.nvim.as_mut() {
-            nvim.resize(grid.width, grid.height);
-            nvim.draw(frame, grid, focused);
+    /// One prompt row, with the visual selection reversed.
+    fn input_line(&self, segment: &super::editor::Segment) -> Line<'static> {
+        if self.input.selection().is_none() {
+            return Line::from(segment.text.clone());
         }
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run = String::new();
+        let mut run_selected = false;
+        for (offset, ch) in segment.text.chars().enumerate() {
+            let selected = self
+                .input
+                .is_selected(segment.row, segment.start_col + offset);
+            if selected != run_selected && !run.is_empty() {
+                spans.push(selection_span(std::mem::take(&mut run), run_selected));
+            }
+            run_selected = selected;
+            run.push(ch);
+        }
+        if !run.is_empty() {
+            spans.push(selection_span(run, run_selected));
+        }
+        Line::from(spans)
     }
 
     fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
@@ -4417,7 +3899,11 @@ impl App {
                                 Style::default().fg(status_color(session.status)),
                             ),
                             Span::styled(
-                                truncate(&session.name, 28),
+                                format!(
+                                    "{}{}",
+                                    origin_marker(session),
+                                    truncate(&session.name, 28)
+                                ),
                                 Style::default().add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
@@ -4506,7 +3992,7 @@ impl App {
 }
 
 /// Rows for the `:` command palette. `value` is dispatched by
-/// [`App::run_picker_command`]; the label and help are only for display.
+/// [`App::run_action`]; the label and help are only for display.
 fn command_items() -> Vec<PickerItem> {
     const COMMANDS: &[(&str, &str, &str)] = &[
         (
@@ -4662,73 +4148,6 @@ struct ProcessExitedParams {
     exit_code: Option<i32>,
 }
 
-struct InputLayout {
-    lines: Vec<String>,
-    cursor_line: usize,
-    cursor_col: usize,
-    offset: usize,
-}
-
-fn layout_input(input: &Input, width: usize, height: usize) -> InputLayout {
-    let width = width.max(1);
-    let height = height.max(1);
-    let mut lines = Vec::new();
-    let mut cursor_line = 0;
-    let mut cursor_col = 0;
-
-    for (row, line) in input.lines.iter().enumerate() {
-        let chars: Vec<char> = line.chars().collect();
-        let mut segment = String::new();
-        let mut segment_width = 0usize;
-
-        if row == input.row && input.col == 0 {
-            cursor_line = lines.len();
-            cursor_col = 0;
-        }
-
-        for (index, &ch) in chars.iter().enumerate() {
-            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if segment_width + ch_width > width && !segment.is_empty() {
-                lines.push(std::mem::take(&mut segment));
-                segment_width = 0;
-            }
-            if row == input.row && input.col == index {
-                cursor_line = lines.len();
-                cursor_col = segment_width;
-            }
-            segment.push(ch);
-            segment_width += ch_width;
-        }
-
-        if row == input.row && input.col >= chars.len() {
-            if segment_width >= width {
-                lines.push(std::mem::take(&mut segment));
-                segment_width = 0;
-            }
-            cursor_line = lines.len();
-            cursor_col = segment_width;
-        }
-        lines.push(segment);
-    }
-
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    let offset = if lines.len() > height {
-        (cursor_line + 1)
-            .saturating_sub(height)
-            .min(lines.len().saturating_sub(height))
-    } else {
-        0
-    };
-    InputLayout {
-        lines,
-        cursor_line,
-        cursor_col,
-        offset,
-    }
-}
-
 fn tool_call_summary(tool: &str, arguments: &Value) -> String {
     let string = |key: &str| {
         arguments
@@ -4829,10 +4248,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         )),
         Line::from(""),
         key_line("i / Enter", "focus the prompt"),
-        key_line("Esc", "leave the prompt (nvim: first Esc is normal mode)"),
-        key_line("Esc Esc", "from the nvim prompt back to the transcript"),
-        key_line("Enter", "send (in prompt)"),
-        key_line("Ctrl-J", "newline (in prompt)"),
+        key_line("Esc", "prompt: normal mode (keeps focus)"),
+        key_line("Esc Esc", "leave the prompt for the transcript"),
+        key_line("Enter", "send (insert mode)"),
+        key_line("Ctrl-J", "newline (insert mode)"),
+        key_line("Space s/f/w/b", "prompt: sessions / files / worktrees / branches"),
+        key_line("Space c/C/h/p", "prompt: ledger / context / history / processes"),
+        key_line("Space r/x/a/?", "prompt: approvals / cancel / actions / help"),
+        key_line("Space o/n/N/F", "prompt: new pane / new / new worktree / fork"),
+        key_line("Space :", "prompt: command palette"),
         key_line("p / Ctrl-G", "session picker"),
         key_line("o", "open session in a new pane"),
         key_line(":", "command palette (every action and provider)"),
@@ -4861,8 +4285,15 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key_line("F", "fork the session (git worktree when inside a repo)"),
         key_line("#", "search message history (Enter runs / opens)"),
         key_line("? / F1", "open this help (F1 anywhere)"),
-        key_line("q / Ctrl-C", "quit"),
+        key_line(
+            "q / Ctrl-C",
+            "quit (Ctrl-C interrupts instead while the prompt is focused)",
+        ),
         Line::from(""),
+        Line::from(Span::styled(
+            "the prompt is modal: Enter sends in insert; normal mode has vim motions, d/c/y, visual (v/V) and u/C-r",
+            Style::default().fg(Color::DarkGray),
+        )),
         Line::from(Span::styled(
             "C-w commands work from the transcript; Esc leaves the prompt first.",
             Style::default().fg(Color::DarkGray),
@@ -5298,6 +4729,37 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// A prompt run, reversed while the visual selection covers it.
+fn selection_span(text: String, selected: bool) -> Span<'static> {
+    if selected {
+        Span::styled(text, Style::default().add_modifier(Modifier::REVERSED))
+    } else {
+        Span::raw(text)
+    }
+}
+
+/// `provider/model` -> `model`, keeping the banner short.
+fn short_model(model: &str) -> &str {
+    model
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .unwrap_or(model)
+}
+
+/// Replace a leading `$HOME` with `~`.
+fn compact_path(path: &str) -> String {
+    match std::env::var_os("HOME") {
+        Some(home) if !home.is_empty() => {
+            let home = home.to_string_lossy();
+            match path.strip_prefix(home.as_ref()) {
+                Some(rest) => format!("~{rest}"),
+                None => path.to_string(),
+            }
+        }
+        _ => path.to_string(),
+    }
+}
+
 /// Sidebar prefix: `↳` for sub-agents and `⑂` for sessions in a worktree.
 fn origin_marker(session: &Session) -> &'static str {
     if session.is_agent() {
@@ -5365,47 +4827,10 @@ mod tests {
     use eix_core::SearchResult;
 
     #[test]
-    fn input_edits_across_lines() {
-        let mut input = Input::default();
-        input.insert_str("hello\nworld");
-        assert_eq!(input.text(), "hello\nworld");
-        assert_eq!((input.row, input.col), (1, 5));
-
-        input.home();
-        input.delete_to_end();
-        assert_eq!(input.text(), "hello\n");
-
-        input.backspace();
-        assert_eq!(input.text(), "hello");
-        assert_eq!((input.row, input.col), (0, 5));
-
-        input.insert_char('!');
-        assert_eq!(input.text(), "hello!");
-    }
-
-    #[test]
-    fn tabs_expand_to_spaces() {
-        let mut input = Input::default();
-        input.insert_char('\t');
-        assert_eq!(input.text(), "    ");
-    }
-
-    #[test]
     fn wrapping_respects_display_width() {
         assert_eq!(wrap_text("abcdef", 3), vec!["abc", "def"]);
         assert_eq!(wrap_text("a\n\nb", 10), vec!["a", "", "b"]);
         assert_eq!(wrap_text("世界", 2), vec!["世", "界"]);
-    }
-
-    #[test]
-    fn cursor_tracks_soft_wrap() {
-        let mut input = Input::default();
-        input.insert_str("abcdef");
-        let layout = layout_input(&input, 3, 2);
-        assert_eq!(layout.lines, vec!["abc", "def", ""]);
-        assert_eq!(layout.cursor_line, 2);
-        assert_eq!(layout.cursor_col, 0);
-        assert_eq!(layout.offset, 1);
     }
 
     #[test]
@@ -6315,36 +5740,102 @@ mod tests {
     }
 
     #[test]
-    fn nvim_mode_strings_classify_insert() {
-        assert!(nvim_is_insert(""));
-        assert!(nvim_is_insert("insert"));
-        assert!(nvim_is_insert("replace"));
-        assert!(!nvim_is_insert("normal"));
-        assert!(!nvim_is_insert("visual"));
-        assert!(!nvim_is_insert("cmdline_normal"));
+    fn banner_helpers_are_compact() {
+        assert_eq!(
+            short_model("deepseek/deepseek-v4.1-flash"),
+            "deepseek-v4.1-flash"
+        );
+        assert_eq!(short_model("gpt-4o"), "gpt-4o");
+        assert_eq!(compact_path("/tmp/x"), "/tmp/x");
+        if let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) {
+            let home = home.to_string_lossy();
+            assert_eq!(compact_path(&format!("{home}/git/eix")), "~/git/eix");
+        }
+    }
+
+    #[test]
+    fn prompt_height_is_fixed() {
+        // 6 editor rows + 2 borders, independent of focus or draft length.
+        assert_eq!(prompt_input_height(40), 8);
+        assert_eq!(prompt_input_height(100), 8);
+        // Short terminals yield to the transcript, but never to a 1-row box.
+        assert_eq!(prompt_input_height(8), 3);
+        assert_eq!(prompt_input_height(4), 3);
     }
 
     #[test]
     fn esc_keeps_focus_in_the_prompt_until_a_double_press() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.focus = Focus::Input;
 
-        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Input));
+        assert_eq!(app.input.mode(), Mode::Normal);
 
-        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Transcript));
         assert!(app.esc_at.is_none());
     }
 
     #[test]
+    fn ctrl_c_interrupts_insert_mode_without_quitting() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.focus_input();
+        assert_eq!(app.input.mode(), Mode::Insert);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(!app.should_quit);
+        assert!(matches!(app.focus, Focus::Input));
+        assert_eq!(app.input.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn ctrl_c_still_quits_outside_the_prompt() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.focus = Focus::Transcript;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
     fn other_keys_break_the_double_esc_gesture() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.focus = Focus::Input;
 
-        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE));
-        app.handle_nvim_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        app.handle_input_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Input));
+    }
+
+    #[test]
+    fn leader_actions_dispatch_like_palette_commands() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+
+        app.run_action("help", &tx);
+        assert!(app.help);
+
+        app.help = false;
+        app.run_action("sessions", &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Sessions)
+        ));
+
+        app.picker = None;
+        app.run_action("not-an-action", &tx);
+        assert!(app.picker.is_none());
     }
 }

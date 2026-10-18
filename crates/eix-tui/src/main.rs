@@ -62,7 +62,6 @@ async fn main() -> Result<()> {
                 session,
                 config.notifications.bell,
                 config.notifications.osc,
-                config.input,
             )
             .await
         }
@@ -1460,15 +1459,7 @@ async fn doctor(cli: &Cli) -> Result<()> {
                     "bwrap missing"
                 }
             );
-            println!(
-                "input    {} (nvim {})",
-                config.input.backend.as_str(),
-                if eix_nvim::embedded::nvim_available() {
-                    "found"
-                } else {
-                    "missing"
-                }
-            );
+            println!("input    native (built-in Vim editor)");
             println!(
                 "snapshot {}",
                 if config.tools.snapshots {

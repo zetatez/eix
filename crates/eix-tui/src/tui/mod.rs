@@ -5,7 +5,9 @@
 
 mod app;
 mod controller;
+mod editor;
 mod net;
+mod theme;
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
@@ -19,8 +21,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use eix_core::{Endpoint, InputBackend, InputConfig};
-use eix_nvim::embedded::NvimInput;
+use eix_core::Endpoint;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
@@ -37,64 +38,23 @@ pub async fn run(
     initial_session: Option<String>,
     bell: bool,
     osc: bool,
-    input: InputConfig,
 ) -> Result<()> {
     if !io::stdout().is_terminal() {
         bail!("`eix tui` needs a terminal (stdout is not a tty)");
     }
 
-    // Spawn the prompt before entering the alternate screen so a required
-    // backend can fail without leaving the terminal in a broken state.
-    let (cols, _rows) = crossterm::terminal::size().unwrap_or((80, 24));
-    let mut fallback_note = None;
-    let nvim = match input.backend {
-        InputBackend::Native => None,
-        InputBackend::Nvim | InputBackend::Auto => {
-            match NvimInput::spawn(cols, 3, input.minimal).await {
-                Ok(nvim) => {
-                    if nvim.used_minimal_fallback() {
-                        fallback_note = Some(
-                            "nvim config failed or timed out; started with -u NONE".to_string(),
-                        );
-                    }
-                    Some(nvim)
-                }
-                Err(err) if input.backend == InputBackend::Nvim => {
-                    return Err(err).context("embedded nvim input");
-                }
-                Err(err) => {
-                    fallback_note = Some(format!(
-                        "embedded nvim unavailable: {err:#}; using the native prompt"
-                    ));
-                    None
-                }
-            }
-        }
-    };
-
     let mut terminal = init_terminal()?;
     let mut app = App::new(initial_session);
     app.bell = bell;
     app.osc = osc;
-    if let Some(nvim) = nvim {
-        app.set_nvim_input(nvim);
-    }
-    if let Some(note) = fallback_note {
-        app.set_status(note);
-    }
     let (cmd_tx, mut ev_rx) = controller::spawn(endpoint, data_dir, config);
     let _ = cmd_tx.send(Command::Hello);
     let _ = cmd_tx.send(Command::List);
 
     let mut events = EventStream::new();
-    let tick = if app.has_nvim_input() {
-        Duration::from_millis(30)
-    } else {
-        Duration::from_millis(200)
-    };
+    let tick = Duration::from_millis(200);
     let mut outcome = Ok(());
     loop {
-        app.poll_nvim(&cmd_tx);
         if app.take_force_clear() {
             terminal.clear().ok();
         }

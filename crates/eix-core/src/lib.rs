@@ -18,8 +18,8 @@ pub mod search;
 pub mod session;
 
 pub use config::{
-    AutoApproveRule, Config, ConfigError, ContextConfig, InputBackend, InputConfig,
-    NotificationsConfig, ProviderConfig, SandboxMode, ServerConfig, ToolPolicy, ToolsConfig,
+    AutoApproveRule, Config, ConfigError, ContextConfig, NotificationsConfig, ProviderConfig,
+    SandboxMode, ServerConfig, ToolPolicy, ToolsConfig,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
