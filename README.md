@@ -60,11 +60,12 @@ timeout_secs = 300
 协议是 Unix socket 上的 newline-delimited JSON：请求带 `id`/`method`/`params`，
 响应带 `id`，事件通知是 `session.updated`、`session.event`、`turn.started`、
 `message.delta`、`tool.approval_required`、`tool.started`、`tool.completed`、
-`turn.completed` 等。`eix-core/src/protocol.rs` 是唯一契约来源。
+`session.attention`、`turn.completed` 等。`eix-core/src/protocol.rs` 是唯一契约来源。
 
 当前限制：工具执行已接入，但写入是审批后直接落盘（DESIGN 里的 staged shadow workspace、
 diff hunk 审批、bubblewrap 沙箱和 context ledger 仍是 Phase 2 的后续项）。TUI 已支持多
-pane，但输入框和 attention 通知仍是临时方案（嵌入 nvim 输入尚未接上）。
+pane；后台 pane 的 attention 用边框/侧栏高亮和 `a` 跳转提示，外部通知命令（dwm/tmux）
+和嵌入 nvim 输入尚未接上。
 
 ## TUI（v1）
 
@@ -84,6 +85,7 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 | `Ctrl-J` | 换行（输入框内） |
 | `p` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（输入框内外都可用） |
 | `o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
+| `a` | 跳到下一个需要 attention 的 pane（审批/错误） |
 | `C-w h/j/k/l` | 按方向切换 pane 焦点（转录区） |
 | `C-w v` / `C-w s` | 打开新 pane |
 | `C-w c` | 关闭聚焦 pane（至少保留一个） |
@@ -99,8 +101,11 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
 有待审批的工具调用时，pane 底部会出现 `[y] approve / [n] deny` 卡片，session 栏显示
-`⚠`；也可以从命令行用 `eix approve` / `eix deny` 处理。输入框是 ratatui 自绘的临时
-方案；DESIGN 里的「一个 client 一个嵌入 nvim」会在 pane 交互稳定后接入。
+`⚠`；也可以从命令行用 `eix approve` / `eix deny` 处理。后台 pane 进入
+`awaiting_approval` / `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
+按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的审批卡片。
+输入框是 ratatui 自绘的临时方案；DESIGN 里的「一个 client 一个嵌入 nvim」会在 pane
+交互稳定后接入。
 
 ### 工具与审批
 
@@ -187,6 +192,7 @@ spike 内：
 - [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve / deny / doctor）
 - [x] TUI v1（多 pane 自动平铺、焦点切换、转录、session 栏、fuzzy picker、多行输入、流式跟随）
 - [x] 工具调用 + 审批门禁（read_file / list_dir / write_file / run_command、workspace 沙箱、审批卡片）
-- [ ] 嵌入 nvim 输入 + attention 通知
+- [x] attention 标记（后台 pane 高亮、`a` 跳转、审批卡片重放）
+- [ ] 嵌入 nvim 输入 + 外部 attention 通知（dwm/tmux/terminal bell）
 - [ ] staging / shadow workspace、diff hunk 审批、沙箱、context ledger
 - [ ] daemon 化的 nvim 前端（JSON-RPC over Unix socket）

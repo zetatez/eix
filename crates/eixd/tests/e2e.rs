@@ -258,12 +258,18 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
         .await?;
     assert!(answered.accepted);
 
+    let mut saw_attention = false;
     let completed = loop {
         let notification = client.next_notification().await?;
+        if notification.method == "session.attention" {
+            assert_eq!(notification.params["status"], "awaiting_approval");
+            saw_attention = true;
+        }
         if notification.method == "turn.completed" {
             break notification.params.clone();
         }
     };
+    assert!(saw_attention);
     assert!(completed["error"].is_null());
 
     let attached: AttachResult = client
@@ -436,6 +442,8 @@ struct TestClient {
     reader: ClientReader,
     writer: WriteHalf<UnixStream>,
     next_id: u64,
+    /// Notifications seen while waiting for a response.
+    pending: std::collections::VecDeque<eix_core::Notification>,
 }
 
 impl TestClient {
@@ -465,12 +473,15 @@ impl TestClient {
                 ServerMessage::Response(other) => {
                     anyhow::bail!("unexpected response id {}", other.id)
                 }
-                ServerMessage::Notification(_) => continue,
+                ServerMessage::Notification(notification) => self.pending.push_back(notification),
             }
         }
     }
 
     async fn next_notification(&mut self) -> anyhow::Result<eix_core::Notification> {
+        if let Some(notification) = self.pending.pop_front() {
+            return Ok(notification);
+        }
         match read_message(&mut self.reader).await? {
             ServerMessage::Notification(notification) => Ok(notification),
             ServerMessage::Response(response) => {
@@ -490,6 +501,7 @@ async fn connect(socket: &Path) -> anyhow::Result<TestClient> {
                     reader: BufReader::new(read),
                     writer: write,
                     next_id: 1,
+                    pending: std::collections::VecDeque::new(),
                 });
             }
             Err(err) => {

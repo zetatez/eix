@@ -4,7 +4,7 @@
 //! embedding Neovim: the daemon protocol and session UX need to settle before
 //! the real-nvim input layer is wired in.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eix_core::{
@@ -217,6 +217,38 @@ impl SessionView {
             scroll: 0,
             follow: true,
         }
+    }
+
+    /// Find an approval request in the replayable log that has no result yet.
+    /// This restores the approval card after a TUI restart / re-attach.
+    fn pending_approval(&self) -> Option<PendingApproval> {
+        let mut resolved = HashSet::new();
+        for event in self.events.iter().rev() {
+            match event.kind {
+                EventKind::ToolResult => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<ToolResultPayload>(event.payload.clone())
+                    {
+                        resolved.insert(payload.call_id);
+                    }
+                }
+                EventKind::ApprovalRequired => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
+                    {
+                        if !resolved.contains(&payload.call_id) {
+                            return Some(PendingApproval {
+                                approval_id: payload.approval_id,
+                                tool: payload.tool,
+                                summary: payload.summary,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
     }
 }
 
@@ -453,6 +485,9 @@ impl App {
         self.upsert_session(attached.session.clone(), false);
         let session_id = attached.session.id.clone();
         let view = SessionView::new(attached.session, attached.events);
+        let restored_approval = view
+            .pending_approval()
+            .filter(|_| view.session.status == SessionStatus::AwaitingApproval);
 
         if let Some(open) = self.open_session(&session_id) {
             // One session lives in at most one pane.
@@ -471,6 +506,9 @@ impl App {
             }
         }
         self.focused = self.focused.min(self.views.len().saturating_sub(1));
+        if let Some(approval) = restored_approval {
+            self.approvals.insert(session_id.clone(), approval);
+        }
         self.selected = self.find_session(&session_id).unwrap_or(self.selected);
         self.error = None;
         self.status = "attached".into();
@@ -504,14 +542,42 @@ impl App {
         match notification.method.as_str() {
             "session.updated" => {
                 if let Ok(session) = serde_json::from_value::<Session>(notification.params) {
-                    if let Some(view) = self
+                    let id = session.id.clone();
+                    let mut background_attention = false;
+                    if let Some((index, view)) = self
                         .views
                         .iter_mut()
-                        .find(|view| view.session.id == session.id)
+                        .enumerate()
+                        .find(|(_, view)| view.session.id == id)
                     {
                         view.session = session.clone();
+                        background_attention =
+                            index != self.focused && session.status.needs_attention();
+                    }
+                    if background_attention {
+                        self.status = format!("{} needs attention", session.name);
                     }
                     self.upsert_session(session, false);
+                }
+            }
+            "session.attention" => {
+                if let Ok(params) = serde_json::from_value::<AttentionParams>(notification.params) {
+                    if let Some((index, view)) = self
+                        .views
+                        .iter_mut()
+                        .enumerate()
+                        .find(|(_, view)| view.session.id == params.session_id)
+                    {
+                        view.session.status = params.status;
+                        if index != self.focused {
+                            self.status = format!(
+                                "{} · {} in pane {}",
+                                view.session.name,
+                                params.status.as_str(),
+                                index + 1
+                            );
+                        }
+                    }
                 }
             }
             "session.event" => {
@@ -744,6 +810,7 @@ impl App {
             KeyCode::Char('n') => self.create_session(tx),
             KeyCode::Char('p') => self.open_picker(PickerMode::Switch),
             KeyCode::Char('o') => self.open_picker(PickerMode::NewPane),
+            KeyCode::Char('a') => self.focus_next_attention(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('x') => self.cancel(tx),
             KeyCode::Tab => self.cycle_session(1, tx),
@@ -937,6 +1004,44 @@ impl App {
         self.views.get_mut(index)
     }
 
+    /// A pane needs attention when its session is blocked and the pane is not
+    /// focused. This is derived from the session status instead of a one-shot
+    /// flag so switching away from a pending approval still marks it.
+    fn pane_needs_attention(&self, index: usize) -> bool {
+        index != self.focused
+            && self
+                .views
+                .get(index)
+                .is_some_and(|view| view.session.status.needs_attention())
+    }
+
+    fn attention_count(&self) -> usize {
+        (0..self.views.len())
+            .filter(|index| self.pane_needs_attention(*index))
+            .count()
+    }
+
+    fn focus_next_attention(&mut self) {
+        let len = self.views.len();
+        for offset in 1..len {
+            let index = (self.focused + offset) % len;
+            if self.views[index].session.status.needs_attention() {
+                self.focus_pane(index);
+                let name = self.views[index].session.name.clone();
+                self.status = format!("attention: {name}");
+                return;
+            }
+        }
+        self.status = if self
+            .focused_view()
+            .is_some_and(|view| view.session.status.needs_attention())
+        {
+            "the focused pane needs attention".into()
+        } else {
+            "nothing needs attention".into()
+        };
+    }
+
     fn open_session(&self, session_id: &str) -> Option<usize> {
         self.views
             .iter()
@@ -1073,7 +1178,11 @@ impl App {
             .filter(|(_, s)| s.id.starts_with(needle))
             .map(|(index, _)| index)
             .collect();
-        (matches.len() == 1).then_some(matches[0])
+        if matches.len() == 1 {
+            Some(matches[0])
+        } else {
+            None
+        }
     }
 
     fn upsert_session(&mut self, session: Session, front: bool) {
@@ -1204,6 +1313,15 @@ impl App {
                 Style::default().fg(Color::DarkGray),
             ));
         }
+        let attention = self.attention_count();
+        if attention > 0 {
+            spans.push(Span::styled(
+                format!("  ⚠ {attention} attention"),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -1227,7 +1345,16 @@ impl App {
             .sessions
             .iter()
             .map(|session| {
-                let pane = match self.open_session(&session.id) {
+                let open = self.open_session(&session.id);
+                let attention = open.is_some_and(|index| self.pane_needs_attention(index));
+                let name_style = if attention {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                let pane = match open {
                     Some(index) => {
                         Span::styled(format!("{}", index + 1), Style::default().fg(Color::Cyan))
                     }
@@ -1240,7 +1367,7 @@ impl App {
                         format!("{} ", session.status.symbol()),
                         Style::default().fg(status_color(session.status)),
                     ),
-                    Span::raw(truncate(&session.name, 12)),
+                    Span::styled(truncate(&session.name, 12), name_style),
                     Span::styled(
                         format!(" {}", short_id(&session.id)),
                         Style::default().fg(Color::DarkGray),
@@ -1299,9 +1426,18 @@ impl App {
             view.scroll = view.scroll.min(max_scroll);
         }
         let name = truncate(&view.session.name, inner_width.saturating_sub(8).max(1));
-        let title = format!(" {} {} {} ", index + 1, view.session.status.symbol(), name);
+        let attention = !focused && view.session.status.needs_attention();
+        let marker = if attention { "!" } else { "" };
+        let title = format!(
+            " {}{marker} {} {} ",
+            index + 1,
+            view.session.status.symbol(),
+            name
+        );
         let border_style = if focused {
             Style::default().fg(Color::Cyan)
+        } else if attention {
+            Style::default().fg(status_color(view.session.status))
         } else {
             Style::default().fg(Color::DarkGray)
         };
@@ -1529,10 +1665,12 @@ impl App {
             Paragraph::new(truncate(&message, chunks[0].width as usize)).style(style),
             chunks[0],
         );
-        let hint = if self.approvals.is_empty() {
-            " C-w pane  p picker  o split  ? help  q quit "
-        } else {
+        let hint = if self.focused_approval().is_some() {
             " y approve  n deny  x cancel  ? help "
+        } else if self.attention_count() > 0 {
+            " a next attention  ? help  q quit "
+        } else {
+            " C-w pane  p picker  o split  ? help  q quit "
         };
         frame.render_widget(
             Paragraph::new(hint)
@@ -1676,6 +1814,12 @@ struct ApprovalParams {
 #[derive(Deserialize)]
 struct ToolCompleted {
     session_id: String,
+}
+
+#[derive(Deserialize)]
+struct AttentionParams {
+    session_id: String,
+    status: SessionStatus,
 }
 
 struct InputLayout {
@@ -1850,6 +1994,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key_line("Ctrl-J", "newline (in prompt)"),
         key_line("p / Ctrl-G", "session picker"),
         key_line("o", "open session in a new pane"),
+        key_line("a", "jump to the next pane needing attention"),
         key_line("C-w h/j/k/l", "focus pane left/down/up/right"),
         key_line("C-w v / s", "open a new pane"),
         key_line("C-w c", "close focused pane"),
@@ -2232,6 +2377,72 @@ mod tests {
         assert!(text.contains("write_file out.txt (+5 bytes)"));
         assert!(text.contains("write_file → ok"));
         assert!(text.contains("wrote 5 bytes to out.txt"));
+    }
+
+    #[test]
+    fn background_attention_is_marked_and_cleared() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.views.push(SessionView::new(
+            Session::new("s2", "two", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                "session.attention",
+                serde_json::json!({"session_id": "s2", "status": "awaiting_approval"}),
+            )),
+            &tx,
+        );
+        assert_eq!(app.views[1].session.status, SessionStatus::AwaitingApproval);
+        assert!(app.pane_needs_attention(1));
+        assert_eq!(app.attention_count(), 1);
+
+        app.focus_next_attention();
+        assert_eq!(app.focused, 1);
+        assert!(!app.pane_needs_attention(1));
+        assert_eq!(app.attention_count(), 0);
+    }
+
+    #[test]
+    fn attach_replays_a_pending_approval() {
+        let session = Session::new("s1", "tools", "/tmp");
+        let approval = SessionEvent::new(
+            "s1",
+            1,
+            EventKind::ApprovalRequired,
+            serde_json::json!({
+                "approval_id": "a1",
+                "call_id": "c1",
+                "tool": "write_file",
+                "summary": "write_file out.txt",
+                "arguments": {"path": "out.txt", "content": "x"},
+            }),
+        );
+        let result = SessionEvent::new(
+            "s1",
+            2,
+            EventKind::ToolResult,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "write_file",
+                "ok": true,
+                "denied": false,
+                "output": "done",
+            }),
+        );
+
+        let pending = SessionView::new(session.clone(), vec![approval.clone()]).pending_approval();
+        assert_eq!(pending.as_ref().map(|p| p.approval_id.as_str()), Some("a1"));
+
+        let resolved = SessionView::new(session, vec![approval, result]).pending_approval();
+        assert!(resolved.is_none());
     }
 
     #[test]

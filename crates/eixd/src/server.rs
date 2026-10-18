@@ -477,6 +477,15 @@ impl Daemon {
         self.emit_event(&event);
         let session = self.require_session(id)?;
         self.emit_session(&session);
+        if to.needs_attention() {
+            self.emit_value(
+                "session.attention",
+                json!({
+                    "session_id": id,
+                    "status": to.as_str(),
+                }),
+            );
+        }
         Ok(session)
     }
 

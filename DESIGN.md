@@ -424,8 +424,10 @@ prompt buffer 的 buffer-local mapping：
 > 平铺 pane（1/2/3/4+ 分别全屏、左右、左大右二、网格），每个 pane 独立维护 session、
 > 转录、滚动与流式跟随；`o` 在新 pane 打开，`p`/`Ctrl-G` 切换聚焦 pane 的 session，
 > `C-w h/j/k/l/w` 切焦点、`C-w v/s` 分屏、`C-w c` 关闭；同一 session 只出现一次，
-> picker 选中已打开 session 会聚焦既有 pane。输入框暂由 ratatui 自绘（非嵌入 nvim），
-> attention 通知待做。
+> picker 选中已打开 session 会聚焦既有 pane。输入框暂由 ratatui 自绘（非嵌入 nvim）。
+> 后台 pane 的 attention 已接入：daemon 在进入 `awaiting_approval` / `error` 时发送
+> `session.attention`，TUI 标记边框/侧栏并支持 `a` 跳到下一个；重新 attach 会从事件日志
+> 恢复未完成的审批卡片。外部通知命令（dwm/tmux）仍待做。
 
 **Phase 2**
 
