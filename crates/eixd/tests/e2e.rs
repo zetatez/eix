@@ -408,6 +408,87 @@ async fn approval_gate_denies_and_keeps_the_workspace_untouched() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn approval_rejects_a_file_changed_during_review() -> anyhow::Result<()> {
+    let dir = temp_dir("conflict");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "conflict", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write out.txt"}),
+        )
+        .await?;
+
+    let approval = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            break notification.params.clone();
+        }
+    };
+    assert_eq!(approval["tool"], "write_file");
+
+    // The file changes after the diff was generated but before the decision.
+    std::fs::write(dir.join("out.txt"), "external")?;
+
+    let answered: eix_core::ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": approval["approval_id"],
+                "decision": "approve",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let result = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolResult)
+        .expect("tool result event");
+    assert_eq!(result.payload["ok"], false);
+    assert_eq!(result.payload["denied"], true);
+    let output = result.payload["output"].as_str().unwrap_or_default();
+    assert!(output.contains("changed after the diff"), "{output}");
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "external");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn recovers_sessions_left_running() -> anyhow::Result<()> {
     let dir = temp_dir("recover");
     let data_dir = dir.join("data");

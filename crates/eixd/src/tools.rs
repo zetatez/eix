@@ -8,6 +8,8 @@
 //! described in DESIGN.md is a later step; until then the approval card is the
 //! safety boundary.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -146,6 +148,50 @@ async fn write_file_diff(args: &Value, cwd: &Path) -> Result<String> {
         return Ok(format!("{label}: diff omitted (file larger than 2 MB)\n"));
     }
     Ok(unified_diff(&label, &old, new))
+}
+
+/// Fingerprint of the file an approval diff was generated against. Re-checked
+/// just before writing so a change made while the user reviewed is not
+/// silently overwritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WriteGuard {
+    path: PathBuf,
+    label: String,
+    hash: u64,
+}
+
+/// Capture the current contents of a `write_file` target for conflict
+/// detection. `None` for tools without a file target (shell commands).
+pub async fn write_guard(tool: &str, args: &Value, cwd: &Path) -> Option<WriteGuard> {
+    if tool != "write_file" {
+        return None;
+    }
+    let raw = required_string(args, "path").ok()?;
+    let path = resolve_path(cwd, raw).ok()?;
+    let bytes = tokio::fs::read(&path).await.unwrap_or_default();
+    Some(WriteGuard {
+        label: display(&path, cwd),
+        path,
+        hash: hash_bytes(&bytes),
+    })
+}
+
+/// Fail when the guarded file changed after the diff was shown.
+pub async fn verify_guard(guard: &WriteGuard) -> Result<()> {
+    let bytes = tokio::fs::read(&guard.path).await.unwrap_or_default();
+    if hash_bytes(&bytes) != guard.hash {
+        bail!(
+            "{} changed after the diff was shown; review and approve again",
+            guard.label
+        );
+    }
+    Ok(())
+}
+
+fn hash_bytes(bytes: &[u8]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    bytes.hash(&mut hasher);
+    hasher.finish()
 }
 
 fn unified_diff(path: &str, old: &str, new: &str) -> String {
@@ -498,6 +544,30 @@ mod tests {
 
         assert!(
             preview("run_command", &json!({"command": "true"}), &cwd, &config)
+                .await
+                .is_none()
+        );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn write_guard_detects_a_changed_file() {
+        let cwd = temp_cwd("guard");
+        std::fs::write(cwd.join("a.txt"), "one").unwrap();
+        let guard = write_guard(
+            "write_file",
+            &json!({"path": "a.txt", "content": "two"}),
+            &cwd,
+        )
+        .await
+        .expect("guard");
+        assert!(verify_guard(&guard).await.is_ok());
+
+        std::fs::write(cwd.join("a.txt"), "external").unwrap();
+        assert!(verify_guard(&guard).await.is_err());
+
+        assert!(
+            write_guard("run_command", &json!({"command": "true"}), &cwd)
                 .await
                 .is_none()
         );

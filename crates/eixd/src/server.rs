@@ -126,6 +126,8 @@ struct PendingApproval {
 struct ApprovalReply {
     decision: ApprovalDecision,
     reason: Option<String>,
+    /// File fingerprint captured when the diff was shown (write_file only).
+    guard: Option<tools::WriteGuard>,
 }
 
 impl Daemon {
@@ -322,6 +324,7 @@ impl Daemon {
                     let _ = pending.responder.send(ApprovalReply {
                         decision: ApprovalDecision::Deny,
                         reason: Some("turn cancelled".to_string()),
+                        guard: None,
                     });
                 }
                 Ok(serde_json::to_value(CancelResult { cancelled })?)
@@ -348,6 +351,7 @@ impl Daemon {
         let _ = pending.responder.send(ApprovalReply {
             decision: params.decision,
             reason: params.reason,
+            guard: None,
         });
         Ok(ApprovalResult { accepted: true })
     }
@@ -681,6 +685,12 @@ impl Daemon {
                         .await?;
                     if reply.decision == ApprovalDecision::Deny {
                         denial = Some(reply.reason.unwrap_or_else(|| "denied by user".to_string()));
+                    } else if let Some(guard) = &reply.guard {
+                        // The user reviewed a diff; do not overwrite a file that
+                        // changed in the meantime.
+                        if let Err(err) = tools::verify_guard(guard).await {
+                            denial = Some(format!("{err:#}"));
+                        }
                     }
                 }
             }
@@ -762,6 +772,7 @@ impl Daemon {
             return Ok(ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("turn cancelled".to_string()),
+                guard: None,
             });
         }
 
@@ -769,6 +780,7 @@ impl Daemon {
         let summary = tools::summarize(tool, args);
         let cwd = self.require_session(session_id)?.cwd;
         let diff = tools::preview(tool, args, &cwd, &self.config).await;
+        let guard = tools::write_guard(tool, args, &cwd).await;
         let (responder, receiver) = oneshot::channel();
         self.approvals.lock().await.insert(
             session_id.to_string(),
@@ -806,16 +818,19 @@ impl Daemon {
         );
         self.transition(session_id, SessionStatus::AwaitingApproval)?;
 
-        let reply = tokio::select! {
+        let mut reply = tokio::select! {
             reply = receiver => reply.unwrap_or(ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("approval channel closed".to_string()),
+                guard: None,
             }),
             _ = wait_for_cancel(cancel) => ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("turn cancelled".to_string()),
+                guard: None,
             },
         };
+        reply.guard = guard;
 
         self.approvals.lock().await.remove(session_id);
         if !cancel.load(Ordering::SeqCst) {

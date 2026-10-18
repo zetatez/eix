@@ -441,9 +441,10 @@ prompt buffer 的 buffer-local mapping：
 > 事件并广播 `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理。
 > 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。`write_file` 在审批前生成
-> unified diff 并随 `approval_required` 事件广播，TUI 卡片和 CLI 均会展示；目前是整文件
-> 批准。**尚未做**：staged shadow workspace、hunk 级选择、stage 后冲突检测、bubblewrap
-> 沙箱、执行前快照、context ledger、process view。
+> unified diff 并随 `approval_required` 事件广播，TUI 卡片（`d` 全屏审阅）和 CLI 均会
+> 展示；目前是整文件批准。写入前会重新校验文件指纹，审阅期间被外部修改则拒绝本次写入。
+> **尚未做**：staged shadow workspace、hunk 级选择、bubblewrap 沙箱、执行前快照、
+> context ledger、process view。
 
 **Phase 3**
 

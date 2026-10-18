@@ -292,6 +292,12 @@ struct PendingApproval {
     diff: Option<String>,
 }
 
+/// Full-screen review of an approval's diff, opened with `d`.
+struct DiffView {
+    session_id: String,
+    scroll: usize,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Left,
@@ -326,6 +332,8 @@ pub struct App {
     pane_areas: Vec<Rect>,
     /// Tool calls waiting on a decision, keyed by session id.
     approvals: HashMap<String, PendingApproval>,
+    /// Full-screen diff review, when open.
+    diff_view: Option<DiffView>,
     status: String,
     error: Option<String>,
     connected: bool,
@@ -355,6 +363,7 @@ impl App {
             pending_window: false,
             pane_areas: Vec::new(),
             approvals: HashMap::new(),
+            diff_view: None,
             status: "connecting…".into(),
             error: None,
             connected: false,
@@ -442,6 +451,7 @@ impl App {
                 if accepted {
                     self.approvals
                         .retain(|_, pending| pending.approval_id != approval_id);
+                    self.diff_view = None;
                     self.status = "approval sent".into();
                 } else {
                     self.status = "approval was stale; the daemon is still waiting".into();
@@ -662,11 +672,13 @@ impl App {
             "tool.completed" => {
                 if let Ok(params) = serde_json::from_value::<ToolCompleted>(notification.params) {
                     self.approvals.remove(&params.session_id);
+                    self.close_diff_view_for(&params.session_id);
                 }
             }
             "turn.completed" => {
                 if let Ok(done) = serde_json::from_value::<TurnCompleted>(notification.params) {
                     self.approvals.remove(&done.session_id);
+                    self.close_diff_view_for(&done.session_id);
                     let Some(view) = self
                         .views
                         .iter_mut()
@@ -778,6 +790,10 @@ impl App {
     }
 
     fn handle_transcript_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        if self.diff_view.is_some() {
+            self.handle_diff_key(key, tx);
+            return;
+        }
         if self.pending_window {
             self.pending_window = false;
             self.handle_window_key(key);
@@ -802,6 +818,10 @@ impl App {
                 }
                 KeyCode::Char('n') => {
                     self.respond_approval(ApprovalDecision::Deny, tx);
+                    return;
+                }
+                KeyCode::Char('d') => {
+                    self.open_diff_view();
                     return;
                 }
                 _ => {}
@@ -978,11 +998,19 @@ impl App {
     }
 
     fn respond_approval(&mut self, decision: ApprovalDecision, tx: &UnboundedSender<Command>) {
-        let Some(view) = self.focused_view() else {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             return;
         };
-        let session_id = view.session.id.clone();
-        let Some(pending) = self.approvals.get(&session_id) else {
+        self.respond_approval_for(&session_id, decision, tx);
+    }
+
+    fn respond_approval_for(
+        &mut self,
+        session_id: &str,
+        decision: ApprovalDecision,
+        tx: &UnboundedSender<Command>,
+    ) {
+        let Some(pending) = self.approvals.get(session_id) else {
             return;
         };
         let approval_id = pending.approval_id.clone();
@@ -992,10 +1020,87 @@ impl App {
         }
         .into();
         let _ = tx.send(Command::Approval {
-            session_id,
+            session_id: session_id.to_string(),
             approval_id,
             decision,
         });
+    }
+
+    fn open_diff_view(&mut self) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            return;
+        };
+        let has_diff = self
+            .approvals
+            .get(&session_id)
+            .and_then(|approval| approval.diff.as_deref())
+            .is_some_and(|diff| !diff.is_empty());
+        if !has_diff {
+            self.status = "no diff to review".into();
+            return;
+        }
+        self.diff_view = Some(DiffView {
+            session_id,
+            scroll: 0,
+        });
+        self.status = "diff review: j/k scroll · y approve · n deny · Esc close".into();
+    }
+
+    fn handle_diff_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        let Some((session_id, scroll)) = self
+            .diff_view
+            .as_ref()
+            .map(|view| (view.session_id.clone(), view.scroll))
+        else {
+            return;
+        };
+        let Some(total) = self
+            .approvals
+            .get(&session_id)
+            .and_then(|approval| approval.diff.as_deref())
+            .map(|diff| diff.lines().count())
+        else {
+            // The approval was answered elsewhere; drop the overlay.
+            self.diff_view = None;
+            return;
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('d') => self.diff_view = None,
+            KeyCode::Char('y') => {
+                self.diff_view = None;
+                self.respond_approval_for(&session_id, ApprovalDecision::Approve, tx);
+            }
+            KeyCode::Char('n') => {
+                self.diff_view = None;
+                self.respond_approval_for(&session_id, ApprovalDecision::Deny, tx);
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.set_diff_scroll(scroll + 1, total),
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.set_diff_scroll(scroll.saturating_sub(1), total)
+            }
+            KeyCode::PageDown => self.set_diff_scroll(scroll + 10, total),
+            KeyCode::PageUp => self.set_diff_scroll(scroll.saturating_sub(10), total),
+            KeyCode::Char('g') => self.set_diff_scroll(0, total),
+            KeyCode::Char('G') => self.set_diff_scroll(usize::MAX, total),
+            _ => {}
+        }
+    }
+
+    fn set_diff_scroll(&mut self, scroll: usize, total: usize) {
+        if let Some(view) = &mut self.diff_view {
+            view.scroll = scroll.min(total.saturating_sub(1));
+        }
+    }
+
+    /// Close the review overlay if it is showing `session_id`.
+    fn close_diff_view_for(&mut self, session_id: &str) {
+        if self
+            .diff_view
+            .as_ref()
+            .is_some_and(|view| view.session_id == session_id)
+        {
+            self.diff_view = None;
+        }
     }
 
     fn focused_view(&self) -> Option<&SessionView> {
@@ -1260,6 +1365,9 @@ impl App {
         }
         if self.help {
             draw_help(frame, area);
+        }
+        if self.diff_view.is_some() {
+            self.draw_diff_view(frame, area);
         }
     }
 
@@ -1668,7 +1776,14 @@ impl App {
             Paragraph::new(truncate(&message, chunks[0].width as usize)).style(style),
             chunks[0],
         );
-        let hint = if self.focused_approval().is_some() {
+        let hint = if self.focused_approval().is_some_and(|approval| {
+            approval
+                .diff
+                .as_deref()
+                .is_some_and(|diff| !diff.is_empty())
+        }) {
+            " y approve  n deny  d review  ? help "
+        } else if self.focused_approval().is_some() {
             " y approve  n deny  x cancel  ? help "
         } else if self.attention_count() > 0 {
             " a next attention  ? help  q quit "
@@ -1681,6 +1796,65 @@ impl App {
                 .style(style),
             chunks[1],
         );
+    }
+
+    fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
+        let Some((session_id, scroll)) = self
+            .diff_view
+            .as_ref()
+            .map(|view| (view.session_id.clone(), view.scroll))
+        else {
+            return;
+        };
+        let Some((tool, diff)) = self.approvals.get(&session_id).and_then(|approval| {
+            approval
+                .diff
+                .clone()
+                .map(|diff| (approval.tool.clone(), diff))
+        }) else {
+            return;
+        };
+
+        let rect = centered(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
+        frame.render_widget(Clear, rect);
+        let inner_width = rect.width.saturating_sub(2) as usize;
+        let inner_height = rect.height.saturating_sub(3) as usize; // borders + hint
+        let lines: Vec<&str> = diff.lines().collect();
+        let max_scroll = lines.len().saturating_sub(inner_height);
+        let scroll = scroll.min(max_scroll);
+        let mut body: Vec<Line> = lines
+            .iter()
+            .skip(scroll)
+            .take(inner_height)
+            .map(|line| {
+                Line::from(Span::styled(
+                    truncate(line, inner_width),
+                    diff_line_style(line),
+                ))
+            })
+            .collect();
+        body.push(Line::from(Span::styled(
+            " j/k scroll  y approve  n deny  Esc close ",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(format!(" diff · {tool} "));
+        frame.render_widget(
+            Paragraph::new(body)
+                .block(block)
+                .style(Style::default().bg(Color::Black)),
+            rect,
+        );
+        if let Some(view) = &mut self.diff_view {
+            view.scroll = scroll;
+        }
     }
 
     fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
@@ -2008,6 +2182,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key_line("n", "new session (new pane)"),
         key_line("x", "cancel focused turn"),
         key_line("y / n", "approve / deny a pending tool call"),
+        key_line("d", "review the pending diff full screen"),
         key_line("j / k", "scroll focused transcript"),
         key_line("g / G", "top / follow tail"),
         key_line("? / F1", "open this help (F1 anywhere)"),
@@ -2167,11 +2342,21 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval)
             Style::default().fg(Color::DarkGray),
         )));
     }
-    lines.push(Line::from(vec![
+    let mut keys = vec![
         Span::styled("[y] approve  ", Style::default().fg(Color::Green)),
         Span::styled("[n] deny  ", Style::default().fg(Color::Red)),
-        Span::styled("[x] cancel", Style::default().fg(Color::DarkGray)),
-    ]));
+    ];
+    if !diff_lines.is_empty() {
+        keys.push(Span::styled(
+            "[d] review  ",
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    keys.push(Span::styled(
+        "[x] cancel",
+        Style::default().fg(Color::DarkGray),
+    ));
+    lines.push(Line::from(keys));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -2523,5 +2708,85 @@ mod tests {
         }
         // The card stays until the daemon confirms the decision.
         assert!(app.approvals.contains_key("s1"));
+    }
+
+    fn app_with_diff(
+        diff: Option<&str>,
+    ) -> (
+        App,
+        tokio::sync::mpsc::UnboundedSender<Command>,
+        tokio::sync::mpsc::UnboundedReceiver<Command>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "tools", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.approvals.insert(
+            "s1".to_string(),
+            PendingApproval {
+                approval_id: "a1".to_string(),
+                tool: "write_file".to_string(),
+                summary: "write_file out.txt".to_string(),
+                diff: diff.map(str::to_string),
+            },
+        );
+        (app, tx, rx)
+    }
+
+    #[test]
+    fn diff_review_scrolls_and_closes() {
+        let (mut app, tx, _rx) =
+            app_with_diff(Some("--- a/out.txt\n+++ b/out.txt\n@@ -1 +1 @@\n-x\n+y\n"));
+
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        assert!(app.diff_view.is_some());
+
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.diff_view.as_ref().map(|view| view.scroll), Some(1));
+
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.diff_view.is_none());
+    }
+
+    #[test]
+    fn diff_review_answers_the_approval() {
+        let (mut app, tx, mut rx) = app_with_diff(Some("@@ -1 +1 @@\n-x\n+y\n"));
+
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+        assert!(app.diff_view.is_none());
+        match rx.try_recv().expect("approval command") {
+            Command::Approval {
+                session_id,
+                approval_id,
+                decision,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(approval_id, "a1");
+                assert_eq!(decision, ApprovalDecision::Approve);
+            }
+            _ => panic!("expected an approval command"),
+        }
+
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("deny command") {
+            Command::Approval { decision, .. } => {
+                assert_eq!(decision, ApprovalDecision::Deny);
+            }
+            _ => panic!("expected a deny command"),
+        }
+    }
+
+    #[test]
+    fn diff_review_needs_a_diff() {
+        let (mut app, tx, _rx) = app_with_diff(None);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        assert!(app.diff_view.is_none());
+        assert!(app.status.contains("no diff"));
     }
 }
