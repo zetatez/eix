@@ -136,12 +136,15 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 计数（`3w`、`2dd`）、preferred column（`j/k`）、`;`/`,` 重复 find 均按 vim 习惯实现。
 - 撤销是快照栈：一次 insert 会话、一次 `dd`/`p` 各算一步；`u` / `Ctrl-r`。
 - 未命名寄存器保存最近一次 yank/delete；`p`/`P` 区分字符与整行。
-- `<Space>` 是 leader（仅 normal）：`s` sessions、`o` 新 pane、`f` 文件、`w` worktree、
-  `b` 分支、`c` ledger、`C` context、`h` 历史、`p` 进程、`r` 审批、`n`/`N` 新建、
-  `F` fork、`x` 取消、`a`/`:` 命令面板、`?` 帮助。单字母完全留给 vim。
+- `<Space>` 是 leader（仅 normal）：`s` sessions、`n` 新 pane、`q` 关闭 pane、`f` 文件、
+  `w` worktree、`b` 分支、`c` ledger、`C` context、`h` 历史、`p` 进程、`r` 审批、
+  `N` 新建、`W` 新建 worktree、`F` fork、`x` 取消、`a`/`:` 命令面板、`?` 帮助。
+  单字母完全留给 vim。
+- plain `j`/`k` 上下翻转录历史（`3j`、`dj`、`↑`/`↓` 仍是草稿内行移动）。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
 - `Enter` 只在 insert 提交；normal 的 `<CR>` 是 vim 的“下一行”。
 - `@`（insert，行首/空白后）打开文件 picker；`Ctrl-G` 在任意模式打开 session picker。
+- picker / 历史搜索：`Ctrl-J`/`Ctrl-K`（或 `↑`/`↓`）上下选择。
 - 不再有 `[input] backend` / `minimal` 配置，也没有 nvim 回退路径。
 
 ### 5.2 buffer 与 draft
@@ -238,7 +241,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<C-j>` / `<C-Enter>` / `<S-Enter>` | 换行（仅 insert） |
 | `@` | 文件 picker（行首/空白后） |
 | `Esc` | insert/visual → normal；normal 下再按一次回转录区 |
-| `<Space>s/f/w/b/c/C/h/p/r/n/N/F/x/a/:/?` | TUI 动作（见 5.1） |
+| `<Space>s/f/w/b/c/C/h/p/r/N/W/F/x/q/a/:/?` | TUI 动作（见 5.1） |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
 | `d c y` + motion / `dd cc yy` / `iw aw` | 操作符 |
 | `v V` + `d x y c p ~ o` | visual |

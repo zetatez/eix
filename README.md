@@ -149,15 +149,17 @@ Vim 风格编辑器（见下）。
 - 编辑：`i a I A o O x X D C s S r ~ J p P u Ctrl-r`，操作符 `d c y` 可配合上面的
   motion、双写整行（`dd cc yy`）或文本对象（`iw aw`）
 - visual：`v` / `V` 进入，`d x y c p ~ o` 操作；选中区域反色显示
-- `Enter` 只在 insert 模式提交；normal 模式下所有字母都归编辑器
+- 浏览历史：plain `j` / `k` 上下翻转录（`3j`、`dj`、方向键仍是草稿内的行移动）
+- `Enter` 只在 insert 模式提交
 
 TUI 动作在 normal 模式下通过 **leader（空格）+ 键**打开：`<Space>s` session
-picker、`<Space>o` 新 pane、`<Space>f` 文件、`<Space>w`/`b` worktree/分支、
-`<Space>c` ledger、`<Space>C` context、`<Space>h` 历史、`<Space>p` 进程、
-`<Space>r` 审批、`<Space>n`/`N` 新建、`<Space>F` fork、`<Space>x` 取消、
-`<Space>a` 或 `<Space>:` 命令面板、`<Space>?` 帮助。insert 模式下保留
-`Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）和
-`@`（文件 picker）。连续两次 `Esc` 回到转录区。
+picker、`<Space>n` 新 pane（`<Space>q` 关闭当前 pane）、`<Space>f` 文件、
+`<Space>w`/`b` worktree/分支、`<Space>c` ledger、`<Space>C` context、`<Space>h` 历史、
+`<Space>p` 进程、`<Space>r` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
+`<Space>F` fork、`<Space>x` 取消、`<Space>a` 或 `<Space>:` 命令面板、`<Space>?` 帮助。
+insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
+和 `@`（文件 picker）。所有 picker / 历史搜索都支持 `Ctrl-J`/`Ctrl-K`（或 `↑`/`↓`）
+上下选择。连续两次 `Esc` 回到转录区。
 输入框固定高度（6 行内容 + 边框；终端过矮时优先让给转录区），不随焦点切换、
 草稿长度或 normal 模式折叠；更长的草稿在框内滚动。
 `write_file` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现 `[y] apply / [n] reject`

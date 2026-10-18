@@ -13,6 +13,7 @@
 //!   objects (`iw aw`)
 //! * edits: `i a I A o O x X D C s S r ~ J p P u Ctrl-r`
 //! * visual: `v V` + motions, then `d x y c p ~ o`
+//! * plain `j`/`k` scroll the transcript; `3j` / `dj` stay vim motions
 //! * `<Space>` is the leader for TUI actions, so plain letters stay native.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -50,6 +51,8 @@ pub enum Outcome {
     Submit,
     FilePicker,
     Action(&'static str),
+    /// Scroll the transcript (positive = down, negative = up).
+    Scroll(isize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -508,6 +511,13 @@ impl Editor {
                 return Outcome::Ignored;
             }
             _ => {}
+        }
+
+        // Plain `j`/`k` browse the transcript history while the prompt keeps
+        // focus. Counts and operators still move within the draft (`3j`,
+        // `dj`), and the arrow keys always do.
+        if matches!(c, 'j' | 'k') && self.op.is_none() && self.count.is_none() {
+            return Outcome::Scroll(if c == 'k' { -1 } else { 1 });
         }
 
         if let Some(op) = self.op {
@@ -1727,10 +1737,12 @@ fn leader_action(ch: char) -> Option<&'static str> {
         'h' => "history",
         'p' => "processes",
         'r' => "approvals",
-        'n' => "new",
-        'N' => "new-worktree",
+        'n' => "new-pane",
+        'N' => "new",
+        'W' => "new-worktree",
         'F' => "fork",
         'x' => "cancel",
+        'q' => "close-pane",
         'a' | ':' => "commands",
         '?' => "help",
         _ => return None,
@@ -1896,6 +1908,20 @@ mod tests {
         let mut editor = Editor::new();
         key(&mut editor, KeyCode::Char(' '));
         assert_eq!(editor.text(), " ");
+    }
+
+    #[test]
+    fn plain_j_and_k_scroll_but_counts_and_operators_still_move() {
+        let mut editor = editor_with("one\ntwo\nthree");
+        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::Scroll(-1));
+        assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Scroll(1));
+        // A count keeps `j`/`k` as vim line motions.
+        press(&mut editor, "2");
+        assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Ignored);
+        assert_eq!(editor.row, 2);
+        // An operator keeps `j` as a linewise motion (`dj`).
+        press(&mut editor, "d");
+        assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Ignored);
     }
 
     #[test]

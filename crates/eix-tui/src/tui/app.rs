@@ -191,13 +191,13 @@ impl PickerKind {
 
     fn hint(self) -> &'static str {
         match self {
-            Self::Sessions => "Enter open · ↑/↓ · Esc close",
-            Self::NewPane => "Enter split · ↑/↓ · Esc close",
-            Self::Files => "Enter insert · ↑/↓ · Esc close",
-            Self::Worktrees => "Enter insert path · ↑/↓ · Esc close",
-            Self::Branches => "Enter insert name · ↑/↓ · Esc close",
-            Self::Context => "Enter open ledger · ↑/↓ · Esc close",
-            Self::Commands => "Enter run · ↑/↓ · Esc close",
+            Self::Sessions => "Enter open · ↑/↓ or C-j/C-k · Esc close",
+            Self::NewPane => "Enter split · ↑/↓ or C-j/C-k · Esc close",
+            Self::Files => "Enter insert · ↑/↓ or C-j/C-k · Esc close",
+            Self::Worktrees => "Enter insert path · ↑/↓ or C-j/C-k · Esc close",
+            Self::Branches => "Enter insert name · ↑/↓ or C-j/C-k · Esc close",
+            Self::Context => "Enter open ledger · ↑/↓ or C-j/C-k · Esc close",
+            Self::Commands => "Enter run · ↑/↓ or C-j/C-k · Esc close",
         }
     }
 }
@@ -1452,6 +1452,7 @@ impl App {
         match self.input.handle_key(key) {
             Outcome::Submit => self.submit(tx),
             Outcome::FilePicker => self.open_picker(PickerKind::Files, tx),
+            Outcome::Scroll(delta) => self.scroll_focused(delta),
             Outcome::Action(id) if self.overlay_closed() => self.run_action(id, tx),
             Outcome::Ignored | Outcome::Action(_) => {}
         }
@@ -1528,7 +1529,8 @@ impl App {
             KeyCode::Char('A') => self.open_inbox(),
             KeyCode::Char('#') => {
                 self.search_view = Some(SearchView::new());
-                self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
+                self.status =
+                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
             }
             KeyCode::Char('F') => self.fork_focused(tx, None),
             KeyCode::Char('a') => self.focus_next_attention(),
@@ -1918,6 +1920,14 @@ impl App {
                     view.move_cursor(1);
                     None
                 }
+                KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    view.move_cursor(1);
+                    None
+                }
+                KeyCode::Char('k') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    view.move_cursor(-1);
+                    None
+                }
                 KeyCode::Backspace => {
                     view.query.pop();
                     view.cursor = 0;
@@ -1988,6 +1998,20 @@ impl App {
         let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
             return;
         };
+        // Ctrl-J / Ctrl-K are the vim-friendly next/previous bindings.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('j') => {
+                    self.move_picker(1);
+                    return;
+                }
+                KeyCode::Char('k') => {
+                    self.move_picker(-1);
+                    return;
+                }
+                _ => {}
+            }
+        }
         match key.code {
             KeyCode::Esc => self.picker = None,
             KeyCode::Up => self.move_picker(-1),
@@ -1996,7 +2020,8 @@ impl App {
             KeyCode::Char('#') if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) => {
                 self.picker = None;
                 self.search_view = Some(SearchView::new());
-                self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
+                self.status =
+                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
             }
             KeyCode::Backspace => {
                 if let Some(picker) = &mut self.picker {
@@ -2159,7 +2184,8 @@ impl App {
             "context" => self.open_picker(PickerKind::Context, tx),
             "history" => {
                 self.search_view = Some(SearchView::new());
-                self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
+                self.status =
+                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
             }
             "processes" => self.open_processes(tx),
             "approvals" => self.open_inbox(),
@@ -2168,6 +2194,7 @@ impl App {
             "new-worktree" => self.create_session(tx, true),
             "fork" => self.fork_focused(tx, None),
             "cancel" => self.cancel(tx),
+            "close-pane" => self.close_focused_pane(),
             "help" => self.help = true,
             "quit" => self.should_quit = true,
             _ => {}
@@ -3683,7 +3710,7 @@ impl App {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
             .title(format!(" search history · {} hit(s) ", view.hits.len()))
-            .title_bottom(" Enter run/open · ↑/↓ select · Esc close ");
+            .title_bottom(" Enter run/open · ↑/↓ or C-j/C-k select · Esc close ");
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
 
@@ -4003,7 +4030,7 @@ fn command_items() -> Vec<PickerItem> {
         (
             "new-pane",
             "open session in a new pane",
-            "Pick a session for a split (o)",
+            "Pick a session for a split (o / Space n)",
         ),
         (
             "files",
@@ -4037,6 +4064,11 @@ fn command_items() -> Vec<PickerItem> {
             "List and inspect processes (P)",
         ),
         ("approvals", "approval inbox", "Pending approvals (A)"),
+        (
+            "close-pane",
+            "close pane",
+            "Close the focused pane (C-w c / Space q)",
+        ),
         ("new", "new session", "Create a session (n)"),
         (
             "new-worktree",
@@ -4255,7 +4287,9 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key_line("Space s/f/w/b", "prompt: sessions / files / worktrees / branches"),
         key_line("Space c/C/h/p", "prompt: ledger / context / history / processes"),
         key_line("Space r/x/a/?", "prompt: approvals / cancel / actions / help"),
-        key_line("Space o/n/N/F", "prompt: new pane / new / new worktree / fork"),
+        key_line("Space n/q", "prompt: open in a new pane / close pane"),
+        key_line("Space N/W/F", "prompt: new session / new worktree / fork"),
+        key_line("j / k (normal)", "scroll the transcript history (3j / dj stay moves)"),
         key_line("Space :", "prompt: command palette"),
         key_line("p / Ctrl-G", "session picker"),
         key_line("o", "open session in a new pane"),
@@ -5817,6 +5851,78 @@ mod tests {
         app.handle_input_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Input));
+    }
+
+    #[test]
+    fn leader_n_opens_a_pane_and_q_closes_it() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.views.push(SessionView::new(
+            Session::new("s2", "two", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus_input();
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::NewPane)
+        ));
+
+        app.picker = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views.len(), 1);
+    }
+
+    #[test]
+    fn picker_accepts_ctrl_j_and_ctrl_k() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.sessions = vec![
+            Session::new("s1", "one", "/tmp"),
+            Session::new("s2", "two", "/tmp"),
+            Session::new("s3", "three", "/tmp"),
+        ];
+        app.open_picker(PickerKind::Sessions, &tx);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+
+        app.handle_picker_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.picker.as_ref().unwrap().selected, 1);
+        app.handle_picker_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+    }
+
+    #[test]
+    fn prompt_normal_mode_j_and_k_scroll_the_transcript() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.views[0].scroll = 5;
+        app.focus_input();
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views[0].scroll, 6);
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views[0].scroll, 5);
     }
 
     #[test]
