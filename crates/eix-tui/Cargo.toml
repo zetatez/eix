@@ -1,0 +1,21 @@
+[package]
+name = "eix-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "eix"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+eix-core = { path = "../eix-core" }
+ratatui = { workspace = true }
+crossterm = { workspace = true, features = ["event-stream"] }
+futures-util = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+unicode-width = "0.2"

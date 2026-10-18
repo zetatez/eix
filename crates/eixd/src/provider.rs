@@ -1,0 +1,552 @@
+//! OpenAI-compatible streaming provider.
+//!
+//! One adapter covers OpenAI, Ollama, vLLM, OpenRouter, LM Studio and friends:
+//! POST `/chat/completions` with `stream: true` and parse SSE `data:` lines.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
+
+use eix_core::{ChatMessage, Config, FunctionCall, ToolCall, ToolDefinition, Usage};
+use futures_util::StreamExt;
+use serde_json::{json, Value};
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum ProviderError {
+    #[error("request cancelled")]
+    Cancelled,
+    #[error("provider configuration: {0}")]
+    Config(String),
+    #[error("provider request failed: {0}")]
+    Http(String),
+    #[error("provider returned HTTP {status}: {body}")]
+    Api { status: u16, body: String },
+    #[error("failed to decode provider stream: {0}")]
+    Decode(String),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Completion {
+    pub text: String,
+    pub model: String,
+    pub usage: Option<Usage>,
+    pub finish_reason: Option<String>,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+pub struct Provider {
+    client: reqwest::Client,
+    endpoint: String,
+    model: String,
+    api_key: Option<String>,
+}
+
+impl Provider {
+    pub fn new(config: &Config) -> Result<Self, ProviderError> {
+        let client = reqwest::Client::builder()
+            .user_agent(format!("eix/{}", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_secs(config.provider.timeout_secs))
+            .build()
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        Ok(Self {
+            client,
+            endpoint: config.chat_endpoint(),
+            model: config.provider.model.clone(),
+            api_key: config.api_key(),
+        })
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    /// Stream a completion, invoking `on_delta` for each non-empty content
+    /// fragment. Returns the assembled message. Checks `cancel` between chunks.
+    pub async fn stream_chat<F>(
+        &self,
+        messages: &[ChatMessage],
+        model: &str,
+        tools: &[ToolDefinition],
+        cancel: &AtomicBool,
+        mut on_delta: F,
+    ) -> Result<Completion, ProviderError>
+    where
+        F: FnMut(&str) + Send,
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ProviderError::Cancelled);
+        }
+
+        let mut body = json!({
+            "model": model,
+            "messages": messages,
+            "stream": true,
+        });
+        if !tools.is_empty() {
+            body["tools"] = serde_json::to_value(tools)
+                .map_err(|e| ProviderError::Config(format!("cannot encode tools: {e}")))?;
+            body["tool_choice"] = json!("auto");
+        }
+        let mut request = self
+            .client
+            .post(&self.endpoint)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body);
+        if let Some(key) = &self.api_key {
+            request = request.bearer_auth(key);
+        }
+
+        let response = request.send().await.map_err(|e| {
+            if cancel.load(Ordering::Relaxed) {
+                ProviderError::Cancelled
+            } else {
+                ProviderError::Http(e.to_string())
+            }
+        })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            return Err(ProviderError::Api {
+                status: status.as_u16(),
+                body: truncate(&body, 2048),
+            });
+        }
+
+        let is_sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+
+        if !is_sse {
+            return self.non_streaming(response, model, on_delta).await;
+        }
+
+        let mut decoder = SseDecoder::new();
+        let mut acc = Accumulator::new(model);
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ProviderError::Cancelled);
+            }
+            let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
+            for data in decoder.feed(&chunk) {
+                if apply_data(&data, &mut acc, &mut on_delta)? {
+                    return Ok(acc.finish());
+                }
+            }
+        }
+        for data in decoder.finish() {
+            if apply_data(&data, &mut acc, &mut on_delta)? {
+                return Ok(acc.finish());
+            }
+        }
+
+        if !acc.saw_event {
+            return Err(ProviderError::Decode(
+                "stream ended without any events".to_string(),
+            ));
+        }
+        Ok(acc.finish())
+    }
+
+    async fn non_streaming<F>(
+        &self,
+        response: reqwest::Response,
+        model: &str,
+        mut on_delta: F,
+    ) -> Result<Completion, ProviderError>
+    where
+        F: FnMut(&str),
+    {
+        let text = response
+            .text()
+            .await
+            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let value: Value = serde_json::from_str(&text)
+            .map_err(|e| ProviderError::Decode(format!("non-streaming response: {e}")))?;
+        if let Some(error) = value.get("error") {
+            return Err(ProviderError::Api {
+                status: 200,
+                body: error_message(error),
+            });
+        }
+        let content = value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if !content.is_empty() {
+            on_delta(&content);
+        }
+        let tool_calls: Vec<ToolCall> = value
+            .pointer("/choices/0/message/tool_calls")
+            .and_then(|calls| serde_json::from_value(calls.clone()).ok())
+            .unwrap_or_default();
+        Ok(Completion {
+            text: content,
+            model: value
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or(model)
+                .to_string(),
+            usage: value
+                .get("usage")
+                .and_then(|u| serde_json::from_value(u.clone()).ok()),
+            finish_reason: value
+                .pointer("/choices/0/finish_reason")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            tool_calls,
+        })
+    }
+}
+
+struct Accumulator {
+    text: String,
+    model: String,
+    usage: Option<Usage>,
+    finish_reason: Option<String>,
+    saw_event: bool,
+    tool_calls: Vec<PartialToolCall>,
+}
+
+#[derive(Default)]
+struct PartialToolCall {
+    id: String,
+    kind: String,
+    name: String,
+    arguments: String,
+}
+
+impl Accumulator {
+    fn new(model: &str) -> Self {
+        Self {
+            text: String::new(),
+            model: model.to_string(),
+            usage: None,
+            finish_reason: None,
+            saw_event: false,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> Completion {
+        let tool_calls = self
+            .tool_calls
+            .into_iter()
+            .filter(|call| !call.name.is_empty())
+            .enumerate()
+            .map(|(index, call)| ToolCall {
+                id: if call.id.is_empty() {
+                    format!("call_{index}")
+                } else {
+                    call.id
+                },
+                kind: if call.kind.is_empty() {
+                    "function".to_string()
+                } else {
+                    call.kind
+                },
+                function: FunctionCall {
+                    name: call.name,
+                    arguments: call.arguments,
+                },
+            })
+            .collect();
+        Completion {
+            text: self.text,
+            model: self.model,
+            usage: self.usage,
+            finish_reason: self.finish_reason,
+            tool_calls,
+        }
+    }
+}
+
+/// Apply one SSE `data:` payload. Returns `true` when the stream is done.
+fn apply_data<F>(data: &str, acc: &mut Accumulator, on_delta: &mut F) -> Result<bool, ProviderError>
+where
+    F: FnMut(&str),
+{
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(false);
+    }
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+
+    let value: Value = serde_json::from_str(data)
+        .map_err(|e| ProviderError::Decode(format!("{e}: {}", truncate(data, 512))))?;
+    acc.saw_event = true;
+
+    if let Some(error) = value.get("error") {
+        return Err(ProviderError::Api {
+            status: 200,
+            body: error_message(error),
+        });
+    }
+    if let Some(model) = value.get("model").and_then(Value::as_str) {
+        acc.model = model.to_string();
+    }
+    if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
+        acc.usage = serde_json::from_value(usage.clone()).ok();
+    }
+    if let Some(choice) = value.pointer("/choices/0") {
+        if let Some(delta) = extract_content(choice.pointer("/delta/content")) {
+            if !delta.is_empty() {
+                acc.text.push_str(&delta);
+                on_delta(&delta);
+            }
+        }
+        if let Some(calls) = choice
+            .pointer("/delta/tool_calls")
+            .and_then(Value::as_array)
+        {
+            for call in calls {
+                let index = call
+                    .get("index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(acc.tool_calls.len() as u64) as usize;
+                if acc.tool_calls.len() <= index {
+                    acc.tool_calls
+                        .resize_with(index + 1, PartialToolCall::default);
+                }
+                let slot = &mut acc.tool_calls[index];
+                if let Some(id) = call.get("id").and_then(Value::as_str) {
+                    slot.id = id.to_string();
+                }
+                if let Some(kind) = call.get("type").and_then(Value::as_str) {
+                    slot.kind = kind.to_string();
+                }
+                if let Some(function) = call.get("function") {
+                    if let Some(name) = function.get("name").and_then(Value::as_str) {
+                        slot.name.push_str(name);
+                    }
+                    if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        slot.arguments.push_str(arguments);
+                    }
+                }
+            }
+        }
+        if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+            acc.finish_reason = Some(reason.to_string());
+        }
+    }
+    Ok(false)
+}
+
+/// OpenAI sends `content` as a string; newer multimodal APIs use an array of
+/// `{type, text}` parts. Accept both.
+fn extract_content(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(parts) => {
+            let mut out = String::new();
+            for part in parts {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    out.push_str(text);
+                } else if let Some(text) = part.as_str() {
+                    out.push_str(text);
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+fn error_message(error: &Value) -> String {
+    error
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| error.to_string())
+}
+
+fn truncate(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// Incremental Server-Sent Events decoder.
+///
+/// Handles arbitrary chunk boundaries, CRLF/LF, comments, and multi-line
+/// `data:` blocks (joined with `\n`, as the SSE spec requires).
+pub struct SseDecoder {
+    buf: Vec<u8>,
+}
+
+impl SseDecoder {
+    pub fn new() -> Self {
+        Self { buf: Vec::new() }
+    }
+
+    pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        while let Some((end, sep_len)) = find_separator(&self.buf) {
+            let block = self.buf[..end].to_vec();
+            self.buf.drain(..end + sep_len);
+            if let Some(data) = block_data(&block) {
+                out.push(data);
+            }
+        }
+        out
+    }
+
+    /// Flush a trailing block that was not terminated by a blank line.
+    pub fn finish(&mut self) -> Vec<String> {
+        if self.buf.is_empty() {
+            return Vec::new();
+        }
+        let block = std::mem::take(&mut self.buf);
+        block_data(&block).into_iter().collect()
+    }
+}
+
+impl Default for SseDecoder {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+fn find_separator(buf: &[u8]) -> Option<(usize, usize)> {
+    for i in 0..buf.len() {
+        if buf[i] == b'\n' && buf.get(i + 1) == Some(&b'\n') {
+            return Some((i, 2));
+        }
+        if buf[i] == b'\r'
+            && buf.get(i + 1) == Some(&b'\n')
+            && buf.get(i + 2) == Some(&b'\r')
+            && buf.get(i + 3) == Some(&b'\n')
+        {
+            return Some((i, 4));
+        }
+    }
+    None
+}
+
+fn block_data(block: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(block);
+    let mut data = Vec::new();
+    for line in text.split('\n') {
+        let line = line.strip_suffix('\r').unwrap_or(line);
+        if let Some(rest) = line.strip_prefix("data:") {
+            data.push(rest.strip_prefix(' ').unwrap_or(rest).to_string());
+        }
+    }
+    if data.is_empty() {
+        None
+    } else {
+        Some(data.join("\n"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decoder_handles_split_chunks_and_crlf() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.feed(b"data: {\"a\":1}").is_empty());
+        let out = decoder.feed(b"\r\n\r\ndata: [DONE]\r\n\r\n");
+        assert_eq!(out, vec!["{\"a\":1}".to_string(), "[DONE]".to_string()]);
+    }
+
+    #[test]
+    fn decoder_ignores_comments_and_joins_multiline_data() {
+        let mut decoder = SseDecoder::new();
+        let out = decoder.feed(b": ping\n\ndata: line1\ndata: line2\n\n");
+        assert_eq!(out, vec!["line1\nline2".to_string()]);
+    }
+
+    #[test]
+    fn decoder_flushes_trailing_block() {
+        let mut decoder = SseDecoder::new();
+        assert!(decoder.feed(b"data: tail").is_empty());
+        assert_eq!(decoder.finish(), vec!["tail".to_string()]);
+        assert!(decoder.finish().is_empty());
+    }
+
+    #[test]
+    fn applies_delta_and_usage() {
+        let mut acc = Accumulator::new("fallback");
+        let mut seen = String::new();
+        let mut on_delta = |d: &str| seen.push_str(d);
+
+        let line = r#"{"model":"m1","choices":[{"delta":{"content":"Hel"}}]}"#;
+        assert!(!apply_data(line, &mut acc, &mut on_delta).unwrap());
+        let line = r#"{"choices":[{"delta":{"content":"lo"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":2,"total_tokens":3}}"#;
+        assert!(!apply_data(line, &mut acc, &mut on_delta).unwrap());
+
+        let done = acc.finish();
+        assert_eq!(seen, "Hello");
+        assert_eq!(done.text, "Hello");
+        assert_eq!(done.model, "m1");
+        assert_eq!(done.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(done.usage.unwrap().total_tokens, 3);
+    }
+
+    #[test]
+    fn accumulates_streamed_tool_calls() {
+        let mut acc = Accumulator::new("m");
+        let mut on_delta = |_: &str| {};
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"pa"}}]}}]}"#;
+        let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        apply_data(first, &mut acc, &mut on_delta).unwrap();
+        apply_data(second, &mut acc, &mut on_delta).unwrap();
+        let done = acc.finish();
+        assert_eq!(done.tool_calls.len(), 1);
+        assert_eq!(done.tool_calls[0].id, "call_a");
+        assert_eq!(done.tool_calls[0].function.name, "read_file");
+        assert_eq!(done.tool_calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(done.finish_reason.as_deref(), Some("tool_calls"));
+    }
+
+    #[test]
+    fn assembles_multiple_tool_calls_by_index() {
+        let mut acc = Accumulator::new("m");
+        let mut on_delta = |_: &str| {};
+        let chunks = [
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read_file","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"list_dir","arguments":"{}"}}]}}]}"#,
+        ];
+        for chunk in chunks {
+            apply_data(chunk, &mut acc, &mut on_delta).unwrap();
+        }
+        let done = acc.finish();
+        assert_eq!(done.tool_calls.len(), 2);
+        assert_eq!(done.tool_calls[0].function.name, "read_file");
+        assert_eq!(done.tool_calls[1].function.name, "list_dir");
+    }
+
+    #[test]
+    fn accepts_content_parts() {
+        let value = json!([{"type": "text", "text": "a"}, {"type": "text", "text": "b"}]);
+        assert_eq!(extract_content(Some(&value)).as_deref(), Some("ab"));
+    }
+
+    #[test]
+    fn surfaces_provider_errors() {
+        let mut acc = Accumulator::new("m");
+        let mut on_delta = |_: &str| {};
+        let err = apply_data(
+            r#"{"error":{"message":"bad key"}}"#,
+            &mut acc,
+            &mut on_delta,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bad key"));
+    }
+}

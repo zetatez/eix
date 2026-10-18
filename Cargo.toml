@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/eix-core",
+    "crates/eixd",
+    "crates/eix-tui",
+    "crates/eix-nvim",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.85"
+
+[workspace.dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+rmpv = "1"
+toml = "0.8"
+dirs = "6"
+uuid = { version = "1", features = ["v4"] }
+chrono = "0.4"
+thiserror = "2"
+rusqlite = { version = "0.31", features = ["bundled"] }
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+] }
+futures-util = "0.3"
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "net",
+    "io-util",
+    "io-std",
+    "sync",
+    "time",
+    "process",
+    "fs",
+    "signal",
+] }
