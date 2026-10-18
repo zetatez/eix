@@ -13,7 +13,7 @@ crates/
 ├── eix-core   共享类型：session、事件、消息、协议、配置
 ├── eixd       daemon：session registry、SQLite 事件日志、agent runtime、OpenAI 兼容 provider
 ├── eix-tui    `eix` 前端：TUI + chat / send / log / picker CLI
-└── eix-nvim   嵌入 nvim + linegrid 渲染 spike
+└── eix-nvim   嵌入 nvim + multigrid 渲染 spike
 ```
 
 ## Phase 0：daemon + provider + CLI
@@ -182,9 +182,12 @@ git 会拒绝，需显式加 `--force`。删除后 session 的 `cwd` 回到主�
 
 ### 输入框：嵌入 nvim
 
-TUI 默认拉起一个 `nvim --embed`（加载你的完整 `~/.config/nvim`），用 `ext_linegrid`
-把 buffer 画在输入条里；按键原样转发给 Neovim，模式、补全、撤销都由 Neovim 自己决定。
-一个 client 只跑一个 nvim，聚焦哪个 pane 就用它写哪个 session 的 prompt。
+TUI 默认拉起一个 `nvim --embed`（加载你的完整 `~/.config/nvim`），用 `ext_linegrid` +
+`ext_multigrid` 把 buffer 画在输入条里；按键原样转发给 Neovim，模式、补全、撤销都由 Neovim
+自己决定。一个 client 只跑一个 nvim，聚焦哪个 pane 就用它写哪个 session 的 prompt。
+
+多 grid 模式下每个窗口（含浮窗、消息区）都是独立 grid，host 按 `compindex` 把浮窗
+叠加到输入条上，所以 cmp / noice 等浮窗不再被输入条边界裁剪；光标跟随实际所在的 grid。
 
 - `Enter` 提交（nvim buffer-local mapping，带 `pumvisible()` / cmp / blink 守卫）
 - `Ctrl-J`（或 `Shift-Enter`）换行：host 直接让 nvim 插入字面换行，绕过补全插件对
@@ -207,8 +210,8 @@ minimal = false      # true 时用 `nvim -u NONE`，跳过用户配置
 ratatui 原生输入框并在状态栏提示。
 
 完整配置下会做输入条“消毒”：关闭行号/符号列/诊断/`list`，并停用
-smear-cursor（动画会留下残影）。cmp 等补全浮窗仍可能被输入条边界裁剪——这是单 grid
-模式的已知限制，需要干净输入条时用 `minimal = true`。
+smear-cursor（动画会留下残影）。浮窗现在作为独立 grid 叠加渲染，不再被输入条边界裁剪；
+需要干净输入条时仍可用 `minimal = true`。
 
 ### 工具与审批
 
@@ -449,7 +452,10 @@ spike 内：
 | `--embed` + msgpack RPC 链路 | 通。`nvim_get_api_info` → channel id → `nvim_set_var` |
 | `ext_linegrid` 自绘 | 通。`ui_attach` 后立刻收到 `redraw`，`flush` 计数正常 |
 | redraw 批次形状 | **不是**文档里的 `[[ev, ...]]`，而是 batch 直接展开成 params：`args[i]` 是 `[name, param_tuple, ...]`，同名连续事件会打包进同一个元素 —— 两种形状都要能解析 |
-| `grid_*` 坐标 | 每个事件第一个参数是 grid handle（即使不开 `ext_multigrid`），常量 1 |
+| `grid_*` 坐标 | 每个事件第一个参数是 grid handle（不开 `ext_multigrid` 时恒为 1） |
+| `ext_multigrid` | 通。窗口/浮窗/消息区各占一个 grid；`win_pos` 给出窗口 grid，`win_float_pos` 给出浮窗位置与 `compindex` |
+| handle 编码 | `win_pos` 的 `win` 是 msgpack **ext type 1**（payload 再编码成整数），`Value::as_u64` 取不到，需要自己拆 |
+| 浮窗坐标是浮点 | nvim 0.12 的 `win_float_pos` 里 `anchor_row/col`、`screen_row/col` 是 f64，整数解析会拿到 `None` |
 | 宽字符 | 通。`grid_line` 用「宽字符 + 空串」两个 cell 表示，空串格不能再写空格，否则会打掉半个字 |
 | 中文 / emoji / 全角 | 通。`🌍` 占 2 格，`世界` 各占 2 格，对齐正确 |
 | `<CR>` 守卫 | 通。走的是真 Neovim 的 mapping，`nvim_input` 打进去的 `<CR>` 会命中它并 `rpcnotify` 回 host |
@@ -458,7 +464,7 @@ spike 内：
 ### 完整配置的两个坑
 
 1. **插件自动命令会覆盖输入框外观**。本机配置里有 `InsertEnter` → `vim.wo.number = true`（"smart line number"），会把行号重新画进输入框。prompt profile 现在自己注册一个 buffer-local 的 `InsertEnter/InsertLeave/TextChanged` autocmd 重新消毒，因为后注册的先跑。
-2. **动画类浮动窗口会在单 grid 上留残影**。`smear-cursor.nvim` 的 1x1 浮动窗口在光标被程序化移动后（probe / 切 pane）会残留几个块字符（`▗▖▝▘`）。这正是 DESIGN 里预判的「插件 UI 干扰」。
+2. **动画类浮动窗口会持续重绘**。`smear-cursor.nvim` 的 1x1 浮窗在光标被程序化移动后会不断刷帧；多 grid 下不再留残影，但仍会抢输入条的刷新。这正是 DESIGN 里预判的「插件 UI 干扰」。
    缓解：启动时带 `g:eix_prompt = 1`，让配置自行关闭这类效果；用户在 init.lua 里写
    ```lua
    if vim.g.eix_prompt then require("smear_cursor").enabled = false end
@@ -502,4 +508,4 @@ spike 内：
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
 - [x] 按 session 权限级别（`read-only` / `workspace-write` / `full`；`session.permission` 支持临时升级并记录事件）
 - [x] nvim 配色 → TUI 主题桥接（启动与 `ColorScheme` 时读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete`，映射转录区/审批 diff 颜色）
-- [ ] `ext_multigrid` 多窗口渲染
+- [x] `ext_multigrid` 多窗口渲染（浮窗/消息区独立 grid，按 `compindex` 叠加）

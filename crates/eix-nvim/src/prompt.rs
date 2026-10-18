@@ -112,10 +112,10 @@ vim.o.mouse = ""
 -- Suppress the "intro" splash for an empty unnamed buffer.
 vim.opt.shortmess:append("I")
 
--- Animation plugins repaint cells on a timer; in a single-grid embed those
--- frames can outlive the prompt's own redraws and erase glyphs (smear-cursor
--- is the common offender). Disable them for this instance, including the ones
--- lazily loaded on `VeryLazy`.
+-- Animation plugins repaint cells on a timer; those frames compete with the
+-- prompt's own redraws and make the input flicker (smear-cursor is the common
+-- offender). Disable them for this instance, including the ones lazily loaded
+-- on `VeryLazy`.
 local function calm_animations()
   pcall(function() require("smear_cursor").enabled = false end)
 end

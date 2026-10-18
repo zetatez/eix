@@ -128,7 +128,7 @@ idle ──submit──> running ──tool──> tool_running ──> running 
 
 - `nvim --embed --cmd 'let g:eix_prompt = 1'`：`--cmd` 在用户配置加载前执行，便于用户在 init.lua 中做条件分支。
 - host 通过 msgpack-rpc 连接；`nvim_get_api_info()` 拿到 channel id，写入 `g:eix_host_chan`。
-- `nvim_ui_attach(cols, rows, {ext_linegrid=true, rgb=true, ext_multigrid=false, ext_popupmenu=false, ext_cmdline=false, ext_messages=false})`。
+- `nvim_ui_attach(cols, rows, {ext_linegrid=true, rgb=true, ext_multigrid=true, ext_popupmenu=false, ext_cmdline=false, ext_messages=false})`。
 - 让 nvim 自己把 cmdline / popupmenu / 消息画进 grid，host 不实现这些组件，减少一半渲染工作量。
 - host 自己占终端最后一行画 eix 状态栏，因此 attach 给 nvim 的高度是 `rows - 1`。
 - 启动兜底（已实现超时回退）：client 启动时拉起 nvim，完整配置超过 5s 未就绪就杀掉子进程、回退 `-u NONE` + 内置 prompt profile，并在状态栏提示用户。完全异步预热（不阻塞 TUI 首帧）仍 planned。
@@ -162,7 +162,10 @@ end
 - `grid_line` 的 cell 是 `[text, hl_id?, repeat?]`；`text == ""` 表示宽字符的右半格，**该格不能写空格**，否则会打掉半个字；但非宽字符来源的空 cell 必须显式清空，否则 diff 渲染会留下残影。
 - 光标形状来自 `mode_info_set` + `mode_change`（block / vertical / horizontal），支持闪烁（planned；spike 只画位置）。
 - 输入条高度：聚焦时 `clamp(line_count, 3, 10)`、失焦时 1 行，布局变化时 `nvim_ui_try_resize`（已实现）。
-  - 已知限制：单 grid 模式下，cmp/noice 等**浮动窗口会被输入条边界裁剪**，动画类浮窗（smear-cursor）还会留残影。v1 用"聚焦时给足高度 + `g:eix_prompt` 逃生"缓解；后续用 `ext_multigrid` 把浮窗作为独立 grid 叠加渲染。
+- **多 grid 合成**（已实现）：`ext_multigrid=true` 后每个窗口、浮窗、消息区都是独立 grid。host 维护 `grid handle → Grid`，用 `win_pos` 记录普通窗口位置，用 `win_float_pos` 的 `compindex` / `screen_row` / `screen_col` 叠加浮窗，消息区按 `msg_set_pos` 叠加；光标跟随 `grid_cursor_goto` 所在 grid 映射到输入条坐标。
+  - 实测：`win_pos` 的 `win` 是 msgpack ext type 1（payload 是再次编码的整数），不能直接 `as_u64`；nvim 0.12 的浮窗坐标是 f64。
+  - 浮窗 cell 直接覆盖底层（与单 grid 时 Neovim 自己合成结果一致）；宽字符的右半格（空字符串 cell）必须原样搬运，否则会用空格打掉半个字。
+  - 动画类浮窗（smear-cursor）仍建议用 `g:eix_prompt` 关闭；`--minimal` 始终是干净回退。
 - **主题桥接**（已实现）：启动及 `ColorScheme` 变化时，用 `nvim_get_hl` 读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete`，映射转录区与审批 diff 的颜色；未取到（`--minimal` / 旧版 nvim）时回退到原来的固定配色。`Pmenu/Visual` 暂未接入主机浮层。
 
 ### 5.3.1 自检（`--probe`）
@@ -488,14 +491,14 @@ TCP 端点不会自动拉起本地 daemon。
 > 转录、滚动与流式跟随；`o` 在新 pane 打开，`p`/`Ctrl-G` 切换聚焦 pane 的 session，
 > `C-w h/j/k/l/w` 切焦点、`C-w v/s` 分屏、`C-w c` 关闭；同一 session 只出现一次，
 > picker 选中已打开 session 会聚焦既有 pane。输入框默认是嵌入的 Neovim：复用
-> `eix-nvim` 的 linegrid 渲染器与 prompt profile，`NvimInput` 把按键/粘贴/resize 排到
+> `eix-nvim` 的 multigrid 渲染器与 prompt profile，`NvimInput` 把按键/粘贴/resize 排到
 > 一个持有 RPC 的 worker（TUI 本身保持同步），`<CR>` 由 nvim 的 buffer-local mapping
 > 提交，`<C-j>`/`Shift-Enter` 由 host 让 nvim 插入字面换行以绕过补全插件的抢占；
 > 聚焦高度 `clamp(line_count, 3, 10)`、失焦 1 行，提交失败会把 draft 放回 buffer。
 > `[input] backend = auto|nvim|native`（env `EIX_INPUT_BACKEND`）可强制 native 或
 > 要求 nvim；`minimal = true`（env `EIX_INPUT_MINIMAL`）用 `-u NONE`，找不到 nvim 时
 > auto 自动回退 ratatui 原生输入框。prompt profile 会停用 smear-cursor 等动画并消毒
-> 窗口选项；cmp 等浮动窗口仍可能被输入条裁剪（单 grid 限制）。
+> 窗口选项；cmp 等浮窗作为独立 grid 叠加到输入条上，不再被边界裁剪。
 > 后台 pane 的 attention 已接入：daemon 在进入 `awaiting_approval` / `error` 时发送
 > `session.attention`，TUI 标记边框/侧栏并支持 `a` 跳到下一个；重新 attach 会从事件日志
 > 恢复未完成的审批卡片。外部通知也已接入：`[notifications] command` 由 daemon 在 attention

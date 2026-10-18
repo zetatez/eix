@@ -1,5 +1,6 @@
-//! `eix-nvim` spike: embed a real Neovim, render it with `ext_linegrid`, and
-//! prove out the input-box contract described in `DESIGN.md`.
+//! `eix-nvim` spike: embed a real Neovim, render it with `ext_linegrid` +
+//! `ext_multigrid`, and prove out the input-box contract described in
+//! `DESIGN.md`.
 //!
 //! Two modes:
 //!
@@ -22,7 +23,7 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use eix_nvim::embedded::{Nvim, NvimHandler, Shared};
-use eix_nvim::{grid, keys, prompt};
+use eix_nvim::{keys, prompt};
 use nvim_rs::create::tokio as create_nvim;
 use nvim_rs::{UiAttachOptions, Value};
 use ratatui::backend::CrosstermBackend;
@@ -69,7 +70,7 @@ impl Args {
 fn print_help() {
     println!(
         "\
-eix-nvim — embedded Neovim + ext_linegrid spike
+eix-nvim — embedded Neovim + ext_linegrid/ext_multigrid spike
 
 USAGE:
     eix-nvim [OPTIONS] [-- <nvim args>]
@@ -113,6 +114,7 @@ async fn main() -> Result<()> {
     let mut opts = UiAttachOptions::new();
     opts.set_rgb(true);
     opts.set_linegrid_external(true);
+    opts.set_multigrid_external(true);
     nvim.ui_attach(cols as i64, nvim_height as i64, &opts)
         .await
         .map_err(|e| anyhow!("nvim_ui_attach failed: {e}"))?;
@@ -159,8 +161,8 @@ fn resolve_size(args: &Args) -> Result<(u16, u16)> {
 fn build_command(args: &Args) -> Command {
     let mut cmd = Command::new("nvim");
     cmd.arg("--embed");
-    // Let user configs detect the prompt profile and opt out of things that
-    // don't survive a single-grid render (cursor smear, animations, ...).
+    // Let user configs detect the prompt profile and opt out of animations
+    // that repaint the prompt on a timer (cursor smear, ...).
     cmd.arg("--cmd").arg("let g:eix_prompt = 1");
     // An embedded child has no real tty; give it a sane TERM so plugins that
     // inspect it don't bail out.
@@ -215,6 +217,27 @@ vim.api.nvim_win_set_cursor(0, { 3, 4 })
 vim.cmd("redraw")
 "#;
 
+/// Open a small float over the prompt so the probe exercises the multigrid
+/// overlay path (non-focusable, so the round-trip below still targets the
+/// prompt buffer).
+const PROBE_FLOAT_LUA: &str = r#"
+if _G.eix_probe_float then vim.api.nvim_win_close(_G.eix_probe_float, true) end
+local buf = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "eix float" })
+_G.eix_probe_float = vim.api.nvim_open_win(buf, false, {
+  relative = "editor", row = 1, col = 2, width = 12, height = 1,
+  style = "minimal", border = "single",
+})
+vim.cmd("redraw")
+"#;
+
+const PROBE_CLOSE_FLOAT_LUA: &str = r#"
+if _G.eix_probe_float then
+  vim.api.nvim_win_close(_G.eix_probe_float, true)
+  _G.eix_probe_float = nil
+end
+"#;
+
 const FLOATS_LUA: &str = r#"
 local out = {}
 for _, w in ipairs(vim.api.nvim_list_wins()) do
@@ -240,6 +263,10 @@ async fn run_probe(nvim: &Nvim, shared: &Arc<Mutex<Shared>>) -> Result<()> {
     run_lua(nvim, PROBE_SAMPLE_LUA).await?;
     let base = shared.lock().map(|s| s.frames).unwrap_or(0);
     wait_frames(shared, base + 2, Duration::from_secs(5)).await?;
+    // Overlay a float to exercise multigrid composition.
+    run_lua(nvim, PROBE_FLOAT_LUA).await?;
+    let with_float = shared.lock().map(|s| s.frames).unwrap_or(0);
+    let _ = wait_frames(shared, with_float + 1, Duration::from_secs(2)).await;
     // Let plugin animations (e.g. smear-cursor floats) finish, then force a
     // full repaint so every cell reflects the settled state.
     tokio::time::sleep(Duration::from_millis(400)).await;
@@ -250,20 +277,23 @@ async fn run_probe(nvim: &Nvim, shared: &Arc<Mutex<Shared>>) -> Result<()> {
     if std::env::var_os("EIX_DEBUG").is_some() {
         let floats = run_lua(nvim, FLOATS_LUA).await?;
         println!("floating windows:\n{}", floats.as_str().unwrap_or("<none>"));
+        if let Ok(s) = shared.lock() {
+            println!("screen state: {}", s.screen.debug_state());
+        }
     }
 
     let (width, height, mode, title, frame, cursor, lines) = {
         let s = shared.lock().map_err(|_| anyhow!("shared lock poisoned"))?;
-        let lines: Vec<String> = (0..s.grid.height)
-            .map(|row| s.grid.line(row as usize).trim_end().to_string())
+        let lines: Vec<String> = (0..s.screen.view.height)
+            .map(|row| s.screen.line(row as usize).trim_end().to_string())
             .collect();
         (
-            s.grid.width,
-            s.grid.height,
-            s.grid.mode.clone(),
-            s.grid.title.clone(),
-            s.grid.frame,
-            (s.grid.cursor_row, s.grid.cursor_col),
+            s.screen.view.width,
+            s.screen.view.height,
+            s.screen.mode.clone(),
+            s.screen.title.clone(),
+            s.screen.frame,
+            (s.screen.view.cursor_row, s.screen.view.cursor_col),
             lines,
         )
     };
@@ -279,6 +309,9 @@ async fn run_probe(nvim: &Nvim, shared: &Arc<Mutex<Shared>>) -> Result<()> {
     for (i, line) in lines.iter().enumerate() {
         println!("  {i:>2}|{line}");
     }
+    // Drop the probe float before typing so the round-trip only involves the
+    // prompt window.
+    run_lua(nvim, PROBE_CLOSE_FLOAT_LUA).await?;
     // Exercise the real submit path: type via `nvim_input` (exactly what the TUI
     // does), then let the buffer-local mapping notify us.
     let before = shared.lock().map(|s| s.submitted.len()).unwrap_or(0);
@@ -401,7 +434,7 @@ async fn run_tui(nvim: Nvim, shared: Arc<Mutex<Shared>>, cols: u16, rows: u16) -
                     break Ok(());
                 }
                 if let Ok(mut s) = shared.lock() {
-                    s.grid.resize(w, nh);
+                    s.screen.resize(w, nh);
                 }
             }
             _ => {}
@@ -467,12 +500,12 @@ fn draw(frame: &mut ratatui::Frame, shared: &Arc<Mutex<Shared>>) {
         Err(_) => return,
     };
 
-    grid::draw_in(frame, &s.grid, grid_area);
+    s.screen.draw(frame, grid_area, true);
 
-    let mode = if s.grid.mode.is_empty() {
+    let mode = if s.screen.mode.is_empty() {
         "--"
     } else {
-        s.grid.mode.as_str()
+        s.screen.mode.as_str()
     };
     let last = s
         .submitted
@@ -489,8 +522,4 @@ fn draw(frame: &mut ratatui::Frame, shared: &Arc<Mutex<Shared>>) {
         Paragraph::new(bar).style(Style::default().fg(Color::Black).bg(Color::Gray)),
         bar_area,
     );
-    frame.set_cursor_position((
-        bar_area.x + s.grid.cursor_col.min(grid_area.width.saturating_sub(1)),
-        s.grid.cursor_row.min(grid_area.height.saturating_sub(1)),
-    ));
 }

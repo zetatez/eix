@@ -1,7 +1,7 @@
 //! Host-side wrapper around an embedded `nvim --embed` prompt.
 //!
 //! The TUI is synchronous, so keys and resizes are queued to a worker task that
-//! owns the RPC connection. The `redraw` handler fills a [`Grid`] and pushes
+//! owns the RPC connection. The `redraw` handler fills a [`Screen`] and pushes
 //! submitted drafts, both behind a mutex the UI can read without awaiting.
 
 use std::sync::{Arc, Mutex};
@@ -19,7 +19,7 @@ use tokio::process::{Child, ChildStdin, Command};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinHandle;
 
-use crate::grid::{self, Grid};
+use crate::grid::{self, Screen};
 use crate::keys;
 use crate::prompt;
 
@@ -48,10 +48,10 @@ impl Theme {
 
 /// State written by the RPC handler and read by the UI.
 pub struct Shared {
-    pub grid: Grid,
+    pub screen: Screen,
     /// Drafts submitted with `<CR>`, oldest first.
     pub submitted: Vec<String>,
-    /// Frames observed by the host (mirrors `grid.frame`).
+    /// Frames observed by the host (mirrors `screen.frame`).
     pub frames: u64,
     /// Number of lines in the prompt buffer, refreshed after every command.
     pub lines: u16,
@@ -64,7 +64,7 @@ pub struct Shared {
 impl Shared {
     pub fn new(width: u16, height: u16) -> Self {
         Self {
-            grid: Grid::new(width, height),
+            screen: Screen::new(width, height),
             submitted: Vec::new(),
             frames: 0,
             lines: 1,
@@ -89,8 +89,8 @@ impl Handler for NvimHandler {
                 // Neovim packs the redraw events directly into the notification
                 // params: `redraw(event, event, ...)`.
                 if let Ok(mut shared) = self.shared.lock() {
-                    shared.grid.apply(&args);
-                    shared.frames = shared.grid.frame;
+                    shared.screen.apply(&args);
+                    shared.frames = shared.screen.frame;
                 }
             }
             "eix_submit" => {
@@ -202,8 +202,12 @@ pub struct NvimInput {
 }
 
 impl NvimInput {
-    /// Spawn `nvim --embed`, attach `ext_linegrid`, and install the prompt
-    /// profile. `minimal` starts Neovim with `-u NONE`.
+    /// Spawn `nvim --embed`, attach `ext_linegrid` + `ext_multigrid`, and
+    /// install the prompt profile. `minimal` starts Neovim with `-u NONE`.
+    ///
+    /// Multi-grid mode gives every window its own grid, so floating windows
+    /// (completion menus, notifications, ...) are composed over the prompt
+    /// instead of being clipped by its boundary.
     ///
     /// With a full config, startup is bounded by five seconds; a hang or an
     /// early exit falls back to `-u NONE` so the user still gets a prompt. The
@@ -245,7 +249,7 @@ impl NvimInput {
         let mut cmd = Command::new("nvim");
         cmd.arg("--embed");
         // Let user configs detect the prompt profile and opt out of animations
-        // that don't survive a single-grid render (cursor smear, ...).
+        // that repaint the prompt on a timer (cursor smear, ...).
         cmd.arg("--cmd").arg("let g:eix_prompt = 1");
         // An embedded child has no real tty; give it a sane TERM.
         cmd.env("TERM", "xterm-256color");
@@ -267,6 +271,7 @@ impl NvimInput {
         let mut opts = UiAttachOptions::new();
         opts.set_rgb(true);
         opts.set_linegrid_external(true);
+        opts.set_multigrid_external(true);
         nvim.ui_attach(width as i64, height as i64, &opts)
             .await
             .map_err(|e| anyhow!("nvim_ui_attach failed: {e}"))?;
@@ -279,6 +284,13 @@ impl NvimInput {
         if let Ok(value) = run_lua(&nvim, THEME_LUA).await {
             if let Ok(mut shared) = shared.lock() {
                 shared.theme = parse_theme(&value);
+            }
+        }
+        // Pin the prompt window so splits (from the user's config) don't make
+        // the renderer pick the wrong grid as the base layer.
+        if let Ok(value) = run_lua(&nvim, "return vim.api.nvim_get_current_win()").await {
+            if let (Some(win), Ok(mut shared)) = (grid::handle_value(&value), shared.lock()) {
+                shared.screen.set_prompt_win(win);
             }
         }
 
@@ -358,7 +370,7 @@ impl NvimInput {
     pub fn mode(&self) -> String {
         self.shared
             .lock()
-            .map(|shared| shared.grid.mode.clone())
+            .map(|shared| shared.screen.mode.clone())
             .unwrap_or_default()
     }
 
@@ -375,7 +387,7 @@ impl NvimInput {
     pub fn line(&self, row: usize) -> String {
         self.shared
             .lock()
-            .map(|shared| shared.grid.line(row))
+            .map(|shared| shared.screen.line(row))
             .unwrap_or_default()
     }
 
@@ -390,6 +402,14 @@ impl NvimInput {
             .lock()
             .map(|shared| shared.fallback)
             .unwrap_or(false)
+    }
+
+    /// Grid topology (debug aid for `EIX_DEBUG=1`).
+    pub fn debug_state(&self) -> String {
+        self.shared
+            .lock()
+            .map(|shared| shared.screen.debug_state())
+            .unwrap_or_default()
     }
 
     /// Highlight colors last reported by Neovim (default when unknown).
@@ -409,7 +429,7 @@ impl NvimInput {
     /// Render the last received frame into `area`.
     pub fn draw(&self, frame: &mut ratatui::Frame, area: Rect, show_cursor: bool) {
         if let Ok(shared) = self.shared.lock() {
-            grid::draw_in_with_cursor(frame, &shared.grid, area, show_cursor);
+            shared.screen.draw(frame, area, show_cursor);
         }
     }
 }
@@ -642,6 +662,75 @@ mod tests {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "line count not updated"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn composes_floating_windows_over_the_prompt() {
+        if !nvim_available() {
+            return;
+        }
+        let nvim = NvimInput::spawn(40, 5, true).await.expect("spawn nvim");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        nvim.set_text("under\nsecond");
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while nvim.line(0).trim_end() != "under" {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "prompt grid did not converge: {:?}",
+                nvim.line(0)
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // Open a non-focusable float over the first row of the prompt.
+        nvim.raw_input(
+            "<Esc>:lua local b=vim.api.nvim_create_buf(false,true); \
+             vim.api.nvim_buf_set_lines(b,0,-1,false,{'float!'}); \
+             vim.api.nvim_open_win(b,false,{relative='editor',row=0,col=1,\
+             width=7,height=1,style='minimal'})<CR>",
+        );
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let first = nvim.line(0);
+            let second = nvim.line(1);
+            if first.contains("float!") && second.trim_end() == "second" {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "float was not composed: row0={first:?} row1={second:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn renders_the_command_line_overlay() {
+        if !nvim_available() {
+            return;
+        }
+        let nvim = NvimInput::spawn(40, 6, true).await.expect("spawn nvim");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        // `cmdheight=0` makes Neovim render the command line in the message
+        // grid at the bottom of the UI, not in the prompt window grid.
+        nvim.raw_input("<Esc>:");
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let rows: Vec<String> = (0..6).map(|row| nvim.line(row)).collect();
+            if rows.iter().any(|row| row.contains(':')) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "command line was not composed: rows={rows:?} state={}",
+                nvim.debug_state()
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
