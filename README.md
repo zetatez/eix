@@ -236,7 +236,7 @@ spike 内：
 - [x] nvim linegrid spike（RPC + 自绘 + 宽字符 + 提交往返 + 完整配置）
 - [x] daemon + OpenAI 兼容 provider（流式 SSE、取消、错误处理）
 - [x] session 事件日志 + SQLite 持久化 + attach 协议（事件流广播）
-- [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve / deny / doctor）
+- [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve[--hunks] / deny / doctor）
 - [x] TUI v1（多 pane 自动平铺、焦点切换、转录、session 栏、fuzzy picker、多行输入、流式跟随）
 - [x] 工具调用 + 审批门禁（read_file / list_dir / write_file / run_command、workspace 沙箱、审批卡片）
 - [x] 写入前 unified diff 预览（TUI 卡片、`d` 全屏审阅、`eix chat` / `eix log`）
@@ -245,5 +245,9 @@ spike 内：
 - [x] attention 标记（后台 pane 高亮、`a` 跳转、审批卡片重放）
 - [x] 外部 attention 通知（`[notifications]` command + TUI 终端铃、冷却、重放）
 - [ ] 嵌入 nvim 输入
-- [ ] staging / shadow workspace、bubblewrap 沙箱、context ledger、process view
-- [ ] daemon 化的 nvim 前端（JSON-RPC over Unix socket）
+- [x] bubblewrap 沙箱（`run_command` 默认隔离，`[tools] sandbox` 可配，写入只限 workspace）
+- [ ] staged shadow workspace（propose → stage → apply、`patch.apply` / `patch.reject`）
+- [ ] 执行前快照（rewind / 回滚的基础）
+- [ ] context ledger、process view
+- [ ] rewind / fork、全文搜索、worktree、子 agent
+- [ ] daemon 化的 nvim 前端（JSON-RPC over Unix socket）、远程 attach（TCP + token）
