@@ -76,19 +76,74 @@ pub fn definitions() -> Vec<ToolDefinition> {
                 "required": ["command"]
             }),
         ),
+        ToolDefinition::function(
+            "start_command",
+            "Start a long-running command (dev server, watch task) in the background. Returns a process id immediately; output is captured in a log. Requires approval.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "command": {"type": "string"},
+                    "cwd": {"type": "string", "description": "Optional directory relative to the workspace."}
+                },
+                "required": ["command"]
+            }),
+        ),
+        ToolDefinition::function(
+            "process_output",
+            "Read the recent output of a background process started with start_command. Read-only.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "process_id": {"type": "string", "description": "Process id. Defaults to the newest process in this session."},
+                    "max_bytes": {"type": "integer", "description": "How many trailing bytes to return (default 8000)."}
+                }
+            }),
+        ),
+        ToolDefinition::function(
+            "spawn_agent",
+            "Start a read-only sub-agent on a focused question and return its final answer. Sub-agents share this workspace, cannot mutate files, and cannot spawn further agents. Use it to explore several independent questions at once.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "The task for the sub-agent."},
+                    "name": {"type": "string", "description": "Optional short label, e.g. `docs`."}
+                },
+                "required": ["prompt"]
+            }),
+        ),
     ]
+}
+
+/// Tools a sub-agent may use. No mutating tools and no nested agents, so a
+/// child can never widen the parent's permissions or change the workspace.
+pub fn readonly_definitions() -> Vec<ToolDefinition> {
+    definitions()
+        .into_iter()
+        .filter(|tool| {
+            matches!(
+                tool.function.name.as_str(),
+                "read_file" | "list_dir" | "process_output"
+            )
+        })
+        .collect()
 }
 
 pub fn is_known(tool: &str) -> bool {
     matches!(
         tool,
-        "read_file" | "list_dir" | "write_file" | "run_command"
+        "read_file"
+            | "list_dir"
+            | "write_file"
+            | "run_command"
+            | "start_command"
+            | "process_output"
+            | "spawn_agent"
     )
 }
 
 /// Mutating tools need an approval decision under the default `ask` policy.
 pub fn requires_approval(tool: &str) -> bool {
-    matches!(tool, "write_file" | "run_command")
+    matches!(tool, "write_file" | "run_command" | "start_command")
 }
 
 /// One-line description shown in the approval card / notification.
@@ -110,6 +165,18 @@ pub fn summarize(tool: &str, args: &Value) -> String {
         "run_command" => {
             let command = string_arg(args, "command");
             format!("run_command: {}", truncate(&command, 120))
+        }
+        "start_command" => {
+            let command = string_arg(args, "command");
+            format!("start_command: {}", truncate(&command, 120))
+        }
+        "process_output" => match optional_string(args, "process_id") {
+            Some(id) => format!("process_output {}", truncate(id, 12)),
+            None => "process_output latest".to_string(),
+        },
+        "spawn_agent" => {
+            let name = optional_string(args, "name").unwrap_or("agent");
+            format!("spawn_agent {name}")
         }
         other => other.to_string(),
     }
@@ -409,6 +476,9 @@ pub async fn execute(tool: &str, args: &Value, cwd: &Path, config: &Config) -> T
         "list_dir" => list_dir(args, cwd, config).await,
         "write_file" => write_file(args, cwd, config).await,
         "run_command" => run_command(args, cwd, config).await,
+        "start_command" | "process_output" => {
+            Err(anyhow::anyhow!("{tool} is handled by the daemon"))
+        }
         other => Err(anyhow::anyhow!("unknown tool {other:?}")),
     };
     match result {
@@ -483,11 +553,34 @@ async fn write_file(args: &Value, cwd: &Path, _config: &Config) -> Result<String
     ))
 }
 
-async fn run_command(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let command = required_string(args, "command")?;
-    let command_cwd = match optional_string(args, "cwd") {
-        Some(raw) => resolve_path(cwd, raw)?,
-        None => cwd.to_path_buf(),
+/// A resolved shell invocation: sandbox wrapper, command, and working
+/// directory. Shared by `run_command` (synchronous) and `start_command`
+/// (background) so both go through the same sandbox decision.
+#[derive(Debug, Clone)]
+pub struct CommandPlan {
+    pub program: std::ffi::OsString,
+    pub args: Vec<std::ffi::OsString>,
+    pub cwd: PathBuf,
+}
+
+impl CommandPlan {
+    pub fn command(&self) -> tokio::process::Command {
+        let mut cmd = tokio::process::Command::new(&self.program);
+        cmd.args(&self.args).current_dir(&self.cwd);
+        cmd
+    }
+}
+
+/// Resolve a shell command into a concrete (possibly sandboxed) invocation.
+pub fn command_plan(
+    command: &str,
+    cwd_arg: Option<&str>,
+    session_cwd: &Path,
+    config: &Config,
+) -> Result<CommandPlan> {
+    let command_cwd = match cwd_arg {
+        Some(raw) => resolve_path(session_cwd, raw)?,
+        None => session_cwd.to_path_buf(),
     };
     let command_cwd = command_cwd.canonicalize().unwrap_or(command_cwd);
     let sandboxed = match config.tools.sandbox {
@@ -501,29 +594,43 @@ async fn run_command(args: &Value, cwd: &Path, config: &Config) -> Result<String
         SandboxMode::Auto => sandbox::bwrap_available(),
     };
 
-    let mut cmd = if sandboxed {
-        let workspace = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    if sandboxed {
+        let workspace = session_cwd
+            .canonicalize()
+            .unwrap_or_else(|_| session_cwd.to_path_buf());
         let home = if config.tools.sandbox_read_home {
             sandbox::home_dir()
         } else {
             None
         };
-        let mut cmd = tokio::process::Command::new("bwrap");
-        cmd.args(sandbox::bwrap_args(
+        args.extend(sandbox::bwrap_args(
             &workspace,
             &command_cwd,
             config.tools.sandbox_network,
             home.as_deref(),
         ));
-        cmd.arg("sh");
-        cmd
-    } else {
-        tokio::process::Command::new("sh")
-    };
-    let child = cmd
-        .arg("-c")
-        .arg(command)
-        .current_dir(&command_cwd)
+        args.push("sh".into());
+    }
+    args.push("-c".into());
+    args.push(command.into());
+    Ok(CommandPlan {
+        program: if sandboxed {
+            "bwrap".into()
+        } else {
+            "sh".into()
+        },
+        args,
+        cwd: command_cwd,
+    })
+}
+
+async fn run_command(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
+    let command = required_string(args, "command")?;
+    let plan = command_plan(command, optional_string(args, "cwd"), cwd, config)?;
+    let command_cwd = plan.cwd.clone();
+    let child = plan
+        .command()
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())

@@ -21,8 +21,13 @@ pub enum EventKind {
     ApprovalRequired,
     /// Pre-execution snapshot of what a mutating tool is about to touch.
     Snapshot,
+    /// A background process started / finished. Output is not an event.
+    ProcessStarted,
+    ProcessExited,
     StatusChanged,
     ContextCompacted,
+    ContextPinned,
+    ContextDropped,
     Error,
 }
 
@@ -39,8 +44,12 @@ impl EventKind {
             Self::PatchConflict => "patch_conflict",
             Self::ApprovalRequired => "approval_required",
             Self::Snapshot => "snapshot",
+            Self::ProcessStarted => "process_started",
+            Self::ProcessExited => "process_exited",
             Self::StatusChanged => "status_changed",
             Self::ContextCompacted => "context_compacted",
+            Self::ContextPinned => "context_pinned",
+            Self::ContextDropped => "context_dropped",
             Self::Error => "error",
         }
     }
@@ -66,8 +75,12 @@ impl std::str::FromStr for EventKind {
             "patch_conflict" => Self::PatchConflict,
             "approval_required" => Self::ApprovalRequired,
             "snapshot" => Self::Snapshot,
+            "process_started" => Self::ProcessStarted,
+            "process_exited" => Self::ProcessExited,
             "status_changed" => Self::StatusChanged,
             "context_compacted" => Self::ContextCompacted,
+            "context_pinned" => Self::ContextPinned,
+            "context_dropped" => Self::ContextDropped,
             "error" => Self::Error,
             _ => return Err(()),
         })
@@ -231,6 +244,56 @@ pub struct StatusChangedPayload {
     pub to: SessionStatus,
 }
 
+/// Pin (or unpin) one ledger entry so trimming never drops it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPinPayload {
+    pub entry: String,
+    pub pinned: bool,
+}
+
+/// Drop one ledger entry from the provider context (or restore it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextDropPayload {
+    pub entry: String,
+    #[serde(default = "default_true")]
+    pub dropped: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A range of history was replaced with a summary. The original events remain
+/// in the log; this only affects what is sent to the provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCompactedPayload {
+    pub from_seq: u64,
+    pub to_seq: u64,
+    pub messages: usize,
+    pub tokens: usize,
+    pub summary: String,
+}
+
+/// A background process was started by `start_command`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessStartedPayload {
+    pub process_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub pid: u32,
+}
+
+/// A background process ended (on its own or because it was killed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessExitedPayload {
+    pub process_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorPayload {
     pub message: String,
@@ -258,8 +321,12 @@ mod tests {
             EventKind::PatchConflict,
             EventKind::ApprovalRequired,
             EventKind::Snapshot,
+            EventKind::ProcessStarted,
+            EventKind::ProcessExited,
             EventKind::StatusChanged,
             EventKind::ContextCompacted,
+            EventKind::ContextPinned,
+            EventKind::ContextDropped,
             EventKind::Error,
         ];
         for kind in all {

@@ -33,6 +33,20 @@ pub struct Config {
     pub tools: ToolsConfig,
     pub notifications: NotificationsConfig,
     pub input: InputConfig,
+    pub context: ContextConfig,
+    pub server: ServerConfig,
+}
+
+/// Optional TCP listener for remote attach. Off by default: the Unix socket is
+/// protected by filesystem permissions, a TCP port is not.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ServerConfig {
+    /// Address to listen on, e.g. `127.0.0.1:7420`. Empty disables TCP.
+    pub tcp: Option<String>,
+    /// Shared secret every TCP client must present (`auth` request). Required
+    /// whenever `tcp` is set.
+    pub token: Option<String>,
 }
 
 /// Which widget renders the prompt at the bottom of the TUI.
@@ -180,6 +194,31 @@ impl Default for ToolsConfig {
     }
 }
 
+/// How the daemon assembles the provider context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContextConfig {
+    /// Soft ceiling for one request, used to trim old tool output and history.
+    pub budget_tokens: usize,
+    /// Workspace-relative files folded into the `instructions` sector. A
+    /// missing file is skipped. `AGENTS.md` is read from the eix config
+    /// directory as well, when present.
+    pub instructions_files: Vec<String>,
+    /// Include a compact workspace summary (top-level entries, git branch and
+    /// status) in the request.
+    pub workspace_summary: bool,
+}
+
+impl Default for ContextConfig {
+    fn default() -> Self {
+        Self {
+            budget_tokens: 32_000,
+            instructions_files: vec!["AGENTS.md".to_string()],
+            workspace_summary: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
@@ -306,6 +345,18 @@ impl Config {
         if let Some(value) = env_var("EIX_INPUT_MINIMAL") {
             self.input.minimal = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
+        if let Some(value) = env_var("EIX_CONTEXT_BUDGET").and_then(|v| v.parse().ok()) {
+            self.context.budget_tokens = value;
+        }
+        if let Some(value) = env_var("EIX_CONTEXT_WORKSPACE") {
+            self.context.workspace_summary = matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        }
+        if let Some(value) = env_var("EIX_TCP") {
+            self.server.tcp = Some(value);
+        }
+        if let Some(value) = env_var("EIX_TCP_TOKEN") {
+            self.server.token = Some(value);
+        }
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -337,6 +388,30 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "tools.command_timeout_secs must be > 0".into(),
             ));
+        }
+        if self.context.budget_tokens == 0 {
+            return Err(ConfigError::Invalid(
+                "context.budget_tokens must be > 0".into(),
+            ));
+        }
+        if let Some(tcp) = self
+            .server
+            .tcp
+            .as_deref()
+            .map(str::trim)
+            .filter(|tcp| !tcp.is_empty())
+        {
+            if self
+                .server
+                .token
+                .as_deref()
+                .map(str::trim)
+                .is_none_or(str::is_empty)
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "server.tcp is {tcp:?} but server.token is empty; TCP requires a token"
+                )));
+            }
         }
         Ok(())
     }

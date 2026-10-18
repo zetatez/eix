@@ -5,7 +5,7 @@
 //! SQLite before they are broadcast, so a frontend can always recover by
 //! re-attaching and replaying the event log.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,22 +15,28 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use eix_core::{
     now_ms, payload, ApprovalDecision, ApprovalRequiredPayload, ApprovalRespondParams,
-    ApprovalResult, AttachResult, CancelResult, ChatMessage, Config, CreateSessionParams,
-    ErrorPayload, Event, EventKind, EventsParams, EventsResult, HelloResult, Notification,
+    ApprovalResult, AttachResult, AuthParams, CancelResult, ChatMessage, Config,
+    ContextCompactParams, ContextCompactedPayload, ContextDropParams, ContextDropPayload,
+    ContextLedgerParams, ContextPinParams, ContextPinPayload, CreateSessionParams, ErrorPayload,
+    Event, EventKind, EventsParams, EventsResult, ForkParams, HelloResult, Notification,
     PatchApplyParams, PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload,
-    RenameParams, Request, Response, ServerMessage, Session, SessionId, SessionList, SessionRef,
-    SessionResult, SessionStatus, SnapshotPayload, StatusChangedPayload, SubmitParams,
-    SubmitResult, ToolCall, ToolCallPayload, ToolPolicy, ToolResultPayload, UserMessagePayload,
-    PROTOCOL_VERSION,
+    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
+    RenameParams, Request, Response, RewindParams, RewindResult, SearchParams, SearchResult,
+    ServerMessage, Session, SessionId, SessionList, SessionOrigin, SessionRef, SessionResult,
+    SessionStatus, SnapshotPayload, StatusChangedPayload, SubmitParams, SubmitResult, ToolCall,
+    ToolCallPayload, ToolDefinition, ToolPolicy, ToolResultPayload, UserMessagePayload,
+    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, WriteHalf};
-use tokio::net::{UnixListener, UnixStream};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
+use crate::context::Ledger;
+use crate::process::ProcessRegistry;
 use crate::provider::{Provider, ProviderError};
 use crate::snapshot::{Scope, Snapshotter};
 use crate::staging::{StagedPatch, Staging};
@@ -49,6 +55,11 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     let (bus, _) = broadcast::channel(2048);
     let snapshots = Snapshotter::new(data_dir.join("snapshots"));
     let staging = Staging::new(data_dir.join("staging"));
+    let processes = Arc::new(ProcessRegistry::new(
+        Arc::clone(&store),
+        bus.clone(),
+        data_dir.clone(),
+    ));
     let daemon = Arc::new(Daemon {
         store,
         provider,
@@ -56,6 +67,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         bus,
         snapshots,
         staging,
+        processes,
         turns: Mutex::new(HashMap::new()),
         approvals: Mutex::new(HashMap::new()),
         notified: std::sync::Mutex::new(HashMap::new()),
@@ -80,6 +92,38 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     eprintln!("  api    {}", daemon.config.provider.base_url);
     eprintln!("  data   {}", db_path.display());
 
+    // Optional remote attach. Off unless configured, because a TCP port does
+    // not have the Unix socket's filesystem permissions; every connection must
+    // authenticate with `server.token` before any other request is answered.
+    let tcp_addr = daemon
+        .config
+        .server
+        .tcp
+        .as_deref()
+        .map(str::trim)
+        .filter(|addr| !addr.is_empty())
+        .map(str::to_string);
+    if let Some(addr) = tcp_addr {
+        let token = daemon.config.server.token.clone().unwrap_or_default();
+        let tcp = TcpListener::bind(&addr)
+            .await
+            .with_context(|| format!("cannot bind tcp {addr}"))?;
+        eprintln!("  tcp    {} (token required)", tcp.local_addr()?);
+        let daemon = Arc::clone(&daemon);
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = tcp.accept().await else {
+                    break;
+                };
+                let daemon = Arc::clone(&daemon);
+                let token = token.clone();
+                tokio::spawn(async move {
+                    daemon.serve(stream, Transport::Tcp, Some(token)).await;
+                });
+            }
+        });
+    }
+
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => break,
@@ -87,13 +131,15 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
                 let (stream, _) = accepted.context("accept failed")?;
                 let daemon = Arc::clone(&daemon);
                 tokio::spawn(async move {
-                    daemon.serve(stream).await;
+                    daemon.serve(stream, Transport::Unix, None).await;
                 });
             }
         }
     }
 
     let _ = fs::remove_file(&socket);
+    // Background processes are children of this daemon; take them with us.
+    daemon.processes.kill_all().await;
     Ok(())
 }
 
@@ -128,6 +174,8 @@ struct Daemon {
     snapshots: Snapshotter,
     /// Staged `write_file` proposals, the session shadow workspace.
     staging: Staging,
+    /// Background processes started with `start_command`.
+    processes: Arc<ProcessRegistry>,
     /// In-flight turns, used for busy checks and cancellation.
     turns: Mutex<HashMap<SessionId, Arc<AtomicBool>>>,
     /// Tool calls blocked on a user decision, keyed by session.
@@ -194,41 +242,33 @@ impl Daemon {
             }
         }
     }
+}
 
-    async fn serve(self: Arc<Self>, stream: UnixStream) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Transport {
+    Unix,
+    Tcp,
+}
+
+impl Daemon {
+    async fn serve<S>(self: Arc<Self>, stream: S, transport: Transport, token: Option<String>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (read, write) = tokio::io::split(stream);
         let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
         let writer = tokio::spawn(write_loop(write, rx));
 
-        let mut bus_rx = self.bus.subscribe();
-        let bus_tx = tx.clone();
-        // Phase 0 broadcasts every event to every connection; the 0600 socket
-        // is the security boundary. Per-connection session filtering belongs
-        // with remote attach, where the boundary is no longer the filesystem.
-        let bus_task = tokio::spawn(async move {
-            loop {
-                match bus_rx.recv().await {
-                    Ok(notification) => {
-                        if bus_tx
-                            .send(ServerMessage::Notification(notification))
-                            .is_err()
-                        {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
-                        let note =
-                            Notification::new("stream.lagged", json!({ "skipped": skipped }));
-                        if bus_tx.send(ServerMessage::Notification(note)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
+        // A Unix connection is trusted by its 0600 permissions, so events are
+        // broadcast to every client. A TCP connection starts with no events at
+        // all and only subscribes after a successful `auth`, so nothing leaks
+        // before the token is checked.
+        let mut bus_task =
+            (transport == Transport::Unix).then(|| spawn_bus(self.bus.clone(), tx.clone()));
 
         let mut lines = BufReader::new(read).lines();
+        // Unix sockets are already protected by filesystem permissions.
+        let mut authorized = transport == Transport::Unix;
         loop {
             let line = match lines.next_line().await {
                 Ok(Some(line)) => line,
@@ -249,13 +289,44 @@ impl Daemon {
                     continue;
                 }
             };
+            if !authorized {
+                let okay = if request.method == "auth" {
+                    serde_json::from_value::<AuthParams>(request.params.clone())
+                        .ok()
+                        .map(|params| params.token)
+                        .as_deref()
+                        .zip(token.as_deref())
+                        .is_some_and(|(given, expected)| secret_eq(given, expected))
+                } else {
+                    false
+                };
+                if !okay {
+                    let _ = tx.send(ServerMessage::Response(Response::err(
+                        request.id,
+                        "unauthorized",
+                        "a valid `auth` request with the server token is required",
+                    )));
+                    break;
+                }
+                authorized = true;
+                // From here on this connection sees the same broadcast as a
+                // local client.
+                bus_task = Some(spawn_bus(self.bus.clone(), tx.clone()));
+                let _ = tx.send(ServerMessage::Response(Response::ok(
+                    request.id,
+                    json!({ "authenticated": true }),
+                )));
+                continue;
+            }
             let response = self.handle(&request).await;
             if tx.send(ServerMessage::Response(response)).is_err() {
                 break;
             }
         }
 
-        bus_task.abort();
+        if let Some(task) = bus_task {
+            task.abort();
+        }
         drop(tx);
         let _ = writer.await;
     }
@@ -287,8 +358,72 @@ impl Daemon {
             "session.create" => {
                 let params: CreateSessionParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(SessionResult {
-                    session: self.create_session(params)?,
+                    session: self.create_session(params).await?,
                 })?)
+            }
+            "session.fork" => {
+                let params: ForkParams = parse_params(request.params.clone())?;
+                let source = self.require_session(&params.session_id)?;
+                if let Some(at) = params.at_seq {
+                    let max = self.store.max_seq(&source.id)?;
+                    if at < 1 || at > max + 1 {
+                        return Err(rpc(
+                            "invalid_params",
+                            format!("at_seq must be between 1 and {}", max + 1),
+                        ));
+                    }
+                }
+                let name = match params.name {
+                    Some(name) => name.trim().to_string(),
+                    None => self.fork_name(&source.name),
+                };
+                if name.is_empty() {
+                    return Err(rpc("invalid_params", "name must not be empty"));
+                }
+                // `None` means auto: a fork gets its own worktree when the
+                // source is in a git work tree, so the branches can edit files
+                // independently. `Some(false)` opts out and shares `cwd`.
+                let want_worktree = match params.worktree {
+                    Some(value) => value,
+                    None => crate::worktree::repo_root(&source.cwd).await.is_some(),
+                };
+                let created = if want_worktree {
+                    Some(crate::worktree::create(&source.cwd, &name).await?)
+                } else {
+                    None
+                };
+                let forked = self.store.fork_session(
+                    &source.id,
+                    params.at_seq,
+                    &name,
+                    created.as_ref().map(|created| created.path.as_path()),
+                    created.as_ref().map(|created| created.path.as_path()),
+                );
+                let session = match forked {
+                    Ok(Some(session)) => session,
+                    Ok(None) => {
+                        if let Some(created) = &created {
+                            let _ = crate::worktree::remove(&created.path, true).await;
+                        }
+                        return Err(rpc("not_found", format!("unknown session {}", source.id)));
+                    }
+                    Err(err) => {
+                        if let Some(created) = &created {
+                            let _ = crate::worktree::remove(&created.path, true).await;
+                        }
+                        return Err(err);
+                    }
+                };
+                self.emit_session(&session);
+                Ok(serde_json::to_value(SessionResult { session })?)
+            }
+            "session.rewind" => {
+                let params: RewindParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.rewind_session(params).await?)?)
+            }
+            "session.worktree.remove" => {
+                let params: WorktreeRemoveParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.remove_worktree(params).await?)?)
             }
             "session.get" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
@@ -309,6 +444,61 @@ impl Daemon {
                     events: self
                         .store
                         .events_after(&params.session_id, params.after_seq)?,
+                })?)
+            }
+            "context.ledger" => {
+                let params: ContextLedgerParams = parse_params(request.params.clone())?;
+                let ledger = self.build_ledger(&params.session_id).await?;
+                Ok(serde_json::to_value(ledger.info())?)
+            }
+            "context.drop" => {
+                let params: ContextDropParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.context_drop(params).await?)?)
+            }
+            "context.pin" => {
+                let params: ContextPinParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.context_pin(params).await?)?)
+            }
+            "context.compact" => {
+                let params: ContextCompactParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.context_compact(params).await?)?)
+            }
+            "search.query" => {
+                let params: SearchParams = parse_params(request.params.clone())?;
+                let query = params.query.trim();
+                if query.is_empty() {
+                    return Err(rpc("invalid_params", "query must not be empty"));
+                }
+                let hits = self.store.search(
+                    query,
+                    params.session_id.as_deref(),
+                    params.limit.unwrap_or(20),
+                )?;
+                Ok(serde_json::to_value(SearchResult {
+                    query: query.to_string(),
+                    hits,
+                })?)
+            }
+            "process.list" => {
+                let params: ProcessListParams = parse_params(request.params.clone())?;
+                if let Some(session_id) = params.session_id.as_deref() {
+                    self.require_session(session_id)?;
+                }
+                Ok(serde_json::to_value(ProcessList {
+                    processes: self.processes.list(params.session_id.as_deref()),
+                })?)
+            }
+            "process.output" => {
+                let params: ProcessOutputParams = parse_params(request.params.clone())?;
+                let max_bytes = params.max_bytes.unwrap_or(16 * 1024).clamp(1, 512 * 1024);
+                Ok(serde_json::to_value(
+                    self.processes.output(&params.process_id, max_bytes)?,
+                )?)
+            }
+            "process.kill" => {
+                let params: ProcessKillParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(ProcessKillResult {
+                    killed: self.processes.kill(&params.process_id)?,
                 })?)
             }
             "session.rename" => {
@@ -420,7 +610,7 @@ impl Daemon {
         })
     }
 
-    fn create_session(&self, params: CreateSessionParams) -> Result<Session> {
+    async fn create_session(&self, params: CreateSessionParams) -> Result<Session> {
         let cwd = match params.cwd {
             Some(cwd) => cwd,
             None => std::env::current_dir().context("cannot determine current directory")?,
@@ -435,15 +625,201 @@ impl Daemon {
             .model
             .map(|m| m.trim().to_string())
             .filter(|m| !m.is_empty());
+        if params.worktree.unwrap_or(false) {
+            let created = crate::worktree::create(&session.cwd, &session.name).await?;
+            session.cwd = created.path.clone();
+            session.worktree = Some(created.path);
+        }
         self.store.create_session(&session)?;
         self.emit_session(&session);
         Ok(session)
     }
 
-    fn require_session(&self, id: &str) -> Result<Session> {
-        self.store
-            .get_session(id)?
-            .ok_or_else(|| rpc("not_found", format!("unknown session {id}")))
+    /// `name~2`, `name~3`, ... The root drops an existing numeric `~N`, so
+    /// forking a fork keeps one family instead of nesting suffixes.
+    fn fork_name(&self, source_name: &str) -> String {
+        let root = match source_name.rsplit_once('~') {
+            Some((head, tail))
+                if !head.is_empty()
+                    && !tail.is_empty()
+                    && tail.chars().all(|c| c.is_ascii_digit()) =>
+            {
+                head
+            }
+            _ => source_name,
+        };
+        let taken: HashSet<String> = self
+            .store
+            .list_sessions()
+            .map(|sessions| sessions.into_iter().map(|session| session.name).collect())
+            .unwrap_or_default();
+        let mut n = 2;
+        loop {
+            let candidate = format!("{root}~{n}");
+            if !taken.contains(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
+    }
+
+    /// Fork the session, then roll the shared workspace back to how it looked
+    /// just before the cut. Snapshots are captured before every mutating tool
+    /// call, so applying the ones at or after the cut in reverse order leaves
+    /// the files as they were before the discarded branch ran.
+    ///
+    /// Rollback is best-effort: files that were never captured, changes made
+    /// outside eix, and failed restores are reported instead of hidden.
+    async fn rewind_session(&self, params: RewindParams) -> Result<RewindResult> {
+        let source = self.require_session(&params.session_id)?;
+        if source.status.is_busy() {
+            return Err(rpc(
+                "busy",
+                format!("session {} is {}", source.id, source.status.as_str()),
+            ));
+        }
+        let max = self.store.max_seq(&source.id)?;
+        let upto = match params.at_seq {
+            Some(at) if at >= 1 && at <= max + 1 => at,
+            Some(_) => {
+                return Err(rpc(
+                    "invalid_params",
+                    format!("at_seq must be between 1 and {}", max + 1),
+                ))
+            }
+            None => max + 1,
+        };
+        let name = match params.name {
+            Some(name) => name.trim().to_string(),
+            None => self.fork_name(&source.name),
+        };
+        if name.is_empty() {
+            return Err(rpc("invalid_params", "name must not be empty"));
+        }
+
+        // Collect the snapshots taken at or after the cut before forking: they
+        // are exactly the mutations the new branch discards.
+        let mut snapshots: Vec<(u64, String, usize)> = Vec::new();
+        for event in self.store.events(&source.id)? {
+            if event.kind != EventKind::Snapshot || event.seq < upto {
+                continue;
+            }
+            let Ok(snapshot) = serde_json::from_value::<SnapshotPayload>(event.payload) else {
+                continue;
+            };
+            if snapshot.ok && !snapshot.snapshot_id.is_empty() {
+                snapshots.push((event.seq, snapshot.snapshot_id, snapshot.skipped));
+            }
+        }
+        // Oldest first so the reverse walk applies the earliest snapshot last.
+        snapshots.sort_by_key(|(seq, _, _)| *seq);
+
+        let session = self
+            .store
+            .fork_session(&source.id, Some(upto), &name, None, None)?
+            .ok_or_else(|| rpc("not_found", format!("unknown session {}", source.id)))?;
+        self.emit_session(&session);
+
+        let mut result = RewindResult {
+            session,
+            restored: true,
+            snapshots: snapshots.len(),
+            files_restored: 0,
+            files_removed: 0,
+            files_missing: 0,
+            warnings: Vec::new(),
+        };
+
+        if !self.config.tools.snapshots {
+            result.restored = false;
+            result
+                .warnings
+                .push("tools.snapshots is disabled, so the workspace was not rolled back".into());
+            return Ok(result);
+        }
+        if snapshots.is_empty() {
+            result.warnings.push(
+                "no snapshots after the cut; files changed outside tool calls were left as they are"
+                    .into(),
+            );
+            return Ok(result);
+        }
+
+        let cwd = result.session.cwd.clone();
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+        for (_, snapshot_id, skipped_files) in snapshots.iter().rev() {
+            skipped += skipped_files;
+            match self.snapshots.restore(&source.id, snapshot_id, &cwd).await {
+                Ok(report) => {
+                    result.files_restored += report.restored;
+                    result.files_removed += report.removed;
+                    result.files_missing += report.missing;
+                }
+                Err(err) => {
+                    failed += 1;
+                    result.warnings.push(format!(
+                        "snapshot {snapshot_id} could not be restored: {err:#}"
+                    ));
+                }
+            }
+        }
+        if skipped > 0 {
+            result.warnings.push(format!(
+                "{skipped} file(s) were too large or excluded and were never captured, so they were not rolled back"
+            ));
+        }
+        if result.files_missing > 0 {
+            result.warnings.push(format!(
+                "{} pre-existing file(s) could not be put back and may be missing",
+                result.files_missing
+            ));
+        }
+        result.warnings.push(
+            "only tool-call mutations are snapshotted; changes made outside eix are not detected"
+                .into(),
+        );
+        result.restored = failed == 0 && result.files_missing == 0;
+        Ok(result)
+    }
+
+    /// Remove the git worktree bound to a session. Without `force` git refuses
+    /// a dirty worktree; that refusal is returned as `removed: false` so the
+    /// caller can surface it and ask for confirmation.
+    async fn remove_worktree(&self, params: WorktreeRemoveParams) -> Result<WorktreeRemoveResult> {
+        let session = self.require_session(&params.session_id)?;
+        if session.status.is_busy() {
+            return Err(rpc(
+                "busy",
+                format!("session {} is {}", session.id, session.status.as_str()),
+            ));
+        }
+        let Some(path) = session.worktree.clone() else {
+            return Err(rpc(
+                "invalid_params",
+                format!("session {} has no worktree", session.id),
+            ));
+        };
+        // Resolve the main repo before removal: once the directory is gone,
+        // `git -C <path>` cannot answer.
+        let repo = crate::worktree::main_repo(&path).await;
+        match crate::worktree::remove(&path, params.force).await {
+            Ok(()) => {
+                let fallback = path.parent().map(Path::to_path_buf);
+                let cwd = repo.or(fallback).unwrap_or_else(|| path.clone());
+                if let Some(updated) = self.store.set_session_cwd(&session.id, &cwd, None)? {
+                    self.emit_session(&updated);
+                }
+                Ok(WorktreeRemoveResult {
+                    removed: true,
+                    message: format!("removed {}", path.display()),
+                })
+            }
+            Err(err) => Ok(WorktreeRemoveResult {
+                removed: false,
+                message: format!("{err:#}; re-run with --force to discard uncommitted changes"),
+            }),
+        }
     }
 
     async fn submit(self: &Arc<Self>, params: SubmitParams) -> Result<SubmitResult> {
@@ -494,6 +870,12 @@ impl Daemon {
         });
 
         Ok(SubmitResult { session, turn_id })
+    }
+
+    fn require_session(&self, id: &str) -> Result<Session> {
+        self.store
+            .get_session(id)?
+            .ok_or_else(|| rpc("not_found", format!("unknown session {id}")))
     }
 
     async fn submit_setup(&self, session_id: SessionId, text: String) -> Result<(Session, String)> {
@@ -618,7 +1000,10 @@ impl Daemon {
         turn_id: String,
         cancel: Arc<AtomicBool>,
     ) {
-        if let Err(err) = self.run_turn_inner(&session_id, &turn_id, &cancel).await {
+        if let Err(err) = self
+            .run_turn_inner(&session_id, &turn_id, &cancel, &tools::definitions())
+            .await
+        {
             eprintln!("eixd: turn {turn_id} failed: {err:#}");
             let message = format!("{err:#}");
             self.fail_turn(&session_id, &turn_id, &message);
@@ -628,20 +1013,21 @@ impl Daemon {
     }
 
     async fn run_turn_inner(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         turn_id: &str,
         cancel: &AtomicBool,
+        allowed_tools: &[ToolDefinition],
     ) -> Result<()> {
         let session = self.require_session(session_id)?;
         let model = session
             .model
             .clone()
             .unwrap_or_else(|| self.provider.model().to_string());
-        let mut messages = Vec::new();
-        messages.push(ChatMessage::system(system_prompt(&self.config, &session)));
-        messages.extend(self.store.messages(session_id)?);
-        let tools = tools::definitions();
+        let ledger = self.build_ledger(session_id).await?;
+        let mut messages = ledger.messages();
+        self.emit_context(session_id, &ledger);
+        let tools = allowed_tools;
 
         for round in 0..=tools::MAX_TOOL_ROUNDS {
             if cancel.load(Ordering::SeqCst) {
@@ -655,7 +1041,7 @@ impl Daemon {
             let mut streamed = String::new();
             let outcome = self
                 .provider
-                .stream_chat(&messages, &model, &tools, cancel, |delta| {
+                .stream_chat(&messages, &model, tools, cancel, |delta| {
                     streamed.push_str(delta);
                     let _ = bus.send(Notification::new(
                         "message.delta",
@@ -733,13 +1119,17 @@ impl Daemon {
                 completion.tool_calls.clone(),
             ));
 
-            for call in &completion.tool_calls {
-                self.run_tool_call(session_id, turn_id, call, &mut messages, cancel)
-                    .await?;
-                if cancel.load(Ordering::SeqCst) {
-                    self.finish_cancelled(session_id, turn_id, "", &model)?;
-                    return Ok(());
-                }
+            self.run_tool_batch(
+                session_id,
+                turn_id,
+                &completion.tool_calls,
+                &mut messages,
+                cancel,
+            )
+            .await?;
+            if cancel.load(Ordering::SeqCst) {
+                self.finish_cancelled(session_id, turn_id, "", &model)?;
+                return Ok(());
             }
 
             if round == tools::MAX_TOOL_ROUNDS {
@@ -750,6 +1140,244 @@ impl Daemon {
             }
         }
         Ok(())
+    }
+
+    /// Run one assistant tool batch. Regular tools run in call order; every
+    /// `spawn_agent` call runs concurrently and its result is appended in call
+    /// order, so several sub-agents can work at once without racing files
+    /// (they are read-only).
+    async fn run_tool_batch(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_id: &str,
+        calls: &[ToolCall],
+        messages: &mut Vec<ChatMessage>,
+        cancel: &AtomicBool,
+    ) -> Result<()> {
+        let mut agents: Vec<(String, tokio::task::JoinHandle<Result<String>>)> = Vec::new();
+        for call in calls {
+            if call.function.name == "spawn_agent" {
+                let daemon = Arc::clone(self);
+                let call = call.clone();
+                let call_id = call.id.clone();
+                let sid = session_id.to_string();
+                let tid = turn_id.to_string();
+                let handle =
+                    tokio::spawn(async move { daemon.spawn_agent(&sid, &tid, &call).await });
+                agents.push((call_id, handle));
+            } else {
+                self.run_tool_call(session_id, turn_id, call, messages, cancel)
+                    .await?;
+            }
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+        }
+        for (call_id, handle) in agents {
+            let output = match handle.await {
+                Ok(Ok(output)) => output,
+                Ok(Err(err)) => format!("spawn_agent failed: {err:#}"),
+                Err(err) => format!("spawn_agent task failed: {err}"),
+            };
+            // `spawn_agent` records its own tool events; only the message fed
+            // back to the provider is added here.
+            messages.push(ChatMessage::tool(call_id, output));
+        }
+        Ok(())
+    }
+
+    /// Start one sub-agent and return its final answer as tool output.
+    ///
+    /// The return type is boxed on purpose: the child turn eventually calls
+    /// back into the tool loop, and an explicit `dyn Future + Send` boundary
+    /// lets the compiler resolve the recursive auto-trait instead of giving up
+    /// with "future is not Send".
+    fn spawn_agent<'a>(
+        self: &'a Arc<Self>,
+        parent_id: &'a str,
+        parent_turn: &'a str,
+        call: &'a ToolCall,
+    ) -> futures_util::future::BoxFuture<'a, Result<String>> {
+        Box::pin(async move { self.spawn_agent_outer(parent_id, parent_turn, call).await })
+    }
+
+    async fn spawn_agent_outer(
+        self: &Arc<Self>,
+        parent_id: &str,
+        parent_turn: &str,
+        call: &ToolCall,
+    ) -> Result<String> {
+        let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
+        let event = self.store.append_event(
+            parent_id,
+            EventKind::ToolCall,
+            payload(&ToolCallPayload {
+                call_id: call.id.clone(),
+                tool: "spawn_agent".to_string(),
+                arguments: args.clone(),
+            }),
+        )?;
+        self.emit_event(&event);
+
+        let parent = self.require_session(parent_id)?;
+        let result = self.spawn_agent_inner(&parent, parent_turn, &args).await;
+        let (ok, output) = match result {
+            Ok(output) => (true, output),
+            Err(err) => (false, format!("{err:#}")),
+        };
+        self.record_tool_result(parent_id, call, ok, false, &output, 0)?;
+        self.emit_value(
+            "tool.completed",
+            json!({
+                "session_id": parent_id,
+                "turn_id": parent_turn,
+                "call_id": call.id,
+                "tool": "spawn_agent",
+                "ok": ok,
+                "denied": false,
+                "duration_ms": 0,
+            }),
+        );
+        // A failed sub-agent is reported to the model, not turned into a
+        // session error: the parent can retry or answer without it.
+        Ok(output)
+    }
+
+    async fn spawn_agent_inner(
+        self: &Arc<Self>,
+        parent: &Session,
+        parent_turn: &str,
+        args: &Value,
+    ) -> Result<String> {
+        if parent.origin == SessionOrigin::Agent {
+            bail!("sub-agents cannot spawn further sub-agents (depth limit is 1)");
+        }
+        let prompt = args
+            .get("prompt")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|prompt| !prompt.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("spawn_agent needs a non-empty `prompt`"))?;
+        let label = args
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|label| !label.is_empty());
+
+        let name = self.agent_name(&parent.name, label);
+        let mut child = Session::new(Uuid::new_v4().to_string(), name.clone(), parent.cwd.clone());
+        child.model = parent.model.clone();
+        child.parent_id = Some(parent.id.clone());
+        child.origin = SessionOrigin::Agent;
+        self.store.create_session(&child)?;
+        self.emit_session(&child);
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.turns
+            .lock()
+            .await
+            .insert(child.id.clone(), Arc::clone(&cancel));
+        self.emit_value(
+            "agent.spawned",
+            json!({
+                "session_id": parent.id,
+                "agent_id": child.id,
+                "name": child.name,
+                "parent_turn_id": parent_turn,
+            }),
+        );
+
+        let run = self.run_child_turn(&child, prompt).await;
+        self.turns.lock().await.remove(&child.id);
+
+        let text = run?;
+        let trimmed = text.trim();
+        let body = if trimmed.is_empty() {
+            "(sub-agent returned no text)".to_string()
+        } else {
+            cap_text(trimmed, self.config.tools.max_output_bytes)
+        };
+        self.emit_value(
+            "agent.completed",
+            json!({
+                "session_id": parent.id,
+                "agent_id": child.id,
+                "name": child.name,
+                "ok": true,
+            }),
+        );
+        Ok(format!(
+            "sub-agent {} ({}) finished:\n{}",
+            child.name,
+            short_id(&child.id),
+            body
+        ))
+    }
+
+    /// Run one bounded, read-only turn for a sub-agent and return its answer.
+    async fn run_child_turn(self: &Arc<Self>, child: &Session, prompt: &str) -> Result<String> {
+        let event = self.store.append_event(
+            &child.id,
+            EventKind::UserMessage,
+            payload(&UserMessagePayload {
+                text: prompt.to_string(),
+            }),
+        )?;
+        self.emit_event(&event);
+        self.transition(&child.id, SessionStatus::Running)?;
+
+        let turn_id = Uuid::new_v4().to_string();
+        let cancel = AtomicBool::new(false);
+        let readonly = tools::readonly_definitions();
+        self.emit_value(
+            "turn.started",
+            json!({
+                "session_id": child.id,
+                "turn_id": turn_id,
+                "model": child
+                    .model
+                    .clone()
+                    .unwrap_or_else(|| self.provider.model().to_string()),
+            }),
+        );
+        if let Err(err) = self
+            .run_turn_inner(&child.id, &turn_id, &cancel, &readonly)
+            .await
+        {
+            self.fail_turn(&child.id, &turn_id, &format!("{err:#}"));
+            return Err(err);
+        }
+
+        let events = self.store.events(&child.id)?;
+        for event in events.iter().rev() {
+            if event.kind != EventKind::AssistantMessage {
+                continue;
+            }
+            if let Ok(assistant) =
+                serde_json::from_value::<eix_core::AssistantMessagePayload>(event.payload.clone())
+            {
+                return Ok(assistant.text);
+            }
+        }
+        Ok(String::new())
+    }
+
+    /// `<parent>/<label>-N`, never colliding with an existing session name.
+    fn agent_name(&self, parent_name: &str, label: Option<&str>) -> String {
+        let label = label.unwrap_or("agent");
+        let taken: HashSet<String> = self
+            .store
+            .list_sessions()
+            .map(|sessions| sessions.into_iter().map(|session| session.name).collect())
+            .unwrap_or_default();
+        let mut n = 1;
+        loop {
+            let candidate = format!("{parent_name}/{label}-{n}");
+            if !taken.contains(&candidate) {
+                return candidate;
+            }
+            n += 1;
+        }
     }
 
     /// Record, gate, execute and feed back a single tool call.
@@ -786,6 +1414,18 @@ impl Daemon {
         if !tools::is_known(tool) {
             let output = format!("unknown tool {tool:?}");
             self.record_tool_result(session_id, call, false, false, &output, 0)?;
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        }
+
+        // Sub-agents inherit the parent's context, not its write access. Even
+        // if the model ignores the read-only tool list, mutating tools are
+        // refused here so a child can never change the shared workspace.
+        if self.require_session(session_id)?.origin == SessionOrigin::Agent
+            && tools::requires_approval(tool)
+        {
+            let output = "sub-agents are read-only; mutating tools are not available".to_string();
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
         }
@@ -851,6 +1491,10 @@ impl Daemon {
                 );
                 let outcome = match &plan {
                     Some(plan) => tools::apply_plan(plan, selected_hunks.as_deref()).await,
+                    None if tool == "start_command" => {
+                        self.start_background(session_id, &args).await
+                    }
+                    None if tool == "process_output" => self.read_process(session_id, &args),
                     None => {
                         let session = self.require_session(session_id)?;
                         match self
@@ -1018,6 +1662,147 @@ impl Daemon {
 
     /// Flag a session with a pending patch so background panes and external
     /// notifications can surface it. The stored status stays `running`.
+    /// Rebuild the context ledger for a session. Used by reads, by the
+    /// `context.*` requests, and at the start of every turn.
+    async fn build_ledger(&self, session_id: &str) -> Result<Ledger> {
+        let session = self.require_session(session_id)?;
+        let events = self.store.events(session_id)?;
+        Ok(Ledger::build(
+            &self.config,
+            system_prompt(&self.config, &session),
+            &session.cwd,
+            &events,
+        )
+        .await)
+    }
+
+    fn emit_context(&self, session_id: &str, ledger: &Ledger) {
+        self.emit_value(
+            "context.updated",
+            json!({
+                "session_id": session_id,
+                "ledger": ledger.info(),
+            }),
+        );
+    }
+
+    async fn context_drop(
+        &self,
+        params: ContextDropParams,
+    ) -> Result<eix_core::ContextLedgerResult> {
+        let ledger = self.build_ledger(&params.session_id).await?;
+        if !ledger.has_entry(&params.entry) {
+            return Err(rpc(
+                "not_found",
+                format!("unknown context entry {:?}", params.entry),
+            ));
+        }
+        if !ledger.is_editable(&params.entry) {
+            return Err(rpc(
+                "invalid_params",
+                format!("context entry {:?} cannot be edited", params.entry),
+            ));
+        }
+        let dropped = params.dropped.unwrap_or(true);
+        let event = self.store.append_event(
+            &params.session_id,
+            EventKind::ContextDropped,
+            payload(&ContextDropPayload {
+                entry: params.entry,
+                dropped,
+            }),
+        )?;
+        self.emit_event(&event);
+        let ledger = self.build_ledger(&params.session_id).await?;
+        self.emit_context(&params.session_id, &ledger);
+        Ok(ledger.info())
+    }
+
+    async fn context_pin(&self, params: ContextPinParams) -> Result<eix_core::ContextLedgerResult> {
+        let ledger = self.build_ledger(&params.session_id).await?;
+        if !ledger.has_entry(&params.entry) {
+            return Err(rpc(
+                "not_found",
+                format!("unknown context entry {:?}", params.entry),
+            ));
+        }
+        if !ledger.is_editable(&params.entry) {
+            return Err(rpc(
+                "invalid_params",
+                format!("context entry {:?} cannot be pinned", params.entry),
+            ));
+        }
+        let event = self.store.append_event(
+            &params.session_id,
+            EventKind::ContextPinned,
+            payload(&ContextPinPayload {
+                entry: params.entry,
+                pinned: params.pinned,
+            }),
+        )?;
+        self.emit_event(&event);
+        let ledger = self.build_ledger(&params.session_id).await?;
+        self.emit_context(&params.session_id, &ledger);
+        Ok(ledger.info())
+    }
+
+    async fn context_compact(
+        &self,
+        params: ContextCompactParams,
+    ) -> Result<eix_core::ContextLedgerResult> {
+        if params.from_seq == 0 || params.to_seq < params.from_seq {
+            return Err(rpc(
+                "invalid_params",
+                "context.compact needs 0 < from_seq <= to_seq",
+            ));
+        }
+        let ledger = self.build_ledger(&params.session_id).await?;
+        if ledger.overlaps_compaction(params.from_seq, params.to_seq) {
+            return Err(rpc(
+                "invalid_params",
+                "compaction range overlaps an existing summary",
+            ));
+        }
+        let (messages, tokens) = ledger.range_stats(params.from_seq, params.to_seq);
+        if messages == 0 {
+            return Err(rpc("invalid_params", "no messages in the requested range"));
+        }
+        let summary = params
+            .summary
+            .map(|text| text.trim().to_string())
+            .filter(|text| !text.is_empty())
+            .unwrap_or_else(|| {
+                "(the user compacted these messages; their text remains in the event log, \
+                 not in this request)"
+                    .to_string()
+            });
+        let event = self.store.append_event(
+            &params.session_id,
+            EventKind::ContextCompacted,
+            payload(&ContextCompactedPayload {
+                from_seq: params.from_seq,
+                to_seq: params.to_seq,
+                messages,
+                tokens,
+                summary,
+            }),
+        )?;
+        self.emit_event(&event);
+        self.emit_value(
+            "context.compacted",
+            json!({
+                "session_id": params.session_id,
+                "from_seq": params.from_seq,
+                "to_seq": params.to_seq,
+                "messages": messages,
+                "tokens": tokens,
+            }),
+        );
+        let ledger = self.build_ledger(&params.session_id).await?;
+        self.emit_context(&params.session_id, &ledger);
+        Ok(ledger.info())
+    }
+
     fn announce_patch(&self, session: &Session) {
         self.emit_value(
             "session.attention",
@@ -1348,6 +2133,101 @@ impl Daemon {
         }
     }
 
+    /// Start a background process on behalf of `start_command`.
+    async fn start_background(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
+        let started = Instant::now();
+        let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+        if command.trim().is_empty() {
+            return tools::ToolOutcome {
+                ok: false,
+                output: "command must not be empty".to_string(),
+                duration_ms: started.elapsed().as_millis() as u64,
+            };
+        }
+        let session = match self.require_session(session_id) {
+            Ok(session) => session,
+            Err(err) => {
+                return tools::ToolOutcome {
+                    ok: false,
+                    output: format!("{err:#}"),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+        };
+        let cwd = args.get("cwd").and_then(Value::as_str);
+        let plan = match tools::command_plan(command, cwd, &session.cwd, &self.config) {
+            Ok(plan) => plan,
+            Err(err) => {
+                return tools::ToolOutcome {
+                    ok: false,
+                    output: format!("{err:#}"),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+        };
+        match self.processes.start(session_id, command, plan).await {
+            Ok(info) => tools::ToolOutcome {
+                ok: true,
+                output: format!(
+                    "started process {} (pid {}) in {}\nlog: {}\nUse process_output to read its output.",
+                    info.id, info.pid, info.cwd, info.log
+                ),
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+            Err(err) => tools::ToolOutcome {
+                ok: false,
+                output: format!("{err:#}"),
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        }
+    }
+
+    /// `process_output`: read-only tail of a background process.
+    fn read_process(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
+        let started = Instant::now();
+        let process_id = args
+            .get("process_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        let max_bytes = args
+            .get("max_bytes")
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(8000)
+            .clamp(1, 512 * 1024);
+        match self
+            .processes
+            .output_for_session(session_id, process_id, max_bytes)
+        {
+            Ok(output) => {
+                let mut text = format!(
+                    "process {} · {} · {} bytes",
+                    output.process_id,
+                    output.status.as_str(),
+                    output.bytes
+                );
+                if let Some(code) = output.exit_code {
+                    text.push_str(&format!(" · exit {code}"));
+                }
+                if output.truncated {
+                    text.push_str(" · tail");
+                }
+                text.push('\n');
+                text.push_str(&output.text);
+                tools::ToolOutcome {
+                    ok: true,
+                    output: text,
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+            Err(err) => tools::ToolOutcome {
+                ok: false,
+                output: format!("{err:#}"),
+                duration_ms: started.elapsed().as_millis() as u64,
+            },
+        }
+    }
+
     /// Copy what a mutating tool is about to change and record the result.
     /// A failed snapshot never blocks the call; the tool output gets a short
     /// note so the lost rollback safety is visible.
@@ -1628,10 +2508,10 @@ async fn wait_for_cancel(cancel: &AtomicBool) {
     }
 }
 
-async fn write_loop(
-    mut write: WriteHalf<UnixStream>,
-    mut rx: mpsc::UnboundedReceiver<ServerMessage>,
-) {
+async fn write_loop<W>(mut write: W, mut rx: mpsc::UnboundedReceiver<ServerMessage>)
+where
+    W: AsyncWrite + Unpin,
+{
     while let Some(message) = rx.recv().await {
         let mut bytes = match serde_json::to_vec(&message) {
             Ok(bytes) => bytes,
@@ -1645,6 +2525,34 @@ async fn write_loop(
             break;
         }
     }
+}
+
+/// Forward every daemon event to one connection. Unix clients subscribe at
+/// connect time; TCP clients subscribe only after `auth`, so `spawn_bus` is
+/// called from the auth branch.
+fn spawn_bus(
+    bus: broadcast::Sender<Notification>,
+    tx: mpsc::UnboundedSender<ServerMessage>,
+) -> tokio::task::JoinHandle<()> {
+    let mut rx = bus.subscribe();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(notification) => {
+                    if tx.send(ServerMessage::Notification(notification)).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    let note = Notification::new("stream.lagged", json!({ "skipped": skipped }));
+                    if tx.send(ServerMessage::Notification(note)).is_err() {
+                        break;
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    })
 }
 
 fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T> {
@@ -1663,6 +2571,34 @@ fn rpc(code: impl Into<String>, message: impl Into<String>) -> anyhow::Error {
         code: code.into(),
         message: message.into(),
     })
+}
+
+/// Compare two secrets without short-circuiting on the first differing byte.
+/// This is not a hardened constant-time primitive, but it removes the trivial
+/// timing signal of `==` for the remote-attach token.
+fn secret_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// First eight bytes of a session id, for human-facing messages.
+fn short_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+/// Truncate tool output without splitting a UTF-8 code point.
+fn cap_text(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max.min(text.len());
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n[truncated]", &text[..end])
 }
 
 fn default_name(cwd: &Path) -> String {

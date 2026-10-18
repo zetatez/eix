@@ -97,15 +97,28 @@ idle ──submit──> running ──tool──> tool_running ──> running 
 
 ### 4.5 fork / rewind
 
-- **rewind**：选择一条消息，截断到它之前，生成新分支头；原分支保留，可 `:Agent branches` 找回。
-- **fork**：复制前缀到新 session，命名 `name~2`，header 显示 `name ← name~2`。
-- **诚实性约束**：事件日志不能重放工作区。所有写文件/打补丁都记录 diff 快照事件；rewind 时尽可能回退，退不了的明确标红提示。
-- fork 默认建议同时起 worktree，避免共享 cwd 的并发冲突。
+- **fork**：复制前缀到新 session，命名 `name~2`，header 显示 `name ← name~2`；只复制对话，不回退文件。
+- **rewind**：`session.rewind {session_id, at_seq?, name?}` 先按 `at_seq`（`None` = 末尾）fork，再把工作区回滚到切点：
+  daemon 在每个会改文件的工具调用前抓快照，rewind 时取 `seq >= at_seq` 的快照，按 seq **倒序**恢复（最新的先撤，才能回到更早的状态）。
+- **诚实性约束**：事件日志不能重放工作区。rewind 是**尽力而为**：返回
+  `RewindResult { restored, snapshots, files_restored, files_removed, files_missing, warnings }`，
+  `restored = false` 表示有快照恢复失败或文件缺失；被保留策略 prune 的旧快照、快照上限之外的大文件、
+  以及 eix 之外的改动都无法察觉，`warnings` 里逐条说明，绝不假装成功。
+- busy 的 session 拒绝 rewind（`session_busy`）。
+- 已实现（2026-10-18）：`session.fork` 仅复制历史，`session.rewind` 组合 fork + 快照回滚；
+  TUI ledger `w`、CLI `eix rewind [--session ID] [--at SEQ] [--name NAME]` 走 rewind，`F` / `f` 仍是纯 fork。
+  fork 在 git 仓库里默认同时起 worktree，避免共享 cwd 的并发冲突（见下）。
 
 ### 4.6 worktree
 
-- 默认绑定 cwd；`--worktree` 或 picker 中一键创建 `.worktrees/<session>`。
+- 默认绑定 cwd；`--worktree`（`eix new --worktree`、TUI `N`）或 picker 中一键创建 `.worktrees/<slug>`。
+- repo 内 fork 默认给新分支建 worktree；`eix fork --shared` / `session.fork worktree=false` 显式共享源工作区。
 - worktree 与 session 生命周期解耦：session 归档不自动删除 worktree，需显式确认。
+- 已实现（2026-10-18）：`eixd/src/worktree.rs` shell out 给 git，`git worktree add -b eix/<slug> .worktrees/<slug>`；
+  main repo 用 `git rev-parse --git-common-dir` 解析并 canonicalize（支持 subdir 和 linked worktree），
+  `.worktrees` 已在快照排除表里。删除走 `eix worktree remove SESSION [--force]`（`session.worktree.remove`）：
+  先算出主仓库，`git worktree remove [--force]`，成功后把 session cwd 重置回仓库根并清空 worktree 字段；
+  工作区有未提交改动时 git 会拒绝，除非显式 `--force`（dirty 删除返回 `removed:false` 并给出提示）。
 
 ## 5. 输入层：嵌入真 nvim
 
@@ -203,6 +216,23 @@ prompt buffer 的 buffer-local mapping：
 
 - 输入条始终可见，失焦时保留最后一行；聚焦时增高。
 - 模式指示由 host 根据 `mode_change` 渲染，不依赖 nvim 的 showmode。
+
+### 5.7 独立 nvim 前端（`eix nvim`）
+
+除了把 nvim 嵌进 TUI 当输入条，也可以让 Neovim 直接当整个前端：
+
+- `eix nvim [--session ID]` 用用户的 nvim 打开一个内嵌 Lua 插件（`eix_core::nvim_plugin` 写在
+  `<data-dir>/eix-nvim.lua`，内容变化才重写），插件自己用 `vim.uv`（`vim.loop` 兼容）连 Unix socket
+  或 TCP，说同一套换行 JSON-RPC。
+- 转录渲染进一个 `eix://<id8>` 的 scratch buffer（`botright` 分屏），用户自己的配置、配色和键位都在。
+- `:Eix` 命令：`attach [ID|name]` / `list` / `new [NAME] [worktree]` / `send TEXT` / `prompt`（输入分屏，
+  `<CR>` 发送）/ `fork [SEQ]` / `rewind [SEQ]` / `stop` / `ps` / `ledger`。
+- 连接和请求都由插件内的 libuv 处理；注意 **libuv 回调是 fast context**，`vim.env` / `vim.fn.*` /
+  `nvim_buf_*` 都必须先 `vim.schedule` 或把环境值在加载时缓存进 `state`（实测坑）。
+- 每个 nvim 进程是独立 client，共享同一 daemon；daemon 串行化同一 session 的 turn，忙时拒绝。
+- 测试：headless e2e 直接跑 `nvim --headless -u NONE --cmd 'lua dofile(...)' -c 'Eix attach ...'`，
+  断言 scratch buffer 里出现 prompt 和回答；`#[tokio::test]` 是 current-thread runtime，阻塞式
+  `Command::output()` 会饿死 daemon，必须放 `spawn_blocking` 里跑。
 
 ## 6. 布局与焦点
 
@@ -352,14 +382,24 @@ prompt buffer 的 buffer-local mapping：
 
 **client → daemon（request）**
 
+- `hello`（版本握手）
+- `auth {token}`（仅 TCP：必须是第一个请求）
 - `session.list|create|attach|detach|rename|archive|fork|rewind`
+- `session.worktree.remove {session_id, force?}`
 - `prompt.submit|cancel|queue`
 - `approval.respond`、`patch.apply|reject`
 - `context.drop|pin|compact`
+- `process.list|output|kill`
+- `search.query`（跨 session 全文搜索；`session_id` 可限定范围）
 - `picker.query`（需要跨 session 搜索时）
-- `nvim.claim`（输入所有权）
+- `nvim.claim`（输入所有权；planned）
 
 所有事件带 `id`、`session_id`、`seq`、`ts`、`type`、`payload`；协议版本握手。
+
+**传输**：默认 Unix socket（0600）。`[server] tcp = "host:port"` 同时监听 TCP，此时 `token` 必填；
+TCP client 的首个请求必须是 `auth {token}`，通过前不返回数据/事件，失败返回 `unauthorized` 并断开。
+Unix 连接视为已认证。CLI/TUI 用 `--tcp` / `--token`（或 `EIX_TCP` / `EIX_TCP_TOKEN`）选择端点；
+TCP 端点不会自动拉起本地 daemon。
 
 ## 12. 持久化与搜索
 
@@ -369,6 +409,10 @@ prompt buffer 的 buffer-local mapping：
   - 主索引 `trigram`（中英混排友好）。
   - **短查询（1–2 字）降级 LIKE 扫描**，先收窄到当前/最近 session；否则中文高频词搜不到。
   - 可选自研 bigram tokenizer 作为后续优化。
+  - 已实现（2026-10-18）：`search_docs` 内容表 + `search_fts` 外部内容虚表，触发器随
+    `append_event` 同步；启动时补索引。短查询用 `instr(lower(...))`（等价于不带通配符的
+    LIKE，且不需要转义 `%`/`_`），默认不做 session 收窄——消息量还小，先保证能搜到；
+    等索引变大再加“当前/最近 session 优先”。
 - 文件权限：目录 0700、文件 0600；日志写入前做密钥脱敏（API key、token、`.env` 内容）。
 - 事件日志天然是回放测试夹具：record/replay 用于集成测试。
 
@@ -476,11 +520,88 @@ prompt buffer 的 buffer-local mapping：
 > 丢弃；落盘前重新校验基准，stage 后被外部修改则记 `patch_conflict` 且不覆盖。单文件快照
 > 改为应用补丁时抓取。pending 补丁跨 daemon 重启恢复；TUI 卡片、attention、`eix approve` /
 > `eix deny`、`eix log` 均已支持补丁。`run_command` 无法 stage，仍在审批处阻塞。
-> **尚未做**：context ledger、process view。
+> Context ledger 已落地：`eixd/src/context.rs` 从事件日志重建 provider 上下文并按 sector
+> 记账（system 5% / instructions 5% / workspace 15% / history 60% / tools 10% / memory 5%），
+> `context.ledger|drop|pin|compact` 请求与 `context.updated|compacted` 通知已接入；
+> `AGENTS.md`（cwd 与 config 目录）注入 `instructions` sector，workspace summary 注入顶层
+> 文件树与 git branch/status。drop / pin / compact 落成事件
+> （`context_dropped|pinned|compacted`），重启后重放一致；`tools` / `history` 超预算时从最旧
+> 未 pin 条目自动裁剪（保留最新 4 条），system / instructions / workspace 不自动裁剪。TUI `c`
+> 打开全屏 ledger（`o` 展开、`p` pin、`d` drop、`m` 标记、`s` 压缩范围），CLI 为
+> `eix context [--drop|--undrop|--pin|--unpin|--compact]`。
+> Process view 已落地：新增 `start_command {command, cwd?}`（与 `run_command` 共用
+> `command_plan`，同一沙箱与审批门禁）在 daemon 内启动后台进程并立即返回 id，以及只读的
+> `process_output {process_id?, max_bytes?}`（缺省取本 session 最新进程）。进程归属 daemon、
+> 按 session 分组，关闭前端不影响；daemon 退出时 `kill_all` 对整个进程组 SIGTERM，2 秒后
+> SIGKILL。输出流式广播 `process.output` 并镜像到 `<data>/processes/<session>/<id>.log`
+> （0600，文件 16 MB 上限），内存保留 128 KB 尾部；事件日志只写
+> `process_started|process_exited`，避免刷爆，广播 8 MB 后停止推送但尾部继续更新。
+> `start_command` 不抓执行前快照：长跑进程的改动不是一个可回滚的单元。
+> `process.list|output|kill` 请求与 `process.started|exited` 通知已接入；TUI `P` 打开全屏
+> 列表（`j/k` 选择、`x` kill、`r` 刷新、`PgUp/PgDn` 滚动、Esc 关闭），列表下方实时跟随选中
+> 进程输出；CLI 为 `eix ps`、`eix tail <id>`、`eix kill <id>`，`eix log` 以 `proc>` 行展示
+> 进程事件。限制：只管理 daemon 的直接子进程组，daemon 重启后 registry 为空（事件日志里可能
+> 出现有 start 无 exit）。
 
 **Phase 3**
 
 - rewind/fork、全文搜索、worktree、子 agent、nvim 前端、远程 attach。
+
+> Fork / rewind 已落地（2026-10-18）：`session.fork {session_id, at_seq?, name?}` 把源
+> session 的 `seq < at_seq`（`None` 表示全部）事件复制到新 session，序号原样保留，因此
+> ledger 重建结果与源前缀一致；新 session 为 `idle`，复制 `cwd` / 模型 pin，并记录
+> `parent_id` + `forked_from_seq`（独占切点）。默认命名去掉已有的数值 `~N` 后取
+> `name~2`、`name~3`…；`sessions` 表用 `PRAGMA table_info` 做幂等加列迁移。原 session
+> 完全不变。TUI `F` 在末尾 fork，ledger 里 `f` 在选中消息之前 fork（`seq_of` 非空时）；
+> 新 session 自动在新 pane attach。CLI 为 `eix fork [--session ID] [--at SEQ] [--name NAME]`。
+> **真正的 rewind**：`session.rewind {session_id, at_seq?, name?}` 先 fork，再把
+> `seq >= at_seq` 的快照按 seq 倒序（最新先撤）交给 `Snapshotter::restore`；busy session
+> 直接拒绝。返回 `RewindResult { restored, snapshots, files_restored, files_removed,
+> files_missing, warnings }`，`restored = failed_restores == 0 && files_missing == 0`；
+> 没有快照 / 快照关闭 / 被 prune / 恢复失败 / 文件缺失都会进 `warnings`，并提示“eix 之外的
+> 改动无法察觉”。TUI ledger `w` 和 CLI `eix rewind` 走这条路径，纯 fork 仍标 `files unchanged`。
+>
+> Worktree 已落地（2026-10-18）：`session.create` / `session.fork` 接受 `worktree: bool?`
+> （`None` = fork 时在 git 仓库里自动建，create 时表示默认不建；`Some(false)` = 共享）。
+> `eixd/src/worktree.rs` 用 `git rev-parse --git-common-dir` 解析主仓库（支持 subdir / linked
+> worktree，canonicalize 后比较），`git worktree add -b eix/<slug> .worktrees/<slug>`；slug
+> 来自 session 名，冲突时加 `-N`。worktree 路径存 `sessions.worktree`，fork 未指定新
+> worktree 时继承源值。`eix worktree list` / `remove SESSION [--force]` 对
+> `session.worktree.remove`：先确定主仓库再 `git worktree remove [--force]`，成功后
+> `set_session_cwd(repo_root)` 并清空 worktree；dirty 且没 `--force` 时返回 `removed:false`。
+> `.worktrees` 已在快照排除表里，避免把 worktree 自身复制进快照。
+>
+> 子 agent 已落地（2026-10-18）：模型工具 `spawn_agent {label, prompt}` 由 daemon 建 child
+> session（`origin = agent`、`parent_id`、名字 `parent/<label>-N`、cwd 继承），只读工具集
+> `read_file` / `list_dir` / `process_output`；agent session 在 `run_tool_call` 里对写工具
+> 直接拒绝，深度上限 1（child 不能再 spawn）。同一 assistant 批次里的多个 `spawn_agent`
+> 用 `tokio::spawn` 并发跑，其余工具保持顺序，结果按调用顺序回填；child 的完整 turn 写进
+> 自己的事件日志，失败作为普通 tool 结果返回，不打断父 turn。TUI 侧栏用 `↳` 标记。
+>
+> 独立 nvim 前端已落地（2026-10-18）：`eix nvim [--session ID]` 把内嵌 Lua 插件写到
+> `<data>/eix-nvim.lua`，用 `EIX_NVIM_SOCKET` / `EIX_NVIM_TCP` / `EIX_NVIM_TOKEN` 连 daemon，
+> 转录渲染进 `eix://<id8>` scratch buffer；`:Eix attach|list|new|send|prompt|fork|rewind|stop|ps|ledger`
+> 覆盖主要操作。插件里所有 buffer API 都经 `vim.schedule`（libuv callback 是 fast context），
+> 环境值在加载时缓存。headless e2e 在 `nvim --headless -u NONE` 下验证 prompt/回答出现在
+> buffer；`#[tokio::test]` 的 current-thread runtime 需要 `spawn_blocking` 跑子进程。
+>
+> 远程 attach 已落地（2026-10-18）：`[server] tcp` / `token`（env `EIX_TCP` / `EIX_TCP_TOKEN`），
+> 设置 `tcp` 时 token 必填（配置校验拒绝空值）。daemon 用泛型 `serve<S: AsyncRead + AsyncWrite>`
+> 同时处理 Unix 和 TCP；TCP 连接首请求必须是 `auth {token}`，`secret_eq` 做常数时间比较，
+> 失败返回 `unauthorized` 并断开，认证前不广播任何事件。Unix 保持免认证。CLI/TUI 的
+> `--tcp` / `--token` 选择 `Endpoint::Tcp`，`ensure_daemon` 对 TCP 端点不自动拉起本地 daemon。
+> 已知限制：Unix 和认证后的 TCP 仍收到所有 session 的广播；按 session 过滤留待后续。
+>
+> 全文搜索已落地（2026-10-18）：`search_docs`（内容表）+ `search_fts`（FTS5 trigram，
+> 外部内容）+ 触发器在 `append_event` 写 `user_message` / `assistant_message` 时同步索引；
+> 启动时用 `INSERT OR IGNORE ... SELECT` 补齐旧库。3+ 字符走 `MATCH`（每个词加引号，
+> 标点按字面处理，空格为隐式 AND，`bm25` 排序）；更短的查询退化为
+> `instr(lower(text), lower(query))` 子串扫描，解决中文 1–2 字词 trigram 匹配不到的问题。
+> 结果带 session 名、seq、角色和字符窗口 snippet（CJK 按 `char` 切分，不会产生非法字节
+> 偏移）。协议 `search.query {query, session_id?, limit?}`，`limit` 夹在 `1..=100`（默认
+> 20）。TUI `#` 打开全屏搜索：输入回车执行、`↑/↓` 选择、再回车在 pane 中打开；CLI
+> `eix search QUERY [--session ID] [--limit N]`。工具输出不进入索引。fork 时把前缀的
+> `search_docs` 行一并复制（走同一批触发器），所以新分支立刻可搜，不必等重启补索引。
 
 ## 17. 待定
 
@@ -489,7 +610,7 @@ prompt buffer 的 buffer-local mapping：
 - `@` 触发是否只在词首；是否需要转义。
 - 是否启用鼠标。
 - session 自动命名规则（首条 prompt / branch / 手动）。
-- 是否支持远程 attach（TCP + token）。
+- 远程 attach 的广播范围：当前所有已认证连接收到所有 session 的事件，是否按 session 订阅。
 
 ## 18. 命名
 

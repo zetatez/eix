@@ -8,20 +8,24 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use eix_core::{
-    ApprovalDecision, ApprovalResult, AttachResult, CancelResult, HelloResult, Notification,
-    Session, SessionList, SessionResult, SubmitResult,
+    ApprovalDecision, ApprovalResult, AttachResult, CancelResult, ContextLedgerResult, Endpoint,
+    HelloResult, Notification, ProcessKillResult, ProcessList, ProcessOutput, RewindResult,
+    SearchResult, Session, SessionList, SessionResult, SubmitResult,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use super::net::{NetEvent, Requester};
-use crate::client::ensure_running;
+use crate::client::ensure_endpoint;
 
 pub enum Command {
     Hello,
     List,
     Attach(String),
-    Create,
+    Create {
+        /// Create the session in its own git worktree.
+        worktree: bool,
+    },
     Submit {
         session_id: String,
         text: String,
@@ -34,6 +38,46 @@ pub enum Command {
         /// Selected hunk indices; `None` applies the whole change.
         hunks: Option<Vec<usize>>,
     },
+    ContextLedger {
+        session_id: String,
+    },
+    ContextOp {
+        session_id: String,
+        op: ContextOp,
+    },
+    ProcessList {
+        session_id: String,
+    },
+    ProcessOutput {
+        process_id: String,
+    },
+    ProcessKill {
+        process_id: String,
+    },
+    Fork {
+        session_id: String,
+        /// Copy history before this sequence; `None` copies everything.
+        at_seq: Option<u64>,
+        name: Option<String>,
+    },
+    Rewind {
+        session_id: String,
+        /// Restore the workspace to just before this sequence.
+        at_seq: Option<u64>,
+        name: Option<String>,
+    },
+    Search {
+        query: String,
+        session_id: Option<String>,
+        limit: Option<u32>,
+    },
+}
+
+/// Ledger edits map one-to-one onto `context.*` requests.
+pub enum ContextOp {
+    Drop { entry: String, dropped: bool },
+    Pin { entry: String, pinned: bool },
+    Compact { from_seq: u64, to_seq: u64 },
 }
 
 impl Command {
@@ -42,10 +86,17 @@ impl Command {
             Self::Hello => "connect",
             Self::List => "list",
             Self::Attach(_) => "attach",
-            Self::Create => "create",
+            Self::Create { .. } => "create",
             Self::Submit { .. } => "submit",
             Self::Cancel(_) => "cancel",
             Self::Approval { .. } => "approval",
+            Self::ContextLedger { .. } | Self::ContextOp { .. } => "context",
+            Self::ProcessList { .. } => "processes",
+            Self::ProcessOutput { .. } => "process output",
+            Self::ProcessKill { .. } => "kill process",
+            Self::Fork { .. } => "fork",
+            Self::Rewind { .. } => "rewind",
+            Self::Search { .. } => "search",
         }
     }
 }
@@ -57,21 +108,45 @@ pub enum Event {
     Created(Session),
     Submitted(SubmitResult),
     Cancelled(bool),
-    Approval { approval_id: String, accepted: bool },
+    Approval {
+        approval_id: String,
+        accepted: bool,
+    },
+    Ledger {
+        session_id: String,
+        result: ContextLedgerResult,
+    },
+    Processes {
+        session_id: String,
+        result: ProcessList,
+    },
+    ProcessOutput {
+        result: ProcessOutput,
+    },
+    ProcessKilled {
+        process_id: String,
+        killed: bool,
+    },
+    Forked(Session),
+    Rewound(Box<RewindResult>),
+    Search(SearchResult),
     Notification(Notification),
-    Error { context: String, message: String },
+    Error {
+        context: String,
+        message: String,
+    },
     Closed(String),
 }
 
 pub fn spawn(
-    socket: PathBuf,
+    endpoint: Endpoint,
     data_dir: PathBuf,
     config: Option<PathBuf>,
 ) -> (UnboundedSender<Command>, UnboundedReceiver<Event>) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        if let Err(err) = run(socket, data_dir, config, cmd_rx, ev_tx.clone()).await {
+        if let Err(err) = run(endpoint, data_dir, config, cmd_rx, ev_tx.clone()).await {
             let _ = ev_tx.send(Event::Error {
                 context: "connect".into(),
                 message: format!("{err:#}"),
@@ -82,15 +157,15 @@ pub fn spawn(
 }
 
 async fn run(
-    socket: PathBuf,
+    endpoint: Endpoint,
     data_dir: PathBuf,
     config: Option<PathBuf>,
     mut cmd_rx: UnboundedReceiver<Command>,
     ev_tx: UnboundedSender<Event>,
 ) -> Result<()> {
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
-    ensure_running(&socket, &data_dir, config.as_deref()).await?;
-    let (requester, mut net_events) = Requester::connect(&socket).await?;
+    ensure_endpoint(&endpoint, &data_dir, config.as_deref()).await?;
+    let (requester, mut net_events) = Requester::connect(&endpoint).await?;
 
     loop {
         tokio::select! {
@@ -144,12 +219,13 @@ async fn dispatch(
                 .await?;
             send(events, Event::Attached(decode(value)?))
         }
-        Command::Create => {
+        Command::Create { worktree } => {
             let value = requester
                 .request(
                     "session.create",
                     json!({
                         "cwd": cwd,
+                        "worktree": worktree,
                     }),
                 )
                 .await?;
@@ -197,6 +273,120 @@ async fn dispatch(
                     accepted: result.accepted,
                 },
             )
+        }
+        Command::ContextLedger { session_id } => {
+            let value = requester
+                .request("context.ledger", json!({ "session_id": session_id }))
+                .await?;
+            send(
+                events,
+                Event::Ledger {
+                    session_id,
+                    result: decode(value)?,
+                },
+            )
+        }
+        Command::ContextOp { session_id, op } => {
+            let (method, params) = match op {
+                ContextOp::Drop { entry, dropped } => (
+                    "context.drop",
+                    json!({ "session_id": session_id, "entry": entry, "dropped": dropped }),
+                ),
+                ContextOp::Pin { entry, pinned } => (
+                    "context.pin",
+                    json!({ "session_id": session_id, "entry": entry, "pinned": pinned }),
+                ),
+                ContextOp::Compact { from_seq, to_seq } => (
+                    "context.compact",
+                    json!({ "session_id": session_id, "from_seq": from_seq, "to_seq": to_seq }),
+                ),
+            };
+            let value = requester.request(method, params).await?;
+            send(
+                events,
+                Event::Ledger {
+                    session_id,
+                    result: decode(value)?,
+                },
+            )
+        }
+        Command::ProcessList { session_id } => {
+            let value = requester
+                .request("process.list", json!({ "session_id": session_id }))
+                .await?;
+            send(
+                events,
+                Event::Processes {
+                    session_id,
+                    result: decode(value)?,
+                },
+            )
+        }
+        Command::ProcessOutput { process_id } => {
+            let value = requester
+                .request("process.output", json!({ "process_id": process_id }))
+                .await?;
+            send(
+                events,
+                Event::ProcessOutput {
+                    result: decode(value)?,
+                },
+            )
+        }
+        Command::ProcessKill { process_id } => {
+            let value = requester
+                .request("process.kill", json!({ "process_id": process_id }))
+                .await?;
+            let result: ProcessKillResult = decode(value)?;
+            send(
+                events,
+                Event::ProcessKilled {
+                    process_id,
+                    killed: result.killed,
+                },
+            )
+        }
+        Command::Fork {
+            session_id,
+            at_seq,
+            name,
+        } => {
+            let value = requester
+                .request(
+                    "session.fork",
+                    json!({ "session_id": session_id, "at_seq": at_seq, "name": name }),
+                )
+                .await?;
+            let result: SessionResult = decode(value)?;
+            send(events, Event::Forked(result.session))
+        }
+        Command::Rewind {
+            session_id,
+            at_seq,
+            name,
+        } => {
+            let value = requester
+                .request(
+                    "session.rewind",
+                    json!({ "session_id": session_id, "at_seq": at_seq, "name": name }),
+                )
+                .await?;
+            let result: RewindResult = decode(value)?;
+            send(events, Event::Rewound(Box::new(result)))
+        }
+        Command::Search {
+            query,
+            session_id,
+            limit,
+        } => {
+            let value = requester
+                .request(
+                    "search.query",
+                    json!({ "query": query, "session_id": session_id, "limit": limit }),
+                )
+                .await?;
+            let result: SearchResult = decode(value)?;
+            send(events, Event::Search(result))
         }
     }
 }

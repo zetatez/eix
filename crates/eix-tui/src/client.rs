@@ -7,31 +7,60 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use eix_core::{Notification, Request, ServerMessage};
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
-use tokio::net::UnixStream;
+use eix_core::{Endpoint, Notification, Request, ServerMessage};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
+
+type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 pub struct Client {
-    writer: WriteHalf<UnixStream>,
-    reader: BufReader<ReadHalf<UnixStream>>,
+    writer: BoxWrite,
+    reader: BufReader<BoxRead>,
     next_id: u64,
     /// Notifications that arrived while waiting for a response.
     pending: VecDeque<Notification>,
 }
 
 impl Client {
-    pub async fn connect(socket: &Path) -> Result<Self> {
-        let stream = UnixStream::connect(socket)
-            .await
-            .with_context(|| format!("cannot connect to {}", socket.display()))?;
-        let (read, write) = tokio::io::split(stream);
-        Ok(Self {
-            writer: write,
-            reader: BufReader::new(read),
+    pub async fn connect(endpoint: &Endpoint) -> Result<Self> {
+        match endpoint {
+            Endpoint::Unix(socket) => {
+                let stream = UnixStream::connect(socket)
+                    .await
+                    .with_context(|| format!("cannot connect to {}", socket.display()))?;
+                let (read, write) = tokio::io::split(stream);
+                Ok(Self::from_split(read, write))
+            }
+            Endpoint::Tcp { addr, token } => {
+                let stream = TcpStream::connect(addr)
+                    .await
+                    .with_context(|| format!("cannot connect to tcp {addr}"))?;
+                let (read, write) = tokio::io::split(stream);
+                let mut client = Self::from_split(read, write);
+                if let Some(token) = token.as_deref() {
+                    let value = client.request("auth", json!({ "token": token })).await?;
+                    if value["authenticated"] != Value::Bool(true) {
+                        bail!("daemon rejected the remote token");
+                    }
+                }
+                Ok(client)
+            }
+        }
+    }
+
+    fn from_split<R, W>(read: R, write: W) -> Self
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        Self {
+            writer: Box::new(write),
+            reader: BufReader::new(Box::new(read)),
             next_id: 1,
             pending: VecDeque::new(),
-        })
+        }
     }
 
     pub async fn request(&mut self, method: &str, params: Value) -> Result<Value> {
@@ -85,14 +114,27 @@ impl Client {
     }
 }
 
-/// Connect to the daemon, starting `eixd` in the background if needed.
+/// Connect to the daemon, starting `eixd` in the background if needed. TCP
+/// endpoints are remote: they are never auto-started here.
 pub async fn ensure_daemon(
-    socket: &Path,
+    endpoint: &Endpoint,
     data_dir: &Path,
     config: Option<&Path>,
 ) -> Result<Client> {
-    ensure_running(socket, data_dir, config).await?;
-    Client::connect(socket).await
+    ensure_endpoint(endpoint, data_dir, config).await?;
+    Client::connect(endpoint).await
+}
+
+/// Make sure the endpoint is reachable, without opening a protocol client.
+pub async fn ensure_endpoint(
+    endpoint: &Endpoint,
+    data_dir: &Path,
+    config: Option<&Path>,
+) -> Result<()> {
+    match endpoint {
+        Endpoint::Unix(socket) => ensure_running(socket, data_dir, config).await,
+        Endpoint::Tcp { .. } => Ok(()),
+    }
 }
 
 /// Make sure a daemon is listening, without opening a protocol client.

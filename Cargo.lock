@@ -340,6 +340,7 @@ dependencies = [
  "anyhow",
  "eix-core",
  "futures-util",
+ "libc",
  "reqwest",
  "rusqlite",
  "serde",

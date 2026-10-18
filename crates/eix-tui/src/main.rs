@@ -5,6 +5,7 @@
 //! prompt, stream the answer, inspect the persisted transcript, cancel.
 
 mod client;
+mod nvim_frontend;
 mod tui;
 
 use std::io::{self, IsTerminal, Read, Write};
@@ -15,9 +16,11 @@ use eix_core::config as core_config;
 use eix_core::sandbox as core_sandbox;
 use eix_core::{
     ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload, AttachResult, CancelResult,
-    Config, Event, EventKind, HelloResult, PatchProposedPayload, PatchResultPayload, Session,
-    SessionList, SessionResult, SnapshotPayload, SubmitResult, ToolCallPayload, ToolResultPayload,
-    UserMessagePayload,
+    Config, ContextCompactedPayload, ContextDropPayload, ContextLedgerResult, ContextPinPayload,
+    Endpoint, Event, EventKind, HelloResult, PatchProposedPayload, PatchResultPayload,
+    ProcessExitedPayload, ProcessKillResult, ProcessList, ProcessOutput, ProcessStartedPayload,
+    RewindResult, SearchResult, Sector, Session, SessionList, SessionResult, SnapshotPayload,
+    SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -36,12 +39,17 @@ async fn main() -> Result<()> {
         Command::Daemon => daemon(&cli).await,
         Command::Doctor => doctor(&cli).await,
         Command::Sessions => sessions(&cli).await,
-        Command::New { name, cwd, model } => new_session(&cli, name, cwd, model).await,
+        Command::New {
+            name,
+            cwd,
+            model,
+            worktree,
+        } => new_session(&cli, name, cwd, model, worktree).await,
         Command::Send { session, text } => send(&cli, session, text).await,
         Command::Tui { session } => {
             let config = Config::load(cli.config_path.as_deref()).unwrap_or_default();
             tui::run(
-                cli.socket.clone(),
+                cli.endpoint.clone(),
                 cli.data_dir.clone(),
                 cli.config_path.clone(),
                 session,
@@ -56,6 +64,24 @@ async fn main() -> Result<()> {
         Command::Cancel { session } => cancel(&cli, session).await,
         Command::Approve { session, hunks } => approval(&cli, session, true, hunks).await,
         Command::Deny { session } => approval(&cli, session, false, None).await,
+        Command::Context(args) => context(&cli, args).await,
+        Command::Search {
+            query,
+            session,
+            limit,
+        } => search(&cli, query, session, limit).await,
+        Command::Fork {
+            session,
+            at,
+            name,
+            shared,
+        } => fork(&cli, session, at, name, shared).await,
+        Command::Rewind { session, at, name } => rewind(&cli, session, at, name).await,
+        Command::Worktree(cmd) => worktree(&cli, cmd).await,
+        Command::Nvim { session } => nvim(&cli, session).await,
+        Command::Processes { session } => processes(&cli, session).await,
+        Command::Tail { process } => tail(&cli, &process).await,
+        Command::Kill { process } => kill(&cli, &process).await,
     }
 }
 
@@ -63,6 +89,8 @@ struct Cli {
     socket: PathBuf,
     data_dir: PathBuf,
     config_path: Option<PathBuf>,
+    /// Resolved transport: Unix socket or TCP remote.
+    endpoint: Endpoint,
     command: Command,
 }
 
@@ -79,6 +107,8 @@ enum Command {
         name: Option<String>,
         cwd: Option<PathBuf>,
         model: Option<String>,
+        /// Create `.worktrees/<name>` and run there.
+        worktree: bool,
     },
     Send {
         session: Option<String>,
@@ -102,9 +132,63 @@ enum Command {
     Deny {
         session: Option<String>,
     },
+    Context(ContextArgs),
+    Search {
+        query: String,
+        session: Option<String>,
+        limit: Option<u32>,
+    },
+    Fork {
+        session: Option<String>,
+        /// Copy history before this sequence; `None` copies everything.
+        at: Option<u64>,
+        name: Option<String>,
+        /// Share the source workspace instead of creating a worktree.
+        shared: bool,
+    },
+    Rewind {
+        session: Option<String>,
+        /// Restore the workspace to just before this sequence.
+        at: Option<u64>,
+        name: Option<String>,
+    },
+    Worktree(WorktreeCmd),
+    Nvim {
+        session: Option<String>,
+    },
+    Processes {
+        session: Option<String>,
+    },
+    Tail {
+        process: String,
+    },
+    Kill {
+        process: String,
+    },
     Doctor,
     Daemon,
     Help,
+}
+
+#[derive(Clone)]
+enum WorktreeCmd {
+    List,
+    Remove {
+        session: Option<String>,
+        force: bool,
+    },
+}
+
+#[derive(Clone, Default)]
+struct ContextArgs {
+    session: Option<String>,
+    drop: Option<String>,
+    undrop: Option<String>,
+    pin: Option<String>,
+    unpin: Option<String>,
+    /// `FROM:TO` or `FROM..TO`; inclusive source event sequences.
+    compact: Option<String>,
+    summary: Option<String>,
 }
 
 impl Cli {
@@ -113,6 +197,8 @@ impl Cli {
         let mut socket = None;
         let mut data_dir = None;
         let mut config_path = None;
+        let mut tcp: Option<String> = std::env::var("EIX_TCP").ok();
+        let mut token: Option<String> = std::env::var("EIX_TCP_TOKEN").ok();
 
         // Global flags may appear anywhere (before or after the subcommand).
         // `--` stops flag scanning so prompt text can contain flag-like words.
@@ -132,7 +218,15 @@ impl Cli {
                 "--config" => {
                     config_path = Some(PathBuf::from(take_value(&mut args, i, "--config")?));
                 }
-                "-h" | "--help" => return Ok(Self::help(socket, data_dir, config_path)),
+                "--tcp" => {
+                    tcp = Some(take_value(&mut args, i, "--tcp")?);
+                }
+                "--token" => {
+                    token = Some(take_value(&mut args, i, "--token")?);
+                }
+                "-h" | "--help" => {
+                    return Ok(Self::help(socket, data_dir, config_path, tcp, token))
+                }
                 "-V" | "--version" => {
                     println!("eix {}", env!("CARGO_PKG_VERSION"));
                     std::process::exit(0);
@@ -155,10 +249,13 @@ impl Cli {
             parse_command(name, args)?
         };
 
+        let socket = socket.unwrap_or_else(core_config::socket_path);
+        let endpoint = Endpoint::new(socket.clone(), tcp, token);
         Ok(Self {
-            socket: socket.unwrap_or_else(core_config::socket_path),
+            socket,
             data_dir: data_dir.unwrap_or_else(core_config::data_dir),
             config_path,
+            endpoint,
             command,
         })
     }
@@ -167,17 +264,22 @@ impl Cli {
         socket: Option<PathBuf>,
         data_dir: Option<PathBuf>,
         config_path: Option<PathBuf>,
+        tcp: Option<String>,
+        token: Option<String>,
     ) -> Self {
+        let socket = socket.unwrap_or_else(core_config::socket_path);
+        let endpoint = Endpoint::new(socket.clone(), tcp, token);
         Self {
-            socket: socket.unwrap_or_else(core_config::socket_path),
+            socket,
             data_dir: data_dir.unwrap_or_else(core_config::data_dir),
             config_path,
+            endpoint,
             command: Command::Help,
         }
     }
 
     async fn connect(&self) -> Result<Client> {
-        ensure_daemon(&self.socket, &self.data_dir, self.config_path.as_deref()).await
+        ensure_daemon(&self.endpoint, &self.data_dir, self.config_path.as_deref()).await
     }
 }
 
@@ -198,11 +300,17 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let name = take_flag(&mut args, "--name")?;
             let cwd = take_flag(&mut args, "--cwd")?.map(PathBuf::from);
             let model = take_flag(&mut args, "--model")?;
+            let worktree = take_switch(&mut args, "--worktree");
             let name = name.or_else(|| {
                 let joined = args.join(" ").trim().to_string();
                 (!joined.is_empty()).then_some(joined)
             });
-            Ok(Command::New { name, cwd, model })
+            Ok(Command::New {
+                name,
+                cwd,
+                model,
+                worktree,
+            })
         }
         "send" => {
             let session = take_flag(&mut args, "--session")?;
@@ -242,6 +350,122 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let session = session.or_else(|| args.first().cloned());
             Ok(Command::Deny { session })
         }
+        "context" | "ctx" | "ledger" => {
+            let session = take_flag(&mut args, "--session")?;
+            let drop = take_flag(&mut args, "--drop")?;
+            let undrop = take_flag(&mut args, "--undrop")?;
+            let pin = take_flag(&mut args, "--pin")?;
+            let unpin = take_flag(&mut args, "--unpin")?;
+            let compact = take_flag(&mut args, "--compact")?;
+            let summary = take_flag(&mut args, "--summary")?;
+            let session = session.or_else(|| args.first().cloned());
+            let edits = [
+                drop.is_some(),
+                undrop.is_some(),
+                pin.is_some(),
+                unpin.is_some(),
+                compact.is_some(),
+            ]
+            .into_iter()
+            .filter(|active| *active)
+            .count();
+            if edits > 1 {
+                bail!(
+                    "eix context takes at most one of --drop, --undrop, --pin, --unpin, --compact"
+                );
+            }
+            if summary.is_some() && compact.is_none() {
+                bail!("--summary is only meaningful with --compact");
+            }
+            Ok(Command::Context(ContextArgs {
+                session,
+                drop,
+                undrop,
+                pin,
+                unpin,
+                compact,
+                summary,
+            }))
+        }
+        "search" | "find" => {
+            let session = take_flag(&mut args, "--session")?;
+            let limit = take_flag(&mut args, "--limit")?
+                .map(|value| value.parse::<u32>().context("invalid --limit"))
+                .transpose()?;
+            let query = args.join(" ").trim().to_string();
+            if query.is_empty() {
+                bail!("usage: eix search QUERY [--session ID] [--limit N]");
+            }
+            Ok(Command::Search {
+                query,
+                session,
+                limit,
+            })
+        }
+        "fork" => {
+            let session = take_flag(&mut args, "--session")?;
+            let at = take_flag(&mut args, "--at")?
+                .map(|value| value.parse::<u64>().context("invalid --at"))
+                .transpose()?;
+            let name = take_flag(&mut args, "--name")?;
+            let shared = take_switch(&mut args, "--shared");
+            Ok(Command::Fork {
+                session,
+                at,
+                name,
+                shared,
+            })
+        }
+        "rewind" => {
+            let session = take_flag(&mut args, "--session")?;
+            let at = take_flag(&mut args, "--at")?
+                .map(|value| value.parse::<u64>().context("invalid --at"))
+                .transpose()?;
+            let name = take_flag(&mut args, "--name")?;
+            Ok(Command::Rewind { session, at, name })
+        }
+        "worktree" | "wt" => {
+            let sub = args.first().cloned().unwrap_or_else(|| "list".to_string());
+            args.remove(0);
+            match sub.as_str() {
+                "list" | "ls" => {
+                    take_flag(&mut args, "--session")?;
+                    Ok(Command::Worktree(WorktreeCmd::List))
+                }
+                "remove" | "rm" => {
+                    let session = take_flag(&mut args, "--session")?;
+                    let force = take_switch(&mut args, "--force");
+                    let session = session.or_else(|| args.first().cloned());
+                    Ok(Command::Worktree(WorktreeCmd::Remove { session, force }))
+                }
+                other => {
+                    bail!("usage: eix worktree [list | remove SESSION [--force]] (got {other:?})")
+                }
+            }
+        }
+        "nvim" => {
+            let session = take_flag(&mut args, "--session")?;
+            let session = session.or_else(|| args.first().cloned());
+            Ok(Command::Nvim { session })
+        }
+        "ps" | "processes" => {
+            let session = take_flag(&mut args, "--session")?;
+            Ok(Command::Processes { session })
+        }
+        "tail" | "output" => {
+            let process = args
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("usage: eix tail <process>"))?;
+            Ok(Command::Tail { process })
+        }
+        "kill" => {
+            let process = args
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("usage: eix kill <process>"))?;
+            Ok(Command::Kill { process })
+        }
         "doctor" => Ok(Command::Doctor),
         "daemon" | "up" => Ok(Command::Daemon),
         "help" => Ok(Command::Help),
@@ -263,6 +487,17 @@ fn take_flag(args: &mut Vec<String>, flag: &str) -> Result<Option<String>> {
         return Ok(None);
     };
     Ok(Some(take_value(args, index, flag)?))
+}
+
+/// Remove a boolean `--flag` and report whether it was present.
+fn take_switch(args: &mut Vec<String>, flag: &str) -> bool {
+    match args.iter().position(|arg| arg == flag) {
+        Some(index) => {
+            args.remove(index);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Parse the comma-separated hunk selection for `eix approve --hunks`.
@@ -310,15 +545,19 @@ async fn new_session(
     name: Option<String>,
     cwd: Option<PathBuf>,
     model: Option<String>,
+    worktree: bool,
 ) -> Result<()> {
     let mut client = cli.connect().await?;
-    let session = create_session(&mut client, name, cwd, model).await?;
+    let session = create_session(&mut client, name, cwd, model, worktree).await?;
     println!(
         "{} {}  {}",
         session.status.symbol(),
         session.name,
         short_id(&session.id)
     );
+    if session.has_worktree() {
+        println!("worktree {}", session.cwd.display());
+    }
     Ok(())
 }
 
@@ -380,7 +619,7 @@ async fn chat(cli: &Cli, session: Option<String>) -> Result<()> {
                 }
             }
             "/new" => {
-                session = create_session(&mut client, None, None, None).await?;
+                session = create_session(&mut client, None, None, None, false).await?;
                 println!("new session {} ({})", session.name, short_id(&session.id));
             }
             "/log" => {
@@ -485,6 +724,408 @@ async fn approval(
     Ok(())
 }
 
+async fn context(cli: &Cli, args: ContextArgs) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, args.session.as_deref(), false).await?;
+    let result: ContextLedgerResult = if let Some(entry) = args.drop {
+        request_ledger(
+            &mut client,
+            "context.drop",
+            json!({"session_id": session.id, "entry": entry, "dropped": true}),
+        )
+        .await?
+    } else if let Some(entry) = args.undrop {
+        request_ledger(
+            &mut client,
+            "context.drop",
+            json!({"session_id": session.id, "entry": entry, "dropped": false}),
+        )
+        .await?
+    } else if let Some(entry) = args.pin {
+        request_ledger(
+            &mut client,
+            "context.pin",
+            json!({"session_id": session.id, "entry": entry, "pinned": true}),
+        )
+        .await?
+    } else if let Some(entry) = args.unpin {
+        request_ledger(
+            &mut client,
+            "context.pin",
+            json!({"session_id": session.id, "entry": entry, "pinned": false}),
+        )
+        .await?
+    } else if let Some(range) = args.compact {
+        let (from, to) = parse_range(&range)?;
+        request_ledger(
+            &mut client,
+            "context.compact",
+            json!({
+                "session_id": session.id,
+                "from_seq": from,
+                "to_seq": to,
+                "summary": args.summary,
+            }),
+        )
+        .await?
+    } else {
+        request_ledger(
+            &mut client,
+            "context.ledger",
+            json!({"session_id": session.id}),
+        )
+        .await?
+    };
+    render_ledger(&session, &result);
+    Ok(())
+}
+
+async fn request_ledger(
+    client: &mut Client,
+    method: &str,
+    params: Value,
+) -> Result<ContextLedgerResult> {
+    Ok(serde_json::from_value(
+        client.request(method, params).await?,
+    )?)
+}
+
+/// Full-text search over user and assistant messages in every session.
+async fn search(
+    cli: &Cli,
+    query: String,
+    session: Option<String>,
+    limit: Option<u32>,
+) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session_id = match session {
+        Some(id) => Some(resolve_session(&mut client, Some(&id), false).await?.id),
+        None => None,
+    };
+    let result: SearchResult = serde_json::from_value(
+        client
+            .request(
+                "search.query",
+                json!({ "query": query, "session_id": session_id, "limit": limit }),
+            )
+            .await?,
+    )?;
+    if result.hits.is_empty() {
+        println!("no matches for {:?}", result.query);
+        return Ok(());
+    }
+    println!("{} hit(s) for {:?}", result.hits.len(), result.query);
+    for hit in result.hits {
+        println!(
+            "  {} ({}) e{} {}",
+            hit.session_name,
+            short_id(&hit.session_id),
+            hit.seq,
+            hit.role
+        );
+        println!("    {}", hit.snippet);
+    }
+    Ok(())
+}
+
+/// Fork a session: copy the (optionally truncated) history into a new
+/// session. The workspace is shared, so files are *not* rolled back.
+async fn fork(
+    cli: &Cli,
+    session: Option<String>,
+    at: Option<u64>,
+    name: Option<String>,
+    shared: bool,
+) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let source = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result: SessionResult = serde_json::from_value(
+        client
+            .request(
+                "session.fork",
+                json!({
+                    "session_id": source.id,
+                    "at_seq": at,
+                    "name": name,
+                    "worktree": if shared { Some(false) } else { None },
+                }),
+            )
+            .await?,
+    )?;
+    let fork = result.session;
+    match at {
+        Some(seq) => println!(
+            "forked {} ({}) from {} before e{seq}",
+            fork.name,
+            short_id(&fork.id),
+            source.name
+        ),
+        None => println!(
+            "forked {} ({}) from {} (full history)",
+            fork.name,
+            short_id(&fork.id),
+            source.name
+        ),
+    }
+    if let Some(worktree) = &fork.worktree {
+        println!("worktree {}", worktree.display());
+        println!("note: files are shared through git only; use `eix rewind` to roll back");
+    } else {
+        println!("note: the workspace is shared; files were not rolled back");
+    }
+    Ok(())
+}
+
+async fn rewind(
+    cli: &Cli,
+    session: Option<String>,
+    at: Option<u64>,
+    name: Option<String>,
+) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let source = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result: RewindResult = serde_json::from_value(
+        client
+            .request(
+                "session.rewind",
+                json!({ "session_id": source.id, "at_seq": at, "name": name }),
+            )
+            .await?,
+    )?;
+    let fork = &result.session;
+    match at {
+        Some(seq) => println!(
+            "rewound {} ({}) from {} before e{seq}",
+            fork.name,
+            short_id(&fork.id),
+            source.name
+        ),
+        None => println!(
+            "rewound {} ({}) from {} (full history; nothing to roll back)",
+            fork.name,
+            short_id(&fork.id),
+            source.name
+        ),
+    }
+    println!(
+        "workspace: {} snapshot(s), {} file(s) restored, {} removed{}",
+        result.snapshots,
+        result.files_restored,
+        result.files_removed,
+        if result.files_missing > 0 {
+            format!(", {} missing", result.files_missing)
+        } else {
+            String::new()
+        }
+    );
+    if !result.restored {
+        println!("warning: the workspace rollback is incomplete");
+    }
+    for warning in &result.warnings {
+        println!("note: {warning}");
+    }
+    if let Some(worktree) = &fork.worktree {
+        println!("worktree {}", worktree.display());
+    }
+    Ok(())
+}
+
+async fn worktree(cli: &Cli, cmd: WorktreeCmd) -> Result<()> {
+    let mut client = cli.connect().await?;
+    match cmd {
+        WorktreeCmd::List => {
+            let sessions = list_sessions(&mut client).await?;
+            let mut any = false;
+            for session in sessions.iter().filter(|session| session.has_worktree()) {
+                any = true;
+                let path = session.worktree.as_deref().unwrap_or(session.cwd.as_path());
+                let state = if path.is_dir() { "ok" } else { "missing" };
+                println!(
+                    "{} {:<28} {:<10} {:<8} {}",
+                    session.status.symbol(),
+                    truncate(&session.name, 28),
+                    short_id(&session.id),
+                    state,
+                    path.display()
+                );
+            }
+            if !any {
+                println!(
+                    "no session worktrees — `eix new --worktree` or fork a session inside a git repo"
+                );
+            }
+            Ok(())
+        }
+        WorktreeCmd::Remove { session, force } => {
+            let target = resolve_session(&mut client, session.as_deref(), false).await?;
+            let result: WorktreeRemoveResult = serde_json::from_value(
+                client
+                    .request(
+                        "session.worktree.remove",
+                        json!({ "session_id": target.id, "force": force }),
+                    )
+                    .await?,
+            )?;
+            if !result.removed {
+                bail!("{}", result.message);
+            }
+            println!("{}", result.message);
+            Ok(())
+        }
+    }
+}
+
+async fn nvim(cli: &Cli, session: Option<String>) -> Result<()> {
+    // Start the local daemon first; on TCP the plugin connects to the remote
+    // endpoint directly (and `ensure_daemon` is a no-op).
+    ensure_daemon(&cli.endpoint, &cli.data_dir, cli.config_path.as_deref()).await?;
+    crate::nvim_frontend::launch(cli.endpoint.clone(), &cli.data_dir, session).await
+}
+
+async fn processes(cli: &Cli, session: Option<String>) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session_id = match session {
+        Some(needle) => Some(resolve_session(&mut client, Some(&needle), false).await?.id),
+        None => None,
+    };
+    let list: ProcessList = serde_json::from_value(
+        client
+            .request("process.list", json!({ "session_id": session_id }))
+            .await?,
+    )?;
+    if list.processes.is_empty() {
+        println!("no background processes");
+        return Ok(());
+    }
+    for process in &list.processes {
+        let code = process
+            .exit_code
+            .map(|code| format!("{code}"))
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{}  {:<7} {:<4} {}  {}",
+            process.short_id(),
+            process.status.as_str(),
+            code,
+            process.command,
+            process.log
+        );
+    }
+    Ok(())
+}
+
+async fn tail(cli: &Cli, process: &str) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let output: ProcessOutput = serde_json::from_value(
+        client
+            .request("process.output", json!({ "process_id": process }))
+            .await?,
+    )?;
+    let code = output
+        .exit_code
+        .map(|code| format!(" · exit {code}"))
+        .unwrap_or_default();
+    println!(
+        "process {} · {}{} · {} bytes{}",
+        output.process_id,
+        output.status.as_str(),
+        code,
+        output.bytes,
+        if output.truncated { " · tail" } else { "" }
+    );
+    print!("{}", output.text);
+    if !output.text.is_empty() && !output.text.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+async fn kill(cli: &Cli, process: &str) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let result: ProcessKillResult = serde_json::from_value(
+        client
+            .request("process.kill", json!({ "process_id": process }))
+            .await?,
+    )?;
+    if result.killed {
+        println!("killing {process}");
+    } else {
+        println!("process {process} is not running");
+    }
+    Ok(())
+}
+
+fn render_ledger(session: &Session, result: &ContextLedgerResult) {
+    let remaining = result.budget_tokens.saturating_sub(result.total_tokens);
+    println!(
+        "context · {} · {} / {} tokens ({} left)",
+        session.name, result.total_tokens, result.budget_tokens, remaining
+    );
+    if result.trimmed > 0 {
+        println!(
+            "  {} entries auto-trimmed to fit the budget",
+            result.trimmed
+        );
+    }
+    if result.entries.is_empty() {
+        println!("  (empty)");
+        return;
+    }
+    for sector in Sector::ALL {
+        let entries: Vec<_> = result
+            .entries
+            .iter()
+            .filter(|entry| entry.sector == sector)
+            .collect();
+        if entries.is_empty() {
+            continue;
+        }
+        let usage = result
+            .sectors
+            .iter()
+            .find(|usage| usage.sector == sector)
+            .map(|usage| (usage.tokens, usage.budget_tokens))
+            .unwrap_or((0, 0));
+        println!("\n{}  ({} / {} tokens)", sector.as_str(), usage.0, usage.1);
+        for entry in entries {
+            let mut flags = Vec::new();
+            if entry.pinned {
+                flags.push("pin");
+            }
+            if entry.dropped {
+                flags.push(if entry.auto { "cut" } else { "off" });
+            }
+            if entry.compacted {
+                flags.push("sum");
+            }
+            let flag = format!("{:<7}", flags.join(","));
+            println!(
+                "  {:<18} {:>6}t  {} {}",
+                entry.id, entry.tokens, flag, entry.preview
+            );
+        }
+    }
+}
+
+fn parse_range(value: &str) -> Result<(u64, u64)> {
+    let (from, to) = value
+        .split_once(':')
+        .or_else(|| value.split_once(".."))
+        .ok_or_else(|| anyhow::anyhow!("--compact expects FROM:TO, e.g. 3:9"))?;
+    let from: u64 = from
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid start sequence in {value:?}"))?;
+    let to: u64 = to
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid end sequence in {value:?}"))?;
+    if from == 0 || to < from {
+        bail!("--compact needs 0 < FROM <= TO");
+    }
+    Ok((from, to))
+}
+
 async fn daemon(cli: &Cli) -> Result<()> {
     let mut client = cli.connect().await?;
     let hello: HelloResult = serde_json::from_value(client.request("hello", Value::Null).await?)?;
@@ -555,6 +1196,20 @@ async fn doctor(cli: &Cli) -> Result<()> {
                     "off"
                 }
             );
+            let agents = std::env::current_dir()
+                .ok()
+                .map(|cwd| cwd.join("AGENTS.md"))
+                .is_some_and(|path| path.exists());
+            println!(
+                "context  {} tokens · AGENTS.md {} · workspace summary {}",
+                config.context.budget_tokens,
+                if agents { "found" } else { "missing" },
+                if config.context.workspace_summary {
+                    "on"
+                } else {
+                    "off"
+                }
+            );
         }
         Err(err) => println!("config   ERROR: {err}"),
     }
@@ -596,6 +1251,7 @@ async fn create_session(
     name: Option<String>,
     cwd: Option<PathBuf>,
     model: Option<String>,
+    worktree: bool,
 ) -> Result<Session> {
     let cwd = match cwd {
         Some(cwd) => cwd,
@@ -609,6 +1265,7 @@ async fn create_session(
                     "name": name,
                     "cwd": cwd,
                     "model": model,
+                    "worktree": worktree,
                 }),
             )
             .await?,
@@ -637,7 +1294,7 @@ async fn resolve_session(
         return Ok(session.clone());
     }
     if create {
-        return create_session(client, None, None, None).await;
+        return create_session(client, None, None, None, false).await;
     }
     bail!("no sessions yet — run `eix new` first")
 }
@@ -944,7 +1601,66 @@ fn render_events(events: &[Event]) {
                     .unwrap_or("?");
                 println!("-- {from} -> {to}");
             }
-            _ => {}
+            EventKind::ContextPinned => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ContextPinPayload>(event.payload.clone())
+                {
+                    println!(
+                        "ctx> {} {}",
+                        if payload.pinned { "pin" } else { "unpin" },
+                        payload.entry
+                    );
+                }
+            }
+            EventKind::ContextDropped => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ContextDropPayload>(event.payload.clone())
+                {
+                    println!(
+                        "ctx> {} {}",
+                        if payload.dropped { "drop" } else { "restore" },
+                        payload.entry
+                    );
+                }
+            }
+            EventKind::ContextCompacted => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ContextCompactedPayload>(event.payload.clone())
+                {
+                    println!(
+                        "ctx> compact {}..={} ({} messages, ~{}t) {}",
+                        payload.from_seq,
+                        payload.to_seq,
+                        payload.messages,
+                        payload.tokens,
+                        payload.summary
+                    );
+                }
+            }
+            EventKind::ProcessStarted => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ProcessStartedPayload>(event.payload.clone())
+                {
+                    println!(
+                        "proc> started {} (pid {}) {}",
+                        payload.process_id, payload.pid, payload.command
+                    );
+                }
+            }
+            EventKind::ProcessExited => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ProcessExitedPayload>(event.payload.clone())
+                {
+                    let code = payload
+                        .exit_code
+                        .map(|code| format!(" ({code})"))
+                        .unwrap_or_default();
+                    println!(
+                        "proc> {} {}{} in {}ms",
+                        payload.process_id, payload.status, code, payload.duration_ms
+                    );
+                }
+            }
         }
     }
 }
@@ -1035,14 +1751,33 @@ COMMANDS:
     chat [--session ID]        interactive chat (non-TUI)
     send [--session ID] TEXT   send one prompt and stream the answer
     ls                         list sessions
-    new [--name N] [--cwd P] [--model M]
-                               create a session
+    new [--name N] [--cwd P] [--model M] [--worktree]
+                               create a session (--worktree: .worktrees/<name>)
     log [--session ID]         print the persisted transcript
     rename [--session ID] NAME
     cancel [--session ID]      cancel the running turn
     approve [--session ID] [--hunks 0,2]
                                approve the pending tool call (all or selected hunks)
     deny [--session ID]        deny the pending tool call
+    context [--session ID]     show the context ledger (tokens per sector)
+    context --drop ENTRY       drop an entry (e.g. e12, workspace, instructions:AGENTS.md)
+    context --undrop ENTRY     restore a dropped entry
+    context --pin ENTRY        never auto-trim an entry (--unpin to undo)
+    context --compact FROM:TO [--summary TEXT]
+                               replace a range of history with a summary
+    ps [--session ID]          list background processes
+    tail PROCESS               print a process's log tail
+    kill PROCESS               stop a background process
+    fork [--session ID] [--at SEQ] [--name NAME] [--shared]
+                               copy history into a new session (--shared: same files;
+                               default: a git worktree when inside a repo)
+    rewind [--session ID] [--at SEQ] [--name NAME]
+                               fork and roll the workspace back to before SEQ
+    worktree [list | remove SESSION [--force]]
+                               inspect or delete session worktrees
+    nvim [--session ID]        open the Neovim frontend against this daemon
+    search QUERY [--session ID] [--limit N]
+                               full-text search over message history
     doctor                     diagnose config, paths and daemon
     daemon                     start/attach the daemon and print its status
     help                       show this help
@@ -1051,6 +1786,8 @@ OPTIONS:
     --socket <path>     daemon socket (default: $XDG_RUNTIME_DIR/eix.sock)
     --data-dir <path>   state directory (default: ~/.local/share/eix)
     --config <path>     config file (default: ~/.config/eix/config.toml)
+    --tcp <host:port>   connect to a remote daemon instead of the socket
+    --token <token>     remote token (or EIX_TCP / EIX_TCP_TOKEN)
 
 The daemon starts automatically. With no command, `eix` opens the TUI; when stdout
 is piped it falls back to `eix chat`. Prompt text after `--` is never parsed as a flag.
@@ -1059,7 +1796,17 @@ EXAMPLES:
     eix send 'explain the session model in DESIGN.md'
     echo 'review the diff' | eix send
     EIX_MODEL=qwen2.5-coder eix chat
-    eix new --name auth --cwd ~/src/app"
+    eix new --name auth --cwd ~/src/app --worktree
+    eix context
+    eix context --compact 3:9 --summary 'we settled on a SQLite event log'
+    eix ps
+    eix tail 4f2a9c11
+    eix fork --at 12
+    eix rewind --at 12
+    eix worktree list
+    eix worktree remove 4f2a9c11 --force
+    eix --tcp 127.0.0.1:7777 --token \"$EIX_TOKEN\" ls
+    eix search 'sqlite event log'"
     );
 }
 
@@ -1080,6 +1827,51 @@ mod tests {
         assert!(parse_hunks("0,,1").is_err());
         assert!(parse_hunks("x").is_err());
         assert!(parse_hunks("-1").is_err());
+    }
+
+    #[test]
+    fn parses_search_query_with_optional_flags() {
+        match parse_command("search".to_string(), vec!["sqlite".into(), "events".into()]).unwrap() {
+            Command::Search {
+                query,
+                session,
+                limit,
+            } => {
+                assert_eq!(query, "sqlite events");
+                assert!(session.is_none());
+                assert!(limit.is_none());
+            }
+            _ => panic!("expected search"),
+        }
+        match parse_command(
+            "search".to_string(),
+            vec![
+                "timeout".into(),
+                "--session".into(),
+                "abc".into(),
+                "--limit".into(),
+                "5".into(),
+            ],
+        )
+        .unwrap()
+        {
+            Command::Search {
+                query,
+                session,
+                limit,
+            } => {
+                assert_eq!(query, "timeout");
+                assert_eq!(session.as_deref(), Some("abc"));
+                assert_eq!(limit, Some(5));
+            }
+            _ => panic!("expected search"),
+        }
+        assert!(parse_command("search".to_string(), Vec::new()).is_err());
+        assert!(parse_command(
+            "search".to_string(),
+            vec!["x".into(), "--limit".into(), "no".into()]
+        )
+        .is_err());
     }
 
     #[test]

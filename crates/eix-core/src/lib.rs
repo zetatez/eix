@@ -5,31 +5,42 @@
 //! commands over the protocol in [`protocol`].
 
 pub mod config;
+pub mod context;
 pub mod event;
 pub mod message;
+pub mod nvim_plugin;
+pub mod process;
 pub mod protocol;
 pub mod sandbox;
+pub mod search;
 pub mod session;
 
 pub use config::{
-    Config, ConfigError, InputBackend, InputConfig, NotificationsConfig, ProviderConfig,
-    SandboxMode, ToolPolicy, ToolsConfig,
+    Config, ConfigError, ContextConfig, InputBackend, InputConfig, NotificationsConfig,
+    ProviderConfig, SandboxMode, ServerConfig, ToolPolicy, ToolsConfig,
 };
+pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
-    payload, ApprovalRequiredPayload, AssistantMessagePayload, ErrorPayload, Event, EventKind,
-    HunkInfo, PatchProposedPayload, PatchResultPayload, SnapshotPayload, StatusChangedPayload,
-    ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    payload, ApprovalRequiredPayload, AssistantMessagePayload, ContextCompactedPayload,
+    ContextDropPayload, ContextPinPayload, ErrorPayload, Event, EventKind, HunkInfo,
+    PatchProposedPayload, PatchResultPayload, ProcessExitedPayload, ProcessStartedPayload,
+    SnapshotPayload, StatusChangedPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, Role, ToolCall, ToolDefinition, Usage,
 };
+pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{
-    ApprovalDecision, ApprovalRespondParams, ApprovalResult, AttachResult, CancelResult,
-    CreateSessionParams, EventsParams, EventsResult, HelloResult, Notification, PatchApplyParams,
-    PatchRejectParams, PatchResult, RenameParams, Request, Response, ServerMessage, SessionList,
-    SessionRef, SessionResult, SubmitParams, SubmitResult, PROTOCOL_VERSION,
+    ApprovalDecision, ApprovalRespondParams, ApprovalResult, AttachResult, AuthParams, AuthResult,
+    CancelResult, ContextCompactParams, ContextDropParams, ContextLedgerParams, ContextPinParams,
+    CreateSessionParams, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult,
+    Notification, PatchApplyParams, PatchRejectParams, PatchResult, ProcessKillParams,
+    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
+    RewindResult, ServerMessage, SessionList, SessionRef, SessionResult, SubmitParams,
+    SubmitResult, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
 };
-pub use session::{Session, SessionId, SessionStatus};
+pub use search::{SearchHit, SearchParams, SearchResult};
+pub use session::{Session, SessionId, SessionOrigin, SessionStatus};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

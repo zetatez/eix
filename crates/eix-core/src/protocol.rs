@@ -15,6 +15,46 @@ use crate::{Event, Session, SessionId};
 /// Bumped whenever a change breaks older clients.
 pub const PROTOCOL_VERSION: u32 = 1;
 
+/// Where a frontend connects. The Unix socket is the default and is protected
+/// by filesystem permissions; TCP is opt-in and requires a token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Endpoint {
+    Unix(PathBuf),
+    Tcp { addr: String, token: Option<String> },
+}
+
+impl Endpoint {
+    pub fn new(socket: impl Into<PathBuf>, tcp: Option<String>, token: Option<String>) -> Self {
+        match tcp
+            .map(|addr| addr.trim().to_string())
+            .filter(|addr| !addr.is_empty())
+        {
+            Some(addr) => Self::Tcp { addr, token },
+            None => Self::Unix(socket.into()),
+        }
+    }
+
+    pub fn is_tcp(&self) -> bool {
+        matches!(self, Self::Tcp { .. })
+    }
+
+    pub fn token(&self) -> Option<&str> {
+        match self {
+            Self::Tcp { token, .. } => token.as_deref(),
+            Self::Unix(_) => None,
+        }
+    }
+}
+
+impl std::fmt::Display for Endpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unix(path) => write!(f, "{}", path.display()),
+            Self::Tcp { addr, .. } => write!(f, "tcp://{addr}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub id: u64,
@@ -113,6 +153,77 @@ pub struct CreateSessionParams {
     pub cwd: Option<PathBuf>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Create `.worktrees/<name>` and run the session there. Requires `cwd`
+    /// (or the daemon's cwd) to be inside a git work tree.
+    #[serde(default)]
+    pub worktree: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkParams {
+    pub session_id: SessionId,
+    /// Copy events with `seq < at_seq`. `None` copies the whole history.
+    #[serde(default)]
+    pub at_seq: Option<u64>,
+    /// Defaults to `<root name>~N`.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// `None` = auto: give the fork its own worktree when the source lives in a
+    /// git work tree. `Some(false)` shares the source workspace.
+    #[serde(default)]
+    pub worktree: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindParams {
+    pub session_id: SessionId,
+    /// Restore the workspace to just before this sequence (exclusive). `None`
+    /// means "now", which only forks and leaves the workspace alone.
+    #[serde(default)]
+    pub at_seq: Option<u64>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// Result of `session.rewind`. `restored` is false when at least one snapshot
+/// could not be applied; `warnings` explains why, including files whose bytes
+/// were never captured.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindResult {
+    pub session: Session,
+    pub restored: bool,
+    pub snapshots: usize,
+    pub files_restored: usize,
+    pub files_removed: usize,
+    pub files_missing: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeRemoveParams {
+    pub session_id: SessionId,
+    /// Pass `--force` to `git worktree remove` (discards uncommitted files).
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeRemoveResult {
+    pub removed: bool,
+    pub message: String,
+}
+
+/// First request on a TCP connection. Unix sockets are already protected by
+/// filesystem permissions and skip this step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthParams {
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthResult {
+    pub authenticated: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -190,6 +301,57 @@ pub struct EventsParams {
     pub session_id: SessionId,
     #[serde(default)]
     pub after_seq: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextLedgerParams {
+    pub session_id: SessionId,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextDropParams {
+    pub session_id: SessionId,
+    pub entry: String,
+    /// `None` means drop; `Some(false)` restores the entry.
+    #[serde(default)]
+    pub dropped: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPinParams {
+    pub session_id: SessionId,
+    pub entry: String,
+    pub pinned: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCompactParams {
+    pub session_id: SessionId,
+    /// Inclusive range of source event sequence numbers.
+    pub from_seq: u64,
+    pub to_seq: u64,
+    /// Replacement text. A mechanical note is generated when omitted.
+    #[serde(default)]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessListParams {
+    /// `None` lists processes across every session.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessOutputParams {
+    pub process_id: String,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessKillParams {
+    pub process_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

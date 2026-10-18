@@ -8,9 +8,10 @@ use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eix_core::{
     ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
-    Event as SessionEvent, EventKind, HelloResult, HunkInfo, PatchProposedPayload,
-    PatchResultPayload, Session, SessionStatus, SubmitResult, ToolCallPayload, ToolResultPayload,
-    UserMessagePayload,
+    ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
+    PatchProposedPayload, PatchResultPayload, ProcessInfo, ProcessList, ProcessOutput,
+    ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult,
+    ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 use eix_nvim::embedded::NvimInput;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -23,7 +24,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::controller::{Command, Event};
+use super::controller::{Command, ContextOp, Event};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -355,6 +356,165 @@ struct DiffView {
     cursor: usize,
 }
 
+/// Full-screen context ledger, opened with `c` from the transcript.
+struct LedgerView {
+    session_id: String,
+    result: ContextLedgerResult,
+    cursor: usize,
+    scroll: usize,
+    /// Entries whose detail is expanded.
+    expanded: HashSet<String>,
+    /// Source seq of the first entry in a pending compaction range.
+    mark: Option<u64>,
+}
+
+impl LedgerView {
+    fn new(session_id: String, result: ContextLedgerResult) -> Self {
+        Self {
+            session_id,
+            result,
+            cursor: 0,
+            scroll: 0,
+            expanded: HashSet::new(),
+            mark: None,
+        }
+    }
+
+    fn entry(&self) -> Option<&ContextEntryInfo> {
+        self.result.entries.get(self.cursor)
+    }
+
+    fn set_result(&mut self, result: ContextLedgerResult) {
+        self.result = result;
+        self.cursor = self.cursor.min(self.result.entries.len().saturating_sub(1));
+    }
+
+    /// Event entries are named `e<seq>`; synthesized entries are not
+    /// compactable.
+    fn seq_of(entry: &ContextEntryInfo) -> Option<u64> {
+        entry.id.strip_prefix('e')?.parse().ok()
+    }
+}
+
+/// Full-screen background process list, opened with `P` from the transcript.
+struct ProcessView {
+    session_id: String,
+    processes: Vec<ProcessInfo>,
+    cursor: usize,
+    /// Tail of the selected process.
+    tail: String,
+    /// Process the tail belongs to, so late chunks can be filtered.
+    tail_id: Option<String>,
+    /// Lines scrolled up from the end (0 follows the output).
+    scroll: usize,
+}
+
+/// Live tail kept in the view; older bytes are dropped.
+const PROCESS_TAIL_BYTES: usize = 128 * 1024;
+
+impl ProcessView {
+    fn new(session_id: String) -> Self {
+        Self {
+            session_id,
+            processes: Vec::new(),
+            cursor: 0,
+            tail: String::new(),
+            tail_id: None,
+            scroll: 0,
+        }
+    }
+
+    fn selected(&self) -> Option<&ProcessInfo> {
+        self.processes.get(self.cursor)
+    }
+
+    /// Replace the list, keeping the cursor on the same process.
+    fn set_list(&mut self, list: ProcessList) {
+        let selected = self.selected().map(|process| process.id.clone());
+        self.processes = list.processes;
+        if let Some(id) = selected {
+            if let Some(index) = self.processes.iter().position(|process| process.id == id) {
+                self.cursor = index;
+            }
+        }
+        self.cursor = self.cursor.min(self.processes.len().saturating_sub(1));
+        if self.processes.is_empty() {
+            self.tail.clear();
+            self.tail_id = None;
+            self.scroll = 0;
+        }
+    }
+
+    fn set_tail(&mut self, output: ProcessOutput) {
+        self.tail = output.text;
+        self.tail_id = Some(output.process_id);
+        self.scroll = 0;
+    }
+
+    /// Append a live chunk when it belongs to the shown process.
+    fn append(&mut self, process_id: &str, chunk: &str) {
+        if self.tail_id.as_deref() != Some(process_id) {
+            return;
+        }
+        self.tail.push_str(chunk);
+        if self.tail.len() > PROCESS_TAIL_BYTES {
+            let mut cut = self.tail.len() - PROCESS_TAIL_BYTES;
+            while !self.tail.is_char_boundary(cut) {
+                cut += 1;
+            }
+            self.tail = self.tail.split_off(cut);
+        }
+    }
+
+    /// Reflect a `process.exited` notification in the list.
+    fn mark_exited(&mut self, process_id: &str, status: ProcessStatus, exit_code: Option<i32>) {
+        if let Some(process) = self
+            .processes
+            .iter_mut()
+            .find(|process| process.id == process_id)
+        {
+            process.status = status;
+            process.exit_code = exit_code;
+        }
+    }
+}
+
+/// Full-screen history search, opened with `#` from the transcript.
+struct SearchView {
+    query: String,
+    hits: Vec<SearchHit>,
+    cursor: usize,
+    /// A request is in flight.
+    searching: bool,
+    /// The query changed since the shown hits were produced, so Enter searches
+    /// again instead of opening the selection.
+    dirty: bool,
+}
+
+impl SearchView {
+    fn new() -> Self {
+        Self {
+            query: String::new(),
+            hits: Vec::new(),
+            cursor: 0,
+            searching: false,
+            dirty: false,
+        }
+    }
+
+    fn selected(&self) -> Option<&SearchHit> {
+        self.hits.get(self.cursor)
+    }
+
+    fn move_cursor(&mut self, delta: isize) {
+        if self.hits.is_empty() {
+            return;
+        }
+        let len = self.hits.len() as isize;
+        self.cursor = (self.cursor as isize + delta).clamp(0, len - 1) as usize;
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Direction {
     Left,
@@ -391,6 +551,12 @@ pub struct App {
     approvals: HashMap<String, PendingApproval>,
     /// Full-screen diff review, when open.
     diff_view: Option<DiffView>,
+    /// Full-screen context ledger, when open.
+    ledger: Option<LedgerView>,
+    /// Full-screen background process list, when open.
+    process_view: Option<ProcessView>,
+    /// Full-screen history search, when open.
+    search_view: Option<SearchView>,
     status: String,
     error: Option<String>,
     connected: bool,
@@ -430,6 +596,9 @@ impl App {
             pane_areas: Vec::new(),
             approvals: HashMap::new(),
             diff_view: None,
+            ledger: None,
+            process_view: None,
+            search_view: None,
             status: "connecting…".into(),
             error: None,
             connected: false,
@@ -549,7 +718,7 @@ impl App {
                 if !self.initialized {
                     self.initialized = true;
                     if self.sessions.is_empty() {
-                        self.create_session(tx);
+                        self.create_session(tx, false);
                     } else {
                         let index = match self.initial_session.as_deref() {
                             Some(needle) => match self.find_session(needle) {
@@ -585,6 +754,80 @@ impl App {
                 self.status = "session created".into();
                 let _ = tx.send(Command::Attach(id));
             }
+            Event::Forked(session) => {
+                let id = session.id.clone();
+                let name = session.name.clone();
+                let worktree = session.worktree.clone();
+                self.upsert_session(session, true);
+                self.selected = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == id)
+                    .unwrap_or(0);
+                self.pending_attach = Some(PendingAttach {
+                    session_id: id.clone(),
+                    slot: AttachSlot::New,
+                });
+                self.error = None;
+                self.status = match worktree {
+                    Some(path) => format!("forked {name} · worktree {}", path.display()),
+                    None => format!("forked {name} · shared workspace"),
+                };
+                let _ = tx.send(Command::Attach(id));
+            }
+            Event::Rewound(result) => {
+                let RewindResult {
+                    session,
+                    restored,
+                    snapshots,
+                    files_restored,
+                    files_removed,
+                    files_missing,
+                    warnings,
+                } = *result;
+                let id = session.id.clone();
+                let name = session.name.clone();
+                self.upsert_session(session, true);
+                self.selected = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == id)
+                    .unwrap_or(0);
+                self.pending_attach = Some(PendingAttach {
+                    session_id: id.clone(),
+                    slot: AttachSlot::New,
+                });
+                self.error = None;
+                let mut status = format!(
+                    "rewound {name} · {snapshots} snapshot(s) · {files_restored} restored, {files_removed} removed"
+                );
+                if files_missing > 0 {
+                    status.push_str(&format!(", {files_missing} missing"));
+                }
+                if !restored {
+                    status.push_str(" · INCOMPLETE");
+                }
+                if let Some(warning) = warnings.first() {
+                    status.push_str(&format!(" · {warning}"));
+                }
+                self.status = status;
+                let _ = tx.send(Command::Attach(id));
+            }
+            Event::Search(result) => {
+                let Some(view) = &mut self.search_view else {
+                    return;
+                };
+                view.searching = false;
+                view.hits = result.hits;
+                view.cursor = 0;
+                view.dirty = false;
+                let count = view.hits.len();
+                self.status = if count == 0 {
+                    format!("no matches for {:?}", result.query)
+                } else {
+                    format!("{count} hit(s) · Enter opens the selected session")
+                };
+            }
             Event::Submitted(submitted) => self.submitted(submitted),
             Event::Cancelled(cancelled) => {
                 self.status = if cancelled {
@@ -612,7 +855,50 @@ impl App {
                     self.status = "approval was stale; the daemon is still waiting".into();
                 }
             }
-            Event::Notification(notification) => self.notification(notification),
+            Event::Ledger { session_id, result } => {
+                if let Some(ledger) = &mut self.ledger {
+                    if ledger.session_id == session_id {
+                        ledger.set_result(result);
+                        self.status = format!(
+                            "context: {} / {} tokens",
+                            ledger.result.total_tokens, ledger.result.budget_tokens
+                        );
+                    }
+                }
+            }
+            Event::Processes { session_id, result } => {
+                if let Some(view) = &mut self.process_view {
+                    if view.session_id == session_id {
+                        let selected = view.selected().map(|process| process.id.clone());
+                        view.set_list(result);
+                        self.status = format!("processes: {}", view.processes.len());
+                        // Load the tail of the (possibly new) selection.
+                        let next = view.selected().map(|process| process.id.clone());
+                        if next != selected {
+                            if let Some(process_id) = next {
+                                let _ = tx.send(Command::ProcessOutput { process_id });
+                            }
+                        }
+                    }
+                }
+            }
+            Event::ProcessOutput { result } => {
+                if let Some(view) = &mut self.process_view {
+                    if view.selected().map(|process| process.id.as_str())
+                        == Some(result.process_id.as_str())
+                    {
+                        view.set_tail(result);
+                    }
+                }
+            }
+            Event::ProcessKilled { process_id, killed } => {
+                self.status = if killed {
+                    format!("killing process {}", short_id(&process_id))
+                } else {
+                    format!("process {} is not running", short_id(&process_id))
+                };
+            }
+            Event::Notification(notification) => self.notification(notification, tx),
             Event::Error { context, message } => {
                 self.error = Some(message.clone());
                 self.status = format!("{context} failed");
@@ -707,7 +993,11 @@ impl App {
         self.status = "running".into();
     }
 
-    fn notification(&mut self, notification: eix_core::Notification) {
+    fn notification(
+        &mut self,
+        notification: eix_core::Notification,
+        tx: &UnboundedSender<Command>,
+    ) {
         match notification.method.as_str() {
             "session.updated" => {
                 if let Ok(session) = serde_json::from_value::<Session>(notification.params) {
@@ -924,6 +1214,80 @@ impl App {
                     }
                 }
             }
+            "context.updated" => {
+                if let Ok(params) =
+                    serde_json::from_value::<ContextUpdatedParams>(notification.params)
+                {
+                    if let Some(ledger) = &mut self.ledger {
+                        if ledger.session_id == params.session_id {
+                            ledger.set_result(params.ledger);
+                        }
+                    }
+                }
+            }
+            "process.started" => {
+                if let Ok(info) = serde_json::from_value::<ProcessInfo>(notification.params) {
+                    if self
+                        .views
+                        .iter()
+                        .any(|view| view.session.id == info.session_id)
+                    {
+                        self.status =
+                            format!("process {} started: {}", short_id(&info.id), info.command);
+                    }
+                    if let Some(view) = &self.process_view {
+                        if view.session_id == info.session_id {
+                            let session_id = view.session_id.clone();
+                            let _ = tx.send(Command::ProcessList { session_id });
+                        }
+                    }
+                }
+            }
+            "process.output" => {
+                if let Ok(params) =
+                    serde_json::from_value::<ProcessChunkParams>(notification.params)
+                {
+                    if let Some(view) = &mut self.process_view {
+                        if view.session_id == params.session_id {
+                            view.append(&params.process_id, &params.chunk);
+                        }
+                    }
+                }
+            }
+            "process.exited" => {
+                if let Ok(params) =
+                    serde_json::from_value::<ProcessExitedParams>(notification.params)
+                {
+                    let status = params.status;
+                    if self
+                        .views
+                        .iter()
+                        .any(|view| view.session.id == params.session_id)
+                    {
+                        self.status = format!(
+                            "process {} {}{}",
+                            short_id(&params.process_id),
+                            status.as_str(),
+                            params
+                                .exit_code
+                                .map(|code| format!(" ({code})"))
+                                .unwrap_or_default()
+                        );
+                    }
+                    if let Some(view) = &mut self.process_view {
+                        if view.session_id == params.session_id {
+                            view.mark_exited(&params.process_id, status, params.exit_code);
+                            if view.selected().map(|process| process.id.as_str())
+                                == Some(params.process_id.as_str())
+                            {
+                                let _ = tx.send(Command::ProcessOutput {
+                                    process_id: params.process_id,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
             "stream.lagged" => {
                 if let Some(skipped) = notification.params.get("skipped") {
                     self.status = format!("dropped {skipped} notifications");
@@ -953,6 +1317,21 @@ impl App {
             ) {
                 self.help = false;
             }
+            return;
+        }
+
+        if self.search_view.is_some() {
+            self.handle_search_key(key, tx);
+            return;
+        }
+
+        if self.ledger.is_some() {
+            self.handle_ledger_key(key, tx);
+            return;
+        }
+
+        if self.process_view.is_some() {
+            self.handle_process_key(key, tx);
             return;
         }
 
@@ -1097,9 +1476,17 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
-            KeyCode::Char('n') => self.create_session(tx),
+            KeyCode::Char('n') => self.create_session(tx, false),
+            KeyCode::Char('N') => self.create_session(tx, true),
             KeyCode::Char('p') => self.open_picker(PickerMode::Switch),
             KeyCode::Char('o') => self.open_picker(PickerMode::NewPane),
+            KeyCode::Char('c') => self.open_ledger(tx),
+            KeyCode::Char('P') => self.open_processes(tx),
+            KeyCode::Char('#') => {
+                self.search_view = Some(SearchView::new());
+                self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
+            }
+            KeyCode::Char('F') => self.fork_focused(tx, None),
             KeyCode::Char('a') => self.focus_next_attention(),
             KeyCode::Char('?') => self.help = true,
             KeyCode::Char('x') => self.cancel(tx),
@@ -1131,6 +1518,232 @@ impl App {
         }
     }
 
+    fn open_ledger(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            self.status = "no session to inspect".into();
+            return;
+        };
+        self.ledger = Some(LedgerView::new(
+            session_id.clone(),
+            ContextLedgerResult::default(),
+        ));
+        self.status = "context ledger: loading…".into();
+        let _ = tx.send(Command::ContextLedger { session_id });
+    }
+
+    fn handle_ledger_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.ledger = None;
+            self.status = "context ledger closed".into();
+            return;
+        }
+        let Some(ledger) = &mut self.ledger else {
+            return;
+        };
+        let len = ledger.result.entries.len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if ledger.cursor + 1 < len {
+                    ledger.cursor += 1;
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                ledger.cursor = ledger.cursor.saturating_sub(1);
+            }
+            KeyCode::PageDown => {
+                ledger.cursor = (ledger.cursor + 10).min(len.saturating_sub(1));
+            }
+            KeyCode::PageUp => {
+                ledger.cursor = ledger.cursor.saturating_sub(10);
+            }
+            KeyCode::Char('g') => ledger.cursor = 0,
+            KeyCode::Char('G') => ledger.cursor = len.saturating_sub(1),
+            KeyCode::Char('o') | KeyCode::Enter => {
+                if let Some(entry) = ledger.entry() {
+                    let id = entry.id.clone();
+                    if !ledger.expanded.remove(&id) {
+                        ledger.expanded.insert(id);
+                    }
+                }
+            }
+            KeyCode::Char('p') => {
+                let Some(entry) = ledger.entry() else { return };
+                if !entry.editable {
+                    self.status = "this entry cannot be pinned".into();
+                    return;
+                }
+                let op = ContextOp::Pin {
+                    entry: entry.id.clone(),
+                    pinned: !entry.pinned,
+                };
+                let session_id = ledger.session_id.clone();
+                let _ = tx.send(Command::ContextOp { session_id, op });
+            }
+            KeyCode::Char('d') => {
+                let Some(entry) = ledger.entry() else { return };
+                if !entry.editable {
+                    self.status = "this entry cannot be dropped".into();
+                    return;
+                }
+                let op = ContextOp::Drop {
+                    entry: entry.id.clone(),
+                    dropped: !entry.dropped,
+                };
+                let session_id = ledger.session_id.clone();
+                let _ = tx.send(Command::ContextOp { session_id, op });
+            }
+            KeyCode::Char('m') => {
+                let Some(entry) = ledger.entry() else { return };
+                let Some(seq) = LedgerView::seq_of(entry) else {
+                    self.status = "only message entries can be marked".into();
+                    return;
+                };
+                if ledger.mark == Some(seq) {
+                    ledger.mark = None;
+                    self.status = "mark cleared".into();
+                } else {
+                    ledger.mark = Some(seq);
+                    self.status = format!("marked e{seq}; move and press s to compact the range");
+                }
+            }
+            KeyCode::Char('s') => {
+                let Some(entry) = ledger.entry() else { return };
+                let Some(seq) = LedgerView::seq_of(entry) else {
+                    self.status = "only message entries can be compacted".into();
+                    return;
+                };
+                let (from, to) = match ledger.mark {
+                    Some(mark) if mark != seq => (mark.min(seq), mark.max(seq)),
+                    _ => (seq, seq),
+                };
+                let op = ContextOp::Compact {
+                    from_seq: from,
+                    to_seq: to,
+                };
+                let session_id = ledger.session_id.clone();
+                ledger.mark = None;
+                let _ = tx.send(Command::ContextOp { session_id, op });
+                self.status = format!("compacting {from}..={to}…");
+            }
+            KeyCode::Char('f') => {
+                let Some(entry) = ledger.entry() else { return };
+                let Some(seq) = LedgerView::seq_of(entry) else {
+                    self.status = "only message entries can be forked".into();
+                    return;
+                };
+                let session_id = ledger.session_id.clone();
+                let _ = tx.send(Command::Fork {
+                    session_id,
+                    at_seq: Some(seq),
+                    name: None,
+                });
+                self.status = format!("forking before e{seq} · files unchanged");
+            }
+            KeyCode::Char('w') => {
+                let Some(entry) = ledger.entry() else { return };
+                let Some(seq) = LedgerView::seq_of(entry) else {
+                    self.status = "only message entries can be rewound".into();
+                    return;
+                };
+                let session_id = ledger.session_id.clone();
+                let _ = tx.send(Command::Rewind {
+                    session_id,
+                    at_seq: Some(seq),
+                    name: None,
+                });
+                self.status = format!("rewinding before e{seq} · restoring the workspace…");
+            }
+            _ => {}
+        }
+    }
+
+    /// Fork the focused session. `at_seq` copies history strictly before that
+    /// sequence (used by the ledger's rewind); `None` copies everything.
+    fn fork_focused(&mut self, tx: &UnboundedSender<Command>, at_seq: Option<u64>) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            self.status = "no session to fork".into();
+            return;
+        };
+        let _ = tx.send(Command::Fork {
+            session_id,
+            at_seq,
+            name: None,
+        });
+        self.status = match at_seq {
+            Some(seq) => format!("forking before e{seq}…"),
+            None => "forking…".into(),
+        };
+    }
+
+    fn open_processes(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            self.status = "no session to inspect".into();
+            return;
+        };
+        self.process_view = Some(ProcessView::new(session_id.clone()));
+        self.status = "processes: loading…".into();
+        let _ = tx.send(Command::ProcessList { session_id });
+    }
+
+    fn handle_process_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
+            self.process_view = None;
+            self.status = "processes closed".into();
+            return;
+        }
+        let Some(view) = &mut self.process_view else {
+            return;
+        };
+        let len = view.processes.len();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if view.cursor + 1 < len {
+                    view.cursor += 1;
+                }
+                if let Some(process) = view.selected() {
+                    let process_id = process.id.clone();
+                    let _ = tx.send(Command::ProcessOutput { process_id });
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                view.cursor = view.cursor.saturating_sub(1);
+                if let Some(process) = view.selected() {
+                    let process_id = process.id.clone();
+                    let _ = tx.send(Command::ProcessOutput { process_id });
+                }
+            }
+            KeyCode::Char('g') => view.scroll = usize::MAX / 2,
+            KeyCode::Char('G') => view.scroll = 0,
+            KeyCode::PageUp => view.scroll = view.scroll.saturating_add(20),
+            KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(20),
+            KeyCode::Char('r') => {
+                let session_id = view.session_id.clone();
+                let _ = tx.send(Command::ProcessList { session_id });
+                if let Some(process) = view.selected() {
+                    let process_id = process.id.clone();
+                    let _ = tx.send(Command::ProcessOutput { process_id });
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(process) = view.selected() {
+                    let process_id = process.id.clone();
+                    let _ = tx.send(Command::ProcessOutput { process_id });
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(process) = view.selected() {
+                    if !process.status.is_running() {
+                        self.status = "process is not running".into();
+                        return;
+                    }
+                    let process_id = process.id.clone();
+                    let _ = tx.send(Command::ProcessKill { process_id });
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_window_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('h') | KeyCode::Left => self.focus_direction(Direction::Left),
@@ -1143,6 +1756,96 @@ impl App {
             KeyCode::Esc => self.status = "window command cancelled".into(),
             _ => {}
         }
+    }
+
+    /// History search. Typing edits the query; the first Enter runs it, then
+    /// Enter opens the selected hit. Up/Down browse results.
+    fn handle_search_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        enum Action {
+            Close,
+            Empty,
+            Run(String),
+            Open(String),
+        }
+
+        let action = {
+            let Some(view) = &mut self.search_view else {
+                return;
+            };
+            match key.code {
+                KeyCode::Esc => Some(Action::Close),
+                KeyCode::Up => {
+                    view.move_cursor(-1);
+                    None
+                }
+                KeyCode::Down => {
+                    view.move_cursor(1);
+                    None
+                }
+                KeyCode::Backspace => {
+                    view.query.pop();
+                    view.cursor = 0;
+                    view.dirty = true;
+                    None
+                }
+                KeyCode::Enter => {
+                    let query = view.query.trim().to_string();
+                    if query.is_empty() {
+                        Some(Action::Empty)
+                    } else if view.dirty || (!view.searching && view.hits.is_empty()) {
+                        view.searching = true;
+                        view.dirty = false;
+                        Some(Action::Run(query))
+                    } else {
+                        view.selected()
+                            .map(|hit| Action::Open(hit.session_id.clone()))
+                    }
+                }
+                KeyCode::Char(c)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    view.query.push(c);
+                    view.cursor = 0;
+                    view.dirty = true;
+                    None
+                }
+                _ => None,
+            }
+        };
+
+        match action {
+            Some(Action::Close) => self.search_view = None,
+            Some(Action::Empty) => self.status = "type a query first".into(),
+            Some(Action::Run(query)) => {
+                self.status = format!("searching for {query:?}…");
+                let _ = tx.send(Command::Search {
+                    query,
+                    session_id: None,
+                    limit: None,
+                });
+            }
+            Some(Action::Open(session_id)) => self.open_search_hit(&session_id, tx),
+            None => {}
+        }
+    }
+
+    /// Focus the hit's pane if it is already open, otherwise attach it in a
+    /// new pane. Search results may mention sessions the client has not
+    /// refreshed yet, so this keys off the id rather than the list.
+    fn open_search_hit(&mut self, session_id: &str, tx: &UnboundedSender<Command>) {
+        self.search_view = None;
+        if let Some(open) = self.open_session(session_id) {
+            self.focus_pane(open);
+            return;
+        }
+        self.pending_attach = Some(PendingAttach {
+            session_id: session_id.to_string(),
+            slot: AttachSlot::New,
+        });
+        self.error = None;
+        self.status = "opening search hit…".into();
+        let _ = tx.send(Command::Attach(session_id.to_string()));
     }
 
     fn handle_picker_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
@@ -1167,6 +1870,11 @@ impl App {
                         PickerMode::NewPane => self.open_in_new_pane(index, tx),
                     }
                 }
+            }
+            KeyCode::Char('#') => {
+                self.picker = None;
+                self.search_view = Some(SearchView::new());
+                self.status = "search history · Enter runs · ↑/↓ select · Esc closes".into();
             }
             KeyCode::Backspace => {
                 picker.query.pop();
@@ -1214,14 +1922,18 @@ impl App {
         hits.into_iter().map(|(_, index)| index).collect()
     }
 
-    fn create_session(&mut self, tx: &UnboundedSender<Command>) {
+    fn create_session(&mut self, tx: &UnboundedSender<Command>, worktree: bool) {
         if self.creating {
             return;
         }
         self.creating = true;
         self.error = None;
-        self.status = "creating session…".into();
-        let _ = tx.send(Command::Create);
+        self.status = if worktree {
+            "creating session in a new worktree…".into()
+        } else {
+            "creating session…".into()
+        };
+        let _ = tx.send(Command::Create { worktree });
     }
 
     fn submit(&mut self, tx: &UnboundedSender<Command>) {
@@ -1759,6 +2471,15 @@ impl App {
         if self.diff_view.is_some() {
             self.draw_diff_view(frame, area);
         }
+        if self.ledger.is_some() {
+            self.draw_ledger(frame, area);
+        }
+        if self.process_view.is_some() {
+            self.draw_processes(frame, area);
+        }
+        if self.search_view.is_some() {
+            self.draw_search(frame, area);
+        }
     }
 
     fn draw_header(&mut self, frame: &mut Frame, area: Rect) {
@@ -1865,7 +2586,7 @@ impl App {
                     pane,
                     Span::raw(" "),
                     Span::styled(
-                        format!("{} ", session.status.symbol()),
+                        format!("{}{} ", origin_marker(session), session.status.symbol()),
                         Style::default().fg(status_color(session.status)),
                     ),
                     Span::styled(truncate(&session.name, 12), name_style),
@@ -2294,7 +3015,7 @@ impl App {
         } else if self.attention_count() > 0 {
             " a next attention  ? help  q quit "
         } else {
-            " C-w pane  p picker  o split  ? help  q quit "
+            " c ctx  P ps  C-w pane  p picker  q quit "
         };
         frame.render_widget(
             Paragraph::new(hint)
@@ -2393,6 +3114,249 @@ impl App {
         if let Some(view) = &mut self.diff_view {
             view.scroll = scroll;
         }
+    }
+
+    fn draw_ledger(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(ledger) = &mut self.ledger else {
+            return;
+        };
+        let rect = centered(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
+        frame.render_widget(Clear, rect);
+        let inner_width = rect.width.saturating_sub(2) as usize;
+        let inner_height = rect.height.saturating_sub(2) as usize;
+        // Two header rows (totals + per-sector budgets) and one hint row.
+        let list_height = inner_height.saturating_sub(3).max(1);
+
+        let mut lines: Vec<Line> = Vec::new();
+        let mut starts = Vec::with_capacity(ledger.result.entries.len());
+        for (index, entry) in ledger.result.entries.iter().enumerate() {
+            starts.push(lines.len());
+            lines.push(ledger_entry_line(
+                entry,
+                index == ledger.cursor,
+                inner_width,
+            ));
+            if ledger.expanded.contains(&entry.id) {
+                for detail in entry.detail.lines().take(8) {
+                    lines.push(Line::from(Span::styled(
+                        truncate(&format!("      {detail}"), inner_width),
+                        Style::default().fg(Color::DarkGray),
+                    )));
+                }
+            }
+        }
+
+        let cursor_line = starts.get(ledger.cursor).copied().unwrap_or(0);
+        let max_scroll = lines.len().saturating_sub(list_height);
+        if cursor_line < ledger.scroll {
+            ledger.scroll = cursor_line;
+        } else if cursor_line >= ledger.scroll + list_height {
+            ledger.scroll = cursor_line + 1 - list_height;
+        }
+        ledger.scroll = ledger.scroll.min(max_scroll);
+
+        let mut body: Vec<Line> = Vec::with_capacity(list_height + 3);
+        body.push(ledger_totals_line(&ledger.result));
+        body.push(ledger_sectors_line(&ledger.result, inner_width));
+        body.extend(lines.into_iter().skip(ledger.scroll).take(list_height));
+        body.push(ledger_hint_line(ledger));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(" context ledger ");
+        frame.render_widget(
+            Paragraph::new(body)
+                .block(block)
+                .style(Style::default().bg(Color::Black)),
+            rect,
+        );
+    }
+
+    fn draw_processes(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(view) = &mut self.process_view else {
+            return;
+        };
+        let rect = centered(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
+        frame.render_widget(Clear, rect);
+        let inner_height = rect.height.saturating_sub(2) as usize;
+        let inner_width = rect.width.saturating_sub(2) as usize;
+        // List on top (bounded), live output below.
+        let list_height = (view.processes.len() + 1)
+            .clamp(2, 10)
+            .min(inner_height.saturating_sub(3).max(3));
+
+        let mut list_lines: Vec<Line> = Vec::new();
+        for (index, process) in view.processes.iter().enumerate() {
+            list_lines.push(process_line(process, index == view.cursor, inner_width));
+        }
+        if view.processes.is_empty() {
+            list_lines.push(Line::from(Span::styled(
+                "  no background processes",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let max_scroll = view.processes.len().saturating_sub(list_height);
+        let list_scroll = view
+            .cursor
+            .saturating_sub(list_height.saturating_sub(1))
+            .min(max_scroll);
+
+        let title = match view.selected() {
+            Some(process) => format!(
+                " processes · {} · {} ",
+                short_id(&process.id),
+                process.status.as_str()
+            ),
+            None => format!(" processes · {} ", short_id(&view.session_id)),
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title)
+            .title_bottom(" j/k select · x kill · r refresh · PgUp/PgDn · Esc close ");
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+
+        let chunks = Layout::vertical([Constraint::Length(list_height as u16), Constraint::Min(1)])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(
+                list_lines
+                    .into_iter()
+                    .skip(list_scroll)
+                    .take(list_height)
+                    .collect::<Vec<_>>(),
+            )
+            .style(Style::default().bg(Color::Black)),
+            chunks[0],
+        );
+
+        let output_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" output ");
+        let output_inner = output_block.inner(chunks[1]);
+        frame.render_widget(output_block, chunks[1]);
+        let width = output_inner.width as usize;
+        let height = output_inner.height as usize;
+        let lines: Vec<&str> = view.tail.lines().collect();
+        let start = lines.len().saturating_sub(height + view.scroll);
+        let body: Vec<Line> = if lines.is_empty() {
+            vec![Line::from(Span::styled(
+                "(no output yet)",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            lines
+                .iter()
+                .skip(start)
+                .take(height)
+                .map(|line| Line::from(truncate(line, width)))
+                .collect()
+        };
+        frame.render_widget(
+            Paragraph::new(body).style(Style::default().bg(Color::Black)),
+            output_inner,
+        );
+    }
+
+    fn draw_search(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(view) = &self.search_view else {
+            return;
+        };
+        let rect = centered(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" search history · {} hit(s) ", view.hits.len()))
+            .title_bottom(" Enter run/open · ↑/↓ select · Esc close ");
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+
+        let chunks = Layout::vertical([Constraint::Length(2), Constraint::Min(1)]).split(inner);
+        let prompt = Line::from(vec![
+            Span::styled("> ", Style::default().fg(Color::Cyan)),
+            Span::raw(view.query.as_str()),
+            Span::styled("▏", Style::default().fg(Color::Cyan)),
+        ]);
+        let hint = if view.searching {
+            "searching…"
+        } else if view.hits.is_empty() {
+            "type a query and press Enter"
+        } else {
+            "Enter opens the selected session"
+        };
+        frame.render_widget(
+            Paragraph::new(vec![
+                prompt,
+                Line::from(Span::styled(hint, Style::default().fg(Color::DarkGray))),
+            ]),
+            chunks[0],
+        );
+
+        let width = chunks[1].width as usize;
+        let height = chunks[1].height as usize;
+        let mut lines: Vec<Line> = Vec::new();
+        if view.hits.is_empty() {
+            lines.push(Line::from(Span::styled(
+                if view.searching {
+                    "searching…"
+                } else {
+                    "no matches"
+                },
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        for (index, hit) in view.hits.iter().enumerate() {
+            let selected = index == view.cursor;
+            let style = if selected {
+                Style::default()
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            let head = format!(
+                "{} ({}) e{} {}",
+                hit.session_name,
+                short_id(&hit.session_id),
+                hit.seq,
+                hit.role
+            );
+            lines.push(Line::from(Span::styled(truncate(&head, width), style)));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", truncate(&hit.snippet, width.saturating_sub(2))),
+                style.fg(Color::Gray),
+            )));
+        }
+        // Each hit takes two rows; keep the cursor on screen.
+        let visible = (height / 2).max(1);
+        let start = view.cursor.saturating_sub(visible - 1) * 2;
+        frame.render_widget(
+            Paragraph::new(
+                lines
+                    .into_iter()
+                    .skip(start)
+                    .take(height)
+                    .collect::<Vec<_>>(),
+            )
+            .style(Style::default().bg(Color::Black)),
+            chunks[1],
+        );
     }
 
     fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
@@ -2555,6 +3519,29 @@ struct ToolCompleted {
 struct AttentionParams {
     session_id: String,
     status: SessionStatus,
+}
+
+#[derive(Deserialize)]
+struct ContextUpdatedParams {
+    session_id: String,
+    ledger: ContextLedgerResult,
+}
+
+#[derive(Deserialize)]
+struct ProcessChunkParams {
+    session_id: String,
+    process_id: String,
+    #[serde(default)]
+    chunk: String,
+}
+
+#[derive(Deserialize)]
+struct ProcessExitedParams {
+    session_id: String,
+    process_id: String,
+    status: ProcessStatus,
+    #[serde(default)]
+    exit_code: Option<i32>,
 }
 
 struct InputLayout {
@@ -2735,7 +3722,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key_line("C-w c", "close focused pane"),
         key_line("C-w w", "cycle panes"),
         key_line("Tab / S-Tab", "next / previous session"),
-        key_line("n", "new session (new pane)"),
+        key_line("n / N", "new session (N: in a fresh git worktree)"),
         key_line("x", "cancel focused turn"),
         key_line("y / n", "approve / deny a pending tool call"),
         key_line(
@@ -2744,6 +3731,10 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         ),
         key_line("j / k", "scroll focused transcript"),
         key_line("g / G", "top / follow tail"),
+        key_line("c", "context ledger (f fork here, w rewind + roll back)"),
+        key_line("P", "background processes (x kills, r refreshes)"),
+        key_line("F", "fork the session (git worktree when inside a repo)"),
+        key_line("#", "search message history (Enter runs / opens)"),
         key_line("? / F1", "open this help (F1 anywhere)"),
         key_line("q / Ctrl-C", "quit"),
         Line::from(""),
@@ -2752,7 +3743,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
-            "the prompt is a native text box for now; the embedded-nvim input lands later",
+            "the ledger is advisory: system and instruction entries are never trimmed automatically",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -2772,6 +3763,136 @@ fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
         ),
         Span::raw(description),
     ])
+}
+
+fn sector_tag(sector: Sector) -> &'static str {
+    match sector {
+        Sector::System => "SYS ",
+        Sector::Instructions => "INS ",
+        Sector::Workspace => "WS  ",
+        Sector::History => "HIS ",
+        Sector::Tools => "TOOL",
+        Sector::Memory => "MEM ",
+    }
+}
+
+fn process_line(process: &ProcessInfo, selected: bool, width: usize) -> Line<'static> {
+    let marker = if selected { "▸" } else { " " };
+    let (tag, color) = match process.status {
+        ProcessStatus::Running => ("run ", Color::Green),
+        ProcessStatus::Exited => ("exit", Color::Gray),
+        ProcessStatus::Killed => ("kill", Color::Yellow),
+        ProcessStatus::Failed => ("fail", Color::Red),
+    };
+    let code = process
+        .exit_code
+        .map(|code| format!(" ({code})"))
+        .unwrap_or_default();
+    let text = format!(
+        "{marker} {tag}{code} {} {}",
+        short_id(&process.id),
+        process.command
+    );
+    let style = if selected {
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(color)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(color)
+    };
+    Line::from(Span::styled(truncate(&text, width), style))
+}
+
+fn ledger_entry_line(entry: &ContextEntryInfo, selected: bool, width: usize) -> Line<'static> {
+    let marker = if selected { "▸" } else { " " };
+    let flag = if entry.dropped {
+        if entry.auto {
+            "cut"
+        } else {
+            "off"
+        }
+    } else if entry.compacted {
+        "sum"
+    } else if entry.pinned {
+        "pin"
+    } else {
+        "   "
+    };
+    let text = format!(
+        "{marker} {flag} {} {:>6}t  {}",
+        sector_tag(entry.sector),
+        entry.tokens,
+        entry.preview
+    );
+    let style = if selected {
+        Style::default()
+            .bg(Color::DarkGray)
+            .add_modifier(Modifier::BOLD)
+    } else if entry.dropped || entry.compacted {
+        Style::default().fg(Color::DarkGray)
+    } else if entry.pinned {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default()
+    };
+    Line::from(Span::styled(truncate(&text, width), style))
+}
+
+fn ledger_totals_line(result: &ContextLedgerResult) -> Line<'static> {
+    let remaining = result.budget_tokens.saturating_sub(result.total_tokens);
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} / {} tokens", result.total_tokens, result.budget_tokens),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  ({remaining} left)"),
+            Style::default().fg(Color::DarkGray),
+        ),
+    ];
+    if result.trimmed > 0 {
+        spans.push(Span::styled(
+            format!("  · {} auto-trimmed", result.trimmed),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn ledger_sectors_line(result: &ContextLedgerResult, width: usize) -> Line<'static> {
+    let parts: Vec<String> = result
+        .sectors
+        .iter()
+        .filter(|sector| sector.entries > 0)
+        .map(|sector| {
+            format!(
+                "{} {}/{}t",
+                sector_tag(sector.sector).trim(),
+                sector.tokens,
+                sector.budget_tokens
+            )
+        })
+        .collect();
+    let text = if parts.is_empty() {
+        " (nothing in context yet)".to_string()
+    } else {
+        format!(" {}", parts.join("  ·  "))
+    };
+    Line::from(Span::styled(
+        truncate(&text, width),
+        Style::default().fg(Color::DarkGray),
+    ))
+}
+
+fn ledger_hint_line(ledger: &LedgerView) -> Line<'static> {
+    let text = match ledger.mark {
+        Some(mark) => format!(" mark e{mark} · s compact range · m clear · Esc close "),
+        None => {
+            " j/k move · o expand · p pin · d drop · m mark · s compact · Esc close ".to_string()
+        }
+    };
+    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }
 
 /// Tile `count` panes inside `area`. One pane is fullscreen, two split
@@ -3001,6 +4122,17 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
+/// Sidebar prefix: `↳` for sub-agents and `⑂` for sessions in a worktree.
+fn origin_marker(session: &Session) -> &'static str {
+    if session.is_agent() {
+        "↳"
+    } else if session.has_worktree() {
+        "⑂"
+    } else {
+        ""
+    }
+}
+
 fn truncate(text: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
@@ -3054,6 +4186,7 @@ const SPINNER: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eix_core::SearchResult;
 
     #[test]
     fn input_edits_across_lines() {
@@ -3517,5 +4650,299 @@ mod tests {
         app.handle_transcript_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
         assert!(app.diff_view.is_none());
         assert!(app.status.contains("no diff"));
+    }
+
+    fn ledger_entry(id: &str, sector: Sector, kind: &str, tokens: usize) -> ContextEntryInfo {
+        ContextEntryInfo {
+            id: id.into(),
+            sector,
+            kind: kind.into(),
+            tokens,
+            chars: 0,
+            preview: format!("{kind} preview"),
+            detail: format!("{kind} detail"),
+            pinned: false,
+            dropped: false,
+            compacted: false,
+            auto: false,
+            editable: true,
+        }
+    }
+
+    #[test]
+    fn ledger_view_tracks_the_cursor_and_parses_seqs() {
+        let result = ContextLedgerResult {
+            entries: vec![
+                ledger_entry("system", Sector::System, "system", 10),
+                ledger_entry("e12", Sector::History, "user", 40),
+            ],
+            sectors: Vec::new(),
+            total_tokens: 50,
+            budget_tokens: 100,
+            trimmed: 0,
+        };
+        let mut view = LedgerView::new("s1".into(), result);
+        assert_eq!(view.entry().map(|entry| entry.id.as_str()), Some("system"));
+        assert!(LedgerView::seq_of(view.entry().unwrap()).is_none());
+        view.cursor = 1;
+        assert_eq!(LedgerView::seq_of(view.entry().unwrap()), Some(12));
+
+        // A refresh never moves the cursor past the end.
+        view.set_result(ContextLedgerResult {
+            entries: vec![ledger_entry("system", Sector::System, "system", 10)],
+            ..Default::default()
+        });
+        assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn ledger_lines_mark_dropped_and_pinned_entries() {
+        let mut entry = ledger_entry("e1", Sector::History, "user", 40);
+        entry.pinned = true;
+        let text: String = ledger_entry_line(&entry, false, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("pin"));
+        assert!(text.contains("HIS"));
+
+        entry.pinned = false;
+        entry.dropped = true;
+        entry.auto = true;
+        let text: String = ledger_entry_line(&entry, true, 80)
+            .spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("cut"));
+        assert!(text.starts_with('▸'));
+    }
+
+    #[test]
+    fn opening_the_ledger_sends_a_request_and_closes_with_esc() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &tx);
+        assert!(app.ledger.is_some());
+        assert!(rx.try_recv().is_ok());
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.ledger.is_none());
+    }
+
+    fn process_info(id: &str, status: ProcessStatus) -> ProcessInfo {
+        ProcessInfo {
+            id: id.into(),
+            session_id: "s1".into(),
+            command: "npm run dev".into(),
+            cwd: "/tmp".into(),
+            pid: 42,
+            status,
+            exit_code: None,
+            started_ms: 0,
+            ended_ms: None,
+            bytes: 0,
+            truncated: false,
+            log: "/tmp/x.log".into(),
+        }
+    }
+
+    #[test]
+    fn process_view_keeps_the_selection_across_refreshes() {
+        let mut view = ProcessView::new("s1".into());
+        view.set_list(ProcessList {
+            processes: vec![
+                process_info("aaaaaaaa-1", ProcessStatus::Running),
+                process_info("bbbbbbbb-2", ProcessStatus::Exited),
+            ],
+        });
+        view.cursor = 1;
+        // A newer process appears at the front; the cursor follows the id.
+        view.set_list(ProcessList {
+            processes: vec![
+                process_info("cccccccc-3", ProcessStatus::Running),
+                process_info("aaaaaaaa-1", ProcessStatus::Running),
+                process_info("bbbbbbbb-2", ProcessStatus::Exited),
+            ],
+        });
+        assert_eq!(
+            view.selected().map(|process| process.id.as_str()),
+            Some("bbbbbbbb-2")
+        );
+        // Shrinking the list clamps the cursor.
+        view.set_list(ProcessList {
+            processes: vec![process_info("aaaaaaaa-1", ProcessStatus::Running)],
+        });
+        assert_eq!(view.cursor, 0);
+    }
+
+    #[test]
+    fn process_view_only_appends_output_for_the_shown_process() {
+        let mut view = ProcessView::new("s1".into());
+        view.set_tail(ProcessOutput {
+            process_id: "aaaaaaaa-1".into(),
+            text: "one\n".into(),
+            bytes: 4,
+            truncated: false,
+            status: ProcessStatus::Running,
+            exit_code: None,
+        });
+        view.append("bbbbbbbb-2", "ignored");
+        assert_eq!(view.tail, "one\n");
+        view.append("aaaaaaaa-1", "two\n");
+        assert_eq!(view.tail, "one\ntwo\n");
+
+        // Exits are reflected in the list.
+        view.set_list(ProcessList {
+            processes: vec![process_info("aaaaaaaa-1", ProcessStatus::Running)],
+        });
+        view.mark_exited("aaaaaaaa-1", ProcessStatus::Killed, None);
+        assert_eq!(view.selected().unwrap().status, ProcessStatus::Killed);
+    }
+
+    #[test]
+    fn opening_processes_sends_a_list_request_and_closes_with_q() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT), &tx);
+        assert!(app.process_view.is_some());
+        assert!(rx.try_recv().is_ok());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert!(app.process_view.is_none());
+        assert!(!app.should_quit, "q closes the overlay, not the app");
+    }
+
+    #[test]
+    fn fork_key_copies_everything_and_ledger_f_forks_before_the_entry() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT), &tx);
+        match rx.try_recv().expect("fork command") {
+            Command::Fork {
+                session_id,
+                at_seq,
+                name,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(at_seq, None);
+                assert!(name.is_none());
+            }
+            _ => panic!("expected a fork command"),
+        }
+
+        // The ledger's `f` forks strictly before the selected message.
+        let mut result = ContextLedgerResult {
+            entries: vec![
+                ledger_entry("system", Sector::System, "system", 10),
+                ledger_entry("e12", Sector::History, "user", 40),
+            ],
+            ..Default::default()
+        };
+        result.entries[0].id = "system".into();
+        let mut ledger = LedgerView::new("s1".into(), result);
+        ledger.cursor = 1;
+        app.ledger = Some(ledger);
+        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("ledger fork command") {
+            Command::Fork { at_seq, .. } => assert_eq!(at_seq, Some(12)),
+            _ => panic!("expected a fork command"),
+        }
+    }
+
+    #[test]
+    fn forked_session_opens_a_new_pane() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut fork = Session::new("fork-1", "one~2", "/tmp");
+        fork.parent_id = Some("s1".into());
+        fork.forked_from_seq = Some(12);
+        app.handle_event(Event::Forked(fork), &tx);
+        assert_eq!(
+            app.pending_attach
+                .as_ref()
+                .map(|pending| pending.session_id.as_str()),
+            Some("fork-1")
+        );
+        assert!(app.sessions.iter().any(|session| session.id == "fork-1"));
+        match rx.try_recv().expect("attach command") {
+            Command::Attach(id) => assert_eq!(id, "fork-1"),
+            _ => panic!("expected an attach command"),
+        }
+        assert!(app.status.contains("workspace") || app.status.contains("files"));
+    }
+
+    #[test]
+    fn search_overlay_runs_a_query_and_opens_the_selected_hit() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+
+        // `#` from the transcript opens the overlay.
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('#'), KeyModifiers::SHIFT), &tx);
+        assert!(app.search_view.is_some());
+
+        // Typing edits the query; the first Enter runs the search.
+        for c in "timeout".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &tx);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("search command") {
+            Command::Search {
+                query,
+                session_id,
+                limit,
+            } => {
+                assert_eq!(query, "timeout");
+                assert!(session_id.is_none());
+                assert!(limit.is_none());
+            }
+            _ => panic!("expected a search command"),
+        }
+
+        let hit = |session: &str, seq: u64| SearchHit {
+            session_id: session.to_string(),
+            session_name: session.to_string(),
+            seq,
+            role: "user".into(),
+            ts: 0,
+            snippet: format!("snippet {seq}"),
+        };
+        app.handle_event(
+            Event::Search(SearchResult {
+                query: "timeout".into(),
+                hits: vec![hit("s1", 3), hit("s9", 7)],
+            }),
+            &tx,
+        );
+        assert_eq!(app.search_view.as_ref().unwrap().hits.len(), 2);
+        assert!(!app.search_view.as_ref().unwrap().dirty);
+
+        // Down selects the second hit; Enter opens its session in a new pane.
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.search_view.is_none());
+        match rx.try_recv().expect("attach command") {
+            Command::Attach(id) => assert_eq!(id, "s9"),
+            _ => panic!("expected an attach command"),
+        }
+        assert!(app.pending_attach.is_some());
     }
 }

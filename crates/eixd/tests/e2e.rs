@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AttachResult, Config, EventKind, HelloResult, Request, Response, ServerMessage, SessionResult,
-    SubmitResult, PROTOCOL_VERSION,
+    AttachResult, Config, EventKind, HelloResult, Request, Response, SearchResult, ServerMessage,
+    SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -105,8 +105,13 @@ async fn daemon_streams_and_persists_a_turn() -> anyhow::Result<()> {
     assert_eq!(body["model"], "session-model");
     assert_eq!(body["stream"], true);
     assert_eq!(body["messages"][0]["role"], "system");
-    assert_eq!(body["messages"][1]["role"], "user");
-    assert_eq!(body["messages"][1]["content"], "say hi");
+    let user_message = body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .expect("user message");
+    assert_eq!(user_message["content"], "say hi");
 
     assert!(data_dir.join("eix.sqlite3").exists());
 
@@ -114,6 +119,238 @@ async fn daemon_streams_and_persists_a_turn() -> anyhow::Result<()> {
     mock.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
+}
+
+#[tokio::test]
+async fn context_ledger_reports_sectors_and_honours_policies() -> anyhow::Result<()> {
+    let dir = temp_dir("context");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("AGENTS.md"), "Always answer in lowercase.\n")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir.clone()));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "ctx", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "first question"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    let ledger: eix_core::ContextLedgerResult = client
+        .request("context.ledger", json!({"session_id": session_id}))
+        .await?;
+    assert!(ledger.total_tokens > 0);
+    assert_eq!(ledger.budget_tokens, 32_000);
+    let instructions = ledger
+        .entries
+        .iter()
+        .find(|entry| entry.id == "instructions:AGENTS.md")
+        .expect("AGENTS.md in the ledger");
+    assert!(instructions.detail.contains("Always answer in lowercase"));
+    assert_eq!(instructions.sector, eix_core::Sector::Instructions);
+    assert!(ledger.entries.iter().any(|entry| entry.id == "workspace"));
+    assert!(ledger
+        .sectors
+        .iter()
+        .find(|sector| sector.sector == eix_core::Sector::History)
+        .is_some_and(|sector| sector.entries == 2));
+
+    // The first request carries the system prompt, the instructions and the
+    // workspace summary.
+    let first: Value = serde_json::from_str(&bodies.lock().await[0])?;
+    let first_text = first["messages"].to_string();
+    assert!(first_text.contains("Always answer in lowercase"));
+    assert!(first_text.contains("workspace:"));
+    assert!(first_text.contains("first question"));
+
+    let user = ledger
+        .entries
+        .iter()
+        .find(|entry| entry.kind == "user")
+        .expect("user entry")
+        .clone();
+    let assistant = ledger
+        .entries
+        .iter()
+        .find(|entry| entry.kind == "assistant")
+        .expect("assistant entry")
+        .clone();
+    assert!(user.id.starts_with('e'));
+    assert!(assistant.id.starts_with('e'));
+
+    let pinned: eix_core::ContextLedgerResult = client
+        .request(
+            "context.pin",
+            json!({"session_id": session_id, "entry": user.id, "pinned": true}),
+        )
+        .await?;
+    assert!(
+        pinned
+            .entries
+            .iter()
+            .find(|entry| entry.id == user.id)
+            .unwrap()
+            .pinned
+    );
+
+    let dropped: eix_core::ContextLedgerResult = client
+        .request(
+            "context.drop",
+            json!({"session_id": session_id, "entry": assistant.id}),
+        )
+        .await?;
+    assert!(
+        dropped
+            .entries
+            .iter()
+            .find(|entry| entry.id == assistant.id)
+            .unwrap()
+            .dropped
+    );
+
+    // System entries are not user-editable.
+    let refused = client
+        .request_error(
+            "context.drop",
+            json!({"session_id": session_id, "entry": "system"}),
+        )
+        .await?;
+    assert_eq!(refused, "invalid_params");
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "second question"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    let second: Value = serde_json::from_str(&bodies.lock().await[1])?;
+    let second_text = second["messages"].to_string();
+    assert!(second_text.contains("Always answer in lowercase"));
+    assert!(second_text.contains("first question"));
+    assert!(
+        !second_text.contains("Hello from mock"),
+        "a dropped assistant message must not be sent: {second_text}"
+    );
+
+    // Compaction replaces the first exchange with one summary.
+    let from = seq_of(&user.id)?;
+    let to = seq_of(&assistant.id)?;
+    let compacted: eix_core::ContextLedgerResult = client
+        .request(
+            "context.compact",
+            json!({
+                "session_id": session_id,
+                "from_seq": from,
+                "to_seq": to,
+                "summary": "we exchanged greetings",
+            }),
+        )
+        .await?;
+    assert!(compacted
+        .entries
+        .iter()
+        .any(|entry| entry.id == format!("c{from}-{to}")));
+    assert!(
+        compacted
+            .entries
+            .iter()
+            .find(|entry| entry.id == user.id)
+            .unwrap()
+            .compacted
+    );
+
+    let overlap = client
+        .request_error(
+            "context.compact",
+            json!({"session_id": session_id, "from_seq": from, "to_seq": from + 1}),
+        )
+        .await?;
+    assert_eq!(overlap, "invalid_params");
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "third question"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+    let third: Value = serde_json::from_str(&bodies.lock().await[2])?;
+    let third_text = third["messages"].to_string();
+    assert!(third_text.contains("we exchanged greetings"));
+    assert!(third_text.contains("[compacted 2 messages"));
+    assert!(!third_text.contains("first question"));
+    assert!(third_text.contains("second question"));
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::ContextPinned));
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::ContextDropped));
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::ContextCompacted));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+async fn wait_turn(client: &mut TestClient) -> anyhow::Result<String> {
+    let mut text = String::new();
+    loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "message.delta" => {
+                if let Some(delta) = notification.params["delta"].as_str() {
+                    text.push_str(delta);
+                }
+            }
+            "turn.completed" => {
+                if let Some(error) = notification.params["error"].as_str() {
+                    anyhow::bail!("turn failed: {error}");
+                }
+                return Ok(text);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn seq_of(id: &str) -> anyhow::Result<u64> {
+    Ok(id
+        .strip_prefix('e')
+        .ok_or_else(|| anyhow::anyhow!("not an event entry: {id}"))?
+        .parse()?)
 }
 
 #[tokio::test]
@@ -837,6 +1074,370 @@ async fn staged_writes_are_visible_to_reads() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn background_process_streams_output_and_can_be_killed() -> anyhow::Result<()> {
+    let dir = temp_dir("process");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(start_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.tools.policy = eix_core::ToolPolicy::Auto;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir.clone()));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "process", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "start the server"}),
+        )
+        .await?;
+    assert!(!submitted.turn_id.is_empty());
+    let answer = wait_turn(&mut client).await?;
+    assert_eq!(answer, "done");
+
+    // The model got a process id back, read its output, and then finished.
+    {
+        let bodies = bodies.lock().await;
+        assert_eq!(bodies.len(), 3, "start, read, finish");
+        let value: Value = serde_json::from_str(
+            bodies
+                .iter()
+                .find(|body| body.matches("\"role\":\"tool\"").count() >= 2)
+                .expect("output round trip"),
+        )?;
+        let tools: Vec<&Value> = value["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|message| message["role"] == "tool")
+            .collect();
+        assert!(tools[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("started process"));
+        let output = tools[1]["content"].as_str().unwrap();
+        assert!(output.starts_with("process "), "output was: {output:?}");
+        assert!(output.contains("running"), "output was: {output:?}");
+    }
+
+    let list: eix_core::ProcessList = client
+        .request("process.list", json!({"session_id": session_id}))
+        .await?;
+    assert_eq!(list.processes.len(), 1);
+    let process = &list.processes[0];
+    assert_eq!(process.status, eix_core::ProcessStatus::Running);
+    let process_id = process.id.clone();
+
+    let mut text = String::new();
+    for _ in 0..100 {
+        let output: eix_core::ProcessOutput = client
+            .request("process.output", json!({"process_id": process_id}))
+            .await?;
+        text = output.text;
+        if text.contains("e2e-process") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(text.contains("e2e-process"), "output was: {text:?}");
+
+    let killed: eix_core::ProcessKillResult = client
+        .request("process.kill", json!({"process_id": process_id}))
+        .await?;
+    assert!(killed.killed);
+
+    let mut status = eix_core::ProcessStatus::Running;
+    for _ in 0..150 {
+        let output: eix_core::ProcessOutput = client
+            .request("process.output", json!({"process_id": process_id}))
+            .await?;
+        status = output.status;
+        if !status.is_running() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(status, eix_core::ProcessStatus::Killed);
+
+    let again: eix_core::ProcessKillResult = client
+        .request("process.kill", json!({"process_id": process_id}))
+        .await?;
+    assert!(!again.killed);
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let started = attached
+        .events
+        .iter()
+        .position(|event| event.kind == EventKind::ProcessStarted)
+        .expect("process started event");
+    let exited = attached
+        .events
+        .iter()
+        .position(|event| event.kind == EventKind::ProcessExited)
+        .expect("process exited event");
+    assert!(started < exited);
+
+    let log = data_dir
+        .join("processes")
+        .join(&session_id)
+        .join(format!("{process_id}.log"));
+    assert!(log.exists(), "log at {}", log.display());
+    assert!(tokio::fs::read_to_string(&log)
+        .await?
+        .contains("e2e-process"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn fork_copies_a_prefix_into_a_new_idle_session() -> anyhow::Result<()> {
+    let dir = temp_dir("fork");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "forkme", "cwd": dir}))
+        .await?;
+    let source = created.session;
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": source.id, "text": "hello"}),
+        )
+        .await?;
+    assert_eq!(wait_turn(&mut client).await?, "Hello from mock");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": source.id}))
+        .await?;
+    let assistant_seq = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .expect("assistant message")
+        .seq;
+    let expected: Vec<&eix_core::Event> = attached
+        .events
+        .iter()
+        .filter(|event| event.seq < assistant_seq)
+        .collect();
+    assert!(!expected.is_empty());
+
+    let forked: SessionResult = client
+        .request(
+            "session.fork",
+            json!({"session_id": source.id, "at_seq": assistant_seq}),
+        )
+        .await?;
+    let fork = forked.session;
+    assert_eq!(fork.name, "forkme~2");
+    assert_eq!(fork.parent_id.as_deref(), Some(source.id.as_str()));
+    assert_eq!(fork.forked_from_seq, Some(assistant_seq));
+    assert_eq!(fork.status, eix_core::SessionStatus::Idle);
+    assert_eq!(fork.cwd, source.cwd);
+
+    // The copy is exactly the source prefix, sequence numbers included.
+    let fork_attached: AttachResult = client
+        .request("session.attach", json!({"session_id": fork.id}))
+        .await?;
+    assert_eq!(fork_attached.events.len(), expected.len());
+    for (copied, original) in fork_attached.events.iter().zip(expected.iter()) {
+        assert_eq!(copied.seq, original.seq);
+        assert_eq!(copied.kind, original.kind);
+        assert_eq!(copied.payload, original.payload);
+    }
+
+    // The fork's search index covers exactly its prefix.
+    let hits: SearchResult = client
+        .request(
+            "search.query",
+            json!({"query": "hello", "session_id": fork.id}),
+        )
+        .await?;
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(hits.hits[0].seq, 1);
+    let hits: SearchResult = client
+        .request(
+            "search.query",
+            json!({"query": "Hello from mock", "session_id": fork.id}),
+        )
+        .await?;
+    assert!(hits.hits.is_empty());
+
+    // A full fork copies the current tail and gets the next suffix.
+    let forked_again: SessionResult = client
+        .request("session.fork", json!({"session_id": source.id}))
+        .await?;
+    assert_eq!(forked_again.session.name, "forkme~3");
+    assert_eq!(
+        forked_again.session.forked_from_seq,
+        attached.events.last().map(|event| event.seq + 1)
+    );
+
+    // Out-of-range cut points are parameter errors.
+    let code = client
+        .request_error(
+            "session.fork",
+            json!({"session_id": source.id, "at_seq": 999}),
+        )
+        .await?;
+    assert_eq!(code, "invalid_params");
+
+    // Forking never mutates the source log.
+    let after: AttachResult = client
+        .request("session.attach", json!({"session_id": source.id}))
+        .await?;
+    assert_eq!(after.events.len(), attached.events.len());
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_indexes_messages_across_sessions_and_short_queries() -> anyhow::Result<()> {
+    let dir = temp_dir("search");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let alpha: SessionResult = client
+        .request("session.create", json!({"name": "alpha", "cwd": dir}))
+        .await?;
+    let beta: SessionResult = client
+        .request("session.create", json!({"name": "beta", "cwd": dir}))
+        .await?;
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": alpha.session.id, "text": "中文检索测试"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({
+                "session_id": beta.session.id,
+                "text": "the request timeout is 30 seconds",
+            }),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    // Three or more characters use the FTS5 trigram index.
+    let hits: SearchResult = client
+        .request("search.query", json!({"query": "timeout"}))
+        .await?;
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(hits.hits[0].session_name, "beta");
+    assert_eq!(hits.hits[0].role, "user");
+    assert!(hits.hits[0].snippet.contains("timeout"));
+
+    // CJK: 4 characters are indexed; 2 characters fall back to a scan.
+    let hits: SearchResult = client
+        .request("search.query", json!({"query": "中文检索"}))
+        .await?;
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(hits.hits[0].session_name, "alpha");
+    let hits: SearchResult = client
+        .request("search.query", json!({"query": "检索"}))
+        .await?;
+    assert_eq!(hits.hits.len(), 1);
+
+    // Assistant text is indexed too, and the limit is applied.
+    let hits: SearchResult = client
+        .request(
+            "search.query",
+            json!({"query": "Hello from mock", "limit": 1}),
+        )
+        .await?;
+    assert_eq!(hits.hits.len(), 1);
+    assert_eq!(hits.hits[0].role, "assistant");
+
+    // Scoping to a session excludes the other one.
+    let hits: SearchResult = client
+        .request(
+            "search.query",
+            json!({"query": "timeout", "session_id": alpha.session.id}),
+        )
+        .await?;
+    assert!(hits.hits.is_empty());
+
+    // Blank queries are parameter errors, and searching does not mutate logs.
+    let code = client
+        .request_error("search.query", json!({"query": "   "}))
+        .await?;
+    assert_eq!(code, "invalid_params");
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": beta.session.id}))
+        .await?;
+    assert_eq!(
+        attached
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::UserMessage)
+            .count(),
+        1
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn recovers_sessions_left_running() -> anyhow::Result<()> {
     let dir = temp_dir("recover");
     let data_dir = dir.join("data");
@@ -866,6 +1467,546 @@ async fn recovers_sessions_left_running() -> anyhow::Result<()> {
         .any(|e| { e.kind == EventKind::StatusChanged && e.payload["to"] == "error" }));
 
     daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewind_restores_the_workspace_before_a_write() -> anyhow::Result<()> {
+    let dir = temp_dir("rewind");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "before")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    // Execute the write immediately so the snapshot and the write land in one
+    // turn; `ask` would stage it and defer the snapshot until apply.
+    config.tools.policy = eix_core::ToolPolicy::Auto;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "rewindme", "cwd": dir}))
+        .await?;
+    let source = created.session;
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": source.id, "text": "write out.txt"}),
+        )
+        .await?;
+    assert_eq!(wait_turn(&mut client).await?, "done");
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": source.id}))
+        .await?;
+    let tool_seq = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCall)
+        .expect("tool call event")
+        .seq;
+    let snapshot = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::Snapshot)
+        .expect("snapshot event");
+    assert_eq!(snapshot.payload["ok"], true);
+    assert!(snapshot.seq >= tool_seq);
+
+    let rewound: eix_core::RewindResult = client
+        .request(
+            "session.rewind",
+            json!({"session_id": source.id, "at_seq": tool_seq}),
+        )
+        .await?;
+    assert!(rewound.restored, "warnings: {:?}", rewound.warnings);
+    assert!(rewound.snapshots >= 1);
+    assert!(rewound.files_restored >= 1, "{rewound:?}");
+    assert_eq!(
+        rewound.session.parent_id.as_deref(),
+        Some(source.id.as_str())
+    );
+    assert_eq!(rewound.session.origin, eix_core::SessionOrigin::Fork);
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
+
+    // The new branch stops before the tool call, and the source is untouched.
+    let branch: AttachResult = client
+        .request("session.attach", json!({"session_id": rewound.session.id}))
+        .await?;
+    assert!(branch.events.iter().all(|event| event.seq < tool_seq));
+    assert_eq!(branch.session.status, eix_core::SessionStatus::Idle);
+    let after: AttachResult = client
+        .request("session.attach", json!({"session_id": source.id}))
+        .await?;
+    assert_eq!(after.events.len(), attached.events.len());
+
+    // Rewinding past the end only forks: the workspace is already there.
+    let noop: eix_core::RewindResult = client
+        .request("session.rewind", json!({"session_id": source.id}))
+        .await?;
+    assert!(noop.restored);
+    assert_eq!(noop.snapshots, 0);
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("git")
+        .args(["-c", "user.email=eix@example.com", "-c", "user.name=eix"])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .expect("run git")
+}
+
+#[tokio::test]
+async fn worktree_sessions_are_created_forked_and_removed() -> anyhow::Result<()> {
+    let dir = temp_dir("worktree");
+    std::fs::create_dir_all(&dir)?;
+    let init = git(&dir, &["init", "-q"]);
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let commit = git(&dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    assert!(
+        commit.status.success(),
+        "git commit: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let repo = dir.canonicalize()?;
+
+    let mut config = Config::default();
+    config.provider.base_url = "http://127.0.0.1:1/v1".to_string();
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "feature", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree path");
+    assert!(worktree.is_dir());
+    assert_eq!(session.cwd, worktree);
+    assert!(worktree.starts_with(repo.join(".worktrees")));
+
+    // A fork inside a repo gets its own worktree by default.
+    let forked: SessionResult = client
+        .request("session.fork", json!({"session_id": session.id}))
+        .await?;
+    assert!(forked.session.has_worktree());
+    assert_eq!(
+        forked.session.parent_id.as_deref(),
+        Some(session.id.as_str())
+    );
+    let fork_worktree = forked.session.worktree.clone().expect("fork worktree");
+    assert!(fork_worktree.is_dir());
+    assert_ne!(fork_worktree, worktree);
+
+    // `worktree: false` shares the source workspace instead.
+    let shared: SessionResult = client
+        .request(
+            "session.fork",
+            json!({"session_id": session.id, "worktree": false, "name": "shared"}),
+        )
+        .await?;
+    assert!(!shared.session.has_worktree());
+    assert_eq!(shared.session.cwd, worktree);
+
+    // A dirty worktree is kept unless the caller explicitly forces removal.
+    std::fs::write(worktree.join("dirty.txt"), "x")?;
+    let refused: eix_core::WorktreeRemoveResult = client
+        .request("session.worktree.remove", json!({"session_id": session.id}))
+        .await?;
+    assert!(!refused.removed);
+    assert!(refused.message.contains("--force"), "{}", refused.message);
+
+    let removed: eix_core::WorktreeRemoveResult = client
+        .request(
+            "session.worktree.remove",
+            json!({"session_id": session.id, "force": true}),
+        )
+        .await?;
+    assert!(removed.removed, "{}", removed.message);
+    assert!(!worktree.exists());
+    let after: SessionResult = client
+        .request("session.get", json!({"session_id": session.id}))
+        .await?;
+    assert!(after.session.worktree.is_none());
+    assert_eq!(after.session.cwd, repo);
+
+    // Removing one worktree never touches another branch's.
+    assert!(fork_worktree.is_dir());
+    let _ = client
+        .request::<eix_core::WorktreeRemoveResult>(
+            "session.worktree.remove",
+            json!({"session_id": forked.session.id, "force": true}),
+        )
+        .await?;
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// Newline-JSON client for the TCP listener (no auto-start, no Unix socket).
+struct RawTcp {
+    reader: BufReader<ReadHalf<tokio::net::TcpStream>>,
+    writer: WriteHalf<tokio::net::TcpStream>,
+    next_id: u64,
+}
+
+impl RawTcp {
+    async fn connect(addr: &str) -> anyhow::Result<Self> {
+        let mut last = None;
+        for _ in 0..100 {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    let (read, write) = tokio::io::split(stream);
+                    return Ok(Self {
+                        reader: BufReader::new(read),
+                        writer: write,
+                        next_id: 1,
+                    });
+                }
+                Err(err) => {
+                    last = Some(err);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }
+        }
+        Err(anyhow::anyhow!(
+            "cannot connect to tcp {addr}: {}",
+            last.map(|err| err.to_string()).unwrap_or_default()
+        ))
+    }
+
+    async fn send(&mut self, method: &str, params: Value) -> anyhow::Result<Option<Response>> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut line = serde_json::to_vec(&Request::new(id, method, params))?;
+        line.push(b'\n');
+        self.writer.write_all(&line).await?;
+        self.writer.flush().await?;
+        let mut buf = String::new();
+        if self.reader.read_line(&mut buf).await? == 0 {
+            return Ok(None);
+        }
+        match serde_json::from_str::<ServerMessage>(buf.trim_end())? {
+            ServerMessage::Response(response) => Ok(Some(response)),
+            ServerMessage::Notification(_) => Ok(None),
+        }
+    }
+
+    async fn recv_notification(&mut self) -> anyhow::Result<Option<String>> {
+        let mut buf = String::new();
+        if self.reader.read_line(&mut buf).await? == 0 {
+            return Ok(None);
+        }
+        Ok(
+            match serde_json::from_str::<ServerMessage>(buf.trim_end())? {
+                ServerMessage::Notification(note) => Some(note.method),
+                ServerMessage::Response(_) => None,
+            },
+        )
+    }
+}
+
+#[tokio::test]
+async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
+    let dir = temp_dir("remote");
+    std::fs::create_dir_all(&dir)?;
+    // Reserve an ephemeral port, then let the daemon take it.
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = probe.local_addr()?.to_string();
+    drop(probe);
+
+    let mut config = Config::default();
+    config.provider.base_url = "http://127.0.0.1:1/v1".to_string();
+    config.server.tcp = Some(addr.clone());
+    config.server.token = Some("s3cret".to_string());
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    // The local Unix socket stays trusted and needs no token.
+    let mut unix = connect(&socket).await?;
+    let hello: HelloResult = unix.request("hello", Value::Null).await?;
+    assert_eq!(hello.protocol, PROTOCOL_VERSION);
+
+    // No auth: the first request is rejected and the connection closes.
+    let mut raw = RawTcp::connect(&addr).await?;
+    let denied = raw.send("hello", Value::Null).await?.expect("response");
+    let error = denied.error.expect("unauthorized error");
+    assert_eq!(error.code, "unauthorized");
+
+    // Wrong token is rejected too.
+    let mut raw = RawTcp::connect(&addr).await?;
+    let denied = raw
+        .send("auth", json!({"token": "wrong"}))
+        .await?
+        .expect("response");
+    assert_eq!(denied.error.expect("unauthorized").code, "unauthorized");
+
+    // The right token unlocks the normal protocol.
+    let mut raw = RawTcp::connect(&addr).await?;
+    let auth = raw
+        .send("auth", json!({"token": "s3cret"}))
+        .await?
+        .expect("response");
+    assert_eq!(auth.result.expect("auth result")["authenticated"], true);
+    let pong = raw.send("ping", Value::Null).await?.expect("response");
+    assert_eq!(pong.result.expect("ping result")["pong"], true);
+    let sessions: eix_core::SessionList = serde_json::from_value(
+        raw.send("session.list", Value::Null)
+            .await?
+            .expect("response")
+            .result
+            .expect("session list"),
+    )?;
+    assert!(sessions.sessions.is_empty());
+
+    // An authenticated TCP client gets the same event broadcast as a local
+    // Unix client.
+    unix.request::<SessionResult>(
+        "session.create",
+        json!({"name": "remote", "cwd": dir.clone()}),
+    )
+    .await?;
+    let seen = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match raw.recv_notification().await? {
+                Some(method) if method == "session.updated" => return Ok::<_, anyhow::Error>(true),
+                Some(_) => continue,
+                None => return Ok(false),
+            }
+        }
+    })
+    .await??;
+    assert!(
+        seen,
+        "authenticated TCP client did not receive the session.updated broadcast"
+    );
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn spawn_agent_runs_a_readonly_child_and_returns_its_answer() -> anyhow::Result<()> {
+    let dir = temp_dir("agent");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(agent_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "parent", "cwd": dir}))
+        .await?;
+    let parent = created.session;
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": parent.id, "text": "investigate"}),
+        )
+        .await?;
+    // Sub-agents stream deltas on the same connection, so wait for the
+    // parent's completion and ignore the child's.
+    let mut text = String::new();
+    loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "message.delta" if notification.params["session_id"] == parent.id.as_str() => {
+                if let Some(delta) = notification.params["delta"].as_str() {
+                    text.push_str(delta);
+                }
+            }
+            "turn.completed" if notification.params["session_id"] == parent.id.as_str() => {
+                assert!(notification.params["error"].is_null());
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(text, "parent done");
+
+    let list: eix_core::SessionList = client.request("session.list", Value::Null).await?;
+    let child = list
+        .sessions
+        .iter()
+        .find(|session| session.origin == eix_core::SessionOrigin::Agent)
+        .expect("agent child session");
+    assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+    assert_eq!(child.name, "parent/scout-1");
+    assert_eq!(child.cwd, parent.cwd);
+    assert_eq!(child.model, parent.model);
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": child.id}))
+        .await?;
+    assert_eq!(attached.session.status, eix_core::SessionStatus::Idle);
+    let user = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::UserMessage)
+        .expect("child prompt");
+    assert_eq!(user.payload["text"], "investigate");
+    let assistant = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .expect("child answer");
+    assert_eq!(assistant.payload["text"], "child answer");
+
+    // The parent receives the child's answer as the tool result.
+    let parent_events: AttachResult = client
+        .request("session.attach", json!({"session_id": parent.id}))
+        .await?;
+    let result = parent_events
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == "spawn_agent")
+        .expect("spawn_agent result");
+    assert_eq!(result.payload["ok"], true);
+    let output = result.payload["output"].as_str().expect("output");
+    assert!(output.contains("child answer"), "{output}");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn nvim_headless_renders_the_transcript() -> anyhow::Result<()> {
+    // The Neovim frontend is optional: skip when the binary is missing.
+    let has_nvim = std::process::Command::new("nvim")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !has_nvim {
+        eprintln!("skipping: nvim not found");
+        return Ok(());
+    }
+
+    let dir = temp_dir("nvim");
+    let data_dir = dir.join("data");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir.clone()));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "editor", "cwd": dir}))
+        .await?;
+    let session = created.session;
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session.id, "text": "say hi"}),
+        )
+        .await?;
+    assert_eq!(wait_turn(&mut client).await?, "Hello from mock");
+
+    let plugin = eix_core::nvim_plugin::write(&data_dir)?;
+    // Wait until the rendered buffer actually contains the answer, then dump
+    // it. Plain `print` goes to stdout under `--headless`.
+    let wait_and_print = concat!(
+        "lua local function ready() ",
+        "if not (_G.eix_nvim and _G.eix_nvim.buffer) then return false end ",
+        "local lines = vim.api.nvim_buf_get_lines(_G.eix_nvim.buffer, 0, -1, false) ",
+        "return table.concat(lines, \"\\n\"):find(\"Hello from mock\", 1, true) ~= nil end ",
+        "local ok = vim.wait(8000, ready, 50) ",
+        "if ok then print(table.concat(vim.api.nvim_buf_get_lines(_G.eix_nvim.buffer, 0, -1, false), \"\\n\")) ",
+        "else print(\"TIMEOUT connected=\"..tostring(_G.eix_nvim.connected)..\" attached=\"..tostring(_G.eix_nvim.attached)..\" buffer=\"..tostring(_G.eix_nvim.buffer)) end",
+    );
+    let plugin_for_nvim = plugin.clone();
+    let socket_for_nvim = socket.clone();
+    let session_id = session.id.clone();
+    // `#[tokio::test]` uses a current-thread runtime: blocking on the child
+    // would starve the daemon, so run nvim on the blocking pool and keep
+    // polling the daemon while it works.
+    let output = tokio::task::spawn_blocking(move || {
+        std::process::Command::new("nvim")
+            .args(["--headless", "-u", "NONE", "-n"])
+            .arg("--cmd")
+            .arg("lua dofile(vim.env.EIX_NVIM_PLUGIN)")
+            .arg("-c")
+            .arg(format!("Eix attach {session_id}"))
+            .arg("-c")
+            .arg(wait_and_print)
+            .arg("-c")
+            .arg("qa!")
+            .env("EIX_NVIM_PLUGIN", &plugin_for_nvim)
+            .env("EIX_NVIM_SOCKET", &socket_for_nvim)
+            .env("EIX_NVIM_SESSION", "")
+            .output()
+    })
+    .await??;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "nvim failed: {stderr}\n{stdout}");
+    // Under `--headless`, Lua `print` goes to stderr; accept either stream.
+    let shown = format!("{stdout}{stderr}");
+    assert!(
+        shown.contains("say hi"),
+        "transcript missing the prompt:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        shown.contains("Hello from mock"),
+        "transcript missing the answer:\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    daemon.abort();
+    mock.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
 }
@@ -918,6 +2059,34 @@ impl TestClient {
             ServerMessage::Notification(notification) => Ok(notification),
             ServerMessage::Response(response) => {
                 anyhow::bail!("unexpected response id {}", response.id)
+            }
+        }
+    }
+
+    /// Send a request that is expected to fail and return the error code.
+    async fn request_error(&mut self, method: &str, params: Value) -> anyhow::Result<String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let mut line = serde_json::to_vec(&Request::new(id, method, params))?;
+        line.push(b'\n');
+        self.writer.write_all(&line).await?;
+        self.writer.flush().await?;
+        loop {
+            match read_message(&mut self.reader).await? {
+                ServerMessage::Response(Response {
+                    id: response_id,
+                    result,
+                    error,
+                }) if response_id == id => {
+                    if let Some(error) = error {
+                        return Ok(error.code);
+                    }
+                    anyhow::bail!("request unexpectedly succeeded: {result:?}");
+                }
+                ServerMessage::Response(other) => {
+                    anyhow::bail!("unexpected response id {}", other.id)
+                }
+                ServerMessage::Notification(notification) => self.pending.push_back(notification),
             }
         }
     }
@@ -1126,6 +2295,70 @@ async fn tool_provider_with_content(
     }
 }
 
+/// A provider for the sub-agent test: the parent (whose tool list contains
+/// `spawn_agent`) asks for one child; the child (read-only tools) answers;
+/// the parent then stops with "parent done".
+async fn agent_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            let can_spawn = value["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "spawn_agent")
+                })
+                .unwrap_or(false);
+
+            let events = if has_tool_result {
+                let chunk = json!({
+                    "model": "mock-agent",
+                    "choices": [{"delta": {"content": "parent done"}, "finish_reason": "stop"}],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else if can_spawn {
+                let arguments = json!({"prompt": "investigate", "name": "scout"}).to_string();
+                let chunk = json!({
+                    "model": "mock-agent",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_agent",
+                                "type": "function",
+                                "function": {"name": "spawn_agent", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else {
+                let chunk = json!({
+                    "model": "mock-agent",
+                    "choices": [{"delta": {"content": "child answer"}, "finish_reason": "stop"}],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
 async fn command_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
@@ -1233,6 +2466,74 @@ fn tool_call_events(call_id: &str, tool: &str, arguments: &str) -> String {
         }],
     });
     format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+async fn start_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let tool_results = value["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                })
+                .unwrap_or(0);
+            let events = if tool_results == 0 {
+                let arguments = json!({"command": "echo e2e-process && sleep 30"}).to_string();
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "start_command", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else if tool_results == 1 {
+                // Read the newest process without naming it.
+                let arguments = json!({"max_bytes": 200}).to_string();
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_2",
+                                "type": "function",
+                                "function": {"name": "process_output", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else {
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
 }
 
 async fn read_http_body(socket: &mut tokio::net::TcpStream) -> Option<String> {

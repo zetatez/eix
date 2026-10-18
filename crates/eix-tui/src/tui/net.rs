@@ -5,17 +5,19 @@
 //! own the socket. Responses are routed by id; notifications go to the UI.
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
-use eix_core::{Notification, Request, Response, ServerMessage};
-use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
-use tokio::net::UnixStream;
+use eix_core::{Endpoint, Notification, Request, Response, ServerMessage};
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
 use tokio::sync::{mpsc, oneshot};
+
+type BoxRead = Box<dyn AsyncRead + Unpin + Send>;
+type BoxWrite = Box<dyn AsyncWrite + Unpin + Send>;
 
 #[derive(Debug)]
 pub enum NetEvent {
@@ -31,11 +33,23 @@ pub struct Requester {
 }
 
 impl Requester {
-    pub async fn connect(socket: &Path) -> Result<(Self, mpsc::UnboundedReceiver<NetEvent>)> {
-        let stream = UnixStream::connect(socket)
-            .await
-            .with_context(|| format!("cannot connect to {}", socket.display()))?;
-        let (read, write) = tokio::io::split(stream);
+    pub async fn connect(endpoint: &Endpoint) -> Result<(Self, mpsc::UnboundedReceiver<NetEvent>)> {
+        let (read, write): (BoxRead, BoxWrite) = match endpoint {
+            Endpoint::Unix(socket) => {
+                let stream = UnixStream::connect(socket)
+                    .await
+                    .with_context(|| format!("cannot connect to {}", socket.display()))?;
+                let (read, write) = tokio::io::split(stream);
+                (Box::new(read), Box::new(write))
+            }
+            Endpoint::Tcp { addr, .. } => {
+                let stream = TcpStream::connect(addr)
+                    .await
+                    .with_context(|| format!("cannot connect to tcp {addr}"))?;
+                let (read, write) = tokio::io::split(stream);
+                (Box::new(read), Box::new(write))
+            }
+        };
 
         let (out_tx, out_rx) = mpsc::unbounded_channel();
         tokio::spawn(writer_loop(write, out_rx));
@@ -45,14 +59,18 @@ impl Requester {
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         tokio::spawn(reader_loop(read, Arc::clone(&pending), event_tx));
 
-        Ok((
-            Self {
-                out: out_tx,
-                pending,
-                next_id: Arc::new(AtomicU64::new(1)),
-            },
-            event_rx,
-        ))
+        let requester = Self {
+            out: out_tx,
+            pending,
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+        if let Some(token) = endpoint.token() {
+            let value = requester.request("auth", json!({ "token": token })).await?;
+            if value["authenticated"] != Value::Bool(true) {
+                bail!("daemon rejected the remote token");
+            }
+        }
+        Ok((requester, event_rx))
     }
 
     pub async fn request(&self, method: &str, params: Value) -> Result<Value> {
@@ -85,7 +103,7 @@ impl Requester {
     }
 }
 
-async fn writer_loop(mut write: WriteHalf<UnixStream>, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
+async fn writer_loop(mut write: BoxWrite, mut rx: mpsc::UnboundedReceiver<Vec<u8>>) {
     while let Some(bytes) = rx.recv().await {
         if write.write_all(&bytes).await.is_err() {
             break;
@@ -97,7 +115,7 @@ async fn writer_loop(mut write: WriteHalf<UnixStream>, mut rx: mpsc::UnboundedRe
 }
 
 async fn reader_loop(
-    read: ReadHalf<UnixStream>,
+    read: BoxRead,
     pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Response>>>>,
     events: mpsc::UnboundedSender<NetEvent>,
 ) {

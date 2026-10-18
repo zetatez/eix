@@ -19,7 +19,7 @@ use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
-use eix_core::{InputBackend, InputConfig};
+use eix_core::{Endpoint, InputBackend, InputConfig};
 use eix_nvim::embedded::NvimInput;
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -31,7 +31,7 @@ use controller::Command;
 type Backend = CrosstermBackend<io::Stdout>;
 
 pub async fn run(
-    socket: PathBuf,
+    endpoint: Endpoint,
     data_dir: PathBuf,
     config: Option<PathBuf>,
     initial_session: Option<String>,
@@ -71,7 +71,7 @@ pub async fn run(
     if let Some(note) = fallback_note {
         app.set_status(format!("{note}; using the native prompt"));
     }
-    let (cmd_tx, mut ev_rx) = controller::spawn(socket, data_dir, config);
+    let (cmd_tx, mut ev_rx) = controller::spawn(endpoint, data_dir, config);
     let _ = cmd_tx.send(Command::Hello);
     let _ = cmd_tx.send(Command::List);
 
