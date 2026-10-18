@@ -8,8 +8,9 @@ use std::collections::{HashMap, HashSet};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use eix_core::{
     ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
-    Event as SessionEvent, EventKind, HelloResult, HunkInfo, Session, SessionStatus, SubmitResult,
-    ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    Event as SessionEvent, EventKind, HelloResult, HunkInfo, PatchProposedPayload,
+    PatchResultPayload, Session, SessionStatus, SubmitResult, ToolCallPayload, ToolResultPayload,
+    UserMessagePayload,
 };
 use eix_nvim::embedded::NvimInput;
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -219,26 +220,62 @@ impl SessionView {
         }
     }
 
-    /// Find an approval request in the replayable log that has no result yet.
-    /// This restores the approval card after a TUI restart / re-attach.
+    /// Find the pending approval or staged patch in the replayable log. A
+    /// blocking tool approval wins (the turn is paused on it); otherwise the
+    /// oldest pending patch is shown so stacked writes apply in order.
     fn pending_approval(&self) -> Option<PendingApproval> {
-        let mut resolved = HashSet::new();
-        for event in self.events.iter().rev() {
+        let mut resolved_calls = HashSet::new();
+        let mut resolved_patches = HashSet::new();
+        for event in &self.events {
             match event.kind {
                 EventKind::ToolResult => {
                     if let Ok(payload) =
                         serde_json::from_value::<ToolResultPayload>(event.payload.clone())
                     {
-                        resolved.insert(payload.call_id);
+                        resolved_calls.insert(payload.call_id);
                     }
                 }
-                EventKind::ApprovalRequired => {
+                EventKind::PatchApplied | EventKind::PatchRejected | EventKind::PatchConflict => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
+                    {
+                        resolved_patches.insert(payload.patch_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut tool = None;
+        let mut patch = None;
+        for event in &self.events {
+            match event.kind {
+                EventKind::ApprovalRequired if tool.is_none() => {
                     if let Ok(payload) =
                         serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
                     {
-                        if !resolved.contains(&payload.call_id) {
-                            return Some(PendingApproval {
+                        if !resolved_calls.contains(&payload.call_id) {
+                            tool = Some(PendingApproval {
+                                kind: PendingKind::Tool,
                                 approval_id: payload.approval_id,
+                                call_id: payload.call_id,
+                                tool: payload.tool,
+                                summary: payload.summary,
+                                diff: payload.diff,
+                                selected: vec![true; payload.hunks.len()],
+                                hunks: payload.hunks,
+                            });
+                        }
+                    }
+                }
+                EventKind::PatchProposed if patch.is_none() => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
+                    {
+                        if !resolved_patches.contains(&payload.patch_id) {
+                            patch = Some(PendingApproval {
+                                kind: PendingKind::Patch,
+                                approval_id: payload.patch_id,
+                                call_id: payload.call_id,
                                 tool: payload.tool,
                                 summary: payload.summary,
                                 diff: payload.diff,
@@ -251,7 +288,7 @@ impl SessionView {
                 _ => {}
             }
         }
-        None
+        tool.or(patch)
     }
 }
 
@@ -285,10 +322,22 @@ struct PendingAttach {
     slot: AttachSlot,
 }
 
-/// A tool call the daemon is holding until the user decides.
+/// A tool call or staged patch the daemon is holding until the user decides.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingKind {
+    /// A blocking tool call (`run_command`) waiting in the turn loop.
+    Tool,
+    /// A staged `write_file` proposal; the turn has already continued.
+    Patch,
+}
+
+/// A tool call or staged patch the daemon is holding until the user decides.
 #[derive(Clone)]
 struct PendingApproval {
+    kind: PendingKind,
     approval_id: String,
+    /// Tool call that produced this card, used to match `tool.completed`.
+    call_id: String,
     tool: String,
     summary: String,
     diff: Option<String>,
@@ -549,9 +598,15 @@ impl App {
                 accepted,
             } => {
                 if accepted {
-                    self.approvals
-                        .retain(|_, pending| pending.approval_id != approval_id);
-                    self.diff_view = None;
+                    let sessions: Vec<String> = self
+                        .approvals
+                        .iter()
+                        .filter(|(_, pending)| pending.approval_id == approval_id)
+                        .map(|(session_id, _)| session_id.clone())
+                        .collect();
+                    for session_id in sessions {
+                        self.reload_pending(&session_id);
+                    }
                     self.status = "approval sent".into();
                 } else {
                     self.status = "approval was stale; the daemon is still waiting".into();
@@ -604,9 +659,6 @@ impl App {
         self.upsert_session(attached.session.clone(), false);
         let session_id = attached.session.id.clone();
         let view = SessionView::new(attached.session, attached.events);
-        let restored_approval = view
-            .pending_approval()
-            .filter(|_| view.session.status == SessionStatus::AwaitingApproval);
 
         if let Some(open) = self.open_session(&session_id) {
             // One session lives in at most one pane.
@@ -625,9 +677,7 @@ impl App {
             }
         }
         self.focused = self.focused.min(self.views.len().saturating_sub(1));
-        if let Some(approval) = restored_approval {
-            self.approvals.insert(session_id.clone(), approval);
-        }
+        self.reload_pending(&session_id);
         self.selected = self.find_session(&session_id).unwrap_or(self.selected);
         self.error = None;
         self.status = "attached".into();
@@ -662,19 +712,12 @@ impl App {
             "session.updated" => {
                 if let Ok(session) = serde_json::from_value::<Session>(notification.params) {
                     let id = session.id.clone();
-                    let mut background_attention = false;
-                    if let Some((index, view)) = self
-                        .views
-                        .iter_mut()
-                        .enumerate()
-                        .find(|(_, view)| view.session.id == id)
-                    {
-                        view.session = session.clone();
-                        background_attention =
-                            index != self.focused && session.status.needs_attention();
-                    }
-                    if background_attention {
-                        self.status = format!("{} needs attention", session.name);
+                    let index = self.views.iter().position(|view| view.session.id == id);
+                    if let Some(index) = index {
+                        self.views[index].session = session.clone();
+                        if index != self.focused && self.pane_needs_attention(index) {
+                            self.status = format!("{} needs attention", session.name);
+                        }
                     }
                     self.upsert_session(session, false);
                 }
@@ -707,6 +750,15 @@ impl App {
             "session.event" => {
                 if let Ok(event) = serde_json::from_value::<SessionEvent>(notification.params) {
                     let id = event.session_id.clone();
+                    let relevant = matches!(
+                        event.kind,
+                        EventKind::ToolResult
+                            | EventKind::ApprovalRequired
+                            | EventKind::PatchProposed
+                            | EventKind::PatchApplied
+                            | EventKind::PatchRejected
+                            | EventKind::PatchConflict
+                    );
                     let Some(view) = self.views.iter_mut().find(|view| view.session.id == id)
                     else {
                         return;
@@ -733,6 +785,9 @@ impl App {
                         _ => {}
                     }
                     view.events.push(event);
+                    if relevant {
+                        self.reload_pending(&id);
+                    }
                 }
             }
             "message.delta" => {
@@ -773,7 +828,9 @@ impl App {
                     self.approvals.insert(
                         params.session_id,
                         PendingApproval {
+                            kind: PendingKind::Tool,
                             approval_id: params.approval_id,
+                            call_id: params.call_id,
                             tool: params.tool,
                             summary: params.summary,
                             selected: vec![true; params.hunks.len()],
@@ -783,16 +840,63 @@ impl App {
                     );
                 }
             }
+            "patch.proposed" => {
+                if let Ok(params) =
+                    serde_json::from_value::<PatchProposedParams>(notification.params)
+                {
+                    if let Some(view) = self
+                        .views
+                        .iter_mut()
+                        .find(|view| view.session.id == params.session_id)
+                    {
+                        view.follow = true;
+                    }
+                    self.status = format!("patch staged: {}", params.path);
+                    self.reload_pending(&params.session_id);
+                }
+            }
+            "patch.applied" | "patch.rejected" | "patch.conflict" => {
+                if let Ok(params) =
+                    serde_json::from_value::<PatchOutcomeParams>(notification.params)
+                {
+                    let message = match notification.method.as_str() {
+                        "patch.applied" => format!("patch applied: {}", params.path),
+                        "patch.rejected" => format!("patch rejected: {}", params.path),
+                        _ => format!("patch conflict: {}", params.path),
+                    };
+                    self.status = message;
+                    self.reload_pending(&params.session_id);
+                    self.close_diff_view_for(&params.session_id);
+                }
+            }
             "tool.completed" => {
                 if let Ok(params) = serde_json::from_value::<ToolCompleted>(notification.params) {
-                    self.approvals.remove(&params.session_id);
-                    self.close_diff_view_for(&params.session_id);
+                    let matches_completed =
+                        self.approvals
+                            .get(&params.session_id)
+                            .is_some_and(|pending| {
+                                pending.kind == PendingKind::Tool
+                                    && (params.call_id.is_empty()
+                                        || pending.call_id == params.call_id)
+                            });
+                    if matches_completed {
+                        self.reload_pending(&params.session_id);
+                        self.close_diff_view_for(&params.session_id);
+                    }
                 }
             }
             "turn.completed" => {
                 if let Ok(done) = serde_json::from_value::<TurnCompleted>(notification.params) {
-                    self.approvals.remove(&done.session_id);
-                    self.close_diff_view_for(&done.session_id);
+                    // A blocking approval belongs to the finished turn; a staged
+                    // patch survives until the user decides.
+                    if self
+                        .approvals
+                        .get(&done.session_id)
+                        .is_some_and(|pending| pending.kind == PendingKind::Tool)
+                    {
+                        self.reload_pending(&done.session_id);
+                        self.close_diff_view_for(&done.session_id);
+                    }
                     let Some(view) = self
                         .views
                         .iter_mut()
@@ -1173,6 +1277,37 @@ impl App {
         self.approvals.get(&view.session.id)
     }
 
+    /// Recompute the cached card for a session from its replayable log. The
+    /// newest unresolved approval or staged patch is shown; resolving it
+    /// reveals the next older one.
+    fn reload_pending(&mut self, session_id: &str) {
+        let next = self
+            .views
+            .iter()
+            .find(|view| view.session.id == session_id)
+            .and_then(|view| {
+                view.pending_approval().filter(|pending| {
+                    pending.kind == PendingKind::Patch
+                        || view.session.status == SessionStatus::AwaitingApproval
+                })
+            });
+        let Some(mut next) = next else {
+            self.approvals.remove(session_id);
+            self.close_diff_view_for(session_id);
+            return;
+        };
+        // Keep an in-progress hunk selection when the same card is reloaded.
+        if let Some(selected) = self
+            .approvals
+            .get(session_id)
+            .filter(|pending| pending.approval_id == next.approval_id)
+            .map(|pending| pending.selected.clone())
+        {
+            next.selected = selected;
+        }
+        self.approvals.insert(session_id.to_string(), next);
+    }
+
     fn respond_approval(&mut self, decision: ApprovalDecision, tx: &UnboundedSender<Command>) {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             return;
@@ -1355,14 +1490,15 @@ impl App {
     }
 
     /// A pane needs attention when its session is blocked and the pane is not
-    /// focused. This is derived from the session status instead of a one-shot
-    /// flag so switching away from a pending approval still marks it.
+    /// focused. This is derived from the session status and any pending
+    /// approval/patch instead of a one-shot flag, so switching away from a
+    /// pending card still marks it.
     fn pane_needs_attention(&self, index: usize) -> bool {
         index != self.focused
-            && self
-                .views
-                .get(index)
-                .is_some_and(|view| view.session.status.needs_attention())
+            && self.views.get(index).is_some_and(|view| {
+                view.session.status.needs_attention()
+                    || self.approvals.contains_key(&view.session.id)
+            })
     }
 
     fn attention_count(&self) -> usize {
@@ -1375,17 +1511,18 @@ impl App {
         let len = self.views.len();
         for offset in 1..len {
             let index = (self.focused + offset) % len;
-            if self.views[index].session.status.needs_attention() {
+            if self.views[index].session.status.needs_attention()
+                || self.approvals.contains_key(&self.views[index].session.id)
+            {
                 self.focus_pane(index);
                 let name = self.views[index].session.name.clone();
                 self.status = format!("attention: {name}");
                 return;
             }
         }
-        self.status = if self
-            .focused_view()
-            .is_some_and(|view| view.session.status.needs_attention())
-        {
+        self.status = if self.focused_view().is_some_and(|view| {
+            view.session.status.needs_attention() || self.approvals.contains_key(&view.session.id)
+        }) {
             "the focused pane needs attention".into()
         } else {
             "nothing needs attention".into()
@@ -1774,11 +1911,15 @@ impl App {
             return;
         }
         let focused = index == self.focused;
+        let session_id = self.views[index].session.id.clone();
         let approval = if focused {
-            self.approvals.get(&self.views[index].session.id).cloned()
+            self.approvals.get(&session_id).cloned()
         } else {
             None
         };
+        let attention = !focused
+            && (self.views[index].session.status.needs_attention()
+                || self.approvals.contains_key(&session_id));
         let view = &mut self.views[index];
         let inner_width = area.width.saturating_sub(2) as usize;
         let inner_height = area.height.saturating_sub(2) as usize;
@@ -1790,7 +1931,6 @@ impl App {
             view.scroll = view.scroll.min(max_scroll);
         }
         let name = truncate(&view.session.name, inner_width.saturating_sub(8).max(1));
-        let attention = !focused && view.session.status.needs_attention();
         let marker = if attention { "!" } else { "" };
         let title = format!(
             " {}{marker} {} {} ",
@@ -1902,6 +2042,56 @@ impl App {
                     {
                         let text = format!("{} — y to approve, n to deny", payload.summary);
                         push_message(&mut lines, "need", Color::Yellow, &text, "", width);
+                    }
+                }
+                EventKind::PatchProposed => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
+                    {
+                        let text = format!("{} — y to apply, n to reject", payload.summary);
+                        push_message(&mut lines, "patch", Color::Magenta, &text, "", width);
+                    }
+                }
+                EventKind::PatchApplied => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
+                    {
+                        push_message(
+                            &mut lines,
+                            "patch",
+                            Color::Green,
+                            &format!("applied {}", payload.path),
+                            "",
+                            width,
+                        );
+                    }
+                }
+                EventKind::PatchRejected => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
+                    {
+                        push_message(
+                            &mut lines,
+                            "patch",
+                            Color::Red,
+                            &format!("rejected {}", payload.path),
+                            "",
+                            width,
+                        );
+                    }
+                }
+                EventKind::PatchConflict => {
+                    if let Ok(payload) =
+                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
+                    {
+                        push_message(
+                            &mut lines,
+                            "patch",
+                            Color::Red,
+                            &format!("conflict on {}", payload.path),
+                            "",
+                            width,
+                        );
                     }
                 }
                 EventKind::ToolResult => {
@@ -2332,6 +2522,8 @@ struct TurnCompleted {
 struct ApprovalParams {
     session_id: String,
     approval_id: String,
+    #[serde(default)]
+    call_id: String,
     tool: String,
     summary: String,
     #[serde(default)]
@@ -2341,8 +2533,22 @@ struct ApprovalParams {
 }
 
 #[derive(Deserialize)]
+struct PatchProposedParams {
+    session_id: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct PatchOutcomeParams {
+    session_id: String,
+    path: String,
+}
+
+#[derive(Deserialize)]
 struct ToolCompleted {
     session_id: String,
+    #[serde(default)]
+    call_id: String,
 }
 
 #[derive(Deserialize)]
@@ -3107,7 +3313,9 @@ mod tests {
         app.approvals.insert(
             "s1".to_string(),
             PendingApproval {
+                kind: PendingKind::Tool,
                 approval_id: "a1".to_string(),
+                call_id: "c1".to_string(),
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: None,
@@ -3153,7 +3361,9 @@ mod tests {
         app.approvals.insert(
             "s1".to_string(),
             PendingApproval {
+                kind: PendingKind::Tool,
                 approval_id: "a1".to_string(),
+                call_id: "c1".to_string(),
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: diff.map(str::to_string),
@@ -3183,7 +3393,9 @@ mod tests {
         app.approvals.insert(
             "s1".to_string(),
             PendingApproval {
+                kind: PendingKind::Tool,
                 approval_id: "a1".to_string(),
+                call_id: "c1".to_string(),
                 tool: "write_file".to_string(),
                 summary: "write_file out.txt".to_string(),
                 diff: Some("unused".to_string()),

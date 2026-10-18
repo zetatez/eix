@@ -6,6 +6,7 @@
 pub mod provider;
 pub mod server;
 pub mod snapshot;
+pub mod staging;
 pub mod store;
 pub mod tools;
 

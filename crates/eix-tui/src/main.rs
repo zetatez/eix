@@ -15,8 +15,9 @@ use eix_core::config as core_config;
 use eix_core::sandbox as core_sandbox;
 use eix_core::{
     ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload, AttachResult, CancelResult,
-    Config, Event, EventKind, HelloResult, Session, SessionList, SessionResult, SnapshotPayload,
-    SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    Config, Event, EventKind, HelloResult, PatchProposedPayload, PatchResultPayload, Session,
+    SessionList, SessionResult, SnapshotPayload, SubmitResult, ToolCallPayload, ToolResultPayload,
+    UserMessagePayload,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -743,6 +744,40 @@ async fn stream_turn(
                     eprintln!("  run `eix approve` or `eix deny`");
                 }
             }
+            "patch.proposed" => {
+                if notification.params["session_id"] == session_id {
+                    if wrote {
+                        println!();
+                        wrote = false;
+                    }
+                    let summary = notification.params["summary"]
+                        .as_str()
+                        .unwrap_or("file change");
+                    eprintln!("patch staged: {summary}");
+                    if let Some(diff) = notification.params["diff"]
+                        .as_str()
+                        .filter(|diff| !diff.is_empty())
+                    {
+                        eprintln!("{diff}");
+                    }
+                    eprintln!("  run `eix approve` to apply or `eix deny` to reject");
+                }
+            }
+            "patch.applied" | "patch.rejected" | "patch.conflict" => {
+                if notification.params["session_id"] == session_id {
+                    if wrote {
+                        println!();
+                        wrote = false;
+                    }
+                    let path = notification.params["path"].as_str().unwrap_or("file");
+                    let label = match notification.method.as_str() {
+                        "patch.applied" => "patch applied",
+                        "patch.rejected" => "patch rejected",
+                        _ => "patch conflict",
+                    };
+                    eprintln!("{label}: {path}");
+                }
+            }
             "stream.lagged" => {
                 if let Some(skipped) = notification.params.get("skipped") {
                     eprintln!("warning: dropped {skipped} notifications (client is too slow)");
@@ -799,6 +834,57 @@ fn render_events(events: &[Event]) {
                     if let Some(diff) = payload.diff.as_deref().filter(|diff| !diff.is_empty()) {
                         print!("{diff}");
                     }
+                }
+            }
+            EventKind::PatchProposed => {
+                if let Ok(payload) =
+                    serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
+                {
+                    println!(
+                        "patch> {} [{}] (y/n in the TUI, or `eix approve/deny`)",
+                        payload.summary, payload.patch_id
+                    );
+                    if let Some(diff) = payload.diff.as_deref().filter(|diff| !diff.is_empty()) {
+                        print!("{diff}");
+                    }
+                }
+            }
+            EventKind::PatchApplied => {
+                if let Ok(payload) =
+                    serde_json::from_value::<PatchResultPayload>(event.payload.clone())
+                {
+                    let hunks = if payload.hunks.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (hunks {:?})", payload.hunks)
+                    };
+                    println!("patch> applied {}{hunks}", payload.path);
+                }
+            }
+            EventKind::PatchRejected => {
+                if let Ok(payload) =
+                    serde_json::from_value::<PatchResultPayload>(event.payload.clone())
+                {
+                    println!(
+                        "patch> rejected {}{}",
+                        payload.path,
+                        payload
+                            .message
+                            .as_deref()
+                            .map(|message| format!(" — {message}"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            EventKind::PatchConflict => {
+                if let Ok(payload) =
+                    serde_json::from_value::<PatchResultPayload>(event.payload.clone())
+                {
+                    println!(
+                        "patch> conflict on {} — {}",
+                        payload.path,
+                        payload.message.as_deref().unwrap_or("file changed")
+                    );
                 }
             }
             EventKind::ToolResult => {

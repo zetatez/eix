@@ -16,6 +16,8 @@ pub enum EventKind {
     ToolResult,
     PatchProposed,
     PatchApplied,
+    PatchRejected,
+    PatchConflict,
     ApprovalRequired,
     /// Pre-execution snapshot of what a mutating tool is about to touch.
     Snapshot,
@@ -33,6 +35,8 @@ impl EventKind {
             Self::ToolResult => "tool_result",
             Self::PatchProposed => "patch_proposed",
             Self::PatchApplied => "patch_applied",
+            Self::PatchRejected => "patch_rejected",
+            Self::PatchConflict => "patch_conflict",
             Self::ApprovalRequired => "approval_required",
             Self::Snapshot => "snapshot",
             Self::StatusChanged => "status_changed",
@@ -58,6 +62,8 @@ impl std::str::FromStr for EventKind {
             "tool_result" => Self::ToolResult,
             "patch_proposed" => Self::PatchProposed,
             "patch_applied" => Self::PatchApplied,
+            "patch_rejected" => Self::PatchRejected,
+            "patch_conflict" => Self::PatchConflict,
             "approval_required" => Self::ApprovalRequired,
             "snapshot" => Self::Snapshot,
             "status_changed" => Self::StatusChanged,
@@ -142,6 +148,44 @@ pub struct HunkInfo {
     pub lines: Vec<String>,
 }
 
+/// A write that has been staged in the session's shadow workspace. The bytes
+/// live under `<data>/staging/<session>/<patch_id>.json`; this event carries the
+/// reviewable diff and hunk preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchProposedPayload {
+    pub patch_id: String,
+    pub call_id: String,
+    pub tool: String,
+    /// Workspace-relative path, for display.
+    pub path: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<HunkInfo>,
+}
+
+/// Outcome of applying, rejecting or conflicting a staged patch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchResultPayload {
+    pub patch_id: String,
+    pub call_id: String,
+    pub path: String,
+    /// True when the change landed on disk.
+    #[serde(default)]
+    pub applied: bool,
+    /// True when the file changed after the patch was staged.
+    #[serde(default)]
+    pub conflict: bool,
+    /// Hunk indices that were applied (empty means the whole change).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalRequiredPayload {
     pub approval_id: String,
@@ -210,6 +254,8 @@ mod tests {
             EventKind::ToolResult,
             EventKind::PatchProposed,
             EventKind::PatchApplied,
+            EventKind::PatchRejected,
+            EventKind::PatchConflict,
             EventKind::ApprovalRequired,
             EventKind::Snapshot,
             EventKind::StatusChanged,

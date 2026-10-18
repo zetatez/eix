@@ -67,11 +67,12 @@ cooldown_secs = 10
 协议是 Unix socket 上的 newline-delimited JSON：请求带 `id`/`method`/`params`，
 响应带 `id`，事件通知是 `session.updated`、`session.event`、`turn.started`、
 `message.delta`、`tool.approval_required`、`tool.started`、`tool.completed`、
+`patch.proposed`、`patch.applied`、`patch.rejected`、`patch.conflict`、
 `session.attention`、`turn.completed` 等。`eix-core/src/protocol.rs` 是唯一契约来源。
 
-当前限制：工具执行已接入，写入是审批后直接落盘；审批前会展示 unified diff 并支持按 hunk
-选择（`d` 全屏审阅里 Space 勾选），审阅期间的文件改动会让本次写入被拒绝；但 staged
-shadow workspace 仍未做（bubblewrap 沙箱和 context ledger 也是 Phase 2 的后续项）。TUI 已支持多
+当前限制：`write_file` 在 `ask` 策略下先 stage 到 shadow workspace、不阻塞 turn，读取
+（以及后续写入）看到的是“真实工作区 + staged”合并视图；`run_command` 仍在审批处阻塞
+（shell 无法 stage）。bubblewrap 沙箱已接入；context ledger 仍是 Phase 2 的后续项。TUI 已支持多
 pane；后台 pane 的 attention 用边框/侧栏高亮和 `a` 跳转提示，外部通知命令（dwm/tmux）
 已接入（见 `[notifications]`）；输入框已默认使用嵌入的 Neovim（见下）。
 
@@ -110,14 +111,14 @@ pane（1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+
 | `q` / `Ctrl-C` | 退出 |
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
-有待审批的工具调用时，pane 底部会出现 `[y] approve / [n] deny` 卡片，`write_file`
-还会显示 unified diff（最多 10 行，超出标 `… diff truncated`），按 `d` 可全屏审阅：
-`j/k` 滚动，`[`/`]` 跳 hunk，`Space` 勾选，`a` 全选/全不选，`y` 应用选中（全选或非
-`write_file` 时按整文件），`n` 拒绝。未勾选任何 hunk 时 `y` 会提示先选择。session 栏
+`write_file` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现 `[y] apply / [n] reject`
+卡片并显示 unified diff（最多 10 行，超出标 `… diff truncated`）；按 `d` 可全屏审阅：
+`j/k` 滚动，`[`/`]` 跳 hunk，`Space` 勾选，`a` 全选/全不选，`y` 应用选中，`n` 拒绝。
+未勾选任何 hunk 时 `y` 会提示先选择。`run_command` 仍走阻塞式审批卡片。session 栏
 显示 `⚠`；也可以从命令行用
-`eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk）。后台 pane 进入
-`awaiting_approval` / `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
-按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的审批卡片。
+`eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk）。后台 pane 有
+pending 审批/补丁或进入 `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
+按 `a` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的卡片。
 ### 输入框：嵌入 nvim
 
 TUI 默认拉起一个 `nvim --embed`（加载你的完整 `~/.config/nvim`），用 `ext_linegrid`
@@ -153,15 +154,13 @@ daemon 目前向模型暴露四个工具：
 | --- | --- | --- |
 | `read_file` | 读取 session cwd 内的文本文件 | 自动放行 |
 | `list_dir` | 列出 session cwd 内的目录 | 自动放行 |
-| `write_file` | 创建/覆盖 cwd 内文件（自动建父目录） | 需要审批 |
+| `write_file` | stage 到 shadow workspace，审批后写入 cwd 内文件（自动建父目录） | stage + 审批落盘 |
 | `run_command` | 在 cwd 内用 `sh -c` 执行命令，带超时；默认套 bubblewrap 沙箱 | 需要审批 |
 
 所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出按
-`max_output_bytes` 截断。`write_file` 在审批前会读取原文件并生成 unified diff 和逐 hunk
-预览，TUI 审批卡片、`eix chat` 和 `eix log` 都会显示；在 TUI 里用 `d` 全屏审阅可以按
-hunk 选择应用，命令行用 `eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。
-批准前会重新校验文件指纹：如果审阅期间文件被外部修改，本次写入会被拒绝并提示重新审阅。
-策略由 `[tools]` 配置或环境变量控制：
+`max_output_bytes` 截断。`write_file` 会先生成 unified diff 和逐 hunk 预览，TUI 审批卡片、
+`eix chat` 和 `eix log` 都会显示；在 TUI 里用 `d` 全屏审阅可以按 hunk 选择应用，命令行用
+`eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。策略由 `[tools]` 配置或环境变量控制：
 
 ```toml
 [tools]
@@ -183,9 +182,30 @@ workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具�
 `auto` 会跳过审批直接执行写操作（危险，显式选择才生效）；`read_only` 直接拒绝写工具
 并把原因回传给模型。一次 turn 最多 12 轮工具往返。
 
+### Shadow workspace（staged 写入）
+
+`ask` 策略下，`write_file` 不再阻塞 turn，而是先把提案 stage 起来：
+
+1. **propose**：`write_file` 读取基准内容（磁盘或更新的 staged 内容）、生成 diff/hunk，
+   返回 `staged <path> as patch <id>; the file is not written yet`，并发出
+   `patch_proposed` 事件和 `patch.proposed` 通知。
+2. **stage**：补丁落在 `<data-dir>/staging/<session>/<patch_id>.json`（新旧内容、路径、
+   call id）。同一文件的多次写入会以最新的 staged 内容为基准，所以可以叠加；
+   读取工具看到的是“真实工作区 + staged”合并视图：`read_file` 返回 staged 内容，
+   `list_dir` 会列出只存在于 shadow 里的文件/目录。daemon 重启后仍能恢复 pending 补丁。
+3. **apply / reject**：TUI 里仍按 `y`/`n`（或 `eix approve` / `eix deny`），底层是
+   `patch.apply` / `patch.reject`（也接受 `approval.respond` + patch id）。落盘前会重新
+   校验基准文件：如果 stage 之后文件被外部修改，补丁标记为 conflict（`patch_conflict`
+   事件），不会覆盖；可以重新让模型 stage。应用时按选择写 hunk，并在写入前做单文件快照。
+
+`run_command` 无法 stage（shell 会读写真实工作区），仍然在审批处阻塞；所以同一个 turn
+里先 staged 写入、再执行 shell 时，shell 看到的是旧文件——这是有意保留的边界。
+模型不会自动收到 apply / reject 的结果，它下一轮通过 `read_file` 看到真实内容（应用后）
+或旧内容（拒绝后）；前端通过 `patch.*` 事件和卡片看到结果。
+
 ### 执行前快照
 
-`write_file` 和 `run_command` 在真正执行前会先做一次快照，落在
+`write_file`（应用 staged 补丁时）和 `run_command`（执行前）会先做一次快照，落在
 `<data-dir>/snapshots/<session>/<snapshot>/`：
 
 - `write_file`：只复制它要覆盖的那个文件；目标原本不存在也会记下来（回滚时删除）。
@@ -282,13 +302,13 @@ spike 内：
 - [x] TUI v1（多 pane 自动平铺、焦点切换、转录、session 栏、fuzzy picker、多行输入、流式跟随）
 - [x] 工具调用 + 审批门禁（read_file / list_dir / write_file / run_command、workspace 沙箱、审批卡片）
 - [x] 写入前 unified diff 预览（TUI 卡片、`d` 全屏审阅、`eix chat` / `eix log`）
-- [x] 审阅期间的 stale-write 冲突检测（批准时重新校验文件指纹）
+- [x] stale-write 冲突检测（stage 后文件被外部修改 → `patch_conflict`，不会覆盖）
 - [x] hunk 级审批（TUI `d` 审阅里勾选 hunk，daemon 按选择应用部分改动）
 - [x] attention 标记（后台 pane 高亮、`a` 跳转、审批卡片重放）
 - [x] 外部 attention 通知（`[notifications]` command + TUI 终端铃、冷却、重放）
 - [x] 嵌入 nvim 输入（ext_linegrid 渲染、按键转发、动态高度、失败回填、native 回退）
 - [x] bubblewrap 沙箱（`run_command` 默认隔离，`[tools] sandbox` 可配，写入只限 workspace）
-- [ ] staged shadow workspace（propose → stage → apply、`patch.apply` / `patch.reject`）
+- [x] staged shadow workspace（propose → stage → apply、合并读视图、`patch.apply` / `patch.reject`、跨重启恢复）
 - [x] 执行前快照（write_file 单文件 / run_command 整个 workspace，`snapshot` 事件，保留 20 份）
 - [ ] context ledger、process view
 - [ ] rewind / fork、全文搜索、worktree、子 agent

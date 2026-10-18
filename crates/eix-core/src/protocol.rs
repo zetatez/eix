@@ -158,6 +158,34 @@ pub struct ApprovalResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchApplyParams {
+    pub session_id: SessionId,
+    pub patch_id: String,
+    /// Indices of hunks to apply. Omitted or empty means the whole change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hunks: Option<Vec<usize>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchRejectParams {
+    pub session_id: SessionId,
+    pub patch_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchResult {
+    pub accepted: bool,
+    #[serde(default)]
+    pub applied: bool,
+    #[serde(default)]
+    pub conflict: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsParams {
     pub session_id: SessionId,
     #[serde(default)]

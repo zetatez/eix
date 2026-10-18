@@ -17,17 +17,17 @@ pub use config::{
 };
 pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ErrorPayload, Event, EventKind,
-    HunkInfo, SnapshotPayload, StatusChangedPayload, ToolCallPayload, ToolResultPayload,
-    UserMessagePayload,
+    HunkInfo, PatchProposedPayload, PatchResultPayload, SnapshotPayload, StatusChangedPayload,
+    ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, Role, ToolCall, ToolDefinition, Usage,
 };
 pub use protocol::{
     ApprovalDecision, ApprovalRespondParams, ApprovalResult, AttachResult, CancelResult,
-    CreateSessionParams, EventsParams, EventsResult, HelloResult, Notification, RenameParams,
-    Request, Response, ServerMessage, SessionList, SessionRef, SessionResult, SubmitParams,
-    SubmitResult, PROTOCOL_VERSION,
+    CreateSessionParams, EventsParams, EventsResult, HelloResult, Notification, PatchApplyParams,
+    PatchRejectParams, PatchResult, RenameParams, Request, Response, ServerMessage, SessionList,
+    SessionRef, SessionResult, SubmitParams, SubmitResult, PROTOCOL_VERSION,
 };
 pub use session::{Session, SessionId, SessionStatus};
 

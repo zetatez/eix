@@ -452,12 +452,12 @@ prompt buffer 的 buffer-local mapping：
 > 事件并广播 `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
 > 选中的 hunk）。
-> 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。`write_file` 在审批前生成
-> unified diff 和逐 hunk 预览并随 `approval_required` 事件广播，TUI 卡片（`d` 全屏审阅）
+> 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。`write_file` 在 stage 时生成
+> unified diff 和逐 hunk 预览并随 `patch_proposed` 事件广播，TUI 卡片（`d` 全屏审阅）
 > 和 CLI 均会展示。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
-> 全不选、`y` 只应用选中的 hunk（全选时整文件），`n` 拒绝；`approval.respond` 新增可选
-> `hunks` 索引列表，daemon 用批准时的原文件内容拼出结果再落盘。写入前会重新校验文件
-> 内容，审阅期间被外部修改则拒绝本次写入。
+> 全不选、`y` 只应用选中的 hunk（全选时整文件），`n` 拒绝；`patch.apply` / `approval.respond`
+> 接受可选 `hunks` 索引列表。应用时用基准内容拼出结果再落盘，并重新校验文件内容：
+> stage 后被外部修改则记 conflict、不覆盖。
 > `run_command` 默认用 bubblewrap 隔离（`[tools] sandbox = auto|bwrap|off`，`sandbox_network`
 > 控制是否 `--unshare-net`，`sandbox_read_home` 决定 `$HOME` 只读挂载还是隐藏）：宿主只读、
 > 仅 session workspace 可写、`/tmp` 为私有 tmpfs；bwrap 缺失时 `auto` 退回直接执行，
@@ -468,7 +468,15 @@ prompt buffer 的 buffer-local mapping：
 > 输出也带一行说明），每个 session 保留 20 份。`Snapshotter::restore` 已实现并有测试覆盖，
 > 供 Phase 3 的 rewind 调用；事件日志只存索引，快照字节在 `<data>/snapshots/<session>/<id>/`。
 > `[tools] snapshots = false`（`EIX_TOOL_SNAPSHOTS=0`）可在大仓库里关闭。
-> **尚未做**：staged shadow workspace、context ledger、process view。
+> Staged shadow workspace 已落地：`ask` 策略下 `write_file` 先把提案写入
+> `<data>/staging/<session>/<patch_id>.json` 并立即返回 `staged ...`，turn 不阻塞；
+> `read_file` / `list_dir` 看到“真实工作区 + staged”合并视图，同一文件再次写入以最新
+> staged 内容为基准，可以叠加。`patch.proposed|applied|rejected|conflict` 事件与同名通知
+> 已接入，`patch.apply` / `patch.reject`（以及 `approval.respond` + patch id）负责落盘或
+> 丢弃；落盘前重新校验基准，stage 后被外部修改则记 `patch_conflict` 且不覆盖。单文件快照
+> 改为应用补丁时抓取。pending 补丁跨 daemon 重启恢复；TUI 卡片、attention、`eix approve` /
+> `eix deny`、`eix log` 均已支持补丁。`run_command` 无法 stage，仍在审批处阻塞。
+> **尚未做**：context ledger、process view。
 
 **Phase 3**
 

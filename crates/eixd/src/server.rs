@@ -17,6 +17,7 @@ use eix_core::{
     now_ms, payload, ApprovalDecision, ApprovalRequiredPayload, ApprovalRespondParams,
     ApprovalResult, AttachResult, CancelResult, ChatMessage, Config, CreateSessionParams,
     ErrorPayload, Event, EventKind, EventsParams, EventsResult, HelloResult, Notification,
+    PatchApplyParams, PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload,
     RenameParams, Request, Response, ServerMessage, Session, SessionId, SessionList, SessionRef,
     SessionResult, SessionStatus, SnapshotPayload, StatusChangedPayload, SubmitParams,
     SubmitResult, ToolCall, ToolCallPayload, ToolPolicy, ToolResultPayload, UserMessagePayload,
@@ -31,7 +32,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use uuid::Uuid;
 
 use crate::provider::{Provider, ProviderError};
-use crate::snapshot::Snapshotter;
+use crate::snapshot::{Scope, Snapshotter};
+use crate::staging::{StagedPatch, Staging};
 use crate::store::Store;
 use crate::tools;
 
@@ -46,16 +48,22 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     let provider = Arc::new(Provider::new(&config).map_err(|e| anyhow::anyhow!("{e}"))?);
     let (bus, _) = broadcast::channel(2048);
     let snapshots = Snapshotter::new(data_dir.join("snapshots"));
+    let staging = Staging::new(data_dir.join("staging"));
     let daemon = Arc::new(Daemon {
         store,
         provider,
         config: Arc::new(config),
         bus,
         snapshots,
+        staging,
         turns: Mutex::new(HashMap::new()),
         approvals: Mutex::new(HashMap::new()),
         notified: std::sync::Mutex::new(HashMap::new()),
     });
+    let restored = daemon.staging.load();
+    if restored > 0 {
+        eprintln!("eixd: restored {restored} staged patch(es)");
+    }
     daemon.recover().await;
 
     prepare_socket(&socket)?;
@@ -118,6 +126,8 @@ struct Daemon {
     bus: broadcast::Sender<Notification>,
     /// Pre-execution snapshots for mutating tools.
     snapshots: Snapshotter,
+    /// Staged `write_file` proposals, the session shadow workspace.
+    staging: Staging,
     /// In-flight turns, used for busy checks and cancellation.
     turns: Mutex<HashMap<SessionId, Arc<AtomicBool>>>,
     /// Tool calls blocked on a user decision, keyed by session.
@@ -346,27 +356,68 @@ impl Daemon {
                 let result = self.respond_approval(params).await?;
                 Ok(serde_json::to_value(result)?)
             }
+            "patch.apply" => {
+                let params: PatchApplyParams = parse_params(request.params.clone())?;
+                let result = self
+                    .decide_patch(
+                        &params.session_id,
+                        &params.patch_id,
+                        ApprovalDecision::Approve,
+                        params.hunks,
+                        None,
+                    )
+                    .await?;
+                Ok(serde_json::to_value(result)?)
+            }
+            "patch.reject" => {
+                let params: PatchRejectParams = parse_params(request.params.clone())?;
+                let result = self
+                    .decide_patch(
+                        &params.session_id,
+                        &params.patch_id,
+                        ApprovalDecision::Deny,
+                        None,
+                        params.reason,
+                    )
+                    .await?;
+                Ok(serde_json::to_value(result)?)
+            }
             other => Err(rpc("method_not_found", format!("unknown method {other:?}"))),
         }
     }
 
     async fn respond_approval(&self, params: ApprovalRespondParams) -> Result<ApprovalResult> {
-        let mut approvals = self.approvals.lock().await;
-        let Some(pending) = approvals.remove(&params.session_id) else {
-            return Ok(ApprovalResult { accepted: false });
-        };
-        if !params.approval_id.is_empty() && pending.approval_id != params.approval_id {
-            // Stale card: keep waiting for the current approval.
-            approvals.insert(params.session_id, pending);
-            return Ok(ApprovalResult { accepted: false });
+        let ApprovalRespondParams {
+            session_id,
+            approval_id,
+            decision,
+            reason,
+            hunks,
+        } = params;
+        {
+            let mut approvals = self.approvals.lock().await;
+            if let Some(pending) = approvals.remove(&session_id) {
+                if !approval_id.is_empty() && pending.approval_id != approval_id {
+                    // Stale card: keep waiting for the current approval.
+                    approvals.insert(session_id, pending);
+                    return Ok(ApprovalResult { accepted: false });
+                }
+                let _ = pending.responder.send(ApprovalReply {
+                    decision,
+                    reason,
+                    plan: None,
+                    hunks,
+                });
+                return Ok(ApprovalResult { accepted: true });
+            }
         }
-        let _ = pending.responder.send(ApprovalReply {
-            decision: params.decision,
-            reason: params.reason,
-            plan: None,
-            hunks: params.hunks,
-        });
-        Ok(ApprovalResult { accepted: true })
+        // No blocking tool call: the id must belong to a staged patch.
+        let result = self
+            .decide_patch(&session_id, &approval_id, decision, hunks, reason)
+            .await?;
+        Ok(ApprovalResult {
+            accepted: result.accepted,
+        })
     }
 
     fn create_session(&self, params: CreateSessionParams) -> Result<Session> {
@@ -739,6 +790,16 @@ impl Daemon {
             return Ok(());
         }
 
+        // Staged writes: under `ask` (the default) a `write_file` proposal goes
+        // into the session's shadow workspace and returns at once. The user
+        // applies or rejects it later with `patch.apply` / `patch.reject`.
+        // Reads and later writes see the staged contents.
+        if tool == "write_file" && self.config.tools.policy == ToolPolicy::Ask {
+            return self
+                .stage_write(session_id, turn_id, call, &args, messages)
+                .await;
+        }
+
         let mut denial: Option<String> = None;
         let mut plan: Option<tools::WritePlan> = None;
         let mut selected_hunks: Option<Vec<usize>> = None;
@@ -750,6 +811,7 @@ impl Daemon {
                         Some("tool policy is read-only; mutating tools are disabled".to_string())
                 }
                 ToolPolicy::Ask => {
+                    // `write_file` returned above; only blocking tools land here.
                     let reply = self
                         .wait_for_approval(session_id, turn_id, call, tool, &args, cancel)
                         .await?;
@@ -791,7 +853,13 @@ impl Daemon {
                     Some(plan) => tools::apply_plan(plan, selected_hunks.as_deref()).await,
                     None => {
                         let session = self.require_session(session_id)?;
-                        tools::execute(tool, &args, &session.cwd, &self.config).await
+                        match self
+                            .read_with_staging(session_id, tool, &args, &session.cwd)
+                            .await
+                        {
+                            Some(outcome) => outcome,
+                            None => tools::execute(tool, &args, &session.cwd, &self.config).await,
+                        }
                     }
                 };
                 (outcome.ok, outcome.output, outcome.duration_ms)
@@ -799,6 +867,10 @@ impl Daemon {
         };
         if let Some(warning) = snapshot_warning {
             output.push_str(&format!("\n[snapshot failed: {warning}]"));
+        }
+        if ok && tool == "write_file" {
+            // `auto` policy writes immediately; record it as an applied patch.
+            self.record_auto_patch(session_id, call, &args)?;
         }
 
         self.record_tool_result(session_id, call, ok, denied, &output, duration_ms)?;
@@ -818,6 +890,464 @@ impl Daemon {
         Ok(())
     }
 
+    /// Stage a `write_file` proposal in the session shadow workspace and return
+    /// immediately. The turn is not blocked: the user applies or rejects the
+    /// patch later, and reads see the staged bytes in the meantime.
+    async fn stage_write(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        args: &Value,
+        messages: &mut Vec<ChatMessage>,
+    ) -> Result<()> {
+        let session = self.require_session(session_id)?;
+        let cwd = session.cwd.clone();
+        let Some(path) = tools::write_target(args, &cwd) else {
+            let output = "write_file needs a path inside the workspace".to_string();
+            self.record_tool_result(session_id, call, false, false, &output, 0)?;
+            self.emit_value(
+                "tool.completed",
+                json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "call_id": call.id,
+                    "tool": "write_file",
+                    "ok": false,
+                    "denied": false,
+                    "duration_ms": 0,
+                }),
+            );
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        };
+        // Diff against the newest staged contents when the agent writes the
+        // same file twice before the user has decided.
+        let base = self.staging.latest_content(session_id, &path);
+        let plan = match tools::write_plan_with_base(
+            "write_file",
+            args,
+            &cwd,
+            &self.config,
+            base.as_deref(),
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(err) => {
+                let output = format!("{err:#}");
+                self.record_tool_result(session_id, call, false, false, &output, 0)?;
+                self.emit_value(
+                    "tool.completed",
+                    json!({
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "call_id": call.id,
+                        "tool": "write_file",
+                        "ok": false,
+                        "denied": false,
+                        "duration_ms": 0,
+                    }),
+                );
+                messages.push(ChatMessage::tool(call.id.clone(), output));
+                return Ok(());
+            }
+        };
+        let summary = tools::summarize("write_file", args);
+        let hunks = plan.hunk_infos();
+        let patch = StagedPatch::new(
+            session_id,
+            &call.id,
+            "write_file",
+            plan.path(),
+            plan.label(),
+            plan.old().to_string(),
+            plan.new_content().to_string(),
+        );
+        self.staging.add(patch.clone())?;
+        let event = self.store.append_event(
+            session_id,
+            EventKind::PatchProposed,
+            payload(&PatchProposedPayload {
+                patch_id: patch.patch_id.clone(),
+                call_id: call.id.clone(),
+                tool: "write_file".to_string(),
+                path: patch.label.clone(),
+                summary: summary.clone(),
+                diff: Some(plan.diff().to_string()),
+                hunks: hunks.clone(),
+            }),
+        )?;
+        self.emit_event(&event);
+        self.emit_value(
+            "patch.proposed",
+            json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "patch_id": patch.patch_id,
+                "call_id": call.id,
+                "tool": "write_file",
+                "path": patch.label,
+                "summary": summary,
+                "diff": plan.diff(),
+                "hunks": hunks,
+            }),
+        );
+        self.announce_patch(&session);
+
+        let output = format!(
+            "staged {} as patch {}; the file is not written yet — the user will apply or reject the patch",
+            patch.label, patch.patch_id
+        );
+        self.record_tool_result(session_id, call, true, false, &output, 0)?;
+        self.emit_value(
+            "tool.completed",
+            json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "call_id": call.id,
+                "tool": "write_file",
+                "ok": true,
+                "denied": false,
+                "duration_ms": 0,
+            }),
+        );
+        messages.push(ChatMessage::tool(call.id.clone(), output));
+        Ok(())
+    }
+
+    /// Flag a session with a pending patch so background panes and external
+    /// notifications can surface it. The stored status stays `running`.
+    fn announce_patch(&self, session: &Session) {
+        self.emit_value(
+            "session.attention",
+            json!({
+                "session_id": session.id,
+                "status": SessionStatus::AwaitingApproval.as_str(),
+            }),
+        );
+        self.notify_attention(session, SessionStatus::AwaitingApproval);
+    }
+
+    /// Record a write that policy `auto` committed to disk without review.
+    fn record_auto_patch(&self, session_id: &str, call: &ToolCall, args: &Value) -> Result<()> {
+        let path = args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        let patch_id = Uuid::new_v4().to_string();
+        let event = self.store.append_event(
+            session_id,
+            EventKind::PatchApplied,
+            payload(&PatchResultPayload {
+                patch_id: patch_id.clone(),
+                call_id: call.id.clone(),
+                path: path.clone(),
+                applied: true,
+                conflict: false,
+                hunks: Vec::new(),
+                snapshot_id: None,
+                message: Some("tool policy auto".to_string()),
+            }),
+        )?;
+        self.emit_event(&event);
+        self.emit_value(
+            "patch.applied",
+            json!({
+                "session_id": session_id,
+                "patch_id": patch_id,
+                "call_id": call.id,
+                "path": path,
+                "applied": true,
+                "auto": true,
+            }),
+        );
+        Ok(())
+    }
+
+    /// Serve `read_file` / `list_dir` from the shadow workspace when a pending
+    /// patch touches the requested path. `None` falls back to the real tool.
+    async fn read_with_staging(
+        &self,
+        session_id: &str,
+        tool: &str,
+        args: &Value,
+        cwd: &Path,
+    ) -> Option<tools::ToolOutcome> {
+        match tool {
+            "read_file" => {
+                let path = tools::write_target(args, cwd)?;
+                let content = self.staging.latest_content(session_id, &path)?;
+                Some(tools::ToolOutcome {
+                    ok: true,
+                    output: tools::cap_output(content, self.config.tools.max_output_bytes),
+                    duration_ms: 0,
+                })
+            }
+            "list_dir" => self.staged_listing(session_id, args, cwd).await,
+            _ => None,
+        }
+    }
+
+    /// Merge pending staged paths into a directory listing. Files that only
+    /// exist in the shadow workspace are shown so the agent can find them.
+    async fn staged_listing(
+        &self,
+        session_id: &str,
+        args: &Value,
+        cwd: &Path,
+    ) -> Option<tools::ToolOutcome> {
+        let patches = self.staging.pending(session_id);
+        if patches.is_empty() {
+            return None;
+        }
+        let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
+        let dir = tools::resolve_path(cwd, raw).ok()?;
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut disk_read = false;
+        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
+            disk_read = true;
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let suffix = match entry.file_type().await {
+                    Ok(kind) if kind.is_dir() => "/",
+                    _ => "",
+                };
+                names.insert(format!("{name}{suffix}"));
+            }
+        }
+        for patch in &patches {
+            let Ok(relative) = patch.path.strip_prefix(&dir) else {
+                continue;
+            };
+            let mut components = relative.components();
+            let Some(first) = components.next() else {
+                continue;
+            };
+            let suffix = if components.next().is_some() { "/" } else { "" };
+            names.insert(format!("{}{suffix}", first.as_os_str().to_string_lossy()));
+        }
+        if !disk_read && names.is_empty() {
+            // Nothing staged under this path either: let the real tool report
+            // the missing directory.
+            return None;
+        }
+        let text = if names.is_empty() {
+            "(empty directory)".to_string()
+        } else {
+            names.into_iter().collect::<Vec<_>>().join("\n")
+        };
+        Some(tools::ToolOutcome {
+            ok: true,
+            output: tools::cap_output(text, self.config.tools.max_output_bytes),
+            duration_ms: 0,
+        })
+    }
+
+    /// Apply or reject a staged patch. An empty `patch_id` targets the oldest
+    /// pending patch in the session (used by `eix approve` / `eix deny`).
+    async fn decide_patch(
+        &self,
+        session_id: &str,
+        patch_id: &str,
+        decision: ApprovalDecision,
+        hunks: Option<Vec<usize>>,
+        reason: Option<String>,
+    ) -> Result<PatchResult> {
+        let patch = if patch_id.is_empty() {
+            self.staging.oldest(session_id)
+        } else {
+            self.staging.get(session_id, patch_id)
+        };
+        let Some(patch) = patch else {
+            return Ok(PatchResult {
+                accepted: false,
+                applied: false,
+                conflict: false,
+                message: Some("no pending patch".to_string()),
+            });
+        };
+        let Some(patch) = self.staging.take(session_id, &patch.patch_id) else {
+            return Ok(PatchResult {
+                accepted: false,
+                applied: false,
+                conflict: false,
+                message: Some("no pending patch".to_string()),
+            });
+        };
+
+        if decision == ApprovalDecision::Deny {
+            self.emit_patch_result(
+                session_id,
+                EventKind::PatchRejected,
+                &patch,
+                false,
+                false,
+                Vec::new(),
+                None,
+                reason.clone(),
+            )?;
+            self.emit_value(
+                "patch.rejected",
+                json!({
+                    "session_id": session_id,
+                    "patch_id": patch.patch_id,
+                    "call_id": patch.call_id,
+                    "path": patch.label,
+                    "reason": reason,
+                }),
+            );
+            self.refresh_session(session_id);
+            return Ok(PatchResult {
+                accepted: true,
+                applied: false,
+                conflict: false,
+                message: reason,
+            });
+        }
+
+        let cwd = self.require_session(session_id)?.cwd;
+        let plan = tools::build_plan(
+            patch.path.clone(),
+            patch.label.clone(),
+            patch.old.clone(),
+            patch.new.clone(),
+            &self.config,
+        );
+        if let Err(err) = plan.verify_unchanged().await {
+            let message = format!("{err:#}");
+            self.emit_patch_result(
+                session_id,
+                EventKind::PatchConflict,
+                &patch,
+                false,
+                true,
+                Vec::new(),
+                None,
+                Some(message.clone()),
+            )?;
+            self.emit_value(
+                "patch.conflict",
+                json!({
+                    "session_id": session_id,
+                    "patch_id": patch.patch_id,
+                    "call_id": patch.call_id,
+                    "path": patch.label,
+                    "message": message,
+                }),
+            );
+            self.refresh_session(session_id);
+            return Ok(PatchResult {
+                accepted: true,
+                applied: false,
+                conflict: true,
+                message: Some(message),
+            });
+        }
+
+        // The snapshot now happens as close to the write as possible.
+        let (snapshot_id, snapshot_warning) = if self.config.tools.snapshots {
+            let result = self
+                .snapshots
+                .capture_file(session_id, "write_file", &patch.call_id, &cwd, &patch.path)
+                .await;
+            self.record_snapshot(
+                session_id,
+                "write_file",
+                &patch.call_id,
+                Scope::File,
+                result,
+            )
+            .await?
+        } else {
+            (None, None)
+        };
+
+        let outcome = tools::apply_plan(&plan, hunks.as_deref()).await;
+        if !outcome.ok {
+            // Keep the proposal so the user can retry after fixing the problem.
+            self.staging.restore(patch.clone())?;
+            return Ok(PatchResult {
+                accepted: true,
+                applied: false,
+                conflict: false,
+                message: Some(outcome.output),
+            });
+        }
+        let message = match snapshot_warning {
+            Some(warning) => format!("{}\n[snapshot failed: {warning}]", outcome.output),
+            None => outcome.output.clone(),
+        };
+        let applied_hunks = hunks.unwrap_or_default();
+        self.emit_patch_result(
+            session_id,
+            EventKind::PatchApplied,
+            &patch,
+            true,
+            false,
+            applied_hunks.clone(),
+            snapshot_id,
+            Some(message.clone()),
+        )?;
+        self.emit_value(
+            "patch.applied",
+            json!({
+                "session_id": session_id,
+                "patch_id": patch.patch_id,
+                "call_id": patch.call_id,
+                "path": patch.label,
+                "applied": true,
+                "hunks": applied_hunks,
+            }),
+        );
+        self.refresh_session(session_id);
+        Ok(PatchResult {
+            accepted: true,
+            applied: true,
+            conflict: false,
+            message: Some(message),
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_patch_result(
+        &self,
+        session_id: &str,
+        kind: EventKind,
+        patch: &StagedPatch,
+        applied: bool,
+        conflict: bool,
+        hunks: Vec<usize>,
+        snapshot_id: Option<String>,
+        message: Option<String>,
+    ) -> Result<()> {
+        let event = self.store.append_event(
+            session_id,
+            kind,
+            payload(&PatchResultPayload {
+                patch_id: patch.patch_id.clone(),
+                call_id: patch.call_id.clone(),
+                path: patch.label.clone(),
+                applied,
+                conflict,
+                hunks,
+                snapshot_id,
+                message,
+            }),
+        )?;
+        self.emit_event(&event);
+        Ok(())
+    }
+
+    /// Re-broadcast a session after a patch decision so frontends that
+    /// optimistically showed an attention badge catch up with the store.
+    fn refresh_session(&self, session_id: &str) {
+        if let Ok(session) = self.require_session(session_id) {
+            self.emit_session(&session);
+        }
+    }
+
     /// Copy what a mutating tool is about to change and record the result.
     /// A failed snapshot never blocks the call; the tool output gets a short
     /// note so the lost rollback safety is visible.
@@ -833,7 +1363,11 @@ impl Daemon {
             return Ok(None);
         }
         let cwd = self.require_session(session_id)?.cwd;
-        let scope = if tool == "write_file" { "file" } else { "tree" };
+        let scope = if tool == "write_file" {
+            Scope::File
+        } else {
+            Scope::Tree
+        };
         let result = match tool {
             "write_file" => {
                 let path = plan
@@ -856,11 +1390,26 @@ impl Daemon {
             _ => return Ok(None),
         };
 
+        let (_snapshot_id, warning) = self
+            .record_snapshot(session_id, tool, &call.id, scope, result)
+            .await?;
+        Ok(warning)
+    }
+
+    /// Record a snapshot outcome (success or failure) as an event.
+    async fn record_snapshot(
+        &self,
+        session_id: &str,
+        tool: &str,
+        call_id: &str,
+        scope: Scope,
+        result: Result<crate::snapshot::Snapshot>,
+    ) -> Result<(Option<String>, Option<String>)> {
         let (event_payload, warning) = match result {
             Ok(snapshot) => (
                 SnapshotPayload {
-                    snapshot_id: snapshot.id,
-                    call_id: call.id.clone(),
+                    snapshot_id: snapshot.id.clone(),
+                    call_id: call_id.to_string(),
                     tool: tool.to_string(),
                     scope: snapshot.scope.as_str().to_string(),
                     ok: true,
@@ -876,9 +1425,9 @@ impl Daemon {
                 (
                     SnapshotPayload {
                         snapshot_id: String::new(),
-                        call_id: call.id.clone(),
+                        call_id: call_id.to_string(),
                         tool: tool.to_string(),
-                        scope: scope.to_string(),
+                        scope: scope.as_str().to_string(),
                         ok: false,
                         files: 0,
                         bytes: 0,
@@ -889,11 +1438,13 @@ impl Daemon {
                 )
             }
         };
+        let snapshot_id =
+            (!event_payload.snapshot_id.is_empty()).then(|| event_payload.snapshot_id.clone());
         let event =
             self.store
                 .append_event(session_id, EventKind::Snapshot, payload(&event_payload))?;
         self.emit_event(&event);
-        Ok(warning)
+        Ok((snapshot_id, warning))
     }
 
     fn record_tool_result(

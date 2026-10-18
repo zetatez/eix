@@ -145,6 +145,21 @@ impl WritePlan {
         &self.path
     }
 
+    /// Workspace-relative label shown in the UI.
+    pub fn label(&self) -> &str {
+        &self.label
+    }
+
+    /// Contents the plan was based on (staged or on disk).
+    pub fn old(&self) -> &str {
+        &self.old
+    }
+
+    /// Contents the plan will write.
+    pub fn new_content(&self) -> &str {
+        &self.new
+    }
+
     pub fn hunk_infos(&self) -> Vec<HunkInfo> {
         self.hunks.iter().map(|hunk| hunk.info.clone()).collect()
     }
@@ -224,30 +239,63 @@ pub async fn write_plan(
     cwd: &Path,
     config: &Config,
 ) -> Option<WritePlan> {
-    if tool != "write_file" {
-        return None;
-    }
-    write_plan_inner(args, cwd, config).await.ok()
+    write_plan_with_base(tool, args, cwd, config, None)
+        .await
+        .ok()
 }
 
-async fn write_plan_inner(args: &Value, cwd: &Path, config: &Config) -> Result<WritePlan> {
+/// Like [`write_plan`], but `base` overrides the contents read from disk. The
+/// staging layer passes the newest staged contents so a second write to the
+/// same file diffs against what the agent already proposed.
+pub async fn write_plan_with_base(
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    config: &Config,
+    base: Option<&str>,
+) -> Result<WritePlan> {
+    if tool != "write_file" {
+        bail!("{tool} has no write plan");
+    }
+    write_plan_inner(args, cwd, config, base).await
+}
+
+async fn write_plan_inner(
+    args: &Value,
+    cwd: &Path,
+    config: &Config,
+    base: Option<&str>,
+) -> Result<WritePlan> {
     let raw = required_string(args, "path")?;
     let new = required_string(args, "content")?;
     let path = resolve_path(cwd, raw)?;
-    let old = match tokio::fs::read(&path).await {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(err) => {
-            return Err(err).with_context(|| format!("cannot read {}", display(&path, cwd)))
-        }
+    let old = match base {
+        Some(base) => base.to_string(),
+        None => match tokio::fs::read(&path).await {
+            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => {
+                return Err(err).with_context(|| format!("cannot read {}", display(&path, cwd)))
+            }
+        },
     };
     let label = display(&path, cwd);
+    Ok(build_plan(path, label, old, new.to_string(), config))
+}
 
+/// Assemble the diff and hunk preview from already-known contents.
+pub fn build_plan(
+    path: PathBuf,
+    label: String,
+    old: String,
+    new: String,
+    config: &Config,
+) -> WritePlan {
     let mut hunks = Vec::new();
     let diff = if old.len() > 2_000_000 || new.len() > 2_000_000 {
         format!("{label}: diff omitted (file larger than 2 MB)\n")
     } else {
-        let text_diff = TextDiff::from_lines(old.as_str(), new);
+        let text_diff = TextDiff::from_lines(old.as_str(), &new);
         for (index, ops) in text_diff.grouped_ops(3).iter().enumerate() {
             let old_start = ops.first().map(|op| op.old_range().start).unwrap_or(0);
             let old_end = ops.last().map(|op| op.old_range().end).unwrap_or(old_start);
@@ -284,17 +332,17 @@ async fn write_plan_inner(args: &Value, cwd: &Path, config: &Config) -> Result<W
                 },
             });
         }
-        unified_diff(&label, &old, new)
+        unified_diff(&label, &old, &new)
     };
 
-    Ok(WritePlan {
+    WritePlan {
         path,
         label,
         old,
-        new: new.to_string(),
+        new,
         hunks,
         diff: cap_output(diff, config.tools.max_output_bytes),
-    })
+    }
 }
 
 /// Write the approved whole change or the selected hunks.
@@ -605,7 +653,7 @@ fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis() as u64
 }
 
-fn cap_output(text: String, max: usize) -> String {
+pub(crate) fn cap_output(text: String, max: usize) -> String {
     if text.len() <= max {
         return text;
     }

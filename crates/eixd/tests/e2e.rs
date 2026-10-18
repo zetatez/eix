@@ -196,7 +196,7 @@ async fn cancel_keeps_the_partial_answer_and_returns_to_idle() -> anyhow::Result
 }
 
 #[tokio::test]
-async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<()> {
+async fn staged_write_is_applied_after_approval() -> anyhow::Result<()> {
     let dir = temp_dir("approve");
     std::fs::create_dir_all(&dir)?;
     // Pre-existing content so the snapshot has something to roll back to.
@@ -230,18 +230,18 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
         .await?;
     assert!(!submitted.turn_id.is_empty());
 
-    let approval = loop {
+    let patch = loop {
         let notification = client.next_notification().await?;
-        if notification.method == "tool.approval_required" {
+        if notification.method == "patch.proposed" {
             break notification.params.clone();
         }
     };
-    assert_eq!(approval["tool"], "write_file");
-    assert_eq!(approval["call_id"], "call_1");
-    let diff = approval["diff"].as_str().expect("diff preview");
+    assert_eq!(patch["tool"], "write_file");
+    assert_eq!(patch["call_id"], "call_1");
+    let diff = patch["diff"].as_str().expect("diff preview");
     assert!(diff.contains("+++ b/out.txt"), "diff was: {diff}");
     assert!(diff.contains("+hello"), "diff was: {diff}");
-    let hunks = approval["hunks"].as_array().expect("hunk preview");
+    let hunks = patch["hunks"].as_array().expect("hunk preview");
     assert_eq!(hunks.len(), 1, "hunks were: {hunks:?}");
     assert_eq!(hunks[0]["index"], 0);
     assert!(
@@ -251,27 +251,9 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
         "hunk was: {:?}",
         hunks[0]
     );
-    let approval_id = approval["approval_id"].as_str().unwrap().to_string();
-
-    let waiting: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    assert_eq!(
-        waiting.session.status,
-        eix_core::SessionStatus::AwaitingApproval
-    );
-
-    let answered: eix_core::ApprovalResult = client
-        .request(
-            "approval.respond",
-            json!({
-                "session_id": session_id,
-                "approval_id": approval_id,
-                "decision": "approve",
-            }),
-        )
-        .await?;
-    assert!(answered.accepted);
+    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
+    // Staging does not touch the workspace.
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
 
     let mut saw_attention = false;
     let completed = loop {
@@ -287,27 +269,51 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
     assert!(saw_attention);
     assert!(completed["error"].is_null());
 
-    let attached: AttachResult = client
+    let staged: AttachResult = client
         .request("session.attach", json!({"session_id": session_id}))
         .await?;
-    assert_eq!(attached.session.status, eix_core::SessionStatus::Idle);
-    let call = attached
+    assert_eq!(staged.session.status, eix_core::SessionStatus::Idle);
+    assert!(staged
         .events
         .iter()
-        .find(|e| e.kind == EventKind::ToolCall)
-        .expect("tool call event");
-    assert_eq!(call.payload["tool"], "write_file");
-    let result = attached
+        .any(|e| e.kind == EventKind::PatchProposed));
+    assert!(
+        !staged
+            .events
+            .iter()
+            .any(|e| e.kind == EventKind::ApprovalRequired),
+        "staged writes do not block on an approval event"
+    );
+    assert!(
+        !staged.events.iter().any(|e| e.kind == EventKind::Snapshot),
+        "the snapshot is taken when the patch is applied"
+    );
+    let result = staged
         .events
         .iter()
         .find(|e| e.kind == EventKind::ToolResult)
         .expect("tool result event");
     assert_eq!(result.payload["ok"], true);
     assert_eq!(result.payload["denied"], false);
+
+    let applied: eix_core::PatchResult = client
+        .request(
+            "patch.apply",
+            json!({"session_id": session_id, "patch_id": patch_id}),
+        )
+        .await?;
+    assert!(applied.accepted);
+    assert!(applied.applied);
+    assert!(!applied.conflict);
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
     assert!(attached
         .events
         .iter()
-        .any(|e| e.kind == EventKind::ApprovalRequired));
+        .any(|e| e.kind == EventKind::PatchApplied));
     let snapshot = attached
         .events
         .iter()
@@ -335,19 +341,24 @@ async fn approval_gate_runs_a_tool_after_the_user_approves() -> anyhow::Result<(
         .expect("final assistant event");
     assert_eq!(assistant.payload["text"], "done");
 
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
-
     let bodies = bodies.lock().await;
     assert_eq!(bodies.len(), 2);
     let first: Value = serde_json::from_str(&bodies[0])?;
     assert_eq!(first["tool_choice"], "auto");
     assert_eq!(first["tools"][0]["function"]["name"], "read_file");
     let second: Value = serde_json::from_str(&bodies[1])?;
-    assert!(second["messages"]
+    let content = second["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| m["role"] == "tool" && m["content"] == "wrote 5 bytes to out.txt"));
+        .find(|m| m["role"] == "tool")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default();
+    assert!(
+        content.starts_with("staged out.txt as patch "),
+        "tool content was: {content}"
+    );
+    assert!(content.contains("not written yet"), "{content}");
 
     daemon.abort();
     mock.abort();
@@ -452,7 +463,7 @@ async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
-async fn approval_applies_only_the_selected_hunks() -> anyhow::Result<()> {
+async fn staged_write_applies_only_the_selected_hunks() -> anyhow::Result<()> {
     let dir = temp_dir("hunks");
     std::fs::create_dir_all(&dir)?;
     let original = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty\n";
@@ -489,28 +500,15 @@ async fn approval_applies_only_the_selected_hunks() -> anyhow::Result<()> {
         )
         .await?;
 
-    let approval = loop {
+    let patch = loop {
         let notification = client.next_notification().await?;
-        if notification.method == "tool.approval_required" {
+        if notification.method == "patch.proposed" {
             break notification.params.clone();
         }
     };
-    let hunks = approval["hunks"].as_array().expect("hunk preview");
+    let hunks = patch["hunks"].as_array().expect("hunk preview");
     assert_eq!(hunks.len(), 2, "hunks were: {hunks:?}");
-
-    // Approve only the first hunk; the second edit must not be written.
-    let answered: eix_core::ApprovalResult = client
-        .request(
-            "approval.respond",
-            json!({
-                "session_id": session_id,
-                "approval_id": approval["approval_id"],
-                "decision": "approve",
-                "hunks": [0],
-            }),
-        )
-        .await?;
-    assert!(answered.accepted);
+    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
 
     loop {
         let notification = client.next_notification().await?;
@@ -519,8 +517,32 @@ async fn approval_applies_only_the_selected_hunks() -> anyhow::Result<()> {
         }
     }
 
+    // Apply only the first hunk; the second edit must not be written.
+    let answered: eix_core::PatchResult = client
+        .request(
+            "patch.apply",
+            json!({
+                "session_id": session_id,
+                "patch_id": patch_id,
+                "hunks": [0],
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+    assert!(answered.applied);
+
     let expected = original.replacen("two\n", "TWO\n", 1);
     assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, expected);
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let applied = attached
+        .events
+        .iter()
+        .find(|e| e.kind == EventKind::PatchApplied)
+        .expect("patch applied event");
+    assert_eq!(applied.payload["hunks"], json!([0]));
 
     daemon.abort();
     mock.abort();
@@ -583,7 +605,7 @@ async fn attention_runs_the_notification_command() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn approval_gate_denies_and_keeps_the_workspace_untouched() -> anyhow::Result<()> {
+async fn staged_write_can_be_rejected_and_keeps_the_workspace_untouched() -> anyhow::Result<()> {
     let dir = temp_dir("deny");
     std::fs::create_dir_all(&dir)?;
 
@@ -613,24 +635,13 @@ async fn approval_gate_denies_and_keeps_the_workspace_untouched() -> anyhow::Res
         )
         .await?;
 
-    let approval = loop {
+    let patch = loop {
         let notification = client.next_notification().await?;
-        if notification.method == "tool.approval_required" {
+        if notification.method == "patch.proposed" {
             break notification.params.clone();
         }
     };
-    let answered: eix_core::ApprovalResult = client
-        .request(
-            "approval.respond",
-            json!({
-                "session_id": session_id,
-                "approval_id": approval["approval_id"],
-                "decision": "deny",
-                "reason": "not this time",
-            }),
-        )
-        .await?;
-    assert!(answered.accepted);
+    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
 
     loop {
         let notification = client.next_notification().await?;
@@ -639,26 +650,40 @@ async fn approval_gate_denies_and_keeps_the_workspace_untouched() -> anyhow::Res
         }
     }
 
+    let answered: eix_core::PatchResult = client
+        .request(
+            "patch.reject",
+            json!({
+                "session_id": session_id,
+                "patch_id": patch_id,
+                "reason": "not this time",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+    assert!(!answered.applied);
+
     let attached: AttachResult = client
         .request("session.attach", json!({"session_id": session_id}))
         .await?;
-    let result = attached
+    let rejected = attached
         .events
         .iter()
-        .find(|e| e.kind == EventKind::ToolResult)
-        .expect("tool result event");
-    assert_eq!(result.payload["ok"], false);
-    assert_eq!(result.payload["denied"], true);
-    assert_eq!(result.payload["output"], "not this time");
+        .find(|e| e.kind == EventKind::PatchRejected)
+        .expect("patch rejected event");
+    assert_eq!(rejected.payload["message"], "not this time");
     assert!(!dir.join("out.txt").exists());
 
     let bodies = bodies.lock().await;
     let second: Value = serde_json::from_str(&bodies[1])?;
-    assert!(second["messages"]
+    let content = second["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|m| m["role"] == "tool" && m["content"] == "not this time"));
+        .find(|m| m["role"] == "tool")
+        .and_then(|m| m["content"].as_str())
+        .unwrap_or_default();
+    assert!(content.contains("staged out.txt"), "{content}");
 
     daemon.abort();
     mock.abort();
@@ -667,7 +692,7 @@ async fn approval_gate_denies_and_keeps_the_workspace_untouched() -> anyhow::Res
 }
 
 #[tokio::test]
-async fn approval_rejects_a_file_changed_during_review() -> anyhow::Result<()> {
+async fn staged_write_reports_a_conflict_when_the_file_changed() -> anyhow::Result<()> {
     let dir = temp_dir("conflict");
     std::fs::create_dir_all(&dir)?;
 
@@ -697,28 +722,14 @@ async fn approval_rejects_a_file_changed_during_review() -> anyhow::Result<()> {
         )
         .await?;
 
-    let approval = loop {
+    let patch = loop {
         let notification = client.next_notification().await?;
-        if notification.method == "tool.approval_required" {
+        if notification.method == "patch.proposed" {
             break notification.params.clone();
         }
     };
-    assert_eq!(approval["tool"], "write_file");
-
-    // The file changes after the diff was generated but before the decision.
-    std::fs::write(dir.join("out.txt"), "external")?;
-
-    let answered: eix_core::ApprovalResult = client
-        .request(
-            "approval.respond",
-            json!({
-                "session_id": session_id,
-                "approval_id": approval["approval_id"],
-                "decision": "approve",
-            }),
-        )
-        .await?;
-    assert!(answered.accepted);
+    assert_eq!(patch["tool"], "write_file");
+    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
 
     loop {
         let notification = client.next_notification().await?;
@@ -727,19 +738,97 @@ async fn approval_rejects_a_file_changed_during_review() -> anyhow::Result<()> {
         }
     }
 
+    // The file changes after the diff was generated but before the decision.
+    std::fs::write(dir.join("out.txt"), "external")?;
+
+    let answered: eix_core::PatchResult = client
+        .request(
+            "patch.apply",
+            json!({"session_id": session_id, "patch_id": patch_id}),
+        )
+        .await?;
+    assert!(answered.accepted);
+    assert!(!answered.applied);
+    assert!(answered.conflict);
+
     let attached: AttachResult = client
         .request("session.attach", json!({"session_id": session_id}))
         .await?;
-    let result = attached
+    let conflict = attached
         .events
         .iter()
-        .find(|event| event.kind == EventKind::ToolResult)
-        .expect("tool result event");
-    assert_eq!(result.payload["ok"], false);
-    assert_eq!(result.payload["denied"], true);
-    let output = result.payload["output"].as_str().unwrap_or_default();
+        .find(|event| event.kind == EventKind::PatchConflict)
+        .expect("patch conflict event");
+    let output = conflict.payload["message"].as_str().unwrap_or_default();
     assert!(output.contains("changed after the diff"), "{output}");
     assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "external");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn staged_writes_are_visible_to_reads() -> anyhow::Result<()> {
+    let dir = temp_dir("shadow");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "on disk")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(staging_read_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "shadow", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write then read"}),
+        )
+        .await?;
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert!(completed["error"].is_null());
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let results: Vec<_> = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolResult)
+        .collect();
+    assert_eq!(results.len(), 2, "events were: {:?}", attached.events);
+    assert_eq!(results[1].payload["tool"], "read_file");
+    assert_eq!(
+        results[1].payload["output"], "staged",
+        "reads must see the shadow workspace"
+    );
+    // The patch is still waiting and the real file is untouched.
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::PatchProposed));
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "on disk");
 
     daemon.abort();
     mock.abort();
@@ -1080,6 +1169,70 @@ async fn command_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>
             write_sse(&mut socket, &events).await;
         });
     }
+}
+
+/// A provider that stages a write, then reads the same file back, then stops.
+async fn staging_read_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let tool_messages = value["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                })
+                .unwrap_or(0);
+            let events = match tool_messages {
+                0 => tool_call_events(
+                    "call_1",
+                    "write_file",
+                    &json!({"path": "out.txt", "content": "staged"}).to_string(),
+                ),
+                1 => tool_call_events(
+                    "call_2",
+                    "read_file",
+                    &json!({"path": "out.txt"}).to_string(),
+                ),
+                _ => {
+                    let chunk = json!({
+                        "model": "mock-tools",
+                        "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                    });
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                }
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+fn tool_call_events(call_id: &str, tool: &str, arguments: &str) -> String {
+    let chunk = json!({
+        "model": "mock-tools",
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool, "arguments": arguments},
+                }]
+            },
+            "finish_reason": "tool_calls",
+        }],
+    });
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
 }
 
 async fn read_http_body(socket: &mut tokio::net::TcpStream) -> Option<String> {
