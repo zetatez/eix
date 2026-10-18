@@ -367,7 +367,11 @@ prompt buffer 的 buffer-local mapping：
   - `full`：跳过审批直接执行写工具（路径限制仍作为纵深防御保留）；全局 `read-only` 仍是硬上限。
   - 子 agent 永远只读，与父 session 的级别无关。
 - 全局 `[tools] policy`（`ask` / `auto` / `read-only`）仍作为默认值与上限。
-- 自动批准规则：工具名 + 路径 glob + 命令前缀/正则；只读工具默认放行（仍待实现）。
+- 自动批准规则（已实现）：`[[tools.auto_approve]]`，字段 `tool` + `path` glob +
+  `command_prefix` / `command_regex`（全部给出时是 AND）。只放宽 `ask`；全局或 session
+  的 `read-only`、子 agent 只读仍是硬上限，`full` 不经过规则。`path` 先做词法归一化，
+  绝对路径和 `..` 逃逸不会匹配；`command_prefix` 匹配整条 shell 字符串，需要更严格时用
+  `command_regex`。只读工具本来就不进审批门禁。
 
 ## 10. Context ledger
 

@@ -1746,14 +1746,22 @@ impl Daemon {
             return Ok(());
         }
 
+        // Rules only relax the default `ask` policy. `auto` needs no help,
+        // `read-only` must stay a hard cap, and `full` sessions already skip
+        // the approval prompt.
+        let auto_approve = self.config.tools.policy == ToolPolicy::Ask
+            && permission != PermissionLevel::Full
+            && self.config.tools.auto_approval(tool, &args).is_some();
+
         // Staged writes: under `ask` (the default) a `write_file` proposal goes
         // into the session's shadow workspace and returns at once. The user
         // applies or rejects it later with `patch.apply` / `patch.reject`.
-        // Reads and later writes see the staged contents. `full` sessions skip
-        // the review step and write directly.
+        // Reads and later writes see the staged contents. `full` sessions and
+        // auto-approved calls skip the review step and write directly.
         if tool == "write_file"
             && self.config.tools.policy == ToolPolicy::Ask
             && permission != PermissionLevel::Full
+            && !auto_approve
         {
             return self
                 .stage_write(session_id, turn_id, call, &args, messages)
@@ -1771,6 +1779,7 @@ impl Daemon {
                         Some("tool policy is read-only; mutating tools are disabled".to_string())
                 }
                 ToolPolicy::Ask if permission == PermissionLevel::Full => {}
+                ToolPolicy::Ask if auto_approve => {}
                 ToolPolicy::Ask => {
                     // `write_file` returned above; only blocking tools land here.
                     let reply = self
@@ -1834,8 +1843,16 @@ impl Daemon {
             output.push_str(&format!("\n[snapshot failed: {warning}]"));
         }
         if ok && tool == "write_file" {
-            // `auto` policy writes immediately; record it as an applied patch.
-            self.record_auto_patch(session_id, call, &args)?;
+            // Direct writes bypass the review step: `auto`, `full`, or a
+            // matching `[[tools.auto_approve]]` rule.
+            let reason = if auto_approve {
+                "auto-approval rule"
+            } else if permission == PermissionLevel::Full {
+                "session permission full"
+            } else {
+                "tool policy auto"
+            };
+            self.record_auto_patch(session_id, call, &args, reason)?;
         }
 
         self.record_tool_result(session_id, call, ok, denied, &output, duration_ms)?;
@@ -2136,8 +2153,15 @@ impl Daemon {
         self.notify_attention(session, SessionStatus::AwaitingApproval);
     }
 
-    /// Record a write that policy `auto` committed to disk without review.
-    fn record_auto_patch(&self, session_id: &str, call: &ToolCall, args: &Value) -> Result<()> {
+    /// Record a write that was committed to disk without review (`auto`
+    /// policy, `full` permission, or an `auto_approve` rule).
+    fn record_auto_patch(
+        &self,
+        session_id: &str,
+        call: &ToolCall,
+        args: &Value,
+        reason: &str,
+    ) -> Result<()> {
         let path = args
             .get("path")
             .and_then(Value::as_str)
@@ -2155,7 +2179,7 @@ impl Daemon {
                 conflict: false,
                 hunks: Vec::new(),
                 snapshot_id: None,
-                message: Some("tool policy auto".to_string()),
+                message: Some(reason.to_string()),
             }),
         )?;
         self.emit_event(&event);

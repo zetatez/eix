@@ -934,6 +934,156 @@ async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> 
 }
 
 #[tokio::test]
+async fn auto_approve_rule_skips_the_prompt() -> anyhow::Result<()> {
+    let dir = temp_dir("auto-approve");
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("src/keep.txt"), "before")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(command_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+    config.tools.auto_approve = vec![eix_core::AutoApproveRule {
+        tool: "run_command".to_string(),
+        command_prefix: Some("printf".to_string()),
+        ..Default::default()
+    }];
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "auto", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let _: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "run it"}),
+        )
+        .await?;
+
+    let mut prompted = false;
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            prompted = true;
+        }
+        if notification.method == "turn.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert!(!prompted, "an auto-approved command must not prompt");
+    assert!(completed["error"].is_null());
+
+    // The command really ran, and it was still snapshotted first.
+    assert_eq!(std::fs::read_to_string(dir.join("src/keep.txt"))?, "after");
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let snapshot = attached
+        .events
+        .iter()
+        .find(|e| e.kind == EventKind::Snapshot)
+        .expect("auto-approved runs are snapshotted");
+    assert_eq!(snapshot.payload["tool"], "run_command");
+    let result = attached
+        .events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::ToolResult)
+        .expect("tool result event");
+    assert_eq!(result.payload["denied"], false);
+    assert_eq!(result.payload["ok"], true);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn auto_approve_rule_cannot_bypass_a_read_only_session() -> anyhow::Result<()> {
+    let dir = temp_dir("auto-approve-readonly");
+    std::fs::create_dir_all(dir.join("src"))?;
+    std::fs::write(dir.join("src/keep.txt"), "before")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(command_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+    // A catch-all rule must still lose to the session's read-only level.
+    config.tools.auto_approve = vec![eix_core::AutoApproveRule {
+        tool: "*".to_string(),
+        ..Default::default()
+    }];
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "ro", "cwd": dir, "permission": "read-only"}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let _: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "run it"}),
+        )
+        .await?;
+
+    let mut prompted = false;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            prompted = true;
+        }
+        if notification.method == "turn.completed" {
+            break;
+        }
+    }
+    assert!(!prompted, "read-only must refuse, not prompt");
+    assert_eq!(std::fs::read_to_string(dir.join("src/keep.txt"))?, "before");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let result = attached
+        .events
+        .iter()
+        .rev()
+        .find(|e| e.kind == EventKind::ToolResult)
+        .expect("tool result event");
+    assert_eq!(result.payload["denied"], true);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn staged_write_applies_only_the_selected_hunks() -> anyhow::Result<()> {
     let dir = temp_dir("hunks");
     std::fs::create_dir_all(&dir)?;

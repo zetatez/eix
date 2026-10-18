@@ -1477,6 +1477,11 @@ async fn doctor(cli: &Cli) -> Result<()> {
                     "off"
                 }
             );
+            println!(
+                "policy   {} · {} auto-approve rule(s)",
+                config.tools.policy.as_str(),
+                config.tools.auto_approve.len()
+            );
             let agents = std::env::current_dir()
                 .ok()
                 .map(|cwd| cwd.join("AGENTS.md"))

@@ -243,6 +243,30 @@ sandbox_read_home = true  # false 时 $HOME 完全隐藏
 snapshots = true          # false 时跳过执行前快照（大仓库可关）
 ```
 
+自动批准规则（只放宽 `ask`，不改变 `read-only` / 子 agent 的硬上限）：
+
+```toml
+[[tools.auto_approve]]
+tool = "run_command"
+command_prefix = "cargo test"
+
+[[tools.auto_approve]]
+tool = "run_command"
+command_regex = "^cargo (check|clippy)\\b"
+
+[[tools.auto_approve]]
+tool = "write_file"
+path = "tests/**"         # workspace 相对路径；* 不跨目录，** 跨目录
+```
+
+- 规则里的字段是 AND 关系；只写 `tool` 表示该工具的所有调用都放行，`tool = "*"` 匹配
+  任何需要审批的工具。`path` 先做词法归一化，绝对路径或 `..` 逃出 workspace 的路径
+  不会匹配（`tests/../src/main.rs` 不会命中 `tests/**`）。
+- `command_prefix` 是整条 `sh -c` 字符串的前缀，`cargo test && rm ...` 也会命中；需要
+  更严格时用 `command_regex`（例如 `^cargo test( |$)`）。
+- 自动批准的调用仍会做执行前快照；`write_file` 记录为 `patch_applied`，message 是
+  `auto-approval rule`。
+
 `run_command` 在 `auto`/`bwrap` 下用 bubblewrap 隔离：宿主目录只读挂载，只有 session
 workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具链缓存、git 配置可读但
 不可写），设为 `false` 则 `$HOME` 指向沙箱内的 `/tmp`。默认保留网络。
@@ -507,5 +531,6 @@ spike 内：
 - [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
 - [x] 按 session 权限级别（`read-only` / `workspace-write` / `full`；`session.permission` 支持临时升级并记录事件）
+- [x] 自动批准规则（`[[tools.auto_approve]]`：工具名 + 路径 glob + 命令前缀/正则；只放宽 `ask`）
 - [x] nvim 配色 → TUI 主题桥接（启动与 `ColorScheme` 时读取 `Normal/Comment/String/Function/ErrorMsg/DiffAdd/DiffDelete`，映射转录区/审批 diff 颜色）
 - [x] `ext_multigrid` 多窗口渲染（浮窗/消息区独立 grid，按 `compindex` 叠加）

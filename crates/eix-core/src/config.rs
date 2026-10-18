@@ -8,7 +8,9 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -165,6 +167,140 @@ impl SandboxMode {
     }
 }
 
+/// One `[[tools.auto_approve]]` rule. Rules only relax the `ask` policy: the
+/// global `read-only` policy and a session's `read-only` level still win, and
+/// `full` sessions never consult them.
+///
+/// All constraints that are present must match (logical AND). A rule with only
+/// `tool` matches every call of that tool, including `"*"` for any mutating
+/// tool.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoApproveRule {
+    /// Tool name (`write_file`, `run_command`, `start_command`, ...) or `"*"`.
+    pub tool: String,
+    /// Workspace-relative glob matched against the `path` argument. `*` stops
+    /// at `/`, `**` crosses directories, `?` matches one character.
+    pub path: Option<String>,
+    /// Prefix of the `command` argument (after leading whitespace).
+    pub command_prefix: Option<String>,
+    /// Regular expression matched against the whole `command` argument.
+    pub command_regex: Option<String>,
+}
+
+impl AutoApproveRule {
+    /// True when this rule covers `tool` with the given call arguments.
+    pub fn matches(&self, tool: &str, args: &Value) -> bool {
+        if self.tool != "*" && self.tool != tool {
+            return false;
+        }
+        if let Some(glob) = self.path.as_deref() {
+            let Some(path) = args
+                .get("path")
+                .and_then(Value::as_str)
+                .and_then(normalize_workspace_path)
+            else {
+                return false;
+            };
+            if !glob_match(glob, &path) {
+                return false;
+            }
+        }
+        if let Some(prefix) = self.command_prefix.as_deref() {
+            let Some(command) = args.get("command").and_then(Value::as_str) else {
+                return false;
+            };
+            if !command.trim_start().starts_with(prefix) {
+                return false;
+            }
+        }
+        if let Some(pattern) = self.command_regex.as_deref() {
+            let Some(command) = args.get("command").and_then(Value::as_str) else {
+                return false;
+            };
+            let Ok(regex) = Regex::new(pattern) else {
+                return false;
+            };
+            if !regex.is_match(command) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// Normalize a tool `path` argument to a workspace-relative path, or `None`
+/// when it is absolute or escapes the workspace. This is what keeps a
+/// `tests/**` rule from matching `tests/../src/main.rs`.
+fn normalize_workspace_path(path: &str) -> Option<String> {
+    if Path::new(path).is_absolute() {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    let normalized = path.replace('\\', "/");
+    for part in normalized.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            other => parts.push(other),
+        }
+    }
+    Some(parts.join("/"))
+}
+
+/// Minimal glob matcher for approval rules: `*` (not crossing `/`), `**`
+/// (crossing `/`, including `**/` for zero directories) and `?`.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.chars().collect();
+    let text: Vec<char> = text.chars().collect();
+    let mut memo = vec![vec![None; text.len() + 1]; pattern.len() + 1];
+
+    fn walk(
+        pattern: &[char],
+        text: &[char],
+        pi: usize,
+        ti: usize,
+        memo: &mut [Vec<Option<bool>>],
+    ) -> bool {
+        if let Some(result) = memo[pi][ti] {
+            return result;
+        }
+        let result = if pi == pattern.len() {
+            ti == text.len()
+        } else if pattern[pi] == '*' {
+            let double = pattern.get(pi + 1) == Some(&'*');
+            if double {
+                let next = pi + 2;
+                // `**/` also matches zero directories.
+                if pattern.get(next) == Some(&'/') && walk(pattern, text, next + 1, ti, memo) {
+                    true
+                } else {
+                    (ti..=text.len()).any(|skip| walk(pattern, text, next, skip, memo))
+                }
+            } else {
+                let next = pi + 1;
+                let mut end = ti;
+                while end < text.len() && text[end] != '/' {
+                    end += 1;
+                }
+                (ti..=end).any(|skip| walk(pattern, text, next, skip, memo))
+            }
+        } else if ti == text.len() {
+            false
+        } else if pattern[pi] == '?' {
+            text[ti] != '/' && walk(pattern, text, pi + 1, ti + 1, memo)
+        } else {
+            pattern[pi] == text[ti] && walk(pattern, text, pi + 1, ti + 1, memo)
+        };
+        memo[pi][ti] = Some(result);
+        result
+    }
+
+    walk(&pattern, &text, 0, 0, &mut memo)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
@@ -181,6 +317,19 @@ pub struct ToolsConfig {
     pub sandbox_read_home: bool,
     /// Copy what a mutating tool can change before it runs.
     pub snapshots: bool,
+    /// Rules that skip the approval prompt for matching mutating tool calls.
+    pub auto_approve: Vec<AutoApproveRule>,
+}
+
+impl ToolsConfig {
+    /// First rule that covers this call, if any. Only meaningful under the
+    /// `ask` policy; callers must still enforce `read-only` and sub-agent
+    /// restrictions before consulting it.
+    pub fn auto_approval(&self, tool: &str, args: &Value) -> Option<&AutoApproveRule> {
+        self.auto_approve
+            .iter()
+            .find(|rule| rule.matches(tool, args))
+    }
 }
 
 impl Default for ToolsConfig {
@@ -193,6 +342,7 @@ impl Default for ToolsConfig {
             sandbox_network: true,
             sandbox_read_home: true,
             snapshots: true,
+            auto_approve: Vec::new(),
         }
     }
 }
@@ -392,6 +542,38 @@ impl Config {
                 "tools.command_timeout_secs must be > 0".into(),
             ));
         }
+        for (index, rule) in self.tools.auto_approve.iter().enumerate() {
+            if rule.tool.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "tools.auto_approve[{index}].tool is required (use \"*\" to match any tool)"
+                )));
+            }
+            if rule
+                .path
+                .as_deref()
+                .is_some_and(|path| path.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "tools.auto_approve[{index}].path is empty"
+                )));
+            }
+            if rule
+                .command_prefix
+                .as_deref()
+                .is_some_and(|prefix| prefix.is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "tools.auto_approve[{index}].command_prefix is empty"
+                )));
+            }
+            if let Some(pattern) = rule.command_regex.as_deref() {
+                Regex::new(pattern).map_err(|err| {
+                    ConfigError::Invalid(format!(
+                        "tools.auto_approve[{index}].command_regex is not a valid regex: {err}"
+                    ))
+                })?;
+            }
+        }
         if self.context.budget_tokens == 0 {
             return Err(ConfigError::Invalid(
                 "context.budget_tokens must be > 0".into(),
@@ -496,6 +678,7 @@ pub fn socket_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn endpoints() {
@@ -572,5 +755,104 @@ mod tests {
         );
         assert!(parsed.notifications.bell);
         assert_eq!(parsed.notifications.cooldown_secs, 3);
+    }
+
+    #[test]
+    fn auto_approve_rules_parse_and_match() {
+        let parsed: Config = toml::from_str(
+            r#"
+            [tools]
+            policy = "ask"
+
+            [[tools.auto_approve]]
+            tool = "run_command"
+            command_prefix = "cargo test"
+
+            [[tools.auto_approve]]
+            tool = "write_file"
+            path = "tests/**"
+
+            [[tools.auto_approve]]
+            tool = "run_command"
+            command_regex = "^cargo (check|clippy)\\b"
+            "#,
+        )
+        .expect("auto approve config");
+        assert_eq!(parsed.tools.auto_approve.len(), 3);
+        parsed.validate().expect("rules are valid");
+
+        let command = json!({"command": "cargo test --workspace"});
+        assert!(parsed
+            .tools
+            .auto_approval("run_command", &command)
+            .is_some());
+        assert!(parsed
+            .tools
+            .auto_approval("start_command", &command)
+            .is_none());
+
+        let write = json!({"path": "./tests/unit/a.rs", "content": "x"});
+        assert!(parsed.tools.auto_approval("write_file", &write).is_some());
+        let escape = json!({"path": "tests/../src/main.rs", "content": "x"});
+        assert!(parsed.tools.auto_approval("write_file", &escape).is_none());
+        let outside = json!({"path": "src/main.rs", "content": "x"});
+        assert!(parsed.tools.auto_approval("write_file", &outside).is_none());
+        // A missing `path` argument cannot satisfy a path rule.
+        assert!(parsed
+            .tools
+            .auto_approval("write_file", &json!({}))
+            .is_none());
+
+        let check = json!({"command": "cargo clippy --workspace"});
+        assert!(parsed.tools.auto_approval("run_command", &check).is_some());
+        assert!(parsed
+            .tools
+            .auto_approval("run_command", &json!({"command": "cargo run"}))
+            .is_none());
+    }
+
+    #[test]
+    fn auto_approve_rejects_invalid_rules() {
+        let invalid: Config = toml::from_str(
+            "[[tools.auto_approve]]\ntool = \"run_command\"\ncommand_regex = \"(\"\n",
+        )
+        .expect("parse first");
+        assert!(invalid.validate().is_err());
+
+        let empty: Config =
+            toml::from_str("[[tools.auto_approve]]\ntool = \"\"\n").expect("parse first");
+        assert!(empty.validate().is_err());
+
+        let prefix: Config = toml::from_str(
+            "[[tools.auto_approve]]\ntool = \"run_command\"\ncommand_prefix = \"\"\n",
+        )
+        .expect("parse first");
+        assert!(prefix.validate().is_err());
+    }
+
+    #[test]
+    fn glob_matching_respects_directories() {
+        assert!(glob_match("tests/**", "tests/unit/a.rs"));
+        assert!(glob_match("tests/**", "tests/a.rs"));
+        assert!(!glob_match("tests/*", "tests/unit/a.rs"));
+        assert!(glob_match("tests/*.rs", "tests/a.rs"));
+        assert!(glob_match("**/*.rs", "a.rs"));
+        assert!(glob_match("**/*.rs", "src/a.rs"));
+        assert!(glob_match("src/?.rs", "src/a.rs"));
+        assert!(!glob_match("src/?.rs", "src/ab.rs"));
+        assert!(!glob_match("*", "a/b"));
+        assert!(glob_match("**", "a/b"));
+        assert!(glob_match("a/**/b", "a/b"));
+        assert!(glob_match("a/**/b", "a/x/y/b"));
+    }
+
+    #[test]
+    fn wildcard_rule_matches_any_mutating_tool() {
+        let rule = AutoApproveRule {
+            tool: "*".to_string(),
+            ..AutoApproveRule::default()
+        };
+        assert!(rule.matches("write_file", &json!({"path": "a"})));
+        assert!(rule.matches("run_command", &json!({"command": "ls"})));
     }
 }
