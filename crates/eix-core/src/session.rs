@@ -145,6 +145,16 @@ impl PermissionLevel {
     pub fn can_write(self) -> bool {
         !matches!(self, Self::ReadOnly)
     }
+
+    /// The stricter of two levels. An agent's read-only restriction always
+    /// wins over a more permissive session; it never widens one.
+    pub fn restrict(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::ReadOnly, _) | (_, Self::ReadOnly) => Self::ReadOnly,
+            (Self::WorkspaceWrite, _) | (_, Self::WorkspaceWrite) => Self::WorkspaceWrite,
+            _ => Self::Full,
+        }
+    }
 }
 
 impl std::str::FromStr for PermissionLevel {
@@ -186,6 +196,13 @@ pub struct Session {
     /// Per-session tool permission level.
     #[serde(default)]
     pub permission: PermissionLevel,
+    /// Primary agent name (built-in or Markdown-defined). `None` means the
+    /// default `build` behavior.
+    #[serde(default)]
+    pub agent: Option<String>,
+    /// Hidden from the default session list, events kept.
+    #[serde(default)]
+    pub archived: bool,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -204,6 +221,8 @@ impl Session {
             worktree: None,
             origin: SessionOrigin::User,
             permission: PermissionLevel::default(),
+            agent: None,
+            archived: false,
             created_at: now,
             updated_at: now,
         }

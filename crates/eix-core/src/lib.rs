@@ -4,6 +4,8 @@
 //! log. Frontends (CLI/TUI today, Neovim later) only render state and send
 //! commands over the protocol in [`protocol`].
 
+pub mod agents;
+pub mod commands;
 pub mod config;
 pub mod context;
 pub mod event;
@@ -16,21 +18,27 @@ pub mod redact;
 pub mod sandbox;
 pub mod search;
 pub mod session;
+pub mod skills;
 
+pub use agents::{find_agent, load_agents, AgentMode, AgentSpec};
+pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
-    AutoApproveRule, Config, ConfigError, ContextConfig, NotificationsConfig, ProviderConfig,
-    SandboxMode, ServerConfig, ToolPolicy, ToolsConfig,
+    load_cli_config, AutoApproveRule, CliConfig, Config, ConfigError, ContextConfig,
+    FormatterConfig, ImagesConfig, LspConfig, LspServerConfig, McpConfig, McpServerConfig,
+    ModelConfig, ModelInfo, ModelRoute, NotificationsConfig, PermissionAction, PermissionRule,
+    ProviderConfig, SandboxMode, ServerConfig, ThemeConfig, ToolPolicy, ToolsConfig,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
-    payload, ApprovalRequiredPayload, AssistantMessagePayload, ContextCompactedPayload,
-    ContextDropPayload, ContextPinPayload, ErrorPayload, Event, EventKind, HunkInfo,
+    payload, ApprovalRequiredPayload, AssistantMessagePayload, ContextClearedPayload,
+    ContextCompactedPayload, ContextDropPayload, ContextPinPayload, ErrorPayload, Event, EventKind,
+    HunkInfo, ImageAttachment, InputAnsweredPayload, InputOption, InputRequiredPayload,
     PatchProposedPayload, PatchResultPayload, PermissionPayload, ProcessExitedPayload,
     ProcessStartedPayload, SnapshotPayload, StatusChangedPayload, ToolCallPayload,
     ToolResultPayload, UserMessagePayload,
 };
 pub use message::{
-    ChatMessage, FunctionCall, FunctionDefinition, Role, ToolCall, ToolDefinition, Usage,
+    ChatMessage, FunctionCall, FunctionDefinition, ImagePart, Role, ToolCall, ToolDefinition, Usage,
 };
 pub use picker::{
     is_data_kind, PickerItem, PickerParams, PickerResult, DATA_KINDS, KIND_BRANCHES, KIND_CONTEXT,
@@ -38,18 +46,24 @@ pub use picker::{
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{
-    ApprovalDecision, ApprovalInfo, ApprovalListParams, ApprovalListResult, ApprovalRespondParams,
-    ApprovalResult, AttachResult, AuthParams, AuthResult, CancelResult, ContextCompactParams,
-    ContextDropParams, ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams,
-    DraftResult, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult, Notification,
-    PatchApplyParams, PatchGetParams, PatchGetResult, PatchRejectParams, PatchResult,
-    PatchReviseParams, PermissionParams, ProcessKillParams, ProcessListParams, ProcessOutputParams,
-    RenameParams, Request, Response, RewindParams, RewindResult, ServerMessage, SessionList,
-    SessionRef, SessionResult, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
-    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams, ApprovalListResult,
+    ApprovalRespondParams, ApprovalResult, AttachResult, AuthParams, AuthResult, BtwParams,
+    BtwResult, CancelResult, ContextClearParams, ContextCompactParams, ContextDropParams,
+    ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams, DraftResult, Endpoint,
+    EventsParams, EventsResult, ForkParams, HelloResult, InputRespondParams, InputResult,
+    LspDiagnosticInfo, LspWorkspaceParams, LspWorkspaceResult, McpListResult, McpServerInfo,
+    ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
+    PatchRejectParams, PatchResult, PatchReviseParams, PermissionParams, ProcessKillParams,
+    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
+    RewindResult, ServerMessage, SessionAgentParams, SessionArchiveParams, SessionCdParams,
+    SessionExport, SessionExportResult, SessionImportParams, SessionList, SessionModelParams,
+    SessionRef, SessionResult, ShellRunParams, ShellRunResult, StatsResult, SubmitParams,
+    SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, TodoItem,
+    TodoList, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 pub use search::{SearchHit, SearchParams, SearchResult};
 pub use session::{PermissionLevel, Session, SessionId, SessionOrigin, SessionStatus};
+pub use skills::{available_prompt as available_skills_prompt, find_skill, load_skills, Skill};
 
 use std::time::{SystemTime, UNIX_EPOCH};
 

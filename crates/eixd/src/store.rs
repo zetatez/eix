@@ -4,6 +4,7 @@
 //! `user_message` / `assistant_message` events, so fork can copy a prefix and
 //! search can be added later without migrating the write path.
 
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -15,6 +16,15 @@ use serde_json::Value;
 
 pub struct Store {
     conn: Mutex<Connection>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct StoreStats {
+    pub sessions: usize,
+    pub archived_sessions: usize,
+    pub running_sessions: usize,
+    pub events: usize,
+    pub db_bytes: u64,
 }
 
 impl Store {
@@ -50,6 +60,8 @@ impl Store {
                 worktree   TEXT,
                 origin     TEXT NOT NULL DEFAULT 'user',
                 permission TEXT NOT NULL DEFAULT 'workspace-write',
+                agent      TEXT,
+                archived   INTEGER NOT NULL DEFAULT 0,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
             );
@@ -60,6 +72,7 @@ impl Store {
                 ts         INTEGER NOT NULL,
                 kind       TEXT NOT NULL,
                 payload    TEXT NOT NULL,
+                undone     INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY (session_id, seq)
             );
 
@@ -118,6 +131,9 @@ impl Store {
             "permission",
             "TEXT NOT NULL DEFAULT 'workspace-write'",
         )?;
+        add_column(&conn, "sessions", "agent", "TEXT")?;
+        add_column(&conn, "sessions", "archived", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "events", "undone", "INTEGER NOT NULL DEFAULT 0")?;
         // Index messages written before the search tables existed. New events
         // are indexed by `append_event`; the UNIQUE key makes this a no-op on
         // later starts (only the scan cost remains).
@@ -142,8 +158,8 @@ impl Store {
         conn.execute(
             "INSERT INTO sessions
                 (id, name, cwd, status, model, parent_id, forked_from_seq, worktree, origin,
-                 permission, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 permission, agent, archived, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session.id,
                 session.name,
@@ -155,6 +171,8 @@ impl Store {
                 session.worktree.as_ref().map(|path| path.to_string_lossy()),
                 session.origin.as_str(),
                 session.permission.as_str(),
+                session.agent,
+                session.archived as i64,
                 session.created_at,
                 session.updated_at,
             ],
@@ -163,12 +181,23 @@ impl Store {
     }
 
     pub fn list_sessions(&self) -> Result<Vec<Session>> {
+        self.list_sessions_including(false)
+    }
+
+    /// `include_archived = true` is used by name generation and explicit
+    /// archived-session pickers; the default session list hides them.
+    pub fn list_sessions_including(&self, include_archived: bool) -> Result<Vec<Session>> {
         let conn = self.conn.lock().expect("store mutex poisoned");
-        let mut stmt = conn.prepare(
+        let sql = if include_archived {
             "SELECT id, name, cwd, status, model, created_at, updated_at,
-                    parent_id, forked_from_seq, worktree, origin, permission
-             FROM sessions ORDER BY updated_at DESC, created_at DESC",
-        )?;
+                    parent_id, forked_from_seq, worktree, origin, permission, agent, archived
+             FROM sessions ORDER BY updated_at DESC, created_at DESC"
+        } else {
+            "SELECT id, name, cwd, status, model, created_at, updated_at,
+                    parent_id, forked_from_seq, worktree, origin, permission, agent, archived
+             FROM sessions WHERE archived = 0 ORDER BY updated_at DESC, created_at DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map([], row_to_session)?;
         let mut sessions = Vec::new();
         for row in rows {
@@ -182,7 +211,7 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin, permission
+                        parent_id, forked_from_seq, worktree, origin, permission, agent, archived
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -208,12 +237,189 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin, permission
+                        parent_id, forked_from_seq, worktree, origin, permission, agent, archived
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
             )
             .optional()?)
+    }
+
+    /// Change a session's pinned model. `None` restores the daemon default.
+    pub fn set_session_model(&self, id: &str, model: Option<&str>) -> Result<Option<Session>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
+            params![model, now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT id, name, cwd, status, model, created_at, updated_at,
+                        parent_id, forked_from_seq, worktree, origin, permission, agent, archived
+                 FROM sessions WHERE id = ?1",
+                params![id],
+                row_to_session,
+            )
+            .optional()?)
+    }
+
+    /// Change a session's primary agent. `None` restores the built-in default.
+    pub fn set_session_agent(&self, id: &str, agent: Option<&str>) -> Result<Option<Session>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET agent = ?1, updated_at = ?2 WHERE id = ?3",
+            params![agent, now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT id, name, cwd, status, model, created_at, updated_at,
+                        parent_id, forked_from_seq, worktree, origin, permission, agent, archived
+                 FROM sessions WHERE id = ?1",
+                params![id],
+                row_to_session,
+            )
+            .optional()?)
+    }
+
+    /// Hide or restore a session without deleting its event log.
+    pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<Option<Session>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "UPDATE sessions SET archived = ?1, updated_at = ?2 WHERE id = ?3",
+            params![archived as i64, now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT id, name, cwd, status, model, created_at, updated_at,
+                        parent_id, forked_from_seq, worktree, origin, permission, agent, archived
+                 FROM sessions WHERE id = ?1",
+                params![id],
+                row_to_session,
+            )
+            .optional()?)
+    }
+
+    /// Delete a session and (via `ON DELETE CASCADE`) its events, draft and
+    /// search rows. Returns false when the session did not exist.
+    pub fn delete_session(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    /// Insert a previously exported event without re-numbering it. Export and
+    /// import preserve sequence numbers so compaction ranges keep working.
+    pub fn insert_event(&self, event: &Event) -> Result<()> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let payload_text = serde_json::to_string(&event.payload)?;
+        tx.execute(
+            "INSERT INTO events (session_id, seq, ts, kind, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                event.session_id,
+                event.seq as i64,
+                event.ts,
+                event.kind.as_str(),
+                payload_text
+            ],
+        )?;
+        if matches!(
+            event.kind,
+            EventKind::UserMessage | EventKind::AssistantMessage
+        ) {
+            let text = event
+                .payload
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or_default();
+            if !text.is_empty() {
+                let role = if event.kind == EventKind::UserMessage {
+                    "user"
+                } else {
+                    "assistant"
+                };
+                tx.execute(
+                    "INSERT OR IGNORE INTO search_docs (session_id, seq, role, ts, text)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![event.session_id, event.seq as i64, role, event.ts, text],
+                )?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hide the newest user turn (the last `user_message` and everything after
+    /// it) from `events()` and the transcript. Each undo gets its own marker so
+    /// repeated undo/redo behaves like a stack.
+    pub fn undo_last_turn(&self, id: &str) -> Result<Option<usize>> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let cutoff: Option<i64> = tx
+            .query_row(
+                "SELECT seq FROM events
+                 WHERE session_id = ?1 AND undone = 0 AND kind = 'user_message'
+                 ORDER BY seq DESC LIMIT 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(cutoff) = cutoff else {
+            return Ok(None);
+        };
+        let round: i64 = tx.query_row(
+            "SELECT COALESCE(MAX(undone), 0) + 1 FROM events WHERE session_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let count = tx.execute(
+            "UPDATE events SET undone = ?1
+             WHERE session_id = ?2 AND seq >= ?3 AND undone = 0",
+            params![round, id, cutoff],
+        )?;
+        reindex_search(&tx, id)?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now_ms(), id],
+        )?;
+        tx.commit()?;
+        Ok(Some(count))
+    }
+
+    /// Restore the most recent undo batch.
+    pub fn redo_last_undo(&self, id: &str) -> Result<Option<usize>> {
+        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let tx = conn.transaction()?;
+        let round: Option<i64> = tx.query_row(
+            "SELECT MAX(undone) FROM events WHERE session_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let Some(round) = round.filter(|round| *round > 0) else {
+            return Ok(None);
+        };
+        let count = tx.execute(
+            "UPDATE events SET undone = 0 WHERE session_id = ?1 AND undone = ?2",
+            params![id, round],
+        )?;
+        reindex_search(&tx, id)?;
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now_ms(), id],
+        )?;
+        tx.commit()?;
+        Ok(Some(count))
     }
 
     /// Highest event sequence in a session, or `None` when the session has no
@@ -309,14 +515,14 @@ impl Store {
     ) -> Result<Option<Session>> {
         let mut conn = self.conn.lock().expect("store mutex poisoned");
         let tx = conn.transaction()?;
-        let source: Option<(String, Option<String>, String)> = tx
+        let source: Option<(String, Option<String>, String, Option<String>)> = tx
             .query_row(
-                "SELECT cwd, model, permission FROM sessions WHERE id = ?1",
+                "SELECT cwd, model, permission, agent FROM sessions WHERE id = ?1",
                 params![source_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .optional()?;
-        let Some((source_cwd, model, permission)) = source else {
+        let Some((source_cwd, model, permission, agent)) = source else {
             return Ok(None);
         };
         let max_seq: i64 = tx.query_row(
@@ -339,16 +545,18 @@ impl Store {
             .unwrap_or_else(|| PathBuf::from(source_cwd));
         let mut session = Session::new(uuid::Uuid::new_v4().to_string(), name, cwd);
         session.model = model;
+        session.agent = agent;
         session.parent_id = Some(source_id.to_string());
         session.forked_from_seq = Some(upto as u64);
         session.worktree = worktree.map(Path::to_path_buf);
         session.origin = eix_core::SessionOrigin::Fork;
+        session.archived = false;
         session.permission = permission.parse().unwrap_or_default();
         tx.execute(
             "INSERT INTO sessions
                 (id, name, cwd, status, model, parent_id, forked_from_seq, worktree, origin,
-                 permission, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 permission, agent, archived, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 session.id,
                 session.name,
@@ -360,6 +568,8 @@ impl Store {
                 session.worktree.as_ref().map(|path| path.to_string_lossy()),
                 session.origin.as_str(),
                 session.permission.as_str(),
+                session.agent,
+                session.archived as i64,
                 session.created_at,
                 session.updated_at,
             ],
@@ -468,7 +678,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
-             WHERE session_id = ?1 AND seq > ?2 ORDER BY seq ASC",
+             WHERE session_id = ?1 AND seq > ?2 AND undone = 0 ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![id, after_seq], |row| {
             let kind: String = row.get(2)?;
@@ -563,7 +773,7 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let mut stmt = conn.prepare(
             "SELECT id, name, cwd, status, model, created_at, updated_at,
-                    parent_id, forked_from_seq, worktree, origin, permission
+                    parent_id, forked_from_seq, worktree, origin, permission, agent, archived
              FROM sessions WHERE status IN ('running', 'awaiting_approval', 'awaiting_input')",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -572,6 +782,56 @@ impl Store {
             sessions.push(row?);
         }
         Ok(sessions)
+    }
+
+    pub fn stats(&self) -> Result<StoreStats> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let sessions: i64 =
+            conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
+        let archived: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE archived != 0",
+            [],
+            |row| row.get(0),
+        )?;
+        let running: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE status IN ('running', 'awaiting_approval', 'awaiting_input')",
+            [],
+            |row| row.get(0),
+        )?;
+        let events: i64 = conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
+        let pages: i64 = conn.query_row("PRAGMA page_count", [], |row| row.get(0))?;
+        let page_size: i64 = conn.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        Ok(StoreStats {
+            sessions: sessions.max(0) as usize,
+            archived_sessions: archived.max(0) as usize,
+            running_sessions: running.max(0) as usize,
+            events: events.max(0) as usize,
+            db_bytes: (pages.max(0) as u64).saturating_mul(page_size.max(0) as u64),
+        })
+    }
+
+    /// Blob ids referenced by any stored user message, including undone
+    /// events (redo can bring them back).
+    pub fn referenced_blob_ids(&self) -> Result<HashSet<String>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE kind = 'user_message' AND payload LIKE '%\"blob\"%'",
+        )?;
+        let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut ids = HashSet::new();
+        for row in rows {
+            let payload: Value = serde_json::from_str(&row?).unwrap_or(Value::Null);
+            let Some(images) = payload.get("images").and_then(Value::as_array) else {
+                continue;
+            };
+            for image in images {
+                if let Some(blob) = image.get("blob").and_then(Value::as_str) {
+                    ids.insert(blob.to_string());
+                }
+            }
+        }
+        Ok(ids)
     }
 
     pub fn set_permissions(path: &Path) -> Result<()> {
@@ -585,6 +845,28 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// Rebuild `search_docs` for one session from the events that are still
+/// visible. Undo/redo change visibility, so the FTS index has to follow.
+fn reindex_search(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<()> {
+    tx.execute(
+        "DELETE FROM search_docs WHERE session_id = ?1",
+        params![session_id],
+    )?;
+    tx.execute(
+        "INSERT INTO search_docs (session_id, seq, role, ts, text)
+         SELECT session_id, seq,
+                CASE kind WHEN 'user_message' THEN 'user' ELSE 'assistant' END,
+                ts,
+                json_extract(payload, '$.text')
+         FROM events
+         WHERE session_id = ?1 AND undone = 0
+           AND kind IN ('user_message', 'assistant_message')
+           AND COALESCE(json_extract(payload, '$.text'), '') <> ''",
+        params![session_id],
+    )?;
+    Ok(())
 }
 
 fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
@@ -615,6 +897,8 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
             .get::<_, Option<String>>(11)?
             .and_then(|value| value.parse().ok())
             .unwrap_or_default(),
+        agent: row.get(12)?,
+        archived: row.get::<_, i64>(13)? != 0,
     })
 }
 

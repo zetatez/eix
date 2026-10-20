@@ -4,6 +4,7 @@ members = [
     "crates/eix-core",
     "crates/eixd",
     "crates/eix-tui",
+    "crates/eix-sdk",
 ]
 
 [workspace.package]
@@ -22,6 +23,7 @@ crossterm = "0.28"
 rmpv = "1"
 toml = "0.8"
 dirs = "6"
+glob = "0.3"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
@@ -34,6 +36,9 @@ reqwest = { version = "0.12", default-features = false, features = [
 ] }
 futures-util = "0.3"
 libc = "0.2"
+arc-swap = "1"
+base64 = "0.22"
+sha2 = "0.10"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",

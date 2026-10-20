@@ -3,21 +3,24 @@
 //! The prompt is a self-contained Vim-style editor (see [`super::editor`]);
 //! there is no embedded editor process.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use eix_core::{
     ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
     ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
-    PatchProposedPayload, PatchResultPayload, PermissionLevel, PermissionPayload, PickerItem,
-    ProcessInfo, ProcessList, ProcessOutput, ProcessStatus, RewindResult, SearchHit, Sector,
-    Session, SessionStatus, SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    InputAnsweredPayload, InputOption, InputRequiredPayload, PatchProposedPayload,
+    PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo, ProcessList, ProcessOutput,
+    ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult,
+    ToolResultPayload, UserMessagePayload,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 use ratatui::Frame;
 use serde::Deserialize;
 use serde_json::Value;
@@ -26,7 +29,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::controller::{Command, ContextOp, Event};
 use super::editor::{Editor, Mode, Outcome};
+use super::keys::{KeyAction, Keybinds};
 use super::theme::Theme;
+use super::transcript::{self, FoldId};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -36,6 +41,115 @@ enum Focus {
 
 /// Two `Esc` presses within this window leave the prompt for the transcript.
 const ESC_WINDOW: Duration = Duration::from_millis(500);
+
+/// A prompt `/command`. Typed as a whole message line and never sent to the
+/// model. `args` is a display hint; parsing is intentionally forgiving.
+/// `template` is set for user-defined commands loaded from Markdown.
+#[derive(Clone)]
+struct CommandSpec {
+    name: String,
+    args: String,
+    description: String,
+    template: Option<String>,
+    agent: Option<String>,
+    model: Option<String>,
+}
+
+fn builtin(name: &str, args: &str, description: &str) -> CommandSpec {
+    CommandSpec {
+        name: name.to_string(),
+        args: args.to_string(),
+        description: description.to_string(),
+        template: None,
+        agent: None,
+        model: None,
+    }
+}
+
+/// Built-in prompt commands, in menu order.
+fn builtin_commands() -> Vec<CommandSpec> {
+    vec![
+        builtin("help", "", "show the key and command reference"),
+        builtin("new", "[name]", "start a new session in this workspace"),
+        builtin("clear", "", "forget this conversation's context"),
+        builtin(
+            "compact",
+            "[notes]",
+            "summarize the history to free context",
+        ),
+        builtin(
+            "btw",
+            "<question>",
+            "ask a one-off question without touching history",
+        ),
+        builtin("cd", "[path]", "change this session's working directory"),
+        builtin("init", "", "draft an AGENTS.md for this workspace"),
+        builtin(
+            "queue",
+            "[clear]",
+            "show or clear prompts waiting for the session",
+        ),
+        builtin("sessions", "", "open the session picker"),
+        builtin("models", "[id]", "list or pin a model for this session"),
+        builtin("agents", "[name]", "choose the session's primary agent"),
+        builtin("mcp", "", "show MCP servers and their tools"),
+        builtin("reload", "", "re-read the daemon config files"),
+        builtin(
+            "timeline",
+            "[n]",
+            "show recent turns, answers and tool calls",
+        ),
+        builtin("export", "[path]", "write this session as JSON"),
+        builtin("archive", "", "hide this session from the picker"),
+        builtin("delete", "", "delete this session (run twice to confirm)"),
+        builtin("undo", "", "hide the newest turn (/redo restores it)"),
+        builtin("redo", "", "restore the most recently undone turn"),
+        builtin(
+            "skills",
+            "[name] [args]",
+            "browse skills with a preview, or insert one",
+        ),
+        builtin("todos", "", "show the model's task list"),
+        builtin(
+            "diagnostics",
+            "[max-files]",
+            "aggregate LSP diagnostics for the workspace",
+        ),
+        builtin("image", "<path>", "attach an image to the next prompt"),
+        builtin(
+            "permission",
+            "<level>",
+            "read-only · workspace-write · full",
+        ),
+        builtin("fork", "[name]", "fork this session into a new pane"),
+        builtin("commands", "", "reload user-defined Markdown commands"),
+        builtin("exit", "", "save and close this session"),
+        builtin("quit", "", "save and close this session"),
+    ]
+}
+
+/// Merge built-ins with user commands. A custom command with the same name
+/// replaces the built-in entry rather than creating a duplicate.
+fn merge_commands(cwd: &std::path::Path) -> Vec<CommandSpec> {
+    let mut commands = builtin_commands();
+    let custom: Vec<_> = eix_core::load_commands(cwd);
+    for command in custom {
+        let spec = CommandSpec {
+            name: command.name.clone(),
+            args: String::new(),
+            description: command.description,
+            template: Some(command.template),
+            agent: command.agent,
+            model: command.model,
+        };
+        if let Some(existing) = commands.iter_mut().find(|item| item.name == spec.name) {
+            *existing = spec;
+        } else {
+            commands.push(spec);
+        }
+    }
+    commands
+}
 
 /// Prompt height: [`super::editor::PROMPT_ROWS`] content rows plus the two
 /// borders, clamped so the transcript keeps a few rows on short terminals.
@@ -49,6 +163,10 @@ struct SessionView {
     stream: Option<StreamState>,
     scroll: usize,
     follow: bool,
+    /// Explicit open/closed state for collapsible Thinking and tool blocks.
+    folds: HashMap<FoldId, bool>,
+    /// Line -> foldable block map from the last draw, used for click-to-fold.
+    slots: Vec<Option<transcript::Fold>>,
 }
 
 impl SessionView {
@@ -59,6 +177,8 @@ impl SessionView {
             stream: None,
             scroll: 0,
             follow: true,
+            folds: HashMap::new(),
+            slots: Vec::new(),
         }
     }
 
@@ -110,6 +230,7 @@ impl SessionView {
                                     .map(str::to_string),
                                 selected: vec![true; payload.hunks.len()],
                                 hunks: payload.hunks,
+                                cursor: 0,
                             });
                         }
                     }
@@ -131,6 +252,7 @@ impl SessionView {
                                 path: Some(payload.path),
                                 selected: vec![true; payload.hunks.len()],
                                 hunks: payload.hunks,
+                                cursor: 0,
                             });
                         }
                     }
@@ -140,11 +262,57 @@ impl SessionView {
         }
         tool.or(patch)
     }
+
+    /// Find the newest unanswered `ask_user` question in the replayable log.
+    fn pending_input(&self) -> Option<PendingInput> {
+        let mut answered = HashSet::new();
+        for event in &self.events {
+            if event.kind != EventKind::InputAnswered {
+                continue;
+            }
+            if let Ok(payload) =
+                serde_json::from_value::<InputAnsweredPayload>(event.payload.clone())
+            {
+                answered.insert(payload.input_id);
+            }
+        }
+        let mut pending = None;
+        for event in &self.events {
+            if event.kind != EventKind::InputRequired {
+                continue;
+            }
+            if let Ok(payload) =
+                serde_json::from_value::<InputRequiredPayload>(event.payload.clone())
+            {
+                if !answered.contains(&payload.input_id) {
+                    pending = Some(PendingInput {
+                        input_id: payload.input_id,
+                        call_id: payload.call_id,
+                        question: payload.question,
+                        options: payload.options,
+                        cursor: 0,
+                    });
+                }
+            }
+        }
+        pending
+    }
 }
 
 struct StreamState {
     turn_id: String,
     text: String,
+    reasoning: String,
+}
+
+impl StreamState {
+    fn new(turn_id: String) -> Self {
+        Self {
+            turn_id,
+            text: String::new(),
+            reasoning: String::new(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -163,6 +331,12 @@ enum PickerKind {
     Context,
     /// Client-side command palette (`:`).
     Commands,
+    /// Pin the focused session to a configured model.
+    Models,
+    /// Select the focused session's primary agent.
+    Agents,
+    /// Browse installed skills, with a body preview.
+    Skills,
 }
 
 impl PickerKind {
@@ -173,7 +347,12 @@ impl PickerKind {
             Self::Worktrees => Some(eix_core::KIND_WORKTREES),
             Self::Branches => Some(eix_core::KIND_BRANCHES),
             Self::Context => Some(eix_core::KIND_CONTEXT),
-            Self::Sessions | Self::NewPane | Self::Commands => None,
+            Self::Sessions
+            | Self::NewPane
+            | Self::Commands
+            | Self::Models
+            | Self::Agents
+            | Self::Skills => None,
         }
     }
 
@@ -186,6 +365,9 @@ impl PickerKind {
             Self::Branches => "branches — insert name",
             Self::Context => "context — open ledger",
             Self::Commands => "commands",
+            Self::Models => "models — pin this session",
+            Self::Agents => "agents — choose the primary agent",
+            Self::Skills => "skills — preview and insert",
         }
     }
 
@@ -198,6 +380,9 @@ impl PickerKind {
             Self::Branches => "Enter insert name · ↑/↓ or C-j/C-k · Esc close",
             Self::Context => "Enter open ledger · ↑/↓ or C-j/C-k · Esc close",
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k · Esc close",
+            Self::Models => "Enter pin · Esc close",
+            Self::Agents => "Enter select · ↑/↓ or C-j/C-k · Esc close",
+            Self::Skills => "Enter insert · preview on the right · Esc close",
         }
     }
 }
@@ -250,12 +435,87 @@ struct PendingApproval {
     hunks: Vec<HunkInfo>,
     /// Whether each hunk is selected; parallel to `hunks`.
     selected: Vec<bool>,
+    /// Highlighted row in the action list.
+    cursor: usize,
+}
+
+/// A row in the approval card's action list. The first action is the
+/// recommendation and Enter picks it without moving the cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ApprovalAction {
+    Approve,
+    Always,
+    Deny,
+    Reason,
+    Review,
+    Open,
+    Edit,
+}
+
+impl PendingApproval {
+    fn actions(&self) -> Vec<ApprovalAction> {
+        let mut actions = vec![ApprovalAction::Approve, ApprovalAction::Always];
+        if self.diff.as_deref().is_some_and(|diff| !diff.is_empty()) {
+            actions.push(ApprovalAction::Review);
+        }
+        if self.path.is_some() {
+            actions.push(ApprovalAction::Open);
+        }
+        if self.kind == PendingKind::Patch {
+            actions.push(ApprovalAction::Edit);
+        }
+        actions.push(ApprovalAction::Deny);
+        actions.push(ApprovalAction::Reason);
+        actions
+    }
+
+    fn action_label(&self, action: ApprovalAction) -> String {
+        let patch = self.kind == PendingKind::Patch;
+        match action {
+            ApprovalAction::Approve if patch => "Apply change".to_string(),
+            ApprovalAction::Approve => "Approve".to_string(),
+            ApprovalAction::Always if patch => "Apply and always allow".to_string(),
+            ApprovalAction::Always => "Always allow".to_string(),
+            ApprovalAction::Deny if patch => "Reject".to_string(),
+            ApprovalAction::Deny => "Deny".to_string(),
+            ApprovalAction::Reason if patch => "Reject with reason…".to_string(),
+            ApprovalAction::Reason => "Deny with reason…".to_string(),
+            ApprovalAction::Review if self.hunks.is_empty() => "Review diff".to_string(),
+            ApprovalAction::Review => "Review hunks".to_string(),
+            ApprovalAction::Open => "Open file".to_string(),
+            ApprovalAction::Edit => "Edit staged content".to_string(),
+        }
+    }
+}
+
+/// An `ask_user` question waiting for the user to pick an option.
+#[derive(Clone)]
+struct PendingInput {
+    input_id: String,
+    /// Tool call that produced the question, used to match `tool.completed`.
+    call_id: String,
+    question: String,
+    options: Vec<InputOption>,
+    /// Highlighted option; starts at the recommended (first) one.
+    cursor: usize,
 }
 
 /// Inline reason for denying an approval (`r` on the card).
 struct ReasonPrompt {
     session_id: String,
     text: String,
+}
+
+/// A `/btw` side question: answered with a throwaway context so the main
+/// conversation and its ledger stay untouched.
+struct BtwView {
+    session_id: String,
+    btw_id: String,
+    question: String,
+    text: String,
+    error: Option<String>,
+    done: bool,
+    scroll: usize,
 }
 
 /// Cross-session list of pending approvals, opened with `A`.
@@ -404,6 +664,17 @@ impl ProcessView {
 }
 
 /// Full-screen history search, opened with `#` from the transcript.
+struct DiagnosticsView {
+    result: eix_core::LspWorkspaceResult,
+    scroll: usize,
+}
+
+impl DiagnosticsView {
+    fn new(result: eix_core::LspWorkspaceResult) -> Self {
+        Self { result, scroll: 0 }
+    }
+}
+
 struct SearchView {
     query: String,
     hits: Vec<SearchHit>,
@@ -467,12 +738,23 @@ pub struct App {
     focus: Focus,
     picker: Option<Picker>,
     help: bool,
+    /// Recent timeline items for the read-only overlay.
+    timeline: Option<Vec<eix_core::TimelineItem>>,
+    timeline_scroll: usize,
+    /// First `/delete` arms a confirmation; the second one deletes.
+    pending_delete: Option<String>,
+    /// Images attached with `/image`, sent with the next prompt.
+    pending_images: Vec<String>,
+    /// Images belonging to an in-flight prompt, restored if submit fails.
+    inflight_images: Vec<String>,
     /// `Ctrl-W` was pressed; the next key is a window command.
     pending_window: bool,
     /// Pane rectangles from the last draw, used to pick a focus direction.
     pane_areas: Vec<Rect>,
     /// Tool calls waiting on a decision, keyed by session id.
     approvals: HashMap<String, PendingApproval>,
+    /// `ask_user` questions waiting on an answer, keyed by session id.
+    inputs: HashMap<String, PendingInput>,
     /// Full-screen diff review, when open.
     diff_view: Option<DiffView>,
     /// Full-screen context ledger, when open.
@@ -481,6 +763,8 @@ pub struct App {
     process_view: Option<ProcessView>,
     /// Full-screen history search, when open.
     search_view: Option<SearchView>,
+    /// Workspace LSP diagnostics overlay.
+    diagnostics_view: Option<DiagnosticsView>,
     status: String,
     error: Option<String>,
     connected: bool,
@@ -489,6 +773,10 @@ pub struct App {
     pub bell: bool,
     /// Emit OSC 9/777 notifications and update the title on attention.
     pub osc: bool,
+    /// New-session defaults from cli.json.
+    pub default_model: Option<String>,
+    pub default_agent: Option<String>,
+    pub default_permission: Option<String>,
     /// Set when a notification should ring; cleared by the event loop.
     ring: bool,
     /// Text for the next alert (session name + status).
@@ -509,10 +797,34 @@ pub struct App {
     /// Cross-session approvals overlay.
     inbox: Option<InboxView>,
     /// Colors used by the transcript and approval cards.
-    theme: Theme,
+    pub(crate) theme: Theme,
+    /// Transcript-mode key overrides from `[keys]`.
+    pub(crate) keybinds: Keybinds,
     /// When the previous `Esc` reached the prompt, for the double-Esc
     /// "leave the input" gesture.
     esc_at: Option<Instant>,
+    /// Prompt history cursor: `None` is the live draft, `Some(i)` is `i`
+    /// entries back from the newest submitted prompt.
+    history_index: Option<usize>,
+    /// Draft captured when history browsing started, restored by `j` past the
+    /// newest entry.
+    history_draft: String,
+    /// Prompts submitted while their session was busy, keyed by session id.
+    /// `tick` drains one at a time as sessions go idle.
+    queues: HashMap<String, VecDeque<String>>,
+    /// A queued prompt whose `prompt.submit` is in flight, kept so a `busy`
+    /// race can put it back at the head of the queue.
+    queued_inflight: Option<(String, String)>,
+    /// Session whose prompt submit is currently in flight (if any).
+    submitting_session: Option<String>,
+    /// Selected row in the `/` command menu.
+    command_cursor: usize,
+    /// Built-in and user-defined Markdown commands, in menu order.
+    commands: Vec<CommandSpec>,
+    /// `/` command menu was dismissed with Esc for the current draft.
+    command_dismissed: bool,
+    /// Streaming `/btw` side answer, shown above the prompt.
+    btw: Option<BtwView>,
 }
 
 impl App {
@@ -535,19 +847,29 @@ impl App {
             focus: Focus::Input,
             picker: None,
             help: false,
+            timeline: None,
+            timeline_scroll: 0,
+            pending_delete: None,
+            pending_images: Vec::new(),
+            inflight_images: Vec::new(),
             pending_window: false,
             pane_areas: Vec::new(),
             approvals: HashMap::new(),
+            inputs: HashMap::new(),
             diff_view: None,
             ledger: None,
             process_view: None,
             search_view: None,
+            diagnostics_view: None,
             status: "connecting…".into(),
             error: None,
             connected: false,
             tick: 0,
             bell: false,
             osc: false,
+            default_model: None,
+            default_agent: None,
+            default_permission: None,
             ring: false,
             last_alert: None,
             draft_loading: None,
@@ -558,7 +880,19 @@ impl App {
             force_clear: false,
             inbox: None,
             theme: Theme::default(),
+            keybinds: Keybinds::default(),
             esc_at: None,
+            history_index: None,
+            history_draft: String::new(),
+            queues: HashMap::new(),
+            queued_inflight: None,
+            submitting_session: None,
+            command_cursor: 0,
+            commands: merge_commands(
+                &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            ),
+            command_dismissed: false,
+            btw: None,
         }
     }
 
@@ -570,12 +904,15 @@ impl App {
             && self.ledger.is_none()
             && self.process_view.is_none()
             && self.search_view.is_none()
+            && self.diagnostics_view.is_none()
             && self.inbox.is_none()
+            && self.btw.is_none()
             && self.reason_prompt.is_none()
     }
 
     /// Put the last submitted draft back after a failed turn, if it belongs to
-    /// `session_id`.
+    /// `session_id` and the prompt is still empty (the user may already be
+    /// typing the next message).
     fn restore_pending_draft(&mut self, session_id: &str) {
         let matches = self
             .pending_draft
@@ -584,8 +921,14 @@ impl App {
         if !matches {
             return;
         }
+        if self.focused_session_id().as_deref() != Some(session_id) {
+            self.pending_draft = None;
+            return;
+        }
         if let Some((_, draft)) = self.pending_draft.take() {
-            self.input.set_text(&draft);
+            if self.input.is_empty() {
+                self.input.set_text(&draft);
+            }
         }
     }
 
@@ -618,6 +961,7 @@ impl App {
     pub fn tick(&mut self, tx: &UnboundedSender<Command>) {
         self.tick = self.tick.wrapping_add(1);
         self.sync_draft(tx);
+        self.flush_queues(tx);
     }
 
     /// Persist the prompt as a per-session draft when the focused pane changes
@@ -668,7 +1012,70 @@ impl App {
 
     pub fn handle_paste(&mut self, text: &str) {
         self.focus = Focus::Input;
+        // Terminal drag-and-drop usually arrives as a bracketed paste of one
+        // or more paths. Attach them instead of dumping quoted paths into the
+        // prompt. Normal text pastes unchanged.
+        let cwd = self
+            .focused_view()
+            .map(|view| view.session.cwd.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        if let Some(paths) = parse_image_paths(text, &cwd) {
+            for path in paths {
+                if !self.pending_images.contains(&path) {
+                    self.pending_images.push(path);
+                }
+            }
+            self.status = format!(
+                "attached {} image(s) for the next prompt",
+                self.pending_images.len()
+            );
+            return;
+        }
         self.input.paste(text);
+    }
+
+    /// Mouse clicks focus a pane and expand/collapse the block under the
+    /// cursor. The wheel scrolls the pane under the cursor. Anything outside
+    /// the panes focuses the prompt.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        let (x, y) = (mouse.column, mouse.row);
+        let pane = self.pane_areas.iter().position(|rect| {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        });
+        let pane = pane.filter(|index| *index < self.views.len());
+        if let Some(index) = pane {
+            match mouse.kind {
+                MouseEventKind::ScrollUp => {
+                    self.focused = index;
+                    self.scroll_focused(-3);
+                    return;
+                }
+                MouseEventKind::ScrollDown => {
+                    self.focused = index;
+                    self.scroll_focused(3);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return;
+        }
+        let Some(index) = pane else {
+            self.focus = Focus::Input;
+            return;
+        };
+        self.focused = index;
+        self.focus = Focus::Transcript;
+        let rect = self.pane_areas[index];
+        let Some(line) = y.checked_sub(rect.y + 1) else {
+            return;
+        };
+        let view = &mut self.views[index];
+        let line = line as usize + view.scroll;
+        if let Some(fold) = view.slots.get(line).and_then(|slot| *slot) {
+            view.folds.insert(fold.id, !fold.open);
+        }
     }
 
     pub fn handle_event(&mut self, event: Event, tx: &UnboundedSender<Command>) {
@@ -815,6 +1222,136 @@ impl App {
                     self.status = format!("{count} {kind} row(s)");
                 }
             }
+            Event::Models(models) => {
+                if let Some(picker) = &mut self.picker {
+                    if picker.kind == PickerKind::Models {
+                        picker.items = model_picker_items(&models);
+                        picker.selected = 0;
+                        picker.loading = false;
+                    }
+                }
+                self.status = format!("{} model(s)", models.len());
+            }
+            Event::Agents(agents) => {
+                if let Some(picker) = &mut self.picker {
+                    if picker.kind == PickerKind::Agents {
+                        picker.items = agent_picker_items(&agents);
+                        picker.selected = 0;
+                        picker.loading = false;
+                    }
+                }
+                self.status = format!("{} agent(s)", agents.len());
+            }
+            Event::Mcp(servers) => {
+                if servers.is_empty() {
+                    self.status = "no MCP servers configured (see [mcp.servers])".into();
+                } else {
+                    let parts: Vec<String> = servers
+                        .iter()
+                        .map(|server| {
+                            if !server.enabled {
+                                format!("{}: disabled", server.name)
+                            } else if let Some(error) = &server.error {
+                                format!("{}: error — {}", server.name, truncate(error, 60))
+                            } else {
+                                format!("{}: {} tool(s)", server.name, server.tools)
+                            }
+                        })
+                        .collect();
+                    self.status = parts.join(" · ");
+                }
+            }
+            Event::ConfigReloaded { paths } => {
+                self.status = format!("config reloaded ({} layer(s))", paths.len());
+            }
+            Event::Exported { path } => {
+                self.status = match path {
+                    Some(path) => format!("exported to {}", path.display()),
+                    None => "exported".into(),
+                };
+            }
+            Event::Archived(session) => {
+                let id = session.id.clone();
+                self.sessions.retain(|existing| existing.id != id);
+                self.views.retain(|view| view.session.id != id);
+                if self.focused >= self.views.len() {
+                    self.focused = self.views.len().saturating_sub(1);
+                }
+                self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+                self.status = format!("archived {}", session.name);
+            }
+            Event::Deleted(id) => {
+                self.sessions.retain(|existing| existing.id != id);
+                self.views.retain(|view| view.session.id != id);
+                if self.focused >= self.views.len() {
+                    self.focused = self.views.len().saturating_sub(1);
+                }
+                self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+                self.status = "session deleted".into();
+            }
+            Event::ShellRan { ok, output } => {
+                let first = output.lines().next().unwrap_or_default();
+                self.status = if first.is_empty() {
+                    if ok {
+                        "shell ok".into()
+                    } else {
+                        "shell failed".into()
+                    }
+                } else {
+                    format!(
+                        "shell {} · {}",
+                        if ok { "ok" } else { "failed" },
+                        truncate(first, 80)
+                    )
+                };
+            }
+            Event::Diagnostics(result) => {
+                let count = result.diagnostics.len();
+                let files = result.files;
+                self.diagnostics_view = Some(DiagnosticsView::new(result));
+                self.status = format!("diagnostics: {count} in {files} file(s)");
+            }
+            Event::Todos(items) => {
+                if items.is_empty() {
+                    self.status = "no tasks".into();
+                } else {
+                    let done = items
+                        .iter()
+                        .filter(|item| item.status == "completed")
+                        .count();
+                    let active = items
+                        .iter()
+                        .find(|item| item.status == "in_progress")
+                        .or_else(|| items.iter().find(|item| item.status == "pending"));
+                    self.status = match active {
+                        Some(item) => format!(
+                            "todos {done}/{} · in progress: {}",
+                            items.len(),
+                            item.content
+                        ),
+                        None => format!("todos {done}/{} · all done", items.len()),
+                    };
+                }
+            }
+            Event::Rewritten(session_id) => {
+                if let Some(index) = self
+                    .views
+                    .iter()
+                    .position(|view| view.session.id == session_id)
+                {
+                    self.pending_attach = Some(PendingAttach {
+                        session_id: session_id.clone(),
+                        slot: AttachSlot::Existing(index),
+                    });
+                    let _ = tx.send(Command::Attach(session_id));
+                    self.status = "history updated".into();
+                }
+            }
+            Event::Timeline(items) => {
+                self.status = format!("timeline: {} item(s)", items.len());
+                self.timeline_scroll = 0;
+                self.timeline = Some(items);
+            }
             Event::Draft { session_id, text } => {
                 if self.input_session.as_deref() != Some(session_id.as_str()) {
                     return;
@@ -835,6 +1372,70 @@ impl App {
                 text,
             } => self.edit_patch(&session_id, &patch_id, &text, tx),
             Event::Submitted(submitted) => self.submitted(submitted),
+            Event::Updated(session) => {
+                let id = session.id.clone();
+                let previous = self
+                    .views
+                    .iter()
+                    .find(|view| view.session.id == id)
+                    .map(|view| (view.session.cwd.clone(), view.session.permission));
+                if let Some(view) = self.views.iter_mut().find(|view| view.session.id == id) {
+                    view.session = session.clone();
+                }
+                if let Some((cwd, permission)) = previous {
+                    if cwd != session.cwd {
+                        self.status = format!("cwd: {}", session.cwd.display());
+                    } else if permission != session.permission {
+                        self.status = format!("permission: {}", session.permission.as_str());
+                    }
+                }
+                self.upsert_session(session, false);
+                self.error = None;
+            }
+            Event::ContextCleared { session_id } => {
+                if let Some(view) = self
+                    .views
+                    .iter_mut()
+                    .find(|view| view.session.id == session_id)
+                {
+                    view.stream = None;
+                }
+                self.status = "context cleared · earlier turns stay in the transcript".into();
+                self.error = None;
+            }
+            Event::Compacted {
+                session_id,
+                entries,
+                tokens,
+            } => {
+                if let Some(view) = self
+                    .views
+                    .iter_mut()
+                    .find(|view| view.session.id == session_id)
+                {
+                    view.follow = true;
+                }
+                self.status =
+                    format!("compacted · context now {tokens} tokens ({entries} entries)");
+                self.error = None;
+            }
+            Event::BtwStarted { session_id, btw_id } => {
+                if let Some(btw) = self.btw.as_mut() {
+                    if btw.session_id == session_id {
+                        btw.btw_id = btw_id;
+                    }
+                }
+            }
+            Event::BtwCancelled { session_id } => {
+                if self
+                    .btw
+                    .as_ref()
+                    .is_some_and(|btw| btw.session_id == session_id)
+                {
+                    self.btw = None;
+                    self.status = "side question cancelled".into();
+                }
+            }
             Event::Cancelled(cancelled) => {
                 self.status = if cancelled {
                     "cancel requested".into()
@@ -859,6 +1460,18 @@ impl App {
                     self.status = "approval sent".into();
                 } else {
                     self.status = "approval was stale; the daemon is still waiting".into();
+                }
+            }
+            Event::InputResponded { accepted } => {
+                if accepted {
+                    self.status = "answer sent".into();
+                } else {
+                    self.status = "answer was stale; the daemon is still waiting".into();
+                    if let Some(session_id) =
+                        self.focused_view().map(|view| view.session.id.clone())
+                    {
+                        self.reload_input(&session_id);
+                    }
                 }
             }
             Event::Ledger { session_id, result } => {
@@ -911,11 +1524,28 @@ impl App {
                 match context.as_str() {
                     "submit" => {
                         self.submitting = false;
+                        self.submitting_session = None;
                         self.pending_prompt = None;
-                        // The prompt was cleared when the request was sent;
-                        // put the draft back so it can be edited or retried.
-                        if let Some((_, draft)) = self.pending_draft.take() {
-                            self.input.set_text(&draft);
+                        self.pending_images = std::mem::take(&mut self.inflight_images);
+                        if let Some((session_id, text)) = self.queued_inflight.take() {
+                            // The daemon still considered the turn busy (the
+                            // completion notification and the turns map race).
+                            // Put it back at the head and retry on the next tick.
+                            self.queues.entry(session_id).or_default().push_front(text);
+                        } else if let Some((session_id, draft)) = self.pending_draft.take() {
+                            if message.contains("already running") {
+                                // The local status was stale: queue the prompt
+                                // instead of losing the "submit while busy"
+                                // intent. The tick retries it when the daemon
+                                // reports the session idle.
+                                self.enqueue(session_id, &draft, tx);
+                                self.error = None;
+                            } else {
+                                // The prompt was cleared when the request was
+                                // sent; put the draft back so it can be edited
+                                // or retried.
+                                self.input.set_text(&draft);
+                            }
                         }
                     }
                     "create" => self.creating = false,
@@ -926,6 +1556,12 @@ impl App {
                     }
                     "list" if !self.initialized => self.initialized = true,
                     "draft" => self.draft_loading = None,
+                    "btw" => {
+                        if let Some(btw) = self.btw.as_mut() {
+                            btw.error = Some(message.clone());
+                            btw.done = true;
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -969,13 +1605,18 @@ impl App {
         }
         self.focused = self.focused.min(self.views.len().saturating_sub(1));
         self.reload_pending(&session_id);
+        self.reload_input(&session_id);
         self.selected = self.find_session(&session_id).unwrap_or(self.selected);
         self.error = None;
         self.status = "attached".into();
     }
 
     fn submitted(&mut self, submitted: SubmitResult) {
+        self.inflight_images.clear();
         self.submitting = false;
+        self.submitting_session = None;
+        self.queued_inflight = None;
+        self.reset_history();
         if let Some(prompt) = self.pending_prompt.take() {
             if self.input.text() == prompt {
                 self.input.clear();
@@ -988,10 +1629,8 @@ impl App {
             .find(|view| view.session.id == submitted.session.id)
         {
             view.session = submitted.session;
-            view.stream = Some(StreamState {
-                turn_id: submitted.turn_id,
-                text: String::new(),
-            });
+            view.stream = Some(StreamState::new(submitted.turn_id));
+            view.folds.remove(&FoldId::Live);
             view.follow = true;
         }
         self.error = None;
@@ -1063,6 +1702,10 @@ impl App {
                             | EventKind::PatchRejected
                             | EventKind::PatchConflict
                     );
+                    let relevant_input = matches!(
+                        event.kind,
+                        EventKind::InputRequired | EventKind::InputAnswered
+                    );
                     let Some(view) = self.views.iter_mut().find(|view| view.session.id == id)
                     else {
                         return;
@@ -1092,9 +1735,13 @@ impl App {
                     if relevant {
                         self.reload_pending(&id);
                     }
+                    if relevant_input {
+                        self.reload_input(&id);
+                    }
                 }
             }
-            "message.delta" => {
+            "message.delta" | "reasoning.delta" => {
+                let reasoning = notification.method == "reasoning.delta";
                 if let Ok(delta) = serde_json::from_value::<DeltaParams>(notification.params) {
                     let Some(view) = self
                         .views
@@ -1105,16 +1752,24 @@ impl App {
                     };
                     match &mut view.stream {
                         Some(stream) if stream.turn_id == delta.turn_id => {
-                            stream.text.push_str(&delta.delta)
+                            let target = if reasoning {
+                                &mut stream.reasoning
+                            } else {
+                                &mut stream.text
+                            };
+                            target.push_str(&delta.delta);
                         }
                         Some(_) => {
                             // Deltas from a superseded turn; ignore them.
                         }
                         None => {
-                            view.stream = Some(StreamState {
-                                turn_id: delta.turn_id,
-                                text: delta.delta,
-                            })
+                            let mut stream = StreamState::new(delta.turn_id);
+                            if reasoning {
+                                stream.reasoning.push_str(&delta.delta);
+                            } else {
+                                stream.text.push_str(&delta.delta);
+                            }
+                            view.stream = Some(stream);
                         }
                     }
                 }
@@ -1127,6 +1782,15 @@ impl App {
                         .find(|view| view.session.id == params.session_id)
                     {
                         view.follow = true;
+                    }
+                    if self
+                        .views
+                        .get(self.focused)
+                        .is_some_and(|view| view.session.id == params.session_id)
+                    {
+                        // The turn is blocked on the card; let j/k/Enter drive
+                        // it without first leaving the prompt.
+                        self.focus = Focus::Transcript;
                     }
                     self.status = format!("approval needed: {}", params.summary);
                     self.approvals.insert(
@@ -1145,6 +1809,36 @@ impl App {
                                 .map(str::to_string),
                             diff: params.diff,
                             hunks: params.hunks,
+                            cursor: 0,
+                        },
+                    );
+                }
+            }
+            "input.required" => {
+                if let Ok(params) = serde_json::from_value::<InputParams>(notification.params) {
+                    if let Some(view) = self
+                        .views
+                        .iter_mut()
+                        .find(|view| view.session.id == params.session_id)
+                    {
+                        view.follow = true;
+                    }
+                    if self
+                        .views
+                        .get(self.focused)
+                        .is_some_and(|view| view.session.id == params.session_id)
+                    {
+                        self.focus = Focus::Transcript;
+                    }
+                    self.status = format!("question: {}", truncate(&params.question, 60));
+                    self.inputs.insert(
+                        params.session_id,
+                        PendingInput {
+                            input_id: params.input_id,
+                            call_id: params.call_id,
+                            question: params.question,
+                            options: params.options,
+                            cursor: 0,
                         },
                     );
                 }
@@ -1163,6 +1857,16 @@ impl App {
                     self.status = format!("patch staged: {}", params.path);
                     self.reload_pending(&params.session_id);
                 }
+            }
+            "config.reloaded" => {
+                self.status = "config reloaded".into();
+            }
+            "config.error" => {
+                let error = notification.params["error"]
+                    .as_str()
+                    .unwrap_or("invalid config");
+                self.error = Some(format!("config: {error}"));
+                self.status = "config error".into();
             }
             "patch.applied" | "patch.rejected" | "patch.conflict" => {
                 if let Ok(params) =
@@ -1192,6 +1896,11 @@ impl App {
                         self.reload_pending(&params.session_id);
                         self.close_diff_view_for(&params.session_id);
                     }
+                    if self.inputs.get(&params.session_id).is_some_and(|pending| {
+                        params.call_id.is_empty() || pending.call_id == params.call_id
+                    }) {
+                        self.inputs.remove(&params.session_id);
+                    }
                 }
             }
             "turn.completed" => {
@@ -1206,6 +1915,8 @@ impl App {
                         self.reload_pending(&done.session_id);
                         self.close_diff_view_for(&done.session_id);
                     }
+                    // A question cannot outlive its turn.
+                    self.inputs.remove(&done.session_id);
                     let Some(view) = self
                         .views
                         .iter_mut()
@@ -1228,7 +1939,7 @@ impl App {
                     } else if done.cancelled {
                         self.status = "cancelled".into();
                     } else {
-                        self.status = "idle".into();
+                        self.status = turn_summary(&done);
                         self.clear_pending_draft(&done.session_id);
                     }
                 }
@@ -1307,6 +2018,40 @@ impl App {
                     }
                 }
             }
+            "btw.delta" => {
+                if let Ok(params) = serde_json::from_value::<BtwDeltaParams>(notification.params) {
+                    if let Some(btw) = self.btw.as_mut() {
+                        if btw.session_id == params.session_id
+                            && (btw.btw_id.is_empty() || btw.btw_id == params.btw_id)
+                        {
+                            btw.text.push_str(&params.delta);
+                        }
+                    }
+                }
+            }
+            "btw.completed" => {
+                if let Ok(params) =
+                    serde_json::from_value::<BtwCompletedParams>(notification.params)
+                {
+                    if let Some(btw) = self.btw.as_mut() {
+                        if btw.session_id == params.session_id
+                            && (btw.btw_id.is_empty() || btw.btw_id == params.btw_id)
+                        {
+                            if !params.text.is_empty() {
+                                btw.text = params.text;
+                            }
+                            btw.done = true;
+                            self.status = match params.error.as_deref() {
+                                Some(error) => {
+                                    btw.error = Some(error.to_string());
+                                    "side question failed".into()
+                                }
+                                None => "side question answered · Esc to close".into(),
+                            };
+                        }
+                    }
+                }
+            }
             "stream.lagged" => {
                 if let Some(skipped) = notification.params.get("skipped") {
                     self.status = format!("dropped {skipped} notifications");
@@ -1332,12 +2077,122 @@ impl App {
                 let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
                 self.handle_input_key(esc, tx);
             } else {
+                self.sync_draft(tx);
                 self.should_quit = true;
             }
             return;
         }
         if matches!(key.code, KeyCode::F(1)) {
             self.help = true;
+            return;
+        }
+
+        // The `/btw` answer floats above the prompt and owns the keyboard until
+        // it is dismissed.
+        if self.btw.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => {
+                    let session_id = self.btw.as_ref().map(|btw| btw.session_id.clone());
+                    self.btw = None;
+                    if let Some(session_id) = session_id {
+                        let _ = tx.send(Command::BtwCancel { session_id });
+                    }
+                    self.status = "side question closed".into();
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_add(1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_add(8);
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_sub(8);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        if self.timeline.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => self.timeline = None,
+                KeyCode::Char('j') | KeyCode::Down => self.timeline_scroll += 1,
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.timeline_scroll = self.timeline_scroll.saturating_sub(1)
+                }
+                KeyCode::PageDown => self.timeline_scroll += 10,
+                KeyCode::PageUp => self.timeline_scroll = self.timeline_scroll.saturating_sub(10),
+                _ => {}
+            }
+            if let Some(items) = &self.timeline {
+                self.timeline_scroll = self.timeline_scroll.min(items.len().saturating_sub(1));
+            }
+            return;
+        }
+
+        if self.diagnostics_view.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.diagnostics_view = None;
+                    self.status = "diagnostics closed".into();
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if let Some(view) = &mut self.diagnostics_view {
+                        view.scroll = view.scroll.saturating_add(1);
+                        let len = view.result.diagnostics.len();
+                        view.scroll = view.scroll.min(len.saturating_sub(1));
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    if let Some(view) = &mut self.diagnostics_view {
+                        view.scroll = view.scroll.saturating_sub(1);
+                    }
+                }
+                KeyCode::PageDown => {
+                    if let Some(view) = &mut self.diagnostics_view {
+                        view.scroll = view.scroll.saturating_add(10);
+                        let len = view.result.diagnostics.len();
+                        view.scroll = view.scroll.min(len.saturating_sub(1));
+                    }
+                }
+                KeyCode::PageUp => {
+                    if let Some(view) = &mut self.diagnostics_view {
+                        view.scroll = view.scroll.saturating_sub(10);
+                    }
+                }
+                KeyCode::Char('g') => {
+                    if let Some(view) = &mut self.diagnostics_view {
+                        view.scroll = 0;
+                    }
+                }
+                KeyCode::Char('G') => {
+                    if let Some(view) = &mut self.diagnostics_view {
+                        view.scroll = view.result.diagnostics.len().saturating_sub(1);
+                    }
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1424,15 +2279,65 @@ impl App {
             return;
         }
 
-        // A single Esc returns to normal mode and keeps the prompt focused; a
-        // second Esc within the window hands the keyboard back to the
-        // transcript. Normal-mode Esc is otherwise a no-op, but still arms the
-        // gesture so `Esc Esc` always works.
+        // While typing a bare `/command`, the suggestion menu owns vertical
+        // navigation, Enter and Tab. Other keys fall through to the editor so
+        // the prefix keeps filtering the list.
+        if self.command_menu_open() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('n') | KeyCode::Char('j') => {
+                        self.move_command_cursor(1);
+                        return;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('k') => {
+                        self.move_command_cursor(-1);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            match key.code {
+                KeyCode::Down => {
+                    self.move_command_cursor(1);
+                    return;
+                }
+                KeyCode::Up => {
+                    self.move_command_cursor(-1);
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.complete_command();
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Some(spec) = self.selected_command() {
+                        let line = format!(
+                            "/{}{}",
+                            spec.name,
+                            if spec.args.is_empty() { "" } else { " " }
+                        );
+                        self.input.set_text(&line);
+                        self.input.enter_normal();
+                        self.submit(tx);
+                        return;
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        // A single Esc returns to normal mode and keeps the prompt focused.
+        // In normal mode, two Esc presses within the window interrupt a
+        // running turn; when nothing is running they hand the keyboard back to
+        // the transcript.
         if matches!(key.code, KeyCode::Esc) {
             let editing = self.input.mode() != Mode::Normal;
             let _ = self.input.handle_key(key);
             if editing {
-                self.esc_at = Some(Instant::now());
+                // Do not arm the double-Esc timer: after leaving insert the
+                // user must still tap Esc twice to interrupt.
+                self.esc_at = None;
+                self.command_dismissed = true;
                 return;
             }
             let now = Instant::now();
@@ -1441,21 +2346,147 @@ impl App {
                 .is_some_and(|last| now.duration_since(last) < ESC_WINDOW);
             if double {
                 self.esc_at = None;
-                self.focus = Focus::Transcript;
+                if self.focused_session_busy() {
+                    self.cancel(tx);
+                } else {
+                    self.focus = Focus::Transcript;
+                }
             } else {
                 self.esc_at = Some(now);
             }
+            self.command_dismissed = true;
             return;
         }
 
         self.esc_at = None;
+        self.command_dismissed = false;
         match self.input.handle_key(key) {
             Outcome::Submit => self.submit(tx),
             Outcome::FilePicker => self.open_picker(PickerKind::Files, tx),
-            Outcome::Scroll(delta) => self.scroll_focused(delta),
+            Outcome::History(delta) => self.navigate_history(delta),
             Outcome::Action(id) if self.overlay_closed() => self.run_action(id, tx),
             Outcome::Ignored | Outcome::Action(_) => {}
         }
+    }
+
+    /// True when the prompt is a partial `/command` and the suggestion list
+    /// should be visible.
+    fn command_menu_open(&self) -> bool {
+        if self.command_dismissed || self.input.mode() != Mode::Insert {
+            return false;
+        }
+        let text = self.input.text();
+        let Some(rest) = text.strip_prefix('/') else {
+            return false;
+        };
+        !rest.contains(char::is_whitespace) && !rest.contains('\n')
+    }
+
+    fn command_matches(&self) -> Vec<&CommandSpec> {
+        let text = self.input.text();
+        let Some(prefix) = text.strip_prefix('/') else {
+            return Vec::new();
+        };
+        let prefix = prefix.to_ascii_lowercase();
+        self.commands
+            .iter()
+            .filter(|spec| spec.name.starts_with(&prefix))
+            .collect()
+    }
+
+    fn selected_command(&self) -> Option<&CommandSpec> {
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        matches
+            .get(self.command_cursor.min(matches.len() - 1))
+            .copied()
+    }
+
+    fn move_command_cursor(&mut self, delta: isize) {
+        let len = self.command_matches().len();
+        if len == 0 {
+            self.command_cursor = 0;
+            return;
+        }
+        let current = self.command_cursor.min(len - 1) as isize;
+        self.command_cursor = (current + delta).rem_euclid(len as isize) as usize;
+    }
+
+    fn complete_command(&mut self) {
+        let Some(spec) = self.selected_command() else {
+            return;
+        };
+        let text = if spec.args.is_empty() {
+            format!("/{}", spec.name)
+        } else {
+            format!("/{} ", spec.name)
+        };
+        self.input.set_text(&text);
+        self.command_cursor = 0;
+    }
+
+    /// Apply a `delta` step to prompt-history browsing. Negative is older.
+    fn navigate_history(&mut self, delta: isize) {
+        let entries = self.history_entries();
+        if entries.is_empty() {
+            self.status = "no earlier prompts in this session".into();
+            return;
+        }
+        let next = match (self.history_index, delta < 0) {
+            (None, true) => {
+                self.history_draft = self.input.text();
+                Some(0)
+            }
+            (None, false) => return,
+            (Some(0), false) => None,
+            (Some(index), true) => Some((index + 1).min(entries.len() - 1)),
+            (Some(index), false) => Some(index.saturating_sub(1)),
+        };
+        // The focused session may have changed while an older cursor was live.
+        let next = next.map(|index| index.min(entries.len() - 1));
+        self.history_index = next;
+        let text = match next {
+            Some(index) => entries[entries.len() - 1 - index].clone(),
+            None => std::mem::take(&mut self.history_draft),
+        };
+        self.input.set_text(&text);
+        self.input.enter_normal();
+        let position = match next {
+            Some(index) => format!("history {}/{}", index + 1, entries.len()),
+            None => "draft".to_string(),
+        };
+        self.status = position;
+    }
+
+    /// Submitted prompts for the focused session, oldest first.
+    fn history_entries(&self) -> Vec<String> {
+        let Some(view) = self.focused_view() else {
+            return Vec::new();
+        };
+        view.events
+            .iter()
+            .filter(|event| event.kind == EventKind::UserMessage)
+            .filter_map(|event| {
+                serde_json::from_value::<UserMessagePayload>(event.payload.clone())
+                    .ok()
+                    .map(|payload| payload.text)
+            })
+            .collect()
+    }
+
+    fn reset_history(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// True while the focused turn can still be interrupted.
+    fn focused_session_busy(&self) -> bool {
+        self.submitting_session.is_some()
+            || self
+                .focused_view()
+                .is_some_and(|view| view.session.status.is_busy())
     }
 
     fn focus_input(&mut self) {
@@ -1474,6 +2505,12 @@ impl App {
             self.handle_window_key(key, tx);
             return;
         }
+        if self.focused_approval().is_none() && self.focused_input().is_none() {
+            if let Some(action) = self.keybinds.action(key) {
+                self.run_key_action(action, tx);
+                return;
+            }
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
             self.open_picker(PickerKind::Sessions, tx);
             return;
@@ -1483,12 +2520,88 @@ impl App {
             self.status = "window: h/j/k/l focus · v split · c close · w cycle · Esc cancel".into();
             return;
         }
-        // While the focused session is blocked on a tool call, y/n answer the
-        // approval card instead of their usual bindings.
-        if self.focused_approval().is_some() {
+        // While the focused session is blocked on an `ask_user` question, the
+        // card owns j/k, Ctrl-N/Ctrl-P and Enter.
+        if self.focused_input().is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('n') | KeyCode::Char('j') => {
+                        self.move_input_cursor(1);
+                        return;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('k') => {
+                        self.move_input_cursor(-1);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.move_input_cursor(1);
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.move_input_cursor(-1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    if let Some(cursor) = self.focused_input().map(|pending| pending.cursor) {
+                        self.respond_input(cursor, tx);
+                    }
+                    return;
+                }
+                KeyCode::Char(ch @ '1'..='9') => {
+                    self.respond_input(ch as usize - '1' as usize, tx);
+                    return;
+                }
+                KeyCode::Char('x') => {
+                    self.cancel(tx);
+                    return;
+                }
+                KeyCode::Esc => return,
+                _ => {}
+            }
+        }
+        // While the focused session is blocked on a tool call, the card owns
+        // j/k, Ctrl-N/Ctrl-P and Enter. y/n/d/e/o/r stay as direct shortcuts.
+        if self.focused_approval().is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('n') | KeyCode::Char('j') => {
+                        self.move_approval_cursor(1);
+                        return;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('k') => {
+                        self.move_approval_cursor(-1);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.move_approval_cursor(1);
+                    return;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.move_approval_cursor(-1);
+                    return;
+                }
+                KeyCode::Enter => {
+                    self.activate_approval(None, tx);
+                    return;
+                }
+                KeyCode::Char(ch @ '1'..='9') => {
+                    self.activate_approval(Some(ch as usize - '1' as usize), tx);
+                    return;
+                }
                 KeyCode::Char('y') => {
                     self.respond_approval(ApprovalDecision::Approve, tx);
+                    return;
+                }
+                KeyCode::Char('a') => {
+                    self.respond_approval(ApprovalDecision::Always, tx);
                     return;
                 }
                 KeyCode::Char('n') => {
@@ -1515,7 +2628,10 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('q') => {
+                self.sync_draft(tx);
+                self.should_quit = true;
+            }
             KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
             KeyCode::Char('n') => self.create_session(tx, false),
             KeyCode::Char('N') => self.create_session(tx, true),
@@ -1564,6 +2680,61 @@ impl App {
         }
     }
 
+    fn run_key_action(&mut self, action: KeyAction, tx: &UnboundedSender<Command>) {
+        match action {
+            KeyAction::Quit => {
+                self.sync_draft(tx);
+                self.should_quit = true;
+            }
+            KeyAction::Help => self.help = true,
+            KeyAction::NewSession => self.create_session(tx, false),
+            KeyAction::NewWorktree => self.create_session(tx, true),
+            KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
+            KeyAction::NewPane => self.open_picker(PickerKind::NewPane, tx),
+            KeyAction::Palette => self.open_picker(PickerKind::Commands, tx),
+            KeyAction::Worktrees => self.open_picker(PickerKind::Worktrees, tx),
+            KeyAction::Branches => self.open_picker(PickerKind::Branches, tx),
+            KeyAction::Ledger => self.open_ledger(tx),
+            KeyAction::Processes => self.open_processes(tx),
+            KeyAction::Inbox => self.open_inbox(),
+            KeyAction::Search => {
+                self.search_view = Some(SearchView::new());
+                self.status =
+                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
+            }
+            KeyAction::Fork => self.fork_focused(tx, None),
+            KeyAction::Attention => self.focus_next_attention(),
+            KeyAction::Cancel => self.cancel(tx),
+            KeyAction::NextSession => self.cycle_session(1, tx),
+            KeyAction::PrevSession => self.cycle_session(-1, tx),
+            KeyAction::ScrollDown => self.scroll_focused(1),
+            KeyAction::ScrollUp => self.scroll_focused(-1),
+            KeyAction::Timeline => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::TimelineData {
+                        session_id,
+                        limit: None,
+                    });
+                    self.status = "timeline: loading…".into();
+                }
+            }
+            KeyAction::Todos => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::ListTodos { session_id });
+                    self.status = "todos: loading…".into();
+                }
+            }
+            KeyAction::Diagnostics => self.open_diagnostics(tx),
+            KeyAction::Undo | KeyAction::Redo => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let redo = action == KeyAction::Redo;
+                    let _ = tx.send(Command::Undo { session_id, redo });
+                    self.status = if redo { "redoing…" } else { "undoing…" }.into();
+                }
+            }
+        }
+    }
+
     fn open_ledger(&mut self, tx: &UnboundedSender<Command>) {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             self.status = "no session to inspect".into();
@@ -1577,12 +2748,25 @@ impl App {
         let _ = tx.send(Command::ContextLedger { session_id });
     }
 
+    fn open_diagnostics(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session to inspect".into();
+            return;
+        };
+        let _ = tx.send(Command::Diagnostics {
+            session_id,
+            max_files: None,
+        });
+        self.status = "diagnostics: loading…".into();
+    }
+
     fn handle_ledger_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
         if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
             self.ledger = None;
             self.status = "context ledger closed".into();
             return;
         }
+        let key = next_prev_key(key);
         let Some(ledger) = &mut self.ledger else {
             return;
         };
@@ -1763,6 +2947,7 @@ impl App {
     }
 
     fn handle_inbox_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        let key = next_prev_key(key);
         let Some(inbox) = self.inbox.as_ref() else {
             return;
         };
@@ -1829,6 +3014,7 @@ impl App {
             self.status = "processes closed".into();
             return;
         }
+        let key = next_prev_key(key);
         let Some(view) = &mut self.process_view else {
             return;
         };
@@ -1928,6 +3114,14 @@ impl App {
                     view.move_cursor(-1);
                     None
                 }
+                KeyCode::Char('n') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    view.move_cursor(1);
+                    None
+                }
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    view.move_cursor(-1);
+                    None
+                }
                 KeyCode::Backspace => {
                     view.query.pop();
                     view.cursor = 0;
@@ -1998,14 +3192,15 @@ impl App {
         let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
             return;
         };
-        // Ctrl-J / Ctrl-K are the vim-friendly next/previous bindings.
+        // Ctrl-J / Ctrl-K / Ctrl-N / Ctrl-P are the vim-friendly next/previous
+        // bindings; j/k still type into the query.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('j') => {
+                KeyCode::Char('j') | KeyCode::Char('n') => {
                     self.move_picker(1);
                     return;
                 }
-                KeyCode::Char('k') => {
+                KeyCode::Char('k') | KeyCode::Char('p') => {
                     self.move_picker(-1);
                     return;
                 }
@@ -2133,6 +3328,40 @@ impl App {
                     self.run_action(&value, tx);
                 }
             }
+            PickerKind::Models => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    if let Some(session_id) = self.focused_session_id() {
+                        let model = (value != "@default").then_some(value);
+                        let _ = tx.send(Command::SetModel { session_id, model });
+                        self.status = "switching model…".into();
+                    }
+                }
+            }
+            PickerKind::Agents => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    if let Some(session_id) = self.focused_session_id() {
+                        let agent = (value != "@default").then_some(value);
+                        let _ = tx.send(Command::SetAgent { session_id, agent });
+                        self.status = "switching agent…".into();
+                    }
+                }
+            }
+            PickerKind::Skills => {
+                if let Some(value) = value {
+                    let cwd = self
+                        .focused_view()
+                        .map(|view| view.session.cwd.clone())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                    if let Some(skill) = eix_core::find_skill(&cwd, &value) {
+                        self.picker = None;
+                        self.input.set_text(&skill.body);
+                        self.focus = Focus::Input;
+                        self.status = format!("inserted skill {}", skill.name);
+                    }
+                }
+            }
         }
     }
 
@@ -2166,6 +3395,25 @@ impl App {
             });
         } else if kind == PickerKind::Commands {
             picker.items = command_items();
+        } else if kind == PickerKind::Models {
+            picker.loading = true;
+            self.status = "models: loading…".into();
+            let _ = tx.send(Command::ListModels);
+        } else if kind == PickerKind::Agents {
+            let Some(session_id) = self.focused_session_id() else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            picker.loading = true;
+            self.status = "agents: loading…".into();
+            let _ = tx.send(Command::ListAgents { session_id });
+        } else if kind == PickerKind::Skills {
+            let cwd = self
+                .focused_view()
+                .map(|view| view.session.cwd.clone())
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+            picker.items = skill_picker_items(&eix_core::load_skills(&cwd));
+            self.status = format!("{} skill(s)", picker.items.len());
         } else {
             picker.selected = self.selected.min(self.sessions.len().saturating_sub(1));
         }
@@ -2181,6 +3429,10 @@ impl App {
             "files" => self.open_picker(PickerKind::Files, tx),
             "worktrees" => self.open_picker(PickerKind::Worktrees, tx),
             "branches" => self.open_picker(PickerKind::Branches, tx),
+            "models" => self.open_picker(PickerKind::Models, tx),
+            "agents" => self.open_picker(PickerKind::Agents, tx),
+            "skills" => self.open_picker(PickerKind::Skills, tx),
+            "diagnostics" | "lsp" => self.open_diagnostics(tx),
             "context" => self.open_picker(PickerKind::Context, tx),
             "history" => {
                 self.search_view = Some(SearchView::new());
@@ -2196,7 +3448,10 @@ impl App {
             "cancel" => self.cancel(tx),
             "close-pane" => self.close_focused_pane(),
             "help" => self.help = true,
-            "quit" => self.should_quit = true,
+            "quit" => {
+                self.sync_draft(tx);
+                self.should_quit = true;
+            }
             _ => {}
         }
     }
@@ -2224,6 +3479,18 @@ impl App {
     }
 
     fn create_session(&mut self, tx: &UnboundedSender<Command>, worktree: bool) {
+        self.create_session_in(tx, worktree, None, None);
+    }
+
+    /// Create a session and open it in a new pane. `cwd`/`name` default to the
+    /// TUI's launch directory / a generated name.
+    fn create_session_in(
+        &mut self,
+        tx: &UnboundedSender<Command>,
+        worktree: bool,
+        cwd: Option<std::path::PathBuf>,
+        name: Option<String>,
+    ) {
         if self.creating {
             return;
         }
@@ -2234,45 +3501,707 @@ impl App {
         } else {
             "creating session…".into()
         };
-        let _ = tx.send(Command::Create { worktree });
+        let _ = tx.send(Command::Create {
+            worktree,
+            cwd,
+            name,
+            model: self.default_model.clone(),
+            agent: self.default_agent.clone(),
+            permission: self.default_permission.clone(),
+        });
     }
 
     fn submit(&mut self, tx: &UnboundedSender<Command>) {
         let text = self.input.text();
-        if text.trim().is_empty() {
+        if text.trim_start().starts_with('/') && self.handle_prompt_command(&text, tx) {
             return;
         }
-        if let Err(message) = self.begin_submit(&text, tx) {
-            self.status = message;
+        if text.trim().is_empty() && self.pending_images.is_empty() {
+            return;
+        }
+        let images = std::mem::take(&mut self.pending_images);
+        if !images.is_empty()
+            && self
+                .focused_session_id()
+                .is_some_and(|id| self.session_busy(&id))
+        {
+            self.pending_images = images;
+            self.status = "wait for the running turn before sending images".into();
+            return;
+        }
+        let Some(session_id) = self.focused_session_id() else {
+            self.pending_images = images;
+            self.status = "no session yet".into();
+            return;
+        };
+        if let Some(command) = text.trim_start().strip_prefix('!') {
+            self.pending_images = images;
+            let command = command.trim();
+            if command.is_empty() {
+                self.status = "usage: !<shell command>".into();
+                return;
+            }
+            self.input.clear();
+            self.input.enter_insert();
+            self.last_saved_draft.clear();
+            self.reset_history();
+            self.error = None;
+            let _ = tx.send(Command::RunShell {
+                session_id: session_id.clone(),
+                command: command.to_string(),
+            });
+            let _ = tx.send(Command::DraftSet {
+                session_id,
+                text: String::new(),
+            });
+            self.status = "running shell command…".into();
+            return;
+        }
+        // A turn is already running (or its submit is in flight): queue the new
+        // prompt instead of refusing it. `tick` drains the queue when idle.
+        if self.session_busy(&session_id) {
+            if !images.is_empty() {
+                self.pending_images = images;
+                self.status = "wait for the running turn before sending images".into();
+                return;
+            }
+            self.enqueue(session_id, &text, tx);
+            return;
+        }
+        self.reset_history();
+        self.send_prompt(&session_id, &text, tx, true, images);
+    }
+
+    /// Send a prompt to a specific session. `from_prompt` means it came from
+    /// the focused prompt (restore the draft if it fails); queued prompts are
+    /// put back at the head of their queue instead.
+    fn send_prompt(
+        &mut self,
+        session_id: &str,
+        text: &str,
+        tx: &UnboundedSender<Command>,
+        from_prompt: bool,
+        images: Vec<String>,
+    ) {
+        self.submitting = true;
+        self.submitting_session = Some(session_id.to_string());
+        self.error = None;
+        if from_prompt {
+            self.pending_prompt = Some(text.to_string());
+            self.pending_draft = Some((session_id.to_string(), text.to_string()));
+            self.inflight_images = images.clone();
+            self.status = "sending…".into();
+        } else {
+            self.queued_inflight = Some((session_id.to_string(), text.to_string()));
+            self.status = "sending queued prompt…".into();
+        }
+        let _ = tx.send(Command::Submit {
+            session_id: session_id.to_string(),
+            text: text.to_string(),
+            images,
+        });
+    }
+
+    /// Park a prompt until its session goes idle. The prompt box is cleared so
+    /// the user can keep typing the next one.
+    fn enqueue(&mut self, session_id: String, text: &str, tx: &UnboundedSender<Command>) {
+        let queue = self.queues.entry(session_id.clone()).or_default();
+        queue.push_back(text.to_string());
+        let pending = queue.len();
+        let insert = self.input.mode() == Mode::Insert;
+        self.input.clear();
+        if insert {
+            self.input.enter_insert();
+        }
+        self.last_saved_draft.clear();
+        self.reset_history();
+        self.error = None;
+        let _ = tx.send(Command::DraftSet {
+            session_id,
+            text: String::new(),
+        });
+        self.status = format!("queued · {pending} prompt(s) waiting");
+    }
+
+    /// Drain at most one queued prompt for an idle session. Called on every
+    /// tick, which also retries after a transient `busy` race.
+    fn flush_queues(&mut self, tx: &UnboundedSender<Command>) {
+        if self.submitting {
+            return;
+        }
+        let Some(session_id) = self
+            .queues
+            .iter()
+            .find(|(id, queue)| !queue.is_empty() && !self.session_busy(id))
+            .map(|(id, _)| id.clone())
+        else {
+            return;
+        };
+        let Some(text) = self
+            .queues
+            .get_mut(&session_id)
+            .and_then(VecDeque::pop_front)
+        else {
+            return;
+        };
+        self.send_prompt(&session_id, &text, tx, false, Vec::new());
+    }
+
+    fn queue_len(&self, session_id: &str) -> usize {
+        self.queues.get(session_id).map(VecDeque::len).unwrap_or(0)
+    }
+
+    fn session_busy(&self, session_id: &str) -> bool {
+        self.submitting_session.as_deref() == Some(session_id)
+            || self
+                .views
+                .iter()
+                .find(|view| view.session.id == session_id)
+                .is_some_and(|view| view.session.status.is_busy())
+    }
+
+    fn focused_session_id(&self) -> Option<String> {
+        self.focused_view().map(|view| view.session.id.clone())
+    }
+
+    /// Prompt commands are typed as the whole message (`/name args`). They never
+    /// reach the model.
+    fn handle_prompt_command(&mut self, text: &str, tx: &UnboundedSender<Command>) -> bool {
+        let trimmed = text.trim();
+        let (name, args) = match trimmed.split_once(char::is_whitespace) {
+            Some((name, args)) => (name, args.trim()),
+            None => (trimmed, ""),
+        };
+        let name = name.trim_start_matches('/');
+        if name.is_empty() {
+            return false;
+        }
+        let Some(spec) = self.commands.iter().find(|spec| spec.name == name).cloned() else {
+            self.error = Some(format!("unknown command /{name} · /help lists them"));
+            return true;
+        };
+        // Commands are not drafts: drop the typed line (and its saved draft)
+        // before dispatching. `/init` installs its own prompt afterwards.
+        self.input.clear();
+        self.last_saved_draft.clear();
+        self.reset_history();
+        // `/exit` and `/quit` save the (now empty) draft themselves.
+        if !matches!(name, "exit" | "quit") {
+            if let Some(session_id) = self.focused_session_id() {
+                let _ = tx.send(Command::DraftSet {
+                    session_id,
+                    text: String::new(),
+                });
+            }
+        }
+        match name {
+            "exit" | "quit" => {
+                self.exit_session(tx);
+                true
+            }
+            "help" => {
+                self.help = true;
+                true
+            }
+            "new" => {
+                let cwd = self.focused_view().map(|view| view.session.cwd.clone());
+                let name = (!args.is_empty()).then(|| args.to_string());
+                self.create_session_in(tx, false, cwd, name);
+                true
+            }
+            "cd" => {
+                self.command_cd(args, tx);
+                true
+            }
+            "clear" => {
+                self.command_clear(tx);
+                true
+            }
+            "compact" => {
+                self.command_compact(args, tx);
+                true
+            }
+            "btw" => {
+                self.command_btw(args, tx);
+                true
+            }
+            "init" => {
+                self.command_init();
+                true
+            }
+            "queue" => {
+                self.command_queue(args);
+                true
+            }
+            "sessions" => {
+                self.open_picker(PickerKind::Sessions, tx);
+                true
+            }
+            "models" => {
+                if args.is_empty() {
+                    self.open_picker(PickerKind::Models, tx);
+                } else if let Some(session_id) = self.focused_session_id() {
+                    let model = (args != "default").then(|| args.to_string());
+                    let _ = tx.send(Command::SetModel { session_id, model });
+                    self.status = format!("switching model to {args}…");
+                }
+                true
+            }
+            "agents" => {
+                if args.is_empty() {
+                    self.open_picker(PickerKind::Agents, tx);
+                } else if let Some(session_id) = self.focused_session_id() {
+                    let agent = (args != "default").then(|| args.to_string());
+                    let _ = tx.send(Command::SetAgent { session_id, agent });
+                    self.status = format!("switching agent to {args}…");
+                }
+                true
+            }
+            "mcp" => {
+                let _ = tx.send(Command::ListMcp);
+                self.status = "mcp: loading…".into();
+                true
+            }
+            "reload" => {
+                let _ = tx.send(Command::ReloadConfig);
+                self.status = "reloading config…".into();
+                true
+            }
+            "timeline" => {
+                let limit = if args.is_empty() {
+                    None
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(limit) => Some(limit),
+                        Err(_) => {
+                            self.error = Some("usage: /timeline [count]".into());
+                            return true;
+                        }
+                    }
+                };
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::TimelineData { session_id, limit });
+                    self.status = "timeline: loading…".into();
+                }
+                true
+            }
+            "export" => {
+                let Some(session_id) = self.focused_session_id() else {
+                    self.status = "no session yet".into();
+                    return true;
+                };
+                let path = if args.is_empty() {
+                    let cwd = self
+                        .focused_view()
+                        .map(|view| view.session.cwd.clone())
+                        .unwrap_or_else(|| {
+                            std::env::current_dir()
+                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                        });
+                    Some(cwd.join(format!("eix-session-{}.json", &session_id[..8])))
+                } else {
+                    Some(std::path::PathBuf::from(args))
+                };
+                let _ = tx.send(Command::ExportSession { session_id, path });
+                self.status = "exporting…".into();
+                true
+            }
+            "archive" => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::ArchiveSession {
+                        session_id,
+                        archived: true,
+                    });
+                    self.status = "archiving…".into();
+                }
+                true
+            }
+            "delete" => {
+                let Some(session_id) = self.focused_session_id() else {
+                    self.status = "no session yet".into();
+                    return true;
+                };
+                if self.pending_delete.as_deref() == Some(session_id.as_str()) {
+                    self.pending_delete = None;
+                    let _ = tx.send(Command::DeleteSession { session_id });
+                    self.status = "deleting…".into();
+                } else {
+                    self.pending_delete = Some(session_id);
+                    self.status = "run /delete again to delete this session permanently".into();
+                }
+                true
+            }
+            "image" => {
+                if args == "clear" {
+                    self.pending_images.clear();
+                    self.status = "images cleared".into();
+                } else if args.is_empty() {
+                    self.status = if self.pending_images.is_empty() {
+                        "no images attached".into()
+                    } else {
+                        format!("attached: {}", self.pending_images.join(", "))
+                    };
+                } else {
+                    let cwd = self
+                        .focused_view()
+                        .map(|view| view.session.cwd.clone())
+                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+                    let paths = parse_image_paths(args, &cwd)
+                        .unwrap_or_else(|| args.split_whitespace().map(str::to_string).collect());
+                    for path in paths {
+                        if !self.pending_images.contains(&path) {
+                            self.pending_images.push(path);
+                        }
+                    }
+                    self.status = format!(
+                        "attached {} · {} image(s) for the next prompt",
+                        args,
+                        self.pending_images.len()
+                    );
+                }
+                true
+            }
+            "todos" => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::ListTodos { session_id });
+                    self.status = "todos: loading…".into();
+                }
+                true
+            }
+            "diagnostics" | "lsp" => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let max_files = args.parse::<usize>().ok();
+                    let _ = tx.send(Command::Diagnostics {
+                        session_id,
+                        max_files,
+                    });
+                    self.status = "diagnostics: loading…".into();
+                }
+                true
+            }
+            "skills" => {
+                let cwd = self
+                    .focused_view()
+                    .map(|view| view.session.cwd.clone())
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    });
+                if args.is_empty() {
+                    self.open_picker(PickerKind::Skills, tx);
+                } else {
+                    let (name, arguments) = args
+                        .split_once(char::is_whitespace)
+                        .map(|(name, rest)| (name, rest.trim()))
+                        .unwrap_or((args, ""));
+                    if let Some(skill) = eix_core::find_skill(&cwd, name) {
+                        self.input
+                            .set_text(&eix_core::expand_command(&skill.body, arguments));
+                        self.focus = Focus::Input;
+                        self.status = format!("inserted skill {}", skill.name);
+                    } else {
+                        self.error = Some(format!("unknown skill {name:?}"));
+                    }
+                }
+                true
+            }
+            "undo" | "redo" => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let redo = name == "redo";
+                    let _ = tx.send(Command::Undo { session_id, redo });
+                    self.status = if redo { "redoing…" } else { "undoing…" }.into();
+                }
+                true
+            }
+            "permission" => {
+                self.command_permission(args, tx);
+                true
+            }
+            "fork" => {
+                let name = (!args.is_empty()).then(|| args.to_string());
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::Fork {
+                        session_id,
+                        at_seq: None,
+                        name,
+                    });
+                    self.status = "forking…".into();
+                }
+                true
+            }
+            "commands" => {
+                let cwd = self
+                    .focused_view()
+                    .map(|view| view.session.cwd.clone())
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+                    });
+                self.commands = merge_commands(&cwd);
+                self.status = format!(
+                    "{} commands ({} user-defined)",
+                    self.commands.len(),
+                    self.commands
+                        .iter()
+                        .filter(|spec| spec.template.is_some())
+                        .count()
+                );
+                true
+            }
+            _ => {
+                if let Some(template) = spec.template {
+                    let expanded = eix_core::expand_command(&template, args);
+                    if expanded.trim().is_empty() {
+                        self.error = Some(format!("/{name} produced an empty prompt"));
+                        return true;
+                    }
+                    let Some(session_id) = self.focused_session_id() else {
+                        self.status = "no session yet".into();
+                        return true;
+                    };
+                    if let Some(model) = spec.model {
+                        let _ = tx.send(Command::SetModel {
+                            session_id: session_id.clone(),
+                            model: Some(model),
+                        });
+                    }
+                    if let Some(agent) = spec.agent {
+                        let _ = tx.send(Command::SetAgent {
+                            session_id: session_id.clone(),
+                            agent: Some(agent),
+                        });
+                    }
+                    if self.session_busy(&session_id) {
+                        self.enqueue(session_id, &expanded, tx);
+                    } else {
+                        self.send_prompt(&session_id, &expanded, tx, false, Vec::new());
+                    }
+                    true
+                } else {
+                    self.error = Some(format!("unknown command /{name} · /help lists them"));
+                    true
+                }
+            }
+        }
+    }
+    fn command_cd(&mut self, args: &str, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        if args.is_empty() {
+            let cwd = self
+                .focused_view()
+                .map(|view| view.session.cwd.display().to_string())
+                .unwrap_or_default();
+            self.status = format!("cwd: {cwd}");
+            return;
+        }
+        self.status = format!("changing directory to {args}…");
+        let _ = tx.send(Command::SetCwd {
+            session_id,
+            path: args.to_string(),
+        });
+    }
+
+    fn command_clear(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        if self.session_busy(&session_id) {
+            self.error = Some("cancel the running turn before /clear".into());
+            return;
+        }
+        self.status = "clearing context…".into();
+        let _ = tx.send(Command::ClearContext { session_id });
+    }
+
+    fn command_compact(&mut self, args: &str, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        if self.session_busy(&session_id) {
+            self.error = Some("cancel the running turn before /compact".into());
+            return;
+        }
+        let notes = (!args.is_empty()).then(|| args.to_string());
+        self.status = "summarizing the conversation…".into();
+        let _ = tx.send(Command::CompactContext { session_id, notes });
+    }
+
+    fn command_btw(&mut self, question: &str, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        if question.is_empty() {
+            self.status = "usage: /btw <question>".into();
+            return;
+        }
+        self.status = "asking a side question…".into();
+        self.btw = Some(BtwView {
+            session_id: session_id.clone(),
+            btw_id: String::new(),
+            question: question.to_string(),
+            text: String::new(),
+            error: None,
+            done: false,
+            scroll: 0,
+        });
+        let _ = tx.send(Command::Btw {
+            session_id,
+            question: question.to_string(),
+        });
+    }
+
+    /// `/init` stages a prompt that asks the model to write `AGENTS.md`. The
+    /// user reviews it in insert mode before sending.
+    fn command_init(&mut self) {
+        let prompt = "Explore this repository and create a concise AGENTS.md at its root. \
+Cover: the project's purpose, the workspace layout, the build/test/lint commands that \
+actually work here, code style conventions, and any non-obvious constraints future \
+contributors must respect. Read the existing docs and config first. If an AGENTS.md \
+already exists, update it in place rather than rewriting it from scratch.";
+        self.input.set_text(prompt);
+        self.focus = Focus::Input;
+        self.reset_history();
+        self.status = "review the /init prompt, then press Enter to run it".into();
+    }
+
+    fn command_queue(&mut self, args: &str) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        let mut parts = args.split_whitespace();
+        match parts.next() {
+            Some("clear") => {
+                let dropped = self
+                    .queues
+                    .remove(&session_id)
+                    .map_or(0, |queue| queue.len());
+                self.status = format!("cleared {dropped} queued prompt(s)");
+                return;
+            }
+            Some("rm" | "drop") => {
+                let index = match parts.next().and_then(|value| value.parse::<usize>().ok()) {
+                    Some(index) if index > 0 => index - 1,
+                    _ => {
+                        self.error = Some("usage: /queue rm <1-based index>".into());
+                        return;
+                    }
+                };
+                let removed = self
+                    .queues
+                    .get_mut(&session_id)
+                    .and_then(|queue| (index < queue.len()).then(|| queue.remove(index)).flatten());
+                self.status = match removed {
+                    Some(prompt) => format!("dropped queued prompt: {}", truncate(&prompt, 60)),
+                    None => "no queued prompt at that index".into(),
+                };
+                return;
+            }
+            Some("move") => {
+                let from = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let to = parts.next().and_then(|value| value.parse::<usize>().ok());
+                let (Some(from), Some(to)) = (from, to) else {
+                    self.error = Some("usage: /queue move <from> <to>".into());
+                    return;
+                };
+                if from == 0 || to == 0 {
+                    self.error = Some("queue indices are 1-based".into());
+                    return;
+                }
+                let moved = self.queues.get_mut(&session_id).and_then(|queue| {
+                    if from > queue.len() || to > queue.len() {
+                        return None;
+                    }
+                    let prompt = queue.remove(from - 1)?;
+                    queue.insert(to - 1, prompt);
+                    Some(())
+                });
+                self.status = if moved.is_some() {
+                    format!("moved queued prompt {from} → {to}")
+                } else {
+                    "queue index out of range".into()
+                };
+                return;
+            }
+            _ => {}
+        }
+        let Some(queue) = self.queues.get(&session_id) else {
+            self.status = "no queued prompts".into();
+            return;
+        };
+        if queue.is_empty() {
+            self.status = "no queued prompts".into();
+            return;
+        }
+        let preview: Vec<String> = queue
+            .iter()
+            .take(3)
+            .enumerate()
+            .map(|(index, prompt)| format!("{}: {}", index + 1, truncate(prompt, 40)))
+            .collect();
+        self.status = format!(
+            "{} queued · {} · /queue rm N or /queue move N M",
+            queue.len(),
+            preview.join(" · ")
+        );
+    }
+
+    fn command_permission(&mut self, args: &str, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        if args.is_empty() {
+            let level = self
+                .focused_view()
+                .map(|view| view.session.permission.as_str())
+                .unwrap_or("?");
+            self.status = format!("permission: {level}");
+            return;
+        }
+        match args.parse::<PermissionLevel>() {
+            Ok(permission) => {
+                self.status = format!("permission → {}", permission.as_str());
+                let _ = tx.send(Command::SetPermission {
+                    session_id,
+                    permission,
+                    temporary: false,
+                });
+            }
+            Err(()) => {
+                self.error = Some("usage: /permission read-only | workspace-write | full".into());
+            }
         }
     }
 
-    /// Ask the daemon to run `text` in the focused session. `Ok` means the
-    /// request was sent, so a caller may clear its own draft.
-    fn begin_submit(&mut self, text: &str, tx: &UnboundedSender<Command>) -> Result<(), String> {
-        if self.submitting {
-            return Err("submit already in flight".into());
-        }
-        if text.trim().is_empty() {
-            return Err("nothing to send".into());
-        }
+    /// Persist the prompt, detach the focused session and, when it was the last
+    /// open pane, quit the TUI. Session history is already durable in the
+    /// daemon; the only state to save here is the (cleared) draft.
+    fn exit_session(&mut self, tx: &UnboundedSender<Command>) {
         let Some(view) = self.focused_view() else {
-            return Err("no session yet".into());
+            self.should_quit = true;
+            return;
         };
-        if view.session.status.is_busy() {
-            self.error = Some("session is running; press x to cancel".into());
-            return Err("session is running".into());
-        }
         let session_id = view.session.id.clone();
-        self.submitting = true;
-        self.pending_prompt = Some(text.to_string());
-        self.error = None;
-        self.status = "submitting…".into();
-        let _ = tx.send(Command::Submit {
+        let name = view.session.name.clone();
+        // Do not persist the command line itself as the next draft.
+        self.input.clear();
+        self.last_saved_draft.clear();
+        let _ = tx.send(Command::DraftSet {
             session_id,
-            text: text.to_string(),
+            text: String::new(),
         });
-        Ok(())
+        if self.views.len() <= 1 {
+            self.status = format!("saved {name} · quitting");
+            self.should_quit = true;
+            return;
+        }
+        self.close_focused_pane();
+        self.status = format!("{name} saved · pane closed");
     }
 
     fn cancel(&mut self, tx: &UnboundedSender<Command>) {
@@ -2309,16 +4238,126 @@ impl App {
             self.close_diff_view_for(session_id);
             return;
         };
-        // Keep an in-progress hunk selection when the same card is reloaded.
-        if let Some(selected) = self
+        // Keep an in-progress hunk selection and cursor when the same card is
+        // reloaded.
+        if let Some((selected, cursor)) = self
             .approvals
             .get(session_id)
             .filter(|pending| pending.approval_id == next.approval_id)
-            .map(|pending| pending.selected.clone())
+            .map(|pending| (pending.selected.clone(), pending.cursor))
         {
             next.selected = selected;
+            next.cursor = cursor.min(next.actions().len().saturating_sub(1));
         }
         self.approvals.insert(session_id.to_string(), next);
+    }
+
+    /// Recompute the cached question for a session from its replayable log.
+    fn reload_input(&mut self, session_id: &str) {
+        let next = self
+            .views
+            .iter()
+            .find(|view| view.session.id == session_id)
+            .and_then(|view| {
+                view.pending_input()
+                    .filter(|_| view.session.status == SessionStatus::AwaitingInput)
+            });
+        let Some(mut next) = next else {
+            self.inputs.remove(session_id);
+            return;
+        };
+        // Keep the highlighted option when the same question is reloaded.
+        if let Some(cursor) = self
+            .inputs
+            .get(session_id)
+            .filter(|pending| pending.input_id == next.input_id)
+            .map(|pending| pending.cursor)
+        {
+            next.cursor = cursor.min(next.options.len().saturating_sub(1));
+        }
+        self.inputs.insert(session_id.to_string(), next);
+    }
+
+    fn focused_input(&self) -> Option<&PendingInput> {
+        let view = self.focused_view()?;
+        self.inputs.get(&view.session.id)
+    }
+
+    /// Move the highlight in the focused question's option list.
+    fn move_input_cursor(&mut self, delta: isize) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            return;
+        };
+        let Some(pending) = self.inputs.get_mut(&session_id) else {
+            return;
+        };
+        let len = pending.options.len();
+        if len == 0 {
+            return;
+        }
+        pending.cursor = (pending.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Answer the focused question with `option_index`.
+    fn respond_input(&mut self, option_index: usize, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            return;
+        };
+        let Some(pending) = self.inputs.get(&session_id) else {
+            return;
+        };
+        let Some(option) = pending.options.get(option_index) else {
+            return;
+        };
+        let input_id = pending.input_id.clone();
+        self.status = format!("answered: {}", truncate(&option.label, 60));
+        let _ = tx.send(Command::Input {
+            session_id,
+            input_id,
+            option_index,
+        });
+    }
+
+    /// Move the highlight in the focused approval card's action list.
+    fn move_approval_cursor(&mut self, delta: isize) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            return;
+        };
+        let Some(pending) = self.approvals.get_mut(&session_id) else {
+            return;
+        };
+        let len = pending.actions().len();
+        if len == 0 {
+            return;
+        }
+        pending.cursor = (pending.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+    }
+
+    /// Run the action on the focused card's highlighted row (or `index`).
+    fn activate_approval(&mut self, index: Option<usize>, tx: &UnboundedSender<Command>) {
+        let Some(pending) = self.focused_approval() else {
+            return;
+        };
+        let actions = pending.actions();
+        let index = index.unwrap_or(pending.cursor);
+        let Some(action) = actions.get(index).copied() else {
+            return;
+        };
+        match action {
+            ApprovalAction::Approve => {
+                self.respond_approval(ApprovalDecision::Approve, tx);
+            }
+            ApprovalAction::Always => {
+                self.respond_approval(ApprovalDecision::Always, tx);
+            }
+            ApprovalAction::Deny => {
+                self.respond_approval(ApprovalDecision::Deny, tx);
+            }
+            ApprovalAction::Reason => self.start_reason_prompt(),
+            ApprovalAction::Review => self.open_diff_view(),
+            ApprovalAction::Open => self.open_approval_file(),
+            ApprovalAction::Edit => self.edit_proposed(tx),
+        }
     }
 
     fn respond_approval(&mut self, decision: ApprovalDecision, tx: &UnboundedSender<Command>) {
@@ -2342,6 +4381,7 @@ impl App {
         let approval_id = pending.approval_id.clone();
         self.status = match decision {
             ApprovalDecision::Approve => "approving…",
+            ApprovalDecision::Always => "allowing always…",
             ApprovalDecision::Deny => "denying…",
         }
         .into();
@@ -2476,6 +4516,7 @@ impl App {
     }
 
     fn handle_diff_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        let key = next_prev_key(key);
         let Some((session_id, scroll, cursor)) = self
             .diff_view
             .as_ref()
@@ -2835,12 +4876,21 @@ impl App {
         self.draw_body(frame, chunks[0]);
         self.draw_input(frame, chunks[1]);
         self.draw_footer(frame, chunks[2]);
+        if self.command_menu_open() {
+            self.draw_command_menu(frame, chunks[1]);
+        }
+        if self.btw.is_some() {
+            self.draw_btw(frame, chunks[0]);
+        }
 
         if self.picker.is_some() {
             self.draw_picker(frame, area);
         }
         if self.help {
             draw_help(frame, area);
+        }
+        if let Some(items) = &self.timeline {
+            draw_timeline(frame, area, items, self.timeline_scroll);
         }
         if self.diff_view.is_some() {
             self.draw_diff_view(frame, area);
@@ -2856,6 +4906,9 @@ impl App {
         }
         if self.search_view.is_some() {
             self.draw_search(frame, area);
+        }
+        if self.diagnostics_view.is_some() {
+            self.draw_diagnostics(frame, area);
         }
     }
 
@@ -2906,6 +4959,15 @@ impl App {
                 dim,
             ));
         }
+        if let Some(session) = session {
+            let queued = self.queue_len(&session.id);
+            if queued > 0 {
+                spans.push(Span::styled(
+                    format!(" ⏳{queued}"),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
+        }
         let attention = self.attention_count();
         if attention > 0 {
             spans.push(Span::styled(
@@ -2952,14 +5014,41 @@ impl App {
         } else {
             None
         };
+        let pending_input = if focused {
+            self.inputs.get(&session_id).cloned()
+        } else {
+            None
+        };
         let attention = !focused
             && (self.views[index].session.status.needs_attention()
-                || self.approvals.contains_key(&session_id));
+                || self.approvals.contains_key(&session_id)
+                || self.inputs.contains_key(&session_id));
         let theme = self.theme;
-        let view = &mut self.views[index];
         let inner_width = area.width.saturating_sub(2) as usize;
         let inner_height = area.height.saturating_sub(2) as usize;
-        let lines = Self::transcript_lines(view, inner_width.max(1), theme);
+        let transcript = {
+            let view = &self.views[index];
+            let live = view.stream.as_ref().map(|stream| transcript::Live {
+                reasoning: &stream.reasoning,
+                text: &stream.text,
+            });
+            let queued: Vec<String> = self
+                .queues
+                .get(&session_id)
+                .map(|queue| queue.iter().cloned().collect())
+                .unwrap_or_default();
+            transcript::render(
+                &view.events,
+                live,
+                &queued,
+                &view.folds,
+                inner_width.max(1),
+                theme,
+            )
+        };
+        let lines = transcript.lines;
+        let view = &mut self.views[index];
+        view.slots = transcript.slots;
         let max_scroll = lines.len().saturating_sub(inner_height);
         if view.follow {
             view.scroll = max_scroll;
@@ -2999,6 +5088,9 @@ impl App {
         if let Some(approval) = approval {
             draw_approval_card(frame, area, &approval, theme);
         }
+        if let Some(pending) = pending_input {
+            draw_input_card(frame, area, &pending);
+        }
     }
 
     fn draw_empty_pane(&self, frame: &mut Frame, area: Rect) {
@@ -3035,246 +5127,29 @@ impl App {
         frame.render_widget(paragraph, area);
     }
 
-    fn transcript_lines(view: &SessionView, width: usize, theme: Theme) -> Vec<Line<'static>> {
-        let mut lines = Vec::new();
-        for event in &view.events {
-            match event.kind {
-                EventKind::UserMessage => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<UserMessagePayload>(event.payload.clone())
-                    {
-                        push_message(
-                            &mut lines,
-                            "you",
-                            theme.string.unwrap_or(Color::Cyan),
-                            &payload.text,
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::AssistantMessage => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
-                    {
-                        if payload.text.is_empty() {
-                            // Tool-only rounds are represented by the tool cards.
-                            continue;
-                        }
-                        let suffix = if payload.cancelled {
-                            "  [cancelled]"
-                        } else {
-                            ""
-                        };
-                        push_message(
-                            &mut lines,
-                            "eix",
-                            theme.function.unwrap_or(Color::Green),
-                            &payload.text,
-                            suffix,
-                            width,
-                        );
-                    }
-                }
-                EventKind::ToolCall => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<ToolCallPayload>(event.payload.clone())
-                    {
-                        let text = tool_call_summary(&payload.tool, &payload.arguments);
-                        push_message(
-                            &mut lines,
-                            "tool",
-                            theme.function.unwrap_or(Color::Yellow),
-                            &text,
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::ApprovalRequired => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
-                    {
-                        let text = format!("{} — y to approve, n to deny", payload.summary);
-                        push_message(
-                            &mut lines,
-                            "need",
-                            theme.function.unwrap_or(Color::Yellow),
-                            &text,
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::PatchProposed => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
-                    {
-                        let text = format!("{} — y to apply, n to reject", payload.summary);
-                        push_message(
-                            &mut lines,
-                            "patch",
-                            theme.function.unwrap_or(Color::Magenta),
-                            &text,
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::PatchApplied => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
-                    {
-                        push_message(
-                            &mut lines,
-                            "patch",
-                            theme.diff_add.unwrap_or(Color::Green),
-                            &format!("applied {}", payload.path),
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::PatchRejected => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
-                    {
-                        push_message(
-                            &mut lines,
-                            "patch",
-                            theme.diff_delete.unwrap_or(Color::Red),
-                            &format!("rejected {}", payload.path),
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::PatchConflict => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
-                    {
-                        push_message(
-                            &mut lines,
-                            "patch",
-                            theme.diff_delete.unwrap_or(Color::Red),
-                            &format!("conflict on {}", payload.path),
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::ToolResult => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<ToolResultPayload>(event.payload.clone())
-                    {
-                        let (label, color) = if payload.denied {
-                            ("denied", theme.error.unwrap_or(Color::Red))
-                        } else if payload.ok {
-                            ("ok", theme.diff_add.unwrap_or(Color::Green))
-                        } else {
-                            ("failed", theme.error.unwrap_or(Color::Red))
-                        };
-                        let header = format!("{} → {label}", payload.tool);
-                        push_message(&mut lines, "tool", color, &header, "", width);
-                        let output = payload.output.trim_end();
-                        if !output.is_empty() {
-                            let max_lines = 40;
-                            for line in output.lines().take(max_lines) {
-                                for segment in wrap_text(line, width.saturating_sub(2).max(1)) {
-                                    lines.push(Line::from(Span::styled(
-                                        format!("  {segment}"),
-                                        Style::default()
-                                            .fg(theme.comment.unwrap_or(Color::DarkGray)),
-                                    )));
-                                }
-                            }
-                            if output.lines().count() > max_lines {
-                                lines.push(Line::from(Span::styled(
-                                    "  …",
-                                    Style::default().fg(theme.comment.unwrap_or(Color::DarkGray)),
-                                )));
-                            }
-                            lines.push(Line::from(""));
-                        }
-                    }
-                }
-                EventKind::Permission => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<PermissionPayload>(event.payload.clone())
-                    {
-                        let text = format!(
-                            "permission {} → {}{}",
-                            payload.from.as_str(),
-                            payload.to.as_str(),
-                            if payload.temporary {
-                                " (temporary)"
-                            } else {
-                                ""
-                            }
-                        );
-                        push_message(
-                            &mut lines,
-                            "perm",
-                            theme.function.unwrap_or(Color::Yellow),
-                            &text,
-                            "",
-                            width,
-                        );
-                    }
-                }
-                EventKind::Error => {
-                    let message = event
-                        .payload
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error");
-                    push_message(
-                        &mut lines,
-                        "error",
-                        theme.error.unwrap_or(Color::Red),
-                        message,
-                        "",
-                        width,
-                    );
-                }
-                _ => {}
-            }
-        }
-        if let Some(stream) = &view.stream {
-            let text = if stream.text.is_empty() {
-                "…"
-            } else {
-                stream.text.as_str()
-            };
-            push_message(
-                &mut lines,
-                "eix",
-                theme.function.unwrap_or(Color::Green),
-                text,
-                "",
-                width,
-            );
-        }
-        if lines.is_empty() {
-            lines.push(Line::from(Span::styled(
-                "no messages yet — type a prompt below",
-                Style::default().fg(theme.comment.unwrap_or(Color::DarkGray)),
-            )));
-        }
-        lines
-    }
-
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Input;
         let mode = self.input.mode();
-        let accent = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
+        // The border color tracks the mode: insert is active (cyan), normal is
+        // vim-quiet (blue), visual is a selection (yellow). Blurred is muted.
+        let accent = if !focused {
             Style::default().fg(Color::DarkGray)
+        } else {
+            match mode {
+                Mode::Insert => Style::default().fg(Color::Cyan),
+                Mode::Normal => Style::default().fg(Color::Blue),
+                Mode::Visual | Mode::VisualLine => Style::default().fg(Color::Yellow),
+            }
         };
         let title = Line::from({
             let mut spans = self.header_spans();
             spans.push(Span::styled(format!(" [{}] ", mode.label()), accent));
+            if !self.pending_images.is_empty() {
+                spans.push(Span::styled(
+                    format!(" [{} img] ", self.pending_images.len()),
+                    Style::default().fg(Color::Yellow),
+                ));
+            }
             spans
         });
         let hint = if !focused {
@@ -3282,7 +5157,7 @@ impl App {
         } else {
             match mode {
                 Mode::Insert => " ⏎ send · C-j newline · Esc normal ",
-                Mode::Normal => " i insert · v visual · Space actions ",
+                Mode::Normal => " i insert · j/k history · Space actions ",
                 Mode::Visual | Mode::VisualLine => " d/y/c · o swap · Esc normal ",
             }
         };
@@ -3324,6 +5199,158 @@ impl App {
             let y = area.y + 1 + row as u16;
             frame.set_cursor_position((x, y));
         }
+    }
+
+    /// `/` suggestion menu floated just above the prompt.
+    fn draw_command_menu(&mut self, frame: &mut Frame, input_area: Rect) {
+        if input_area.y < 3 {
+            return;
+        }
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let height = (matches.len() as u16 + 2)
+            .min(15)
+            .min(input_area.y.saturating_sub(1));
+        let visible = height.saturating_sub(2) as usize;
+        if visible == 0 {
+            return;
+        }
+        let cursor = self.command_cursor.min(matches.len() - 1);
+        let start = cursor.saturating_sub(visible.saturating_sub(1));
+        let width = input_area.width.clamp(30, 88);
+        let rect = Rect::new(input_area.x, input_area.y - height, width, height);
+        frame.render_widget(Clear, rect);
+
+        let name_width = 24usize;
+        let inner = width.saturating_sub(4) as usize;
+        let desc_width = inner.saturating_sub(name_width + 2);
+        let mut lines = Vec::new();
+        for (offset, spec) in matches.iter().skip(start).take(visible).enumerate() {
+            let index = start + offset;
+            let selected = index == cursor;
+            let base = if selected {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(54, 60, 76))
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let name = if spec.args.is_empty() {
+                format!("/{}", spec.name)
+            } else {
+                format!("/{} {}", spec.name, spec.args)
+            };
+            let name = truncate(&name, name_width);
+            let name_pad = name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
+            let description = truncate(&spec.description, desc_width);
+            lines.push(Line::from(vec![
+                Span::styled(format!(" {} ", if selected { "›" } else { " " }), base),
+                Span::styled(name, base),
+                Span::raw(" ".repeat(name_pad)),
+                Span::styled(
+                    description,
+                    if selected {
+                        base
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    },
+                ),
+            ]));
+        }
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(Span::styled(
+                " / commands · ↑↓ · Tab complete · Enter run ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        frame.render_widget(Paragraph::new(lines).block(block), rect);
+    }
+
+    /// Floating `/btw` answer. It owns the keyboard until dismissed.
+    fn draw_btw(&mut self, frame: &mut Frame, area: Rect) {
+        let width = (area.width as u32 * 3 / 4).max(46).min(area.width as u32) as u16;
+        let height = (area.height as u32 * 3 / 5)
+            .clamp(10, 20)
+            .min(area.height as u32) as u16;
+        let rect = centered(area, width, height);
+        let inner_width = width.saturating_sub(4) as usize;
+        let inner_height = height.saturating_sub(2) as usize;
+
+        let session_name = self
+            .btw
+            .as_ref()
+            .and_then(|btw| {
+                self.views
+                    .iter()
+                    .find(|view| view.session.id == btw.session_id)
+                    .map(|view| view.session.name.clone())
+            })
+            .unwrap_or_else(|| "side question".into());
+        let Some(btw) = self.btw.as_mut() else {
+            return;
+        };
+
+        let mut lines = vec![Line::from(vec![
+            Span::styled("  ? ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                btw.question.clone(),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])];
+        if let Some(error) = &btw.error {
+            for segment in wrap_text(error, inner_width.saturating_sub(2)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {segment}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        } else if btw.text.is_empty() {
+            lines.push(Line::from(Span::styled(
+                if btw.done {
+                    "  (no answer)"
+                } else {
+                    "  thinking…"
+                },
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for segment in wrap_text(&btw.text, inner_width.saturating_sub(2)) {
+                lines.push(Line::from(format!("  {segment}")));
+            }
+        }
+        let max_scroll = lines.len().saturating_sub(inner_height);
+        btw.scroll = btw.scroll.min(max_scroll);
+        let border = if btw.error.is_some() {
+            Color::Red
+        } else if btw.done {
+            Color::Green
+        } else {
+            Color::Cyan
+        };
+        frame.render_widget(Clear, rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .title(Span::styled(
+                format!(" btw · {session_name} "),
+                Style::default().fg(border).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " Esc close · j/k scroll ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .scroll((btw.scroll.min(u16::MAX as usize) as u16, 0)),
+            rect,
+        );
     }
 
     /// One prompt row, with the visual selection reversed.
@@ -3389,7 +5416,7 @@ impl App {
         } else if self.attention_count() > 0 {
             " a next attention  A approvals  ? help  q quit "
         } else {
-            " c ctx  P ps  A approvals  p picker  q quit "
+            " /cmds  c ctx  A appr  p picker  q quit "
         };
         frame.render_widget(
             Paragraph::new(hint)
@@ -3786,6 +5813,78 @@ impl App {
         );
     }
 
+    fn draw_diagnostics(&mut self, frame: &mut Frame, area: Rect) {
+        let Some(view) = &self.diagnostics_view else {
+            return;
+        };
+        let rect = centered(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
+        frame.render_widget(Clear, rect);
+        let title = format!(
+            " diagnostics · {} issue(s) · {} file(s){} ",
+            view.result.diagnostics.len(),
+            view.result.files,
+            if view.result.skipped > 0 {
+                format!(" · {} skipped", view.result.skipped)
+            } else {
+                String::new()
+            }
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title)
+            .title_bottom(" j/k scroll · g/G ends · q close ");
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+
+        if view.result.diagnostics.is_empty() {
+            let text = if view.result.servers.is_empty() {
+                "no language server is configured for this workspace"
+            } else {
+                "no diagnostics"
+            };
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+                inner,
+            );
+            return;
+        }
+        let width = inner.width as usize;
+        let lines: Vec<Line> = view
+            .result
+            .diagnostics
+            .iter()
+            .map(|item| {
+                let color = match item.severity.as_str() {
+                    "error" => Color::Red,
+                    "warning" => Color::Yellow,
+                    "info" => Color::Cyan,
+                    _ => Color::Gray,
+                };
+                let text = format!(
+                    "{}:{}:{}  {}: {}",
+                    item.path.display(),
+                    item.line + 1,
+                    item.character + 1,
+                    item.severity,
+                    item.message
+                );
+                Line::from(Span::styled(
+                    truncate(&text, width),
+                    Style::default().fg(color),
+                ))
+            })
+            .collect();
+        frame.render_widget(
+            Paragraph::new(lines).scroll((view.scroll.min(u16::MAX as usize) as u16, 0)),
+            inner,
+        );
+    }
+
     fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
         let filtered = self.picker_filtered();
         let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
@@ -4018,6 +6117,131 @@ impl App {
     }
 }
 
+/// Rows for `/models`. `@default` clears the session's pinned model.
+fn model_picker_items(models: &[eix_core::ModelInfo]) -> Vec<PickerItem> {
+    let mut items = vec![PickerItem::new("@default")
+        .with_label("(daemon default)")
+        .with_detail("use the model from [provider]")
+        .with_preview("Clear this session's model override.\n\nUse /models to pin a model again.")];
+    for model in models {
+        let mut detail = model.name.clone();
+        if model.name != model.id {
+            detail = format!("{}  {}", model.name, model.id);
+        }
+        if model.default {
+            detail.push_str("  · default");
+        }
+        if !model.variants.is_empty() {
+            detail.push_str(&format!("  · variants: {}", model.variants.join(", ")));
+        }
+        if let (Some(input), Some(output)) = (model.input_cost, model.output_cost) {
+            detail.push_str(&format!("  · ${input:.2}/${output:.2} per M"));
+        }
+        let mut preview = vec![
+            model.id.clone(),
+            model.name.clone(),
+            format!("provider  {}", model.provider),
+        ];
+        if model.default {
+            preview.push("default   yes".to_string());
+        }
+        if !model.variants.is_empty() {
+            preview.push(format!("variants  {}", model.variants.join(", ")));
+        }
+        if let Some(context) = model.context_tokens {
+            preview.push(format!("context   {context} tokens"));
+        }
+        if let Some(input) = model.input_cost {
+            preview.push(format!("input     ${input:.2} / 1M tokens"));
+        }
+        if let Some(output) = model.output_cost {
+            preview.push(format!("output    ${output:.2} / 1M tokens"));
+        }
+        items.push(
+            PickerItem::new(&model.id)
+                .with_detail(detail)
+                .with_preview(preview.join("\n")),
+        );
+        // A variant is a separate row so it is discoverable without knowing
+        // the `id#variant` syntax.
+        for variant in &model.variants {
+            let id = format!("{}#{variant}", model.id);
+            items.push(
+                PickerItem::new(&id)
+                    .with_detail(format!("{}  · variant: {variant}", model.name))
+                    .with_preview(format!(
+                        "{id}\n{} ({}) with reasoning variant `{variant}`.",
+                        model.name, model.provider
+                    )),
+            );
+        }
+    }
+    items
+}
+
+/// Rows for `/agents`, limited to primary-capable agents.
+fn agent_picker_items(agents: &[eix_core::AgentSpec]) -> Vec<PickerItem> {
+    agents
+        .iter()
+        .filter(|agent| agent.mode.can_primary())
+        .map(|agent| {
+            let mut detail = agent.description.clone();
+            detail.push_str(&format!("  · {}", agent.mode.as_str()));
+            if let Some(model) = &agent.model {
+                detail.push_str(&format!("  · {model}"));
+            }
+            if let Some(permission) = agent.permission {
+                detail.push_str(&format!("  · {}", permission.as_str()));
+            }
+            let mut preview = vec![
+                agent.name.clone(),
+                String::new(),
+                agent.description.clone(),
+                format!("mode        {}", agent.mode.as_str()),
+            ];
+            if let Some(model) = &agent.model {
+                preview.push(format!("model       {model}"));
+            }
+            if let Some(permission) = agent.permission {
+                preview.push(format!("permission  {}", permission.as_str()));
+            }
+            if !agent.prompt.is_empty() {
+                preview.push(String::new());
+                preview.push(agent.prompt.clone());
+            }
+            if let Some(source) = &agent.source {
+                preview.push(String::new());
+                preview.push(format!("source      {}", source.display()));
+            }
+            PickerItem::new(&agent.name)
+                .with_detail(detail)
+                .with_preview(preview.join("\n"))
+        })
+        .collect()
+}
+
+fn skill_picker_items(skills: &[eix_core::Skill]) -> Vec<PickerItem> {
+    skills
+        .iter()
+        .map(|skill| {
+            let mut detail = skill.description.clone();
+            if !skill.allowed_tools.is_empty() {
+                detail.push_str(&format!(" · tools: {}", skill.allowed_tools.join(", ")));
+            }
+            let mut preview = vec![skill.name.clone(), String::new(), skill.description.clone()];
+            if !skill.allowed_tools.is_empty() {
+                preview.push(format!("allowed tools: {}", skill.allowed_tools.join(", ")));
+            }
+            preview.push(format!("source: {}", skill.source.display()));
+            preview.push(String::new());
+            preview.push(skill.body.clone());
+            PickerItem::new(&skill.name)
+                .with_detail(detail)
+                .with_preview(preview.join("\n"))
+        })
+        .collect()
+}
+
 /// Rows for the `:` command palette. `value` is dispatched by
 /// [`App::run_action`]; the label and help are only for display.
 fn command_items() -> Vec<PickerItem> {
@@ -4085,6 +6309,26 @@ fn command_items() -> Vec<PickerItem> {
             "cancel the running turn",
             "Stop the focused session (x)",
         ),
+        (
+            "agents",
+            "agents",
+            "Choose the focused session's primary agent",
+        ),
+        (
+            "skills",
+            "skills",
+            "Browse installed skills with a body preview",
+        ),
+        (
+            "diagnostics",
+            "diagnostics",
+            "Aggregate LSP diagnostics for the workspace",
+        ),
+        (
+            "models",
+            "models",
+            "Pin the focused session to a configured model",
+        ),
         ("help", "key help", "Show the key map (?)"),
         ("quit", "quit eix", "Leave the TUI (q)"),
     ];
@@ -4114,6 +6358,29 @@ struct TurnCompleted {
     cancelled: bool,
     #[serde(default)]
     error: Option<String>,
+    #[serde(default)]
+    usage: Option<eix_core::Usage>,
+    #[serde(default)]
+    cost: Option<f64>,
+    #[serde(default)]
+    duration_ms: Option<u64>,
+}
+
+#[derive(Deserialize)]
+struct BtwDeltaParams {
+    session_id: String,
+    btw_id: String,
+    delta: String,
+}
+
+#[derive(Deserialize)]
+struct BtwCompletedParams {
+    session_id: String,
+    btw_id: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    error: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4130,6 +6397,17 @@ struct ApprovalParams {
     diff: Option<String>,
     #[serde(default)]
     hunks: Vec<HunkInfo>,
+}
+
+#[derive(Deserialize)]
+struct InputParams {
+    session_id: String,
+    input_id: String,
+    #[serde(default)]
+    call_id: String,
+    question: String,
+    #[serde(default)]
+    options: Vec<InputOption>,
 }
 
 #[derive(Deserialize)]
@@ -4180,7 +6458,7 @@ struct ProcessExitedParams {
     exit_code: Option<i32>,
 }
 
-fn tool_call_summary(tool: &str, arguments: &Value) -> String {
+pub(super) fn tool_call_summary(tool: &str, arguments: &Value) -> String {
     let string = |key: &str| {
         arguments
             .get(key)
@@ -4188,15 +6466,34 @@ fn tool_call_summary(tool: &str, arguments: &Value) -> String {
             .unwrap_or_default()
     };
     match tool {
+        "run_command" | "start_command" => format!("$ {}", string("command")),
+        "read_file" => format!("read {}", string("path")),
+        "list_dir" => {
+            let path = string("path");
+            format!("ls {}", if path.is_empty() { "." } else { path })
+        }
         "write_file" => {
             let bytes = string("content").len();
-            format!("write_file {} (+{bytes} bytes)", string("path"))
+            format!("write {} (+{bytes} bytes)", string("path"))
         }
-        "run_command" => format!("run_command: {}", string("command")),
-        "read_file" | "list_dir" => {
-            let path = string("path");
-            format!("{tool} {}", if path.is_empty() { "." } else { path })
+        "process_output" => {
+            let id = string("process_id");
+            if id.is_empty() {
+                "process output".to_string()
+            } else {
+                format!("process output {id}")
+            }
         }
+        "spawn_agent" => {
+            let name = string("name");
+            let prompt = truncate(string("prompt"), 60);
+            if name.is_empty() {
+                format!("agent: {prompt}")
+            } else {
+                format!("agent {name}: {prompt}")
+            }
+        }
+        "ask_user" => format!("? {}", truncate(string("question"), 80)),
         _ => {
             let compact = serde_json::to_string(arguments).unwrap_or_default();
             format!("{tool} {}", truncate(&compact, 80))
@@ -4204,42 +6501,7 @@ fn tool_call_summary(tool: &str, arguments: &Value) -> String {
     }
 }
 
-fn push_message(
-    lines: &mut Vec<Line<'static>>,
-    role: &str,
-    color: Color,
-    text: &str,
-    suffix: &str,
-    width: usize,
-) {
-    let prefix = format!("{role}> ");
-    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let content_width = width.saturating_sub(prefix_width).max(1);
-    let wrapped = wrap_text(text, content_width);
-    let continuation = " ".repeat(prefix_width);
-    for (index, segment) in wrapped.iter().enumerate() {
-        let mut spans = Vec::new();
-        if index == 0 {
-            spans.push(Span::styled(
-                prefix.clone(),
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            spans.push(Span::raw(continuation.clone()));
-        }
-        spans.push(Span::raw(segment.clone()));
-        if index + 1 == wrapped.len() && !suffix.is_empty() {
-            spans.push(Span::styled(
-                suffix.to_string(),
-                Style::default().fg(Color::DarkGray),
-            ));
-        }
-        lines.push(Line::from(spans));
-    }
-    lines.push(Line::from(""));
-}
-
-fn wrap_text(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     let width = width.max(1);
     let mut out = Vec::new();
     for line in text.split('\n') {
@@ -4268,28 +6530,73 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
 fn draw_help(frame: &mut Frame, area: Rect) {
     let width = (area.width as u32 * 7 / 10).max(50).min(area.width as u32) as u16;
-    let height = (area.height as u32 * 7 / 10)
-        .max(16)
-        .min(area.height as u32) as u16;
-    let rect = centered(area, width, height);
-    frame.render_widget(Clear, rect);
     let lines = vec![
         Line::from(Span::styled(
-            "eix keys",
+            "prompt commands",
             Style::default().add_modifier(Modifier::BOLD),
         )),
+        key_line("/help", "open this reference"),
+        key_line("/new", "start a session here (/new optional-name)"),
+        key_line("/clear", "forget the conversation context (transcript stays)"),
+        key_line("/compact", "summarize the history (/compact optional notes)"),
+        key_line(
+            "/btw",
+            "one-off answer (/btw <question>); kept out of the conversation",
+        ),
+        key_line("/cd", "change the working directory (/cd <path>); alone shows it"),
+        key_line("/init", "draft AGENTS.md; you review before sending"),
+        key_line("/queue", "list queued prompts (/queue clear | rm N | move N M)"),
+        key_line("/sessions", "open the session picker"),
+        key_line("/timeline", "recent turns, answers and tool calls (j/k scroll)"),
+        key_line("/export", "write this session as JSON (/export optional-path)"),
+        key_line("/archive · /delete", "hide from the picker · delete (confirm twice)"),
+        key_line("/undo · /redo", "hide or restore the newest turn"),
+        key_line(
+            "/skills [name] [args]",
+            "browse skills with a preview, or insert one with arguments",
+        ),
+        key_line("/todos", "show the model's current task list"),
+        key_line(
+            "/diagnostics [max-files]",
+            "aggregate workspace LSP diagnostics (j/k scroll)",
+        ),
+        key_line(
+            "/image <path>",
+            "attach images (paste/drop a path or file:// URI); png/jpg/gif/webp",
+        ),
+        key_line("!<cmd>", "run a shell command in the session cwd (sandboxed, snapshotted)"),
+        key_line("/fork", "fork this session (/fork optional-name)"),
+        key_line("/permission", "set read-only · workspace-write · full"),
+        key_line("/exit · /quit", "save and close this session (quits on the last pane)"),
         Line::from(""),
+        Line::from(Span::styled(
+            "keys",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         key_line("i / Enter", "focus the prompt"),
+        key_line(
+            "mouse",
+            "click folds a Thinking / tool block; wheel scrolls the transcript",
+        ),
         key_line("Esc", "prompt: normal mode (keeps focus)"),
-        key_line("Esc Esc", "leave the prompt for the transcript"),
-        key_line("Enter", "send (insert mode)"),
+        key_line(
+            "Esc Esc",
+            "normal mode: interrupt the running turn, or leave for the transcript",
+        ),
+        key_line("Enter", "send (insert mode); prompts sent while busy are queued"),
         key_line("Ctrl-J", "newline (insert mode)"),
         key_line("Space s/f/w/b", "prompt: sessions / files / worktrees / branches"),
-        key_line("Space c/C/h/p", "prompt: ledger / context / history / processes"),
+        key_line(
+            "Space c/C/h/p/e",
+            "prompt: ledger / context / history / processes / diagnostics",
+        ),
         key_line("Space r/x/a/?", "prompt: approvals / cancel / actions / help"),
         key_line("Space n/q", "prompt: open in a new pane / close pane"),
         key_line("Space N/W/F", "prompt: new session / new worktree / fork"),
-        key_line("j / k (normal)", "scroll the transcript history (3j / dj stay moves)"),
+        key_line(
+            "j / k",
+            "normal mode: browse submitted prompts (3j / dj stay draft moves)",
+        ),
         key_line("Space :", "prompt: command palette"),
         key_line("p / Ctrl-G", "session picker"),
         key_line("o", "open session in a new pane"),
@@ -4304,7 +6611,12 @@ fn draw_help(frame: &mut Frame, area: Rect) {
         key_line("Tab / S-Tab", "next / previous session"),
         key_line("n / N", "new session (N: in a fresh git worktree)"),
         key_line("x", "cancel focused turn"),
-        key_line("y / n", "approve / deny a pending tool call"),
+        key_line("y / n", "approve / deny a pending tool call (card shortcut)"),
+        key_line(
+            "j / k · Enter",
+            "pending card: pick an approval action / answer with the highlighted option",
+        ),
+        key_line("1-6 · C-n/C-p", "answer a question directly / next-prev option"),
         key_line(
             "d",
             "review the pending diff full screen (Space toggles hunks)",
@@ -4333,12 +6645,56 @@ fn draw_help(frame: &mut Frame, area: Rect) {
             Style::default().fg(Color::DarkGray),
         )),
         Line::from(Span::styled(
+            "ask_user and the approval card are option pickers: first option is recommended.",
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(Span::styled(
             "the ledger is advisory: system and instruction entries are never trimmed automatically",
             Style::default().fg(Color::DarkGray),
         )),
     ];
+    let height = (lines.len() as u16 + 2)
+        .min(area.height.saturating_sub(2))
+        .max(8);
+    let rect = centered(area, width, height);
+    frame.render_widget(Clear, rect);
     let paragraph = Paragraph::new(lines)
         .block(Block::default().borders(Borders::ALL).title(" help "))
+        .wrap(Wrap { trim: false })
+        .style(Style::default().bg(Color::Black));
+    frame.render_widget(paragraph, rect);
+}
+
+fn draw_timeline(frame: &mut Frame, area: Rect, items: &[eix_core::TimelineItem], scroll: usize) {
+    let width = (area.width as u32 * 8 / 10).max(60).min(area.width as u32) as u16;
+    let height = area.height.saturating_sub(4).max(8);
+    let rect = centered(area, width, height);
+    let inner_height = rect.height.saturating_sub(2) as usize;
+    let lines: Vec<Line> = items
+        .iter()
+        .skip(scroll)
+        .take(inner_height)
+        .map(|item| {
+            Line::from(vec![
+                Span::styled(
+                    format!("e{:<4} ", item.seq),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    format!("{:<17} ", item.kind),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::raw(item.preview.replace('\n', " ")),
+            ])
+        })
+        .collect();
+    frame.render_widget(Clear, rect);
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" timeline (j/k scroll, Esc close) "),
+        )
         .style(Style::default().bg(Color::Black));
     frame.render_widget(paragraph, rect);
 }
@@ -4346,7 +6702,7 @@ fn draw_help(frame: &mut Frame, area: Rect) {
 fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
     Line::from(vec![
         Span::styled(
-            format!("{key:<14}"),
+            format!("{key:<15}"),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -4638,16 +6994,40 @@ fn approval_risk(tool: &str) -> (&'static str, Color) {
     }
 }
 
+/// Map `Ctrl-N`/`Ctrl-P` (and the vim `Ctrl-J`/`Ctrl-K`) onto plain `j`/`k`
+/// for list overlays whose letters already mean next/previous.
+fn next_prev_key(key: KeyEvent) -> KeyEvent {
+    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+        return key;
+    }
+    match key.code {
+        KeyCode::Char('n') | KeyCode::Char('j') => {
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE)
+        }
+        KeyCode::Char('p') | KeyCode::Char('k') => {
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE)
+        }
+        _ => key,
+    }
+}
+
 fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval, theme: Theme) {
-    if area.width < 20 || area.height < 6 {
+    if area.width < 24 || area.height < 6 {
         return;
     }
-    // The card grows to fit a capped diff preview, never taller than the pane.
-    let max_diff = area.height.saturating_sub(5) as usize; // borders + summary + keys
+    let actions = approval.actions();
+    let cursor = approval.cursor.min(actions.len().saturating_sub(1));
     let diff_lines: Vec<&str> = approval.diff.as_deref().unwrap_or("").lines().collect();
-    let max_diff = max_diff.min(10);
+    // Borders + summary + actions + hint; the diff takes whatever is left.
+    let fixed = 2 + 1 + actions.len() + 1;
+    let max_diff = (area.height as usize).saturating_sub(fixed).min(8);
     let shown = diff_lines.len().min(max_diff);
-    let height = (4 + shown + usize::from(diff_lines.len() > shown)) as u16;
+    let truncated = diff_lines.len() > shown && max_diff > 0;
+    // Leave the pane's title row visible and never underflow `y` on a pane
+    // that starts at the top of the screen.
+    let height = (fixed + shown + usize::from(truncated))
+        .min(area.height.saturating_sub(1) as usize)
+        .max(3) as u16;
     let rect = Rect {
         x: area.x + 1,
         y: area.y + area.height - height - 1,
@@ -4656,7 +7036,8 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
     };
     frame.render_widget(Clear, rect);
 
-    let summary = truncate(&approval.summary, rect.width.saturating_sub(4) as usize);
+    let inner = rect.width.saturating_sub(2) as usize;
+    let summary = truncate(&approval.summary, inner.saturating_sub(12));
     let (risk, risk_color) = approval_risk(&approval.tool);
     let mut lines = vec![Line::from(vec![
         Span::styled(
@@ -4668,48 +7049,43 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
         Span::styled(summary, Style::default().fg(Color::Yellow)),
         Span::styled(format!("  [{risk}]"), Style::default().fg(risk_color)),
     ])];
-    let inner = rect.width.saturating_sub(2) as usize;
     for line in diff_lines.iter().take(shown) {
         lines.push(Line::from(Span::styled(
             truncate(line, inner),
             diff_line_style(line, theme),
         )));
     }
-    if diff_lines.len() > shown {
+    if truncated {
         lines.push(Line::from(Span::styled(
             "… diff truncated",
             Style::default().fg(Color::DarkGray),
         )));
     }
-    let mut keys = vec![
-        Span::styled("[y] approve  ", Style::default().fg(Color::Green)),
-        Span::styled("[n] deny  ", Style::default().fg(Color::Red)),
-    ];
-    if approval.path.is_some() {
-        keys.push(Span::styled("[o] open  ", Style::default().fg(Color::Cyan)));
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Yellow)
+        .add_modifier(Modifier::BOLD);
+    for (index, action) in actions.iter().enumerate() {
+        let marker = if index == cursor { "▸ " } else { "  " };
+        let mut text = format!("{marker}{}. {}", index + 1, approval.action_label(*action));
+        if index == 0 {
+            text.push_str("  ★ recommended");
+        }
+        let text = truncate(&text, inner);
+        let style = if index == cursor {
+            selected_style
+        } else {
+            Style::default().fg(approval_action_color(*action))
+        };
+        lines.push(Line::from(Span::styled(pad_to(&text, inner), style)));
     }
-    if approval.kind == PendingKind::Patch {
-        keys.push(Span::styled("[e] edit  ", Style::default().fg(Color::Cyan)));
-    }
-    keys.push(Span::styled(
-        "[r] reason  ",
+    lines.push(Line::from(Span::styled(
+        truncate(
+            "j/k or C-n/C-p select · Enter confirm · y/n · x cancel",
+            inner,
+        ),
         Style::default().fg(Color::DarkGray),
-    ));
-    if !diff_lines.is_empty() {
-        keys.push(Span::styled(
-            if approval.hunks.is_empty() {
-                "[d] review  "
-            } else {
-                "[d] review hunks  "
-            },
-            Style::default().fg(Color::Cyan),
-        ));
-    }
-    keys.push(Span::styled(
-        "[x] cancel",
-        Style::default().fg(Color::DarkGray),
-    ));
-    lines.push(Line::from(keys));
+    )));
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4721,6 +7097,104 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
             .style(Style::default().bg(Color::Black)),
         rect,
     );
+}
+
+fn approval_action_color(action: ApprovalAction) -> Color {
+    match action {
+        ApprovalAction::Approve => Color::Green,
+        ApprovalAction::Always => Color::Green,
+        ApprovalAction::Deny | ApprovalAction::Reason => Color::Red,
+        ApprovalAction::Review | ApprovalAction::Open | ApprovalAction::Edit => Color::Cyan,
+    }
+}
+
+/// Render an `ask_user` question as a keyboard-driven option picker.
+fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput) {
+    if area.width < 24 || area.height < 5 {
+        return;
+    }
+    let height = (3 + pending.options.len() + 1)
+        .min(area.height.saturating_sub(1) as usize)
+        .max(4) as u16;
+    let rect = Rect {
+        x: area.x + 1,
+        y: area.y + area.height - height - 1,
+        width: area.width.saturating_sub(2),
+        height,
+    };
+    frame.render_widget(Clear, rect);
+    let inner = rect.width.saturating_sub(2) as usize;
+    let cursor = pending.cursor.min(pending.options.len().saturating_sub(1));
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            "? ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            truncate(&pending.question, inner.saturating_sub(2)),
+            Style::default().fg(Color::Yellow),
+        ),
+    ])];
+    let selected_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    for (index, option) in pending.options.iter().enumerate() {
+        let marker = if index == cursor { "▸ " } else { "  " };
+        let mut text = format!("{marker}{}. {}", index + 1, option.label);
+        if let Some(description) = option
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+        {
+            text.push_str(" — ");
+            text.push_str(description);
+        }
+        if index == 0 {
+            text.push_str("  ★ recommended");
+        }
+        let text = truncate(&text, inner);
+        let style = if index == cursor {
+            selected_style
+        } else if index == 0 {
+            Style::default().fg(Color::Green)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::from(Span::styled(pad_to(&text, inner), style)));
+    }
+    lines.push(Line::from(Span::styled(
+        truncate(
+            "j/k or C-n/C-p select · Enter answer · 1-6 jump · x cancel",
+            inner,
+        ),
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(" question ");
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().bg(Color::Black)),
+        rect,
+    );
+}
+
+/// Pad a single-line string with spaces to `width` terminal cells.
+fn pad_to(text: &str, width: usize) -> String {
+    let used = UnicodeWidthStr::width(text);
+    let mut out = String::with_capacity(text.len() + width.saturating_sub(used));
+    out.push_str(text);
+    for _ in used..width {
+        out.push(' ');
+    }
+    out
 }
 
 fn diff_line_style(line: &str, theme: Theme) -> Style {
@@ -4780,6 +7254,27 @@ fn short_model(model: &str) -> &str {
         .unwrap_or(model)
 }
 
+/// Compact usage summary for the footer: tokens, throughput and cost.
+fn turn_summary(done: &TurnCompleted) -> String {
+    let Some(usage) = &done.usage else {
+        return "idle".to_string();
+    };
+    let mut parts = vec![format!(
+        "idle · {} tok",
+        usage
+            .total_tokens
+            .max(usage.prompt_tokens.saturating_add(usage.completion_tokens),)
+    )];
+    if let Some(duration) = done.duration_ms.filter(|duration| *duration > 0) {
+        let tps = usage.completion_tokens as f64 / (duration as f64 / 1000.0);
+        parts.push(format!("{tps:.1} tok/s"));
+    }
+    if let Some(cost) = done.cost {
+        parts.push(format!("${cost:.4}"));
+    }
+    parts.join(" · ")
+}
+
 /// Replace a leading `$HOME` with `~`.
 fn compact_path(path: &str) -> String {
     match std::env::var_os("HOME") {
@@ -4805,7 +7300,7 @@ fn origin_marker(session: &Session) -> &'static str {
     }
 }
 
-fn truncate(text: &str, max: usize) -> String {
+pub(super) fn truncate(text: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
@@ -4855,10 +7350,154 @@ fn fuzzy_score(query: &str, haystack: &str) -> Option<i32> {
 
 const SPINNER: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
 
+/// Parse a drag-and-drop / clipboard paste as image paths. Returns `None` when
+/// the paste is ordinary text, so callers can fall back to the editor.
+fn parse_image_paths(text: &str, cwd: &std::path::Path) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !trimmed.contains('\n') {
+        if let Some(path) = normalize_image_path(trimmed, cwd) {
+            return Some(vec![path]);
+        }
+    }
+    let tokens = shell_words(trimmed);
+    if tokens.is_empty() {
+        return None;
+    }
+    let mut paths = Vec::new();
+    for token in tokens {
+        paths.push(normalize_image_path(&token, cwd)?);
+    }
+    Some(paths)
+}
+
+fn normalize_image_path(raw: &str, cwd: &std::path::Path) -> Option<String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = if let Some(uri) = raw.strip_prefix("file://") {
+        let uri = uri.strip_prefix("localhost").unwrap_or(uri);
+        std::path::PathBuf::from(percent_decode(uri))
+    } else if let Some(rest) = raw.strip_prefix("~/") {
+        dirs::home_dir()?.join(rest)
+    } else {
+        let relative = std::path::Path::new(raw);
+        if relative.is_absolute() {
+            relative.to_path_buf()
+        } else {
+            cwd.join(relative)
+        }
+    };
+    let extension = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    if !matches!(extension.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp") {
+        return None;
+    }
+    if !path.is_file() {
+        return None;
+    }
+    // Keep relative tokens relative so the daemon's workspace path checks see
+    // the same path the user dropped. File URIs and `~` have to be expanded
+    // because the daemon does not parse either form.
+    if raw.starts_with("file://") || raw.starts_with("~/") {
+        Some(path.to_string_lossy().into_owned())
+    } else {
+        Some(raw.to_string())
+    }
+}
+
+/// Minimal shell-like tokenizer: whitespace separators, single/double quotes
+/// and backslash escapes. Good enough for paths pasted by terminal emulators.
+fn shell_words(text: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = text.chars().peekable();
+    let mut quote: Option<char> = None;
+    while let Some(ch) = chars.next() {
+        match quote {
+            Some(active) if ch == active => quote = None,
+            Some(_) => current.push(ch),
+            None if ch == '\'' || ch == '"' => quote = Some(ch),
+            None if ch == '\\' => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            None if ch.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            None => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn percent_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
+                out.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use eix_core::SearchResult;
+
+    #[test]
+    fn paste_recognizes_image_paths_and_file_uris() {
+        let dir = std::env::temp_dir().join(format!(
+            "eix-paste-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let first = dir.join("shot one.png");
+        let second = dir.join("two.jpg");
+        std::fs::write(&first, b"png").unwrap();
+        std::fs::write(&second, b"jpg").unwrap();
+
+        assert_eq!(
+            parse_image_paths("shot one.png", &dir),
+            Some(vec!["shot one.png".to_string()])
+        );
+        assert_eq!(
+            parse_image_paths("\"shot one.png\" 'two.jpg'", &dir),
+            Some(vec!["shot one.png".to_string(), "two.jpg".to_string()])
+        );
+        let uri = format!("file://{}", first.to_string_lossy().replace(' ', "%20"));
+        assert_eq!(
+            parse_image_paths(&uri, &dir),
+            Some(vec![first.to_string_lossy().into_owned()])
+        );
+        assert_eq!(parse_image_paths("hello world", &dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn wrapping_respects_display_width() {
@@ -4922,6 +7561,26 @@ mod tests {
             .collect()
     }
 
+    fn render_transcript(view: &SessionView, width: usize) -> String {
+        let live = view.stream.as_ref().map(|stream| transcript::Live {
+            reasoning: &stream.reasoning,
+            text: &stream.text,
+        });
+        transcript::render(
+            &view.events,
+            live,
+            &[],
+            &view.folds,
+            width,
+            Theme::default(),
+        )
+        .lines
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+    }
+
     #[test]
     fn transcript_renders_tool_cards() {
         let session = Session::new("s1", "tools", "/tmp");
@@ -4949,15 +7608,161 @@ mod tests {
                 }),
             ),
         ];
+        let mut view = SessionView::new(session, events);
+
+        // Finished calls collapse to a single summary line with a status.
+        let collapsed = render_transcript(&view, 60);
+        assert!(collapsed.contains("write out.txt (+5 bytes)"));
+        assert!(collapsed.contains("ok"));
+        assert!(!collapsed.contains("wrote 5 bytes to out.txt"));
+
+        // Expanding the block reveals the argument and the output.
+        view.folds.insert(FoldId::Event(1), true);
+        let expanded = render_transcript(&view, 60);
+        assert!(expanded.contains("wrote 5 bytes to out.txt"));
+        assert!(expanded.contains("content"));
+    }
+
+    #[test]
+    fn transcript_renders_chat_turns_and_thinking() {
+        let session = Session::new("s1", "chat", "/tmp");
+        let events = vec![
+            SessionEvent::new(
+                "s1",
+                1,
+                EventKind::UserMessage,
+                serde_json::json!({"text": "hi there"}),
+            ),
+            SessionEvent::new(
+                "s1",
+                2,
+                EventKind::AssistantMessage,
+                serde_json::json!({
+                    "text": "hello",
+                    "model": "m",
+                    "reasoning": "pondering",
+                    "cancelled": false,
+                }),
+            ),
+        ];
         let view = SessionView::new(session, events);
-        let text = App::transcript_lines(&view, 60, Theme::default())
-            .iter()
-            .map(line_text)
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(text.contains("write_file out.txt (+5 bytes)"));
-        assert!(text.contains("write_file → ok"));
-        assert!(text.contains("wrote 5 bytes to out.txt"));
+        let rendered = render_transcript(&view, 40);
+        // No role prefixes; the user turn is right-aligned.
+        assert!(!rendered.contains("you>"));
+        assert!(!rendered.contains("eix>"));
+        let lines: Vec<&str> = rendered.lines().collect();
+        let user = lines.iter().find(|line| line.contains("hi there")).unwrap();
+        assert!(
+            user.starts_with("  "),
+            "user turn should be indented: {user:?}"
+        );
+        assert!(lines.iter().any(|line| line.contains("▸ Thinking")));
+        // Stored thinking is collapsed until expanded.
+        assert!(!rendered.contains("pondering"));
+        let mut view = view;
+        view.folds.insert(FoldId::Event(2), true);
+        assert!(render_transcript(&view, 40).contains("pondering"));
+    }
+
+    #[test]
+    fn transcript_marks_context_events() {
+        let session = Session::new("s1", "ctx", "/tmp");
+        let events = vec![
+            SessionEvent::new(
+                "s1",
+                1,
+                EventKind::UserMessage,
+                serde_json::json!({ "text": "old question" }),
+            ),
+            SessionEvent::new(
+                "s1",
+                2,
+                EventKind::ContextCompacted,
+                serde_json::json!({
+                    "from_seq": 1,
+                    "to_seq": 1,
+                    "messages": 1,
+                    "tokens": 10,
+                    "summary": "we talked",
+                }),
+            ),
+            SessionEvent::new("s1", 3, EventKind::ContextCleared, serde_json::json!({})),
+        ];
+        let view = SessionView::new(session, events);
+        let rendered = render_transcript(&view, 60);
+        assert!(rendered.contains("context compacted · 1 message(s)"));
+        assert!(rendered.contains("context cleared"));
+        // Clearing context never removes the transcript history.
+        assert!(rendered.contains("old question"));
+    }
+
+    #[test]
+    fn transcript_streams_live_thinking() {
+        let session = Session::new("s1", "chat", "/tmp");
+        let mut view = SessionView::new(session, Vec::new());
+        view.stream = Some(StreamState {
+            turn_id: "t1".into(),
+            text: String::new(),
+            reasoning: "thinking out loud".into(),
+        });
+        let rendered = render_transcript(&view, 40);
+        assert!(rendered.contains("Thinking…"));
+        assert!(rendered.contains("thinking out loud"));
+    }
+
+    #[test]
+    fn reasoning_delta_accumulates_before_the_answer() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "chat", "/tmp"),
+            Vec::new(),
+        ));
+        for (method, delta) in [("reasoning.delta", "think"), ("message.delta", "answer")] {
+            app.handle_event(
+                Event::Notification(eix_core::Notification::new(
+                    method,
+                    serde_json::json!({
+                        "session_id": "s1",
+                        "turn_id": "t1",
+                        "delta": delta,
+                    }),
+                )),
+                &tx,
+            );
+        }
+        let stream = app.views[0].stream.as_ref().expect("stream");
+        assert_eq!(stream.reasoning, "think");
+        assert_eq!(stream.text, "answer");
+    }
+
+    #[test]
+    fn clicking_a_fold_toggles_it() {
+        let mut app = App::new(None);
+        let session = Session::new("s1", "tools", "/tmp");
+        let mut view = SessionView::new(session, Vec::new());
+        view.slots = vec![Some(transcript::Fold {
+            id: FoldId::Event(1),
+            open: false,
+        })];
+        app.views.push(view);
+        app.pane_areas = vec![Rect::new(0, 0, 40, 10)];
+
+        let click = |row| MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        // The first inner row is the block header.
+        app.handle_mouse(click(1));
+        assert_eq!(app.views[0].folds.get(&FoldId::Event(1)), Some(&true));
+        app.views[0].slots[0] = Some(transcript::Fold {
+            id: FoldId::Event(1),
+            open: true,
+        });
+        app.handle_mouse(click(1));
+        assert_eq!(app.views[0].folds.get(&FoldId::Event(1)), Some(&false));
     }
 
     #[test]
@@ -5090,6 +7895,7 @@ mod tests {
                 path: None,
                 hunks: Vec::new(),
                 selected: Vec::new(),
+                cursor: 0,
             },
         );
 
@@ -5141,6 +7947,7 @@ mod tests {
                 path: None,
                 hunks: Vec::new(),
                 selected: Vec::new(),
+                cursor: 0,
             },
         );
         (app, tx, rx)
@@ -5174,6 +7981,7 @@ mod tests {
                 path: None,
                 selected: vec![true; hunks.len()],
                 hunks,
+                cursor: 0,
             },
         );
         app
@@ -5733,7 +8541,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.open_picker(PickerKind::Commands, &tx);
-        for c in "git work".chars() {
+        for c in "git worktrees".chars() {
             app.handle_picker_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE), &tx);
         }
         let filtered = app.picker_filtered();
@@ -5803,9 +8611,15 @@ mod tests {
         let mut app = App::new(None);
         app.focus = Focus::Input;
 
+        // Leaving insert mode does not arm the gesture.
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Input));
         assert_eq!(app.input.mode(), Mode::Normal);
+        assert!(app.esc_at.is_none());
+
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(matches!(app.focus, Focus::Input));
+        assert!(app.esc_at.is_some());
 
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Transcript));
@@ -5907,22 +8721,40 @@ mod tests {
     }
 
     #[test]
-    fn prompt_normal_mode_j_and_k_scroll_the_transcript() {
+    fn prompt_normal_mode_j_and_k_browse_submitted_history() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
-        app.views.push(SessionView::new(
-            Session::new("s1", "one", "/tmp"),
-            Vec::new(),
-        ));
+        let events = vec![
+            SessionEvent::new(
+                "s1",
+                1,
+                EventKind::UserMessage,
+                serde_json::json!({ "text": "first" }),
+            ),
+            SessionEvent::new(
+                "s1",
+                2,
+                EventKind::UserMessage,
+                serde_json::json!({ "text": "second" }),
+            ),
+        ];
+        app.views
+            .push(SessionView::new(Session::new("s1", "one", "/tmp"), events));
         app.focused = 0;
-        app.views[0].scroll = 5;
         app.focus_input();
+        app.input.set_text("draft");
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
-        assert_eq!(app.views[0].scroll, 6);
+        // `k` recalls newest first; the live draft is restored by `j`.
         app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), &tx);
-        assert_eq!(app.views[0].scroll, 5);
+        assert_eq!(app.input.text(), "second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.input.text(), "first");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.input.text(), "second");
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.input.text(), "draft");
+        assert!(app.history_index.is_none());
     }
 
     #[test]
@@ -5943,5 +8775,456 @@ mod tests {
         app.picker = None;
         app.run_action("not-an-action", &tx);
         assert!(app.picker.is_none());
+    }
+
+    fn input_app() -> (
+        App,
+        UnboundedSender<Command>,
+        tokio::sync::mpsc::UnboundedReceiver<Command>,
+    ) {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "ask", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.inputs.insert(
+            "s1".to_string(),
+            PendingInput {
+                input_id: "i1".to_string(),
+                call_id: "c1".to_string(),
+                question: "Which database?".to_string(),
+                options: vec![
+                    InputOption {
+                        label: "SQLite".to_string(),
+                        description: Some("embedded".to_string()),
+                    },
+                    InputOption {
+                        label: "Postgres".to_string(),
+                        description: None,
+                    },
+                    InputOption {
+                        label: "MySQL".to_string(),
+                        description: None,
+                    },
+                ],
+                cursor: 0,
+            },
+        );
+        (app, tx, rx)
+    }
+
+    #[test]
+    fn input_keys_pick_options_and_enter_answers() {
+        let (mut app, tx, mut rx) = input_app();
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+
+        app.handle_transcript_key(key(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.focused_input().expect("pending").cursor, 1);
+        app.handle_transcript_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(app.focused_input().expect("pending").cursor, 0);
+        app.handle_transcript_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL), &tx);
+        assert_eq!(app.focused_input().expect("pending").cursor, 1);
+
+        app.handle_transcript_key(key(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("input command") {
+            Command::Input {
+                session_id,
+                input_id,
+                option_index,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(input_id, "i1");
+                assert_eq!(option_index, 1);
+            }
+            _ => panic!("expected an input command"),
+        }
+    }
+
+    #[test]
+    fn number_keys_answer_without_moving_the_cursor() {
+        let (mut app, tx, mut rx) = input_app();
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("input command") {
+            Command::Input { option_index, .. } => assert_eq!(option_index, 2),
+            _ => panic!("expected an input command"),
+        }
+    }
+
+    #[test]
+    fn pending_input_replays_from_events() {
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::InputRequired,
+            eix_core::payload(&InputRequiredPayload {
+                input_id: "i1".to_string(),
+                call_id: "c1".to_string(),
+                question: "Which?".to_string(),
+                options: vec![
+                    InputOption {
+                        label: "A".to_string(),
+                        description: None,
+                    },
+                    InputOption {
+                        label: "B".to_string(),
+                        description: None,
+                    },
+                ],
+            }),
+        )];
+        let view = SessionView::new(Session::new("s1", "ask", "/tmp"), events);
+        let pending = view.pending_input().expect("pending question");
+        assert_eq!(pending.question, "Which?");
+        assert_eq!(pending.options.len(), 2);
+        assert_eq!(pending.cursor, 0);
+    }
+
+    #[test]
+    fn approval_actions_lead_with_the_recommendation() {
+        let mut approval = PendingApproval {
+            kind: PendingKind::Tool,
+            approval_id: "a1".to_string(),
+            call_id: "c1".to_string(),
+            tool: "run_command".to_string(),
+            summary: "run_command: ls".to_string(),
+            diff: None,
+            path: None,
+            hunks: Vec::new(),
+            selected: Vec::new(),
+            cursor: 0,
+        };
+        assert_eq!(
+            approval.actions(),
+            vec![
+                ApprovalAction::Approve,
+                ApprovalAction::Always,
+                ApprovalAction::Deny,
+                ApprovalAction::Reason
+            ]
+        );
+        approval.path = Some("src/main.rs".to_string());
+        approval.diff = Some("@@ -1 +1 @@".to_string());
+        assert_eq!(
+            approval.actions(),
+            vec![
+                ApprovalAction::Approve,
+                ApprovalAction::Always,
+                ApprovalAction::Review,
+                ApprovalAction::Open,
+                ApprovalAction::Deny,
+                ApprovalAction::Reason,
+            ]
+        );
+        assert_eq!(approval.action_label(ApprovalAction::Approve), "Approve");
+        approval.kind = PendingKind::Patch;
+        assert_eq!(
+            approval.action_label(ApprovalAction::Approve),
+            "Apply change"
+        );
+    }
+
+    #[test]
+    fn enter_approves_the_recommended_action() {
+        let (mut app, tx, mut rx) = input_app();
+        app.inputs.clear();
+        app.approvals.insert(
+            "s1".to_string(),
+            PendingApproval {
+                kind: PendingKind::Tool,
+                approval_id: "a1".to_string(),
+                call_id: "c1".to_string(),
+                tool: "run_command".to_string(),
+                summary: "run_command: ls".to_string(),
+                diff: None,
+                path: None,
+                hunks: Vec::new(),
+                selected: Vec::new(),
+                cursor: 0,
+            },
+        );
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("approval command") {
+            Command::Approval { decision, .. } => {
+                assert_eq!(decision, ApprovalDecision::Approve)
+            }
+            _ => panic!("expected an approval command"),
+        }
+    }
+
+    fn session_pane(id: &str, name: &str) -> SessionView {
+        SessionView::new(Session::new(id, name, "/tmp"), Vec::new())
+    }
+
+    #[test]
+    fn slash_exit_saves_and_closes_the_focused_pane() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.views.push(session_pane("s2", "two"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.set_text("/exit");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(!app.should_quit, "another pane is still open");
+        assert_eq!(app.views.len(), 1);
+        assert_eq!(app.views[0].session.id, "s2");
+        assert!(app.input.is_empty(), "the command line is cleared");
+        match rx.try_recv().expect("draft save") {
+            Command::DraftSet { session_id, text } => {
+                assert_eq!(session_id, "s1");
+                assert!(text.is_empty(), "the command is not kept as a draft");
+            }
+            _ => panic!("expected a draft save"),
+        }
+    }
+
+    #[test]
+    fn slash_quit_on_the_last_pane_quits_after_saving() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.set_text("/quit");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.should_quit, "the last pane quits the app");
+        assert_eq!(app.views.len(), 1);
+        match rx.try_recv().expect("draft save") {
+            Command::DraftSet { session_id, text } => {
+                assert_eq!(session_id, "s1");
+                assert!(text.is_empty());
+            }
+            _ => panic!("expected a draft save"),
+        }
+    }
+
+    #[test]
+    fn submitting_while_busy_queues_and_flushes_when_idle() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.views[0].session.status = SessionStatus::Running;
+        app.input.set_text("next prompt");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert_eq!(app.queue_len("s1"), 1);
+        assert!(app.input.is_empty());
+        let mut submitted = false;
+        while let Ok(command) = rx.try_recv() {
+            if matches!(command, Command::Submit { .. }) {
+                submitted = true;
+            }
+        }
+        assert!(!submitted, "busy sessions must not receive a submit");
+
+        app.views[0].session.status = SessionStatus::Idle;
+        app.tick(&tx);
+        let mut text = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::Submit { text: value, .. } = command {
+                text = Some(value);
+            }
+        }
+        assert_eq!(text.as_deref(), Some("next prompt"));
+        assert!(app.submitting);
+        assert_eq!(app.queue_len("s1"), 0);
+    }
+
+    #[test]
+    fn a_busy_race_requeues_the_inflight_prompt() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.views[0].session.status = SessionStatus::Running;
+        app.input.set_text("queued");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        app.views[0].session.status = SessionStatus::Idle;
+        app.tick(&tx);
+        while rx.try_recv().is_ok() {}
+
+        app.handle_event(
+            Event::Error {
+                context: "submit".into(),
+                message: "session s1 is already running".into(),
+            },
+            &tx,
+        );
+        assert!(!app.submitting);
+        assert_eq!(app.queue_len("s1"), 1);
+
+        app.tick(&tx);
+        let mut text = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::Submit { text: value, .. } = command {
+                text = Some(value);
+            }
+        }
+        assert_eq!(text.as_deref(), Some("queued"));
+    }
+
+    #[test]
+    fn a_stale_busy_error_queues_the_prompt() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.set_text("retry me");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        while rx.try_recv().is_ok() {}
+
+        // The TUI thought the session was idle, but the daemon was busy.
+        app.handle_event(
+            Event::Error {
+                context: "submit".into(),
+                message: "busy: session s1 is already running".into(),
+            },
+            &tx,
+        );
+        assert_eq!(app.queue_len("s1"), 1);
+        assert!(app.input.is_empty());
+        assert!(app.error.is_none());
+        assert!(!app.submitting);
+    }
+
+    #[test]
+    fn double_esc_in_normal_mode_interrupts_a_running_turn() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.views[0].session.status = SessionStatus::Running;
+        app.focus_input();
+        let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
+        app.handle_input_key(esc, &tx); // insert -> normal
+        app.handle_input_key(esc, &tx); // arm
+        app.handle_input_key(esc, &tx); // interrupt
+        let mut cancelled = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::Cancel(id) = command {
+                cancelled = Some(id);
+            }
+        }
+        assert_eq!(cancelled.as_deref(), Some("s1"));
+        assert!(matches!(app.focus, Focus::Input));
+    }
+
+    #[test]
+    fn slash_commands_dispatch_requests_and_clear_the_prompt() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+
+        app.input.set_text("/clear");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.input.is_empty());
+        let mut cleared = false;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::ClearContext { session_id } = command {
+                assert_eq!(session_id, "s1");
+                cleared = true;
+            }
+        }
+        assert!(cleared);
+
+        app.input.set_text("/cd /tmp");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let mut cwd = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::SetCwd { path, .. } = command {
+                cwd = Some(path);
+            }
+        }
+        assert_eq!(cwd.as_deref(), Some("/tmp"));
+
+        app.input.set_text("/compact tighten it");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let mut notes = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::CompactContext { notes: value, .. } = command {
+                notes = value;
+            }
+        }
+        assert_eq!(notes.as_deref(), Some("tighten it"));
+
+        app.input.set_text("/btw why is the sky blue?");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let mut question = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::Btw {
+                question: value, ..
+            } = command
+            {
+                question = Some(value);
+            }
+        }
+        assert_eq!(question.as_deref(), Some("why is the sky blue?"));
+        assert!(app.btw.is_some());
+        app.btw = None;
+
+        app.input.set_text("/help");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.help);
+
+        app.input.set_text("/init");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.input.text().contains("AGENTS.md"));
+        let mut submitted = false;
+        while let Ok(command) = rx.try_recv() {
+            if matches!(command, Command::Submit { .. }) {
+                submitted = true;
+            }
+        }
+        assert!(!submitted, "/init only stages a prompt");
+    }
+
+    #[test]
+    fn command_menu_filters_completes_and_runs() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.focus_input();
+        app.input.set_text("/cl");
+        assert!(app.command_menu_open());
+        let names: Vec<&str> = app
+            .command_matches()
+            .iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert!(names.contains(&"clear"), "{names:?}");
+        assert!(names.iter().all(|name| name.starts_with("cl")), "{names:?}");
+        app.complete_command();
+        assert_eq!(app.input.text(), "/clear");
+
+        app.input.set_text("/hel");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.help, "Enter runs the highlighted command");
+    }
+
+    #[test]
+    fn a_message_mentioning_slash_exit_is_still_sent() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.set_text("please run /exit later");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(!app.should_quit);
+        assert_eq!(app.views.len(), 1);
+        match rx.try_recv().expect("submit") {
+            Command::Submit { text, .. } => assert_eq!(text, "please run /exit later"),
+            _ => panic!("expected a submit"),
+        }
     }
 }

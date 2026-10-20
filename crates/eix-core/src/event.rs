@@ -19,6 +19,10 @@ pub enum EventKind {
     PatchRejected,
     PatchConflict,
     ApprovalRequired,
+    /// The model asked the user a question and is waiting for an answer.
+    InputRequired,
+    /// The user answered an `InputRequired`.
+    InputAnswered,
     /// Pre-execution snapshot of what a mutating tool is about to touch.
     Snapshot,
     /// A background process started / finished. Output is not an event.
@@ -28,6 +32,9 @@ pub enum EventKind {
     ContextCompacted,
     ContextPinned,
     ContextDropped,
+    /// Everything before this event is ignored when rebuilding provider
+    /// messages. The transcript and event log keep it.
+    ContextCleared,
     /// A session's permission level changed (including temporary escalation).
     Permission,
     Error,
@@ -45,6 +52,8 @@ impl EventKind {
             Self::PatchRejected => "patch_rejected",
             Self::PatchConflict => "patch_conflict",
             Self::ApprovalRequired => "approval_required",
+            Self::InputRequired => "input_required",
+            Self::InputAnswered => "input_answered",
             Self::Snapshot => "snapshot",
             Self::ProcessStarted => "process_started",
             Self::ProcessExited => "process_exited",
@@ -52,6 +61,7 @@ impl EventKind {
             Self::ContextCompacted => "context_compacted",
             Self::ContextPinned => "context_pinned",
             Self::ContextDropped => "context_dropped",
+            Self::ContextCleared => "context_cleared",
             Self::Permission => "permission",
             Self::Error => "error",
         }
@@ -77,6 +87,8 @@ impl std::str::FromStr for EventKind {
             "patch_rejected" => Self::PatchRejected,
             "patch_conflict" => Self::PatchConflict,
             "approval_required" => Self::ApprovalRequired,
+            "input_required" => Self::InputRequired,
+            "input_answered" => Self::InputAnswered,
             "snapshot" => Self::Snapshot,
             "process_started" => Self::ProcessStarted,
             "process_exited" => Self::ProcessExited,
@@ -84,6 +96,7 @@ impl std::str::FromStr for EventKind {
             "context_compacted" => Self::ContextCompacted,
             "context_pinned" => Self::ContextPinned,
             "context_dropped" => Self::ContextDropped,
+            "context_cleared" => Self::ContextCleared,
             "permission" => Self::Permission,
             "error" => Self::Error,
             _ => return Err(()),
@@ -120,12 +133,37 @@ impl Event {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UserMessagePayload {
     pub text: String,
+    /// Images attached to this prompt. New prompts reference content-addressed
+    /// blobs; legacy events may still carry inline base64.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    /// Path as entered by the user, for display.
+    pub path: String,
+    pub mime: String,
+    /// Base64, without the `data:` prefix. New prompts leave this empty and
+    /// reference `blob`; older events remain readable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data: String,
+    /// Content-addressed blob id under `<data>/blobs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    /// Original image size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AssistantMessagePayload {
     pub text: String,
     pub model: String,
+    /// Streamed chain-of-thought, when the provider exposed it. Display-only:
+    /// it is never sent back as a chat message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
     /// True when the turn was cancelled and only a partial answer was kept.
     #[serde(default)]
     pub cancelled: bool,
@@ -201,6 +239,33 @@ pub struct PatchResultPayload {
     pub snapshot_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// One selectable answer to an `ask_user` question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The model asked the user a multiple-choice question and is blocked until
+/// they answer. `options` is ordered best-first; index 0 is the recommendation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputRequiredPayload {
+    pub input_id: String,
+    pub call_id: String,
+    pub question: String,
+    pub options: Vec<InputOption>,
+}
+
+/// The user's answer to an `InputRequired`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputAnsweredPayload {
+    pub input_id: String,
+    pub call_id: String,
+    pub answer: String,
+    pub option_index: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +353,12 @@ pub struct ContextCompactedPayload {
     pub summary: String,
 }
 
+/// Everything with `seq <=` this event's sequence is excluded from provider
+/// messages. The log keeps it so the transcript stays complete and the user can
+/// still search it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextClearedPayload {}
+
 /// A background process was started by `start_command`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessStartedPayload {
@@ -334,6 +405,8 @@ mod tests {
             EventKind::PatchRejected,
             EventKind::PatchConflict,
             EventKind::ApprovalRequired,
+            EventKind::InputRequired,
+            EventKind::InputAnswered,
             EventKind::Snapshot,
             EventKind::ProcessStarted,
             EventKind::ProcessExited,
@@ -351,12 +424,16 @@ mod tests {
 
     #[test]
     fn message_payloads() {
-        let user = payload(&UserMessagePayload { text: "hi".into() });
+        let user = payload(&UserMessagePayload {
+            text: "hi".into(),
+            images: Vec::new(),
+        });
         assert_eq!(user["text"], "hi");
 
         let assistant = payload(&AssistantMessagePayload {
             text: "yo".into(),
             model: "m".into(),
+            reasoning: None,
             cancelled: false,
             usage: None,
             tool_calls: Vec::new(),

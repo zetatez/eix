@@ -5,6 +5,7 @@
 //! driven from the same types.
 
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -34,6 +35,20 @@ fn function_type() -> String {
     "function".to_string()
 }
 
+/// One image attached to a user message. `data` is base64 (no data-URL
+/// prefix); `mime` is `image/png`, `image/jpeg`, ... .
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImagePart {
+    pub mime: String,
+    pub data: String,
+}
+
+impl ImagePart {
+    pub fn data_url(&self) -> String {
+        format!("data:{};base64,{}", self.mime, self.data)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ChatMessage {
     pub role: Role,
@@ -46,6 +61,9 @@ pub struct ChatMessage {
     /// Present on `role: tool` messages, linking the result to its call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
+    /// Attached images for multimodal user messages.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImagePart>,
 }
 
 impl ChatMessage {
@@ -55,6 +73,12 @@ impl ChatMessage {
 
     pub fn user(content: impl Into<String>) -> Self {
         Self::new(Role::User, content)
+    }
+
+    pub fn user_with_images(content: impl Into<String>, images: Vec<ImagePart>) -> Self {
+        let mut message = Self::new(Role::User, content);
+        message.images = images;
+        message
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
@@ -80,7 +104,40 @@ impl ChatMessage {
             name: None,
             tool_calls: None,
             tool_call_id: None,
+            images: Vec::new(),
         }
+    }
+
+    /// OpenAI-compatible wire object. Text-only messages keep `content` as a
+    /// string so providers that do not understand content parts keep working;
+    /// image messages use the multimodal array form.
+    pub fn to_wire(&self) -> Value {
+        let content = if self.images.is_empty() {
+            json!(self.content)
+        } else {
+            let mut parts = Vec::new();
+            if !self.content.is_empty() {
+                parts.push(json!({ "type": "text", "text": self.content }));
+            }
+            for image in &self.images {
+                parts.push(json!({
+                    "type": "image_url",
+                    "image_url": { "url": image.data_url() },
+                }));
+            }
+            Value::Array(parts)
+        };
+        let mut value = json!({ "role": self.role, "content": content });
+        if let Some(name) = &self.name {
+            value["name"] = json!(name);
+        }
+        if let Some(tool_calls) = &self.tool_calls {
+            value["tool_calls"] = serde_json::to_value(tool_calls).unwrap_or(Value::Null);
+        }
+        if let Some(tool_call_id) = &self.tool_call_id {
+            value["tool_call_id"] = json!(tool_call_id);
+        }
+        value
     }
 }
 
@@ -160,6 +217,25 @@ mod tests {
         let value = serde_json::to_value(&result).unwrap();
         assert_eq!(value["role"], "tool");
         assert_eq!(value["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn image_only_messages_use_content_parts() {
+        let message = ChatMessage::user_with_images(
+            "",
+            vec![ImagePart {
+                mime: "image/png".into(),
+                data: "aGVsbG8=".into(),
+            }],
+        );
+        let wire = message.to_wire();
+        assert_eq!(wire["role"], "user");
+        assert_eq!(wire["content"].as_array().unwrap().len(), 1);
+        assert_eq!(wire["content"][0]["type"], "image_url");
+        assert_eq!(
+            wire["content"][0]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
     }
 
     #[test]

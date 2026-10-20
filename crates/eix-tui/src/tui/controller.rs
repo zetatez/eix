@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use eix_core::{
     ApprovalDecision, ApprovalResult, AttachResult, CancelResult, ContextLedgerResult, Endpoint,
-    HelloResult, Notification, ProcessKillResult, ProcessList, ProcessOutput, RewindResult,
-    SearchResult, Session, SessionList, SessionResult, SubmitResult,
+    HelloResult, InputResult, LspWorkspaceResult, Notification, ProcessKillResult, ProcessList,
+    ProcessOutput, RewindResult, SearchResult, Session, SessionList, SessionResult, SubmitResult,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -25,10 +25,105 @@ pub enum Command {
     Create {
         /// Create the session in its own git worktree.
         worktree: bool,
+        /// Working directory; defaults to the TUI's launch directory.
+        cwd: Option<PathBuf>,
+        /// Optional name; the daemon generates one when omitted.
+        name: Option<String>,
+        /// Defaults from cli.json (unless overridden on the command line).
+        model: Option<String>,
+        agent: Option<String>,
+        permission: Option<String>,
+    },
+    /// Move a session to another working directory.
+    SetCwd {
+        session_id: String,
+        path: String,
+    },
+    /// Drop everything before now from the model context.
+    ClearContext {
+        session_id: String,
+    },
+    /// Summarize the whole context so the next turn starts small.
+    CompactContext {
+        session_id: String,
+        notes: Option<String>,
+    },
+    /// Change the session's tool permission level.
+    SetPermission {
+        session_id: String,
+        permission: eix_core::PermissionLevel,
+        temporary: bool,
+    },
+    /// Pin the session to one of the configured models.
+    SetModel {
+        session_id: String,
+        model: Option<String>,
+    },
+    /// Select the session's primary agent.
+    SetAgent {
+        session_id: String,
+        agent: Option<String>,
+    },
+    /// List models configured for `/models`.
+    ListModels,
+    /// List agents visible from a session's workspace.
+    ListAgents {
+        session_id: String,
+    },
+    /// List configured MCP servers and their tool counts.
+    ListMcp,
+    /// Re-read the daemon config files.
+    ReloadConfig,
+    /// Write an exported session JSON to a file.
+    ExportSession {
+        session_id: String,
+        path: Option<PathBuf>,
+    },
+    /// Hide or restore a session.
+    ArchiveSession {
+        session_id: String,
+        archived: bool,
+    },
+    /// Delete a session and its event log.
+    DeleteSession {
+        session_id: String,
+    },
+    /// Fetch recent turns/tool calls for the status line.
+    TimelineData {
+        session_id: String,
+        limit: Option<usize>,
+    },
+    /// Run a user-typed shell command in the session workspace.
+    RunShell {
+        session_id: String,
+        command: String,
+    },
+    /// Read the model-managed task list.
+    ListTodos {
+        session_id: String,
+    },
+    /// Aggregate language-server diagnostics for the whole workspace.
+    Diagnostics {
+        session_id: String,
+        max_files: Option<usize>,
+    },
+    /// Hide or restore the newest turn.
+    Undo {
+        session_id: String,
+        redo: bool,
+    },
+    /// Ask a one-off side question (never written to the session log).
+    Btw {
+        session_id: String,
+        question: String,
+    },
+    BtwCancel {
+        session_id: String,
     },
     Submit {
         session_id: String,
         text: String,
+        images: Vec<String>,
     },
     Cancel(String),
     Approval {
@@ -38,6 +133,12 @@ pub enum Command {
         /// Selected hunk indices; `None` applies the whole change.
         hunks: Option<Vec<usize>>,
         reason: Option<String>,
+    },
+    /// Answer an `ask_user` question with the option at `option_index`.
+    Input {
+        session_id: String,
+        input_id: String,
+        option_index: usize,
     },
     ContextLedger {
         session_id: String,
@@ -109,9 +210,30 @@ impl Command {
             Self::List => "list",
             Self::Attach(_) => "attach",
             Self::Create { .. } => "create",
+            Self::SetCwd { .. } => "cd",
+            Self::ClearContext { .. } => "clear",
+            Self::CompactContext { .. } => "compact",
+            Self::SetPermission { .. } => "permission",
+            Self::SetModel { .. } => "model",
+            Self::SetAgent { .. } => "agent",
+            Self::ListModels | Self::ListAgents { .. } => "catalog",
+            Self::ListMcp => "mcp",
+            Self::ReloadConfig => "reload",
+            Self::ExportSession { .. } => "export",
+            Self::ArchiveSession { .. } => "archive",
+            Self::DeleteSession { .. } => "delete",
+            Self::TimelineData { .. } => "timeline",
+            Self::ListTodos { .. } => "todos",
+            Self::Diagnostics { .. } => "diagnostics",
+            Self::RunShell { .. } => "shell",
+            Self::Undo { redo: false, .. } => "undo",
+            Self::Undo { redo: true, .. } => "redo",
+            Self::Btw { .. } => "btw",
+            Self::BtwCancel { .. } => "btw",
             Self::Submit { .. } => "submit",
             Self::Cancel(_) => "cancel",
             Self::Approval { .. } => "approval",
+            Self::Input { .. } => "answer",
             Self::ContextLedger { .. } | Self::ContextOp { .. } => "context",
             Self::ProcessList { .. } => "processes",
             Self::ProcessOutput { .. } => "process output",
@@ -133,10 +255,30 @@ pub enum Event {
     Sessions(Vec<Session>),
     Attached(AttachResult),
     Created(Session),
+    /// A session's cwd or permission changed; the view replays it.
+    Updated(Session),
+    ContextCleared {
+        session_id: String,
+    },
+    Compacted {
+        session_id: String,
+        entries: usize,
+        tokens: usize,
+    },
+    BtwStarted {
+        session_id: String,
+        btw_id: String,
+    },
+    BtwCancelled {
+        session_id: String,
+    },
     Submitted(SubmitResult),
     Cancelled(bool),
     Approval {
         approval_id: String,
+        accepted: bool,
+    },
+    InputResponded {
         accepted: bool,
     },
     Ledger {
@@ -161,6 +303,25 @@ pub enum Event {
         kind: String,
         items: Vec<eix_core::PickerItem>,
     },
+    Models(Vec<eix_core::ModelInfo>),
+    Agents(Vec<eix_core::AgentSpec>),
+    Mcp(Vec<eix_core::McpServerInfo>),
+    ConfigReloaded {
+        paths: Vec<String>,
+    },
+    Exported {
+        path: Option<PathBuf>,
+    },
+    Archived(Session),
+    Deleted(String),
+    Timeline(Vec<eix_core::TimelineItem>),
+    Rewritten(String),
+    Todos(Vec<eix_core::TodoItem>),
+    Diagnostics(LspWorkspaceResult),
+    ShellRan {
+        ok: bool,
+        output: String,
+    },
     Draft {
         session_id: String,
         text: String,
@@ -182,10 +343,14 @@ pub fn spawn(
     endpoint: Endpoint,
     data_dir: PathBuf,
     config: Option<PathBuf>,
-) -> (UnboundedSender<Command>, UnboundedReceiver<Event>) {
+) -> (
+    UnboundedSender<Command>,
+    UnboundedReceiver<Event>,
+    tokio::task::JoinHandle<()>,
+) {
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (ev_tx, ev_rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         if let Err(err) = run(endpoint, data_dir, config, cmd_rx, ev_tx.clone()).await {
             let _ = ev_tx.send(Event::Error {
                 context: "connect".into(),
@@ -193,7 +358,7 @@ pub fn spawn(
             });
         }
     });
-    (cmd_tx, ev_rx)
+    (cmd_tx, ev_rx, handle)
 }
 
 async fn run(
@@ -241,7 +406,7 @@ async fn dispatch(
     command: Command,
     requester: &Requester,
     events: &UnboundedSender<Event>,
-    cwd: &Path,
+    default_cwd: &Path,
 ) -> Result<()> {
     match command {
         Command::Hello => {
@@ -259,24 +424,261 @@ async fn dispatch(
                 .await?;
             send(events, Event::Attached(decode(value)?))
         }
-        Command::Create { worktree } => {
+        Command::Create {
+            worktree,
+            cwd,
+            name,
+            model,
+            agent,
+            permission,
+        } => {
+            let cwd = cwd.unwrap_or_else(|| default_cwd.to_path_buf());
             let value = requester
                 .request(
                     "session.create",
                     json!({
                         "cwd": cwd,
                         "worktree": worktree,
+                        "name": name,
+                        "model": model,
+                        "agent": agent,
+                        "permission": permission,
                     }),
                 )
                 .await?;
             let result: SessionResult = decode(value)?;
             send(events, Event::Created(result.session))
         }
-        Command::Submit { session_id, text } => {
+        Command::SetCwd { session_id, path } => {
+            let value = requester
+                .request(
+                    "session.cd",
+                    json!({ "session_id": session_id, "path": path }),
+                )
+                .await?;
+            let result: SessionResult = decode(value)?;
+            send(events, Event::Updated(result.session))
+        }
+        Command::ClearContext { session_id } => {
+            let value = requester
+                .request("context.clear", json!({ "session_id": session_id }))
+                .await?;
+            let _: eix_core::ContextLedgerResult = decode(value)?;
+            send(events, Event::ContextCleared { session_id })
+        }
+        Command::CompactContext { session_id, notes } => {
+            let value = requester
+                .request(
+                    "context.compact",
+                    json!({
+                        "session_id": session_id,
+                        "summary": notes,
+                        "generate": true,
+                    }),
+                )
+                .await?;
+            let ledger: eix_core::ContextLedgerResult = decode(value)?;
+            let entries = ledger.entries.len();
+            let tokens = ledger.total_tokens;
+            send(
+                events,
+                Event::Compacted {
+                    session_id,
+                    entries,
+                    tokens,
+                },
+            )
+        }
+        Command::SetPermission {
+            session_id,
+            permission,
+            temporary,
+        } => {
+            let value = requester
+                .request(
+                    "session.permission",
+                    json!({
+                        "session_id": session_id,
+                        "permission": permission,
+                        "temporary": temporary,
+                    }),
+                )
+                .await?;
+            let result: SessionResult = decode(value)?;
+            send(events, Event::Updated(result.session))
+        }
+        Command::SetModel { session_id, model } => {
+            let value = requester
+                .request(
+                    "session.model",
+                    json!({ "session_id": session_id, "model": model }),
+                )
+                .await?;
+            let result: SessionResult = decode(value)?;
+            send(events, Event::Updated(result.session))
+        }
+        Command::SetAgent { session_id, agent } => {
+            let value = requester
+                .request(
+                    "session.agent",
+                    json!({ "session_id": session_id, "agent": agent }),
+                )
+                .await?;
+            let result: SessionResult = decode(value)?;
+            send(events, Event::Updated(result.session))
+        }
+        Command::ListModels => {
+            let value = requester.request("model.list", Value::Null).await?;
+            let result: eix_core::ModelListResult = decode(value)?;
+            send(events, Event::Models(result.models))
+        }
+        Command::ListAgents { session_id } => {
+            let value = requester
+                .request("agent.list", json!({ "session_id": session_id }))
+                .await?;
+            let result: eix_core::AgentListResult = decode(value)?;
+            send(events, Event::Agents(result.agents))
+        }
+        Command::ListMcp => {
+            let value = requester.request("mcp.list", Value::Null).await?;
+            let result: eix_core::McpListResult = decode(value)?;
+            send(events, Event::Mcp(result.servers))
+        }
+        Command::ExportSession { session_id, path } => {
+            let value = requester
+                .request("session.export", json!({ "session_id": session_id }))
+                .await?;
+            let result: eix_core::SessionExportResult = decode(value)?;
+            if let Some(path) = path {
+                tokio::fs::write(&path, &result.json)
+                    .await
+                    .with_context(|| format!("cannot write {}", path.display()))?;
+                send(events, Event::Exported { path: Some(path) })
+            } else {
+                send(events, Event::Exported { path: None })
+            }
+        }
+        Command::ArchiveSession {
+            session_id,
+            archived,
+        } => {
+            let value = requester
+                .request(
+                    "session.archive",
+                    json!({ "session_id": session_id, "archived": archived }),
+                )
+                .await?;
+            let result: eix_core::SessionResult = decode(value)?;
+            send(events, Event::Archived(result.session))
+        }
+        Command::DeleteSession { session_id } => {
+            requester
+                .request("session.delete", json!({ "session_id": session_id }))
+                .await?;
+            send(events, Event::Deleted(session_id))
+        }
+        Command::TimelineData { session_id, limit } => {
+            let value = requester
+                .request(
+                    "session.timeline",
+                    json!({ "session_id": session_id, "limit": limit }),
+                )
+                .await?;
+            let result: eix_core::TimelineResult = decode(value)?;
+            send(events, Event::Timeline(result.items))
+        }
+        Command::RunShell {
+            session_id,
+            command,
+        } => {
+            let value = requester
+                .request(
+                    "shell.run",
+                    json!({ "session_id": session_id, "command": command }),
+                )
+                .await?;
+            let result: eix_core::ShellRunResult = decode(value)?;
+            send(
+                events,
+                Event::ShellRan {
+                    ok: result.ok,
+                    output: result.output,
+                },
+            )
+        }
+        Command::ListTodos { session_id } => {
+            let value = requester
+                .request("session.todos", json!({ "session_id": session_id }))
+                .await?;
+            let result: eix_core::TodoList = decode(value)?;
+            send(events, Event::Todos(result.items))
+        }
+        Command::Diagnostics {
+            session_id,
+            max_files,
+        } => {
+            let value = requester
+                .request(
+                    "lsp.workspace",
+                    json!({ "session_id": session_id, "max_files": max_files }),
+                )
+                .await?;
+            send(events, Event::Diagnostics(decode(value)?))
+        }
+        Command::Undo { session_id, redo } => {
+            let method = if redo { "session.redo" } else { "session.undo" };
+            requester
+                .request(method, json!({ "session_id": session_id }))
+                .await?;
+            send(events, Event::Rewritten(session_id))
+        }
+        Command::ReloadConfig => {
+            let value = requester.request("config.reload", Value::Null).await?;
+            let paths = value["paths"]
+                .as_array()
+                .map(|paths| {
+                    paths
+                        .iter()
+                        .filter_map(|path| path.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            send(events, Event::ConfigReloaded { paths })
+        }
+        Command::Btw {
+            session_id,
+            question,
+        } => {
+            let value = requester
+                .request(
+                    "session.btw",
+                    json!({ "session_id": session_id, "question": question }),
+                )
+                .await?;
+            let result: eix_core::BtwResult = decode(value)?;
+            send(
+                events,
+                Event::BtwStarted {
+                    session_id,
+                    btw_id: result.btw_id,
+                },
+            )
+        }
+        Command::BtwCancel { session_id } => {
+            requester
+                .request("btw.cancel", json!({ "session_id": session_id }))
+                .await?;
+            send(events, Event::BtwCancelled { session_id })
+        }
+        Command::Submit {
+            session_id,
+            text,
+            images,
+        } => {
             let value = requester
                 .request(
                     "prompt.submit",
-                    json!({ "session_id": session_id, "text": text }),
+                    json!({ "session_id": session_id, "text": text, "images": images }),
                 )
                 .await?;
             send(events, Event::Submitted(decode(value)?))
@@ -312,6 +714,29 @@ async fn dispatch(
                 events,
                 Event::Approval {
                     approval_id,
+                    accepted: result.accepted,
+                },
+            )
+        }
+        Command::Input {
+            session_id,
+            input_id,
+            option_index,
+        } => {
+            let value = requester
+                .request(
+                    "input.respond",
+                    json!({
+                        "session_id": session_id,
+                        "input_id": input_id,
+                        "option_index": option_index,
+                    }),
+                )
+                .await?;
+            let result: InputResult = decode(value)?;
+            send(
+                events,
+                Event::InputResponded {
                     accepted: result.accepted,
                 },
             )

@@ -31,7 +31,7 @@
 | 内核 | 从零手写 | 上下文与工具策略完全可控 | 工作量与质量风险 |
 | provider | 优先 OpenAI 兼容接口 | 一套 adapter 覆盖 OpenAI / Ollama / vLLM / OpenRouter 等，本地模型零成本接入 | 各家非标准字段需归一 |
 | leader | `<Space>`（仅 normal 模式） | 单字母全部留给 vim；落在同一前缀上 | insert 下不可用，用 `<C-g>` 补充 |
-| 转录 | ratatui 自绘 + vim 子集键位 | 流式/审批卡片/性能可控 | 需维护一套只读导航键位 |
+| 转录 | ratatui 自绘 + 对话式布局 + 可折叠块 | 流式 reasoning/工具/审批卡片可见，性能可控 | 需维护一套只读导航键位 |
 | 审批 | propose → stage → apply | hunk 级审批才有意义；可回滚 | 需虚拟工作区/补丁暂存 |
 | 上下文 | 可见且可编辑的 context ledger | 既是 UX 也是回答质量 | 中等额外工作量 |
 
@@ -237,19 +237,49 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 | 键 | 行为 |
 |---|---|
-| `<CR>` | 提交（仅 insert） |
+| `<CR>` | 提交（仅 insert）；turn 运行中提交会进入该 session 的队列，当前 turn 结束后按序发出 |
+| `/命令` | 整条消息作为 prompt 命令处理，不发给模型（见下表） |
 | `<C-j>` / `<C-Enter>` / `<S-Enter>` | 换行（仅 insert） |
 | `@` | 文件 picker（行首/空白后） |
-| `Esc` | insert/visual → normal；normal 下再按一次回转录区 |
+| `Esc` | insert/visual → normal；normal 下 500ms 内再按一次：有 turn 在跑时中断它，否则回到转录区 |
+| plain `j` / `k` | normal 模式下浏览已提交的 prompt 历史（`3j`、`dj`、方向键仍是草稿内移动） |
 | `<Space>s/f/w/b/c/C/h/p/r/N/W/F/x/q/a/:/?` | TUI 动作（见 5.1） |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
 | `d c y` + motion / `dd cc yy` / `iw aw` | 操作符 |
 | `v V` + `d x y c p ~ o` | visual |
 
+**prompt 命令**（输入框里以整条消息发送的 `/命令`；输入 `/` 时在输入框上方弹出补全菜单，
+`↑↓`/`C-n`/`C-p` 选择、`Tab` 补全、`Enter` 执行）
+
+| 命令 | 行为 |
+|---|---|
+| `/help` | 帮助 |
+| `/new [name]` | 在聚焦 session 的 cwd 新建 session 并打开 pane |
+| `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
+| `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要 |
+| `/btw <question>` | 一次性旁支问答，不写事件日志；`btw.delta` / `btw.completed` 通知，`btw.cancel` 中断 |
+| `/cd [path]` | 切换 session cwd（`session.cd`，canonicalize 后校验在 worktree 内） |
+| `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
+| `/queue [clear]` | 查看/清空本 session 的待发送队列 |
+| `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
+| `/permission <level>` | 设置 `read-only` / `workspace-write` / `full` |
+| `/exit` / `/quit` | 保存并关闭当前 pane；最后一个 pane 时退出 TUI |
+
+队列按 session 保存在 TUI 内存（`HashMap<SessionId, VecDeque<String>>`），tick 时空闲即取一条
+发送；`turn.completed` 与 daemon `turns` 移除之间的竞态用“出错重排到队首、下个 tick 重试”处理。
+
 **转录区**
+
+转录按对话渲染：用户消息是右对齐的圆角气泡（panel 背景），agent 输出左对齐、2 空格缩进，
+不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
+以 `Thinking` 模块流式展开，turn 结束后收起；工具调用按 `call_id` 合并
+call/approval/patch/result 事件，一行显示状态圆点、命令或路径摘要与右侧状态
+（`ok` / `running` / `needs approval`），展开后以 `│` 对齐显示参数、输出和 diff。
+`thinking` 与工具块都可用鼠标点击折叠；排队中的 prompt 以 `⏳ queued` 行显示在转录末尾。
 
 | 键 | 行为 |
 |---|---|
+| 鼠标左键 / 滚轮 | 聚焦 pane；点击 `Thinking` / 工具块折叠或展开；滚轮滚动转录 |
 | `j/k`、`<C-d>/<C-u>`、`gg/G`、`<C-f>/<C-b>` | 滚动 |
 | `/`、`n/N` | 搜索 |
 | `za`、`zR/zM` | 折叠当前/全部 |
@@ -297,9 +327,12 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
     processes / approvals / new / fork / cancel / help / quit）。
   - 独立 nvim 前端：`:Eix pick [sessions|files|worktrees|branches|context]`（`sessions` 为默认），
     文件/分支/worktree 选中后插入光标处，context 选中后在 scratch 分屏显示条目详情。
-- 仍待做：history 仍走独立的 `#` 全文搜索视图（未并入 picker）；models / diff hunks provider、
+- 仍待做：history 仍走独立的 `#` 全文搜索视图（未并入 picker）；diff hunks provider、
   多选（多文件插入、多 session 开 pane、多 hunk 审批）、frecency 排序与 `#` 匹配度模式、外挂
   `agent pick`/`fzf`、file 语法高亮预览。
+- 已补（2026-10-19）：`/models` 打开客户端生成的模型 picker（含 `id#variant` 行），
+  `/agents` 打开 primary agent picker；两者都复用同一个 overlay，数据来自 `model.list` /
+  `agent.list`，选中后发 `session.model` / `session.agent`。
 - 模糊匹配用 `fuzzy-matcher`（skim 算法）；不做自研打分。
 
 ## 9. 审批与工作区
@@ -312,13 +345,20 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 ### 9.2 审批 UI
 
-内联卡片（已实现）：
+内联卡片（已实现，选项式 picker）：
 
 ```
-⚠ 修改 src/auth.rs (+12 -4)  [workspace-write]
-[y] 批准  [n] 拒绝  [e] 编辑  [o] 打开  [r] 理由  [d] 全量 diff
+⚠ run_command: cargo test                      [shell]
+▸ 1. Approve  ★ recommended
+  2. Review diff
+  3. Open file
+  4. Deny
+  5. Deny with reason…
+j/k or C-n/C-p select · Enter confirm · y/n · x cancel
 ```
 
+- 卡片把动作排成选项列表，首个选项是推荐项；`j`/`k`（或 `C-n`/`C-p`）移动、
+  `Enter` 执行、`1-9` 直选。`y`/`n` 仍是批准/拒绝快捷方式，`d`/`e`/`o`/`r` 也保留。
 - `e`：把 staged 的新内容写到临时文件，交给 `$VISUAL`/`$EDITOR`，保存后走
   `patch.revise` 重算 diff/hunks 再审批（工作区在此前不动）。
 - `o`：在编辑器里打开工作区中的真实文件（仅查看/对照；写操作仍走审批）。
@@ -332,6 +372,19 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 左文件树 / 右 hunk；`J/K` 跳 hunk，`Space` 选中，`[`/`]` 跳文件。
 - `y` 应用选中（未选中则全部），`n` 拒绝。
 - 冲突检测：文件在 stage 后被外部修改 → 标红并要求重新 stage。
+
+### 9.2.1 ask_user（已实现）
+
+模型可调用 `ask_user {question, options}`（2-6 项，第一项是推荐项），用于需求歧义、
+破坏性选择或无法推断的偏好。daemon 追加 `input_required` 事件、广播 `input.required`、
+把 session 切到 `awaiting_input` 并阻塞 turn；TUI 在 pane 底部显示同样风格的选项卡片。
+
+- 按键：`j`/`k`（或 `C-n`/`C-p`）移动，`Enter` 确认，`1-6` 直选；`x` 取消整个 turn。
+- 用户选择后 daemon 追加 `input_answered`，把选项 label（有 description 时附在 `—` 后）
+  作为 tool result 回给模型，并把状态切回 `running`。
+- 协议：`input.respond {session_id, input_id?, option_index}`；空 `input_id` 表示当前问题。
+  `eix answer N` 是无头等价物；`prompt.cancel` 会关闭等待中的问题。
+- 子 agent 不能提问（没有 UI，会阻塞父 turn）。
 
 ### 9.3 权限策略
 
@@ -373,8 +426,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 **daemon → client（notification）**
 
 - `session.created|updated|status`、`session.attention`
-- `turn.started`、`message.delta`、`message.completed`
-- `tool.requested`、`tool.approval_required`、`tool.started`、`tool.output`、`tool.completed`
+- `turn.started`、`message.delta`、`reasoning.delta`、`message.completed`
+- `tool.requested`、`tool.approval_required`、`input.required`、`tool.started`、`tool.output`、`tool.completed`
 - `patch.proposed`、`patch.applied`、`patch.rejected`、`patch.conflict`
 - `process.started|output|exited`
 - `context.updated`、`context.compacted`
@@ -389,7 +442,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - `session.worktree.remove {session_id, force?}`
 - `session.subscribe {session_ids?}`（连接级广播过滤；`null` = 全部）
 - `prompt.submit|cancel|queue`
-- `approval.respond|list`、`patch.apply|reject|get|revise`
+- `approval.respond|list`、`input.respond`、`patch.apply|reject|get|revise`
 - `draft.get|set`（按 session 的未发送输入；空文本删除）
 - `context.drop|pin|compact`
 - `process.list|output|kill`
@@ -402,13 +455,18 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 **传输**：默认 Unix socket（0600）。`[server] tcp = "host:port"` 同时监听 TCP，此时 `token` 必填；
 TCP client 的首个请求必须是 `auth {token}`，通过前不返回数据/事件，失败返回 `unauthorized` 并断开。
-Unix 连接视为已认证。CLI/TUI 用 `--tcp` / `--token`（或 `EIX_TCP` / `EIX_TCP_TOKEN`）选择端点；
-TCP 端点不会自动拉起本地 daemon。
+`[server] http = "host:port"` 另开一个轻量 HTTP surface：`GET /health`（免认证）、`GET /stats`、
+`POST /rpc`（Bearer token，单请求单响应）、`GET /events`（SSE，Bearer token，可用
+`?session_id=` 重复/逗号分隔过滤，无 session 的全局 notification 仍送达）。HTTP 与 TCP 共用
+`server.token`（配置了 HTTP/TCP 就必须非空），body 上限 8 MB；所有响应和错误带 CORS 头，
+`OPTIONS` 预检免认证。SSE 直接订阅 `bus`，因此与 Unix/TCP 的广播语义一致；`eix-sdk` 提供
+类型化 Rust client 和 notification stream。Unix 连接视为已认证。CLI/TUI 用 `--tcp` / `--token`（或 `EIX_TCP` / `EIX_TCP_TOKEN`）选择端点；
+TCP/HTTP 端点不会自动拉起本地 daemon。
 
 ## 12. 持久化与搜索
 
 - SQLite（WAL）：`sessions`、`events`、`messages`、`drafts`、`approvals`、`patches`、`frecency`。
-- 大输出/补丁走内容寻址 blob：`~/.local/share/agent/blobs/<sha256>`。
+- 大输出/补丁走内容寻址 blob；prompt 图片走 `<data>/blobs/<sha256 前两位>/<sha256>`（自动去重、保留/GC 策略见上文）。
 - FTS5：
   - 主索引 `trigram`（中英混排友好）。
   - **短查询（1–2 字）降级 LIKE 扫描**，先收窄到当前/最近 session；否则中文高频词搜不到。
@@ -620,6 +678,68 @@ TCP 端点不会自动拉起本地 daemon。
 > 20）。TUI `#` 打开全屏搜索：输入回车执行、`↑/↓` 选择、再回车在 pane 中打开；CLI
 > `eix search QUERY [--session ID] [--limit N]`。工具输出不进入索引。fork 时把前缀的
 > `search_docs` 行一并复制（走同一批触发器），所以新分支立刻可搜，不必等重启补索引。
+>
+> **P0 补齐（2026-10-19）**
+>
+> 工具：`grep {pattern, path?, include?, literal?, caseSensitive?, limit?}`、
+> `glob {pattern, path?, hidden?, limit?}`、`edit {path, oldString, newString, replaceAll?}`
+> 和 `patch {patchText}` 已落地。`read_file` 增加 `offset`/`limit` 且输出带行号。
+> `grep` / `glob` 只读自动放行；`edit` 与 `write_file` 共用 staged shadow workspace
+> （唯一匹配校验、生成 hunks）；`patch` 走阻塞审批，解析 `*** Begin Patch` 的
+> Add/Update/Delete，先校验全部文件再写入，并抓工作区树快照。`grep` / `glob` 目前看不到
+> staged 内容（MVP 限制）。
+>
+> 扩展：`eix-core/src/commands.rs` 从 `~/.config/eix/commands`、`~/.config/opencode/commands`
+> 和项目祖先目录的 `.eix/commands` / `.opencode/commands` 加载 Markdown 命令；嵌套目录映射为
+> `team/name`，frontmatter 支持 `description` / `agent` / `model`，模板支持 `$ARGUMENTS` 和
+> `$1..$9`。`eix-core/src/agents.rs` 用同样的目录规则加载 agent，frontmatter 支持
+> `mode` / `model` / `permission`，正文追加到 system prompt；内置 `build` / `plan` / `explore`。
+> `session.agent` 持久化到 `sessions.agent`，`spawn_agent` 接受 `agent` 参数，权限只能收紧。
+>
+> 模型：`[[models]]` 提供多 provider 注册（每个条目独立的 `base_url` / `api_key(_env)` /
+> `model` / 成本 / `variants`）；`Config::route` 解析 `id#variant`，变体作为
+> `reasoning_effort` 发送。`model.list` / `session.model` / `/models` picker（含变体行）已接入；
+> `turn.completed` 带 `usage` / `cost` / `duration_ms`，footer 显示 tokens、tok/s 和成本。
+>
+> MCP：`eixd/src/mcp.rs` 实现 stdio JSON-RPC 客户端，`[mcp.servers.<name>]` 懒启动并缓存进程。
+> `tools/list` / `resources/list` / `prompts/list` 都支持分页 cursor；工具名为
+> `mcp__<server>__<tool>`，始终需要审批（`auto` / `full` 除外），执行前抓树快照；资源与 prompt
+> 通过只读的 `mcp_list_resources` / `mcp_read_resource` / `mcp_list_prompts` / `mcp_get_prompt`
+> 暴露，不需要审批。`notifications/*/list_changed` 标记缓存失效，下次 turn 或 `/mcp` 刷新。
+> `allowed_tools` / `denied_tools` 支持 `*` / `?`（`*` 也匹配 `/`，deny 优先）；`mcp.list` 与
+> `/mcp` 显示状态、工具/资源/prompt 数量和错误。
+>
+> Session 管理：`session.archive` / `session.delete` / `session.export` / `session.import` /
+> `session.timeline` / `session.undo` / `session.redo` / `session.todos` RPC；archive 是持久化
+> 标记且默认列表隐藏，delete 级联事件/草稿/搜索，export/import 保留事件 seq（压缩范围仍然有效）。
+> undo/redo 用 `events.undone` 批次标记隐藏/恢复最近一个 user turn，并同步 FTS 索引；工作区文件
+> 不自动回滚（需要 `rewind`）。TUI 对应 `/undo`、`/redo`、`/timeline`、`/export`、`/archive`、
+> `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`。
+>
+> Skills：`eix-core/src/skills.rs` 从全局与项目祖先目录加载 `<name>/SKILL.md`（含 `.opencode` /
+> `.claude` 兼容，同目录 `.eix` > `.opencode` > `.claude`）；system prompt 只放
+> `<available_skills>` 摘要，模型用只读 `use_skill {name, arguments}` 按需取正文，正文展开
+> `$ARGUMENTS` / `$1..$9`。`allowed-tools` 支持通配，加载后在本 turn 内限制工具（并集，`use_skill`
+> 始终可用，下一条 user prompt 清空）；Claude 风格工具名映射到 eix 名称。TUI `/skills` 是带正文
+> 预览的 picker。`[formatter]`
+> 在直接写入和 staged apply 之后运行（`$1` 为路径，失败只附注）。`todo` / `webfetch` / `websearch`
+> 为新增工具；`todo` 是 daemon 内存态任务表，网络工具无 API key（DuckDuckGo HTML），读取结果会截断。
+> TUI 支持 `[theme]` 调色板、`[keys]` 转录区快捷键覆盖（输入框保持 vim 行为），以及 prompt 里的
+> `!<cmd>`：直接执行 shell（同样沙箱、先抓 tree snapshot、只读 session 拒绝），命令和输出写入 tool 事件。
+>
+> 图片：`prompt.submit` 接受 `images: [path]`，daemon 经 `resolve_path_in` 校验后按 SHA-256 写入
+> `<data>/blobs/<前两位>/<hash>`，事件只存 blob id / MIME / 大小；`ChatMessage::to_wire` 把带图
+> 消息编成 OpenAI 多模态 content 数组（text + image_url data URL），文本消息仍保持字符串
+> content。旧的内联 base64 事件仍可回放；export 会内联图片，import 重新落 blob。默认最多 4 张、
+> 每张 8 MB、无引用 blob 保留 30 天（`[images]` 可调），启动/删除 session/后台每 6 小时 GC。
+> TUI `/image`、直接粘贴/拖入路径或 `file://` URI、CLI `eix send --image` 是入口。
+>
+> LSP：`eixd/src/lsp.rs` 是精简 stdio 客户端（Content-Length framing），按 server+workspace root
+> 懒启动并缓存；写入/编辑/apply 成功后收集 `textDocument/publishDiagnostics`，作为附注追加到工具
+> 输出，`lsp_diagnostics` 只读工具可主动查询。`lsp.workspace` 扫描 workspace（默认 200 文件、上限
+> 2000，跳过 `.git` / `target` / `node_modules` 等，最多 2000 条诊断、5 秒收集窗口），TUI
+> `/diagnostics` / `<Space>e` 在可滚动浮层里展示。初始化失败按 key 缓存；配置热重载 `clear()` 后重建。
+> 只支持 diagnostics，不支持 completion/hover/rename。
 
 ## 17. 待定
 

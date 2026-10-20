@@ -18,10 +18,11 @@ use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload,
     AttachResult, CancelResult, Config, ContextCompactedPayload, ContextDropPayload,
     ContextLedgerResult, ContextPinPayload, Endpoint, Event, EventKind, HelloResult,
-    PatchProposedPayload, PatchResultPayload, PermissionPayload, ProcessExitedPayload,
-    ProcessKillResult, ProcessList, ProcessOutput, ProcessStartedPayload, RewindResult,
-    SearchResult, Sector, Session, SessionList, SessionResult, SessionStatus, SnapshotPayload,
-    SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
+    InputAnsweredPayload, InputRequiredPayload, InputResult, PatchProposedPayload,
+    PatchResultPayload, PermissionPayload, ProcessExitedPayload, ProcessKillResult, ProcessList,
+    ProcessOutput, ProcessStartedPayload, RewindResult, SearchResult, Sector, Session, SessionList,
+    SessionResult, SessionStatus, SnapshotPayload, SubmitResult, ToolCallPayload,
+    ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -39,7 +40,7 @@ async fn main() -> Result<()> {
         }
         Command::Daemon => daemon(&cli).await,
         Command::Doctor => doctor(&cli).await,
-        Command::Sessions => sessions(&cli).await,
+        Command::Sessions { archived } => sessions(&cli, archived).await,
         Command::New {
             name,
             cwd,
@@ -52,7 +53,11 @@ async fn main() -> Result<()> {
             level,
             temporary,
         } => permission(&cli, session, level, temporary).await,
-        Command::Send { session, text } => send(&cli, session, text).await,
+        Command::Send {
+            session,
+            text,
+            images,
+        } => send(&cli, session, text, images).await,
         Command::Tui { session } => {
             let config = Config::load(cli.config_path.as_deref()).unwrap_or_default();
             tui::run(
@@ -75,6 +80,7 @@ async fn main() -> Result<()> {
             reason,
         } => approval(&cli, session, true, hunks, reason).await,
         Command::Deny { session, reason } => approval(&cli, session, false, None, reason).await,
+        Command::Answer { session, option } => answer(&cli, session, option).await,
         Command::Approvals { json } => approvals(&cli, json).await,
         Command::Status { json } => status(&cli, json).await,
         Command::Pick { query, limit, json } => pick(&cli, query, limit, json).await,
@@ -91,6 +97,16 @@ async fn main() -> Result<()> {
             shared,
         } => fork(&cli, session, at, name, shared).await,
         Command::Rewind { session, at, name } => rewind(&cli, session, at, name).await,
+        Command::Delete { session } => delete_session(&cli, session).await,
+        Command::Archive { session, undo } => archive_session(&cli, session, undo).await,
+        Command::Export { session, output } => export_session(&cli, session, output).await,
+        Command::Import { file, name, cwd } => import_session(&cli, file, name, cwd).await,
+        Command::Timeline {
+            session,
+            limit,
+            json,
+        } => timeline(&cli, session, limit, json).await,
+        Command::Undo { session, redo } => undo(&cli, session, redo).await,
         Command::Worktree(cmd) => worktree(&cli, cmd).await,
         Command::Nvim { session } => nvim(&cli, session).await,
         Command::Processes { session } => processes(&cli, session).await,
@@ -116,7 +132,10 @@ enum Command {
     Chat {
         session: Option<String>,
     },
-    Sessions,
+    Sessions {
+        /// Include archived sessions.
+        archived: bool,
+    },
     New {
         name: Option<String>,
         cwd: Option<PathBuf>,
@@ -136,6 +155,7 @@ enum Command {
     Send {
         session: Option<String>,
         text: String,
+        images: Vec<String>,
     },
     Log {
         session: Option<String>,
@@ -156,6 +176,11 @@ enum Command {
     Deny {
         session: Option<String>,
         reason: Option<String>,
+    },
+    Answer {
+        session: Option<String>,
+        /// 1-based option number.
+        option: usize,
     },
     Approvals {
         json: bool,
@@ -187,6 +212,33 @@ enum Command {
         /// Restore the workspace to just before this sequence.
         at: Option<u64>,
         name: Option<String>,
+    },
+    Delete {
+        session: Option<String>,
+    },
+    Archive {
+        session: Option<String>,
+        /// Restore an archived session instead.
+        undo: bool,
+    },
+    Export {
+        session: Option<String>,
+        /// Write to this path instead of stdout.
+        output: Option<PathBuf>,
+    },
+    Import {
+        file: PathBuf,
+        name: Option<String>,
+        cwd: Option<PathBuf>,
+    },
+    Timeline {
+        session: Option<String>,
+        limit: Option<usize>,
+        json: bool,
+    },
+    Undo {
+        session: Option<String>,
+        redo: bool,
     },
     Worktree(WorktreeCmd),
     Nvim {
@@ -331,7 +383,10 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let session = session.or_else(|| args.first().cloned());
             Ok(Command::Chat { session })
         }
-        "ls" | "list" | "sessions" => Ok(Command::Sessions),
+        "ls" | "list" | "sessions" => {
+            let archived = take_switch(&mut args, "--archived") || take_switch(&mut args, "-a");
+            Ok(Command::Sessions { archived })
+        }
         "new" => {
             let name = take_flag(&mut args, "--name")?;
             let cwd = take_flag(&mut args, "--cwd")?.map(PathBuf::from);
@@ -367,9 +422,14 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
         }
         "send" => {
             let session = take_flag(&mut args, "--session")?;
+            let mut images = Vec::new();
+            while let Some(image) = take_flag(&mut args, "--image")? {
+                images.push(image);
+            }
             Ok(Command::Send {
                 session,
                 text: args.join(" "),
+                images,
             })
         }
         "log" => {
@@ -408,6 +468,18 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let reason = take_flag(&mut args, "--reason")?;
             let session = session.or_else(|| args.first().cloned());
             Ok(Command::Deny { session, reason })
+        }
+        "answer" | "reply" => {
+            let session = take_flag(&mut args, "--session")?;
+            let option = args
+                .first()
+                .context("usage: eix answer [--session ID] <option>")?
+                .parse::<usize>()
+                .context("option must be a number")?;
+            if option == 0 {
+                bail!("option numbers start at 1");
+            }
+            Ok(Command::Answer { session, option })
         }
         "approvals" | "inbox" => {
             let json = take_switch(&mut args, "--json");
@@ -503,6 +575,56 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let name = take_flag(&mut args, "--name")?;
             Ok(Command::Rewind { session, at, name })
         }
+        "delete" | "rm" => {
+            let session = take_flag(&mut args, "--session")?;
+            let session = session.or_else(|| args.first().cloned());
+            if session.is_none() {
+                bail!("usage: eix delete <session>");
+            }
+            Ok(Command::Delete { session })
+        }
+        "archive" => {
+            let session = take_flag(&mut args, "--session")?;
+            let undo = take_switch(&mut args, "--undo");
+            let session = session.or_else(|| args.first().cloned());
+            if session.is_none() {
+                bail!("usage: eix archive <session> [--undo]");
+            }
+            Ok(Command::Archive { session, undo })
+        }
+        "export" => {
+            let session = take_flag(&mut args, "--session")?;
+            let output = take_flag(&mut args, "--output")?.map(PathBuf::from);
+            Ok(Command::Export { session, output })
+        }
+        "import" => {
+            let name = take_flag(&mut args, "--name")?;
+            let cwd = take_flag(&mut args, "--cwd")?.map(PathBuf::from);
+            let file =
+                args.first().cloned().map(PathBuf::from).ok_or_else(|| {
+                    anyhow::anyhow!("usage: eix import <file> [--name N] [--cwd P]")
+                })?;
+            Ok(Command::Import { file, name, cwd })
+        }
+        "undo" | "redo" => {
+            let session = take_flag(&mut args, "--session")?;
+            Ok(Command::Undo {
+                session,
+                redo: name == "redo",
+            })
+        }
+        "timeline" | "tl" => {
+            let session = take_flag(&mut args, "--session")?;
+            let limit = take_flag(&mut args, "--limit")?
+                .map(|value| value.parse::<usize>().context("invalid --limit"))
+                .transpose()?;
+            let json = take_switch(&mut args, "--json");
+            Ok(Command::Timeline {
+                session,
+                limit,
+                json,
+            })
+        }
         "worktree" | "wt" => {
             let sub = args.first().cloned().unwrap_or_else(|| "list".to_string());
             args.remove(0);
@@ -597,9 +719,9 @@ fn parse_hunks(value: &str) -> Result<Vec<usize>> {
     Ok(hunks)
 }
 
-async fn sessions(cli: &Cli) -> Result<()> {
+async fn sessions(cli: &Cli, archived: bool) -> Result<()> {
     let mut client = cli.connect().await?;
-    let list = list_sessions(&mut client).await?;
+    let list = list_sessions_including(&mut client, archived).await?;
     if list.is_empty() {
         println!("no sessions yet — start one with `eix new` or just `eix`");
         return Ok(());
@@ -628,6 +750,16 @@ async fn new_session(
     worktree: bool,
     permission: Option<String>,
 ) -> Result<()> {
+    let defaults_cwd = cwd
+        .clone()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_default();
+    let defaults = eix_core::load_cli_config(&defaults_cwd)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    let model = model.or(defaults.model);
+    let permission = permission.or(defaults.permission);
     let mut client = cli.connect().await?;
     let session = create_session(&mut client, name, cwd, model, worktree, permission).await?;
     println!(
@@ -643,18 +775,23 @@ async fn new_session(
     Ok(())
 }
 
-async fn send(cli: &Cli, session: Option<String>, mut text: String) -> Result<()> {
+async fn send(
+    cli: &Cli,
+    session: Option<String>,
+    mut text: String,
+    images: Vec<String>,
+) -> Result<()> {
     let mut client = cli.connect().await?;
     if text.trim().is_empty() && !io::stdin().is_terminal() {
         io::stdin()
             .read_to_string(&mut text)
             .context("cannot read prompt from stdin")?;
     }
-    if text.trim().is_empty() {
-        bail!("usage: eix send [--session ID] <text>");
+    if text.trim().is_empty() && images.is_empty() {
+        bail!("usage: eix send [--session ID] [--image PATH]... <text>");
     }
     let session = resolve_session(&mut client, session.as_deref(), true).await?;
-    let submit = submit_prompt(&mut client, &session.id, text.trim()).await?;
+    let submit = submit_prompt(&mut client, &session.id, text.trim(), &images).await?;
     let outcome = stream_turn(&mut client, &session.id, &submit.turn_id, Display::Raw).await?;
     match outcome.error {
         Some(error) => bail!("{error}"),
@@ -712,7 +849,7 @@ async fn chat(cli: &Cli, session: Option<String>) -> Result<()> {
                 println!("unknown command {other:?} (try /help)");
             }
             _ => {
-                let submit = match submit_prompt(&mut client, &session.id, text).await {
+                let submit = match submit_prompt(&mut client, &session.id, text, &[]).await {
                     Ok(submit) => submit,
                     Err(err) => {
                         eprintln!("error: {err:#}");
@@ -833,6 +970,29 @@ async fn approval(
         );
     } else {
         println!("{} has no pending approval", session.name);
+    }
+    Ok(())
+}
+
+async fn answer(cli: &Cli, session: Option<String>, option: usize) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result: InputResult = serde_json::from_value(
+        client
+            .request(
+                "input.respond",
+                json!({
+                    "session_id": session.id,
+                    "input_id": "",
+                    "option_index": option - 1,
+                }),
+            )
+            .await?,
+    )?;
+    if result.accepted {
+        println!("answered {} (option {option})", session.name);
+    } else {
+        println!("{} has no pending question", session.name);
     }
     Ok(())
 }
@@ -1210,6 +1370,137 @@ async fn rewind(
     Ok(())
 }
 
+async fn delete_session(cli: &Cli, session: Option<String>) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, session.as_deref(), false).await?;
+    client
+        .request("session.delete", json!({ "session_id": session.id }))
+        .await?;
+    println!("deleted {} ({})", session.name, short_id(&session.id));
+    Ok(())
+}
+
+async fn archive_session(cli: &Cli, session: Option<String>, undo: bool) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result: SessionResult = serde_json::from_value(
+        client
+            .request(
+                "session.archive",
+                json!({ "session_id": session.id, "archived": !undo }),
+            )
+            .await?,
+    )?;
+    println!(
+        "{} {} ({})",
+        if undo { "unarchived" } else { "archived" },
+        result.session.name,
+        short_id(&result.session.id)
+    );
+    Ok(())
+}
+
+async fn export_session(cli: &Cli, session: Option<String>, output: Option<PathBuf>) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result: eix_core::SessionExportResult = serde_json::from_value(
+        client
+            .request("session.export", json!({ "session_id": session.id }))
+            .await?,
+    )?;
+    match output {
+        Some(path) => {
+            std::fs::write(&path, &result.json)
+                .with_context(|| format!("cannot write {}", path.display()))?;
+            println!("exported {} to {}", session.name, path.display());
+        }
+        None => println!("{}", result.json),
+    }
+    Ok(())
+}
+
+async fn import_session(
+    cli: &Cli,
+    file: PathBuf,
+    name: Option<String>,
+    cwd: Option<PathBuf>,
+) -> Result<()> {
+    let json = std::fs::read_to_string(&file)
+        .with_context(|| format!("cannot read {}", file.display()))?;
+    let mut client = cli.connect().await?;
+    let result: SessionResult = serde_json::from_value(
+        client
+            .request(
+                "session.import",
+                json!({ "json": json, "name": name, "cwd": cwd }),
+            )
+            .await?,
+    )?;
+    let session = result.session;
+    println!(
+        "imported {} ({}) cwd {}",
+        session.name,
+        short_id(&session.id),
+        session.cwd.display()
+    );
+    Ok(())
+}
+
+async fn undo(cli: &Cli, session: Option<String>, redo: bool) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result = client
+        .request(
+            if redo { "session.redo" } else { "session.undo" },
+            json!({ "session_id": session.id }),
+        )
+        .await?;
+    println!(
+        "{} {} event(s) in {}",
+        if redo { "restored" } else { "hid" },
+        result["changed"].as_u64().unwrap_or(0),
+        session.name
+    );
+    Ok(())
+}
+
+async fn timeline(
+    cli: &Cli,
+    session: Option<String>,
+    limit: Option<usize>,
+    json_out: bool,
+) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let session = resolve_session(&mut client, session.as_deref(), false).await?;
+    let result: eix_core::TimelineResult = serde_json::from_value(
+        client
+            .request(
+                "session.timeline",
+                json!({ "session_id": session.id, "limit": limit }),
+            )
+            .await?,
+    )?;
+    if json_out {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    if result.items.is_empty() {
+        println!("timeline is empty");
+        return Ok(());
+    }
+    for item in result.items {
+        let preview = item.preview.replace('\n', " ");
+        println!(
+            "e{:<4} {}  {:<17} {}",
+            item.seq,
+            format_ts(item.ts),
+            item.kind,
+            preview
+        );
+    }
+    Ok(())
+}
+
 async fn worktree(cli: &Cli, cmd: WorktreeCmd) -> Result<()> {
     let mut client = cli.connect().await?;
     match cmd {
@@ -1518,8 +1809,15 @@ async fn doctor(cli: &Cli) -> Result<()> {
 }
 
 async fn list_sessions(client: &mut Client) -> Result<Vec<Session>> {
-    let list: SessionList =
-        serde_json::from_value(client.request("session.list", Value::Null).await?)?;
+    list_sessions_including(client, false).await
+}
+
+async fn list_sessions_including(client: &mut Client, archived: bool) -> Result<Vec<Session>> {
+    let list: SessionList = serde_json::from_value(
+        client
+            .request("session.list", json!({ "include_archived": archived }))
+            .await?,
+    )?;
     Ok(list.sessions)
 }
 
@@ -1587,12 +1885,17 @@ async fn attach_events(client: &mut Client, session_id: &str) -> Result<Vec<Even
     Ok(attach.events)
 }
 
-async fn submit_prompt(client: &mut Client, session_id: &str, text: &str) -> Result<SubmitResult> {
+async fn submit_prompt(
+    client: &mut Client,
+    session_id: &str,
+    text: &str,
+    images: &[String],
+) -> Result<SubmitResult> {
     Ok(serde_json::from_value(
         client
             .request(
                 "prompt.submit",
-                json!({"session_id": session_id, "text": text}),
+                json!({"session_id": session_id, "text": text, "images": images}),
             )
             .await?,
     )?)
@@ -1678,6 +1981,31 @@ async fn stream_turn(
                         eprintln!("{diff}");
                     }
                     eprintln!("  run `eix approve` or `eix deny`");
+                }
+            }
+            "input.required" => {
+                if notification.params["session_id"] == session_id {
+                    if wrote {
+                        println!();
+                        wrote = false;
+                    }
+                    let question = notification.params["question"]
+                        .as_str()
+                        .unwrap_or("the model has a question");
+                    eprintln!("question: {question}");
+                    if let Some(options) = notification.params["options"].as_array() {
+                        for (index, option) in options.iter().enumerate() {
+                            let label = option["label"].as_str().unwrap_or("");
+                            let description = option["description"].as_str().unwrap_or("");
+                            let recommended = if index == 0 { " (recommended)" } else { "" };
+                            if description.is_empty() {
+                                eprintln!("  {}. {label}{recommended}", index + 1);
+                            } else {
+                                eprintln!("  {}. {label} — {description}{recommended}", index + 1);
+                            }
+                        }
+                    }
+                    eprintln!("  run `eix answer <n>` with the option number");
                 }
             }
             "patch.proposed" => {
@@ -1932,6 +2260,9 @@ fn render_events(events: &[Event]) {
                     );
                 }
             }
+            EventKind::ContextCleared => {
+                println!("ctx> cleared (e{} and earlier stay in the log)", event.seq);
+            }
             EventKind::ProcessStarted => {
                 if let Ok(payload) =
                     serde_json::from_value::<ProcessStartedPayload>(event.payload.clone())
@@ -1954,6 +2285,35 @@ fn render_events(events: &[Event]) {
                         "proc> {} {}{} in {}ms",
                         payload.process_id, payload.status, code, payload.duration_ms
                     );
+                }
+            }
+            EventKind::InputRequired => {
+                if let Ok(payload) =
+                    serde_json::from_value::<InputRequiredPayload>(event.payload.clone())
+                {
+                    println!(
+                        "ask> {} (answer in the TUI, or `eix answer <n>`)",
+                        payload.question
+                    );
+                    for (index, option) in payload.options.iter().enumerate() {
+                        let recommended = if index == 0 { " (recommended)" } else { "" };
+                        match option.description.as_deref() {
+                            Some(description) if !description.is_empty() => println!(
+                                "  {}. {} — {}{recommended}",
+                                index + 1,
+                                option.label,
+                                description
+                            ),
+                            _ => println!("  {}. {}{recommended}", index + 1, option.label),
+                        }
+                    }
+                }
+            }
+            EventKind::InputAnswered => {
+                if let Ok(payload) =
+                    serde_json::from_value::<InputAnsweredPayload>(event.payload.clone())
+                {
+                    println!("ask> answered: {}", payload.answer);
                 }
             }
         }
@@ -2044,8 +2404,9 @@ USAGE:
 COMMANDS:
     tui [--session ID]         full-screen terminal UI (default)
     chat [--session ID]        interactive chat (non-TUI)
-    send [--session ID] TEXT   send one prompt and stream the answer
-    ls                         list sessions
+    send [--session ID] [--image PATH]... TEXT
+                              send one prompt and stream the answer
+    ls [--archived]            list sessions (--archived includes hidden ones)
     new [--name N] [--cwd P] [--model M] [--worktree] [--permission LEVEL]
                                create a session (--worktree: .worktrees/<name>)
     permission LEVEL [--session ID] [--temporary]
@@ -2057,6 +2418,8 @@ COMMANDS:
                                approve the pending tool call (all or selected hunks)
     deny [--session ID] [--reason TEXT]
                                deny the pending tool call, optionally with a reason
+    answer [--session ID] <option>
+                               answer the pending question with a 1-based option
     approvals [--json]         list pending approvals across sessions
     status [--json]            daemon and session summary (`--json` for dwmblocks)
     pick [--query Q] [--limit N] [--json]
@@ -2075,6 +2438,16 @@ COMMANDS:
                                default: a git worktree when inside a repo)
     rewind [--session ID] [--at SEQ] [--name NAME]
                                fork and roll the workspace back to before SEQ
+    delete <session>           delete a session and its event log
+    archive <session> [--undo] hide a session from the default list (events kept)
+    export [--session ID] [--output FILE]
+                               export a session as JSON
+    import <file> [--name N] [--cwd P]
+                               import an exported session as a new session
+    timeline [--session ID] [--limit N] [--json]
+                               show user/assistant/tool events for navigation
+    undo [--session ID]        hide the newest turn (redo restores it)
+    redo [--session ID]        restore the most recent undo
     worktree [list | remove SESSION [--force]]
                                inspect or delete session worktrees
     nvim [--session ID]        open the Neovim frontend against this daemon

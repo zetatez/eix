@@ -17,10 +17,12 @@ use std::path::Path;
 use eix_core::{
     AssistantMessagePayload, ChatMessage, Config, ContextCompactedPayload, ContextDropPayload,
     ContextEntryInfo, ContextLedgerResult, ContextPinPayload, ContextSectorInfo, Event, EventKind,
-    Sector, ToolResultPayload, UserMessagePayload,
+    ImagePart, Sector, ToolResultPayload, UserMessagePayload,
 };
 use serde::de::DeserializeOwned;
 use tokio::time::{timeout, Duration};
+
+use crate::blob::BlobStore;
 
 /// Never auto-drop the newest few entries in a sector: the model still needs
 /// the tool output it just received.
@@ -59,6 +61,9 @@ struct Policy {
     pinned: HashSet<String>,
     dropped: HashSet<String>,
     compactions: Vec<Compaction>,
+    /// Messages at or before this sequence are excluded from the provider
+    /// context (a `/clear` boundary).
+    cleared_seq: Option<u64>,
 }
 
 impl Policy {
@@ -95,6 +100,13 @@ impl Policy {
                         });
                     }
                 }
+                EventKind::ContextCleared => {
+                    // The clear boundary supersedes every earlier policy: all
+                    // prior messages (and any summaries covering them) leave
+                    // the context.
+                    policy.cleared_seq = Some(event.seq);
+                    policy.compactions.clear();
+                }
                 _ => {}
             }
         }
@@ -105,18 +117,32 @@ impl Policy {
 impl Ledger {
     /// Load instructions and the workspace summary, then assemble the ledger.
     pub async fn build(config: &Config, system: String, cwd: &Path, events: &[Event]) -> Self {
+        Self::build_with_blobs(config, system, cwd, events, None).await
+    }
+
+    /// Like [`build`](Self::build), but resolves image blob references so
+    /// provider messages contain the original bytes.
+    pub async fn build_with_blobs(
+        config: &Config,
+        system: String,
+        cwd: &Path,
+        events: &[Event],
+        blobs: Option<&BlobStore>,
+    ) -> Self {
         let instructions = load_instructions(config, cwd).await;
         let workspace = if config.context.workspace_summary {
             workspace_summary(cwd).await
         } else {
             None
         };
-        Self::assemble(
+        let images = load_images(events, blobs).await;
+        Self::assemble_with_images(
             system,
             instructions,
             workspace,
             events,
             config.context.budget_tokens,
+            &images,
         )
     }
 
@@ -127,6 +153,24 @@ impl Ledger {
         workspace: Option<String>,
         events: &[Event],
         budget_tokens: usize,
+    ) -> Self {
+        Self::assemble_with_images(
+            system,
+            instructions,
+            workspace,
+            events,
+            budget_tokens,
+            &HashMap::new(),
+        )
+    }
+
+    fn assemble_with_images(
+        system: String,
+        instructions: Vec<(String, String)>,
+        workspace: Option<String>,
+        events: &[Event],
+        budget_tokens: usize,
+        images: &HashMap<String, ImagePart>,
     ) -> Self {
         let policy = Policy::from_events(events);
         let mut entries = Vec::new();
@@ -159,7 +203,7 @@ impl Ledger {
                 &policy,
             ));
         }
-        entries.extend(event_entries(events, &policy));
+        entries.extend(event_entries(events, &policy, images));
 
         let entries = apply_compactions(entries, &policy.compactions);
         let mut entries = entries;
@@ -215,12 +259,72 @@ impl Ledger {
         (messages, tokens)
     }
 
+    /// Inclusive `(first, last)` source sequence of everything still in the
+    /// context. `None` when the context holds no messages yet.
+    pub fn message_range(&self) -> Option<(u64, u64)> {
+        let mut range: Option<(u64, u64)> = None;
+        for entry in &self.entries {
+            if entry.info.dropped || entry.info.compacted {
+                continue;
+            }
+            if let Some(seq) = entry.seq {
+                range = Some(match range {
+                    Some((from, to)) => (from.min(seq), to.max(seq)),
+                    None => (seq, seq),
+                });
+            }
+        }
+        range
+    }
+
     /// Compactions may not overlap: two summaries over the same events would
     /// double-count and make the replay order-dependent.
     pub fn overlaps_compaction(&self, from_seq: u64, to_seq: u64) -> bool {
         self.compactions
             .iter()
             .any(|other| from_seq <= other.to_seq && other.from_seq <= to_seq)
+    }
+
+    /// Messages inside an inclusive source range, skipping dropped and already
+    /// compacted entries.
+    pub fn messages_in_range(&self, from_seq: u64, to_seq: u64) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        for entry in &self.entries {
+            if entry.info.dropped || entry.info.compacted {
+                continue;
+            }
+            if entry
+                .seq
+                .is_some_and(|seq| from_seq <= seq && seq <= to_seq)
+            {
+                messages.extend(entry.messages.iter().cloned());
+            }
+        }
+        messages
+    }
+
+    /// Range an auto-compaction should summarize: everything before the last
+    /// `keep_turns` user messages. `None` when there is not enough history.
+    pub fn auto_compact_range(&self, keep_turns: usize) -> Option<(u64, u64)> {
+        let keep_turns = keep_turns.max(1);
+        let mut users: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
+            .filter(|entry| entry.info.kind == "user")
+            .filter_map(|entry| entry.seq)
+            .collect();
+        users.sort_unstable();
+        users.dedup();
+        if users.len() <= keep_turns {
+            return None;
+        }
+        let cutoff = users[users.len() - keep_turns];
+        let (from, _) = self.message_range()?;
+        if cutoff <= from {
+            return None;
+        }
+        Some((from, cutoff - 1))
     }
 }
 
@@ -246,7 +350,47 @@ fn synthesized(
     entry
 }
 
-fn event_entries(events: &[Event], policy: &Policy) -> Vec<Entry> {
+async fn load_images(events: &[Event], blobs: Option<&BlobStore>) -> HashMap<String, ImagePart> {
+    use base64::Engine;
+    let Some(blobs) = blobs else {
+        return HashMap::new();
+    };
+    let mut mimes: HashMap<String, String> = HashMap::new();
+    for event in events {
+        if event.kind != EventKind::UserMessage {
+            continue;
+        }
+        let Some(payload) = decode::<UserMessagePayload>(event) else {
+            continue;
+        };
+        for image in payload.images {
+            if let Some(blob) = image.blob {
+                mimes.entry(blob).or_insert(image.mime);
+            }
+        }
+    }
+    let ids: HashSet<String> = mimes.keys().cloned().collect();
+    let bytes = blobs.load_many(&ids).await;
+    bytes
+        .into_iter()
+        .filter_map(|(id, data)| {
+            let mime = mimes.remove(&id)?;
+            Some((
+                id,
+                ImagePart {
+                    mime,
+                    data: base64::engine::general_purpose::STANDARD.encode(data),
+                },
+            ))
+        })
+        .collect()
+}
+
+fn event_entries(
+    events: &[Event],
+    policy: &Policy,
+    blob_images: &HashMap<String, ImagePart>,
+) -> Vec<Entry> {
     // Tool results are matched to the assistant message that requested them so
     // a dropped or compacted step never produces a `tool` message without its
     // preceding `tool_calls`.
@@ -270,7 +414,24 @@ fn event_entries(events: &[Event], policy: &Policy) -> Vec<Entry> {
                 let Some(payload) = decode::<UserMessagePayload>(event) else {
                     continue;
                 };
-                let message = ChatMessage::user(payload.text.clone());
+                let images: Vec<ImagePart> = payload
+                    .images
+                    .iter()
+                    .filter_map(|image| {
+                        if let Some(blob) = &image.blob {
+                            return blob_images.get(blob).cloned();
+                        }
+                        (!image.data.is_empty()).then(|| ImagePart {
+                            mime: image.mime.clone(),
+                            data: image.data.clone(),
+                        })
+                    })
+                    .collect();
+                let message = if images.is_empty() {
+                    ChatMessage::user(payload.text.clone())
+                } else {
+                    ChatMessage::user_with_images(payload.text.clone(), images)
+                };
                 let mut entry = make_entry(
                     format!("e{}", event.seq),
                     Sector::History,
@@ -364,6 +525,13 @@ fn event_entries(events: &[Event], policy: &Policy) -> Vec<Entry> {
                 entries.push(with_policy(entry, policy));
             }
             _ => {}
+        }
+    }
+    if let Some(cleared) = policy.cleared_seq {
+        for entry in &mut entries {
+            if entry.seq.is_some_and(|seq| seq <= cleared) {
+                entry.info.dropped = true;
+            }
         }
     }
     entries
@@ -766,7 +934,10 @@ mod tests {
         event(
             seq,
             EventKind::UserMessage,
-            payload(&UserMessagePayload { text: text.into() }),
+            payload(&UserMessagePayload {
+                text: text.into(),
+                images: Vec::new(),
+            }),
         )
     }
 
@@ -777,6 +948,7 @@ mod tests {
             payload(&AssistantMessagePayload {
                 text: text.into(),
                 model: "m".into(),
+                reasoning: None,
                 cancelled: false,
                 usage: None,
                 tool_calls: Vec::new(),
@@ -888,6 +1060,7 @@ mod tests {
                 payload(&AssistantMessagePayload {
                     text: String::new(),
                     model: "m".into(),
+                    reasoning: None,
                     cancelled: false,
                     usage: None,
                     tool_calls: vec![eix_core::ToolCall {
@@ -959,6 +1132,7 @@ mod tests {
             payload(&AssistantMessagePayload {
                 text: text.into(),
                 model: "m".into(),
+                reasoning: None,
                 cancelled: false,
                 usage: None,
                 tool_calls: calls,
@@ -1042,5 +1216,46 @@ mod tests {
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[2].content, "next");
         assert!(messages.iter().all(|message| message.tool_calls.is_none()));
+    }
+
+    #[test]
+    fn auto_compact_keeps_the_newest_user_turns() {
+        let events = vec![
+            user(1, "one"),
+            assistant(2, "a1"),
+            user(3, "two"),
+            assistant(4, "a2"),
+            user(5, "three"),
+            assistant(6, "a3"),
+            user(7, "four"),
+            assistant(8, "a4"),
+        ];
+        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 100_000);
+        // Keep the two newest user turns (seq 5 and 7).
+        assert_eq!(ledger.auto_compact_range(2), Some((1, 4)));
+        assert_eq!(ledger.auto_compact_range(3), Some((1, 2)));
+        // Nothing to compact when every turn must be kept.
+        assert_eq!(ledger.auto_compact_range(4), None);
+
+        let range = ledger.messages_in_range(1, 4);
+        assert_eq!(range.len(), 4, "two user/assistant pairs");
+
+        // After a compaction, the next range starts after the summary.
+        let mut events = events;
+        events.push(event(
+            9,
+            EventKind::ContextCompacted,
+            payload(&ContextCompactedPayload {
+                from_seq: 1,
+                to_seq: 4,
+                messages: 4,
+                tokens: 10,
+                summary: "earlier talk".into(),
+            }),
+        ));
+        events.push(user(10, "five"));
+        events.push(assistant(11, "a5"));
+        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 100_000);
+        assert_eq!(ledger.auto_compact_range(2), Some((5, 6)));
     }
 }

@@ -160,6 +160,9 @@ pub struct CreateSessionParams {
     /// Per-session tool permission level. Defaults to `workspace-write`.
     #[serde(default)]
     pub permission: Option<PermissionLevel>,
+    /// Primary agent name; defaults to `build`.
+    #[serde(default)]
+    pub agent: Option<String>,
 }
 
 /// `session.permission`: change a session's tool permission level.
@@ -249,6 +252,131 @@ pub struct SessionRef {
 pub struct SubmitParams {
     pub session_id: SessionId,
     pub text: String,
+    /// Paths to images attached to this prompt (relative to the session cwd or
+    /// inside an allowed `external_directory`).
+    #[serde(default)]
+    pub images: Vec<String>,
+}
+
+/// `session.cd`: move a session to another working directory.
+/// `session.model`: pin a session to one of the models from `model.list`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionModelParams {
+    pub session_id: SessionId,
+    /// Empty or omitted restores the daemon default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+/// `session.agent`: choose the session's primary agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionAgentParams {
+    pub session_id: SessionId,
+    /// Empty or omitted restores the built-in default.
+    #[serde(default)]
+    pub agent: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelListResult {
+    pub models: Vec<crate::ModelInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentListResult {
+    pub agents: Vec<crate::AgentSpec>,
+}
+
+/// `mcp.list`: configured MCP servers and how many tools each exposes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpListResult {
+    pub servers: Vec<McpServerInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpServerInfo {
+    pub name: String,
+    pub enabled: bool,
+    pub command: String,
+    pub tools: usize,
+    #[serde(default)]
+    pub resources: usize,
+    #[serde(default)]
+    pub prompts: usize,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// `stats`: a compact daemon health/capacity snapshot for dashboards and the
+/// HTTP `GET /stats` endpoint.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatsResult {
+    pub version: String,
+    pub uptime_secs: u64,
+    pub sessions: usize,
+    pub archived_sessions: usize,
+    pub running_sessions: usize,
+    pub events: usize,
+    pub db_bytes: u64,
+    pub blob_count: usize,
+    pub blob_bytes: u64,
+    pub skills: usize,
+    pub mcp_servers: usize,
+    pub default_model: String,
+}
+
+/// One diagnostic row from `lsp.workspace`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LspDiagnosticInfo {
+    /// Absolute path.
+    pub path: PathBuf,
+    pub line: u32,
+    pub character: u32,
+    pub severity: String,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LspWorkspaceResult {
+    pub diagnostics: Vec<LspDiagnosticInfo>,
+    /// Files that were opened for diagnostics.
+    pub files: usize,
+    /// Name of the language servers that ran.
+    pub servers: Vec<String>,
+    /// Files skipped because `max_files` was reached.
+    pub skipped: usize,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LspWorkspaceParams {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub max_files: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionCdParams {
+    pub session_id: SessionId,
+    pub path: String,
+}
+
+/// `context.clear`: make the model start from a clean context. Earlier events
+/// stay in the log (and the transcript); they are simply not sent again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextClearParams {
+    pub session_id: SessionId,
+}
+
+/// `session.btw`: a one-off side question, answered in a throwaway context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BtwParams {
+    pub session_id: SessionId,
+    pub question: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BtwResult {
+    pub btw_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -262,6 +390,8 @@ pub struct RenameParams {
 pub enum ApprovalDecision {
     Approve,
     Deny,
+    /// Approve this call and matching calls for the rest of the session.
+    Always,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,6 +409,22 @@ pub struct ApprovalRespondParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApprovalResult {
+    pub accepted: bool,
+}
+
+/// Answer the model's `ask_user` question. `input_id` may be empty to target
+/// the session's current question.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputRespondParams {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub input_id: String,
+    /// Zero-based index into the question's option list.
+    pub option_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputResult {
     pub accepted: bool,
 }
 
@@ -422,12 +568,20 @@ pub struct ContextPinParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextCompactParams {
     pub session_id: SessionId,
-    /// Inclusive range of source event sequence numbers.
-    pub from_seq: u64,
-    pub to_seq: u64,
-    /// Replacement text. A mechanical note is generated when omitted.
+    /// Inclusive range of source event sequence numbers. Both `None` means
+    /// "every message currently in the context".
+    #[serde(default)]
+    pub from_seq: Option<u64>,
+    #[serde(default)]
+    pub to_seq: Option<u64>,
+    /// Replacement text. When omitted, a mechanical note is generated (or the
+    /// model writes one when `generate` is set).
     #[serde(default)]
     pub summary: Option<String>,
+    /// Ask the provider for a real summary of the range instead of the
+    /// mechanical placeholder. Used by the `/compact` command.
+    #[serde(default)]
+    pub generate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -453,6 +607,85 @@ pub struct ProcessKillParams {
 pub struct SessionList {
     pub sessions: Vec<Session>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionArchiveParams {
+    pub session_id: SessionId,
+    pub archived: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionExportResult {
+    /// A self-contained JSON document accepted by `session.import`.
+    pub json: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionImportParams {
+    pub json: String,
+    /// Overrides the exported name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Overrides the exported working directory.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+}
+
+/// One row of `session.timeline`: a user or assistant event plus a short
+/// preview, intended for navigation rather than full rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineItem {
+    pub seq: u64,
+    pub ts: i64,
+    pub kind: String,
+    pub preview: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellRunParams {
+    pub session_id: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShellRunResult {
+    pub ok: bool,
+    pub output: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineResult {
+    pub items: Vec<TimelineItem>,
+}
+
+/// One model-managed task. `status` is `pending`, `in_progress`, `completed`
+/// or `cancelled`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TodoItem {
+    pub content: String,
+    #[serde(default = "default_todo_status")]
+    pub status: String,
+}
+
+fn default_todo_status() -> String {
+    "pending".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TodoList {
+    pub items: Vec<TodoItem>,
+}
+
+/// Versioned export envelope. Kept in the protocol module so CLI/TUI clients
+/// can parse it without a second schema.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionExport {
+    pub version: u32,
+    pub session: Session,
+    pub events: Vec<Event>,
+}
+
+pub const SESSION_EXPORT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionResult {

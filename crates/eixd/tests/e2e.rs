@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AttachResult, Config, EventKind, HelloResult, PermissionLevel, Request, Response, SearchResult,
-    ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
+    AttachResult, Config, EventKind, HelloResult, ModelConfig, PermissionLevel, Request, Response,
+    SearchResult, ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -318,6 +318,580 @@ async fn context_ledger_reports_sectors_and_honours_policies() -> anyhow::Result
         .events
         .iter()
         .any(|event| event.kind == EventKind::ContextCompacted));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
+    let dir = temp_dir("clear");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "clear", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "first question"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    let cleared: eix_core::ContextLedgerResult = client
+        .request("context.clear", json!({"session_id": session_id}))
+        .await?;
+    assert!(
+        cleared
+            .entries
+            .iter()
+            .any(|entry| entry.id.starts_with('e') && entry.dropped),
+        "earlier messages are marked dropped"
+    );
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "second question"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    let bodies = bodies.lock().await;
+    let second: Value = serde_json::from_str(&bodies[1])?;
+    let second_text = second["messages"].to_string();
+    assert!(
+        !second_text.contains("first question"),
+        "the cleared prompt is not resent: {second_text}"
+    );
+    assert!(
+        !second_text.contains("Hello from mock"),
+        "the cleared answer is not resent: {second_text}"
+    );
+    assert!(second_text.contains("second question"));
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::ContextCleared));
+    // The log keeps the earlier turns for the transcript.
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::UserMessage
+            && event.payload["text"] == "first question"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_compact_can_generate_a_summary() -> anyhow::Result<()> {
+    let dir = temp_dir("compact");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "compact", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "long discussion"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    // No from/to: compact everything that is still in the context. No summary:
+    // ask the provider.
+    let compacted: eix_core::ContextLedgerResult = client
+        .request(
+            "context.compact",
+            json!({"session_id": session_id, "generate": true}),
+        )
+        .await?;
+    assert!(compacted
+        .entries
+        .iter()
+        .any(|entry| entry.id.starts_with('c')));
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "follow up"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    let bodies = bodies.lock().await;
+    // bodies[0] = main turn, bodies[1] = summarization, bodies[2] = follow up.
+    let summary_request: Value = serde_json::from_str(&bodies[1])?;
+    assert!(summary_request["messages"]
+        .to_string()
+        .contains("Summarize the conversation"));
+    let follow_up: Value = serde_json::from_str(&bodies[2])?;
+    let text = follow_up["messages"].to_string();
+    assert!(
+        text.contains("Hello from mock"),
+        "summary is in context: {text}"
+    );
+    assert!(text.contains("follow up"));
+    assert!(
+        !text.contains("long discussion"),
+        "old turn was compacted: {text}"
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_cd_moves_the_workspace() -> anyhow::Result<()> {
+    let dir = temp_dir("cd");
+    std::fs::create_dir_all(dir.join("sub"))?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::new(Mutex::new(Vec::new()))));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "cd", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let updated: SessionResult = client
+        .request(
+            "session.cd",
+            json!({"session_id": session_id, "path": "sub"}),
+        )
+        .await?;
+    let expected = dir.join("sub").canonicalize()?;
+    assert_eq!(updated.session.cwd, expected);
+
+    let code = client
+        .request_error(
+            "session.cd",
+            json!({"session_id": session_id, "path": "missing-dir"}),
+        )
+        .await?;
+    assert_eq!(code, "invalid_params");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
+    let dir = temp_dir("models-agents");
+    std::fs::create_dir_all(dir.join(".eix/agents"))?;
+    std::fs::create_dir_all(dir.join(".eix/commands"))?;
+    std::fs::write(
+        dir.join(".eix/agents/reviewer.md"),
+        "---\ndescription: Review changes\nmode: all\npermission: read-only\n---\n\nFind bugs.\n",
+    )?;
+    std::fs::write(
+        dir.join(".eix/commands/review.md"),
+        "---\ndescription: Review a path\nagent: reviewer\n---\n\nReview $ARGUMENTS carefully.\n",
+    )?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::new(Mutex::new(Vec::new()))));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.models = vec![ModelConfig {
+        id: "mock/second".to_string(),
+        name: Some("Second".to_string()),
+        base_url: format!("http://{addr}/v1"),
+        input_cost: Some(1.0),
+        output_cost: Some(2.0),
+        variants: vec!["high".to_string()],
+        ..ModelConfig::default()
+    }];
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "catalog", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let models: eix_core::ModelListResult = client.request("model.list", Value::Null).await?;
+    assert_eq!(models.models.len(), 2);
+    assert_eq!(models.models[0].id, "mock-model");
+    assert!(models.models[0].default);
+    assert_eq!(models.models[1].id, "mock/second");
+    assert_eq!(models.models[1].variants, vec!["high"]);
+
+    let pinned: SessionResult = client
+        .request(
+            "session.model",
+            json!({"session_id": session_id, "model": "mock/second#high"}),
+        )
+        .await?;
+    assert_eq!(pinned.session.model.as_deref(), Some("mock/second#high"));
+    let cleared: SessionResult = client
+        .request(
+            "session.model",
+            json!({"session_id": session_id, "model": null}),
+        )
+        .await?;
+    assert!(cleared.session.model.is_none());
+
+    let agents: eix_core::AgentListResult = client
+        .request("agent.list", json!({"session_id": session_id}))
+        .await?;
+    assert!(agents.agents.iter().any(|agent| agent.name == "build"));
+    let reviewer = agents
+        .agents
+        .iter()
+        .find(|agent| agent.name == "reviewer")
+        .expect("reviewer agent");
+    assert_eq!(reviewer.permission, Some(PermissionLevel::ReadOnly));
+    assert_eq!(reviewer.prompt, "Find bugs.");
+
+    let selected: SessionResult = client
+        .request(
+            "session.agent",
+            json!({"session_id": session_id, "agent": "reviewer"}),
+        )
+        .await?;
+    assert_eq!(selected.session.agent.as_deref(), Some("reviewer"));
+
+    let code = client
+        .request_error(
+            "session.agent",
+            json!({"session_id": session_id, "agent": "missing"}),
+        )
+        .await?;
+    assert_eq!(code, "invalid_params");
+
+    let commands = eix_core::load_commands(&dir);
+    let review = commands
+        .iter()
+        .find(|command| command.name == "review")
+        .expect("review command");
+    assert_eq!(review.agent.as_deref(), Some("reviewer"));
+    assert_eq!(
+        eix_core::expand_command(&review.template, "src/lib.rs"),
+        "Review src/lib.rs carefully."
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn mcp_tools_are_listed_and_require_approval() -> anyhow::Result<()> {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return Ok(()); // no Python: nothing to run the stdio server with
+    }
+    let dir = temp_dir("mcp");
+    std::fs::create_dir_all(&dir)?;
+    let script = dir.join("server.py");
+    std::fs::write(
+        &script,
+        r#"import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "mock", "version": "0"}}})
+    elif method == "notifications/initialized":
+        pass
+    elif method == "tools/list":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"tools": [{
+            "name": "echo",
+            "description": "Echo text",
+            "inputSchema": {"type": "object",
+                            "properties": {"text": {"type": "string"}},
+                            "required": ["text"]}}]}})
+    elif method == "tools/call":
+        text = msg["params"]["arguments"].get("text", "")
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "content": [{"type": "text", "text": "echo:" + text}]}})
+    elif method == "resources/list":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"resources": [{
+            "uri": "file:///note", "name": "note",
+            "description": "A note", "mimeType": "text/plain"}]}})
+    elif method == "resources/read":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"contents": [{
+            "uri": "file:///note", "mimeType": "text/plain",
+            "text": "note body"}]}})
+    elif method == "prompts/list":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {"prompts": [{
+            "name": "review", "description": "Review a path",
+            "arguments": [{"name": "path", "required": True}]}]}})
+    elif method == "prompts/get":
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "description": "Review prompt",
+            "messages": [{"role": "user", "content": {
+                "type": "text", "text": "review this"}}]}})
+    else:
+        send({"jsonrpc": "2.0", "id": msg.get("id"),
+              "error": {"code": -32601, "message": "unknown method"}})
+"#,
+    )?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mcp_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.mcp.servers.insert(
+        "mock".to_string(),
+        eix_core::McpServerConfig {
+            command: "python3".to_string(),
+            args: vec![script.to_string_lossy().into_owned()],
+            ..eix_core::McpServerConfig::default()
+        },
+    );
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "mcp", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let mcp: eix_core::McpListResult = client.request("mcp.list", Value::Null).await?;
+    assert_eq!(mcp.servers.len(), 1);
+    assert_eq!(mcp.servers[0].name, "mock");
+    assert!(mcp.servers[0].error.is_none(), "{:?}", mcp.servers[0].error);
+    assert_eq!(mcp.servers[0].tools, 1);
+    assert_eq!(mcp.servers[0].resources, 1);
+    assert_eq!(mcp.servers[0].prompts, 1);
+
+    let _: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "echo something"}),
+        )
+        .await?;
+
+    let approval = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            break notification.params.clone();
+        }
+    };
+    assert_eq!(approval["tool"], "mcp__mock__echo");
+    assert!(approval["summary"]
+        .as_str()
+        .unwrap()
+        .contains("mcp__mock__echo"));
+    let approval_id = approval["approval_id"].as_str().unwrap().to_string();
+    let answered: eix_core::ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "decision": "approve",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert!(completed["error"].is_null());
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let tool_result = |name: &str| {
+        attached
+            .events
+            .iter()
+            .find(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == name)
+            .unwrap_or_else(|| panic!("missing tool result for {name}"))
+    };
+    let echo = tool_result("mcp__mock__echo");
+    assert!(
+        echo.payload["output"].as_str().unwrap().contains("echo:hi"),
+        "{}",
+        echo.payload["output"]
+    );
+    assert!(tool_result("mcp_list_resources").payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("file:///note"));
+    assert!(tool_result("mcp_read_resource").payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("note body"));
+    assert!(tool_result("mcp_list_prompts").payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("review"));
+    assert!(tool_result("mcp_get_prompt").payload["output"]
+        .as_str()
+        .unwrap()
+        .contains("review this"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn btw_answers_without_touching_the_log() -> anyhow::Result<()> {
+    let dir = temp_dir("btw");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "btw", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "main question"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    let before: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let events_before = before.events.len();
+
+    let result: eix_core::BtwResult = client
+        .request(
+            "session.btw",
+            json!({"session_id": session_id, "question": "quick side question"}),
+        )
+        .await?;
+    assert!(!result.btw_id.is_empty());
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "btw.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert_eq!(completed["error"], Value::Null);
+    assert_eq!(completed["text"], "Hello from mock");
+
+    let after: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert_eq!(after.events.len(), events_before, "btw adds no events");
+
+    let bodies = bodies.lock().await;
+    let btw: Value = serde_json::from_str(&bodies[1])?;
+    let text = btw["messages"].to_string();
+    assert!(text.contains("quick side question"));
+    assert!(
+        !text.contains("main question"),
+        "the side question is answered out of context: {text}"
+    );
 
     daemon.abort();
     mock.abort();
@@ -1441,7 +2015,7 @@ async fn staged_writes_are_visible_to_reads() -> anyhow::Result<()> {
     assert_eq!(results.len(), 2, "events were: {:?}", attached.events);
     assert_eq!(results[1].payload["tool"], "read_file");
     assert_eq!(
-        results[1].payload["output"], "staged",
+        results[1].payload["output"], "1: staged\n",
         "reads must see the shadow workspace"
     );
     // The patch is still waiting and the real file is untouched.
@@ -2454,6 +3028,130 @@ async fn spawn_agent_runs_a_readonly_child_and_returns_its_answer() -> anyhow::R
 }
 
 #[tokio::test]
+async fn ask_user_blocks_the_turn_until_the_user_answers() -> anyhow::Result<()> {
+    let dir = temp_dir("ask");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(ask_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "ask", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id;
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "pick a database"}),
+        )
+        .await?;
+
+    let mut saw_question = false;
+    let mut text = String::new();
+    loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "input.required" if notification.params["session_id"] == session_id.as_str() => {
+                assert_eq!(
+                    notification.params["question"],
+                    "Which database should we use?"
+                );
+                let options = notification.params["options"].as_array().expect("options");
+                assert_eq!(options.len(), 3);
+                assert_eq!(options[0]["label"], "SQLite");
+                let result: eix_core::InputResult = client
+                    .request(
+                        "input.respond",
+                        json!({
+                            "session_id": session_id,
+                            "input_id": notification.params["input_id"],
+                            "option_index": 1,
+                        }),
+                    )
+                    .await?;
+                assert!(result.accepted);
+                saw_question = true;
+            }
+            "message.delta" if notification.params["session_id"] == session_id.as_str() => {
+                if let Some(delta) = notification.params["delta"].as_str() {
+                    text.push_str(delta);
+                }
+            }
+            "turn.completed" if notification.params["session_id"] == session_id.as_str() => {
+                assert!(notification.params["error"].is_null());
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(saw_question, "the daemon never asked");
+    assert_eq!(text, "done");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert_eq!(attached.session.status, eix_core::SessionStatus::Idle);
+    let asked = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::InputRequired)
+        .expect("question event");
+    assert_eq!(asked.payload["question"], "Which database should we use?");
+    assert_eq!(asked.payload["options"][2]["label"], "MySQL");
+    let answered = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::InputAnswered)
+        .expect("answer event");
+    assert_eq!(answered.payload["option_index"], 1);
+    assert_eq!(
+        answered.payload["answer"],
+        "Postgres — Server, better concurrency"
+    );
+    let result = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == "ask_user")
+        .expect("ask_user result");
+    assert_eq!(result.payload["ok"], true);
+    let output = result.payload["output"].as_str().expect("output");
+    assert!(output.contains("User selected option 2 of 3"), "{output}");
+    assert!(output.contains("Postgres"), "{output}");
+
+    // The selected label reached the provider as the tool result.
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), 2);
+    let second: Value = serde_json::from_str(&bodies[1])?;
+    let tool_message = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool message");
+    assert!(tool_message["content"]
+        .as_str()
+        .unwrap()
+        .contains("Postgres"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn nvim_headless_renders_the_transcript() -> anyhow::Result<()> {
     // The Neovim frontend is optional: skip when the binary is missing.
     let has_nvim = std::process::Command::new("nvim")
@@ -3025,6 +3723,1258 @@ async fn tool_provider_with_content(
     }
 }
 
+#[tokio::test]
+async fn skills_are_listed_in_the_prompt_and_loadable_with_use_skill() -> anyhow::Result<()> {
+    let dir = temp_dir("skills");
+    std::fs::create_dir_all(dir.join(".eix/skills/deploy"))?;
+    std::fs::write(
+        dir.join(".eix/skills/deploy/SKILL.md"),
+        "---\ndescription: deploy checklist\n---\nRun the deploy checklist before shipping.\n",
+    )?;
+    std::fs::create_dir_all(dir.join(".claude/skills/audit"))?;
+    std::fs::write(
+        dir.join(".claude/skills/audit/SKILL.md"),
+        "---\ndescription: Claude-compatible audit\nallowed-tools: read_file\n---\nAudit the workspace.\n",
+    )?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(skill_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "skills", "cwd": dir}))
+        .await?;
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "deploy please"}),
+        )
+        .await?;
+    let mut text = String::new();
+    loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "message.delta" => {
+                text.push_str(notification.params["delta"].as_str().unwrap_or_default())
+            }
+            "turn.completed"
+                if notification.params["session_id"] == created.session.id.as_str()
+                    && notification.params["turn_id"] == submitted.turn_id.as_str() =>
+            {
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(text, "used skill");
+    let bodies = bodies.lock().await;
+    assert!(bodies.len() >= 2);
+    assert!(bodies[0].contains("<available_skills>"));
+    assert!(bodies[0].contains("deploy checklist"));
+    assert!(bodies[0].contains("Claude-compatible audit"));
+    assert!(bodies[0].contains("<allowed_tools>read_file</allowed_tools>"));
+    assert!(bodies[1].contains("Run the deploy checklist before shipping."));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn skills_expand_arguments_and_enforce_allowed_tools() -> anyhow::Result<()> {
+    let dir = temp_dir("skill-guard");
+    std::fs::create_dir_all(dir.join(".eix/skills/locked"))?;
+    std::fs::write(
+        dir.join(".eix/skills/locked/SKILL.md"),
+        "---\ndescription: locked workflow\nallowed-tools: read_file\n---\nDo $ARGUMENTS ($1 / $2).\n",
+    )?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(skill_guard_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "guard", "cwd": dir}))
+        .await?;
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "run the locked workflow"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == created.session.id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": created.session.id}))
+        .await?;
+    let results: Vec<_> = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolResult)
+        .collect();
+    let skill = results
+        .iter()
+        .find(|event| event.payload["tool"] == "use_skill")
+        .expect("use_skill result");
+    let output = skill.payload["output"].as_str().unwrap_or_default();
+    assert!(output.contains("Do alpha beta (alpha / beta)."), "{output}");
+    assert!(output.contains("Allowed tools"), "{output}");
+    let write = results
+        .iter()
+        .find(|event| event.payload["tool"] == "write_file")
+        .expect("blocked write result");
+    assert_eq!(write.payload["ok"], false);
+    assert_eq!(write.payload["denied"], true);
+    assert!(
+        write.payload["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("does not allow"),
+        "{}",
+        write.payload["output"]
+    );
+    assert!(!dir.join("x.txt").exists(), "the write must not run");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+async fn skill_guard_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let tool_count = value["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                })
+                .unwrap_or(0);
+            let (name, arguments, text) = match tool_count {
+                0 => (
+                    "use_skill",
+                    json!({"name": "locked", "arguments": "alpha beta"}).to_string(),
+                    String::new(),
+                ),
+                1 => (
+                    "write_file",
+                    json!({"path": "x.txt", "content": "blocked"}).to_string(),
+                    String::new(),
+                ),
+                _ => ("", String::new(), "done".to_string()),
+            };
+            if tool_count >= 2 {
+                let chunk = json!({
+                    "model": "mock-skill",
+                    "choices": [{"delta": {"content": text}, "finish_reason": "stop"}],
+                });
+                write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+                return;
+            }
+            let chunk = json!({
+                "model": "mock-skill",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": format!("call_{tool_count}"),
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }]
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            });
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
+async fn skill_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            let chunk = if has_tool_result {
+                json!({
+                    "model": "mock-skill",
+                    "choices": [{"delta": {"content": "used skill"}, "finish_reason": "stop"}],
+                })
+            } else {
+                json!({
+                    "model": "mock-skill",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_skill",
+                                "type": "function",
+                                "function": {"name": "use_skill", "arguments": "{\"name\":\"deploy\"}"},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn todo_tool_updates_the_session_task_list() -> anyhow::Result<()> {
+    let dir = temp_dir("todos");
+    std::fs::create_dir_all(&dir)?;
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(todo_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "todos", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "plan the work"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == session_id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    let todos: eix_core::TodoList = client
+        .request("session.todos", json!({"session_id": session_id}))
+        .await?;
+    assert_eq!(todos.items.len(), 2);
+    assert_eq!(todos.items[0].content, "inspect the code");
+    assert_eq!(todos.items[0].status, "completed");
+    assert_eq!(todos.items[1].status, "in_progress");
+    let bodies = bodies.lock().await;
+    assert!(bodies[0].contains("\"name\":\"todo\""));
+    assert!(bodies[1].contains("[>] write the fix"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+async fn todo_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            let chunk = if has_tool_result {
+                json!({
+                    "model": "mock-todo",
+                    "choices": [{"delta": {"content": "planned"}, "finish_reason": "stop"}],
+                })
+            } else {
+                let arguments = json!({
+                    "todos": [
+                        {"content": "inspect the code", "status": "completed"},
+                        {"content": "write the fix", "status": "in_progress"}
+                    ]
+                })
+                .to_string();
+                json!({
+                    "model": "mock-todo",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_todo",
+                                "type": "function",
+                                "function": {"name": "todo", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Result<()> {
+    let dir = temp_dir("auto-compact");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.budget_tokens = 100_000;
+    // Force the path without depending on how many tokens the prompt has.
+    config.context.auto_compact_threshold = 0.0001;
+    config.context.auto_compact_keep_turns = 2;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "compact", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    for text in ["one", "two", "three"] {
+        let submitted: SubmitResult = client
+            .request(
+                "prompt.submit",
+                json!({"session_id": session_id, "text": text}),
+            )
+            .await?;
+        loop {
+            let notification = client.next_notification().await?;
+            if notification.method == "turn.completed"
+                && notification.params["turn_id"] == submitted.turn_id.as_str()
+            {
+                assert!(notification.params["error"].is_null());
+                break;
+            }
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let compacted = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ContextCompacted)
+        .expect("auto compaction event");
+    assert_eq!(compacted.payload["messages"], 2);
+    assert_eq!(compacted.payload["summary"], "Hello from mock");
+
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), 4, "three turns plus one summary");
+    let summary: Value = serde_json::from_str(&bodies[2])?;
+    assert!(summary["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Summarize the conversation")));
+    let third: Value = serde_json::from_str(&bodies[3])?;
+    assert!(third["messages"].as_array().unwrap().iter().any(|message| {
+        message["role"] == "system"
+            && message["content"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("[compacted 2 messages")
+    }));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// Like [`tool_provider`], but keys off the *last* message so a second user
+/// turn in the same session calls the tool again.
+async fn repeat_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let last_is_tool = value["messages"]
+                .as_array()
+                .and_then(|messages| messages.last())
+                .map(|message| message["role"] == "tool")
+                .unwrap_or(false);
+            let events = if last_is_tool {
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else {
+                let arguments = json!({"path": "out.txt", "content": "hello"}).to_string();
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "write_file", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
+    let dir = temp_dir("reload");
+    std::fs::create_dir_all(&dir)?;
+    let config_path = dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"first-model\"\n\
+         api_key = \"test\"\ntimeout_secs = 5\n",
+    )?;
+
+    let mut config = Config::default();
+    config.provider.base_url = "http://127.0.0.1:9/v1".into();
+    config.provider.model = "first-model".into();
+    config.provider.api_key = Some("test".into());
+    // Mark the file as the authoritative source so `reload` reads it again.
+    config.explicit_path = Some(config_path.clone());
+    config.load_cwd = dir.clone();
+    config.watch_paths = vec![config_path.clone()];
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "reload", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let before: eix_core::ModelListResult = client.request("model.list", Value::Null).await?;
+    assert_eq!(before.models[0].id, "first-model");
+
+    std::fs::write(
+        &config_path,
+        "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"second-model\"\n\
+         api_key = \"test\"\ntimeout_secs = 5\n",
+    )?;
+    let reloaded: Value = client.request("config.reload", Value::Null).await?;
+    assert_eq!(reloaded["reloaded"], true);
+    let after: eix_core::ModelListResult = client.request("model.list", Value::Null).await?;
+    assert_eq!(after.models[0].id, "second-model");
+    // The session still exists; only new turns use the new default.
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert_eq!(attached.session.id, session_id);
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn sessions_can_be_exported_imported_archived_and_deleted() -> anyhow::Result<()> {
+    let dir = temp_dir("session-management");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "original", "cwd": dir}))
+        .await?;
+    let original_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": original_id, "text": "say hi"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == original_id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    let timeline: eix_core::TimelineResult = client
+        .request("session.timeline", json!({"session_id": original_id}))
+        .await?;
+    assert!(timeline
+        .items
+        .iter()
+        .any(|item| item.kind == "user_message"));
+    assert!(timeline
+        .items
+        .iter()
+        .any(|item| item.kind == "assistant_message" && item.preview.contains("Hello")));
+
+    let exported: eix_core::SessionExportResult = client
+        .request("session.export", json!({"session_id": original_id}))
+        .await?;
+    let document: eix_core::SessionExport = serde_json::from_str(&exported.json)?;
+    assert_eq!(document.version, eix_core::SESSION_EXPORT_VERSION);
+    assert!(!document.events.is_empty());
+
+    let imported: SessionResult = client
+        .request(
+            "session.import",
+            json!({"json": exported.json, "name": "imported", "cwd": dir}),
+        )
+        .await?;
+    assert_ne!(imported.session.id, original_id);
+    assert_eq!(imported.session.name, "imported");
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": imported.session.id}))
+        .await?;
+    assert_eq!(attached.events.len(), document.events.len());
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::AssistantMessage
+            && event.payload["text"] == "Hello from mock"));
+
+    let archived: SessionResult = client
+        .request(
+            "session.archive",
+            json!({"session_id": original_id, "archived": true}),
+        )
+        .await?;
+    assert!(archived.session.archived);
+    let active: eix_core::SessionList = client.request("session.list", Value::Null).await?;
+    assert!(!active.sessions.iter().any(|s| s.id == original_id));
+    let all: eix_core::SessionList = client
+        .request("session.list", json!({"include_archived": true}))
+        .await?;
+    assert!(all.sessions.iter().any(|s| s.id == original_id));
+
+    let deleted: Value = client
+        .request("session.delete", json!({"session_id": imported.session.id}))
+        .await?;
+    assert_eq!(deleted["deleted"], true);
+    assert!(client
+        .request::<AttachResult>("session.attach", json!({"session_id": imported.session.id}),)
+        .await
+        .is_err());
+    let remaining: eix_core::SessionList = client
+        .request("session.list", json!({"include_archived": true}))
+        .await?;
+    assert!(remaining
+        .sessions
+        .iter()
+        .all(|s| s.id != imported.session.id));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_attachments_are_stored_and_sent_as_content_parts() -> anyhow::Result<()> {
+    let dir = temp_dir("images");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("pixel.png"), b"\x89PNG\r\n\x1a\nnot-a-real-png")?;
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "images", "cwd": dir}))
+        .await?;
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({
+                "session_id": created.session.id,
+                "text": "what is this?",
+                "images": ["pixel.png"],
+            }),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == created.session.id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": created.session.id}))
+        .await?;
+    let user = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::UserMessage)
+        .expect("user event");
+    assert_eq!(user.payload["images"][0]["path"], "pixel.png");
+    assert_eq!(user.payload["images"][0]["mime"], "image/png");
+    let blob = user.payload["images"][0]["blob"]
+        .as_str()
+        .expect("event references a blob");
+    assert_eq!(blob.len(), 64);
+    assert!(user.payload["images"][0]["data"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty());
+    assert!(dir.join("data/blobs").join(&blob[..2]).join(blob).is_file());
+
+    // Exports hydrate blob bytes so another machine can import the session.
+    let exported: eix_core::SessionExportResult = client
+        .request("session.export", json!({"session_id": created.session.id}))
+        .await?;
+    let document: eix_core::SessionExport = serde_json::from_str(&exported.json)?;
+    let exported_image = document
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::UserMessage)
+        .and_then(|event| event.payload["images"][0].as_object())
+        .expect("exported image");
+    assert!(!exported_image["data"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty());
+
+    // Import must not depend on the exporting machine's blob directory. Remove
+    // the local blob first, then import the hydrated export and check that the
+    // bytes were written back under the same content hash.
+    let blob_path = dir.join("data/blobs").join(&blob[..2]).join(blob);
+    std::fs::remove_file(&blob_path)?;
+    let imported: SessionResult = client
+        .request(
+            "session.import",
+            json!({"json": exported.json, "name": "imported-images"}),
+        )
+        .await?;
+    assert_ne!(imported.session.id, created.session.id);
+    assert!(blob_path.is_file(), "import did not restore the image blob");
+    let imported_attach: AttachResult = client
+        .request("session.attach", json!({"session_id": imported.session.id}))
+        .await?;
+    let imported_user = imported_attach
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::UserMessage)
+        .expect("imported user event");
+    assert_eq!(imported_user.payload["images"][0]["blob"], blob);
+    assert!(imported_user.payload["images"][0]["data"]
+        .as_str()
+        .unwrap_or_default()
+        .is_empty());
+
+    let bodies = bodies.lock().await;
+    let body: Value = serde_json::from_str(&bodies[0])?;
+    let content = &body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "user")
+        .unwrap()["content"];
+    assert!(content.is_array());
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[1]["type"], "image_url");
+    assert!(content[1]["image_url"]["url"]
+        .as_str()
+        .unwrap()
+        .starts_with("data:image/png;base64,"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Result<()> {
+    let dir = temp_dir("http");
+    std::fs::create_dir_all(&dir)?;
+    let port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.local_addr()?.port()
+    };
+    let mut config = Config::default();
+    config.server.http = Some(format!("127.0.0.1:{port}"));
+    config.server.token = Some("http-secret".to_string());
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let _client = connect(&socket).await?;
+
+    let base = format!("http://127.0.0.1:{port}");
+    let http = reqwest::Client::new();
+    let mut health = None;
+    for _ in 0..100 {
+        if let Ok(response) = http.get(format!("{base}/health")).send().await {
+            if response.status().is_success() {
+                health = Some(response.json::<Value>().await?);
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let health = health.expect("http server did not start");
+    assert_eq!(health["ok"], true);
+
+    let preflight = http
+        .request(reqwest::Method::OPTIONS, format!("{base}/rpc"))
+        .send()
+        .await?;
+    assert_eq!(preflight.status(), 204);
+    assert_eq!(
+        preflight
+            .headers()
+            .get("access-control-allow-origin")
+            .and_then(|value| value.to_str().ok()),
+        Some("*")
+    );
+
+    let stats = http
+        .get(format!("{base}/stats"))
+        .bearer_auth("http-secret")
+        .send()
+        .await?;
+    assert_eq!(stats.status(), 200);
+    let stats: Value = stats.json().await?;
+    assert!(stats["db_bytes"].as_u64().unwrap_or_default() > 0);
+
+    let sdk = eix_sdk::Client::new(&base, "http-secret");
+    assert_eq!(sdk.health().await?.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(sdk.stats().await?.version, env!("CARGO_PKG_VERSION"));
+
+    let unauthorized = http
+        .post(format!("{base}/rpc"))
+        .json(&json!({"id": 1, "method": "hello", "params": null}))
+        .send()
+        .await?;
+    assert_eq!(unauthorized.status(), 401);
+
+    let response = http
+        .post(format!("{base}/rpc"))
+        .bearer_auth("http-secret")
+        .json(&json!({"id": 2, "method": "hello", "params": null}))
+        .send()
+        .await?;
+    assert_eq!(response.status(), 200);
+    let response: Value = response.json().await?;
+    assert_eq!(response["id"], 2);
+    assert_eq!(response["result"]["protocol"], PROTOCOL_VERSION);
+
+    let mut events = http
+        .get(format!("{base}/events"))
+        .bearer_auth("http-secret")
+        .send()
+        .await?
+        .bytes_stream();
+    use futures_util::StreamExt;
+    // Headers are flushed before the handler subscribes to the daemon bus.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let created = http
+        .post(format!("{base}/rpc"))
+        .bearer_auth("http-secret")
+        .json(&json!({
+            "id": 3,
+            "method": "session.create",
+            "params": {"name": "http", "cwd": dir},
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), 200);
+    let created: Value = created.json().await?;
+    let target = created["result"]["session"]["id"]
+        .as_str()
+        .expect("created session id")
+        .to_string();
+    let mut seen = String::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    while tokio::time::Instant::now() < deadline {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(500), events.next()).await;
+        let Ok(Some(Ok(chunk))) = next else { continue };
+        seen.push_str(&String::from_utf8_lossy(&chunk));
+        if seen.contains("session.updated") {
+            break;
+        }
+    }
+    assert!(seen.contains("session.updated"), "no SSE event: {seen}");
+
+    // The SDK uses the same HTTP surface. Exercise typed create/stats plus a
+    // session-filtered event stream: another session's updates must not leak.
+    let mut filtered = sdk.events(&[target.as_str()]).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let other = sdk
+        .create_session(&eix_core::CreateSessionParams {
+            name: Some("other".into()),
+            cwd: Some(dir.clone()),
+            ..Default::default()
+        })
+        .await?;
+    sdk.request(
+        "session.rename",
+        json!({"session_id": target.clone(), "name": "renamed"}),
+    )
+    .await?;
+
+    let mut saw_other = false;
+    let mut saw_target = false;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while tokio::time::Instant::now() < deadline && !saw_target {
+        let next = tokio::time::timeout(Duration::from_millis(500), filtered.next()).await;
+        let Ok(Some(Ok(notification))) = next else {
+            continue;
+        };
+        if notification.params.to_string().contains(&other.session.id) {
+            saw_other = true;
+        }
+        if notification.method == "session.updated"
+            && notification.params["id"].as_str() == Some(target.as_str())
+        {
+            saw_target = true;
+        }
+    }
+    assert!(
+        saw_target,
+        "filtered stream did not deliver the target session"
+    );
+    assert!(!saw_other, "filtered stream leaked another session");
+    assert!(sdk
+        .sessions(true)
+        .await?
+        .sessions
+        .iter()
+        .any(|session| session.id == target));
+    assert!(sdk.stats().await?.sessions >= 2);
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_shell_commands_are_recorded_and_refused_in_read_only_sessions() -> anyhow::Result<()>
+{
+    let dir = temp_dir("shell-run");
+    std::fs::create_dir_all(&dir)?;
+    let mut config = Config::default();
+    config.tools.snapshots = false;
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "shell", "cwd": dir}))
+        .await?;
+    let result: eix_core::ShellRunResult = client
+        .request(
+            "shell.run",
+            json!({"session_id": created.session.id, "command": "printf shell-ok"}),
+        )
+        .await?;
+    assert!(result.ok, "{}", result.output);
+    assert!(result.output.contains("shell-ok"));
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": created.session.id}))
+        .await?;
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::ToolCall
+            && event.payload["tool"] == "run_command"
+            && event.payload["arguments"]["command"] == "printf shell-ok"));
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::ToolResult
+            && event.payload["tool"] == "run_command"
+            && event.payload["ok"] == true));
+
+    let readonly: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "readonly", "cwd": dir, "permission": "read-only"}),
+        )
+        .await?;
+    assert!(client
+        .request::<eix_core::ShellRunResult>(
+            "shell.run",
+            json!({"session_id": readonly.session.id, "command": "printf nope"}),
+        )
+        .await
+        .is_err());
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_and_redo_toggle_the_newest_turn() -> anyhow::Result<()> {
+    let dir = temp_dir("undo");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "undo", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "remember this"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == session_id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let before = attached.events.len();
+    assert!(before >= 2);
+
+    let undone: Value = client
+        .request("session.undo", json!({"session_id": session_id}))
+        .await?;
+    assert!(undone["changed"].as_u64().unwrap_or(0) >= 2);
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(!attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::UserMessage));
+    assert!(!attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::AssistantMessage));
+
+    let redone: Value = client
+        .request("session.redo", json!({"session_id": session_id}))
+        .await?;
+    assert!(redone["changed"].as_u64().unwrap_or(0) >= 2);
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert_eq!(attached.events.len(), before);
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::UserMessage
+            && event.payload["text"] == "remember this"));
+
+    client
+        .request::<Value>("session.undo", json!({"session_id": session_id}))
+        .await?;
+    assert!(client
+        .request::<Value>("session.undo", json!({"session_id": session_id}))
+        .await
+        .is_err());
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::Result<()> {
+    let dir = temp_dir("always");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(repeat_tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "always", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let first: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write it"}),
+        )
+        .await?;
+    let proposed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "patch.proposed" {
+            break notification.params.clone();
+        }
+    };
+    let patch_id = proposed["patch_id"].as_str().unwrap().to_string();
+    let answered: eix_core::ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": patch_id,
+                "decision": "always",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == first.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write it again"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let applied: Vec<_> = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::PatchApplied)
+        .collect();
+    assert_eq!(applied.len(), 2, "both writes were applied");
+    assert_eq!(applied[1].payload["message"], "auto-approval rule");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// A provider that asks for the `mock` MCP server's `echo` tool, then answers.
+async fn mcp_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let tool_count = value["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                })
+                .unwrap_or(0);
+            if tool_count >= 5 {
+                let chunk = json!({
+                    "model": "mock-tools",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                });
+                write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+                return;
+            }
+            let (name, arguments) = match tool_count {
+                0 => ("mcp__mock__echo", json!({"text": "hi"}).to_string()),
+                1 => ("mcp_list_resources", json!({"server": "mock"}).to_string()),
+                2 => (
+                    "mcp_read_resource",
+                    json!({"server": "mock", "uri": "file:///note"}).to_string(),
+                ),
+                3 => ("mcp_list_prompts", json!({"server": "mock"}).to_string()),
+                _ => (
+                    "mcp_get_prompt",
+                    json!({"server": "mock", "name": "review",
+                           "arguments": {"path": "src"}})
+                    .to_string(),
+                ),
+            };
+            let chunk = json!({
+                "model": "mock-tools",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": format!("call_mcp_{tool_count}"),
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }]
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            });
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
 /// A provider for the sub-agent test: the parent (whose tool list contains
 /// `spawn_agent`) asks for one child; the child (read-only tools) answers;
 /// the parent then stops with "parent done".
@@ -3174,6 +5124,47 @@ async fn staging_read_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Stri
                     });
                     format!("data: {chunk}\n\ndata: [DONE]\n\n")
                 }
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+/// A provider for the `ask_user` test: the first round asks a question, the
+/// second (after the tool result) stops with "done".
+async fn ask_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            let events = if has_tool_result {
+                let chunk = json!({
+                    "model": "mock-ask",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else {
+                let arguments = json!({
+                    "question": "Which database should we use?",
+                    "options": [
+                        {"label": "SQLite", "description": "Embedded, no setup"},
+                        {"label": "Postgres", "description": "Server, better concurrency"},
+                        {"label": "MySQL", "description": "Widely deployed"}
+                    ]
+                })
+                .to_string();
+                tool_call_events("call_ask", "ask_user", &arguments)
             };
             write_sse(&mut socket, &events).await;
         });

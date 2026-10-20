@@ -6,7 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use eix_core::{ChatMessage, Config, FunctionCall, ToolCall, ToolDefinition, Usage};
+use eix_core::{ChatMessage, Config, FunctionCall, ModelRoute, ToolCall, ToolDefinition, Usage};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -28,17 +28,26 @@ pub enum ProviderError {
 #[derive(Debug, Clone, Default)]
 pub struct Completion {
     pub text: String,
+    /// Streamed chain-of-thought (`reasoning_content` / `reasoning`), when the
+    /// provider exposes it. Never fed back as a chat message.
+    pub reasoning: String,
     pub model: String,
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
     pub tool_calls: Vec<ToolCall>,
 }
 
+/// One streamed fragment. Providers like DeepSeek interleave reasoning and
+/// answer tokens, so the host needs to tell them apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamDelta<'a> {
+    Content(&'a str),
+    Reasoning(&'a str),
+}
+
 pub struct Provider {
     client: reqwest::Client,
-    endpoint: String,
     model: String,
-    api_key: Option<String>,
 }
 
 impl Provider {
@@ -51,9 +60,7 @@ impl Provider {
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         Ok(Self {
             client,
-            endpoint: config.chat_endpoint(),
             model: config.provider.model.clone(),
-            api_key: config.api_key(),
         })
     }
 
@@ -61,28 +68,34 @@ impl Provider {
         &self.model
     }
 
-    /// Stream a completion, invoking `on_delta` for each non-empty content
-    /// fragment. Returns the assembled message. Checks `cancel` between chunks.
+    /// Stream a completion, invoking `on_delta` for each non-empty content or
+    /// reasoning fragment. Returns the assembled message. Checks `cancel`
+    /// between chunks.
     pub async fn stream_chat<F>(
         &self,
         messages: &[ChatMessage],
-        model: &str,
+        route: &ModelRoute,
         tools: &[ToolDefinition],
         cancel: &AtomicBool,
         mut on_delta: F,
     ) -> Result<Completion, ProviderError>
     where
-        F: FnMut(&str) + Send,
+        F: FnMut(StreamDelta<'_>) + Send,
     {
         if cancel.load(Ordering::Relaxed) {
             return Err(ProviderError::Cancelled);
         }
 
+        let model = route.model.as_str();
+        let wire_messages: Vec<Value> = messages.iter().map(ChatMessage::to_wire).collect();
         let mut body = json!({
             "model": model,
-            "messages": messages,
+            "messages": wire_messages,
             "stream": true,
         });
+        if let Some(effort) = &route.reasoning_effort {
+            body["reasoning_effort"] = json!(effort);
+        }
         if !tools.is_empty() {
             body["tools"] = serde_json::to_value(tools)
                 .map_err(|e| ProviderError::Config(format!("cannot encode tools: {e}")))?;
@@ -90,10 +103,10 @@ impl Provider {
         }
         let mut request = self
             .client
-            .post(&self.endpoint)
+            .post(&route.endpoint)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body);
-        if let Some(key) = &self.api_key {
+        if let Some(key) = &route.api_key {
             request = request.bearer_auth(key);
         }
 
@@ -160,7 +173,7 @@ impl Provider {
         mut on_delta: F,
     ) -> Result<Completion, ProviderError>
     where
-        F: FnMut(&str),
+        F: FnMut(StreamDelta<'_>),
     {
         let text = response
             .text()
@@ -179,8 +192,15 @@ impl Provider {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
+        let reasoning = value
+            .pointer("/choices/0/message")
+            .and_then(extract_reasoning)
+            .unwrap_or_default();
+        if !reasoning.is_empty() {
+            on_delta(StreamDelta::Reasoning(&reasoning));
+        }
         if !content.is_empty() {
-            on_delta(&content);
+            on_delta(StreamDelta::Content(&content));
         }
         let tool_calls: Vec<ToolCall> = value
             .pointer("/choices/0/message/tool_calls")
@@ -188,6 +208,7 @@ impl Provider {
             .unwrap_or_default();
         Ok(Completion {
             text: content,
+            reasoning,
             model: value
                 .get("model")
                 .and_then(Value::as_str)
@@ -207,6 +228,7 @@ impl Provider {
 
 struct Accumulator {
     text: String,
+    reasoning: String,
     model: String,
     usage: Option<Usage>,
     finish_reason: Option<String>,
@@ -226,6 +248,7 @@ impl Accumulator {
     fn new(model: &str) -> Self {
         Self {
             text: String::new(),
+            reasoning: String::new(),
             model: model.to_string(),
             usage: None,
             finish_reason: None,
@@ -259,6 +282,7 @@ impl Accumulator {
             .collect();
         Completion {
             text: self.text,
+            reasoning: self.reasoning,
             model: self.model,
             usage: self.usage,
             finish_reason: self.finish_reason,
@@ -270,7 +294,7 @@ impl Accumulator {
 /// Apply one SSE `data:` payload. Returns `true` when the stream is done.
 fn apply_data<F>(data: &str, acc: &mut Accumulator, on_delta: &mut F) -> Result<bool, ProviderError>
 where
-    F: FnMut(&str),
+    F: FnMut(StreamDelta<'_>),
 {
     let data = data.trim();
     if data.is_empty() {
@@ -297,10 +321,18 @@ where
         acc.usage = serde_json::from_value(usage.clone()).ok();
     }
     if let Some(choice) = value.pointer("/choices/0") {
+        if let Some(reasoning) = choice
+            .pointer("/delta")
+            .and_then(extract_reasoning)
+            .filter(|text| !text.is_empty())
+        {
+            acc.reasoning.push_str(&reasoning);
+            on_delta(StreamDelta::Reasoning(&reasoning));
+        }
         if let Some(delta) = extract_content(choice.pointer("/delta/content")) {
             if !delta.is_empty() {
                 acc.text.push_str(&delta);
-                on_delta(&delta);
+                on_delta(StreamDelta::Content(&delta));
             }
         }
         if let Some(calls) = choice
@@ -338,6 +370,18 @@ where
         }
     }
     Ok(false)
+}
+
+/// Reasoning-capable providers expose the chain of thought under different
+/// keys: DeepSeek uses `reasoning_content`, OpenRouter/vLLM use `reasoning`
+/// (sometimes `thinking`). Accept any of them.
+fn extract_reasoning(value: &Value) -> Option<String> {
+    for key in ["reasoning_content", "reasoning", "thinking"] {
+        if let Some(text) = extract_content(value.get(key)) {
+            return Some(text);
+        }
+    }
+    None
 }
 
 /// OpenAI sends `content` as a string; newer multimodal APIs use an array of
@@ -484,7 +528,11 @@ mod tests {
     fn applies_delta_and_usage() {
         let mut acc = Accumulator::new("fallback");
         let mut seen = String::new();
-        let mut on_delta = |d: &str| seen.push_str(d);
+        let mut on_delta = |delta: StreamDelta<'_>| {
+            if let StreamDelta::Content(text) = delta {
+                seen.push_str(text);
+            }
+        };
 
         let line = r#"{"model":"m1","choices":[{"delta":{"content":"Hel"}}]}"#;
         assert!(!apply_data(line, &mut acc, &mut on_delta).unwrap());
@@ -500,9 +548,28 @@ mod tests {
     }
 
     #[test]
+    fn accumulates_streamed_reasoning() {
+        let mut acc = Accumulator::new("m");
+        let mut seen = String::new();
+        let mut on_delta = |delta: StreamDelta<'_>| {
+            if let StreamDelta::Reasoning(text) = delta {
+                seen.push_str(text);
+            }
+        };
+        let line = r#"{"choices":[{"delta":{"reasoning_content":"step "}}]}"#;
+        apply_data(line, &mut acc, &mut on_delta).unwrap();
+        let line = r#"{"choices":[{"delta":{"reasoning":"one","content":"answer"}}]}"#;
+        apply_data(line, &mut acc, &mut on_delta).unwrap();
+        let done = acc.finish();
+        assert_eq!(seen, "step one");
+        assert_eq!(done.reasoning, "step one");
+        assert_eq!(done.text, "answer");
+    }
+
+    #[test]
     fn accumulates_streamed_tool_calls() {
         let mut acc = Accumulator::new("m");
-        let mut on_delta = |_: &str| {};
+        let mut on_delta = |_: StreamDelta<'_>| {};
         let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"pa"}}]}}]}"#;
         let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#;
         apply_data(first, &mut acc, &mut on_delta).unwrap();
@@ -518,7 +585,7 @@ mod tests {
     #[test]
     fn assembles_multiple_tool_calls_by_index() {
         let mut acc = Accumulator::new("m");
-        let mut on_delta = |_: &str| {};
+        let mut on_delta = |_: StreamDelta<'_>| {};
         let chunks = [
             r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read_file","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"list_dir","arguments":"{}"}}]}}]}"#,
         ];
@@ -540,7 +607,7 @@ mod tests {
     #[test]
     fn surfaces_provider_errors() {
         let mut acc = Accumulator::new("m");
-        let mut on_delta = |_: &str| {};
+        let mut on_delta = |_: StreamDelta<'_>| {};
         let err = apply_data(
             r#"{"error":{"message":"bad key"}}"#,
             &mut acc,

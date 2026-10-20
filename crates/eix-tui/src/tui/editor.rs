@@ -51,8 +51,9 @@ pub enum Outcome {
     Submit,
     FilePicker,
     Action(&'static str),
-    /// Scroll the transcript (positive = down, negative = up).
-    Scroll(isize),
+    /// Browse previously submitted prompts (negative = older, positive =
+    /// newer). The host owns the history list; the editor only reports intent.
+    History(isize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -227,6 +228,13 @@ impl Editor {
     pub fn enter_insert(&mut self) {
         self.mode = Mode::Insert;
         self.col = self.col.min(self.line_len());
+    }
+
+    /// Leave insert/visual mode without touching the text. Used after the host
+    /// replaces the buffer (history recall) and wants to stay in normal mode.
+    pub fn enter_normal(&mut self) {
+        self.mode = Mode::Normal;
+        self.clamp_normal();
     }
 
     /// Insert host-provided text (pickers) at the cursor.
@@ -513,11 +521,11 @@ impl Editor {
             _ => {}
         }
 
-        // Plain `j`/`k` browse the transcript history while the prompt keeps
-        // focus. Counts and operators still move within the draft (`3j`,
-        // `dj`), and the arrow keys always do.
+        // Plain `j`/`k` browse the prompt's own submitted-message history while
+        // the prompt keeps focus. Counts and operators still move within the
+        // draft (`3j`, `dj`).
         if matches!(c, 'j' | 'k') && self.op.is_none() && self.count.is_none() {
-            return Outcome::Scroll(if c == 'k' { -1 } else { 1 });
+            return Outcome::History(if c == 'k' { -1 } else { 1 });
         }
 
         if let Some(op) = self.op {
@@ -1736,6 +1744,7 @@ fn leader_action(ch: char) -> Option<&'static str> {
         'C' => "context",
         'h' => "history",
         'p' => "processes",
+        'e' => "diagnostics",
         'r' => "approvals",
         'n' => "new-pane",
         'N' => "new",
@@ -1911,10 +1920,10 @@ mod tests {
     }
 
     #[test]
-    fn plain_j_and_k_scroll_but_counts_and_operators_still_move() {
+    fn plain_j_and_k_browse_history_but_counts_and_operators_still_move() {
         let mut editor = editor_with("one\ntwo\nthree");
-        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::Scroll(-1));
-        assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Scroll(1));
+        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::History(-1));
+        assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::History(1));
         // A count keeps `j`/`k` as vim line motions.
         press(&mut editor, "2");
         assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Ignored);
