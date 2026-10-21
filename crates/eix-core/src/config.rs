@@ -701,6 +701,15 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     /// Overall request timeout. Streaming responses are bounded by this.
     pub timeout_secs: u64,
+    /// Extra attempts after the first one for transient failures (network,
+    /// upstream 5xx, rate limits, malformed/empty responses). `0` disables
+    /// automatic retries.
+    pub retry_attempts: u32,
+    /// Base delay for exponential backoff between retries.
+    pub retry_base_ms: u64,
+    /// Upper bound for a single retry delay. A provider's `Retry-After` header
+    /// is also capped by this value.
+    pub retry_max_secs: u64,
     /// Optional replacement for the built-in system prompt.
     pub system_prompt: Option<String>,
 }
@@ -713,6 +722,9 @@ impl Default for ProviderConfig {
             api_key: None,
             api_key_env: "OPENAI_API_KEY".to_string(),
             timeout_secs: 300,
+            retry_attempts: 5,
+            retry_base_ms: 500,
+            retry_max_secs: 30,
             system_prompt: None,
         }
     }
@@ -1009,6 +1021,15 @@ impl Config {
         if let Some(value) = env_var("EIX_TIMEOUT_SECS").and_then(|v| v.parse().ok()) {
             self.provider.timeout_secs = value;
         }
+        if let Some(value) = env_var("EIX_RETRY_ATTEMPTS").and_then(|v| v.parse().ok()) {
+            self.provider.retry_attempts = value;
+        }
+        if let Some(value) = env_var("EIX_RETRY_BASE_MS").and_then(|v| v.parse().ok()) {
+            self.provider.retry_base_ms = value;
+        }
+        if let Some(value) = env_var("EIX_RETRY_MAX_SECS").and_then(|v| v.parse().ok()) {
+            self.provider.retry_max_secs = value;
+        }
         if let Some(value) = env_var("EIX_TOOL_POLICY") {
             match value.as_str() {
                 "ask" => self.tools.policy = ToolPolicy::Ask,
@@ -1092,6 +1113,21 @@ impl Config {
         if provider.timeout_secs == 0 {
             return Err(ConfigError::Invalid(
                 "provider.timeout_secs must be > 0".into(),
+            ));
+        }
+        if provider.retry_base_ms == 0 {
+            return Err(ConfigError::Invalid(
+                "provider.retry_base_ms must be > 0".into(),
+            ));
+        }
+        if provider.retry_max_secs == 0 {
+            return Err(ConfigError::Invalid(
+                "provider.retry_max_secs must be > 0".into(),
+            ));
+        }
+        if provider.retry_max_secs.saturating_mul(1_000) < provider.retry_base_ms {
+            return Err(ConfigError::Invalid(
+                "provider.retry_max_secs is shorter than provider.retry_base_ms".into(),
             ));
         }
         if self.tools.max_output_bytes == 0 {
@@ -1698,6 +1734,15 @@ mod tests {
     #[test]
     fn default_model_is_not_empty() {
         assert!(!Config::default().provider.model.is_empty());
+    }
+
+    #[test]
+    fn provider_retry_defaults_are_bounded() {
+        let provider = Config::default().provider;
+        assert!(provider.retry_attempts > 0);
+        assert!(provider.retry_base_ms > 0);
+        assert!(provider.retry_max_secs > 0);
+        assert!(provider.retry_max_secs.saturating_mul(1_000) >= provider.retry_base_ms);
     }
 
     #[test]

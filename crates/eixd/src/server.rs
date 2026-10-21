@@ -2194,6 +2194,14 @@ impl Daemon {
         self.emit_context(session_id, &ledger);
         let tools = allowed_tools;
         let route = self.config.load().route(&model);
+        let (max_retries, retry_base, retry_max) = {
+            let config = self.config.load();
+            (
+                config.provider.retry_attempts,
+                Duration::from_millis(config.provider.retry_base_ms.max(1)),
+                Duration::from_secs(config.provider.retry_max_secs.max(1)),
+            )
+        };
 
         for round in 0..=tools::MAX_TOOL_ROUNDS {
             if cancel.load(Ordering::SeqCst) {
@@ -2201,47 +2209,42 @@ impl Daemon {
                 return Ok(());
             }
 
-            let bus = self.bus.clone();
-            let sid = session_id.to_string();
-            let tid = turn_id.to_string();
-            let mut streamed = String::new();
-            let mut streamed_reasoning = String::new();
             let provider = self.provider.load_full();
-            let outcome = provider
-                .stream_chat(&messages, &route, tools, cancel, |delta| match delta {
-                    crate::provider::StreamDelta::Content(text) => {
-                        streamed.push_str(text);
-                        let _ = bus.send(Notification::new(
-                            "message.delta",
-                            json!({
-                                "session_id": sid,
-                                "turn_id": tid,
-                                "delta": text,
-                            }),
-                        ));
-                    }
-                    crate::provider::StreamDelta::Reasoning(text) => {
-                        streamed_reasoning.push_str(text);
-                        let _ = bus.send(Notification::new(
-                            "reasoning.delta",
-                            json!({
-                                "session_id": sid,
-                                "turn_id": tid,
-                                "delta": text,
-                            }),
-                        ));
-                    }
-                })
-                .await;
+            let mut attempt = 0u32;
+            let completion = loop {
+                let bus = self.bus.clone();
+                let sid = session_id.to_string();
+                let tid = turn_id.to_string();
+                let mut streamed = String::new();
+                let mut streamed_reasoning = String::new();
+                let outcome = provider
+                    .stream_chat(&messages, &route, tools, cancel, |delta| match delta {
+                        crate::provider::StreamDelta::Content(text) => {
+                            streamed.push_str(text);
+                            let _ = bus.send(Notification::new(
+                                "message.delta",
+                                json!({
+                                    "session_id": sid,
+                                    "turn_id": tid,
+                                    "delta": text,
+                                }),
+                            ));
+                        }
+                        crate::provider::StreamDelta::Reasoning(text) => {
+                            streamed_reasoning.push_str(text);
+                            let _ = bus.send(Notification::new(
+                                "reasoning.delta",
+                                json!({
+                                    "session_id": sid,
+                                    "turn_id": tid,
+                                    "delta": text,
+                                }),
+                            ));
+                        }
+                    })
+                    .await;
 
-            if cancel.load(Ordering::SeqCst) {
-                self.finish_cancelled(session_id, turn_id, &streamed, &streamed_reasoning, &model)?;
-                return Ok(());
-            }
-
-            let completion = match outcome {
-                Ok(completion) => completion,
-                Err(ProviderError::Cancelled) => {
+                if cancel.load(Ordering::SeqCst) {
                     self.finish_cancelled(
                         session_id,
                         turn_id,
@@ -2251,13 +2254,82 @@ impl Daemon {
                     )?;
                     return Ok(());
                 }
-                Err(err) => return Err(anyhow::anyhow!("{err}")),
+
+                let (reason, delay) = match outcome {
+                    Ok(completion)
+                        if completion.tool_calls.is_empty()
+                            && completion.text.trim().is_empty()
+                            && completion.reasoning.trim().is_empty()
+                            && attempt < max_retries =>
+                    {
+                        (
+                            "model returned an empty response".to_string(),
+                            retry_delay(retry_base, retry_max, attempt + 1, None),
+                        )
+                    }
+                    Ok(completion) => break completion,
+                    Err(ProviderError::Cancelled) => {
+                        self.finish_cancelled(
+                            session_id,
+                            turn_id,
+                            &streamed,
+                            &streamed_reasoning,
+                            &model,
+                        )?;
+                        return Ok(());
+                    }
+                    Err(err) if err.retry_class().is_retryable() && attempt < max_retries => {
+                        let delay =
+                            retry_delay(retry_base, retry_max, attempt + 1, err.retry_after());
+                        (err.to_string(), delay)
+                    }
+                    Err(err) => {
+                        if attempt > 0 {
+                            return Err(anyhow::anyhow!("{err} (after {} attempts)", attempt + 1));
+                        }
+                        return Err(anyhow::anyhow!("{err}"));
+                    }
+                };
+
+                attempt += 1;
+                if !streamed.is_empty() || !streamed_reasoning.is_empty() {
+                    // Deltas from the failed attempt are already in the TUI;
+                    // clear them before the new attempt streams its own text.
+                    self.emit_value(
+                        "message.reset",
+                        json!({
+                            "session_id": session_id,
+                            "turn_id": turn_id,
+                        }),
+                    );
+                }
+                let reason = truncate_ui(&redact(&reason), 240);
+                eprintln!(
+                    "eixd: turn {turn_id} retry {attempt}/{max_retries} in {}ms: {reason}",
+                    delay.as_millis()
+                );
+                self.emit_value(
+                    "turn.retrying",
+                    json!({
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "attempt": attempt + 1,
+                        "max_attempts": max_retries + 1,
+                        "delay_ms": delay.as_millis() as u64,
+                        "reason": reason,
+                    }),
+                );
+                if sleep_cancellable(delay, cancel).await {
+                    self.finish_cancelled(session_id, turn_id, "", "", &model)?;
+                    return Ok(());
+                }
             };
 
             if completion.tool_calls.is_empty() {
                 if completion.text.trim().is_empty() && completion.reasoning.trim().is_empty() {
                     return Err(anyhow::anyhow!(
-                        "model returned an empty response (finish_reason: {:?})",
+                        "model returned an empty response after {} attempt(s) (finish_reason: {:?})",
+                        attempt + 1,
                         completion.finish_reason
                     ));
                 }
@@ -4488,6 +4560,45 @@ async fn wait_for_cancel(cancel: &AtomicBool) {
     }
 }
 
+fn retry_delay(
+    base: Duration,
+    max: Duration,
+    attempt: u32,
+    retry_after: Option<Duration>,
+) -> Duration {
+    if let Some(after) = retry_after {
+        return after.clamp(Duration::from_millis(1), max);
+    }
+    let factor = 1u32 << attempt.saturating_sub(1).min(20);
+    base.saturating_mul(factor).min(max)
+}
+
+/// Sleep, but wake up promptly when the turn is cancelled.
+async fn sleep_cancellable(delay: Duration, cancel: &AtomicBool) -> bool {
+    let deadline = Instant::now() + delay;
+    loop {
+        if cancel.load(Ordering::SeqCst) {
+            return true;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return false;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(100))).await;
+    }
+}
+
+fn truncate_ui(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
 async fn write_loop<W>(mut write: W, mut rx: mpsc::UnboundedReceiver<ServerMessage>)
 where
     W: AsyncWrite + Unpin,
@@ -4950,5 +5061,22 @@ mod tests {
         assert!(SessionStatus::Running.is_busy());
         assert!(SessionStatus::AwaitingApproval.is_busy());
         assert!(!SessionStatus::Error.is_busy());
+    }
+
+    #[test]
+    fn retry_delay_is_exponential_and_bounded() {
+        let base = Duration::from_millis(500);
+        let max = Duration::from_secs(5);
+        assert_eq!(retry_delay(base, max, 1, None), base);
+        assert_eq!(retry_delay(base, max, 2, None), Duration::from_secs(1));
+        assert_eq!(retry_delay(base, max, 10, None), max);
+        assert_eq!(
+            retry_delay(base, max, 1, Some(Duration::from_secs(2))),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            retry_delay(base, max, 1, Some(Duration::from_secs(60))),
+            max
+        );
     }
 }

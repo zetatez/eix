@@ -14,7 +14,7 @@ use eix_core::{
     ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
     InputAnsweredPayload, InputOption, InputRequiredPayload, PatchProposedPayload,
     PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo, ProcessList, ProcessOutput,
-    ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult,
+    ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult, TodoItem,
     ToolResultPayload, UserMessagePayload, THEME_PRESETS,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
@@ -85,8 +85,26 @@ fn builtin(name: &str, args: &str, description: &str) -> CommandSpec {
 /// Built-in prompt commands, in menu order.
 fn builtin_commands() -> Vec<CommandSpec> {
     vec![
-        builtin("help", "", "show the key and command reference"),
+        builtin("help", "[query]", "search the key and command reference"),
+        builtin("keys", "[query]", "search just the key map"),
         builtin("new", "[name]", "start a new session in this workspace"),
+        builtin("new-pane", "", "open a session in a new pane"),
+        builtin(
+            "new-worktree",
+            "[name]",
+            "start a session in a new git worktree",
+        ),
+        builtin("files", "", "browse and insert workspace files"),
+        builtin("worktrees", "", "browse and insert git worktrees"),
+        builtin("branches", "", "browse and insert git branches"),
+        builtin("context", "", "browse context entries with previews"),
+        builtin("ledger", "", "open the full context ledger"),
+        builtin("history", "", "search conversation history"),
+        builtin("processes", "", "list and inspect background processes"),
+        builtin("approvals", "", "open the approval inbox"),
+        builtin("attention", "", "jump to the next pane needing attention"),
+        builtin("cancel", "", "cancel the focused session's running turn"),
+        builtin("toggle-agent", "", "toggle Build / Plan for this session"),
         builtin("clear", "", "forget this conversation's context"),
         builtin(
             "compact",
@@ -456,6 +474,10 @@ enum PickerKind {
     Skills,
     /// Preview and apply a color preset.
     Themes,
+    /// Configured MCP servers and their tool counts.
+    Mcp,
+    /// The focused session's current task list.
+    Todos,
 }
 
 impl PickerKind {
@@ -472,7 +494,9 @@ impl PickerKind {
             | Self::Models
             | Self::Agents
             | Self::Skills
-            | Self::Themes => None,
+            | Self::Themes
+            | Self::Mcp
+            | Self::Todos => None,
         }
     }
 
@@ -489,6 +513,8 @@ impl PickerKind {
             Self::Agents => "agents — choose the primary agent",
             Self::Skills => "skills — preview and insert",
             Self::Themes => "themes — live preview",
+            Self::Mcp => "mcp — servers and tools",
+            Self::Todos => "todos — model task list",
         }
     }
 
@@ -505,6 +531,8 @@ impl PickerKind {
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
+            Self::Mcp => "Enter close · ↑/↓ or C-j/C-k select · Esc close",
+            Self::Todos => "Enter close · ↑/↓ or C-j/C-k select · Esc close",
         }
     }
 }
@@ -851,6 +879,8 @@ pub struct App {
     focus: Focus,
     picker: Option<Picker>,
     help: bool,
+    /// Restrict the help overlay to one `HELP_SECTIONS` title.
+    help_scope: Option<&'static str>,
     /// Interactive filter for the help overlay.
     help_query: String,
     /// Selected row in the filtered help list.
@@ -979,6 +1009,7 @@ impl App {
             focus: Focus::Input,
             picker: None,
             help: false,
+            help_scope: None,
             help_query: String::new(),
             help_selected: 0,
             timeline: None,
@@ -1053,9 +1084,20 @@ impl App {
 
     /// Open the help overlay with a fresh filter and selection.
     fn open_help(&mut self) {
+        self.open_help_scoped(None, "");
+    }
+
+    /// Open only the key map. `/keys [query]` keeps the same interactive
+    /// filter/selection as the full help overlay.
+    fn open_keys_help(&mut self, query: &str) {
+        self.open_help_scoped(Some("keys"), query);
+    }
+
+    fn open_help_scoped(&mut self, scope: Option<&'static str>, query: &str) {
         self.pending_leader = false;
         self.help = true;
-        self.help_query.clear();
+        self.help_scope = scope;
+        self.help_query = query.to_string();
         self.help_selected = 0;
     }
 
@@ -1065,7 +1107,10 @@ impl App {
     fn handle_help_key(&mut self, key: KeyEvent) {
         let control = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
-            KeyCode::Esc => self.help = false,
+            KeyCode::Esc => {
+                self.help = false;
+                self.help_scope = None;
+            }
             KeyCode::Char('u') if control => {
                 self.help_query.clear();
                 self.help_selected = 0;
@@ -1086,7 +1131,8 @@ impl App {
             KeyCode::Char('n') if control => self.move_help_selection(1),
             KeyCode::Home => self.help_selected = 0,
             KeyCode::End => {
-                self.help_selected = help_entry_count(&self.help_query).saturating_sub(1);
+                self.help_selected =
+                    help_entry_count_in(&self.help_query, self.help_scope).saturating_sub(1);
             }
             KeyCode::Char(ch) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
                 self.help_query.push(ch);
@@ -1097,7 +1143,7 @@ impl App {
     }
 
     fn move_help_selection(&mut self, delta: isize) {
-        let count = help_entry_count(&self.help_query);
+        let count = help_entry_count_in(&self.help_query, self.help_scope);
         if count == 0 {
             self.help_selected = 0;
             return;
@@ -1634,6 +1680,13 @@ impl App {
                 self.status = format!("{} agent(s)", agents.len());
             }
             Event::Mcp(servers) => {
+                if let Some(picker) = &mut self.picker {
+                    if picker.kind == PickerKind::Mcp {
+                        picker.items = mcp_picker_items(&servers);
+                        picker.selected = 0;
+                        picker.loading = false;
+                    }
+                }
                 if servers.is_empty() {
                     self.status = "no MCP servers configured (see [mcp.servers])".into();
                 } else {
@@ -1691,6 +1744,13 @@ impl App {
                 };
             }
             Event::Todos(items) => {
+                if let Some(picker) = &mut self.picker {
+                    if picker.kind == PickerKind::Todos {
+                        picker.items = todo_picker_items(&items);
+                        picker.selected = 0;
+                        picker.loading = false;
+                    }
+                }
                 if items.is_empty() {
                     self.status = "no tasks".into();
                 } else {
@@ -2199,6 +2259,54 @@ impl App {
                             view.stream = Some(stream);
                         }
                     }
+                }
+            }
+            "message.reset" => {
+                if let Ok(reset) = serde_json::from_value::<TurnRef>(notification.params) {
+                    if let Some(view) = self
+                        .views
+                        .iter_mut()
+                        .find(|view| view.session.id == reset.session_id)
+                    {
+                        if view
+                            .stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.turn_id == reset.turn_id)
+                        {
+                            view.stream = None;
+                        }
+                    }
+                }
+            }
+            "turn.retrying" => {
+                if let Ok(retry) = serde_json::from_value::<TurnRetrying>(notification.params) {
+                    if let Some(view) = self
+                        .views
+                        .iter_mut()
+                        .find(|view| view.session.id == retry.session_id)
+                    {
+                        if view
+                            .stream
+                            .as_ref()
+                            .is_some_and(|stream| stream.turn_id == retry.turn_id)
+                        {
+                            view.stream = None;
+                        }
+                    }
+                    let delay = retry.delay_ms as f64 / 1000.0;
+                    let reason = truncate(&retry.reason, 80);
+                    self.error = None;
+                    self.status = if reason.is_empty() {
+                        format!(
+                            "retrying {}/{} in {delay:.1}s",
+                            retry.attempt, retry.max_attempts
+                        )
+                    } else {
+                        format!(
+                            "retrying {}/{} in {delay:.1}s: {reason}",
+                            retry.attempt, retry.max_attempts
+                        )
+                    };
                 }
             }
             "tool.approval_required" => {
@@ -3902,6 +4010,18 @@ impl App {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             picker.items = skill_picker_items(&eix_core::load_skills(&cwd));
             self.status = format!("{} skill(s)", picker.items.len());
+        } else if kind == PickerKind::Mcp {
+            picker.loading = true;
+            self.status = "mcp: loading…".into();
+            let _ = tx.send(Command::ListMcp);
+        } else if kind == PickerKind::Todos {
+            let Some(session_id) = self.focused_session_id() else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            picker.loading = true;
+            self.status = "todos: loading…".into();
+            let _ = tx.send(Command::ListTodos { session_id });
         } else if kind == PickerKind::Themes {
             picker.items = theme_picker_items();
             let current = self.theme.preset.unwrap_or(THEME_DEFAULT_VALUE);
@@ -3923,6 +4043,7 @@ impl App {
     fn run_action(&mut self, id: &str, tx: &UnboundedSender<Command>) {
         match id {
             "commands" | "palette" => self.open_picker(PickerKind::Commands, tx),
+            "keys" => self.open_keys_help(""),
             "sessions" => self.open_picker(PickerKind::Sessions, tx),
             "new-pane" => self.open_picker(PickerKind::NewPane, tx),
             "files" => self.open_picker(PickerKind::Files, tx),
@@ -3941,6 +4062,8 @@ impl App {
             }
             "processes" => self.open_processes(tx),
             "approvals" => self.open_inbox(),
+            "mcp" => self.open_picker(PickerKind::Mcp, tx),
+            "todos" => self.open_picker(PickerKind::Todos, tx),
             "ledger" => self.open_ledger(tx),
             "new" => self.create_session(tx, false),
             "new-worktree" => self.create_session(tx, true),
@@ -4235,13 +4358,73 @@ impl App {
                 true
             }
             "help" => {
-                self.open_help();
+                self.open_help_scoped(None, args);
+                true
+            }
+            "keys" => {
+                self.open_keys_help(args);
                 true
             }
             "new" => {
                 let cwd = self.focused_view().map(|view| view.session.cwd.clone());
                 let name = (!args.is_empty()).then(|| args.to_string());
                 self.create_session_in(tx, false, cwd, name);
+                true
+            }
+            "new-pane" => {
+                self.open_picker(PickerKind::NewPane, tx);
+                true
+            }
+            "new-worktree" => {
+                let cwd = self.focused_view().map(|view| view.session.cwd.clone());
+                let name = (!args.is_empty()).then(|| args.to_string());
+                self.create_session_in(tx, true, cwd, name);
+                true
+            }
+            "files" => {
+                self.open_picker(PickerKind::Files, tx);
+                true
+            }
+            "worktrees" => {
+                self.open_picker(PickerKind::Worktrees, tx);
+                true
+            }
+            "branches" => {
+                self.open_picker(PickerKind::Branches, tx);
+                true
+            }
+            "context" => {
+                self.open_picker(PickerKind::Context, tx);
+                true
+            }
+            "ledger" => {
+                self.open_ledger(tx);
+                true
+            }
+            "history" => {
+                self.search_view = Some(SearchView::new());
+                self.status =
+                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
+                true
+            }
+            "processes" => {
+                self.open_processes(tx);
+                true
+            }
+            "approvals" => {
+                self.open_inbox();
+                true
+            }
+            "attention" => {
+                self.focus_next_attention();
+                true
+            }
+            "cancel" => {
+                self.cancel(tx);
+                true
+            }
+            "toggle-agent" => {
+                self.toggle_agent_mode(tx);
                 true
             }
             "cd" => {
@@ -4293,8 +4476,7 @@ impl App {
                 true
             }
             "mcp" => {
-                let _ = tx.send(Command::ListMcp);
-                self.status = "mcp: loading…".into();
+                self.open_picker(PickerKind::Mcp, tx);
                 true
             }
             "reload" => {
@@ -4384,10 +4566,7 @@ impl App {
                 true
             }
             "todos" => {
-                if let Some(session_id) = self.focused_session_id() {
-                    let _ = tx.send(Command::ListTodos { session_id });
-                    self.status = "todos: loading…".into();
-                }
+                self.open_picker(PickerKind::Todos, tx);
                 true
             }
             "skills" => {
@@ -5424,6 +5603,7 @@ already exists, update it in place rather than rewriting it from scratch.";
                 area,
                 &self.help_query,
                 self.help_selected,
+                self.help_scope,
                 self.theme,
             );
         }
@@ -7148,6 +7328,26 @@ struct DeltaParams {
 }
 
 #[derive(Deserialize)]
+struct TurnRef {
+    session_id: String,
+    turn_id: String,
+}
+
+#[derive(Deserialize)]
+struct TurnRetrying {
+    session_id: String,
+    turn_id: String,
+    #[serde(default)]
+    attempt: u32,
+    #[serde(default)]
+    max_attempts: u32,
+    #[serde(default)]
+    delay_ms: u64,
+    #[serde(default)]
+    reason: String,
+}
+
+#[derive(Deserialize)]
 struct TurnCompleted {
     session_id: String,
     turn_id: String,
@@ -7650,9 +7850,16 @@ enum HelpRow {
 }
 
 fn help_rows(query: &str) -> Vec<HelpRow> {
+    help_rows_in(query, None)
+}
+
+fn help_rows_in(query: &str, scope: Option<&str>) -> Vec<HelpRow> {
     let query = query.trim().to_lowercase();
     let mut rows = Vec::new();
     for section in HELP_SECTIONS {
+        if scope.is_some_and(|scope| scope != section.title) {
+            continue;
+        }
         let matched: Vec<&HelpEntry> = section
             .entries
             .iter()
@@ -7671,21 +7878,34 @@ fn help_rows(query: &str) -> Vec<HelpRow> {
 }
 
 fn help_entry_count(query: &str) -> usize {
+    help_entry_count_in(query, None)
+}
+
+fn help_entry_count_in(query: &str, scope: Option<&str>) -> usize {
     let query = query.trim().to_lowercase();
     HELP_SECTIONS
         .iter()
+        .filter(|section| scope.map_or(true, |scope| scope == section.title))
         .flat_map(|section| section.entries.iter())
         .filter(|entry| entry.matches(&query))
         .count()
 }
 
-fn draw_help(frame: &mut Frame, area: Rect, query: &str, selected: usize, theme: Theme) {
+fn draw_help(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    selected: usize,
+    scope: Option<&str>,
+    theme: Theme,
+) {
     let dialog_bg = dialog_background(theme);
     let width = (area.width as u32 * 7 / 10).max(50).min(area.width as u32) as u16;
-    let rows = help_rows(query);
-    let matches = help_entry_count(query);
+    let rows = help_rows_in(query, scope);
+    let matches = help_entry_count_in(query, scope);
     let total: usize = HELP_SECTIONS
         .iter()
+        .filter(|section| scope.map_or(true, |scope| scope == section.title))
         .map(|section| section.entries.len())
         .sum();
 
@@ -7698,7 +7918,7 @@ fn draw_help(frame: &mut Frame, area: Rect, query: &str, selected: usize, theme:
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title(" help ")
+            .title(if scope.is_some() { " keys " } else { " help " })
             .style(Style::default().bg(dialog_bg)),
         rect,
     );
@@ -9610,6 +9830,40 @@ mod tests {
         let stream = app.views[0].stream.as_ref().expect("stream");
         assert_eq!(stream.reasoning, "think");
         assert_eq!(stream.text, "answer");
+    }
+
+    #[test]
+    fn retry_notification_clears_the_partial_stream() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "chat", "/tmp"),
+            Vec::new(),
+        ));
+        app.views[0].stream = Some(StreamState {
+            turn_id: "t1".into(),
+            text: "partial".into(),
+            reasoning: "part".into(),
+        });
+
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                "turn.retrying",
+                serde_json::json!({
+                    "session_id": "s1",
+                    "turn_id": "t1",
+                    "attempt": 2,
+                    "max_attempts": 6,
+                    "delay_ms": 500,
+                    "reason": "provider returned HTTP 503: overloaded",
+                }),
+            )),
+            &tx,
+        );
+
+        assert!(app.views[0].stream.is_none());
+        assert!(app.status.contains("retrying 2/6"), "{}", app.status);
+        assert!(app.status.contains("0.5s"), "{}", app.status);
     }
 
     #[test]

@@ -20,9 +20,72 @@ pub enum ProviderError {
     #[error("provider request failed: {0}")]
     Http(String),
     #[error("provider returned HTTP {status}: {body}")]
-    Api { status: u16, body: String },
+    Api {
+        status: u16,
+        body: String,
+        retry_after_secs: Option<u64>,
+    },
     #[error("failed to decode provider stream: {0}")]
     Decode(String),
+}
+
+/// How the daemon should react to a provider failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetryClass {
+    /// Worth another attempt with exponential backoff.
+    Transient,
+    /// The provider asked us to slow down; retry, preferably after
+    /// `Retry-After`.
+    RateLimited,
+    /// The plan/credits are exhausted. Retrying immediately cannot help.
+    Quota,
+    /// Configuration, authentication, or request errors that need the user.
+    Fatal,
+}
+
+impl RetryClass {
+    pub fn is_retryable(self) -> bool {
+        matches!(self, Self::Transient | Self::RateLimited)
+    }
+}
+
+impl ProviderError {
+    pub fn retry_class(&self) -> RetryClass {
+        match self {
+            Self::Cancelled | Self::Config(_) => RetryClass::Fatal,
+            // Transport failures (DNS, connect, reset, timeout) and malformed
+            // streams are usually transient.
+            Self::Http(_) | Self::Decode(_) => RetryClass::Transient,
+            Self::Api { status, body, .. } => {
+                let body = body.to_ascii_lowercase();
+                if looks_like_quota(&body) || *status == 402 {
+                    return RetryClass::Quota;
+                }
+                if *status == 429 {
+                    return RetryClass::RateLimited;
+                }
+                if matches!(*status, 408 | 409 | 425) || (500..=599).contains(status) {
+                    return RetryClass::Transient;
+                }
+                // Some providers report overload/rate-limit errors inside a
+                // 200 SSE payload. Treat those as transient too.
+                if *status == 200 && looks_like_transient(&body) {
+                    return RetryClass::Transient;
+                }
+                RetryClass::Fatal
+            }
+        }
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Api {
+                retry_after_secs: Some(secs),
+                ..
+            } => Some(Duration::from_secs(*secs)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,10 +183,12 @@ impl Provider {
 
         let status = response.status();
         if !status.is_success() {
+            let retry_after_secs = parse_retry_after(response.headers());
             let body = response.text().await.unwrap_or_default();
             return Err(ProviderError::Api {
                 status: status.as_u16(),
                 body: truncate(&body, 2048),
+                retry_after_secs,
             });
         }
 
@@ -185,6 +250,7 @@ impl Provider {
             return Err(ProviderError::Api {
                 status: 200,
                 body: error_message(error),
+                retry_after_secs: None,
             });
         }
         let content = value
@@ -312,6 +378,7 @@ where
         return Err(ProviderError::Api {
             status: 200,
             body: error_message(error),
+            retry_after_secs: None,
         });
     }
     if let Some(model) = value.get("model").and_then(Value::as_str) {
@@ -421,6 +488,60 @@ fn truncate(text: &str, max: usize) -> String {
         end -= 1;
     }
     format!("{}…", &text[..end])
+}
+
+fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+    if let Some(secs) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|secs| secs.is_finite() && *secs >= 0.0)
+    {
+        return Some(secs.ceil() as u64);
+    }
+    headers
+        .get("retry-after-ms")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .map(|ms| ms.saturating_add(999) / 1_000)
+}
+
+fn looks_like_quota(body: &str) -> bool {
+    [
+        "insufficient_quota",
+        "insufficient quota",
+        "exceeded your current quota",
+        "quota exceeded",
+        "quota has been exceeded",
+        "billing",
+        "payment required",
+        "credit balance",
+        "out of credits",
+        "no credits",
+        "余额不足",
+        "配额",
+        "套餐",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
+
+fn looks_like_transient(body: &str) -> bool {
+    [
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "overloaded",
+        "temporarily",
+        "try again",
+        "timeout",
+        "timed out",
+        "capacity",
+        "server error",
+        "service unavailable",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
 }
 
 /// Incremental Server-Sent Events decoder.
@@ -615,5 +736,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("bad key"));
+    }
+
+    #[test]
+    fn classifies_transient_provider_failures() {
+        for status in [408, 409, 425, 429, 500, 502, 503, 504] {
+            let err = ProviderError::Api {
+                status,
+                body: "temporary".into(),
+                retry_after_secs: None,
+            };
+            assert!(
+                err.retry_class().is_retryable(),
+                "status {status} should retry"
+            );
+        }
+        assert!(ProviderError::Http("connection reset".into())
+            .retry_class()
+            .is_retryable());
+        assert!(ProviderError::Decode("truncated stream".into())
+            .retry_class()
+            .is_retryable());
+    }
+
+    #[test]
+    fn does_not_retry_quota_or_auth_failures() {
+        for status in [400, 401, 403, 404, 422] {
+            let err = ProviderError::Api {
+                status,
+                body: "bad request".into(),
+                retry_after_secs: None,
+            };
+            assert_eq!(err.retry_class(), RetryClass::Fatal);
+        }
+        let quota = ProviderError::Api {
+            status: 429,
+            body: r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#.into(),
+            retry_after_secs: Some(10),
+        };
+        assert_eq!(quota.retry_class(), RetryClass::Quota);
+        assert_eq!(quota.retry_after(), Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn parses_retry_after_seconds_and_milliseconds() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(reqwest::header::RETRY_AFTER, "3".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(3));
+
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert("retry-after-ms", "1500".parse().unwrap());
+        assert_eq!(parse_retry_after(&headers), Some(2));
     }
 }

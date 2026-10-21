@@ -288,7 +288,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 **转录区**
 
-转录按对话渲染：用户消息是右对齐的圆角气泡（panel 背景，前后不额外留空行），agent 输出左对齐、2 空格缩进，
+转录按对话渲染：用户消息是右对齐的两行紧凑气泡（panel 背景，圆角顶边 + 左右边条，前后不额外留空行），agent 输出左对齐、2 空格缩进，
 不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
 以 `Thinking` 模块流式展开，turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
 call/approval/patch/result 事件，一行显示状态圆点、命令或路径摘要与右侧状态
