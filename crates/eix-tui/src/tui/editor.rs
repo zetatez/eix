@@ -1837,11 +1837,9 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'r' => "layout-fibonacci",
         'l' => "layout-cycle",
         'x' => "cancel",
-        'q' => "close-pane",
         'i' => "input",
         'A' => "attention",
         'a' | ':' => "commands",
-        '?' => "help",
         _ => return None,
     })
 }

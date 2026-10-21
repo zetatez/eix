@@ -887,10 +887,6 @@ impl PaneLayout {
         }
     }
 
-    fn shows_tabs(self) -> bool {
-        matches!(self, Self::Tabby | Self::Fibonacci)
-    }
-
     fn next(self) -> Self {
         match self {
             Self::Grid => Self::Horizontal,
@@ -6035,21 +6031,16 @@ already exists, update it in place rather than rewriting it from scratch.";
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         // Sessions live in the floating picker (`p` / `<Space>s`), not in a
         // permanent sidebar: panes get the whole body.
-        if self.views.is_empty() || !self.layout.shows_tabs() || area.height <= 1 {
+        if self.views.is_empty() || self.layout != PaneLayout::Tabby || area.height <= 1 {
             self.draw_panes(frame, area);
             return;
         }
-        if self.layout == PaneLayout::Tabby {
-            // Keep the tab strip against the prompt's Build line instead of
-            // the top of the transcript.
-            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
-            self.draw_panes(frame, chunks[0]);
-            self.draw_tab_bar(frame, chunks[1]);
-        } else {
-            let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
-            self.draw_tab_bar(frame, chunks[0]);
-            self.draw_panes(frame, chunks[1]);
-        }
+        // Keep the tab strip against the prompt's Build line instead of the
+        // top of the transcript. Fibonacci shows every pane, so it needs no
+        // tab strip at all.
+        let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+        self.draw_panes(frame, chunks[0]);
+        self.draw_tab_bar(frame, chunks[1]);
     }
 
     fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
@@ -10151,6 +10142,19 @@ mod tests {
         assert_eq!(tab_row + 1, build_row, "{rendered}");
     }
 
+    #[test]
+    fn fibonacci_layout_shows_every_pane_without_a_tab_strip() {
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.layout = PaneLayout::Fibonacci;
+        app.focused = 1;
+
+        let rendered = render_text(&mut app, 80, 24);
+        assert!(rendered.contains("session a"), "{rendered}");
+        assert!(rendered.contains("session b"), "{rendered}");
+        assert!(rendered.contains("session c"), "{rendered}");
+        assert!(!rendered.contains("[2 session b]"), "{rendered}");
+    }
+
     fn line_text(line: &Line<'_>) -> String {
         line.spans
             .iter()
@@ -11963,7 +11967,9 @@ mod tests {
         app.picker = None;
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), &tx);
-        assert!(app.help);
+        assert!(!app.help, "leader+? no longer opens help");
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), &tx);
+        assert!(app.help, "bare ? still opens help");
     }
 
     #[test]
@@ -12047,7 +12053,7 @@ mod tests {
     }
 
     #[test]
-    fn leader_n_creates_a_session_and_q_closes_a_pane() {
+    fn leader_n_creates_a_session_and_q_does_not_close_a_pane() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.views.push(SessionView::new(
@@ -12072,7 +12078,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
-        assert_eq!(app.views.len(), 1);
+        assert_eq!(app.views.len(), 2, "leader+q no longer closes a pane");
     }
 
     #[test]
@@ -12407,6 +12413,28 @@ mod tests {
             }
             _ => panic!("unexpected command"),
         }
+    }
+
+    #[test]
+    fn tab_toggles_agent_and_shift_tab_does_not_cycle_sessions() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1", "s2"]);
+        app.focus = Focus::Transcript;
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert_eq!(app.views[0].session.agent.as_deref(), Some("plan"));
+        match rx.try_recv().expect("set plan agent") {
+            Command::SetAgent { session_id, agent } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(agent.as_deref(), Some("plan"));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT), &tx);
+        assert_eq!(app.focused, 0, "Shift-Tab no longer switches sessions");
+        assert_eq!(app.views[0].session.agent.as_deref(), Some("plan"));
+        assert!(rx.try_recv().is_err());
     }
 
     #[test]

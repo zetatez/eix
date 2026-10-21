@@ -196,7 +196,7 @@ extensions = ["py"]
 底部输入条只作用于当前聚焦 pane。
 
 用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、
-`tabby`（输入框 Build 行上方显示 tab，只显示当前 session）和 `fibonacci`（tab + 螺旋分屏）；`<Space>l` 在四种布局
+`tabby`（输入框 Build 行上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个**活跃队列**：pane 1 是当前工作槽位；turn 完成或
 session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；
 给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。
@@ -232,7 +232,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
-| `Tab`（normal） | 在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
+| `Tab` | normal 模式与转录区：在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
 | `<Space>s` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
 | `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
 | `:` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
@@ -244,7 +244,6 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
 | `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用） |
 | `Alt-1` … `Alt-9` | 同上；用于终端无法区分 `Ctrl-1…9` 的情况 |
-| `Tab` / `S-Tab` | 聚焦 pane 切到下一个 / 上一个 session（转录区） |
 | `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；有待审批时卡片上的 `n` 仍是 deny |
 | `<Space>W` | 新建 session，同时在 `.worktrees/<name>` 建 git worktree |
 | `y` / `n` | 批准 / 拒绝聚焦 pane 的待审批工具调用（卡片快捷方式） |
@@ -450,17 +449,17 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
 - visual：`v` / `V` 进入，`d x y c p ~ o` 操作；选中区域反色显示
 - 浏览历史：normal 模式下 `Ctrl-K` / `Ctrl-J` 在已提交的 prompt 之间上下浏览（更早 / 更新）；
   越过最新一条会恢复当前草稿。`j`、`k`、`3j`、`dj`、方向键是草稿内的行移动
-- 模式切换：normal 模式下 `Tab` 在 Build / Plan 之间切换；Plan 只读，Build 可执行工具
+- 模式切换：输入框 normal 模式与转录区都可用 `Tab` 在 Build / Plan 之间切换；Plan 只读，Build 可执行工具
 - `Enter` 只在 insert 模式提交；turn 运行中提交的内容自动排队（`/queue` 查看，`Esc Esc` 中断当前 turn）
 
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：`<Space>s` session
 picker、`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
-（`<Space>c` / `<Space>q` 关闭当前 pane）、`<Space>f` 文件、
+（`<Space>c` 关闭当前 pane）、`<Space>f` 文件、
 `<Space>w`/`b` worktree/分支、`<Space>C` ledger、`<Space>h` 历史、
 `<Space>p` 进程、`<Space>R` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
 `<Space>F` fork、`<Space>x` 取消、`<Space>A` attention、`<Space>i` 聚焦输入框、
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>a` 或
-`<Space>:` 命令面板、`<Space>?` 帮助。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
+`<Space>:` 命令面板。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
 除此之外，裸字母 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
 insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
 和 `@`（文件 picker）。所有 picker / 历史搜索都支持 `Ctrl-J`/`Ctrl-K` 或
