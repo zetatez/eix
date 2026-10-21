@@ -762,6 +762,14 @@ impl Editor {
             KeyCode::Down => self.motion_char('j'),
             KeyCode::Home => self.motion_char('0'),
             KeyCode::End => self.motion_char('$'),
+            KeyCode::Char('G') => {
+                let target = self
+                    .count
+                    .take()
+                    .map(|n| n.saturating_sub(1))
+                    .unwrap_or(self.lines.len() - 1);
+                self.goto_row(target);
+            }
             KeyCode::Char('g') => self.pending_g = true,
             KeyCode::Char(c @ '1'..='9') => self.push_count(c),
             KeyCode::Char('0') if self.count.is_some() => self.push_count('0'),
@@ -1974,6 +1982,21 @@ mod tests {
         press(&mut editor, "V");
         press(&mut editor, "d");
         assert_eq!(editor.text(), "two\nthree");
+    }
+
+    #[test]
+    fn visual_line_g_extends_the_selection_to_the_last_line() {
+        let mut editor = editor_with("one\ntwo\nthree");
+        press(&mut editor, "V");
+        press(&mut editor, "G");
+
+        let selection = editor.selection().expect("visual-line selection");
+        assert!(selection.linewise);
+        assert_eq!(selection.start, (0, 0));
+        assert_eq!(selection.end.0, 2);
+        assert!(editor.is_selected(0, 0));
+        assert!(editor.is_selected(1, 0));
+        assert!(editor.is_selected(2, 0));
     }
 
     #[test]
