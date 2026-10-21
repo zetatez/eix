@@ -196,7 +196,7 @@ extensions = ["py"]
 底部输入条只作用于当前聚焦 pane。
 
 用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、
-`tabby`（顶部 tab，只显示当前 session）和 `fibonacci`（tab + 螺旋分屏）；`<Space>l` 在四种布局
+`tabby`（输入框 Build 行上方显示 tab，只显示当前 session）和 `fibonacci`（tab + 螺旋分屏）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个**活跃队列**：pane 1 是当前工作槽位；turn 完成或
 session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；
 给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。
@@ -240,10 +240,6 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `<Space>b` | branch picker：选中后把分支名插入输入框 |
 | `@`（输入框内） | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发） |
 | `<Space>A` | 跳到下一个需要 attention 的 pane（审批/错误） |
-| `C-w h/j/k/l` | 按方向切换 pane 焦点（转录区） |
-| `C-w v` / `C-w s` | 打开新 pane |
-| `C-w c` | 关闭聚焦 pane（至少保留一个） |
-| `C-w w` | 循环切换 pane |
 | `Shift+,` / `Shift+.` | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式） |
 | `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
 | `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用） |
@@ -423,7 +419,9 @@ resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server �
 
 **转录区不响应裸字母快捷键**：动作一律走 `<Space>` leader（见下），但 `i` 仍用于聚焦
 输入框并进入 insert 模式；`j`/`k` 等导航键和 `:`/`?` 等标点键也保留。输入框聚焦时（normal 模式）单字母是 vim 命令，TUI 动作同样用
-leader。转录区动作可以通过 `[keys]` 覆盖，但裸字母会被忽略，请用 `C-`/`A-` 修饰键或
+leader；`?`、`#`、翻页/滚动和 `[keys]` 绑定也与转录区一致，只有输入框自己的
+vim 编辑键（如 `j`/`k` 行移动、`Tab` 切换 Build/Plan）保留编辑器语义。
+转录区动作可以通过 `[keys]` 覆盖，但裸字母会被忽略，请用 `C-`/`A-` 修饰键或
 命名键，例如 `sessions = "C-t"`、`new_session = "C-n"`、`help = "F2"`。可用动作：`quit`、`help`、`new_session`、
 `new_worktree`、`sessions`、`new_pane`、`palette`、`worktrees`、`branches`、`ledger`、
 `processes`、`inbox`、`search`、`fork`、`attention`、`cancel`、`next_session`、

@@ -145,6 +145,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `a`/`:` 命令面板、`?` 帮助。单字母基本留给 vim；转录区裸字母不触发动作，仅保留
   `i`（聚焦输入框）、`Z`（退出）、`j/k`/`g/G` 等导航和 `:`/`?` 等标点入口；布局动作
   同样走 leader（`v`/`t`/`r`/`l`）。
+- 输入框 normal 模式复用转录区的 TUI 动作：leader、`?`/`#`、翻页/滚动和
+  `[keys]` 绑定行为一致；`j/k` 行移动、`Tab` 切换 Build/Plan 等 vim/编辑器键仍归输入框。
 - `Shift+,` / `Shift+.`（即 `<` / `>`）在转录区和输入框 normal 模式线性切换上一个 / 下一个 pane。
 - `Ctrl-J`/`Ctrl-K` 上下翻转录历史（`j`/`k`、`3j`、`dj`、`↑`/`↓` 是草稿内行移动）。
 - normal 模式下 `Tab` 在 Build / Plan 之间切换：`None` 表示默认 Build，`Some("plan")`
@@ -210,8 +212,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 ## 6. 布局与焦点
 
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
-- 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首占 55% 高度）、`tabby`（顶部 tab，
-  只渲染当前 session）、`fibonacci`（tab + 左/上/右/下循环切分的螺旋分屏）。用 leader
+- 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首占 55% 高度）、`tabby`（输入框 Build 行
+  上方显示 tab，只渲染当前 session）、`fibonacci`（tab + 左/上/右/下循环切分的螺旋分屏）。用 leader
   `<Space>v/t/r` 切换，`<Space>l` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session，
   在 `tabby` 下即切换到第 N 个 tab。TUI 启动时请求 kitty 键盘协议（CSI-u），否则传统终端
   会把 `Ctrl-2`/`Ctrl-3` 等编码成 NUL/Esc；不支持该协议时用 `Alt-1` … `Alt-9`。
@@ -223,7 +225,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 不再有独立顶部 header 行：Build/Plan、session 状态、模型和 cwd 作为输入框标题行，直接压在
   prompt 网格上方（cwd 用 `~` 缩写，模型省略 provider 前缀）；输入框下方保留一行 statusline，
   左侧显示模式、session 和最近状态，中间显示 attention 提醒，右侧显示模型与队列/attention 信息。
-- 焦点：`<C-w>h/j/k/l`（normal 模式与转录区一致）、`<C-w>w` 循环；转录区按 `i`、`Enter` 或 `<Space>i` 聚焦输入并进入 insert。
+- 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i`、`Enter` 或 `<Space>i` 聚焦输入并进入 insert。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
 - 输入条最少显示 6 行内容（加边框；短终端优先让给转录区），长草稿会向上生长到 12 行，让长命令
@@ -244,8 +246,6 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 |---|---|
 | `<C-g>` | session picker（直达） |
 | `<C-g><C-g>` | 回到上一个 session |
-| `<C-w>h/j/k/l` | 切换 pane 焦点 |
-| `<C-w>w` | 循环 pane |
 | `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
 | `<Space>l` | 循环 grid / horizontal / tabby / fibonacci |
 | `<Space>R` | 跨 session 审批收件箱 |
@@ -352,7 +352,7 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 | `y` / `Y` / `v` | 复制当前块 / 整条消息 / 可视选择 |
 | `gf` / `gx` | 打开路径 / URL |
 | `i` | 聚焦输入（insert） |
-| `<leader>a…`、`<C-g>`、`<C-w>…` | 同全局 |
+| `<leader>a…`、`<C-g>` | 同全局 |
 
 **Picker**
 
@@ -610,7 +610,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 实现快照（2026-10-18）：多 pane TUI 已落地（`eix` 无命令默认打开，或 `eix tui`）。左侧 session 栏 + 右侧自动
 > 平铺 pane（1/2/3/4+ 分别全屏、左右、左大右二、网格），每个 pane 独立维护 session、
 > 转录、滚动与流式跟随；`<Space>o` 在新 pane 打开，`<Space>s`/`Ctrl-G` 切换聚焦 pane 的 session，
-> `C-w h/j/k/l/w` 切焦点、`C-w v/s` 分屏、`C-w c` 关闭；同一 session 只出现一次，
+> `Shift+,` / `Shift+.` 切换 pane、`<Space>n` 新建 session、`<Space>c`/`<Space>q` 关闭；同一 session 只出现一次，
 > picker 选中已打开 session 会聚焦既有 pane。输入框是自研的 Vim 风格模态编辑器
 > （`tui/editor.rs`）：normal / insert / visual / visual-line，常用 motion + operator +
 > count、`u`/`Ctrl-r`、未命名寄存器；不启动子进程、不加载 nvim 配置，按键零往返。

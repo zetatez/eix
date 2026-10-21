@@ -858,14 +858,6 @@ impl SearchView {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Left,
-    Right,
-    Up,
-    Down,
-}
-
 /// How open sessions are arranged in the body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaneLayout {
@@ -946,8 +938,6 @@ pub struct App {
     pending_images: Vec<String>,
     /// Images belonging to an in-flight prompt, restored if submit fails.
     inflight_images: Vec<String>,
-    /// `Ctrl-W` was pressed; the next key is a window command.
-    pending_window: bool,
     /// `<Space>` was pressed in the transcript; the next key is a leader action.
     pending_leader: bool,
     /// Text selected with the mouse, waiting for the event loop to copy it to
@@ -1070,7 +1060,6 @@ impl App {
             pending_delete: None,
             pending_images: Vec::new(),
             inflight_images: Vec::new(),
-            pending_window: false,
             pending_leader: false,
             pending_clipboard: None,
             pending_history: None,
@@ -1388,7 +1377,6 @@ impl App {
     /// cursor. The wheel scrolls the pane under the cursor.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.pending_leader = false;
-        self.pending_window = false;
         let (x, y) = (mouse.column, mouse.row);
         let pane = self.pane_areas.iter().position(|rect| {
             x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
@@ -2862,11 +2850,7 @@ impl App {
         // A blocking approval/question card owns its navigation keys no matter
         // whether the prompt or the transcript has focus. Other overlays above
         // keep priority.
-        if self.diff_view.is_none()
-            && !self.pending_window
-            && !self.pending_leader
-            && self.handle_card_key(key, tx)
-        {
+        if self.diff_view.is_none() && !self.pending_leader && self.handle_card_key(key, tx) {
             return;
         }
 
@@ -2915,7 +2899,7 @@ impl App {
             // under it, and never let the editor start a second one either.
             if self.focused_approval().is_none() && self.focused_input().is_none() {
                 self.pending_leader = true;
-                self.status = "leader: s/f/w/b · n new · o pane · v/t/r/l layout · R approvals · C ledger · c/q close · a commands · i input · ? help · Z quit · Esc cancel"
+                self.status = "leader: s/f/w/b · n new · o pane · v/t/r/l layout · R approvals · C ledger · c close · a commands · i input · Z quit · Esc cancel"
                     .into();
             }
             return true;
@@ -2928,12 +2912,6 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('w') => {
-                    self.pending_window = true;
-                    self.status =
-                        "window: h/j/k/l focus · v split · c close · w cycle · Esc cancel".into();
-                    return true;
-                }
                 KeyCode::Char('d') => {
                     self.scroll_focused(10);
                     return true;
@@ -2964,26 +2942,21 @@ impl App {
                 self.scroll_focused(-10);
                 true
             }
-            KeyCode::BackTab => {
-                self.cycle_session(-1, tx);
-                true
-            }
             _ => false,
         }
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        // The diff overlay owns the keyboard regardless of which pane was
+        // focused when it opened, matching the transcript path.
+        if self.diff_view.is_some() {
+            self.handle_diff_key(key, tx);
+            return;
+        }
         // Insert/visual keys belong to the editor, so a pane leader must not
         // leak into typed input. Normal mode shares the transcript leader.
         if self.input.mode() != Mode::Normal {
             self.pending_leader = false;
-        }
-        if self.pending_window {
-            self.pending_window = false;
-            if self.input.mode() == Mode::Normal {
-                self.handle_window_key(key, tx);
-                return;
-            }
         }
         // In normal mode the prompt behaves like a focused pane for the TUI
         // actions the editor does not own. A half-typed vim prefix keeps the
@@ -3236,7 +3209,6 @@ impl App {
     fn focus_input(&mut self) {
         self.focus = Focus::Input;
         self.pending_leader = false;
-        self.pending_window = false;
         self.esc_at = None;
         self.input.enter_insert();
     }
@@ -3363,11 +3335,6 @@ impl App {
             self.handle_diff_key(key, tx);
             return;
         }
-        if self.pending_window {
-            self.pending_window = false;
-            self.handle_window_key(key, tx);
-            return;
-        }
         if self.handle_shared_normal_key(key, tx) {
             return;
         }
@@ -3398,7 +3365,7 @@ impl App {
             // `i` is the one bare letter that stays: focusing the prompt is
             // the normal way out of the transcript, like vim insert mode.
             KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
-            KeyCode::Tab => self.cycle_session(1, tx),
+            KeyCode::Tab => self.toggle_agent_mode(tx),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_focused(-1),
             KeyCode::Char('g') => {
@@ -3789,20 +3756,6 @@ impl App {
                     let _ = tx.send(Command::ProcessKill { process_id });
                 }
             }
-            _ => {}
-        }
-    }
-
-    fn handle_window_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
-        match key.code {
-            KeyCode::Char('h') | KeyCode::Left => self.focus_direction(Direction::Left),
-            KeyCode::Char('l') | KeyCode::Right => self.focus_direction(Direction::Right),
-            KeyCode::Char('j') | KeyCode::Down => self.focus_direction(Direction::Down),
-            KeyCode::Char('k') | KeyCode::Up => self.focus_direction(Direction::Up),
-            KeyCode::Char('v') | KeyCode::Char('s') => self.open_picker(PickerKind::NewPane, tx),
-            KeyCode::Char('c') | KeyCode::Char('q') => self.close_focused_pane(),
-            KeyCode::Char('w') => self.cycle_pane(1),
-            KeyCode::Esc => self.status = "window command cancelled".into(),
             _ => {}
         }
     }
@@ -5720,23 +5673,6 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.move_view(index, last, focus_after);
     }
 
-    fn focus_direction(&mut self, direction: Direction) {
-        if self.layout == PaneLayout::Tabby {
-            match direction {
-                Direction::Left | Direction::Up => self.cycle_pane(-1),
-                Direction::Right | Direction::Down => self.cycle_pane(1),
-            }
-            return;
-        }
-        if self.views.len() < 2 || self.pane_areas.len() != self.views.len() {
-            return;
-        }
-        match pick_direction(&self.pane_areas, self.focused, direction) {
-            Some(index) => self.focus_pane(index),
-            None => self.status = "no pane in that direction".into(),
-        }
-    }
-
     fn cycle_pane(&mut self, delta: isize) {
         if self.views.len() < 2 {
             return;
@@ -6099,12 +6035,20 @@ already exists, update it in place rather than rewriting it from scratch.";
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         // Sessions live in the floating picker (`p` / `<Space>s`), not in a
         // permanent sidebar: panes get the whole body.
-        if !self.views.is_empty() && self.layout.shows_tabs() && area.height > 1 {
+        if self.views.is_empty() || !self.layout.shows_tabs() || area.height <= 1 {
+            self.draw_panes(frame, area);
+            return;
+        }
+        if self.layout == PaneLayout::Tabby {
+            // Keep the tab strip against the prompt's Build line instead of
+            // the top of the transcript.
+            let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
+            self.draw_panes(frame, chunks[0]);
+            self.draw_tab_bar(frame, chunks[1]);
+        } else {
             let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
             self.draw_tab_bar(frame, chunks[0]);
             self.draw_panes(frame, chunks[1]);
-        } else {
-            self.draw_panes(frame, area);
         }
     }
 
@@ -7827,7 +7771,7 @@ fn command_items() -> Vec<PickerItem> {
         (
             "close-pane",
             "close pane",
-            "Close the focused pane (C-w c / Space c / Space q)",
+            "Close the focused pane (Space c)",
         ),
         ("new", "new session", "Create a session (n / Space n)"),
         (
@@ -7853,7 +7797,7 @@ fn command_items() -> Vec<PickerItem> {
         (
             "toggle-agent",
             "Build / Plan",
-            "Toggle the focused session's agent (Tab in prompt normal mode)",
+            "Toggle the focused session's agent (Tab)",
         ),
         (
             "skills",
@@ -8248,12 +8192,12 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt & transcript: ledger / history / processes",
             },
             HelpEntry {
-                key: "Space r/x/a/?",
-                description: "prompt & transcript: approvals / cancel / actions / help",
+                key: "Space r/x/a",
+                description: "prompt & transcript: approvals / cancel / actions",
             },
             HelpEntry {
-                key: "Space n/c/q",
-                description: "prompt & transcript: new session / close pane (c or q)",
+                key: "Space n/c",
+                description: "prompt & transcript: new session / close pane",
             },
             HelpEntry {
                 key: "Shift+, / Shift+.",
@@ -8316,28 +8260,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "jump to the next pane needing attention",
             },
             HelpEntry {
-                key: "C-w h/j/k/l",
-                description: "focus pane left/down/up/right",
-            },
-            HelpEntry {
-                key: "C-w v / s",
-                description: "open a new pane",
-            },
-            HelpEntry {
-                key: "C-w c",
-                description: "close focused pane",
-            },
-            HelpEntry {
-                key: "C-w w",
-                description: "cycle panes",
-            },
-            HelpEntry {
-                key: "Tab / S-Tab",
-                description: "next / previous session",
-            },
-            HelpEntry {
-                key: "Tab (prompt normal)",
-                description: "toggle Build / Plan mode",
+                key: "Tab",
+                description: "toggle Build / Plan mode (prompt normal & transcript)",
             },
             HelpEntry {
                 key: "Space n / Space N",
@@ -8423,10 +8347,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "prompt",
                 description: "modal: Enter sends in insert; normal mode has vim motions, d/c/y, visual (v/V) and u/C-r",
-            },
-            HelpEntry {
-                key: "C-w",
-                description: "commands work from the transcript; Esc leaves the prompt first.",
             },
             HelpEntry {
                 key: "ask_user",
@@ -8920,44 +8840,6 @@ fn pane_rects(area: Rect, count: usize) -> Vec<Rect> {
             rects
         }
     }
-}
-
-/// Pick the pane that lies in `direction` from `current`, preferring panes
-/// aligned on the other axis (so a 2x2 grid moves predictably).
-fn pick_direction(areas: &[Rect], current: usize, direction: Direction) -> Option<usize> {
-    let from = *areas.get(current)?;
-    let (from_x, from_y) = center_of(from);
-    let mut best: Option<(usize, i64, i64)> = None;
-    for (index, rect) in areas.iter().enumerate() {
-        if index == current {
-            continue;
-        }
-        let (x, y) = center_of(*rect);
-        let (primary, perpendicular) = match direction {
-            Direction::Left if x < from_x => (from_x - x, (y - from_y).abs()),
-            Direction::Right if x > from_x => (x - from_x, (y - from_y).abs()),
-            Direction::Up if y < from_y => (from_y - y, (x - from_x).abs()),
-            Direction::Down if y > from_y => (y - from_y, (x - from_x).abs()),
-            _ => continue,
-        };
-        let better = match best {
-            None => true,
-            Some((_, best_perpendicular, best_primary)) => {
-                (perpendicular, primary) < (best_perpendicular, best_primary)
-            }
-        };
-        if better {
-            best = Some((index, perpendicular, primary));
-        }
-    }
-    best.map(|(index, _, _)| index)
-}
-
-fn center_of(rect: Rect) -> (i64, i64) {
-    (
-        rect.x as i64 + rect.width as i64 / 2,
-        rect.y as i64 + rect.height as i64 / 2,
-    )
 }
 
 /// Line index where each hunk starts in the review body.
@@ -10255,16 +10137,18 @@ mod tests {
         assert!(rendered.contains("session c"), "{rendered}");
         // The active tab is bracketed; inactive tabs are not separate panes.
         assert!(rendered.contains("[2 session b]"), "{rendered}");
-    }
 
-    #[test]
-    fn direction_prefers_aligned_neighbor() {
-        let rects = pane_rects(Rect::new(0, 0, 100, 40), 4);
-        assert_eq!(pick_direction(&rects, 0, Direction::Right), Some(1));
-        assert_eq!(pick_direction(&rects, 0, Direction::Down), Some(2));
-        assert_eq!(pick_direction(&rects, 3, Direction::Left), Some(2));
-        assert_eq!(pick_direction(&rects, 3, Direction::Up), Some(1));
-        assert_eq!(pick_direction(&rects, 0, Direction::Up), None);
+        // Tabs sit directly above the prompt's Build line.
+        let lines: Vec<&str> = rendered.lines().collect();
+        let tab_row = lines
+            .iter()
+            .position(|line| line.contains("[2 session b]"))
+            .expect("tab strip");
+        let build_row = lines
+            .iter()
+            .position(|line| line.contains("Build ·"))
+            .expect("prompt header");
+        assert_eq!(tab_row + 1, build_row, "{rendered}");
     }
 
     fn line_text(line: &Line<'_>) -> String {
@@ -12273,20 +12157,26 @@ mod tests {
         struct Snapshot {
             help: bool,
             search: bool,
+            ledger: bool,
+            processes: bool,
             picker: Option<u8>,
             panes: usize,
             focused: usize,
             scroll: Option<(usize, bool)>,
+            leader: bool,
         }
 
         fn snapshot(app: &App) -> Snapshot {
             Snapshot {
                 help: app.help,
                 search: app.search_view.is_some(),
+                ledger: app.ledger.is_some(),
+                processes: app.process_view.is_some(),
                 picker: app.picker.as_ref().map(|picker| picker.kind as u8),
                 panes: app.views.len(),
                 focused: app.focused,
                 scroll: app.focused_view().map(|view| (view.scroll, view.follow)),
+                leader: app.pending_leader,
             }
         }
 
@@ -12305,12 +12195,20 @@ mod tests {
                 KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
             ],
             vec![
-                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
             ],
             vec![
                 KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            ],
+            vec![
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+            ],
+            vec![
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
             ],
         ];
 
