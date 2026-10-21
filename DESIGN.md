@@ -270,8 +270,11 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 | 命令 | 行为 |
 |---|---|
-| `/help` | 帮助（可输入关键字筛选条目） |
+| `/help [query]` | 可搜索帮助（命令 / 快捷键 / notes），可带初始查询 |
+| `/keys [query]` | 只搜索快捷键章节 |
 | `/new [name]` | 在聚焦 session 的 cwd 新建 session 并打开 pane |
+| `/new-pane` | session picker，把已有 session 放进新 pane |
+| `/new-worktree [name]` | 在独立 git worktree 新建 session |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
 | `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要 |
 | `/btw <question>` | 一次性旁支问答，不写事件日志；`btw.delta` / `btw.completed` 通知，`btw.cancel` 中断 |
@@ -279,6 +282,11 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
 | `/queue [clear]` | 查看/清空本 session 的待发送队列 |
 | `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
+| `/files` / `/worktrees` / `/branches` | picker；选中后插入路径 / worktree / 分支名 |
+| `/context` / `/ledger` / `/history` | context picker / 完整 ledger / 历史搜索 |
+| `/processes` / `/approvals` / `/attention` | 进程 / 审批收件箱 / 下一个 attention |
+| `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
+| `/cancel` / `/toggle-agent` | 取消运行 / 切换 Build·Plan |
 | `/permission <level>` | 设置 `read-only` / `workspace-write` / `full` |
 | `/exit` / `/quit` | 保存并关闭当前 pane；最后一个 pane 时退出 TUI |
 | `/close` | 保存并关闭当前 pane；保留最后一个 pane，改用 `/quit` 退出 |
@@ -464,7 +472,7 @@ j/k or C-n/C-p select · Enter confirm · y/n · x cancel
 **daemon → client（notification）**
 
 - `session.created|updated|status`、`session.attention`
-- `turn.started`、`message.delta`、`reasoning.delta`、`message.completed`
+- `turn.started`、`message.delta`、`reasoning.delta`、`message.reset`、`turn.retrying`、`message.completed`
 - `tool.requested`、`tool.approval_required`、`input.required`、`tool.started`、`tool.output`、`tool.completed`
 - `patch.proposed`、`patch.applied`、`patch.rejected`、`patch.conflict`
 - `process.started|output|exited`

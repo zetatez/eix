@@ -157,6 +157,137 @@ async fn daemon_streams_and_persists_a_turn() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn daemon_retries_transient_provider_failures() -> anyhow::Result<()> {
+    let dir = temp_dir("retry");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(flaky_provider(listener, 2, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.provider.retry_attempts = 3;
+    config.provider.retry_base_ms = 1;
+    config.provider.retry_max_secs = 1;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir));
+
+    let mut client = connect(&socket).await?;
+    let _: HelloResult = client.request("hello", Value::Null).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "retry", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "retry please"}),
+        )
+        .await?;
+
+    let mut text = String::new();
+    let mut retries = 0;
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "message.delta"
+                if notification.params["session_id"] == session_id.as_str()
+                    && notification.params["turn_id"] == submitted.turn_id.as_str() =>
+            {
+                text.push_str(notification.params["delta"].as_str().unwrap_or_default());
+            }
+            "turn.retrying" => {
+                assert_eq!(notification.params["session_id"], session_id);
+                assert_eq!(notification.params["turn_id"], submitted.turn_id);
+                assert!(notification.params["attempt"].as_u64().unwrap() >= 2);
+                retries += 1;
+            }
+            "turn.completed"
+                if notification.params["session_id"] == session_id.as_str()
+                    && notification.params["turn_id"] == submitted.turn_id.as_str() =>
+            {
+                break notification.params.clone();
+            }
+            _ => {}
+        }
+    };
+
+    assert_eq!(retries, 2);
+    assert_eq!(text, "recovered");
+    assert!(completed["error"].is_null());
+    assert_eq!(bodies.lock().await.len(), 3);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_does_not_retry_an_exhausted_quota() -> anyhow::Result<()> {
+    let dir = temp_dir("quota");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(quota_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.provider.retry_attempts = 3;
+    config.provider.retry_base_ms = 1;
+    config.provider.retry_max_secs = 1;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir));
+
+    let mut client = connect(&socket).await?;
+    let _: HelloResult = client.request("hello", Value::Null).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "quota", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "hello"}),
+        )
+        .await?;
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == session_id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break notification.params.clone();
+        }
+        assert_ne!(notification.method, "turn.retrying");
+    };
+
+    let error = completed["error"].as_str().unwrap_or_default();
+    assert!(error.contains("quota"), "{error}");
+    assert_eq!(bodies.lock().await.len(), 1);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn context_ledger_reports_sectors_and_honours_policies() -> anyhow::Result<()> {
     let dir = temp_dir("context");
     std::fs::create_dir_all(&dir)?;
@@ -3640,6 +3771,76 @@ async fn mock_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
             let _ = socket.flush().await;
         });
     }
+}
+
+async fn flaky_provider(listener: TcpListener, failures: usize, bodies: Arc<Mutex<Vec<String>>>) {
+    let remaining = Arc::new(Mutex::new(failures));
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        let remaining = Arc::clone(&remaining);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            bodies.lock().await.push(body);
+            let fail = {
+                let mut remaining = remaining.lock().await;
+                if *remaining > 0 {
+                    *remaining -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if fail {
+                write_http_error(
+                    &mut socket,
+                    "503 Service Unavailable",
+                    r#"{"error":{"message":"temporarily overloaded"}}"#,
+                )
+                .await;
+                return;
+            }
+            let events = concat!(
+                "data: {\"model\":\"mock-retry\",\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            write_sse(&mut socket, events).await;
+        });
+    }
+}
+
+async fn quota_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            bodies.lock().await.push(body);
+            write_http_error(
+                &mut socket,
+                "429 Too Many Requests",
+                r#"{"error":{"type":"insufficient_quota","message":"You exceeded your current quota"}}"#,
+            )
+            .await;
+        });
+    }
+}
+
+async fn write_http_error(socket: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    let response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let _ = socket.write_all(response.as_bytes()).await;
+    let _ = socket.flush().await;
 }
 
 async fn slow_provider(listener: TcpListener) {

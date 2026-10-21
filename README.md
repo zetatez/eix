@@ -51,6 +51,9 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 api_key_env = "OPENAI_API_KEY"
 timeout_secs = 300
+retry_attempts = 5            # 首次失败后的自动重试次数；0 关闭
+retry_base_ms = 500           # 指数退避起点
+retry_max_secs = 30           # 单次等待上限（也限制 Retry-After）
 # system_prompt = "..."
 
 [notifications]
@@ -135,7 +138,8 @@ extensions = ["py"]
 ```
 
 环境变量覆盖：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、`EIX_API_KEY_ENV`、
-`EIX_SYSTEM_PROMPT`、`EIX_TIMEOUT_SECS`、`EIX_TOOL_POLICY`、`EIX_TOOL_MAX_OUTPUT`、
+`EIX_SYSTEM_PROMPT`、`EIX_TIMEOUT_SECS`、`EIX_RETRY_ATTEMPTS`、`EIX_RETRY_BASE_MS`、
+`EIX_RETRY_MAX_SECS`、`EIX_TOOL_POLICY`、`EIX_TOOL_MAX_OUTPUT`、
 `EIX_TOOL_TIMEOUT_SECS`、`EIX_TOOL_SANDBOX`、`EIX_TOOL_SANDBOX_NETWORK`、
 `EIX_TOOL_SANDBOX_READ_HOME`、`EIX_TOOL_SNAPSHOTS`、`EIX_CONTEXT_BUDGET`、
 `EIX_CONTEXT_AUTO_COMPACT`、`EIX_CONTEXT_AUTO_COMPACT_THRESHOLD`、
@@ -259,8 +263,11 @@ agent 输出和用户气泡都按 Markdown 渲染：标题、粗体/斜体/删�
 
 | 命令 | 行为 |
 | --- | --- |
-| `/help` | 打开帮助（命令列表在顶部；输入关键字即时筛选） |
+| `/help [query]` | 打开可搜索帮助（命令、快捷键、notes）；可带初始查询 |
+| `/keys [query]` | 只打开快捷键章节，同样支持即时搜索和上下选择 |
 | `/new [name]` | 在聚焦 session 的 cwd 里新建 session，并在新 pane 打开 |
+| `/new-pane` | 打开 session picker，把已有 session 放进新 pane |
+| `/new-worktree [name]` | 在独立 git worktree 里新建 session |
 | `/clear` | 清空模型上下文（更早的 turn 仍留在转录和事件日志里，只是不再发给模型） |
 | `/compact [notes]` | 让模型总结当前上下文，用摘要替换历史；`notes` 直接作为摘要文本 |
 | `/btw <question>` | 用一次性上下文回答旁支问题；不写入事件日志，也不进入主对话；`Esc` 关闭 |
@@ -268,14 +275,19 @@ agent 输出和用户气泡都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/init` | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送 |
 | `/queue [clear]` | 查看队列；`clear` 清空，`rm N` 删除第 N 条，`move N M` 调整顺序 |
 | `/sessions` | 打开 session picker |
+| `/files` / `/worktrees` / `/branches` | 交互式 picker，选中后插入 `@path` / worktree 路径 / 分支名 |
+| `/context` / `/ledger` | context 条目 picker（右侧预览）/ 打开完整 context ledger |
+| `/history` | 打开全文历史搜索弹窗 |
+| `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
+| `/attention` / `/cancel` / `/toggle-agent` | 跳到下一个需要 attention 的 pane / 取消运行 / 切换 Build·Plan |
 | `/models [id]` | 打开模型 picker（含变体行）；直接 `/models provider/model#variant` 可固定到某个模型 |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
-| `/mcp` | 显示 MCP server 及其工具数量/错误 |
+| `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
 | `/commands` | 从磁盘重新加载自定义 Markdown 命令 |
 | `/reload` | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC） |
 | `/theme` | 打开主题 picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原主题 |
 | `/skills [name] [args]` | 打开 skill picker（右侧预览正文）；带名字时把正文放进输入框并展开 `$ARGUMENTS` / `$1..$9` |
-| `/todos` | 查看模型当前的任务列表（内存态，daemon 重启后清空） |
+| `/todos` | 打开任务列表 picker（搜索任务，显示状态和详情；内存态，daemon 重启后清空） |
 | `/image <path>` | 把图片挂到下一条 prompt（png / jpg / gif / webp，最多 4 张、每张 8 MB）；不带参数时显示已挂图片，`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI |
 
 在 prompt 里以 `!` 开头（例如 `!cargo test`）会直接在当前 session 的 cwd 里执行 shell：走同样的沙箱、
@@ -658,6 +670,26 @@ workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具�
   `warnings` 里列出，`restored = false` 表示工作区没有完全回到切点。
 - 大仓库可以设 `[tools] snapshots = false`（或 `EIX_TOOL_SNAPSHOTS=0`）关掉；关闭后不再
   记录 `snapshot` 事件。`eix doctor` 会显示当前开关。
+
+### Provider 自动重试
+
+每轮 provider 调用失败后，daemon 会先判断错误类型再决定是否重试：
+
+| 类型 | 例子 | 行为 |
+| --- | --- | --- |
+| 瞬时故障 | 连接重置/DNS/超时、HTTP 408/409/425、5xx、流被截断 | 指数退避重试 |
+| 限流 | HTTP 429、`overloaded` / `try again` | 重试；有 `Retry-After` 时优先按它等待 |
+| 空响应 | 模型只返回空内容或空 reasoning | 视为瞬时故障重试 |
+| 套餐/余额 | `insufficient_quota`、402、billing/credit 类错误 | 不重试，直接报错并保留草稿 |
+| 鉴权/配置 | 400/401/403/404/422、无效 key、错误的 base URL | 不重试 |
+
+- `retry_attempts` 是首次请求之外的额外次数；等待从 `retry_base_ms` 开始按 1s → 2s → 4s
+  增长，单次不超过 `retry_max_secs`。
+- 重试发生在当前工具轮次内部，不会把整轮对话重新跑一遍；已经进入上下文的事件不变。
+- 如果失败前已经向 TUI 流式输出了部分文本，daemon 会先发 `message.reset` 清掉这部分，
+  再发 `turn.retrying` 显示“第几次重试/等待多久”；重试成功后不会重复显示旧内容。
+- 取消（`Esc` / `eix cancel`）会立即打断退避等待；重试耗尽后才把 session 标为 error。
+- `/btw` 和自动摘要目前不参与这套 turn 级重试。
 
 ### Context ledger
 

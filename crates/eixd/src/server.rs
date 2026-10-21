@@ -2314,7 +2314,7 @@ impl Daemon {
                         "session_id": session_id,
                         "turn_id": turn_id,
                         "attempt": attempt + 1,
-                        "max_attempts": max_retries + 1,
+                        "max_attempts": max_retries.saturating_add(1),
                         "delay_ms": delay.as_millis() as u64,
                         "reason": reason,
                     }),

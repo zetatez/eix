@@ -2237,6 +2237,9 @@ impl App {
                     else {
                         return;
                     };
+                    if self.status.starts_with("retrying ") {
+                        self.status = "running".into();
+                    }
                     match &mut view.stream {
                         Some(stream) if stream.turn_id == delta.turn_id => {
                             let target = if reasoning {
@@ -3952,6 +3955,9 @@ impl App {
                 if let Some(value) = value {
                     self.apply_theme_picker(&value);
                 }
+            }
+            PickerKind::Mcp | PickerKind::Todos => {
+                self.picker = None;
             }
         }
     }
@@ -7196,6 +7202,58 @@ fn agent_picker_items(agents: &[eix_core::AgentSpec]) -> Vec<PickerItem> {
         .collect()
 }
 
+fn mcp_picker_items(servers: &[eix_core::McpServerInfo]) -> Vec<PickerItem> {
+    servers
+        .iter()
+        .map(|server| {
+            let state = if !server.enabled {
+                "disabled".to_string()
+            } else if server.error.is_some() {
+                "error".to_string()
+            } else {
+                format!("{} tool(s)", server.tools)
+            };
+            let mut preview = vec![
+                server.name.clone(),
+                format!("command   {}", server.command),
+                format!("tools     {}", server.tools),
+                format!("state     {state}"),
+            ];
+            if server.resources > 0 {
+                preview.push(format!("resources {}", server.resources));
+            }
+            if server.prompts > 0 {
+                preview.push(format!("prompts   {}", server.prompts));
+            }
+            if let Some(error) = &server.error {
+                preview.push(String::new());
+                preview.push(format!("error: {error}"));
+            }
+            PickerItem::new(&server.name)
+                .with_detail(state)
+                .with_preview(preview.join("\n"))
+        })
+        .collect()
+}
+
+fn todo_picker_items(items: &[TodoItem]) -> Vec<PickerItem> {
+    items
+        .iter()
+        .map(|item| {
+            let mark = match item.status.as_str() {
+                "completed" => "[x]",
+                "in_progress" => "[~]",
+                "cancelled" => "[-]",
+                _ => "[ ]",
+            };
+            PickerItem::new(&item.content)
+                .with_label(format!("{mark} {}", item.content))
+                .with_detail(item.status.clone())
+                .with_preview(format!("{}\n\nstatus: {}", item.content, item.status))
+        })
+        .collect()
+}
+
 fn skill_picker_items(skills: &[eix_core::Skill]) -> Vec<PickerItem> {
     skills
         .iter()
@@ -7265,6 +7323,17 @@ fn command_items() -> Vec<PickerItem> {
         ),
         ("approvals", "approval inbox", "Pending approvals (A)"),
         (
+            "mcp",
+            "mcp servers",
+            "Browse configured MCP servers and tool counts",
+        ),
+        ("todos", "task list", "Browse the focused session's tasks"),
+        (
+            "attention",
+            "next attention",
+            "Jump to the next pane needing approval or input",
+        ),
+        (
             "close-pane",
             "close pane",
             "Close the focused pane (C-w c / Space C / Space q)",
@@ -7306,7 +7375,12 @@ fn command_items() -> Vec<PickerItem> {
             "Pin the focused session to a configured model",
         ),
         ("theme", "theme", "Choose a color preset with live preview"),
-        ("help", "key help", "Show the key map (?)"),
+        (
+            "help",
+            "key help",
+            "Search the key and command reference (?)",
+        ),
+        ("keys", "key bindings", "Search just the key map"),
         ("quit", "quit eix", "Leave the TUI (q)"),
     ];
     COMMANDS
@@ -7554,12 +7628,12 @@ const HELP_SECTIONS: &[HelpSection] = &[
         title: "prompt commands",
         entries: &[
             HelpEntry {
-                key: "/help",
-                description: "open this reference",
+                key: "/help · /keys",
+                description: "search the reference · search just the key map",
             },
             HelpEntry {
-                key: "/new",
-                description: "start a session here (/new optional-name)",
+                key: "/new · /new-pane · /new-worktree",
+                description: "new session · choose one for a new pane · new worktree session",
             },
             HelpEntry {
                 key: "/clear",
@@ -7586,8 +7660,24 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "list queued prompts (/queue clear | rm N | move N M)",
             },
             HelpEntry {
-                key: "/sessions",
-                description: "open the session picker",
+                key: "/sessions · /files · /worktrees · /branches",
+                description: "interactive pickers for sessions, files, worktrees and branches",
+            },
+            HelpEntry {
+                key: "/context · /ledger",
+                description: "browse context entries · open the full ledger",
+            },
+            HelpEntry {
+                key: "/history · /processes · /approvals",
+                description: "search history · inspect processes · pending approvals",
+            },
+            HelpEntry {
+                key: "/mcp · /todos",
+                description: "search MCP servers · browse the model's task list",
+            },
+            HelpEntry {
+                key: "/attention · /cancel · /toggle-agent",
+                description: "next attention · cancel the turn · toggle Build / Plan",
             },
             HelpEntry {
                 key: "/timeline",
@@ -7604,10 +7694,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "/skills [name] [args]",
                 description: "browse skills with a preview, or insert one with arguments",
-            },
-            HelpEntry {
-                key: "/todos",
-                description: "show the model's current task list",
             },
             HelpEntry {
                 key: "/image <path>",
@@ -7849,10 +7935,6 @@ enum HelpRow {
     Entry(&'static HelpEntry),
 }
 
-fn help_rows(query: &str) -> Vec<HelpRow> {
-    help_rows_in(query, None)
-}
-
 fn help_rows_in(query: &str, scope: Option<&str>) -> Vec<HelpRow> {
     let query = query.trim().to_lowercase();
     let mut rows = Vec::new();
@@ -7877,6 +7959,7 @@ fn help_rows_in(query: &str, scope: Option<&str>) -> Vec<HelpRow> {
     rows
 }
 
+#[cfg(test)]
 fn help_entry_count(query: &str) -> usize {
     help_entry_count_in(query, None)
 }
@@ -7885,7 +7968,7 @@ fn help_entry_count_in(query: &str, scope: Option<&str>) -> usize {
     let query = query.trim().to_lowercase();
     HELP_SECTIONS
         .iter()
-        .filter(|section| scope.map_or(true, |scope| scope == section.title))
+        .filter(|section| scope.is_none_or(|scope| scope == section.title))
         .flat_map(|section| section.entries.iter())
         .filter(|entry| entry.matches(&query))
         .count()
@@ -7905,7 +7988,7 @@ fn draw_help(
     let matches = help_entry_count_in(query, scope);
     let total: usize = HELP_SECTIONS
         .iter()
-        .filter(|section| scope.map_or(true, |scope| scope == section.title))
+        .filter(|section| scope.is_none_or(|scope| scope == section.title))
         .map(|section| section.entries.len())
         .sum();
 
@@ -7999,7 +8082,7 @@ fn draw_help(
                             Style::default().fg(Color::DarkGray),
                         ),
                         Span::styled(
-                            format!("{:<15}", entry.key),
+                            format!("{:<15} ", entry.key),
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
@@ -10910,7 +10993,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.open_help();
-        for ch in "approvals".chars() {
+        for ch in "approvals inbox".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
         }
 
@@ -11717,6 +11800,114 @@ mod tests {
             Command::DraftSet { session_id, .. } => assert_eq!(session_id, "s1"),
             _ => panic!("expected a draft save"),
         }
+    }
+
+    #[test]
+    fn slash_commands_mirror_the_action_palette() {
+        let commands = builtin_commands();
+        let builtins: HashSet<&str> = commands.iter().map(|spec| spec.name.as_str()).collect();
+        for item in command_items() {
+            let slash = if item.value == "close-pane" {
+                "close"
+            } else {
+                item.value.as_str()
+            };
+            assert!(
+                builtins.contains(slash),
+                "palette action {:?} has no /{slash} command",
+                item.value
+            );
+        }
+    }
+
+    #[test]
+    fn every_palette_action_has_a_working_slash_command() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        for item in command_items() {
+            let name = if item.value == "close-pane" {
+                "close"
+            } else {
+                item.value.as_str()
+            };
+            let mut app = App::new(None);
+            assert!(
+                app.handle_prompt_command(&format!("/{name}"), &tx),
+                "/{name} was not handled"
+            );
+            assert!(app.error.is_none(), "/{name} failed: {:?}", app.error);
+        }
+    }
+
+    #[test]
+    fn slash_help_and_keys_open_filtered_interactive_references() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+
+        assert!(app.handle_prompt_command("/help approval", &tx));
+        assert!(app.help);
+        assert_eq!(app.help_scope, None);
+        assert_eq!(app.help_query, "approval");
+        assert!(help_entry_count_in(&app.help_query, app.help_scope) > 0);
+
+        app.help = false;
+        assert!(app.handle_prompt_command("/keys space", &tx));
+        assert!(app.help);
+        assert_eq!(app.help_scope, Some("keys"));
+        assert_eq!(app.help_query, "space");
+        let rows = help_rows_in(&app.help_query, app.help_scope);
+        assert!(!rows.is_empty());
+        assert!(rows.iter().all(|row| !matches!(
+            row,
+            HelpRow::Section(title) if *title != "keys"
+        )));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!app.help);
+        assert_eq!(app.help_scope, None);
+    }
+
+    #[test]
+    fn mcp_and_todos_commands_open_searchable_pickers() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+
+        assert!(app.handle_prompt_command("/mcp", &tx));
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Mcp)
+        ));
+        app.handle_event(
+            Event::Mcp(vec![eix_core::McpServerInfo {
+                name: "files".into(),
+                enabled: true,
+                command: "npx server".into(),
+                tools: 2,
+                resources: 0,
+                prompts: 0,
+                error: None,
+            }]),
+            &tx,
+        );
+        assert_eq!(app.picker.as_ref().unwrap().items.len(), 1);
+        assert!(!app.picker.as_ref().unwrap().loading);
+
+        app.picker = None;
+        assert!(app.handle_prompt_command("/todos", &tx));
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Todos)
+        ));
+        app.handle_event(
+            Event::Todos(vec![eix_core::TodoItem {
+                content: "write tests".into(),
+                status: "in_progress".into(),
+            }]),
+            &tx,
+        );
+        assert_eq!(app.picker.as_ref().unwrap().items.len(), 1);
+        assert!(!app.picker.as_ref().unwrap().loading);
     }
 
     #[test]
