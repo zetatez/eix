@@ -880,7 +880,7 @@ enum FocusAfterMove {
 impl PaneLayout {
     fn label(self) -> &'static str {
         match self {
-            Self::Grid => "grid",
+            Self::Grid => "layout_grid",
             Self::Horizontal => "horizontal",
             Self::Tabby => "tabby",
             Self::Fibonacci => "fibonacci",
@@ -10095,6 +10095,7 @@ mod tests {
             );
             assert_eq!(app.layout, expected, "leader {leader}");
         }
+        assert_eq!(app.status, "layout: layout_grid");
     }
 
     #[test]
