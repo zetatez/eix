@@ -139,12 +139,12 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 未命名寄存器保存最近一次 yank/delete；`p`/`P` 区分字符与整行；寄存器为空时读取
   系统剪贴板（鼠标选中的转录文本可直接粘贴），且外部粘贴不覆盖内部寄存器。
 - `<Space>` 是 leader（输入框 normal 与转录区共用同一映射）：`s` sessions、`n` 新建 session 并开新 pane、
-  `o` 打开 session picker（已有 session 放进新 pane）、`C`/`q` 关闭 pane、`f` 文件、
-  `w` worktree、`b` 分支、`c` ledger、`h` 历史、`p` 进程、`r` 审批、
+  `o` 打开 session picker（已有 session 放进新 pane）、`c`/`q` 关闭 pane、`f` 文件、
+  `w` worktree、`b` 分支、`C` ledger、`h` 历史、`p` 进程、`r` 审批、
   `N` 新建、`W` 新建 worktree、`F` fork、`x` 取消、`A` attention、`i` 聚焦输入框、
-  `Q` 退出、`a`/`:` 命令面板、`?` 帮助。单字母完全留给 vim；转录区裸字母不触发动作，
-  仅保留 `i`（聚焦输入框）、`j/k`/`g/G` 等导航和 `:`/`?` 等标点入口；布局动作同样走
-  leader（`V`/`T`/`R`/`L`）。
+  `a`/`:` 命令面板、`?` 帮助。单字母基本留给 vim；转录区裸字母不触发动作，仅保留
+  `i`（聚焦输入框）、`Z`（退出）、`j/k`/`g/G` 等导航和 `:`/`?` 等标点入口；布局动作
+  同样走 leader（`v`/`t`/`r`/`l`）。
 - `Shift+,` / `Shift+.`（即 `<` / `>`）在转录区和输入框 normal 模式线性切换上一个 / 下一个 pane。
 - `Ctrl-J`/`Ctrl-K` 上下翻转录历史（`j`/`k`、`3j`、`dj`、`↑`/`↓` 是草稿内行移动）。
 - normal 模式下 `Tab` 在 Build / Plan 之间切换：`None` 表示默认 Build，`Some("plan")`
@@ -180,7 +180,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   Build/Plan 固定 5 列宽，切换时状态和模型不位移。不再显示 `eix` 品牌；拒绝理由会临时占用这一行，
   错误则显示在居中的浮动对话框里，按 `Esc` / `Enter` / `q` 关闭，输入框顶部保持 Build/Plan 与 cwd 信息。
 - 输入框下方保留一条 Vim 风格 statusline：左侧是彩色的单字母模式徽标（`N` / `I` / `V` / `VL`）、
-  当前 session 名和最近状态；右侧是模型、多 pane 时的 `当前/总数`、排队数和 attention 数。
+  当前 session 名和最近状态；中间显示后台 attention 提醒；右侧是模型、多 pane 时的
+  `当前/总数`、排队数和 attention 数。
 - 输入框底边保持普通边框，不再挂模式徽标，也不堆叠快捷键提示。
 - 正文左侧留 1 格内边距；不再显示 `❯` 输入槽和占位文案，空输入时只保留光标。
 - 视觉选区逐字符判断并反色渲染；终端光标跟随实际字符位置。
@@ -212,7 +213,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首占 55% 高度）、`tabby`（顶部 tab，
   只渲染当前 session）、`fibonacci`（tab + 左/上/右/下循环切分的螺旋分屏）。用 leader
   `<Space>v/t/r` 切换，`<Space>l` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session，
-  在 `tabby` 下即切换到第 N 个 tab。
+  在 `tabby` 下即切换到第 N 个 tab。TUI 启动时请求 kitty 键盘协议（CSI-u），否则传统终端
+  会把 `Ctrl-2`/`Ctrl-3` 等编码成 NUL/Esc；不支持该协议时用 `Alt-1` … `Alt-9`。
 - 活跃队列：`views` 顺序即队列顺序，位置 0 是 pane 1，也是当前工作槽位。turn 完成、等待
   审批/输入时把对应 session 移到第二个位置（position 1，即 pane 2），避免替换 pane 1 正在
   编辑的内容；提交流程（包括排队和 `!` shell）把它移到队尾。重排时保持聚焦槽位，因此发送后
@@ -220,7 +222,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   第二个位置，demotion 则留在原槽位等待下一个 session。
 - 不再有独立顶部 header 行：Build/Plan、session 状态、模型和 cwd 作为输入框标题行，直接压在
   prompt 网格上方（cwd 用 `~` 缩写，模型省略 provider 前缀）；输入框下方保留一行 statusline，
-  左侧显示模式、session 和最近状态，右侧显示模型与队列/attention 信息。
+  左侧显示模式、session 和最近状态，中间显示 attention 提醒，右侧显示模型与队列/attention 信息。
 - 焦点：`<C-w>h/j/k/l`（normal 模式与转录区一致）、`<C-w>w` 循环；转录区按 `i`、`Enter` 或 `<Space>i` 聚焦输入并进入 insert。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
@@ -247,7 +249,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
 | `<Space>l` | 循环 grid / horizontal / tabby / fibonacci |
 | `<Space>R` | 跨 session 审批收件箱 |
-| `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab） |
+| `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab；需 kitty 键盘协议） |
+| `Alt-1…9` | 同上；终端无法区分 `Ctrl-1…9` 时使用 |
 
 **`eix nvim` 前端（`:Eix` palette）**
 
@@ -414,16 +417,19 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 
 ```
 ⚠ run_command: cargo test                      [shell]
-▸ 1. Approve  ★ recommended
-  2. Review diff
-  3. Open file
-  4. Deny
-  5. Deny with reason…
-j/k or C-n/C-p select · Enter confirm · y/n · x cancel
+- [x] Approve  ★ recommended
+- [ ] Review diff
+- [ ] Open file
+- [ ] Deny
+- [ ] Deny with reason…
+Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 ```
 
-- 卡片把动作排成选项列表，首个选项是推荐项；`j`/`k`（或 `C-n`/`C-p`）移动、
-  `Enter` 执行、`1-9` 直选。`y`/`n` 仍是批准/拒绝快捷方式，`d`/`e`/`o`/`r` 也保留。
+- 卡片把动作排成 Markdown checkbox 列表（`- [ ]` / `- [x]`），`[x]` 是当前高亮项（单选），
+  首个选项是推荐项；`Ctrl-J`/`Ctrl-K`（或 `j`/`k`、`C-n`/`C-p`）移动、
+  `Enter` 执行、`1-9` 直选。卡片键盘在 prompt/transcript 聚焦以及 `tabby` 布局下都优先路由给
+  卡片。`y`/`n` 仍是批准/拒绝快捷方式，
+  `d`/`e`/`o`/`r` 也保留。
   shell 审批显示完整命令行（按卡片宽度换行），而不是 daemon 摘要里的截断版本。
 - `e`：把 staged 的新内容写到临时文件，交给 `$VISUAL`/`$EDITOR`，保存后走
   `patch.revise` 重算 diff/hunks 再审批（工作区在此前不动）。
@@ -447,7 +453,9 @@ j/k or C-n/C-p select · Enter confirm · y/n · x cancel
 破坏性选择或无法推断的偏好。daemon 追加 `input_required` 事件、广播 `input.required`、
 把 session 切到 `awaiting_input` 并阻塞 turn；TUI 在 pane 底部显示同样风格的选项卡片。
 
-- 按键：`j`/`k`（或 `C-n`/`C-p`）移动，`Enter` 确认，`1-6` 直选；`x` 取消整个 turn。
+- 选项按 Markdown checkbox 渲染（`- [ ]` / `- [x]`，`[x]` 为当前高亮项）；
+  按键：`Ctrl-J`/`Ctrl-K`（或 `j`/`k`、`C-n`/`C-p`）移动，`Enter` 确认，`1-9` 直选；
+  `x` 取消整个 turn。pane 太矮时列表随光标滚动，保证高亮项可见。
 - 用户选择后 daemon 追加 `input_answered`，把选项 label（有 description 时附在 `—` 后）
   作为 tool result 回给模型，并把状态切回 `running`。
 - 协议：`input.respond {session_id, input_id?, option_index}`；空 `input_id` 表示当前问题。
@@ -549,7 +557,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 ## 13. 通知
 
-- 终端：OSC 9 / OSC 777、bell、标题栏 `[⚠2] eix: auth`。
+- TUI：后台 attention 提醒显示在底部状态栏中间（约 8 秒），可选终端 bell；不弹桌面通知。
 - 桌面：`notify-send`（dunst），可通过配置替换命令。
 - dwmblocks：`agent status --json` 输出 `{running, approval, error}`。
 - 仅在状态跃迁时通知；当前聚焦 session 不通知；冷却时间可配。
@@ -612,8 +620,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `session.attention`，TUI 标记边框/侧栏并支持 `<Space>A` 跳到下一个；重新 attach 会从事件日志
 > 恢复未完成的审批卡片。外部通知也已接入：`[notifications] command` 由 daemon 在 attention
 > 时用 `sh -c` 执行并传入 `EIX_SESSION_ID` / `EIX_SESSION_NAME` / `EIX_SESSION_CWD` /
-> `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；`eix tui` 可用 `bell = true` 在后台
-> pane 需要 attention 时响终端铃。
+> `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；TUI 内提醒显示在底部状态栏中间，
+> 可用 `bell = true` 额外响终端铃。
 > 输入框补齐（2026-10-18）：`@`（词首）打开 `picker.query` 的 files provider，选中后以
 > `@<相对路径>` 插入；编辑变化按 200ms tick 镜像到 `draft.set`，切 session 时 `draft.get` 回填。
 > 独立前端补上 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick [KIND]` 与 `:Eix doctor`。

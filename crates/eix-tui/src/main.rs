@@ -66,7 +66,6 @@ async fn main() -> Result<()> {
                 cli.config_path.clone(),
                 session,
                 config.notifications.bell,
-                config.notifications.osc,
             )
             .await
         }

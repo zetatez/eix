@@ -59,7 +59,6 @@ retry_max_secs = 30           # 单次等待上限（也限制 Retry-After）
 [notifications]
 # command = "notify-send eix \"$EIX_SESSION_NAME $EIX_STATUS\""
 bell = false
-osc = true            # OSC 9/777 桌面通知 + 终端标题（不支持的终端会忽略）
 cooldown_secs = 10
 
 [context]
@@ -177,12 +176,12 @@ extensions = ["py"]
 当前限制：`write_file` 在 `ask` 策略下先 stage 到 shadow workspace、不阻塞 turn，读取
 （以及后续写入）看到的是“真实工作区 + staged”合并视图；`run_command` 的写操作仍在审批处
 阻塞（shell 无法 stage），白名单内的只读命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
-（见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮和
-`a` 跳转提示，外部通知命令（dwm/tmux）已接入（见 `[notifications]`）；输入框使用内置的
-Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：顶部左侧显示
+（见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮、`a` 跳转提示，
+并在底部状态栏中间显示提醒（不弹桌面通知）；外部通知命令（dwm/tmux）已接入
+（见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：顶部左侧显示
 `Build · ○ deepseek-v4-flash`（当前模式 · 状态图标 + 模型，Plan 为黄色），右侧对齐 cwd、git 分支和工作树；
 正文左侧留 1 格内边距，底边保持普通边框；输入框下方是一行 statusline，左侧显示 `N` / `I` / `V` / `VL`
-模式徽标、session 名和最近状态，右侧显示模型、pane 位置、排队数和 attention。
+模式徽标、session 名和最近状态，中间显示后台 attention 提醒（约 8 秒），右侧显示模型、pane 位置、排队数和 attention。
 
 ## TUI（v1）
 
@@ -202,11 +201,12 @@ Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板�
 session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；
 给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。
 `Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session；在 `tabby` 布局下就是切换到第 N 个 tab
-（输入框内也可用）。
+（输入框内也可用）。终端需要支持 kitty 键盘协议才能完整区分这些组合键；不支持时可用
+`Alt-1` … `Alt-9`。
 
 历史 session 不再占用左侧栏：按 `<Space>s` 打开浮动 picker，输入即模糊搜索，`Enter` 选择、
 `Esc` 关闭。输入框标题行直接显示 Build/Plan、session 状态和模型，cwd 右对齐并以 `~` 缩写，
-模型省略 provider 前缀；输入框下方保留一行 statusline 展示模式、session、最近状态和队列信息。
+模型省略 provider 前缀；输入框下方保留一行 statusline 展示模式、session、最近状态、居中提醒和队列信息。
 
 转录区按对话渲染：用户消息和 agent 输出都使用普通文本（左侧 2 空格缩进，不加角色前缀），不再使用气泡；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
@@ -247,18 +247,19 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `Shift+,` / `Shift+.` | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式） |
 | `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
 | `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用） |
+| `Alt-1` … `Alt-9` | 同上；用于终端无法区分 `Ctrl-1…9` 的情况 |
 | `Tab` / `S-Tab` | 聚焦 pane 切到下一个 / 上一个 session（转录区） |
 | `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；有待审批时卡片上的 `n` 仍是 deny |
 | `<Space>W` | 新建 session，同时在 `.worktrees/<name>` 建 git worktree |
 | `y` / `n` | 批准 / 拒绝聚焦 pane 的待审批工具调用（卡片快捷方式） |
 | `a` | `Always allow`：批准并为此 session 记住同类调用（卡片快捷方式） |
-| `j`/`k` · `Enter` | 卡片是选项列表：`j`/`k`（或 `C-n`/`C-p`）移动，`Enter` 执行高亮项，`1-9` 直接执行；首个选项是推荐项 |
-| 提问卡片 | 模型用 `ask_user` 提问时显示选项：`j`/`k` 选择、`Enter` 确认（`1-6` 直接选）；无头场景用 `eix answer N` |
+| `Ctrl-J` / `Ctrl-K` · `Enter` | 审批/提问卡片是 Markdown checkbox 列表（`- [ ]` / `- [x]`）：`Ctrl-J`/`Ctrl-K`（或 `j`/`k`、`C-n`/`C-p`）移动，`Enter` 执行高亮项，`1-9` 直接选；首个选项是推荐项 |
+| 提问卡片 | 模型用 `ask_user` 提问时显示选项：`Ctrl-J`/`Ctrl-K` 移动、`Enter` 确认（`1-9` 直接选）；无头场景用 `eix answer N` |
 | `e` / `o` | 编辑 staged 的新内容（改完重新 stage）/ 在 `$EDITOR` 打开真实文件 |
 | `r` | 输入理由并拒绝（Enter 发送，Esc 取消） |
 | `<Space>R` | 跨 session 审批 inbox（`j/k` 选择、`Enter` 跳转、`y/n` 处理、`Esc` 关闭） |
 | `d` | 全屏审阅待审批写入的 side-by-side diff（左旧右新、语法高亮）；有 hunk 时 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/全不选、`y` 应用选中、`n` 拒绝 |
-| `<Space>c` | context ledger：`j/k` 移动、`o` 展开、`p` pin、`d` drop/恢复、`m` 标记、`s` 压缩（单条或 mark 到光标的范围）、`f` fork、`w` rewind 并回滚工作区、`Esc` 关闭 |
+| `<Space>C` | context ledger：`j/k` 移动、`o` 展开、`p` pin、`d` drop/恢复、`m` 标记、`s` 压缩（单条或 mark 到光标的范围）、`f` fork、`w` rewind 并回滚工作区、`Esc` 关闭 |
 | `<Space>p` | 后台进程：`j/k` 选择、`x` kill、`r` 刷新、`PgUp`/`PgDn` 滚动输出、`Esc` 关闭 |
 | `<Space>F` | fork 当前 session；在 git 仓库里自动建 worktree，仓库外共享工作区 |
 | `#` | 全文搜索历史消息：输入查询回车执行，`↑/↓` 选择，再回车打开对应 session |
@@ -266,7 +267,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `j` / `k` / `PgUp` / `PgDn` | 转录区聚焦时滚动；输入框 normal 模式下 `j`/`k` 是草稿内行移动，`Ctrl-J`/`Ctrl-K` 浏览已提交的 prompt 历史 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
 | `?` / `F1` | 帮助（F1 任意位置可用）；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭 |
-| `<Space>Q` / `Ctrl-C` | 退出（输入框内 `Ctrl-C` 是 vim 中断：回到 normal / 离开 insert，不会退出） |
+| `Z` / `Ctrl-C` | 退出（normal 模式下的 `Shift+Z`；输入框内 `Ctrl-C` 是 vim 中断：回到 normal / 离开 insert，不会退出） |
 
 ### prompt 命令
 
@@ -439,7 +440,7 @@ branches / context 由 daemon 的 `picker.query` 提供，其余（sessions、�
 常驻，只通过这个浮动 picker 打开（`<Space>s`）。
 
 输入框是自研的 Vim 风格编辑器（不再内嵌 Neovim 进程，输入零往返延迟）。外框使用透明背景的
-圆角边框，跟随主题的 `background`（未设置时用终端背景），顶部显示 `Build · ○ deepseek-v4-flash`（idle 为静态圆点，running 为动画 spinner），右侧对齐 cwd、git 分支/工作树和图片数；底边保持普通边框，输入框下方一行 statusline 显示彩色单字母模式徽标、session 名和最近状态，右侧显示模型、pane 位置、排队数和 attention；
+圆角边框，跟随主题的 `background`（未设置时用终端背景），顶部显示 `Build · ○ deepseek-v4-flash`（idle 为静态圆点，running 为动画 spinner），右侧对齐 cwd、git 分支/工作树和图片数；底边保持普通边框，输入框下方一行 statusline 显示彩色单字母模式徽标、session 名和最近状态，中间显示后台 attention 提醒（约 8 秒），右侧显示模型、pane 位置、排队数和 attention；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
@@ -456,13 +457,13 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
 
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：`<Space>s` session
 picker、`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
-（`<Space>C` / `<Space>q` 关闭当前 pane）、`<Space>f` 文件、
-`<Space>w`/`b` worktree/分支、`<Space>c` ledger、`<Space>h` 历史、
+（`<Space>c` / `<Space>q` 关闭当前 pane）、`<Space>f` 文件、
+`<Space>w`/`b` worktree/分支、`<Space>C` ledger、`<Space>h` 历史、
 `<Space>p` 进程、`<Space>R` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
 `<Space>F` fork、`<Space>x` 取消、`<Space>A` attention、`<Space>i` 聚焦输入框、
-`<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>Q` 退出、`<Space>a` 或
-`<Space>:` 命令面板、`<Space>?` 帮助。裸字母
-`o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
+`<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>a` 或
+`<Space>:` 命令面板、`<Space>?` 帮助。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
+除此之外，裸字母 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
 insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
 和 `@`（文件 picker）。所有 picker / 历史搜索都支持 `Ctrl-J`/`Ctrl-K` 或
 `Ctrl-N`/`Ctrl-P`（以及 `↑`/`↓`）上下选择。normal 模式下 `Esc Esc` 先中断运行中的 turn；
@@ -473,8 +474,10 @@ insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`
 （`Apply change` / `Review hunks` / `Open file` / `Edit staged content` / `Reject` /
 `Reject with reason…`，第一个是推荐项）并显示 side-by-side diff（宽 pane 左旧右新、语法高亮，
 窄 pane 回退 unified；最多 8 行，超出标 `… diff truncated`）。卡片本身是交互式 picker：
-`j/k` 或 `C-n/C-p` 移动、`Enter` 执行，
-`1-9` 直接执行；`y`/`n` 仍是批准/拒绝的快捷方式。按 `d` 可全屏审阅：
+选项按 Markdown checklist 渲染（`- [ ]` / `- [x]`），
+`Ctrl-J`/`Ctrl-K`（或 `j/k`、`C-n/C-p`）移动、`Enter` 执行，`1-9` 直接执行；`[x]` 表示当前
+高亮项（单选），不是多选。卡片键在 prompt/transcript 聚焦以及 `tabby` 布局下都优先给卡片。
+`y`/`n` 仍是批准/拒绝的快捷方式。按 `d` 可全屏审阅：
 `j/k` 滚动，`[`/`]` 跳 hunk，`Space` 勾选，`a` 全选/全不选，`y` 应用选中，`n` 拒绝。
 未勾选任何 hunk 时 `y` 会提示先选择。`e` 把 staged 内容写进临时文件交给
 `$EDITOR`，保存后通过 `patch.revise` 更新 diff 再审批；`o` 打开工作区里的真实文件；
@@ -483,8 +486,8 @@ insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`
 仍走阻塞式审批卡片，白名单内的只读命令不会打断 turn。session 栏显示 `⚠`；也可以从命令行用
 `eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk，
 `eix deny --reason "..."` 会记录理由）。模型调用 `ask_user` 时 pane 底部出现同样的选项
-卡片：`j/k` 或 `C-n/C-p` 选择、`Enter` 确认、`1-6` 直接选，第一个选项标为推荐；
-无头场景用 `eix answer N`。`A` 打开跨 session 的审批 inbox，`Enter` 跳到
+卡片：选项同样按 Markdown checkbox 渲染，`Ctrl-J`/`Ctrl-K`（或 `j/k`）移动、`Enter` 确认、
+`1-9` 直接选，第一个选项标为推荐；无头场景用 `eix answer N`。`A` 打开跨 session 的审批 inbox，`Enter` 跳到
 对应 pane，`y/n` 直接处理；`eix approvals --json` 供脚本使用。后台 pane 有
 pending 审批/补丁或进入 `error` 时会标 `!`、边框和侧栏变黄/红，顶部显示 attention 计数，
 按 `<Space>A` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的卡片，输入框
@@ -720,7 +723,7 @@ workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具�
 
 ### Context ledger
 
-每次请求的上下文由 daemon 从事件日志重建，并按 sector 记账（`eix context` 或 TUI 里按 `<Space>c`）：
+每次请求的上下文由 daemon 从事件日志重建，并按 sector 记账（`eix context` 或 TUI 里按 `<Space>C`）：
 
 | sector | 内容 | 预算 |
 | --- | --- | --- |
@@ -763,7 +766,8 @@ workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具�
 
 ### 外部通知
 
-`[notifications]` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你：
+`[notifications]` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你。
+TUI 内的提醒固定显示在底部状态栏中间，不会弹桌面通知：
 
 | 字段 | 默认 | 行为 |
 | --- | --- | --- |
@@ -915,7 +919,7 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] bubblewrap 沙箱（`run_command` 默认隔离，`[tools] sandbox` 可配，写入只限 workspace）
 - [x] staged shadow workspace（propose → stage → apply、合并读视图、`patch.apply` / `patch.reject`、跨重启恢复）
 - [x] 执行前快照（write_file 单文件 / run_command 整个 workspace，`snapshot` 事件，保留 20 份）
-- [x] context ledger（sector 预算 / token 记账、AGENTS.md + workspace 注入、drop / pin / compact、TUI `c` 与 `eix context`）
+- [x] context ledger（sector 预算 / token 记账、AGENTS.md + workspace 注入、drop / pin / compact、TUI `C` 与 `eix context`）
 - [x] process view（daemon 托管后台进程、`start_command` / `process_output`、流式输出与日志、TUI `P`、`eix ps/tail/kill`）
 - [x] fork / rewind（按消息裁剪历史复制到新 session；`eix rewind` / ledger `w` 还会按快照倒序回滚工作区，并报告无法恢复的改动）
 - [x] git worktree（`--worktree` / TUI `N` / repo 内 fork 自动建 `.worktrees/<name>`、`eix worktree list|remove`）
@@ -929,7 +933,7 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] 审批卡片改为选项列表（`j/k` / `C-n/C-p` 选择、`Enter` 执行、`1-9` 直选、首项推荐；`y/n` 快捷方式保留）
 - [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
 - [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）
-- [x] 客户端通知（`bell` + OSC 9/777 + 终端标题，`[notifications] osc`）
+- [x] 客户端通知（后台 attention 在底部状态栏居中提示，可选 `bell`，不弹桌面通知）
 - [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）与 provider 上下行可逆脱敏
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
 - [x] 按 session 权限级别（`read-only` / `workspace-write` / `full`；`session.permission` 支持临时升级并记录事件）

@@ -24,7 +24,10 @@ use std::time::Duration;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use crossterm::cursor::{Hide, Show};
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -47,7 +50,6 @@ pub async fn run(
     config: Option<PathBuf>,
     initial_session: Option<String>,
     bell: bool,
-    osc: bool,
 ) -> Result<()> {
     if !io::stdout().is_terminal() {
         bail!("`eix tui` needs a terminal (stdout is not a tty)");
@@ -56,7 +58,6 @@ pub async fn run(
     let mut terminal = init_terminal()?;
     let mut app = App::new(initial_session);
     app.bell = bell;
-    app.osc = osc;
     let loaded = eix_core::Config::load(config.as_deref()).unwrap_or_default();
     app.theme = Theme::from_config(&loaded.theme);
     app.theme_config = loaded.theme.clone();
@@ -112,21 +113,11 @@ pub async fn run(
             maybe = ev_rx.recv() => match maybe {
                 Some(event) => {
                     app.handle_event(event, &cmd_tx);
+                    // Attention alerts render in the status bar; no desktop
+                    // notification popups or terminal-title changes.
                     if app.take_ring() {
-                        let message = app
-                            .alert_message()
-                            .unwrap_or_else(|| "attention needed".to_string());
                         let mut stdout = io::stdout();
-                        if app.bell {
-                            let _ = stdout.write_all(b"\x07");
-                        }
-                        if app.osc {
-                            // OSC 9 (iTerm/kitty), OSC 777 (rxvt-unicode) and
-                            // a title update; unsupported terminals ignore them.
-                            let _ = write!(stdout, "\x1b]9;eix: {message}\x07");
-                            let _ = write!(stdout, "\x1b]777;notify;eix;{message}\x07");
-                            let _ = write!(stdout, "\x1b]2;eix · {message}\x07");
-                        }
+                        let _ = stdout.write_all(b"\x07");
                         let _ = stdout.flush();
                     }
                 }
@@ -237,8 +228,19 @@ fn init_terminal() -> Result<Terminal<Backend>> {
     install_panic_hook();
     enable_raw_mode().context("cannot enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture, Hide)
-        .context("cannot enter alternate screen")?;
+    // Ask the terminal to disambiguate modified keys (CSI-u). Without this,
+    // terminals encode Ctrl-2/Ctrl-3/... as NUL/Esc/control characters, so
+    // Ctrl-1..9 cannot be told apart from existing shortcuts.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        Hide,
+        // The alternate screen has its own keyboard-mode stack, so push only
+        // after switching screens.
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .context("cannot enter alternate screen")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
     terminal.clear().ok();
     Ok(terminal)
@@ -248,6 +250,7 @@ fn restore_terminal(terminal: &mut Terminal<Backend>) -> Result<()> {
     disable_raw_mode().ok();
     execute!(
         terminal.backend_mut(),
+        PopKeyboardEnhancementFlags,
         LeaveAlternateScreen,
         DisableMouseCapture,
         Show
@@ -265,6 +268,7 @@ fn install_panic_hook() {
             let _ = disable_raw_mode();
             let _ = execute!(
                 io::stdout(),
+                PopKeyboardEnhancementFlags,
                 LeaveAlternateScreen,
                 DisableMouseCapture,
                 Show

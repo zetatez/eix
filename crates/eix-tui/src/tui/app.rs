@@ -44,6 +44,9 @@ enum Focus {
 /// Two `Esc` presses within this window leave the prompt for the transcript.
 const ESC_WINDOW: Duration = Duration::from_millis(500);
 
+/// Background-attention alerts stay centered in the status bar this long.
+const ALERT_DISPLAY: Duration = Duration::from_secs(8);
+
 /// Picker value for "no preset" (keep the terminal/default palette).
 const THEME_DEFAULT_VALUE: &str = "@default";
 
@@ -696,7 +699,7 @@ struct DiffView {
     width: usize,
 }
 
-/// Full-screen context ledger, opened with `c` from the transcript.
+/// Full-screen context ledger, opened with `C` from the transcript.
 struct LedgerView {
     session_id: String,
     result: ContextLedgerResult,
@@ -976,8 +979,6 @@ pub struct App {
     git_checked: Option<Instant>,
     /// Ring the terminal bell when a background pane needs attention.
     pub bell: bool,
-    /// Emit OSC 9/777 notifications and update the title on attention.
-    pub osc: bool,
     /// New-session defaults from cli.json.
     pub default_model: Option<String>,
     pub default_agent: Option<String>,
@@ -986,6 +987,8 @@ pub struct App {
     ring: bool,
     /// Text for the next alert (session name + status).
     last_alert: Option<String>,
+    /// When the status-bar alert should disappear.
+    alert_at: Option<Instant>,
     /// Session whose daemon draft is being loaded into a fresh buffer.
     draft_loading: Option<String>,
     /// Last draft submitted from the prompt (session id, text), kept so a
@@ -1086,12 +1089,12 @@ impl App {
             git_branch: None,
             git_checked: None,
             bell: false,
-            osc: false,
             default_model: None,
             default_agent: None,
             default_permission: None,
             ring: false,
             last_alert: None,
+            alert_at: None,
             draft_loading: None,
             pending_draft: None,
             input_session: None,
@@ -1250,11 +1253,6 @@ impl App {
         std::mem::take(&mut self.ring)
     }
 
-    /// Text for the most recent background alert.
-    pub fn alert_message(&self) -> Option<String> {
-        self.last_alert.clone()
-    }
-
     /// True once after an external editor ran, so the frame is fully repainted.
     pub fn take_force_clear(&mut self) -> bool {
         std::mem::take(&mut self.force_clear)
@@ -1390,6 +1388,7 @@ impl App {
     /// cursor. The wheel scrolls the pane under the cursor.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
         self.pending_leader = false;
+        self.pending_window = false;
         let (x, y) = (mouse.column, mouse.row);
         let pane = self.pane_areas.iter().position(|rect| {
             x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
@@ -2253,7 +2252,10 @@ impl App {
                             .map(|view| {
                                 format!("{} · {}", view.session.name, params.status.as_str())
                             });
-                        if self.bell || self.osc {
+                        if self.last_alert.is_some() {
+                            self.alert_at = Some(Instant::now());
+                        }
+                        if self.bell {
                             self.ring = true;
                         }
                     }
@@ -2857,6 +2859,17 @@ impl App {
             return;
         }
 
+        // A blocking approval/question card owns its navigation keys no matter
+        // whether the prompt or the transcript has focus. Other overlays above
+        // keep priority.
+        if self.diff_view.is_none()
+            && !self.pending_window
+            && !self.pending_leader
+            && self.handle_card_key(key, tx)
+        {
+            return;
+        }
+
         // Queue-position shortcuts work from both the prompt and transcript.
         // Ctrl-1..9 needs a terminal with keyboard disambiguation (kitty
         // protocol); Alt-1..9 is the fallback for terminals that fold those
@@ -2878,10 +2891,109 @@ impl App {
         }
     }
 
+    /// TUI actions shared by transcript focus and the prompt's normal mode.
+    /// The prompt keeps its vim editing keys (`j`/`k`, `Tab`, `Enter`, ...);
+    /// only actions the editor does not own are handled here.
+    fn handle_shared_normal_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) -> bool {
+        if self.pending_leader {
+            let available = self.focused_approval().is_none() && self.focused_input().is_none();
+            self.pending_leader = false;
+            if available {
+                if let KeyCode::Char(ch) = key.code {
+                    if let Some(action) = leader_action(ch) {
+                        self.run_action(action, tx);
+                    }
+                }
+            }
+            return true;
+        }
+        if key.code == KeyCode::Char(' ')
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+        {
+            // A blocking card owns the keyboard; never start a hidden leader
+            // under it, and never let the editor start a second one either.
+            if self.focused_approval().is_none() && self.focused_input().is_none() {
+                self.pending_leader = true;
+                self.status = "leader: s/f/w/b · n new · o pane · v/t/r/l layout · R approvals · C ledger · c/q close · a commands · i input · ? help · Z quit · Esc cancel"
+                    .into();
+            }
+            return true;
+        }
+        if self.focused_approval().is_none() && self.focused_input().is_none() {
+            if let Some(action) = self.keybinds.action(key) {
+                self.run_key_action(action, tx);
+                return true;
+            }
+        }
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('w') => {
+                    self.pending_window = true;
+                    self.status =
+                        "window: h/j/k/l focus · v split · c close · w cycle · Esc cancel".into();
+                    return true;
+                }
+                KeyCode::Char('d') => {
+                    self.scroll_focused(10);
+                    return true;
+                }
+                KeyCode::Char('u') => {
+                    self.scroll_focused(-10);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        match key.code {
+            KeyCode::Char('?') => {
+                self.open_help();
+                true
+            }
+            KeyCode::Char('#') => {
+                self.search_view = Some(SearchView::new());
+                self.status =
+                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
+                true
+            }
+            KeyCode::PageDown => {
+                self.scroll_focused(10);
+                true
+            }
+            KeyCode::PageUp => {
+                self.scroll_focused(-10);
+                true
+            }
+            KeyCode::BackTab => {
+                self.cycle_session(-1, tx);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn handle_input_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
-        // The prompt's editor owns its own leader; never leak a transcript
-        // leader into typed input.
-        self.pending_leader = false;
+        // Insert/visual keys belong to the editor, so a pane leader must not
+        // leak into typed input. Normal mode shares the transcript leader.
+        if self.input.mode() != Mode::Normal {
+            self.pending_leader = false;
+        }
+        if self.pending_window {
+            self.pending_window = false;
+            if self.input.mode() == Mode::Normal {
+                self.handle_window_key(key, tx);
+                return;
+            }
+        }
+        // In normal mode the prompt behaves like a focused pane for the TUI
+        // actions the editor does not own. A half-typed vim prefix keeps the
+        // key for the editor instead.
+        if self.input.mode() == Mode::Normal
+            && self.input.normal_idle()
+            && self.handle_shared_normal_key(key, tx)
+        {
+            return;
+        }
         // Cross-mode session picker. It is a TUI binding, so it works in every
         // editor mode (and does not consume a normal-mode letter).
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
@@ -3123,8 +3235,126 @@ impl App {
     fn focus_input(&mut self) {
         self.focus = Focus::Input;
         self.pending_leader = false;
+        self.pending_window = false;
         self.esc_at = None;
         self.input.enter_insert();
+    }
+
+    /// Route keys owned by a blocking approval or question card. Returns true
+    /// when the card consumed the key, so both prompt and transcript focus
+    /// behave the same in every layout.
+    fn handle_card_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) -> bool {
+        if self.focused_input().is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('n') | KeyCode::Char('j') => {
+                        self.move_input_cursor(1);
+                        return true;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('k') => {
+                        self.move_input_cursor(-1);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.move_input_cursor(1);
+                    return true;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.move_input_cursor(-1);
+                    return true;
+                }
+                KeyCode::Enter => {
+                    if let Some(cursor) = self.focused_input().map(|pending| pending.cursor) {
+                        self.respond_input(cursor, tx);
+                    }
+                    return true;
+                }
+                KeyCode::Char(ch @ '1'..='9') => {
+                    self.respond_input(ch as usize - '1' as usize, tx);
+                    return true;
+                }
+                KeyCode::Char('x') => {
+                    self.cancel(tx);
+                    return true;
+                }
+                // Esc dismisses nothing: the question still blocks the turn,
+                // and leaving focus in place avoids a dead, untouched card.
+                KeyCode::Esc => return true,
+                _ => {}
+            }
+        }
+        if self.focused_approval().is_some() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('n') | KeyCode::Char('j') => {
+                        self.move_approval_cursor(1);
+                        return true;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('k') => {
+                        self.move_approval_cursor(-1);
+                        return true;
+                    }
+                    _ => {}
+                }
+            }
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.move_approval_cursor(1);
+                    return true;
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.move_approval_cursor(-1);
+                    return true;
+                }
+                KeyCode::Enter => {
+                    self.activate_approval(None, tx);
+                    return true;
+                }
+                KeyCode::Char(ch @ '1'..='9') => {
+                    self.activate_approval(Some(ch as usize - '1' as usize), tx);
+                    return true;
+                }
+                KeyCode::Char('y') => {
+                    self.respond_approval(ApprovalDecision::Approve, tx);
+                    return true;
+                }
+                KeyCode::Char('a') => {
+                    self.respond_approval(ApprovalDecision::Always, tx);
+                    return true;
+                }
+                KeyCode::Char('n') => {
+                    self.respond_approval(ApprovalDecision::Deny, tx);
+                    return true;
+                }
+                KeyCode::Char('d') => {
+                    self.open_diff_view();
+                    return true;
+                }
+                KeyCode::Char('e') => {
+                    self.edit_proposed(tx);
+                    return true;
+                }
+                KeyCode::Char('o') => {
+                    self.open_approval_file();
+                    return true;
+                }
+                KeyCode::Char('r') => {
+                    self.start_reason_prompt();
+                    return true;
+                }
+                KeyCode::Char('x') => {
+                    self.cancel(tx);
+                    return true;
+                }
+                KeyCode::Esc => return true,
+                _ => {}
+            }
+        }
+        false
     }
 
     fn handle_transcript_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
@@ -3137,177 +3367,39 @@ impl App {
             self.handle_window_key(key, tx);
             return;
         }
-        if self.pending_leader {
-            let available = self.focused_approval().is_none() && self.focused_input().is_none();
-            self.pending_leader = false;
-            if available {
-                if let KeyCode::Char(ch) = key.code {
-                    if let Some(action) = leader_action(ch) {
-                        self.run_action(action, tx);
-                    }
-                }
-            }
+        if self.handle_shared_normal_key(key, tx) {
             return;
-        }
-        if self.focused_approval().is_none() && self.focused_input().is_none() {
-            if key.code == KeyCode::Char(' ')
-                && !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
-                self.pending_leader = true;
-                self.status = "leader: s/f/w/b · n new · o pane · v/t/r/l layout · R approvals · C/q close · a commands · i input · Q quit · ? help · Esc cancel"
-                    .into();
-                return;
-            }
-            if let Some(action) = self.keybinds.action(key) {
-                self.run_key_action(action, tx);
-                return;
-            }
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
             self.open_picker(PickerKind::Sessions, tx);
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('w')) {
-            self.pending_window = true;
-            self.status = "window: h/j/k/l focus · v split · c close · w cycle · Esc cancel".into();
+        // Direct test callers may reach the transcript handler without going
+        // through `handle_key`; keep card navigation working there too.
+        if self.handle_card_key(key, tx) {
             return;
-        }
-        // While the focused session is blocked on an `ask_user` question, the
-        // card owns j/k, Ctrl-N/Ctrl-P and Enter.
-        if self.focused_input().is_some() {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Char('n') | KeyCode::Char('j') => {
-                        self.move_input_cursor(1);
-                        return;
-                    }
-                    KeyCode::Char('p') | KeyCode::Char('k') => {
-                        self.move_input_cursor(-1);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.move_input_cursor(1);
-                    return;
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.move_input_cursor(-1);
-                    return;
-                }
-                KeyCode::Enter => {
-                    if let Some(cursor) = self.focused_input().map(|pending| pending.cursor) {
-                        self.respond_input(cursor, tx);
-                    }
-                    return;
-                }
-                KeyCode::Char(ch @ '1'..='9') => {
-                    self.respond_input(ch as usize - '1' as usize, tx);
-                    return;
-                }
-                KeyCode::Char('x') => {
-                    self.cancel(tx);
-                    return;
-                }
-                KeyCode::Esc => return,
-                _ => {}
-            }
-        }
-        // While the focused session is blocked on a tool call, the card owns
-        // j/k, Ctrl-N/Ctrl-P and Enter. y/n/d/e/o/r stay as direct shortcuts.
-        if self.focused_approval().is_some() {
-            if key.modifiers.contains(KeyModifiers::CONTROL) {
-                match key.code {
-                    KeyCode::Char('n') | KeyCode::Char('j') => {
-                        self.move_approval_cursor(1);
-                        return;
-                    }
-                    KeyCode::Char('p') | KeyCode::Char('k') => {
-                        self.move_approval_cursor(-1);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-            match key.code {
-                KeyCode::Char('j') | KeyCode::Down => {
-                    self.move_approval_cursor(1);
-                    return;
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    self.move_approval_cursor(-1);
-                    return;
-                }
-                KeyCode::Enter => {
-                    self.activate_approval(None, tx);
-                    return;
-                }
-                KeyCode::Char(ch @ '1'..='9') => {
-                    self.activate_approval(Some(ch as usize - '1' as usize), tx);
-                    return;
-                }
-                KeyCode::Char('y') => {
-                    self.respond_approval(ApprovalDecision::Approve, tx);
-                    return;
-                }
-                KeyCode::Char('a') => {
-                    self.respond_approval(ApprovalDecision::Always, tx);
-                    return;
-                }
-                KeyCode::Char('n') => {
-                    self.respond_approval(ApprovalDecision::Deny, tx);
-                    return;
-                }
-                KeyCode::Char('d') => {
-                    self.open_diff_view();
-                    return;
-                }
-                KeyCode::Char('e') => {
-                    self.edit_proposed(tx);
-                    return;
-                }
-                KeyCode::Char('o') => {
-                    self.open_approval_file();
-                    return;
-                }
-                KeyCode::Char('r') => {
-                    self.start_reason_prompt();
-                    return;
-                }
-                _ => {}
-            }
         }
         // Pane actions are leader-only. Single letters are reserved for
         // navigation (j/k, g/G) and the prompt's own vim editing; the only
         // direct shortcuts left are shifted punctuation (`:`/`?`/`#`/`<`/`>`).
         match key.code {
-            KeyCode::Char(':') => self.open_picker(PickerKind::Commands, tx),
-            KeyCode::Char('?') => self.open_help(),
-            KeyCode::Char('#') => {
-                self.search_view = Some(SearchView::new());
-                self.status =
-                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
+            // Shift+Z is the vim-adjacent quit key in normal mode.
+            KeyCode::Char('Z')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.run_action("quit", tx)
             }
+            KeyCode::Char(':') => self.open_picker(PickerKind::Commands, tx),
             KeyCode::Char('<') => self.cycle_pane(-1),
             KeyCode::Char('>') => self.cycle_pane(1),
             // `i` is the one bare letter that stays: focusing the prompt is
             // the normal way out of the transcript, like vim insert mode.
             KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
             KeyCode::Tab => self.cycle_session(1, tx),
-            KeyCode::BackTab => self.cycle_session(-1, tx),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_focused(-1),
-            KeyCode::PageDown => self.scroll_focused(10),
-            KeyCode::PageUp => self.scroll_focused(-10),
-            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_focused(10)
-            }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.scroll_focused(-10)
-            }
             KeyCode::Char('g') => {
                 if let Some(view) = self.focused_view_mut() {
                     view.scroll = 0;
@@ -6488,6 +6580,23 @@ already exists, update it in place rather than rewriting it from scratch.";
         Line::from(spans)
     }
 
+    /// Background-attention notice shown in the middle of the status bar.
+    /// Desktop popups are intentionally avoided, so this is the only alert UI.
+    fn status_bar_alert(&self) -> Option<Line<'static>> {
+        let text = self.last_alert.as_deref()?;
+        if self.alert_at?.elapsed() >= ALERT_DISPLAY {
+            return None;
+        }
+        let panel = composer_background(self.theme);
+        Some(Line::from(Span::styled(
+            format!(" {text} "),
+            Style::default()
+                .fg(composer_warn(self.theme))
+                .bg(panel)
+                .add_modifier(Modifier::BOLD),
+        )))
+    }
+
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
@@ -6496,16 +6605,30 @@ already exists, update it in place rather than rewriting it from scratch.";
         let background = Style::default().bg(panel);
         let left = self.status_bar_left();
         let right = self.status_bar_right();
+        let alert = self.status_bar_alert();
         let right_width = (right.width() as u16).min(area.width);
-        let chunks =
-            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
+        let left_width = (left.width() as u16).min(area.width.saturating_sub(right_width));
+        let chunks = Layout::horizontal([
+            Constraint::Length(left_width),
+            Constraint::Min(0),
+            Constraint::Length(right_width),
+        ])
+        .split(area);
         frame.render_widget(Paragraph::new(left).style(background), chunks[0]);
+        if let Some(alert) = alert {
+            frame.render_widget(
+                Paragraph::new(alert)
+                    .alignment(Alignment::Center)
+                    .style(background),
+                chunks[1],
+            );
+        }
         if right_width > 0 {
             frame.render_widget(
                 Paragraph::new(right)
                     .alignment(Alignment::Right)
                     .style(background),
-                chunks[1],
+                chunks[2],
             );
         }
     }
@@ -7234,11 +7357,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         };
         let dialog_bg = dialog_background(theme);
 
-        let width = (area.width as u32 * 8 / 10).max(44).min(area.width as u32) as u16;
-        let height = (area.height as u32 * 7 / 10)
-            .max(12)
-            .min(area.height as u32) as u16;
-        let rect = centered(area, width, height);
+        let rect = search_dialog_rect(area);
         frame.render_widget(Clear, rect);
         let title = format!(" {} ({}) ", kind.title(), filtered.len());
         let block = Block::default()
@@ -7250,29 +7369,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             .title_bottom(format!(" {} ", kind.hint()));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        let chunks = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Min(4),
-        ])
-        .split(inner);
-
-        frame.render_widget(
-            Paragraph::new(Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(accent)),
-                Span::raw(query.clone()),
-            ]))
-            .style(Style::default().bg(dialog_bg)),
-            chunks[0],
-        );
-        frame.render_widget(
-            Paragraph::new("─".repeat(chunks[1].width as usize))
-                .style(Style::default().fg(muted).bg(dialog_bg)),
-            chunks[1],
-        );
-
-        // A preview column is only worth it on a reasonably wide terminal.
-        let body = chunks[2];
+        let body = draw_search_field(frame, inner, &query, accent, muted, dialog_bg);
         let (list_area, preview_area) = if body.width >= 64 {
             let columns =
                 Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -7703,7 +7800,7 @@ fn command_items() -> Vec<PickerItem> {
             "context entries",
             "Browse the context ledger with previews",
         ),
-        ("ledger", "context ledger", "Open the full ledger (c)"),
+        ("ledger", "context ledger", "Open the full ledger (C)"),
         (
             "history",
             "search history",
@@ -7729,7 +7826,7 @@ fn command_items() -> Vec<PickerItem> {
         (
             "close-pane",
             "close pane",
-            "Close the focused pane (C-w c / Space C / Space q)",
+            "Close the focused pane (C-w c / Space c / Space q)",
         ),
         ("new", "new session", "Create a session (n / Space n)"),
         (
@@ -8146,7 +8243,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt & transcript: sessions / files / worktrees / branches",
             },
             HelpEntry {
-                key: "Space c/h/p",
+                key: "Space C/h/p",
                 description: "prompt & transcript: ledger / history / processes",
             },
             HelpEntry {
@@ -8154,8 +8251,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt & transcript: approvals / cancel / actions / help",
             },
             HelpEntry {
-                key: "Space n/q/Q",
-                description: "prompt & transcript: new session / close pane / quit",
+                key: "Space n/c/q",
+                description: "prompt & transcript: new session / close pane (c or q)",
             },
             HelpEntry {
                 key: "Shift+, / Shift+.",
@@ -8171,7 +8268,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Ctrl-1 … Ctrl-9",
-                description: "focus the Nth open session (the Nth tab in tabby)",
+                description: "focus the Nth open session / tabby tab (needs CSI-u keyboard support)",
+            },
+            HelpEntry {
+                key: "Alt-1 … Alt-9",
+                description: "focus the Nth open session / tabby tab without Ctrl-digit support",
             },
             HelpEntry {
                 key: "active queue",
@@ -8254,12 +8355,12 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "approve / deny a pending tool call (card shortcut)",
             },
             HelpEntry {
-                key: "j / k · Enter",
-                description: "pending card: pick an approval action / answer with the highlighted option",
+                key: "Ctrl-J / Ctrl-K · Enter",
+                description: "pending card: move the checkbox selection / run or answer the highlighted item",
             },
             HelpEntry {
-                key: "1-6 · C-n/C-p",
-                description: "answer a question directly / next-prev option",
+                key: "1-9 · j / k",
+                description: "answer a question directly / move the card selection",
             },
             HelpEntry {
                 key: "d",
@@ -8286,7 +8387,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "top / follow tail",
             },
             HelpEntry {
-                key: "Space c",
+                key: "Space C",
                 description: "context ledger (f fork here, w rewind + roll back)",
             },
             HelpEntry {
@@ -8306,8 +8407,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "open this help (F1 anywhere)",
             },
             HelpEntry {
-                key: "Space Q / Ctrl-C",
-                description: "quit (Ctrl-C interrupts instead while the prompt is focused)",
+                key: "Z / Ctrl-C",
+                description: "quit in normal mode (Ctrl-C interrupts instead while the prompt is focused)",
             },
             HelpEntry {
                 key: "help search",
@@ -8328,7 +8429,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "ask_user",
-                description: "the approval card is an option picker; the first option is recommended.",
+                description: "approval/question cards use - [ ] / - [x] rows; the first option is recommended.",
             },
             HelpEntry {
                 key: "ledger",
@@ -8392,7 +8493,6 @@ fn draw_help(
     theme: Theme,
 ) {
     let dialog_bg = dialog_background(theme);
-    let width = (area.width as u32 * 7 / 10).max(50).min(area.width as u32) as u16;
     let rows = help_rows_in(query, scope);
     let matches = help_entry_count_in(query, scope);
     let total: usize = HELP_SECTIONS
@@ -8401,55 +8501,30 @@ fn draw_help(
         .map(|section| section.entries.len())
         .sum();
 
-    let height = (rows.len() as u16 + 5)
-        .min(area.height.saturating_sub(2))
-        .max(8);
-    let rect = centered(area, width, height);
+    let rect = search_dialog_rect(area);
     frame.render_widget(Clear, rect);
     frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+    let title = if scope.is_some() {
+        format!(" keys ({matches}/{total}) ")
+    } else {
+        format!(" help ({matches}/{total}) ")
+    };
     frame.render_widget(
         Block::default()
             .borders(Borders::ALL)
-            .title(if scope.is_some() { " keys " } else { " help " })
+            .title(title)
             .style(Style::default().bg(dialog_bg)),
         rect,
     );
 
     let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
-    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(inner);
-
-    let search = if query.is_empty() {
-        Line::from(vec![
-            Span::styled(
-                "search",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                "  type to filter the reference",
-                Style::default().fg(Color::DarkGray),
-            ),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(
-                "search  ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(query.to_string()),
-            Span::styled("▌", Style::default().fg(Color::DarkGray)),
-        ])
-    };
-    let count = Line::from(Span::styled(
-        format!("{matches}/{total} entries · ↑/↓ select · Ctrl-U clear · Esc close"),
-        Style::default().fg(Color::DarkGray),
-    ));
-    frame.render_widget(
-        Paragraph::new(vec![search, count, Line::from("")]).style(Style::default().bg(dialog_bg)),
-        chunks[0],
+    let list_area = draw_search_field(
+        frame,
+        inner,
+        query,
+        composer_accent(theme),
+        composer_muted(theme),
+        dialog_bg,
     );
 
     let selected_row = rows
@@ -8458,7 +8533,7 @@ fn draw_help(
         .filter(|(_, row)| matches!(row, HelpRow::Entry(_)))
         .nth(selected)
         .map(|(index, _)| index);
-    let visible = chunks[1].height as usize;
+    let visible = list_area.height as usize;
     let start = selected_row
         .map(|index| index.saturating_add(1).saturating_sub(visible))
         .unwrap_or(0);
@@ -8510,7 +8585,7 @@ fn draw_help(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .style(Style::default().bg(dialog_bg)),
-        chunks[1],
+        list_area,
     );
 }
 
@@ -8916,6 +8991,9 @@ fn review_unified_total(approval: &PendingApproval) -> usize {
 /// alternate screen. The caller sets `force_clear` so ratatui repaints.
 fn run_editor(path: &std::path::Path) -> anyhow::Result<()> {
     use crossterm::cursor::{Hide, Show};
+    use crossterm::event::{
+        KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    };
     use crossterm::terminal::{
         disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
     };
@@ -8926,13 +9004,25 @@ fn run_editor(path: &std::path::Path) -> anyhow::Result<()> {
     let program = parts.next().unwrap_or("nvim");
     let mut stdout = std::io::stdout();
     disable_raw_mode().ok();
-    crossterm::execute!(stdout, LeaveAlternateScreen, Show).ok();
+    crossterm::execute!(
+        stdout,
+        PopKeyboardEnhancementFlags,
+        LeaveAlternateScreen,
+        Show
+    )
+    .ok();
     let status = std::process::Command::new(program)
         .args(parts)
         .arg(path)
         .status();
     enable_raw_mode().ok();
-    crossterm::execute!(stdout, EnterAlternateScreen, Hide).ok();
+    crossterm::execute!(
+        stdout,
+        EnterAlternateScreen,
+        Hide,
+        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+    )
+    .ok();
     match status {
         Ok(status) if status.success() => Ok(()),
         Ok(status) => Err(anyhow::anyhow!("editor exited with {status}")),
@@ -9005,24 +9095,38 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
         .max(8);
     let mut summary_lines = wrap_text(&approval.summary, body_width);
     let max_height = area.height.saturating_sub(1) as usize;
-    let reserved = 2 + actions.len() + 1;
-    let max_summary = max_height.saturating_sub(reserved).max(1);
-    let summary_truncated = summary_lines.len() > max_summary;
-    if summary_truncated {
-        summary_lines.truncate(max_summary.saturating_sub(1));
+    let capacity = max_height.saturating_sub(2); // rows inside the borders
+    let hint_rows = 1;
+    // The summary can be a full shell command. Wrap it, but never let it push
+    // the action list or hint off the card.
+    let summary_cap = capacity.saturating_sub(actions.len() + hint_rows).max(1);
+    if summary_lines.len() > summary_cap {
+        summary_lines.truncate(summary_cap.saturating_sub(1));
         summary_lines.push("…".to_string());
     }
-
-    // Borders + summary + actions + hint; the diff takes whatever is left.
-    let fixed = 2 + summary_lines.len() + actions.len() + 1;
-    let max_diff = max_height.saturating_sub(fixed).min(8);
+    let summary_rows = summary_lines.len();
+    // On a short pane, scroll the action list instead of clipping the
+    // highlighted row. The diff only gets space after all actions fit.
+    let action_rows = actions
+        .len()
+        .min(capacity.saturating_sub(summary_rows + hint_rows))
+        .max(1);
+    let action_start = if action_rows >= actions.len() {
+        0
+    } else {
+        cursor
+            .saturating_sub(action_rows.saturating_sub(1))
+            .min(actions.len().saturating_sub(action_rows))
+    };
+    let diff_budget = capacity.saturating_sub(summary_rows + action_rows + hint_rows);
+    let diff_reserve = usize::from(diff_len > 0 && diff_budget > 0);
+    let max_diff = diff_budget.saturating_sub(diff_reserve).min(8);
     let shown = diff_len.min(max_diff);
-    let truncated = diff_len > shown && max_diff > 0;
+    let truncated = diff_len > shown && diff_budget > 0;
     // Leave the pane's title row visible and never underflow `y` on a pane
     // that starts at the top of the screen.
-    let height = (fixed + shown + usize::from(truncated))
-        .min(max_height)
-        .max(3) as u16;
+    let content_rows = summary_rows + action_rows + shown + usize::from(truncated) + hint_rows;
+    let height = (content_rows + 2).min(max_height).max(3) as u16;
     let rect = Rect {
         x: area.x + 1,
         y: area.y + area.height - height - 1,
@@ -9032,7 +9136,7 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
     frame.render_widget(Clear, rect);
     frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
 
-    let mut lines = Vec::with_capacity(fixed + shown);
+    let mut lines = Vec::with_capacity(content_rows);
     for (index, summary) in summary_lines.into_iter().enumerate() {
         let mut spans = Vec::new();
         if index == 0 {
@@ -9073,9 +9177,14 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
         .fg(Color::Black)
         .bg(Color::Yellow)
         .add_modifier(Modifier::BOLD);
-    for (index, action) in actions.iter().enumerate() {
-        let marker = if index == cursor { "▸ " } else { "  " };
-        let mut text = format!("{marker}{}. {}", index + 1, approval.action_label(*action));
+    for (index, action) in actions
+        .iter()
+        .enumerate()
+        .skip(action_start)
+        .take(action_rows)
+    {
+        let check = if index == cursor { "x" } else { " " };
+        let mut text = format!("- [{check}] {}", approval.action_label(*action));
         if index == 0 {
             text.push_str("  ★ recommended");
         }
@@ -9089,7 +9198,7 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
     }
     lines.push(Line::from(Span::styled(
         truncate(
-            "j/k or C-n/C-p select · Enter confirm · y/n · x cancel",
+            "Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel",
             inner,
         ),
         Style::default().fg(Color::DarkGray),
@@ -9122,7 +9231,7 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
     if area.width < 24 || area.height < 5 {
         return;
     }
-    let height = (3 + pending.options.len() + 1)
+    let height = (pending.options.len() + 4)
         .min(area.height.saturating_sub(1) as usize)
         .max(4) as u16;
     let rect = Rect {
@@ -9151,9 +9260,13 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
         .fg(Color::Black)
         .bg(Color::Cyan)
         .add_modifier(Modifier::BOLD);
-    for (index, option) in pending.options.iter().enumerate() {
-        let marker = if index == cursor { "▸ " } else { "  " };
-        let mut text = format!("{marker}{}. {}", index + 1, option.label);
+    // Small panes clip the card; keep the highlighted option visible instead
+    // of always rendering the first N rows.
+    let visible = (height as usize).saturating_sub(4).max(1);
+    let start = cursor.saturating_sub(visible.saturating_sub(1));
+    for (index, option) in pending.options.iter().enumerate().skip(start).take(visible) {
+        let check = if index == cursor { "x" } else { " " };
+        let mut text = format!("- [{check}] {}", option.label);
         if let Some(description) = option
             .description
             .as_deref()
@@ -9178,7 +9291,7 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
     }
     lines.push(Line::from(Span::styled(
         truncate(
-            "j/k or C-n/C-p select · Enter answer · 1-6 jump · x cancel",
+            "Ctrl-J/K or j/k select · Enter answer · 1-9 jump · x cancel",
             inner,
         ),
         Style::default().fg(Color::DarkGray),
@@ -9219,6 +9332,47 @@ fn diff_line_style(line: &str, theme: Theme) -> Style {
     } else {
         Style::default().fg(theme.normal.unwrap_or(Color::Gray))
     }
+}
+
+/// Draw the query row and separator shared by the theme picker and help/keys.
+/// Returns the remaining area for results.
+fn draw_search_field(
+    frame: &mut Frame,
+    area: Rect,
+    query: &str,
+    accent: Color,
+    muted: Color,
+    dialog_bg: Color,
+) -> Rect {
+    let chunks = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(area);
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("❯ ", Style::default().fg(accent)),
+            Span::raw(query.to_string()),
+        ]))
+        .style(Style::default().bg(dialog_bg)),
+        chunks[0],
+    );
+    frame.render_widget(
+        Paragraph::new("─".repeat(chunks[1].width as usize))
+            .style(Style::default().fg(muted).bg(dialog_bg)),
+        chunks[1],
+    );
+    chunks[2]
+}
+
+/// Shared size for searchable popups such as the theme picker and help/keys.
+fn search_dialog_rect(area: Rect) -> Rect {
+    let width = (area.width as u32 * 8 / 10).max(44).min(area.width as u32) as u16;
+    let height = (area.height as u32 * 7 / 10)
+        .max(12)
+        .min(area.height as u32) as u16;
+    centered(area, width, height)
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -10031,6 +10185,14 @@ mod tests {
         assert_eq!(app.views[app.focused].session.id, "a");
         assert_eq!(app.input.mode(), Mode::Normal);
         assert_eq!(app.status, "tab 1/3 focused");
+
+        // Terminals without CSI-u report Ctrl-1..9 as control bytes; Alt-1..9
+        // remains a reliable fallback there.
+        app.input.enter_insert();
+        app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::ALT), &tx);
+        assert_eq!(app.focused, 1);
+        assert_eq!(app.views[app.focused].session.id, "b");
+        assert_eq!(app.status, "tab 2/3 focused");
     }
 
     #[test]
@@ -11303,7 +11465,7 @@ mod tests {
             Vec::new(),
         ));
         app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE), &tx);
         assert!(app.ledger.is_some());
         assert!(rx.try_recv().is_ok());
 
@@ -11968,14 +12130,34 @@ mod tests {
             Some(PickerKind::Commands)
         ));
 
-        // Focus and quit also live behind the leader now.
+        // Focus still lives behind the leader.
         app.picker = None;
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Input));
+
+        // Shift+Z quits from normal mode; leader+Q no longer does.
         app.focus = Focus::Transcript;
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE), &tx);
+        assert!(!app.should_quit);
+        app.handle_key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT), &tx);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn shift_z_quits_from_prompt_normal_mode() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT), &tx);
         assert!(app.should_quit);
     }
 
@@ -12057,13 +12239,99 @@ mod tests {
         app.focus = Focus::Transcript;
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &tx);
 
         assert_eq!(app.views.len(), 1);
         assert!(
-            app.picker.is_none(),
-            "leader C must not open the context picker"
+            app.ledger.is_none(),
+            "leader c closes the pane instead of opening the ledger"
         );
+    }
+
+    #[test]
+    fn prompt_normal_mode_matches_transcript_for_tui_actions() {
+        fn pane_app() -> App {
+            let mut app = App::new(None);
+            app.views.push(SessionView::new(
+                Session::new("s1", "one", "/tmp"),
+                Vec::new(),
+            ));
+            app.views.push(SessionView::new(
+                Session::new("s2", "two", "/tmp"),
+                Vec::new(),
+            ));
+            app.focused = 0;
+            app.keybinds = Keybinds::from_config(&std::collections::BTreeMap::from([(
+                "help".to_string(),
+                "F2".to_string(),
+            )]));
+            app
+        }
+
+        fn snapshot(
+            app: &App,
+        ) -> (
+            bool,
+            bool,
+            Option<PickerKind>,
+            usize,
+            usize,
+            Option<(usize, bool)>,
+        ) {
+            (
+                app.help,
+                app.search_view.is_some(),
+                app.picker.as_ref().map(|picker| picker.kind),
+                app.views.len(),
+                app.focused,
+                app.focused_view().map(|view| (view.scroll, view.follow)),
+            )
+        }
+
+        let scenarios = vec![
+            vec![KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)],
+            vec![KeyEvent::new(KeyCode::Char('#'), KeyModifiers::SHIFT)],
+            vec![KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)],
+            vec![KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)],
+            vec![
+                KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            ],
+            vec![KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE)],
+            vec![
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            ],
+            vec![
+                KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE),
+            ],
+            vec![
+                KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
+                KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            ],
+        ];
+
+        for keys in scenarios {
+            let (pane_tx, _pane_rx) = tokio::sync::mpsc::unbounded_channel();
+            let (prompt_tx, _prompt_rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut pane = pane_app();
+            pane.focus = Focus::Transcript;
+            let mut prompt = pane_app();
+            prompt.focus_input();
+            prompt.input.enter_normal();
+
+            for key in keys.clone() {
+                pane.handle_key(key, &pane_tx);
+                prompt.handle_key(key, &prompt_tx);
+            }
+
+            assert_eq!(
+                snapshot(&pane),
+                snapshot(&prompt),
+                "transcript and prompt normal mode disagreed on {keys:?}"
+            );
+        }
     }
 
     #[test]
@@ -12383,6 +12651,122 @@ mod tests {
         match rx.try_recv().expect("input command") {
             Command::Input { option_index, .. } => assert_eq!(option_index, 2),
             _ => panic!("expected an input command"),
+        }
+    }
+
+    #[test]
+    fn question_card_uses_markdown_checkboxes() {
+        let (mut app, _, _rx) = input_app();
+        let text = render_text(&mut app, 80, 30);
+        assert!(text.contains("- [x] SQLite"), "{text}");
+        assert!(text.contains("- [ ] Postgres"), "{text}");
+        assert!(text.contains("- [ ] MySQL"), "{text}");
+
+        app.move_input_cursor(1);
+        let text = render_text(&mut app, 80, 30);
+        assert!(text.contains("- [ ] SQLite"), "{text}");
+        assert!(text.contains("- [x] Postgres"), "{text}");
+    }
+
+    #[test]
+    fn card_ctrl_navigation_works_with_prompt_focus_in_tabby() {
+        let (mut app, tx, mut rx) = input_app();
+        app.layout = PaneLayout::Tabby;
+        app.focus = Focus::Input;
+        app.input.enter_insert();
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.focused_input().expect("pending").cursor, 1);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.focused_input().expect("pending").cursor, 0);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("input command") {
+            Command::Input { option_index, .. } => assert_eq!(option_index, 1),
+            _ => panic!("expected an input command"),
+        }
+    }
+
+    #[test]
+    fn approval_card_uses_markdown_checkboxes() {
+        let (mut app, _, _rx) = input_app();
+        app.inputs.clear();
+        app.approvals.insert(
+            "s1".to_string(),
+            PendingApproval {
+                kind: PendingKind::Tool,
+                approval_id: "a1".to_string(),
+                call_id: "c1".to_string(),
+                tool: "run_command".to_string(),
+                summary: "run_command: ls".to_string(),
+                diff: None,
+                path: None,
+                hunks: Vec::new(),
+                selected: Vec::new(),
+                cursor: 0,
+            },
+        );
+
+        let text = render_text(&mut app, 80, 30);
+        assert!(text.contains("- [x] Approve"), "{text}");
+        assert!(text.contains("- [ ] Always allow"), "{text}");
+
+        app.move_approval_cursor(1);
+        let text = render_text(&mut app, 80, 30);
+        assert!(text.contains("- [ ] Approve"), "{text}");
+        assert!(text.contains("- [x] Always allow"), "{text}");
+    }
+
+    #[test]
+    fn approval_ctrl_navigation_works_with_prompt_focus() {
+        let (mut app, tx, mut rx) = input_app();
+        app.inputs.clear();
+        app.layout = PaneLayout::Tabby;
+        app.focus = Focus::Input;
+        app.approvals.insert(
+            "s1".to_string(),
+            PendingApproval {
+                kind: PendingKind::Tool,
+                approval_id: "a1".to_string(),
+                call_id: "c1".to_string(),
+                tool: "run_command".to_string(),
+                summary: "run_command: ls".to_string(),
+                diff: None,
+                path: None,
+                hunks: Vec::new(),
+                selected: Vec::new(),
+                cursor: 0,
+            },
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.focused_approval().expect("approval").cursor, 1);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.focused_approval().expect("approval").cursor, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("approval command") {
+            Command::Approval { decision, .. } => {
+                assert_eq!(decision, ApprovalDecision::Approve)
+            }
+            _ => panic!("expected an approval command"),
         }
     }
 
@@ -13027,6 +13411,34 @@ mod tests {
         let text = render_text(&mut app, 80, 20);
         let bar = text.lines().nth(19).expect("status bar row");
         assert!(bar.contains(" N "), "{bar}");
+    }
+
+    #[test]
+    fn attention_alerts_render_centered_in_the_status_bar() {
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "status test", "/tmp");
+        session.model = Some("openai/gpt-5".into());
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.connected = true;
+        app.status = "retrying 2/5".into();
+        app.last_alert = Some("worker · awaiting approval".into());
+        app.alert_at = Some(Instant::now());
+
+        let text = render_text(&mut app, 80, 20);
+        let bar = text.lines().nth(19).expect("status bar row");
+        let alert = bar
+            .find("worker · awaiting approval")
+            .expect("center alert");
+        assert!(alert > bar.find("retrying").unwrap(), "{bar}");
+        assert!(bar.contains("gpt-5"), "{bar}");
+
+        // The alert is transient, so stale attention text does not stick.
+        app.alert_at = Some(Instant::now() - ALERT_DISPLAY);
+        let text = render_text(&mut app, 80, 20);
+        let bar = text.lines().nth(19).expect("status bar row");
+        assert!(!bar.contains("worker · awaiting approval"), "{bar}");
     }
 
     #[test]

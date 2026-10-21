@@ -221,10 +221,9 @@ impl Editor {
         !self.register.is_empty()
     }
 
-    /// True when `p`/`P` is a plain normal-mode paste with no pending
-    /// operator, count or leader. The host uses this to substitute the system
-    /// clipboard for the editor's internal register.
-    pub fn normal_paste_ready(&self) -> bool {
+    /// True when normal mode has no half-typed count, operator or prefix, so
+    /// the host may dispatch pane-level TUI actions before the editor.
+    pub fn normal_idle(&self) -> bool {
         self.mode == Mode::Normal
             && self.op.is_none()
             && self.count.is_none()
@@ -233,6 +232,13 @@ impl Editor {
             && !self.pending_replace
             && self.pending_object.is_none()
             && !self.leader
+    }
+
+    /// True when `p`/`P` is a plain normal-mode paste with no pending
+    /// operator, count or leader. The host uses this to substitute the system
+    /// clipboard for the editor's internal register.
+    pub fn normal_paste_ready(&self) -> bool {
+        self.normal_idle()
     }
 
     /// Seed the unnamed register from externally copied text. Used after a
@@ -582,6 +588,10 @@ impl Editor {
             ' ' if self.op.is_none() && self.count.is_none() => {
                 self.leader = true;
                 return Outcome::Ignored;
+            }
+            // Vim-adjacent `Z` (Shift+z) quits the TUI from normal mode.
+            'Z' if self.op.is_none() && self.count.is_none() => {
+                return Outcome::Action("quit");
             }
             '1'..='9' => {
                 self.push_count(c);
@@ -1814,8 +1824,8 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'f' => "files",
         'w' => "worktrees",
         'b' => "branches",
-        'c' => "ledger",
-        'C' => "close-pane",
+        'c' => "close-pane",
+        'C' => "ledger",
         'h' => "history",
         'p' => "processes",
         'R' => "approvals",
@@ -1828,7 +1838,6 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'l' => "layout-cycle",
         'x' => "cancel",
         'q' => "close-pane",
-        'Q' => "quit",
         'i' => "input",
         'A' => "attention",
         'a' | ':' => "commands",
@@ -2043,6 +2052,19 @@ mod tests {
         let mut editor = Editor::new();
         key(&mut editor, KeyCode::Char(' '));
         assert_eq!(editor.text(), " ");
+    }
+
+    #[test]
+    fn normal_shift_z_quits_but_insert_shift_z_types() {
+        let mut editor = editor_with("");
+        assert_eq!(
+            key(&mut editor, KeyCode::Char('Z')),
+            Outcome::Action("quit")
+        );
+
+        let mut editor = Editor::new();
+        key(&mut editor, KeyCode::Char('Z'));
+        assert_eq!(editor.text(), "Z");
     }
 
     #[test]
