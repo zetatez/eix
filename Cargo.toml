@@ -23,6 +23,13 @@ crossterm = "0.28"
 rmpv = "1"
 toml = "0.8"
 dirs = "6"
+pulldown-cmark = { version = "0.13", default-features = false }
+syntect = { version = "5", default-features = false, features = [
+    "parsing",
+    "regex-fancy",
+    "default-syntaxes",
+    "default-themes",
+] }
 glob = "0.3"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }

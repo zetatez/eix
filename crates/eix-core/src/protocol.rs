@@ -248,6 +248,16 @@ pub struct SessionRef {
     pub session_id: SessionId,
 }
 
+/// `session.attach`: replay a session. When `tail` is set only the newest
+/// events are returned, so very long sessions open quickly; older pages can be
+/// fetched with `session.events` and `before_seq`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttachParams {
+    pub session_id: SessionId,
+    #[serde(default)]
+    pub tail: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitParams {
     pub session_id: SessionId,
@@ -542,6 +552,12 @@ pub struct EventsParams {
     pub session_id: SessionId,
     #[serde(default)]
     pub after_seq: u64,
+    /// Return events older than this sequence. Used for paging history.
+    #[serde(default)]
+    pub before_seq: Option<u64>,
+    /// Maximum number of events to return for a paged query.
+    #[serde(default)]
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -696,6 +712,9 @@ pub struct SessionResult {
 pub struct AttachResult {
     pub session: Session,
     pub events: Vec<Event>,
+    /// True when older events exist before the returned tail.
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -712,6 +731,9 @@ pub struct CancelResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventsResult {
     pub events: Vec<Event>,
+    /// True when another older page exists before the returned events.
+    #[serde(default)]
+    pub has_more: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -5,8 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AttachResult, Config, EventKind, HelloResult, ModelConfig, PermissionLevel, Request, Response,
-    SearchResult, ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
+    AttachResult, Config, EventKind, EventsResult, HelloResult, ModelConfig, PermissionLevel,
+    Request, Response, SearchResult, ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -112,6 +112,41 @@ async fn daemon_streams_and_persists_a_turn() -> anyhow::Result<()> {
         .find(|message| message["role"] == "user")
         .expect("user message");
     assert_eq!(user_message["content"], "say hi");
+    drop(bodies);
+
+    // Long sessions open at their tail; older pages are fetched with
+    // `before_seq` using the first loaded sequence.
+    let tail: AttachResult = client
+        .request(
+            "session.attach",
+            json!({"session_id": session_id, "tail": 2}),
+        )
+        .await?;
+    assert!(tail.has_more);
+    assert_eq!(tail.events.len(), 2);
+    assert!(tail
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::AssistantMessage));
+    let page: EventsResult = client
+        .request(
+            "session.events",
+            json!({
+                "session_id": session_id,
+                "before_seq": tail.events[0].seq,
+                "limit": 10,
+            }),
+        )
+        .await?;
+    assert!(page
+        .events
+        .iter()
+        .all(|event| event.seq < tail.events[0].seq));
+    assert!(page
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::UserMessage));
+    assert!(!page.has_more);
 
     assert!(data_dir.join("eix.sqlite3").exists());
 

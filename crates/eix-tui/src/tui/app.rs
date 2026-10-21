@@ -10,17 +10,19 @@ use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use eix_core::{
-    ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
+    theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
     ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
     InputAnsweredPayload, InputOption, InputRequiredPayload, PatchProposedPayload,
     PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo, ProcessList, ProcessOutput,
     ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult,
-    ToolResultPayload, UserMessagePayload,
+    ToolResultPayload, UserMessagePayload, THEME_PRESETS,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
+};
 use ratatui::Frame;
 use serde::Deserialize;
 use serde_json::Value;
@@ -28,7 +30,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::controller::{Command, ContextOp, Event};
-use super::editor::{Editor, Mode, Outcome};
+use super::editor::{leader_action, Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
 use super::theme::Theme;
 use super::transcript::{self, FoldId};
@@ -41,6 +43,20 @@ enum Focus {
 
 /// Two `Esc` presses within this window leave the prompt for the transcript.
 const ESC_WINDOW: Duration = Duration::from_millis(500);
+
+/// Picker value for "no preset" (keep the terminal/default palette).
+const THEME_DEFAULT_VALUE: &str = "@default";
+
+/// Running sessions use a short animated glyph; idle sessions show `○`.
+const RUNNING_SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
+
+/// Re-read the focused session's git branch at this interval.
+const GIT_BRANCH_REFRESH: Duration = Duration::from_secs(5);
+
+/// Start loading the previous history page when the viewport is this close to
+/// the top, and wait until it scrolls further down before arming another page.
+const HISTORY_PRELOAD_LINES: usize = 3;
+const HISTORY_REARM_LINES: usize = 12;
 
 /// A prompt `/command`. Typed as a whole message line and never sent to the
 /// model. `args` is a display hint; parsing is intentionally forgiving.
@@ -99,7 +115,6 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "[n]",
             "show recent turns, answers and tool calls",
         ),
-        builtin("export", "[path]", "write this session as JSON"),
         builtin("archive", "", "hide this session from the picker"),
         builtin("delete", "", "delete this session (run twice to confirm)"),
         builtin("undo", "", "hide the newest turn (/redo restores it)"),
@@ -110,12 +125,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "browse skills with a preview, or insert one",
         ),
         builtin("todos", "", "show the model's task list"),
-        builtin(
-            "diagnostics",
-            "[max-files]",
-            "aggregate LSP diagnostics for the workspace",
-        ),
         builtin("image", "<path>", "attach an image to the next prompt"),
+        builtin("theme", "", "choose a color preset with live preview"),
         builtin(
             "permission",
             "<level>",
@@ -125,6 +136,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("commands", "", "reload user-defined Markdown commands"),
         builtin("exit", "", "save and close this session"),
         builtin("quit", "", "save and close this session"),
+        builtin("close", "", "save and close this session"),
     ]
 }
 
@@ -152,14 +164,64 @@ fn merge_commands(cwd: &std::path::Path) -> Vec<CommandSpec> {
 }
 
 /// Prompt height: [`super::editor::PROMPT_ROWS`] content rows plus the two
-/// borders, clamped so the transcript keeps a few rows on short terminals.
-fn prompt_input_height(area_height: u16) -> u16 {
-    (super::editor::PROMPT_ROWS + 2).min(area_height.saturating_sub(5).max(3))
+/// borders. Long drafts grow the box up to a small cap before the editor
+/// starts scrolling, and short terminals always keep transcript rows.
+fn prompt_input_height(area_height: u16, area_width: u16, input: &Editor) -> u16 {
+    const PROMPT_MAX_ROWS: usize = 12;
+    let inner_width = area_width.saturating_sub(4).max(1) as usize;
+    let rows = input.layout(inner_width, 1).segments.len();
+    let visible = rows.clamp(super::editor::PROMPT_ROWS as usize, PROMPT_MAX_ROWS) as u16;
+    (visible + 2).min(area_height.saturating_sub(5).max(3))
+}
+
+// Keep the prompt readable without a separate panel: its chrome paints over
+// the theme canvas (or the terminal background) instead of an opaque composer
+// box.
+const COMPOSER_TEXT: Color = Color::Rgb(220, 223, 228);
+const COMPOSER_MUTED: Color = Color::Rgb(110, 116, 129);
+const COMPOSER_BORDER: Color = Color::Rgb(74, 88, 120);
+const COMPOSER_ACCENT: Color = Color::Rgb(122, 162, 247);
+const COMPOSER_SUCCESS: Color = Color::Rgb(126, 199, 149);
+const COMPOSER_WARN: Color = Color::Rgb(229, 192, 123);
+const COMPOSER_DANGER: Color = Color::Rgb(231, 130, 132);
+const COMPOSER_BADGE_TEXT: Color = Color::Rgb(20, 22, 28);
+const COMPOSER_SELECTION: Color = Color::Rgb(54, 60, 76);
+
+/// A mouse text selection in transcript-line/cell coordinates.
+#[derive(Clone, Copy, Debug)]
+struct TextSelection {
+    anchor: (usize, usize),
+    cursor: (usize, usize),
+    dragging: bool,
+    moved: bool,
+}
+
+/// Parsed and wrapped history for one pane. Only the live turn is re-rendered
+/// on each frame; stored events stay here until the log, width, theme or fold
+/// state changes.
+struct HistoryCache {
+    width: usize,
+    theme: Theme,
+    folds: HashMap<FoldId, bool>,
+    events_rev: u64,
+    lines: Vec<Line<'static>>,
 }
 
 struct SessionView {
     session: Session,
     events: Vec<SessionEvent>,
+    /// Bumped whenever `events` changes so the render cache can be reused.
+    events_rev: u64,
+    history_cache: Option<HistoryCache>,
+    /// Older stored events exist before the first loaded event.
+    history_has_more: bool,
+    /// A history request is in flight.
+    history_loading: bool,
+    /// Cleared while a page loads so one page cannot immediately request more.
+    history_armed: bool,
+    /// `(old history line count, old scroll)` captured before prepending, so
+    /// the viewport keeps its place when the new page is rendered.
+    history_anchor: Option<(usize, usize)>,
     stream: Option<StreamState>,
     scroll: usize,
     follow: bool,
@@ -167,6 +229,11 @@ struct SessionView {
     folds: HashMap<FoldId, bool>,
     /// Line -> foldable block map from the last draw, used for click-to-fold.
     slots: Vec<Option<transcript::Fold>>,
+    /// Plain text for every transcript line from the last draw, used when a
+    /// mouse selection is copied.
+    text_lines: Vec<String>,
+    /// Active mouse selection, if any.
+    selection: Option<TextSelection>,
 }
 
 impl SessionView {
@@ -174,12 +241,45 @@ impl SessionView {
         Self {
             session,
             events,
+            events_rev: 0,
+            history_cache: None,
+            history_has_more: false,
+            history_loading: false,
+            history_armed: true,
+            history_anchor: None,
             stream: None,
             scroll: 0,
             follow: true,
             folds: HashMap::new(),
             slots: Vec::new(),
+            text_lines: Vec::new(),
+            selection: None,
         }
+    }
+
+    /// Rebuild the cached history when its inputs changed. Stored events are
+    /// immutable between pushes, so this is normally a no-op on redraws.
+    fn ensure_history(&mut self, width: usize, theme: Theme) {
+        let stale = self.history_cache.as_ref().is_none_or(|cache| {
+            cache.width != width
+                || cache.theme != theme
+                || cache.folds != self.folds
+                || cache.events_rev != self.events_rev
+        });
+        if !stale {
+            return;
+        }
+        let transcript::Transcript { lines, slots } =
+            transcript::render_history(&self.events, &self.folds, width, theme);
+        self.slots = slots;
+        self.text_lines = lines.iter().map(text_line).collect();
+        self.history_cache = Some(HistoryCache {
+            width,
+            theme,
+            folds: self.folds.clone(),
+            events_rev: self.events_rev,
+            lines,
+        });
     }
 
     /// Find the pending approval or staged patch in the replayable log. A
@@ -216,18 +316,35 @@ impl SessionView {
                         serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
                     {
                         if !resolved_calls.contains(&payload.call_id) {
+                            // Shell approvals carry a deliberately short
+                            // daemon summary. Keep the real command line so the
+                            // card can show it in full instead of approving a
+                            // truncated command.
+                            let summary =
+                                if matches!(payload.tool.as_str(), "run_command" | "start_command")
+                                {
+                                    payload
+                                        .arguments
+                                        .get("command")
+                                        .and_then(serde_json::Value::as_str)
+                                        .map(|command| format!("$ {command}"))
+                                        .unwrap_or(payload.summary)
+                                } else {
+                                    payload.summary
+                                };
+                            let path = payload
+                                .arguments
+                                .get("path")
+                                .and_then(serde_json::Value::as_str)
+                                .map(str::to_string);
                             tool = Some(PendingApproval {
                                 kind: PendingKind::Tool,
                                 approval_id: payload.approval_id,
                                 call_id: payload.call_id,
                                 tool: payload.tool,
-                                summary: payload.summary,
+                                summary,
                                 diff: payload.diff,
-                                path: payload
-                                    .arguments
-                                    .get("path")
-                                    .and_then(serde_json::Value::as_str)
-                                    .map(str::to_string),
+                                path,
                                 selected: vec![true; payload.hunks.len()],
                                 hunks: payload.hunks,
                                 cursor: 0,
@@ -337,6 +454,8 @@ enum PickerKind {
     Agents,
     /// Browse installed skills, with a body preview.
     Skills,
+    /// Preview and apply a color preset.
+    Themes,
 }
 
 impl PickerKind {
@@ -352,7 +471,8 @@ impl PickerKind {
             | Self::Commands
             | Self::Models
             | Self::Agents
-            | Self::Skills => None,
+            | Self::Skills
+            | Self::Themes => None,
         }
     }
 
@@ -368,6 +488,7 @@ impl PickerKind {
             Self::Models => "models — pin this session",
             Self::Agents => "agents — choose the primary agent",
             Self::Skills => "skills — preview and insert",
+            Self::Themes => "themes — live preview",
         }
     }
 
@@ -383,6 +504,7 @@ impl PickerKind {
             Self::Models => "Enter pin · Esc close",
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
+            Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
         }
     }
 }
@@ -538,6 +660,8 @@ struct DiffView {
     scroll: usize,
     /// Hunk under the selection cursor.
     cursor: usize,
+    /// Last rendered body width. Zero until the first frame.
+    width: usize,
 }
 
 /// Full-screen context ledger, opened with `c` from the transcript.
@@ -664,17 +788,6 @@ impl ProcessView {
 }
 
 /// Full-screen history search, opened with `#` from the transcript.
-struct DiagnosticsView {
-    result: eix_core::LspWorkspaceResult,
-    scroll: usize,
-}
-
-impl DiagnosticsView {
-    fn new(result: eix_core::LspWorkspaceResult) -> Self {
-        Self { result, scroll: 0 }
-    }
-}
-
 struct SearchView {
     query: String,
     hits: Vec<SearchHit>,
@@ -738,6 +851,10 @@ pub struct App {
     focus: Focus,
     picker: Option<Picker>,
     help: bool,
+    /// Interactive filter for the help overlay.
+    help_query: String,
+    /// Selected row in the filtered help list.
+    help_selected: usize,
     /// Recent timeline items for the read-only overlay.
     timeline: Option<Vec<eix_core::TimelineItem>>,
     timeline_scroll: usize,
@@ -749,6 +866,13 @@ pub struct App {
     inflight_images: Vec<String>,
     /// `Ctrl-W` was pressed; the next key is a window command.
     pending_window: bool,
+    /// `<Space>` was pressed in the transcript; the next key is a leader action.
+    pending_leader: bool,
+    /// Text selected with the mouse, waiting for the event loop to copy it to
+    /// the system clipboard.
+    pending_clipboard: Option<String>,
+    /// Older-history request picked up by the event loop after drawing.
+    pending_history: Option<(String, u64)>,
     /// Pane rectangles from the last draw, used to pick a focus direction.
     pane_areas: Vec<Rect>,
     /// Tool calls waiting on a decision, keyed by session id.
@@ -763,12 +887,14 @@ pub struct App {
     process_view: Option<ProcessView>,
     /// Full-screen history search, when open.
     search_view: Option<SearchView>,
-    /// Workspace LSP diagnostics overlay.
-    diagnostics_view: Option<DiagnosticsView>,
     status: String,
     error: Option<String>,
     connected: bool,
     tick: u64,
+    /// Cached branch of the focused session's cwd for the prompt header.
+    git_cwd: Option<std::path::PathBuf>,
+    git_branch: Option<String>,
+    git_checked: Option<Instant>,
     /// Ring the terminal bell when a background pane needs attention.
     pub bell: bool,
     /// Emit OSC 9/777 notifications and update the title on attention.
@@ -798,6 +924,12 @@ pub struct App {
     inbox: Option<InboxView>,
     /// Colors used by the transcript and approval cards.
     pub(crate) theme: Theme,
+    /// `[theme]` as loaded from config, kept so `/theme` can re-derive a
+    /// palette from a different preset without losing explicit slot overrides.
+    pub(crate) theme_config: eix_core::ThemeConfig,
+    /// Palette/config captured when the theme picker opened. Esc restores it;
+    /// Enter keeps the previewed selection.
+    theme_picker_backup: Option<(eix_core::ThemeConfig, Theme)>,
     /// Transcript-mode key overrides from `[keys]`.
     pub(crate) keybinds: Keybinds,
     /// When the previous `Esc` reached the prompt, for the double-Esc
@@ -806,8 +938,8 @@ pub struct App {
     /// Prompt history cursor: `None` is the live draft, `Some(i)` is `i`
     /// entries back from the newest submitted prompt.
     history_index: Option<usize>,
-    /// Draft captured when history browsing started, restored by `j` past the
-    /// newest entry.
+    /// Draft captured when history browsing started, restored by Ctrl-J past
+    /// the newest entry.
     history_draft: String,
     /// Prompts submitted while their session was busy, keyed by session id.
     /// `tick` drains one at a time as sessions go idle.
@@ -847,12 +979,17 @@ impl App {
             focus: Focus::Input,
             picker: None,
             help: false,
+            help_query: String::new(),
+            help_selected: 0,
             timeline: None,
             timeline_scroll: 0,
             pending_delete: None,
             pending_images: Vec::new(),
             inflight_images: Vec::new(),
             pending_window: false,
+            pending_leader: false,
+            pending_clipboard: None,
+            pending_history: None,
             pane_areas: Vec::new(),
             approvals: HashMap::new(),
             inputs: HashMap::new(),
@@ -860,11 +997,13 @@ impl App {
             ledger: None,
             process_view: None,
             search_view: None,
-            diagnostics_view: None,
             status: "connecting…".into(),
             error: None,
             connected: false,
             tick: 0,
+            git_cwd: None,
+            git_branch: None,
+            git_checked: None,
             bell: false,
             osc: false,
             default_model: None,
@@ -880,6 +1019,8 @@ impl App {
             force_clear: false,
             inbox: None,
             theme: Theme::default(),
+            theme_config: eix_core::ThemeConfig::default(),
+            theme_picker_backup: None,
             keybinds: Keybinds::default(),
             esc_at: None,
             history_index: None,
@@ -904,10 +1045,65 @@ impl App {
             && self.ledger.is_none()
             && self.process_view.is_none()
             && self.search_view.is_none()
-            && self.diagnostics_view.is_none()
             && self.inbox.is_none()
             && self.btw.is_none()
+            && self.error.is_none()
             && self.reason_prompt.is_none()
+    }
+
+    /// Open the help overlay with a fresh filter and selection.
+    fn open_help(&mut self) {
+        self.pending_leader = false;
+        self.help = true;
+        self.help_query.clear();
+        self.help_selected = 0;
+    }
+
+    /// Keys while help is open: typing filters, arrows/C-n/C-p select, Esc
+    /// closes. Plain `q`/`j`/`k` are search input rather than shortcuts so any
+    /// key entry can be found by name.
+    fn handle_help_key(&mut self, key: KeyEvent) {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => self.help = false,
+            KeyCode::Char('u') if control => {
+                self.help_query.clear();
+                self.help_selected = 0;
+            }
+            KeyCode::Backspace => {
+                self.help_query.pop();
+                self.help_selected = 0;
+            }
+            KeyCode::Up | KeyCode::PageUp => {
+                let step = if key.code == KeyCode::PageUp { 8 } else { 1 };
+                self.move_help_selection(-step);
+            }
+            KeyCode::Down | KeyCode::PageDown => {
+                let step = if key.code == KeyCode::PageDown { 8 } else { 1 };
+                self.move_help_selection(step);
+            }
+            KeyCode::Char('p') if control => self.move_help_selection(-1),
+            KeyCode::Char('n') if control => self.move_help_selection(1),
+            KeyCode::Home => self.help_selected = 0,
+            KeyCode::End => {
+                self.help_selected = help_entry_count(&self.help_query).saturating_sub(1);
+            }
+            KeyCode::Char(ch) if !control && !key.modifiers.contains(KeyModifiers::ALT) => {
+                self.help_query.push(ch);
+                self.help_selected = 0;
+            }
+            _ => {}
+        }
+    }
+
+    fn move_help_selection(&mut self, delta: isize) {
+        let count = help_entry_count(&self.help_query);
+        if count == 0 {
+            self.help_selected = 0;
+            return;
+        }
+        let selected = self.help_selected.min(count - 1) as isize;
+        self.help_selected = (selected + delta).clamp(0, count as isize - 1) as usize;
     }
 
     /// Put the last submitted draft back after a failed turn, if it belongs to
@@ -958,10 +1154,53 @@ impl App {
         std::mem::take(&mut self.force_clear)
     }
 
+    /// Text selected with the mouse, for the event loop's clipboard writer.
+    pub fn take_clipboard(&mut self) -> Option<String> {
+        self.pending_clipboard.take()
+    }
+
+    /// An older-history page request produced by the last draw.
+    pub fn take_history_request(&mut self) -> Option<(String, u64)> {
+        self.pending_history.take()
+    }
+
     pub fn tick(&mut self, tx: &UnboundedSender<Command>) {
         self.tick = self.tick.wrapping_add(1);
+        self.refresh_git_branch();
         self.sync_draft(tx);
         self.flush_queues(tx);
+    }
+
+    /// Update the branch shown in the prompt header. Spawning `git` on every
+    /// tick would be wasteful, so a cached value is reused for a few seconds.
+    fn refresh_git_branch(&mut self) {
+        let cwd = self
+            .focused_view()
+            .map(|view| view.session.cwd.clone())
+            .or_else(|| {
+                self.sessions
+                    .get(self.selected)
+                    .map(|session| session.cwd.clone())
+            });
+        let Some(cwd) = cwd else {
+            self.git_cwd = None;
+            self.git_branch = None;
+            self.git_checked = None;
+            return;
+        };
+        if self.git_cwd.as_ref() != Some(&cwd) {
+            self.git_cwd = Some(cwd.clone());
+            self.git_branch = None;
+            self.git_checked = None;
+        }
+        if self
+            .git_checked
+            .is_some_and(|checked| checked.elapsed() < GIT_BRANCH_REFRESH)
+        {
+            return;
+        }
+        self.git_checked = Some(Instant::now());
+        self.git_branch = read_git_branch(&cwd);
     }
 
     /// Persist the prompt as a per-session draft when the focused pane changes
@@ -1034,10 +1273,11 @@ impl App {
         self.input.paste(text);
     }
 
-    /// Mouse clicks focus a pane and expand/collapse the block under the
-    /// cursor. The wheel scrolls the pane under the cursor. Anything outside
-    /// the panes focuses the prompt.
+    /// Mouse clicks focus a pane; dragging selects transcript text and copies
+    /// it on release. A click without a drag still toggles the block under the
+    /// cursor. The wheel scrolls the pane under the cursor.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.pending_leader = false;
         let (x, y) = (mouse.column, mouse.row);
         let pane = self.pane_areas.iter().position(|rect| {
             x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
@@ -1058,24 +1298,170 @@ impl App {
                 _ => {}
             }
         }
-        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+
+        let active = self
+            .views
+            .iter()
+            .position(|view| view.selection.is_some_and(|selection| selection.dragging));
+        let index = match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let Some(index) = pane else {
+                    self.focus = Focus::Input;
+                    for view in &mut self.views {
+                        view.selection = None;
+                    }
+                    return;
+                };
+                self.focused = index;
+                self.focus = Focus::Transcript;
+                for view in &mut self.views {
+                    view.selection = None;
+                }
+                index
+            }
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                // Keep tracking the pane where the drag started, even when the
+                // pointer crosses into another pane or leaves the transcript.
+                let Some(index) = active else {
+                    return;
+                };
+                index
+            }
+            _ => return,
+        };
+        let rect = self.pane_areas.get(index).copied().unwrap_or_default();
+        if rect.width < 3 || rect.height < 3 {
             return;
         }
-        let Some(index) = pane else {
-            self.focus = Focus::Input;
-            return;
-        };
-        self.focused = index;
-        self.focus = Focus::Transcript;
-        let rect = self.pane_areas[index];
-        let Some(line) = y.checked_sub(rect.y + 1) else {
-            return;
-        };
+
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let position = self.selection_position(index, rect, x, y, false);
+                self.views[index].selection = position.map(|(line, column)| TextSelection {
+                    anchor: (line, column),
+                    cursor: (line, column),
+                    dragging: true,
+                    moved: false,
+                });
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(selection) = self.views[index].selection else {
+                    return;
+                };
+                if !selection.dragging {
+                    return;
+                }
+                let Some(position) = self.selection_position(index, rect, x, y, true) else {
+                    return;
+                };
+                let view = &mut self.views[index];
+                if let Some(selection) = view.selection.as_mut() {
+                    if position != selection.cursor {
+                        selection.moved = true;
+                        selection.cursor = position;
+                    }
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let mut copied = None;
+                let mut fold = None;
+                {
+                    let view = &mut self.views[index];
+                    let Some(selection) = view.selection.as_mut() else {
+                        return;
+                    };
+                    selection.dragging = false;
+                    if selection.moved {
+                        let text = selection_text(&view.text_lines, selection);
+                        if !text.is_empty() {
+                            copied = Some(text);
+                        }
+                    } else {
+                        fold = view.slots.get(selection.anchor.0).and_then(|slot| *slot);
+                    }
+                }
+                if let Some(fold) = fold {
+                    self.views[index].folds.insert(fold.id, !fold.open);
+                    self.views[index].selection = None;
+                } else if let Some(text) = copied {
+                    self.status = format!("copied {} chars", text.chars().count());
+                    // Seed the prompt's unnamed register too: normal-mode `p`
+                    // can then paste the same text even if the native
+                    // clipboard helper is unavailable.
+                    self.input.set_register_text(&text);
+                    self.pending_clipboard = Some(text);
+                } else {
+                    // A plain click, or a drag over nothing, leaves no
+                    // zero-width selection behind.
+                    self.views[index].selection = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Map a screen cell to a transcript line/column, clamping drags to the
+    /// pane and auto-scrolling when the pointer crosses its top or bottom.
+    fn selection_position(
+        &mut self,
+        index: usize,
+        rect: Rect,
+        x: u16,
+        y: u16,
+        dragging: bool,
+    ) -> Option<(usize, usize)> {
+        let borders = pane_borders(&self.pane_areas, index);
+        let left = rect
+            .x
+            .saturating_add(u16::from(borders.contains(Borders::LEFT)));
+        let right = rect
+            .x
+            .saturating_add(rect.width)
+            .saturating_sub(u16::from(borders.contains(Borders::RIGHT)));
+        let top = rect
+            .y
+            .saturating_add(u16::from(borders.contains(Borders::TOP)));
+        let bottom = rect
+            .y
+            .saturating_add(rect.height)
+            .saturating_sub(u16::from(borders.contains(Borders::BOTTOM)));
+        if right <= left || bottom <= top {
+            return None;
+        }
+        if !dragging && (x < left || x >= right || y < top || y >= bottom) {
+            return None;
+        }
+
         let view = &mut self.views[index];
-        let line = line as usize + view.scroll;
-        if let Some(fold) = view.slots.get(line).and_then(|slot| *slot) {
-            view.folds.insert(fold.id, !fold.open);
+        if dragging {
+            let inner_height = rect
+                .height
+                .saturating_sub(u16::from(borders.contains(Borders::TOP)))
+                .saturating_sub(u16::from(borders.contains(Borders::BOTTOM)))
+                as usize;
+            if y < top {
+                view.history_armed = true;
+                if view.scroll > 0 {
+                    view.scroll -= 1;
+                    view.follow = false;
+                }
+            } else if y >= bottom {
+                let max_scroll = view.text_lines.len().saturating_sub(inner_height);
+                if view.scroll < max_scroll {
+                    view.scroll += 1;
+                    view.follow = false;
+                }
+            }
         }
+        let x = x.clamp(left, right.saturating_sub(1));
+        let y = y.clamp(top, bottom.saturating_sub(1));
+        let line = view.scroll.saturating_add(y.saturating_sub(top) as usize);
+        if view.text_lines.is_empty() {
+            return Some((line, 0));
+        }
+        let line = line.min(view.text_lines.len() - 1);
+        let width = UnicodeWidthStr::width(view.text_lines[line].as_str());
+        Some((line, ((x - left) as usize).min(width)))
     }
 
     pub fn handle_event(&mut self, event: Event, tx: &UnboundedSender<Command>) {
@@ -1116,6 +1502,11 @@ impl App {
                 }
             }
             Event::Attached(attached) => self.attached(attached),
+            Event::HistoryPage {
+                session_id,
+                events,
+                has_more,
+            } => self.history_page(session_id, events, has_more),
             Event::Created(session) => {
                 self.creating = false;
                 let id = session.id.clone();
@@ -1264,12 +1655,6 @@ impl App {
             Event::ConfigReloaded { paths } => {
                 self.status = format!("config reloaded ({} layer(s))", paths.len());
             }
-            Event::Exported { path } => {
-                self.status = match path {
-                    Some(path) => format!("exported to {}", path.display()),
-                    None => "exported".into(),
-                };
-            }
             Event::Archived(session) => {
                 let id = session.id.clone();
                 self.sessions.retain(|existing| existing.id != id);
@@ -1304,12 +1689,6 @@ impl App {
                         truncate(first, 80)
                     )
                 };
-            }
-            Event::Diagnostics(result) => {
-                let count = result.diagnostics.len();
-                let files = result.files;
-                self.diagnostics_view = Some(DiagnosticsView::new(result));
-                self.status = format!("diagnostics: {count} in {files} file(s)");
             }
             Event::Todos(items) => {
                 if items.is_empty() {
@@ -1550,6 +1929,14 @@ impl App {
                     }
                     "create" => self.creating = false,
                     "attach" => self.pending_attach = None,
+                    "history" => {
+                        for view in &mut self.views {
+                            view.history_loading = false;
+                            // Re-arm only after the user scrolls down again,
+                            // so a persistent error cannot spam requests.
+                            view.history_armed = false;
+                        }
+                    }
                     "connect" => {
                         self.connected = false;
                         self.initialized = true;
@@ -1585,7 +1972,9 @@ impl App {
         let pending = self.pending_attach.take().expect("checked above");
         self.upsert_session(attached.session.clone(), false);
         let session_id = attached.session.id.clone();
-        let view = SessionView::new(attached.session, attached.events);
+        let has_more = attached.has_more;
+        let mut view = SessionView::new(attached.session, attached.events);
+        view.history_has_more = has_more;
 
         if let Some(open) = self.open_session(&session_id) {
             // One session lives in at most one pane.
@@ -1609,6 +1998,43 @@ impl App {
         self.selected = self.find_session(&session_id).unwrap_or(self.selected);
         self.error = None;
         self.status = "attached".into();
+    }
+
+    /// Merge a page of older stored events and keep the viewport anchored on
+    /// the content it was showing before the prepend.
+    fn history_page(&mut self, session_id: String, events: Vec<SessionEvent>, has_more: bool) {
+        let Some(view) = self
+            .views
+            .iter_mut()
+            .find(|view| view.session.id == session_id)
+        else {
+            return;
+        };
+        view.history_loading = false;
+        view.history_has_more = has_more;
+        view.history_armed = false;
+        let Some(first_seq) = view.events.first().map(|event| event.seq) else {
+            view.history_has_more = false;
+            return;
+        };
+        let older: Vec<SessionEvent> = events
+            .into_iter()
+            .filter(|event| event.seq < first_seq)
+            .collect();
+        if older.is_empty() {
+            // An empty page means there is nothing further back, even if the
+            // daemon's count was off.
+            view.history_has_more = false;
+            return;
+        }
+        if !view.follow {
+            if let Some(cache) = &view.history_cache {
+                let anchor = (cache.lines.len(), view.scroll);
+                view.history_anchor.get_or_insert(anchor);
+            }
+        }
+        view.events.splice(0..0, older);
+        view.events_rev = view.events_rev.wrapping_add(1);
     }
 
     fn submitted(&mut self, submitted: SubmitResult) {
@@ -1732,6 +2158,7 @@ impl App {
                         _ => {}
                     }
                     view.events.push(event);
+                    view.events_rev = view.events_rev.wrapping_add(1);
                     if relevant {
                         self.reload_pending(&id);
                     }
@@ -2082,8 +2509,19 @@ impl App {
             }
             return;
         }
+        // Errors float above everything else and keep the keyboard until
+        // dismissed, so a failed action cannot silently disappear.
+        if self.error.is_some() {
+            if matches!(
+                key.code,
+                KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') | KeyCode::Char('Q')
+            ) {
+                self.error = None;
+            }
+            return;
+        }
         if matches!(key.code, KeyCode::F(1)) {
-            self.help = true;
+            self.open_help();
             return;
         }
 
@@ -2151,58 +2589,8 @@ impl App {
             return;
         }
 
-        if self.diagnostics_view.is_some() {
-            match key.code {
-                KeyCode::Esc | KeyCode::Char('q') => {
-                    self.diagnostics_view = None;
-                    self.status = "diagnostics closed".into();
-                }
-                KeyCode::Char('j') | KeyCode::Down => {
-                    if let Some(view) = &mut self.diagnostics_view {
-                        view.scroll = view.scroll.saturating_add(1);
-                        let len = view.result.diagnostics.len();
-                        view.scroll = view.scroll.min(len.saturating_sub(1));
-                    }
-                }
-                KeyCode::Char('k') | KeyCode::Up => {
-                    if let Some(view) = &mut self.diagnostics_view {
-                        view.scroll = view.scroll.saturating_sub(1);
-                    }
-                }
-                KeyCode::PageDown => {
-                    if let Some(view) = &mut self.diagnostics_view {
-                        view.scroll = view.scroll.saturating_add(10);
-                        let len = view.result.diagnostics.len();
-                        view.scroll = view.scroll.min(len.saturating_sub(1));
-                    }
-                }
-                KeyCode::PageUp => {
-                    if let Some(view) = &mut self.diagnostics_view {
-                        view.scroll = view.scroll.saturating_sub(10);
-                    }
-                }
-                KeyCode::Char('g') => {
-                    if let Some(view) = &mut self.diagnostics_view {
-                        view.scroll = 0;
-                    }
-                }
-                KeyCode::Char('G') => {
-                    if let Some(view) = &mut self.diagnostics_view {
-                        view.scroll = view.result.diagnostics.len().saturating_sub(1);
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-
         if self.help {
-            if matches!(
-                key.code,
-                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('?')
-            ) {
-                self.help = false;
-            }
+            self.handle_help_key(key);
             return;
         }
 
@@ -2272,11 +2660,35 @@ impl App {
     }
 
     fn handle_input_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        // The prompt's editor owns its own leader; never leak a transcript
+        // leader into typed input.
+        self.pending_leader = false;
         // Cross-mode session picker. It is a TUI binding, so it works in every
         // editor mode (and does not consume a normal-mode letter).
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
             self.open_picker(PickerKind::Sessions, tx);
             return;
+        }
+
+        // Normal-mode `p`/`P` can paste the desktop clipboard as well as the
+        // editor's own register. Prefer the register when it already holds a
+        // yank/delete so Vim editing keeps working; otherwise read the system
+        // clipboard (e.g. text selected with the mouse in the transcript).
+        if matches!(key.code, KeyCode::Char('p') | KeyCode::Char('P'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && self.input.normal_paste_ready()
+            && !self.input.has_register_text()
+        {
+            if let Some(text) = super::read_clipboard() {
+                let chars = text.chars().count();
+                self.input
+                    .paste_external(&text, matches!(key.code, KeyCode::Char('p')));
+                self.status = format!("pasted {chars} chars");
+                self.esc_at = None;
+                return;
+            }
         }
 
         // While typing a bare `/command`, the suggestion menu owns vertical
@@ -2491,6 +2903,7 @@ impl App {
 
     fn focus_input(&mut self) {
         self.focus = Focus::Input;
+        self.pending_leader = false;
         self.esc_at = None;
         self.input.enter_insert();
     }
@@ -2505,7 +2918,28 @@ impl App {
             self.handle_window_key(key, tx);
             return;
         }
+        if self.pending_leader {
+            let available = self.focused_approval().is_none() && self.focused_input().is_none();
+            self.pending_leader = false;
+            if available {
+                if let KeyCode::Char(ch) = key.code {
+                    if let Some(action) = leader_action(ch) {
+                        self.run_action(action, tx);
+                    }
+                }
+            }
+            return;
+        }
         if self.focused_approval().is_none() && self.focused_input().is_none() {
+            if key.code == KeyCode::Char(' ')
+                && !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                self.pending_leader = true;
+                self.status = "leader: s/f/w/b · n new · o pane · C/q close · a commands · i input · Q quit · ? help · Esc cancel"
+                    .into();
+                return;
+            }
             if let Some(action) = self.keybinds.action(key) {
                 self.run_key_action(action, tx);
                 return;
@@ -2627,31 +3061,22 @@ impl App {
                 _ => {}
             }
         }
+        // Pane actions are leader-only. Single letters are reserved for
+        // navigation (j/k, g/G) and the prompt's own vim editing; the only
+        // direct shortcuts left are shifted punctuation (`:`/`?`/`#`/`<`/`>`).
         match key.code {
-            KeyCode::Char('q') => {
-                self.sync_draft(tx);
-                self.should_quit = true;
-            }
-            KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
-            KeyCode::Char('n') => self.create_session(tx, false),
-            KeyCode::Char('N') => self.create_session(tx, true),
-            KeyCode::Char('p') => self.open_picker(PickerKind::Sessions, tx),
-            KeyCode::Char('o') => self.open_picker(PickerKind::NewPane, tx),
             KeyCode::Char(':') => self.open_picker(PickerKind::Commands, tx),
-            KeyCode::Char('w') => self.open_picker(PickerKind::Worktrees, tx),
-            KeyCode::Char('b') => self.open_picker(PickerKind::Branches, tx),
-            KeyCode::Char('c') => self.open_ledger(tx),
-            KeyCode::Char('P') => self.open_processes(tx),
-            KeyCode::Char('A') => self.open_inbox(),
+            KeyCode::Char('?') => self.open_help(),
             KeyCode::Char('#') => {
                 self.search_view = Some(SearchView::new());
                 self.status =
                     "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
             }
-            KeyCode::Char('F') => self.fork_focused(tx, None),
-            KeyCode::Char('a') => self.focus_next_attention(),
-            KeyCode::Char('?') => self.help = true,
-            KeyCode::Char('x') => self.cancel(tx),
+            KeyCode::Char('<') => self.cycle_pane(-1),
+            KeyCode::Char('>') => self.cycle_pane(1),
+            // `i` is the one bare letter that stays: focusing the prompt is
+            // the normal way out of the transcript, like vim insert mode.
+            KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
             KeyCode::Tab => self.cycle_session(1, tx),
             KeyCode::BackTab => self.cycle_session(-1, tx),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
@@ -2668,6 +3093,7 @@ impl App {
                 if let Some(view) = self.focused_view_mut() {
                     view.scroll = 0;
                     view.follow = false;
+                    view.history_armed = true;
                 }
             }
             KeyCode::Char('G') => {
@@ -2686,7 +3112,7 @@ impl App {
                 self.sync_draft(tx);
                 self.should_quit = true;
             }
-            KeyAction::Help => self.help = true,
+            KeyAction::Help => self.open_help(),
             KeyAction::NewSession => self.create_session(tx, false),
             KeyAction::NewWorktree => self.create_session(tx, true),
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
@@ -2724,7 +3150,6 @@ impl App {
                     self.status = "todos: loading…".into();
                 }
             }
-            KeyAction::Diagnostics => self.open_diagnostics(tx),
             KeyAction::Undo | KeyAction::Redo => {
                 if let Some(session_id) = self.focused_session_id() {
                     let redo = action == KeyAction::Redo;
@@ -2746,18 +3171,6 @@ impl App {
         ));
         self.status = "context ledger: loading…".into();
         let _ = tx.send(Command::ContextLedger { session_id });
-    }
-
-    fn open_diagnostics(&mut self, tx: &UnboundedSender<Command>) {
-        let Some(session_id) = self.focused_session_id() else {
-            self.status = "no session to inspect".into();
-            return;
-        };
-        let _ = tx.send(Command::Diagnostics {
-            session_id,
-            max_files: None,
-        });
-        self.status = "diagnostics: loading…".into();
     }
 
     fn handle_ledger_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
@@ -3208,7 +3621,13 @@ impl App {
             }
         }
         match key.code {
-            KeyCode::Esc => self.picker = None,
+            KeyCode::Esc => {
+                if kind == PickerKind::Themes {
+                    self.cancel_theme_picker();
+                } else {
+                    self.picker = None;
+                }
+            }
             KeyCode::Up => self.move_picker(-1),
             KeyCode::Down => self.move_picker(1),
             KeyCode::Enter => self.picker_enter(kind, tx),
@@ -3235,6 +3654,7 @@ impl App {
             }
             _ => {}
         }
+        self.preview_theme_selection();
     }
 
     fn move_picker(&mut self, delta: i32) {
@@ -3247,6 +3667,64 @@ impl App {
                 picker.selected = (current + delta).clamp(0, len as i32 - 1) as usize;
             }
         }
+        self.preview_theme_selection();
+    }
+
+    /// Recolor the TUI for the theme under the picker cursor. The original
+    /// palette is restored by Esc, so browsing never leaves a half-applied
+    /// theme behind.
+    fn preview_theme_selection(&mut self) {
+        if self.picker.as_ref().map(|picker| picker.kind) != Some(PickerKind::Themes) {
+            return;
+        }
+        let Some((config, original)) = self.theme_picker_backup.clone() else {
+            return;
+        };
+        let selected = self
+            .picker
+            .as_ref()
+            .map(|picker| picker.selected)
+            .unwrap_or(0);
+        let value = self
+            .picker_filtered()
+            .get(selected)
+            .copied()
+            .and_then(|index| {
+                self.picker
+                    .as_ref()
+                    .and_then(|picker| picker.items.get(index))
+                    .map(|item| item.value.clone())
+            });
+        let Some(value) = value else {
+            self.theme = original;
+            return;
+        };
+        let mut config = config;
+        config.preset = (value != THEME_DEFAULT_VALUE).then_some(value);
+        self.theme = Theme::from_config(&config);
+    }
+
+    fn cancel_theme_picker(&mut self) {
+        if let Some((config, theme)) = self.theme_picker_backup.take() {
+            self.theme_config = config;
+            self.theme = theme;
+            self.status = "theme unchanged".into();
+        }
+        self.picker = None;
+    }
+
+    fn apply_theme_picker(&mut self, value: &str) {
+        self.theme_picker_backup = None;
+        self.theme_config.preset = (value != THEME_DEFAULT_VALUE).then(|| value.to_string());
+        self.theme = Theme::from_config(&self.theme_config);
+        self.status = if value == THEME_DEFAULT_VALUE {
+            "theme → default".into()
+        } else if let Some(preset) = theme_preset(value) {
+            format!("theme → {} ({})", preset.name, preset.description)
+        } else {
+            format!("theme → {value}")
+        };
+        self.picker = None;
     }
 
     /// Rows for the open picker: session indices or item indices.
@@ -3362,6 +3840,11 @@ impl App {
                     }
                 }
             }
+            PickerKind::Themes => {
+                if let Some(value) = value {
+                    self.apply_theme_picker(&value);
+                }
+            }
         }
     }
 
@@ -3375,6 +3858,11 @@ impl App {
     fn open_picker(&mut self, kind: PickerKind, tx: &UnboundedSender<Command>) {
         // A picker opening clears any half-finished double-Esc gesture.
         self.esc_at = None;
+        // Switching from one picker to another must not keep a previewed theme.
+        if let Some((config, theme)) = self.theme_picker_backup.take() {
+            self.theme_config = config;
+            self.theme = theme;
+        }
         let mut picker = Picker {
             kind,
             query: String::new(),
@@ -3414,6 +3902,16 @@ impl App {
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             picker.items = skill_picker_items(&eix_core::load_skills(&cwd));
             self.status = format!("{} skill(s)", picker.items.len());
+        } else if kind == PickerKind::Themes {
+            picker.items = theme_picker_items();
+            let current = self.theme.preset.unwrap_or(THEME_DEFAULT_VALUE);
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.value == current)
+                .unwrap_or(0);
+            self.theme_picker_backup = Some((self.theme_config.clone(), self.theme));
+            self.status = "theme preview · Enter apply · Esc cancel".into();
         } else {
             picker.selected = self.selected.min(self.sessions.len().saturating_sub(1));
         }
@@ -3424,6 +3922,7 @@ impl App {
     /// Unknown ids are ignored.
     fn run_action(&mut self, id: &str, tx: &UnboundedSender<Command>) {
         match id {
+            "commands" | "palette" => self.open_picker(PickerKind::Commands, tx),
             "sessions" => self.open_picker(PickerKind::Sessions, tx),
             "new-pane" => self.open_picker(PickerKind::NewPane, tx),
             "files" => self.open_picker(PickerKind::Files, tx),
@@ -3431,8 +3930,9 @@ impl App {
             "branches" => self.open_picker(PickerKind::Branches, tx),
             "models" => self.open_picker(PickerKind::Models, tx),
             "agents" => self.open_picker(PickerKind::Agents, tx),
+            "toggle-agent" => self.toggle_agent_mode(tx),
             "skills" => self.open_picker(PickerKind::Skills, tx),
-            "diagnostics" | "lsp" => self.open_diagnostics(tx),
+            "theme" => self.open_picker(PickerKind::Themes, tx),
             "context" => self.open_picker(PickerKind::Context, tx),
             "history" => {
                 self.search_view = Some(SearchView::new());
@@ -3446,14 +3946,45 @@ impl App {
             "new-worktree" => self.create_session(tx, true),
             "fork" => self.fork_focused(tx, None),
             "cancel" => self.cancel(tx),
+            "attention" => self.focus_next_attention(),
+            "input" => self.focus_input(),
             "close-pane" => self.close_focused_pane(),
-            "help" => self.help = true,
+            "pane-prev" => self.cycle_pane(-1),
+            "pane-next" => self.cycle_pane(1),
+            "help" => self.open_help(),
             "quit" => {
                 self.sync_draft(tx);
                 self.should_quit = true;
             }
             _ => {}
         }
+    }
+
+    /// Flip the focused session between the built-in `build` and `plan`
+    /// agents. `None` means the default build behavior; `Some("plan")` selects
+    /// the read-only planning agent.
+    fn toggle_agent_mode(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(view) = self.focused_view_mut() else {
+            self.status = "attach a session first".into();
+            return;
+        };
+        let session_id = view.session.id.clone();
+        let next = if view.session.agent.as_deref() == Some("plan") {
+            None
+        } else {
+            Some("plan".to_string())
+        };
+        // Update locally so a quick second Tab flips back before the daemon
+        // round-trip lands; the session event reconciles the final state.
+        view.session.agent = next.clone();
+        let _ = tx.send(Command::SetAgent {
+            session_id,
+            agent: next.clone(),
+        });
+        self.status = match next.as_deref() {
+            Some("plan") => "Plan".into(),
+            _ => "Build".into(),
+        };
     }
 
     fn filtered_sessions(&self) -> Vec<usize> {
@@ -3685,8 +4216,8 @@ impl App {
         self.input.clear();
         self.last_saved_draft.clear();
         self.reset_history();
-        // `/exit` and `/quit` save the (now empty) draft themselves.
-        if !matches!(name, "exit" | "quit") {
+        // `/exit`, `/quit` and `/close` save the (now empty) draft themselves.
+        if !matches!(name, "exit" | "quit" | "close") {
             if let Some(session_id) = self.focused_session_id() {
                 let _ = tx.send(Command::DraftSet {
                     session_id,
@@ -3699,8 +4230,12 @@ impl App {
                 self.exit_session(tx);
                 true
             }
+            "close" => {
+                self.close_session(tx);
+                true
+            }
             "help" => {
-                self.help = true;
+                self.open_help();
                 true
             }
             "new" => {
@@ -3767,6 +4302,14 @@ impl App {
                 self.status = "reloading config…".into();
                 true
             }
+            "theme" => {
+                if args.is_empty() {
+                    self.open_picker(PickerKind::Themes, tx);
+                } else {
+                    self.error = Some("usage: /theme (opens the theme picker)".into());
+                }
+                true
+            }
             "timeline" => {
                 let limit = if args.is_empty() {
                     None
@@ -3783,27 +4326,6 @@ impl App {
                     let _ = tx.send(Command::TimelineData { session_id, limit });
                     self.status = "timeline: loading…".into();
                 }
-                true
-            }
-            "export" => {
-                let Some(session_id) = self.focused_session_id() else {
-                    self.status = "no session yet".into();
-                    return true;
-                };
-                let path = if args.is_empty() {
-                    let cwd = self
-                        .focused_view()
-                        .map(|view| view.session.cwd.clone())
-                        .unwrap_or_else(|| {
-                            std::env::current_dir()
-                                .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                        });
-                    Some(cwd.join(format!("eix-session-{}.json", &session_id[..8])))
-                } else {
-                    Some(std::path::PathBuf::from(args))
-                };
-                let _ = tx.send(Command::ExportSession { session_id, path });
-                self.status = "exporting…".into();
                 true
             }
             "archive" => {
@@ -3865,17 +4387,6 @@ impl App {
                 if let Some(session_id) = self.focused_session_id() {
                     let _ = tx.send(Command::ListTodos { session_id });
                     self.status = "todos: loading…".into();
-                }
-                true
-            }
-            "diagnostics" | "lsp" => {
-                if let Some(session_id) = self.focused_session_id() {
-                    let max_files = args.parse::<usize>().ok();
-                    let _ = tx.send(Command::Diagnostics {
-                        session_id,
-                        max_files,
-                    });
-                    self.status = "diagnostics: loading…".into();
                 }
                 true
             }
@@ -4182,6 +4693,15 @@ already exists, update it in place rather than rewriting it from scratch.";
     /// open pane, quit the TUI. Session history is already durable in the
     /// daemon; the only state to save here is the (cleared) draft.
     fn exit_session(&mut self, tx: &UnboundedSender<Command>) {
+        self.detach_focused_session(tx, true)
+    }
+
+    /// Close the focused pane without quitting when it is the last one.
+    fn close_session(&mut self, tx: &UnboundedSender<Command>) {
+        self.detach_focused_session(tx, false)
+    }
+
+    fn detach_focused_session(&mut self, tx: &UnboundedSender<Command>, quit_when_last: bool) {
         let Some(view) = self.focused_view() else {
             self.should_quit = true;
             return;
@@ -4196,8 +4716,12 @@ already exists, update it in place rather than rewriting it from scratch.";
             text: String::new(),
         });
         if self.views.len() <= 1 {
-            self.status = format!("saved {name} · quitting");
-            self.should_quit = true;
+            if quit_when_last {
+                self.status = format!("saved {name} · quitting");
+                self.should_quit = true;
+            } else {
+                self.status = "cannot close the last pane · use /quit to exit".into();
+            }
             return;
         }
         self.close_focused_pane();
@@ -4507,6 +5031,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             session_id,
             scroll: 0,
             cursor: 0,
+            width: 0,
         });
         self.status = if has_hunks {
             "diff review: j/k scroll · [ ] hunk · Space toggle · y apply · n deny".into()
@@ -4517,18 +5042,27 @@ already exists, update it in place rather than rewriting it from scratch.";
 
     fn handle_diff_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
         let key = next_prev_key(key);
-        let Some((session_id, scroll, cursor)) = self
-            .diff_view
-            .as_ref()
-            .map(|view| (view.session_id.clone(), view.scroll, view.cursor))
-        else {
+        let Some((session_id, scroll, cursor, width)) = self.diff_view.as_ref().map(|view| {
+            (
+                view.session_id.clone(),
+                view.scroll,
+                view.cursor,
+                view.width,
+            )
+        }) else {
             return;
         };
-        let Some((total, offsets)) = self
-            .approvals
-            .get(&session_id)
-            .map(|approval| (review_total_lines(approval), review_hunk_offsets(approval)))
-        else {
+        let Some((total, offsets)) = self.approvals.get(&session_id).map(|approval| {
+            let rows = super::diff::rows(&approval.hunks, approval.diff.as_deref());
+            if super::diff::DiffRenderer::can_render(&rows, width, "") {
+                (rows.len(), super::diff::hunk_offsets(&approval.hunks))
+            } else {
+                (
+                    review_unified_total(approval),
+                    review_unified_hunk_offsets(approval),
+                )
+            }
+        }) else {
             // The approval was answered elsewhere; drop the overlay.
             self.diff_view = None;
             return;
@@ -4842,6 +5376,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         if amount >= 0 {
             view.scroll = view.scroll.saturating_add(amount as usize);
         } else {
+            // Scrolling up is an explicit request for older content, so allow
+            // another page even if the previous page added very few lines.
+            view.history_armed = true;
             view.scroll = view.scroll.saturating_sub(amount.unsigned_abs());
         }
     }
@@ -4863,19 +5400,14 @@ already exists, update it in place rather than rewriting it from scratch.";
             return;
         }
 
-        // Fixed prompt height: normal-mode editing and long drafts must never
-        // resize the box (the editor scrolls instead).
-        let input_height = prompt_input_height(area.height);
-        let chunks = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(input_height),
-            Constraint::Length(1),
-        ])
-        .split(area);
+        // Grow with the draft up to a small cap so long command lines are
+        // readable; beyond that the editor scrolls instead of taking the pane.
+        let input_height = prompt_input_height(area.height, area.width, &self.input);
+        let chunks =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(input_height)]).split(area);
 
         self.draw_body(frame, chunks[0]);
         self.draw_input(frame, chunks[1]);
-        self.draw_footer(frame, chunks[2]);
         if self.command_menu_open() {
             self.draw_command_menu(frame, chunks[1]);
         }
@@ -4887,10 +5419,16 @@ already exists, update it in place rather than rewriting it from scratch.";
             self.draw_picker(frame, area);
         }
         if self.help {
-            draw_help(frame, area);
+            draw_help(
+                frame,
+                area,
+                &self.help_query,
+                self.help_selected,
+                self.theme,
+            );
         }
         if let Some(items) = &self.timeline {
-            draw_timeline(frame, area, items, self.timeline_scroll);
+            draw_timeline(frame, area, items, self.timeline_scroll, self.theme);
         }
         if self.diff_view.is_some() {
             self.draw_diff_view(frame, area);
@@ -4907,77 +5445,154 @@ already exists, update it in place rather than rewriting it from scratch.";
         if self.search_view.is_some() {
             self.draw_search(frame, area);
         }
-        if self.diagnostics_view.is_some() {
-            self.draw_diagnostics(frame, area);
+        if self.error.is_some() {
+            self.draw_error_dialog(frame, area);
         }
     }
 
-    /// Compact session banner, rendered on the line directly above the prompt
-    /// grid (the input box title) instead of a separate top row.
+    /// Glyph for the prompt header. Idle and running are icon-only so the
+    /// header stays compact; other states keep their symbol and label.
+    fn status_glyph(&self, status: SessionStatus) -> String {
+        match status {
+            SessionStatus::Idle => status.symbol().to_string(),
+            SessionStatus::Running => {
+                RUNNING_SPINNER[(self.tick as usize) % RUNNING_SPINNER.len()].to_string()
+            }
+            _ => format!("{} {}", status.symbol(), status.as_str()),
+        }
+    }
+
+    /// Prompt header: current agent mode, session status and model. The old
+    /// `eix` brand chip and the footer statusline are intentionally gone so the
+    /// line above the input stays quiet.
     fn header_spans(&self) -> Vec<Span<'static>> {
         let session = self
             .focused_view()
             .map(|view| &view.session)
             .or_else(|| self.sessions.get(self.selected));
-        let dim = Style::default().fg(Color::DarkGray);
-        let mut spans = vec![Span::styled(
-            " eix ",
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )];
+        let panel = composer_background(self.theme);
+        let muted = composer_muted(self.theme);
+        let accent = composer_accent(self.theme);
+        let warn = composer_warn(self.theme);
+        let plan = session.is_some_and(|session| session.agent.as_deref() == Some("plan"));
+        let mode = if plan { "Plan" } else { "Build" };
+        let mode_color = if plan { warn } else { accent };
+        let mut spans = vec![
+            // Keep Build/Plan the same cell width so the status and model do
+            // not shift when the mode changes.
+            Span::styled(
+                format!(" {mode:<5}"),
+                Style::default()
+                    .fg(mode_color)
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(muted).bg(panel)),
+        ];
         if let Some(session) = session {
-            let spinner = if session.status == SessionStatus::Running {
-                SPINNER[(self.tick as usize / 2) % SPINNER.len()]
+            let (status, status_color) = if self.connected {
+                (
+                    self.status_glyph(session.status),
+                    composer_status_color(session.status, self.theme),
+                )
             } else {
-                session.status.symbol()
+                ("offline".to_string(), composer_danger(self.theme))
             };
             spans.push(Span::styled(
-                format!(" {spinner} "),
-                Style::default().fg(status_color(session.status)),
+                status,
+                Style::default().fg(status_color).bg(panel),
             ));
+            spans.push(Span::styled(" ", Style::default().bg(panel)));
             spans.push(Span::styled(
-                session.name.clone(),
-                Style::default().add_modifier(Modifier::BOLD),
+                short_model(self.model()).to_string(),
+                Style::default().fg(accent).bg(panel),
             ));
-            spans.push(Span::styled(format!(" {} ", session.status.as_str()), dim));
-            spans.push(Span::styled(
-                format!("{} ", short_model(self.model())),
-                Style::default().fg(Color::Magenta),
-            ));
-            spans.push(Span::styled(
-                compact_path(&session.cwd.display().to_string()),
-                dim,
-            ));
-        } else {
-            spans.push(Span::styled(" no session", dim));
-        }
-        if !self.views.is_empty() {
-            spans.push(Span::styled(
-                format!(" {}/{}", self.focused + 1, self.views.len()),
-                dim,
-            ));
-        }
-        if let Some(session) = session {
             let queued = self.queue_len(&session.id);
             if queued > 0 {
                 spans.push(Span::styled(
-                    format!(" ⏳{queued}"),
-                    Style::default().fg(Color::Yellow),
+                    format!("  ⏳{queued}"),
+                    Style::default().fg(warn).bg(panel),
                 ));
             }
+        } else if self.connected {
+            spans.push(Span::styled(
+                "no session",
+                Style::default().fg(muted).bg(panel),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "connecting…",
+                Style::default().fg(muted).bg(panel),
+            ));
         }
         let attention = self.attention_count();
         if attention > 0 {
             spans.push(Span::styled(
-                format!(" ⚠{attention}"),
+                format!("  ⚠{attention}"),
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(warn)
+                    .bg(panel)
                     .add_modifier(Modifier::BOLD),
             ));
         }
+        spans.push(Span::styled(" ", Style::default().bg(panel)));
         spans
+    }
+
+    /// Right-aligned half of the prompt banner.
+    fn header_meta_spans(&self) -> Vec<Span<'static>> {
+        let session = self
+            .focused_view()
+            .map(|view| &view.session)
+            .or_else(|| self.sessions.get(self.selected));
+        let panel = composer_background(self.theme);
+        let muted = composer_muted(self.theme);
+        let accent = composer_accent(self.theme);
+        let warn = composer_warn(self.theme);
+        let mut spans = Vec::new();
+        if let Some(session) = session {
+            spans.push(Span::styled(
+                format!(" {} ", compact_path(&session.cwd.display().to_string())),
+                Style::default().fg(muted).bg(panel),
+            ));
+            if self.git_cwd.as_ref() == Some(&session.cwd) {
+                if let Some(branch) = &self.git_branch {
+                    spans.push(Span::styled(
+                        format!("{branch} "),
+                        Style::default().fg(accent).bg(panel),
+                    ));
+                }
+            }
+            if let Some(worktree) = &session.worktree {
+                let name = worktree
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "worktree".into());
+                spans.push(Span::styled(
+                    format!("wt:{name} "),
+                    Style::default().fg(warn).bg(panel),
+                ));
+            }
+        }
+        if !self.pending_images.is_empty() {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" ", Style::default().bg(panel)));
+            }
+            spans.push(Span::styled(
+                format!(" {} img ", self.pending_images.len()),
+                Style::default().fg(warn).bg(panel),
+            ));
+        }
+        spans
+    }
+
+    fn header_meta_line(&self) -> Option<Line<'static>> {
+        let spans = self.header_meta_spans();
+        if spans.is_empty() {
+            None
+        } else {
+            Some(Line::from(spans))
+        }
     }
 
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
@@ -5024,72 +5639,164 @@ already exists, update it in place rather than rewriting it from scratch.";
                 || self.approvals.contains_key(&session_id)
                 || self.inputs.contains_key(&session_id));
         let theme = self.theme;
-        let inner_width = area.width.saturating_sub(2) as usize;
-        let inner_height = area.height.saturating_sub(2) as usize;
-        let transcript = {
+        let borders = pane_borders(&self.pane_areas, index);
+        let border_cols = u16::from(borders.contains(Borders::LEFT))
+            + u16::from(borders.contains(Borders::RIGHT));
+        let border_rows = u16::from(borders.contains(Borders::TOP))
+            + u16::from(borders.contains(Borders::BOTTOM));
+        let inner_width = area.width.saturating_sub(border_cols) as usize;
+        let inner_height = area.height.saturating_sub(border_rows) as usize;
+        // Stored history is rendered once and cached; only the live tail is
+        // rebuilt on each frame. This keeps streaming cheap for long sessions.
+        self.views[index].ensure_history(inner_width.max(1), theme);
+        let queued: Vec<String> = self
+            .queues
+            .get(&session_id)
+            .map(|queue| queue.iter().cloned().collect())
+            .unwrap_or_default();
+        let transcript::Transcript {
+            lines: tail_lines,
+            slots: tail_slots,
+        } = {
             let view = &self.views[index];
             let live = view.stream.as_ref().map(|stream| transcript::Live {
                 reasoning: &stream.reasoning,
                 text: &stream.text,
             });
-            let queued: Vec<String> = self
-                .queues
-                .get(&session_id)
-                .map(|queue| queue.iter().cloned().collect())
-                .unwrap_or_default();
-            transcript::render(
-                &view.events,
-                live,
-                &queued,
-                &view.folds,
-                inner_width.max(1),
-                theme,
-            )
+            transcript::render_tail(live, &queued, &view.folds, inner_width.max(1), theme)
         };
-        let lines = transcript.lines;
-        let view = &mut self.views[index];
-        view.slots = transcript.slots;
-        let max_scroll = lines.len().saturating_sub(inner_height);
-        if view.follow {
-            view.scroll = max_scroll;
-        } else {
-            view.scroll = view.scroll.min(max_scroll);
+        let history_len = self.views[index]
+            .history_cache
+            .as_ref()
+            .map(|cache| cache.lines.len())
+            .unwrap_or(0);
+        {
+            let view = &mut self.views[index];
+            if let Some((old_len, old_scroll)) = view.history_anchor.take() {
+                if !view.follow {
+                    // Prepending a page shifts every existing line down. Move
+                    // the scroll and any selection by the same amount so the
+                    // viewport content does not jump under the user.
+                    let delta = history_len.saturating_sub(old_len);
+                    view.scroll = old_scroll.saturating_add(delta);
+                    if let Some(selection) = &mut view.selection {
+                        selection.anchor.0 = selection.anchor.0.saturating_add(delta);
+                        selection.cursor.0 = selection.cursor.0.saturating_add(delta);
+                    }
+                }
+            }
         }
-        let name = truncate(&view.session.name, inner_width.saturating_sub(8).max(1));
+        {
+            let view = &mut self.views[index];
+            view.slots.truncate(history_len);
+            view.slots.extend(tail_slots);
+            view.text_lines.truncate(history_len);
+            view.text_lines.extend(tail_lines.iter().map(text_line));
+        }
+        let total = history_len + tail_lines.len();
+        let max_scroll = total.saturating_sub(inner_height);
+        {
+            let view = &mut self.views[index];
+            if view.follow {
+                view.scroll = max_scroll;
+            } else {
+                view.scroll = view.scroll.min(max_scroll);
+                if view.scroll > HISTORY_REARM_LINES {
+                    view.history_armed = true;
+                }
+            }
+        }
+        // Ask the event loop for the previous page when the viewport reaches
+        // the top. Only the focused pane loads history; background panes stay
+        // idle.
+        let request = {
+            let view = &self.views[index];
+            if focused
+                && !view.follow
+                && view.history_armed
+                && !view.history_loading
+                && view.history_has_more
+                && view.scroll <= HISTORY_PRELOAD_LINES
+            {
+                view.events
+                    .first()
+                    .map(|event| (session_id.clone(), event.seq))
+            } else {
+                None
+            }
+        };
+        if let Some((id, before_seq)) = request {
+            let view = &mut self.views[index];
+            view.history_loading = true;
+            view.history_armed = false;
+            self.pending_history = Some((id, before_seq));
+        }
+        // Only hand the visible window to ratatui. Besides reducing layout
+        // work, this keeps the paragraph independent of the full line vector.
+        let scroll = self.views[index].scroll;
+        let end = (scroll + inner_height).min(total);
+        let mut lines: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(scroll));
+        {
+            let view = &self.views[index];
+            if let Some(cache) = view.history_cache.as_ref() {
+                if scroll < history_len {
+                    let history_end = end.min(history_len);
+                    lines.extend_from_slice(&cache.lines[scroll..history_end]);
+                }
+            }
+        }
+        if end > history_len {
+            let tail_start = scroll.saturating_sub(history_len);
+            lines.extend_from_slice(&tail_lines[tail_start..end - history_len]);
+        }
+        if let Some(selection) = self.views[index].selection {
+            highlight_selection_window(&mut lines, &selection, scroll);
+        }
+        let view = &self.views[index];
+        let name = truncate(
+            &view.session.name,
+            inner_width.saturating_sub(6).clamp(1, 18),
+        );
         let marker = if attention { "!" } else { "" };
         let permission = match view.session.permission {
-            PermissionLevel::ReadOnly => " [ro]",
-            PermissionLevel::Full => " [full]",
-            PermissionLevel::WorkspaceWrite => "",
+            PermissionLevel::ReadOnly => " ro",
+            _ => "",
         };
         let title = format!(
-            " {}{marker} {} {}{permission} ",
+            " {}{}{marker} {}{permission} ",
             index + 1,
             view.session.status.symbol(),
             name
         );
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
+        let border_color = if focused {
+            composer_border(theme)
         } else if attention {
-            Style::default().fg(status_color(view.session.status))
+            composer_warn(theme)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Color::Rgb(48, 52, 62)
         };
-        let paragraph = Paragraph::new(lines)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .border_style(border_style)
-                    .title(title),
-            )
-            .scroll((view.scroll.min(u16::MAX as usize) as u16, 0));
+        let mut border_style = Style::default().fg(border_color);
+        let mut title_style = Style::default()
+            .fg(border_color)
+            .add_modifier(Modifier::DIM);
+        let mut block = Block::default().borders(borders).title(title);
+        if let Some(background) = theme.background {
+            border_style = border_style.bg(background);
+            title_style = title_style.bg(background);
+            block = block.style(Style::default().bg(background));
+        }
+        block = block.border_style(border_style).title_style(title_style);
+        let mut paragraph = Paragraph::new(lines).block(block);
+        if let Some(background) = theme.background {
+            paragraph = paragraph.style(Style::default().bg(background));
+        }
         frame.render_widget(paragraph, area);
 
         if let Some(approval) = approval {
             draw_approval_card(frame, area, &approval, theme);
         }
         if let Some(pending) = pending_input {
-            draw_input_card(frame, area, &pending);
+            draw_input_card(frame, area, &pending, theme);
         }
     }
 
@@ -5122,64 +5829,83 @@ already exists, update it in place rather than rewriting it from scratch.";
                 "press p to pick a session, o to open a new pane",
             ));
         }
-        let paragraph = Paragraph::new(lines)
-            .block(Block::default().borders(Borders::ALL).title(" transcript "));
+        let background = self.theme.background;
+        let block = Block::default().borders(Borders::ALL).title(" transcript ");
+        let block = if let Some(background) = background {
+            block.style(Style::default().bg(background))
+        } else {
+            block
+        };
+        let mut paragraph = Paragraph::new(lines).block(block);
+        if let Some(background) = background {
+            paragraph = paragraph.style(Style::default().bg(background));
+        }
         frame.render_widget(paragraph, area);
     }
 
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Input;
         let mode = self.input.mode();
-        // The border color tracks the mode: insert is active (cyan), normal is
-        // vim-quiet (blue), visual is a selection (yellow). Blurred is muted.
-        let accent = if !focused {
-            Style::default().fg(Color::DarkGray)
+        let panel = composer_background(self.theme);
+        let text = composer_text(self.theme);
+        let border_color = if focused {
+            composer_border(self.theme)
         } else {
-            match mode {
-                Mode::Insert => Style::default().fg(Color::Cyan),
-                Mode::Normal => Style::default().fg(Color::Blue),
-                Mode::Visual | Mode::VisualLine => Style::default().fg(Color::Yellow),
-            }
+            Color::Rgb(46, 50, 60)
         };
-        let title = Line::from({
-            let mut spans = self.header_spans();
-            spans.push(Span::styled(format!(" [{}] ", mode.label()), accent));
-            if !self.pending_images.is_empty() {
-                spans.push(Span::styled(
-                    format!(" [{} img] ", self.pending_images.len()),
-                    Style::default().fg(Color::Yellow),
-                ));
-            }
-            spans
-        });
-        let hint = if !focused {
-            " i to type "
+
+        // The top border is the session banner; the bottom border carries only
+        // the mode chip. Deny reasons temporarily replace the banner; errors
+        // live in a floating dialog so the prompt chrome stays stable.
+        let title_width = area.width.saturating_sub(2) as usize;
+        let (top_left, top_right) = if let Some(prompt) = &self.reason_prompt {
+            let line = Line::from(vec![
+                Span::styled(
+                    " deny reason: ",
+                    Style::default()
+                        .fg(composer_warn(self.theme))
+                        .bg(panel)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{}▏", prompt.text),
+                    Style::default().fg(text).bg(panel),
+                ),
+                Span::styled(
+                    "  Enter denies · Esc cancels",
+                    Style::default().fg(composer_muted(self.theme)).bg(panel),
+                ),
+            ]);
+            (truncate_line(line, title_width), None)
         } else {
-            match mode {
-                Mode::Insert => " ⏎ send · C-j newline · Esc normal ",
-                Mode::Normal => " i insert · j/k history · Space actions ",
-                Mode::Visual | Mode::VisualLine => " d/y/c · o swap · Esc normal ",
-            }
+            fit_title(
+                Line::from(self.header_spans()),
+                self.header_meta_line(),
+                title_width,
+            )
         };
-        let block = Block::default()
+        let bottom_left = Line::from(Span::styled(
+            format!(" {} ", mode.short_label()),
+            composer_mode_style(mode, focused, self.theme),
+        ));
+
+        let mut block = Block::default()
             .borders(Borders::ALL)
-            .border_style(accent)
-            .title(title)
-            .title_bottom(Span::styled(hint, Style::default().fg(Color::DarkGray)));
-
-        let inner_width = area.width.saturating_sub(2).max(1) as usize;
-        let inner_height = area.height.saturating_sub(2).max(1) as usize;
-
-        if self.input.is_empty() && !focused {
-            let paragraph = Paragraph::new(Line::from(Span::styled(
-                "press i to type",
-                Style::default().fg(Color::DarkGray),
-            )))
-            .block(block);
-            frame.render_widget(paragraph, area);
-            return;
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(border_color).bg(panel))
+            .style(Style::default().bg(panel))
+            .title_style(Style::default().bg(panel))
+            .padding(Padding::new(1, 1, 0, 0))
+            .title_top(top_left)
+            .title_bottom(bottom_left);
+        if let Some(title) = top_right {
+            block = block.title_top(title.right_aligned());
         }
 
+        // One cell of left padding keeps the text close to the border; one
+        // cell on the right mirrors it. The old `❯` gutter marker is gone.
+        let inner_width = area.width.saturating_sub(4).max(1) as usize;
+        let inner_height = area.height.saturating_sub(2).max(1) as usize;
         let layout = self.input.layout(inner_width, inner_height);
         let lines: Vec<Line> = layout
             .segments
@@ -5188,10 +5914,14 @@ already exists, update it in place rather than rewriting it from scratch.";
             .collect();
         let paragraph = Paragraph::new(lines)
             .block(block)
+            .style(Style::default().fg(text).bg(panel))
             .scroll((layout.offset.min(u16::MAX as usize) as u16, 0));
         frame.render_widget(paragraph, area);
-        if focused {
-            let x = area.x + 1 + layout.cursor_col.min(inner_width.saturating_sub(1)) as u16;
+
+        // The error dialog covers the prompt; don't leave a blinking input
+        // cursor on top of it.
+        if focused && self.error.is_none() {
+            let x = area.x + 2 + layout.cursor_col.min(inner_width.saturating_sub(1)) as u16;
             let row = layout
                 .cursor_line
                 .saturating_sub(layout.offset)
@@ -5219,55 +5949,84 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
         let cursor = self.command_cursor.min(matches.len() - 1);
         let start = cursor.saturating_sub(visible.saturating_sub(1));
-        let width = input_area.width.clamp(30, 88);
+        let width = input_area.width.min(88);
         let rect = Rect::new(input_area.x, input_area.y - height, width, height);
         frame.render_widget(Clear, rect);
 
-        let name_width = 24usize;
-        let inner = width.saturating_sub(4) as usize;
-        let desc_width = inner.saturating_sub(name_width + 2);
+        let panel = composer_background(self.theme);
+        let muted = composer_muted(self.theme);
+        let text = composer_text(self.theme);
+        let accent = composer_accent(self.theme);
+        let inner = width.saturating_sub(2) as usize;
+        let marker_width = 3usize;
+        let name_width = 22.min(inner.saturating_sub(marker_width + 2));
+        let desc_width = inner
+            .saturating_sub(marker_width + name_width)
+            .saturating_sub(2);
         let mut lines = Vec::new();
         for (offset, spec) in matches.iter().skip(start).take(visible).enumerate() {
             let index = start + offset;
             let selected = index == cursor;
-            let base = if selected {
+            let row_bg = if selected { COMPOSER_SELECTION } else { panel };
+            let marker_style = if selected {
                 Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(54, 60, 76))
+                    .fg(accent)
+                    .bg(row_bg)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(Color::Gray)
+                Style::default().fg(muted).bg(row_bg)
+            };
+            let name_style = if selected {
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text).bg(row_bg)
+            };
+            let desc_style = if selected {
+                Style::default().fg(text).bg(row_bg)
+            } else {
+                Style::default().fg(muted).bg(row_bg)
             };
             let name = if spec.args.is_empty() {
                 format!("/{}", spec.name)
             } else {
                 format!("/{} {}", spec.name, spec.args)
             };
-            let name = truncate(&name, name_width);
-            let name_pad = name_width.saturating_sub(UnicodeWidthStr::width(name.as_str()));
-            let description = truncate(&spec.description, desc_width);
+            let name = pad_to(&truncate(&name, name_width), name_width);
+            let description = pad_to(&truncate(&spec.description, desc_width), desc_width);
+            let gap = inner.saturating_sub(marker_width + name_width + desc_width);
             lines.push(Line::from(vec![
-                Span::styled(format!(" {} ", if selected { "›" } else { " " }), base),
-                Span::styled(name, base),
-                Span::raw(" ".repeat(name_pad)),
                 Span::styled(
-                    description,
-                    if selected {
-                        base
-                    } else {
-                        Style::default().fg(Color::DarkGray)
-                    },
+                    format!(" {} ", if selected { "❯" } else { " " }),
+                    marker_style,
                 ),
+                Span::styled(name, name_style),
+                Span::styled(" ".repeat(gap), desc_style),
+                Span::styled(description, desc_style),
             ]));
         }
+        let title_left = Line::from(Span::styled(
+            " / commands ",
+            Style::default()
+                .fg(accent)
+                .bg(panel)
+                .add_modifier(Modifier::BOLD),
+        ));
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
-            .title(Span::styled(
-                " / commands · ↑↓ · Tab complete · Enter run ",
-                Style::default().fg(Color::DarkGray),
-            ));
-        frame.render_widget(Paragraph::new(lines).block(block), rect);
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent).bg(panel))
+            .style(Style::default().bg(panel))
+            .title_style(Style::default().bg(panel))
+            .title_top(title_left);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().fg(text).bg(panel)),
+            rect,
+        );
     }
 
     /// Floating `/btw` answer. It owns the keyboard until dismissed.
@@ -5280,6 +6039,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         let inner_width = width.saturating_sub(4) as usize;
         let inner_height = height.saturating_sub(2) as usize;
 
+        let dialog_bg = dialog_background(self.theme);
         let session_name = self
             .btw
             .as_ref()
@@ -5334,9 +6094,11 @@ already exists, update it in place rather than rewriting it from scratch.";
             Color::Cyan
         };
         frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(border))
+            .style(Style::default().bg(dialog_bg))
             .title(Span::styled(
                 format!(" btw · {session_name} "),
                 Style::default().fg(border).add_modifier(Modifier::BOLD),
@@ -5348,7 +6110,60 @@ already exists, update it in place rather than rewriting it from scratch.";
         frame.render_widget(
             Paragraph::new(lines)
                 .block(block)
+                .style(Style::default().bg(dialog_bg))
                 .scroll((btw.scroll.min(u16::MAX as usize) as u16, 0)),
+            rect,
+        );
+    }
+
+    /// Floating error report. It sits above every other overlay and is
+    /// dismissed with Esc / Enter / q.
+    fn draw_error_dialog(&self, frame: &mut Frame, area: Rect) {
+        let Some(error) = self.error.as_deref() else {
+            return;
+        };
+        if area.width < 20 || area.height < 5 {
+            return;
+        }
+        let width = ((area.width as u32 * 3 / 5).max(36).min(area.width as u32)) as u16;
+        let text_width = width.saturating_sub(4) as usize;
+        let lines: Vec<Line> = wrap_text(error, text_width)
+            .into_iter()
+            .map(|line| Line::from(format!("  {line}")))
+            .collect();
+        let height = (lines.len() as u16 + 2).clamp(3, area.height.saturating_sub(2));
+        let rect = centered(area, width, height);
+        let background = dialog_background(self.theme);
+        let danger = composer_danger(self.theme);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(background)),
+            rect,
+        );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(danger).bg(background))
+            .style(Style::default().bg(background))
+            .title(Span::styled(
+                " error ",
+                Style::default()
+                    .fg(danger)
+                    .bg(background)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " Esc / Enter close ",
+                Style::default()
+                    .fg(composer_muted(self.theme))
+                    .bg(background),
+            ));
+        frame.render_widget(
+            Paragraph::new(lines).block(block).style(
+                Style::default()
+                    .fg(composer_text(self.theme))
+                    .bg(background),
+            ),
             rect,
         );
     }
@@ -5377,57 +6192,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         Line::from(spans)
     }
 
-    fn draw_footer(&mut self, frame: &mut Frame, area: Rect) {
-        let connected = if self.connected { "●" } else { "○" };
-        let status = match &self.reason_prompt {
-            Some(prompt) => format!("deny reason: {}▏ (Enter denies · Esc cancels)", prompt.text),
-            None => self.status.clone(),
-        };
-        let message = match &self.error {
-            Some(error) => format!(" error: {error}"),
-            None => format!(
-                " {} eixd  {}  {} pane(s)  {} session(s)  {}",
-                connected,
-                self.model(),
-                self.views.len(),
-                self.sessions.len(),
-                status
-            ),
-        };
-        let style = if self.error.is_some() {
-            Style::default().fg(Color::White).bg(Color::Red)
-        } else {
-            Style::default().fg(Color::Black).bg(Color::Gray)
-        };
-        let chunks = Layout::horizontal([Constraint::Min(20), Constraint::Length(46)]).split(area);
-        frame.render_widget(
-            Paragraph::new(truncate(&message, chunks[0].width as usize)).style(style),
-            chunks[0],
-        );
-        let hint = if self.focused_approval().is_some_and(|approval| {
-            approval
-                .diff
-                .as_deref()
-                .is_some_and(|diff| !diff.is_empty())
-        }) {
-            " y approve  n deny  e edit  o open  r reason  d review  ? help "
-        } else if self.focused_approval().is_some() {
-            " y approve  n deny  o open  r reason  x cancel  ? help "
-        } else if self.attention_count() > 0 {
-            " a next attention  A approvals  ? help  q quit "
-        } else {
-            " /cmds  c ctx  A appr  p picker  q quit "
-        };
-        frame.render_widget(
-            Paragraph::new(hint)
-                .alignment(Alignment::Right)
-                .style(style),
-            chunks[1],
-        );
-    }
-
     fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
+        let dialog_bg = dialog_background(theme);
         let Some((session_id, scroll, cursor)) = self
             .diff_view
             .as_ref()
@@ -5439,6 +6206,8 @@ already exists, update it in place rather than rewriting it from scratch.";
             return;
         };
         let tool = approval.tool.clone();
+        let path = approval.path.clone().unwrap_or_default();
+        let rows = super::diff::rows(&approval.hunks, approval.diff.as_deref());
 
         let rect = centered(
             area,
@@ -5448,46 +6217,61 @@ already exists, update it in place rather than rewriting it from scratch.";
         frame.render_widget(Clear, rect);
         let inner_width = rect.width.saturating_sub(2) as usize;
         let inner_height = rect.height.saturating_sub(3) as usize; // borders + hint
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
 
         let interactive = !approval.hunks.is_empty();
-        let mut body: Vec<Line> = Vec::new();
-        if interactive {
-            for (index, hunk) in approval.hunks.iter().enumerate() {
-                let selected = approval.selected.get(index).copied().unwrap_or(true);
-                let focused = index == cursor;
-                for (line_index, line) in hunk.lines.iter().enumerate() {
-                    if line_index == 0 {
-                        let marker = if focused { "▸ " } else { "  " };
-                        let check = if selected { "[x] " } else { "[ ] " };
-                        let style = if focused {
-                            Style::default()
-                                .fg(Color::Yellow)
-                                .add_modifier(Modifier::BOLD)
-                        } else if selected {
-                            Style::default().fg(Color::Cyan)
-                        } else {
-                            Style::default().fg(Color::DarkGray)
-                        };
+        let side_by_side = (!rows.is_empty())
+            .then(|| {
+                super::diff::DiffRenderer::new(&rows, inner_width, &path, theme, "", dialog_bg)
+            })
+            .flatten()
+            .map(|mut renderer| renderer.render(&rows, interactive, &approval.selected, cursor));
+        let body: Vec<Line> = match side_by_side {
+            Some(body) => body,
+            None => {
+                // Too narrow for two readable code columns: keep the old
+                // unified view as a fallback.
+                let mut body = Vec::new();
+                if interactive {
+                    for (index, hunk) in approval.hunks.iter().enumerate() {
+                        let selected = approval.selected.get(index).copied().unwrap_or(true);
+                        let focused = index == cursor;
+                        for (line_index, line) in hunk.lines.iter().enumerate() {
+                            if line_index == 0 {
+                                let marker = if focused { "▸ " } else { "  " };
+                                let check = if selected { "[x] " } else { "[ ] " };
+                                let style = if focused {
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD)
+                                } else if selected {
+                                    Style::default().fg(Color::Cyan)
+                                } else {
+                                    Style::default().fg(Color::DarkGray)
+                                };
+                                body.push(Line::from(Span::styled(
+                                    truncate(&format!("{marker}{check}{line}"), inner_width),
+                                    style,
+                                )));
+                            } else {
+                                body.push(Line::from(Span::styled(
+                                    truncate(&format!("    {line}"), inner_width),
+                                    diff_line_style(line, theme),
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    for line in approval.diff.as_deref().unwrap_or("").lines() {
                         body.push(Line::from(Span::styled(
-                            truncate(&format!("{marker}{check}{line}"), inner_width),
-                            style,
-                        )));
-                    } else {
-                        body.push(Line::from(Span::styled(
-                            truncate(&format!("    {line}"), inner_width),
+                            truncate(line, inner_width),
                             diff_line_style(line, theme),
                         )));
                     }
                 }
+                body
             }
-        } else {
-            for line in approval.diff.as_deref().unwrap_or("").lines() {
-                body.push(Line::from(Span::styled(
-                    truncate(line, inner_width),
-                    diff_line_style(line, theme),
-                )));
-            }
-        }
+        };
 
         let total = body.len();
         let max_scroll = total.saturating_sub(inner_height);
@@ -5503,22 +6287,29 @@ already exists, update it in place rather than rewriting it from scratch.";
             Style::default().fg(Color::DarkGray),
         )));
 
+        let title = if path.is_empty() {
+            format!(" diff · {tool} ")
+        } else {
+            format!(" diff · {tool} · {path} ")
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
-            .title(format!(" diff · {tool} "));
+            .title(title);
         frame.render_widget(
             Paragraph::new(body)
                 .block(block)
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(dialog_bg)),
             rect,
         );
         if let Some(view) = &mut self.diff_view {
             view.scroll = scroll;
+            view.width = inner_width;
         }
     }
 
     fn draw_ledger(&mut self, frame: &mut Frame, area: Rect) {
+        let dialog_bg = dialog_background(self.theme);
         let Some(ledger) = &mut self.ledger else {
             return;
         };
@@ -5528,6 +6319,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             area.height.saturating_sub(4),
         );
         frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
         let inner_width = rect.width.saturating_sub(2) as usize;
         let inner_height = rect.height.saturating_sub(2) as usize;
         // Two header rows (totals + per-sector budgets) and one hint row.
@@ -5574,18 +6366,20 @@ already exists, update it in place rather than rewriting it from scratch.";
         frame.render_widget(
             Paragraph::new(body)
                 .block(block)
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(dialog_bg)),
             rect,
         );
     }
 
     fn draw_inbox(&mut self, frame: &mut Frame, area: Rect) {
+        let dialog_bg = dialog_background(self.theme);
         let Some(inbox) = &self.inbox else {
             return;
         };
         let rows = (inbox.items.len() as u16 + 4).min(area.height.saturating_sub(2).max(5));
         let rect = centered(area, area.width.saturating_sub(6).max(30), rows);
         frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
         let inner = rect.width.saturating_sub(2) as usize;
 
         let mut lines: Vec<Line> = Vec::new();
@@ -5626,12 +6420,13 @@ already exists, update it in place rather than rewriting it from scratch.";
         frame.render_widget(
             Paragraph::new(lines)
                 .block(block)
-                .style(Style::default().bg(Color::Black)),
+                .style(Style::default().bg(dialog_bg)),
             rect,
         );
     }
 
     fn draw_processes(&mut self, frame: &mut Frame, area: Rect) {
+        let dialog_bg = dialog_background(self.theme);
         let Some(view) = &mut self.process_view else {
             return;
         };
@@ -5641,6 +6436,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             area.height.saturating_sub(4),
         );
         frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
         let inner_height = rect.height.saturating_sub(2) as usize;
         let inner_width = rect.width.saturating_sub(2) as usize;
         // List on top (bounded), live output below.
@@ -5690,7 +6486,7 @@ already exists, update it in place rather than rewriting it from scratch.";
                     .take(list_height)
                     .collect::<Vec<_>>(),
             )
-            .style(Style::default().bg(Color::Black)),
+            .style(Style::default().bg(dialog_bg)),
             chunks[0],
         );
 
@@ -5718,12 +6514,13 @@ already exists, update it in place rather than rewriting it from scratch.";
                 .collect()
         };
         frame.render_widget(
-            Paragraph::new(body).style(Style::default().bg(Color::Black)),
+            Paragraph::new(body).style(Style::default().bg(dialog_bg)),
             output_inner,
         );
     }
 
     fn draw_search(&mut self, frame: &mut Frame, area: Rect) {
+        let dialog_bg = dialog_background(self.theme);
         let Some(view) = &self.search_view else {
             return;
         };
@@ -5733,6 +6530,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             area.height.saturating_sub(4),
         );
         frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Cyan))
@@ -5808,80 +6606,8 @@ already exists, update it in place rather than rewriting it from scratch.";
                     .take(height)
                     .collect::<Vec<_>>(),
             )
-            .style(Style::default().bg(Color::Black)),
+            .style(Style::default().bg(dialog_bg)),
             chunks[1],
-        );
-    }
-
-    fn draw_diagnostics(&mut self, frame: &mut Frame, area: Rect) {
-        let Some(view) = &self.diagnostics_view else {
-            return;
-        };
-        let rect = centered(
-            area,
-            area.width.saturating_sub(4),
-            area.height.saturating_sub(4),
-        );
-        frame.render_widget(Clear, rect);
-        let title = format!(
-            " diagnostics · {} issue(s) · {} file(s){} ",
-            view.result.diagnostics.len(),
-            view.result.files,
-            if view.result.skipped > 0 {
-                format!(" · {} skipped", view.result.skipped)
-            } else {
-                String::new()
-            }
-        );
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(title)
-            .title_bottom(" j/k scroll · g/G ends · q close ");
-        let inner = block.inner(rect);
-        frame.render_widget(block, rect);
-
-        if view.result.diagnostics.is_empty() {
-            let text = if view.result.servers.is_empty() {
-                "no language server is configured for this workspace"
-            } else {
-                "no diagnostics"
-            };
-            frame.render_widget(
-                Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
-                inner,
-            );
-            return;
-        }
-        let width = inner.width as usize;
-        let lines: Vec<Line> = view
-            .result
-            .diagnostics
-            .iter()
-            .map(|item| {
-                let color = match item.severity.as_str() {
-                    "error" => Color::Red,
-                    "warning" => Color::Yellow,
-                    "info" => Color::Cyan,
-                    _ => Color::Gray,
-                };
-                let text = format!(
-                    "{}:{}:{}  {}: {}",
-                    item.path.display(),
-                    item.line + 1,
-                    item.character + 1,
-                    item.severity,
-                    item.message
-                );
-                Line::from(Span::styled(
-                    truncate(&text, width),
-                    Style::default().fg(color),
-                ))
-            })
-            .collect();
-        frame.render_widget(
-            Paragraph::new(lines).scroll((view.scroll.min(u16::MAX as usize) as u16, 0)),
-            inner,
         );
     }
 
@@ -5908,6 +6634,26 @@ already exists, update it in place rather than rewriting it from scratch.";
             .map(|picker| picker.query.clone())
             .unwrap_or_default();
         let loading = self.picker.as_ref().is_some_and(|picker| picker.loading);
+        // The theme picker previews the highlighted palette immediately, so
+        // its own chrome should follow that palette too (not a fixed cyan).
+        let theme_picker = kind == PickerKind::Themes;
+        let theme = self.theme;
+        let accent = if theme_picker {
+            composer_accent(theme)
+        } else {
+            Color::Cyan
+        };
+        let muted = if theme_picker {
+            composer_muted(theme)
+        } else {
+            Color::DarkGray
+        };
+        let preview_text = if theme_picker {
+            composer_text(theme)
+        } else {
+            Color::Gray
+        };
+        let dialog_bg = dialog_background(theme);
 
         let width = (area.width as u32 * 8 / 10).max(44).min(area.width as u32) as u16;
         let height = (area.height as u32 * 7 / 10)
@@ -5918,7 +6664,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         let title = format!(" {} ({}) ", kind.title(), filtered.len());
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(accent).bg(dialog_bg))
+            .title_style(Style::default().bg(dialog_bg))
+            .style(Style::default().bg(dialog_bg))
             .title(title)
             .title_bottom(format!(" {} ", kind.hint()));
         let inner = block.inner(rect);
@@ -5932,14 +6680,15 @@ already exists, update it in place rather than rewriting it from scratch.";
 
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("❯ ", Style::default().fg(Color::Cyan)),
+                Span::styled("❯ ", Style::default().fg(accent)),
                 Span::raw(query.clone()),
-            ])),
+            ]))
+            .style(Style::default().bg(dialog_bg)),
             chunks[0],
         );
         frame.render_widget(
             Paragraph::new("─".repeat(chunks[1].width as usize))
-                .style(Style::default().fg(Color::DarkGray)),
+                .style(Style::default().fg(muted).bg(dialog_bg)),
             chunks[1],
         );
 
@@ -5957,12 +6706,13 @@ already exists, update it in place rather than rewriting it from scratch.";
         if filtered.is_empty() {
             let text = if loading { "loading…" } else { "no matches" };
             frame.render_widget(
-                Paragraph::new(text).style(Style::default().fg(Color::DarkGray)),
+                Paragraph::new(text).style(Style::default().fg(muted).bg(dialog_bg)),
                 list_area,
             );
         } else {
             let rows = self.picker_rows(kind, &filtered);
             let list = List::new(rows)
+                .style(Style::default().bg(dialog_bg))
                 .highlight_style(
                     Style::default()
                         .bg(Color::DarkGray)
@@ -5982,11 +6732,11 @@ already exists, update it in place rather than rewriting it from scratch.";
                 .map(|line| Line::from(truncate(&line, width)))
                 .collect();
             let preview = Paragraph::new(body)
-                .style(Style::default().fg(Color::Gray))
+                .style(Style::default().fg(preview_text).bg(dialog_bg))
                 .block(
                     Block::default()
                         .borders(Borders::LEFT)
-                        .border_style(Style::default().fg(Color::DarkGray)),
+                        .border_style(Style::default().fg(muted).bg(dialog_bg)),
                 )
                 .wrap(ratatui::widgets::Wrap { trim: false });
             frame.render_widget(preview, preview_area);
@@ -6048,19 +6798,29 @@ already exists, update it in place rather than rewriting it from scratch.";
                 let Some(picker) = &self.picker else {
                     return Vec::new();
                 };
+                let theme_picker = kind == PickerKind::Themes;
+                let label_style = if theme_picker {
+                    Style::default()
+                        .fg(composer_text(self.theme))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                let detail_color = if theme_picker {
+                    composer_muted(self.theme)
+                } else {
+                    Color::DarkGray
+                };
                 filtered
                     .iter()
                     .filter_map(|&index| picker.items.get(index))
                     .map(|item| {
-                        let mut spans = vec![Span::styled(
-                            item.label.clone(),
-                            Style::default().add_modifier(Modifier::BOLD),
-                        )];
+                        let mut spans = vec![Span::styled(item.label.clone(), label_style)];
                         if let Some(detail) = &item.detail {
                             if !detail.is_empty() {
                                 spans.push(Span::styled(
                                     format!("  {detail}"),
-                                    Style::default().fg(Color::DarkGray),
+                                    Style::default().fg(detail_color),
                                 ));
                             }
                         }
@@ -6115,6 +6875,42 @@ already exists, update it in place rather than rewriting it from scratch.";
             }
         }
     }
+}
+
+/// Rows for the interactive `/theme` picker. The first row clears the preset;
+/// the rest are the built-in palettes in `THEME_PRESETS` order.
+fn theme_picker_items() -> Vec<PickerItem> {
+    let mut items = vec![PickerItem::new(THEME_DEFAULT_VALUE)
+        .with_label("default")
+        .with_detail("transparent · terminal palette")
+        .with_preview(
+            "default\n\nUse the terminal background and palette. The prompt has no separate fill; explicit [theme] slot overrides still apply.",
+        )];
+    items.extend(THEME_PRESETS.iter().map(|preset| {
+        let preview = format!(
+            "{}\n\n{}\n\nnormal      {}\ncomment     {}\nstring      {}\nfunction    {}\nerror       {}\ndiff_add    {}\ndiff_delete {}\npanel       {}\nbackground  {}",
+            preset.name,
+            preset.description,
+            theme_slot(preset.normal),
+            theme_slot(preset.comment),
+            theme_slot(preset.string),
+            theme_slot(preset.function),
+            theme_slot(preset.error),
+            theme_slot(preset.diff_add),
+            theme_slot(preset.diff_delete),
+            theme_slot(preset.panel),
+            theme_slot(preset.background),
+        );
+        PickerItem::new(preset.name)
+            .with_label(preset.name)
+            .with_detail(preset.description)
+            .with_preview(preview)
+    }));
+    items
+}
+
+fn theme_slot(value: Option<&'static str>) -> &'static str {
+    value.unwrap_or("—")
 }
 
 /// Rows for `/models`. `@default` clears the session's pinned model.
@@ -6254,7 +7050,7 @@ fn command_items() -> Vec<PickerItem> {
         (
             "new-pane",
             "open session in a new pane",
-            "Pick a session for a split (o / Space n)",
+            "Pick a session for a split (o)",
         ),
         (
             "files",
@@ -6291,9 +7087,9 @@ fn command_items() -> Vec<PickerItem> {
         (
             "close-pane",
             "close pane",
-            "Close the focused pane (C-w c / Space q)",
+            "Close the focused pane (C-w c / Space C / Space q)",
         ),
-        ("new", "new session", "Create a session (n)"),
+        ("new", "new session", "Create a session (n / Space n)"),
         (
             "new-worktree",
             "new session in a worktree",
@@ -6315,20 +7111,21 @@ fn command_items() -> Vec<PickerItem> {
             "Choose the focused session's primary agent",
         ),
         (
+            "toggle-agent",
+            "Build / Plan",
+            "Toggle the focused session's agent (Tab in prompt normal mode)",
+        ),
+        (
             "skills",
             "skills",
             "Browse installed skills with a body preview",
-        ),
-        (
-            "diagnostics",
-            "diagnostics",
-            "Aggregate LSP diagnostics for the workspace",
         ),
         (
             "models",
             "models",
             "Pin the focused session to a configured model",
         ),
+        ("theme", "theme", "Choose a color preset with live preview"),
         ("help", "key help", "Show the key map (?)"),
         ("quit", "quit eix", "Leave the TUI (q)"),
     ];
@@ -6528,144 +7325,487 @@ pub(super) fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-fn draw_help(frame: &mut Frame, area: Rect) {
+struct HelpEntry {
+    key: &'static str,
+    description: &'static str,
+}
+
+struct HelpSection {
+    title: &'static str,
+    entries: &'static [HelpEntry],
+}
+
+impl HelpEntry {
+    /// Every whitespace-separated term must appear in the key or description.
+    fn matches(&self, query: &str) -> bool {
+        if query.is_empty() {
+            return true;
+        }
+        let key = self.key.to_lowercase();
+        let description = self.description.to_lowercase();
+        query
+            .split_whitespace()
+            .all(|term| key.contains(term) || description.contains(term))
+    }
+}
+
+const HELP_SECTIONS: &[HelpSection] = &[
+    HelpSection {
+        title: "prompt commands",
+        entries: &[
+            HelpEntry {
+                key: "/help",
+                description: "open this reference",
+            },
+            HelpEntry {
+                key: "/new",
+                description: "start a session here (/new optional-name)",
+            },
+            HelpEntry {
+                key: "/clear",
+                description: "forget the conversation context (transcript stays)",
+            },
+            HelpEntry {
+                key: "/compact",
+                description: "summarize the history (/compact optional notes)",
+            },
+            HelpEntry {
+                key: "/btw",
+                description: "one-off answer (/btw <question>); kept out of the conversation",
+            },
+            HelpEntry {
+                key: "/cd",
+                description: "change the working directory (/cd <path>); alone shows it",
+            },
+            HelpEntry {
+                key: "/init",
+                description: "draft AGENTS.md; you review before sending",
+            },
+            HelpEntry {
+                key: "/queue",
+                description: "list queued prompts (/queue clear | rm N | move N M)",
+            },
+            HelpEntry {
+                key: "/sessions",
+                description: "open the session picker",
+            },
+            HelpEntry {
+                key: "/timeline",
+                description: "recent turns, answers and tool calls (j/k scroll)",
+            },
+            HelpEntry {
+                key: "/archive · /delete",
+                description: "hide from the picker · delete (confirm twice)",
+            },
+            HelpEntry {
+                key: "/undo · /redo",
+                description: "hide or restore the newest turn",
+            },
+            HelpEntry {
+                key: "/skills [name] [args]",
+                description: "browse skills with a preview, or insert one with arguments",
+            },
+            HelpEntry {
+                key: "/todos",
+                description: "show the model's current task list",
+            },
+            HelpEntry {
+                key: "/image <path>",
+                description: "attach images (paste/drop a path or file:// URI); png/jpg/gif/webp",
+            },
+            HelpEntry {
+                key: "!<cmd>",
+                description: "run a shell command in the session cwd (sandboxed, snapshotted)",
+            },
+            HelpEntry {
+                key: "/fork",
+                description: "fork this session (/fork optional-name)",
+            },
+            HelpEntry {
+                key: "/permission",
+                description: "set read-only · workspace-write · full",
+            },
+            HelpEntry {
+                key: "/exit · /quit · /close",
+                description: "save and close this session (quits on the last pane)",
+            },
+        ],
+    },
+    HelpSection {
+        title: "keys",
+        entries: &[
+            HelpEntry {
+                key: "i / Enter / Space i",
+                description: "focus the prompt in insert mode",
+            },
+            HelpEntry {
+                key: "mouse",
+                description: "click folds a Thinking / tool block; wheel scrolls the transcript",
+            },
+            HelpEntry {
+                key: "Esc",
+                description: "prompt: normal mode (keeps focus)",
+            },
+            HelpEntry {
+                key: "Esc Esc",
+                description: "normal mode: interrupt the running turn, or leave for the transcript",
+            },
+            HelpEntry {
+                key: "Enter",
+                description: "send (insert mode); prompts sent while busy are queued",
+            },
+            HelpEntry {
+                key: "Ctrl-J",
+                description: "newline (insert mode)",
+            },
+            HelpEntry {
+                key: "Space s/f/w/b",
+                description: "prompt & transcript: sessions / files / worktrees / branches",
+            },
+            HelpEntry {
+                key: "Space c/h/p",
+                description: "prompt & transcript: ledger / history / processes",
+            },
+            HelpEntry {
+                key: "Space r/x/a/?",
+                description: "prompt & transcript: approvals / cancel / actions / help",
+            },
+            HelpEntry {
+                key: "Space n/q/Q",
+                description: "prompt & transcript: new session / close pane / quit",
+            },
+            HelpEntry {
+                key: "Shift+, / Shift+.",
+                description: "prompt normal & transcript: previous / next pane",
+            },
+            HelpEntry {
+                key: "Space N/W/F",
+                description: "prompt & transcript: new session / new worktree / fork",
+            },
+            HelpEntry {
+                key: "Ctrl-J / Ctrl-K",
+                description: "normal mode: browse submitted prompts (newer / older)",
+            },
+            HelpEntry {
+                key: "j / k",
+                description: "normal mode: move between lines in the draft",
+            },
+            HelpEntry {
+                key: ":",
+                description: "command palette (prompt normal mode and transcript)",
+            },
+            HelpEntry {
+                key: "Space s / Ctrl-G",
+                description: "session picker",
+            },
+            HelpEntry {
+                key: "Space o",
+                description: "open session in a new pane",
+            },
+            HelpEntry {
+                key: "Space w / Space b",
+                description: "insert a git worktree path / branch name",
+            },
+            HelpEntry {
+                key: "@ (in prompt)",
+                description: "workspace file picker",
+            },
+            HelpEntry {
+                key: "Space A",
+                description: "jump to the next pane needing attention",
+            },
+            HelpEntry {
+                key: "C-w h/j/k/l",
+                description: "focus pane left/down/up/right",
+            },
+            HelpEntry {
+                key: "C-w v / s",
+                description: "open a new pane",
+            },
+            HelpEntry {
+                key: "C-w c",
+                description: "close focused pane",
+            },
+            HelpEntry {
+                key: "C-w w",
+                description: "cycle panes",
+            },
+            HelpEntry {
+                key: "Tab / S-Tab",
+                description: "next / previous session",
+            },
+            HelpEntry {
+                key: "Tab (prompt normal)",
+                description: "toggle Build / Plan mode",
+            },
+            HelpEntry {
+                key: "Space n / Space N",
+                description: "new session in a new pane",
+            },
+            HelpEntry {
+                key: "Space W",
+                description: "new session in a fresh git worktree",
+            },
+            HelpEntry {
+                key: "Space x",
+                description: "cancel focused turn",
+            },
+            HelpEntry {
+                key: "y / n",
+                description: "approve / deny a pending tool call (card shortcut)",
+            },
+            HelpEntry {
+                key: "j / k · Enter",
+                description: "pending card: pick an approval action / answer with the highlighted option",
+            },
+            HelpEntry {
+                key: "1-6 · C-n/C-p",
+                description: "answer a question directly / next-prev option",
+            },
+            HelpEntry {
+                key: "d",
+                description: "review the pending diff full screen (Space toggles hunks)",
+            },
+            HelpEntry {
+                key: "e / o",
+                description: "edit the staged content / open the real file",
+            },
+            HelpEntry {
+                key: "r",
+                description: "deny the pending approval with a reason",
+            },
+            HelpEntry {
+                key: "Space r",
+                description: "approvals inbox across sessions",
+            },
+            HelpEntry {
+                key: "j / k",
+                description: "scroll focused transcript",
+            },
+            HelpEntry {
+                key: "g / G",
+                description: "top / follow tail",
+            },
+            HelpEntry {
+                key: "Space c",
+                description: "context ledger (f fork here, w rewind + roll back)",
+            },
+            HelpEntry {
+                key: "Space p",
+                description: "background processes (x kills, r refreshes)",
+            },
+            HelpEntry {
+                key: "Space F",
+                description: "fork the session (git worktree when inside a repo)",
+            },
+            HelpEntry {
+                key: "#",
+                description: "search message history (Enter runs / opens)",
+            },
+            HelpEntry {
+                key: "? / F1",
+                description: "open this help (F1 anywhere)",
+            },
+            HelpEntry {
+                key: "Space Q / Ctrl-C",
+                description: "quit (Ctrl-C interrupts instead while the prompt is focused)",
+            },
+            HelpEntry {
+                key: "help search",
+                description: "type to filter entries · ↑/↓ select · Ctrl-U clears · Esc closes",
+            },
+        ],
+    },
+    HelpSection {
+        title: "notes",
+        entries: &[
+            HelpEntry {
+                key: "prompt",
+                description: "modal: Enter sends in insert; normal mode has vim motions, d/c/y, visual (v/V) and u/C-r",
+            },
+            HelpEntry {
+                key: "C-w",
+                description: "commands work from the transcript; Esc leaves the prompt first.",
+            },
+            HelpEntry {
+                key: "ask_user",
+                description: "the approval card is an option picker; the first option is recommended.",
+            },
+            HelpEntry {
+                key: "ledger",
+                description: "advisory: system and instruction entries are never trimmed automatically",
+            },
+        ],
+    },
+];
+
+enum HelpRow {
+    Blank,
+    Section(&'static str),
+    Entry(&'static HelpEntry),
+}
+
+fn help_rows(query: &str) -> Vec<HelpRow> {
+    let query = query.trim().to_lowercase();
+    let mut rows = Vec::new();
+    for section in HELP_SECTIONS {
+        let matched: Vec<&HelpEntry> = section
+            .entries
+            .iter()
+            .filter(|entry| entry.matches(&query))
+            .collect();
+        if matched.is_empty() {
+            continue;
+        }
+        if !rows.is_empty() {
+            rows.push(HelpRow::Blank);
+        }
+        rows.push(HelpRow::Section(section.title));
+        rows.extend(matched.into_iter().map(HelpRow::Entry));
+    }
+    rows
+}
+
+fn help_entry_count(query: &str) -> usize {
+    let query = query.trim().to_lowercase();
+    HELP_SECTIONS
+        .iter()
+        .flat_map(|section| section.entries.iter())
+        .filter(|entry| entry.matches(&query))
+        .count()
+}
+
+fn draw_help(frame: &mut Frame, area: Rect, query: &str, selected: usize, theme: Theme) {
+    let dialog_bg = dialog_background(theme);
     let width = (area.width as u32 * 7 / 10).max(50).min(area.width as u32) as u16;
-    let lines = vec![
-        Line::from(Span::styled(
-            "prompt commands",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        key_line("/help", "open this reference"),
-        key_line("/new", "start a session here (/new optional-name)"),
-        key_line("/clear", "forget the conversation context (transcript stays)"),
-        key_line("/compact", "summarize the history (/compact optional notes)"),
-        key_line(
-            "/btw",
-            "one-off answer (/btw <question>); kept out of the conversation",
-        ),
-        key_line("/cd", "change the working directory (/cd <path>); alone shows it"),
-        key_line("/init", "draft AGENTS.md; you review before sending"),
-        key_line("/queue", "list queued prompts (/queue clear | rm N | move N M)"),
-        key_line("/sessions", "open the session picker"),
-        key_line("/timeline", "recent turns, answers and tool calls (j/k scroll)"),
-        key_line("/export", "write this session as JSON (/export optional-path)"),
-        key_line("/archive · /delete", "hide from the picker · delete (confirm twice)"),
-        key_line("/undo · /redo", "hide or restore the newest turn"),
-        key_line(
-            "/skills [name] [args]",
-            "browse skills with a preview, or insert one with arguments",
-        ),
-        key_line("/todos", "show the model's current task list"),
-        key_line(
-            "/diagnostics [max-files]",
-            "aggregate workspace LSP diagnostics (j/k scroll)",
-        ),
-        key_line(
-            "/image <path>",
-            "attach images (paste/drop a path or file:// URI); png/jpg/gif/webp",
-        ),
-        key_line("!<cmd>", "run a shell command in the session cwd (sandboxed, snapshotted)"),
-        key_line("/fork", "fork this session (/fork optional-name)"),
-        key_line("/permission", "set read-only · workspace-write · full"),
-        key_line("/exit · /quit", "save and close this session (quits on the last pane)"),
-        Line::from(""),
-        Line::from(Span::styled(
-            "keys",
-            Style::default().add_modifier(Modifier::BOLD),
-        )),
-        key_line("i / Enter", "focus the prompt"),
-        key_line(
-            "mouse",
-            "click folds a Thinking / tool block; wheel scrolls the transcript",
-        ),
-        key_line("Esc", "prompt: normal mode (keeps focus)"),
-        key_line(
-            "Esc Esc",
-            "normal mode: interrupt the running turn, or leave for the transcript",
-        ),
-        key_line("Enter", "send (insert mode); prompts sent while busy are queued"),
-        key_line("Ctrl-J", "newline (insert mode)"),
-        key_line("Space s/f/w/b", "prompt: sessions / files / worktrees / branches"),
-        key_line(
-            "Space c/C/h/p/e",
-            "prompt: ledger / context / history / processes / diagnostics",
-        ),
-        key_line("Space r/x/a/?", "prompt: approvals / cancel / actions / help"),
-        key_line("Space n/q", "prompt: open in a new pane / close pane"),
-        key_line("Space N/W/F", "prompt: new session / new worktree / fork"),
-        key_line(
-            "j / k",
-            "normal mode: browse submitted prompts (3j / dj stay draft moves)",
-        ),
-        key_line("Space :", "prompt: command palette"),
-        key_line("p / Ctrl-G", "session picker"),
-        key_line("o", "open session in a new pane"),
-        key_line(":", "command palette (every action and provider)"),
-        key_line("w / b", "insert a git worktree path / branch name"),
-        key_line("@ (in prompt)", "workspace file picker"),
-        key_line("a", "jump to the next pane needing attention"),
-        key_line("C-w h/j/k/l", "focus pane left/down/up/right"),
-        key_line("C-w v / s", "open a new pane"),
-        key_line("C-w c", "close focused pane"),
-        key_line("C-w w", "cycle panes"),
-        key_line("Tab / S-Tab", "next / previous session"),
-        key_line("n / N", "new session (N: in a fresh git worktree)"),
-        key_line("x", "cancel focused turn"),
-        key_line("y / n", "approve / deny a pending tool call (card shortcut)"),
-        key_line(
-            "j / k · Enter",
-            "pending card: pick an approval action / answer with the highlighted option",
-        ),
-        key_line("1-6 · C-n/C-p", "answer a question directly / next-prev option"),
-        key_line(
-            "d",
-            "review the pending diff full screen (Space toggles hunks)",
-        ),
-        key_line("e / o", "edit the staged content / open the real file"),
-        key_line("r", "deny the pending approval with a reason"),
-        key_line("A", "approvals inbox across sessions"),
-        key_line("j / k", "scroll focused transcript"),
-        key_line("g / G", "top / follow tail"),
-        key_line("c", "context ledger (f fork here, w rewind + roll back)"),
-        key_line("P", "background processes (x kills, r refreshes)"),
-        key_line("F", "fork the session (git worktree when inside a repo)"),
-        key_line("#", "search message history (Enter runs / opens)"),
-        key_line("? / F1", "open this help (F1 anywhere)"),
-        key_line(
-            "q / Ctrl-C",
-            "quit (Ctrl-C interrupts instead while the prompt is focused)",
-        ),
-        Line::from(""),
-        Line::from(Span::styled(
-            "the prompt is modal: Enter sends in insert; normal mode has vim motions, d/c/y, visual (v/V) and u/C-r",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "C-w commands work from the transcript; Esc leaves the prompt first.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "ask_user and the approval card are option pickers: first option is recommended.",
-            Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(Span::styled(
-            "the ledger is advisory: system and instruction entries are never trimmed automatically",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-    let height = (lines.len() as u16 + 2)
+    let rows = help_rows(query);
+    let matches = help_entry_count(query);
+    let total: usize = HELP_SECTIONS
+        .iter()
+        .map(|section| section.entries.len())
+        .sum();
+
+    let height = (rows.len() as u16 + 5)
         .min(area.height.saturating_sub(2))
         .max(8);
     let rect = centered(area, width, height);
     frame.render_widget(Clear, rect);
-    let paragraph = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" help "))
-        .wrap(Wrap { trim: false })
-        .style(Style::default().bg(Color::Black));
-    frame.render_widget(paragraph, rect);
+    frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+    frame.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" help ")
+            .style(Style::default().bg(dialog_bg)),
+        rect,
+    );
+
+    let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
+    let chunks = Layout::vertical([Constraint::Length(3), Constraint::Min(0)]).split(inner);
+
+    let search = if query.is_empty() {
+        Line::from(vec![
+            Span::styled(
+                "search",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  type to filter the reference",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled(
+                "search  ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(query.to_string()),
+            Span::styled("▌", Style::default().fg(Color::DarkGray)),
+        ])
+    };
+    let count = Line::from(Span::styled(
+        format!("{matches}/{total} entries · ↑/↓ select · Ctrl-U clear · Esc close"),
+        Style::default().fg(Color::DarkGray),
+    ));
+    frame.render_widget(
+        Paragraph::new(vec![search, count, Line::from("")]).style(Style::default().bg(dialog_bg)),
+        chunks[0],
+    );
+
+    let selected_row = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| matches!(row, HelpRow::Entry(_)))
+        .nth(selected)
+        .map(|(index, _)| index);
+    let visible = chunks[1].height as usize;
+    let start = selected_row
+        .map(|index| index.saturating_add(1).saturating_sub(visible))
+        .unwrap_or(0);
+
+    let mut ordinal = rows
+        .iter()
+        .take(start)
+        .filter(|row| matches!(row, HelpRow::Entry(_)))
+        .count();
+    let lines: Vec<Line> = if rows.is_empty() {
+        vec![Line::from(Span::styled(
+            "no matching key help",
+            Style::default().fg(Color::DarkGray),
+        ))]
+    } else {
+        rows.iter()
+            .skip(start)
+            .map(|row| match row {
+                HelpRow::Blank => Line::from(""),
+                HelpRow::Section(title) => Line::from(Span::styled(
+                    *title,
+                    Style::default().add_modifier(Modifier::BOLD),
+                )),
+                HelpRow::Entry(entry) => {
+                    let is_selected = ordinal == selected;
+                    ordinal += 1;
+                    let mut line = Line::from(vec![
+                        Span::styled(
+                            if is_selected { "› " } else { "  " },
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                        Span::styled(
+                            format!("{:<15}", entry.key),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(entry.description),
+                    ]);
+                    if is_selected {
+                        line = line.style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                    }
+                    line
+                }
+            })
+            .collect()
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .style(Style::default().bg(dialog_bg)),
+        chunks[1],
+    );
 }
 
-fn draw_timeline(frame: &mut Frame, area: Rect, items: &[eix_core::TimelineItem], scroll: usize) {
+fn draw_timeline(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[eix_core::TimelineItem],
+    scroll: usize,
+    theme: Theme,
+) {
+    let dialog_bg = dialog_background(theme);
     let width = (area.width as u32 * 8 / 10).max(60).min(area.width as u32) as u16;
     let height = area.height.saturating_sub(4).max(8);
     let rect = centered(area, width, height);
@@ -6689,26 +7829,16 @@ fn draw_timeline(frame: &mut Frame, area: Rect, items: &[eix_core::TimelineItem]
         })
         .collect();
     frame.render_widget(Clear, rect);
+    frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
     let paragraph = Paragraph::new(lines)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" timeline (j/k scroll, Esc close) "),
+                .title(" timeline (j/k scroll, Esc close) ")
+                .style(Style::default().bg(dialog_bg)),
         )
-        .style(Style::default().bg(Color::Black));
+        .style(Style::default().bg(dialog_bg));
     frame.render_widget(paragraph, rect);
-}
-
-fn key_line(key: &'static str, description: &'static str) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(
-            format!("{key:<15}"),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(description),
-    ])
 }
 
 fn sector_tag(sector: Sector) -> &'static str {
@@ -6844,6 +7974,36 @@ fn ledger_hint_line(ledger: &LedgerView) -> Line<'static> {
 /// Tile `count` panes inside `area`. One pane is fullscreen, two split
 /// vertically, three use a tall left pane plus two stacked on the right, and
 /// everything else uses a near-square grid.
+/// Adjacent panes share one line: the left pane owns the right border, the
+/// top pane owns the top border. This halves the gap between neighbouring
+/// panes while keeping every title on a top border.
+fn pane_borders(areas: &[Rect], index: usize) -> Borders {
+    let Some(rect) = areas.get(index).copied() else {
+        return Borders::ALL;
+    };
+    let overlaps = |a_start: u16, a_len: u16, b_start: u16, b_len: u16| {
+        a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
+    };
+
+    let mut borders = Borders::ALL;
+    for (other_index, other) in areas.iter().enumerate() {
+        if other_index == index {
+            continue;
+        }
+        let left_neighbour = other.x.saturating_add(other.width) == rect.x
+            && overlaps(other.y, other.height, rect.y, rect.height);
+        let bottom_neighbour = other.y == rect.y.saturating_add(rect.height)
+            && overlaps(other.x, other.width, rect.x, rect.width);
+        if left_neighbour {
+            borders.remove(Borders::LEFT);
+        }
+        if bottom_neighbour {
+            borders.remove(Borders::BOTTOM);
+        }
+    }
+    borders
+}
+
 fn pane_rects(area: Rect, count: usize) -> Vec<Rect> {
     match count {
         0 => Vec::new(),
@@ -6928,7 +8088,7 @@ fn center_of(rect: Rect) -> (i64, i64) {
 }
 
 /// Line index where each hunk starts in the review body.
-fn review_hunk_offsets(approval: &PendingApproval) -> Vec<usize> {
+fn review_unified_hunk_offsets(approval: &PendingApproval) -> Vec<usize> {
     let mut offsets = Vec::with_capacity(approval.hunks.len());
     let mut line = 0;
     for hunk in &approval.hunks {
@@ -6938,8 +8098,8 @@ fn review_hunk_offsets(approval: &PendingApproval) -> Vec<usize> {
     offsets
 }
 
-/// Number of lines the review body renders.
-fn review_total_lines(approval: &PendingApproval) -> usize {
+/// Number of lines the unified fallback renders.
+fn review_unified_total(approval: &PendingApproval) -> usize {
     if approval.hunks.is_empty() {
         approval
             .diff
@@ -7012,21 +8172,59 @@ fn next_prev_key(key: KeyEvent) -> KeyEvent {
 }
 
 fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval, theme: Theme) {
+    let dialog_bg = dialog_background(theme);
     if area.width < 24 || area.height < 6 {
         return;
     }
     let actions = approval.actions();
     let cursor = approval.cursor.min(actions.len().saturating_sub(1));
     let diff_lines: Vec<&str> = approval.diff.as_deref().unwrap_or("").lines().collect();
+    let inner = area.width.saturating_sub(4) as usize;
+    let rows = super::diff::rows(&approval.hunks, approval.diff.as_deref());
+    let side_by_side = (!rows.is_empty())
+        .then(|| {
+            super::diff::DiffRenderer::new(
+                &rows,
+                inner,
+                approval.path.as_deref().unwrap_or(""),
+                theme,
+                "",
+                dialog_bg,
+            )
+        })
+        .flatten();
+    let diff_len = if side_by_side.is_some() {
+        rows.len()
+    } else {
+        diff_lines.len()
+    };
+    // The summary can be a full shell command. Wrap it instead of cutting it
+    // off, but keep the action list and hint on screen.
+    let (risk, risk_color) = approval_risk(&approval.tool);
+    let risk_label = format!("  [{risk}]");
+    let prefix_width = 2; // "⚠ "
+    let body_width = inner
+        .saturating_sub(prefix_width + UnicodeWidthStr::width(risk_label.as_str()))
+        .max(8);
+    let mut summary_lines = wrap_text(&approval.summary, body_width);
+    let max_height = area.height.saturating_sub(1) as usize;
+    let reserved = 2 + actions.len() + 1;
+    let max_summary = max_height.saturating_sub(reserved).max(1);
+    let summary_truncated = summary_lines.len() > max_summary;
+    if summary_truncated {
+        summary_lines.truncate(max_summary.saturating_sub(1));
+        summary_lines.push("…".to_string());
+    }
+
     // Borders + summary + actions + hint; the diff takes whatever is left.
-    let fixed = 2 + 1 + actions.len() + 1;
-    let max_diff = (area.height as usize).saturating_sub(fixed).min(8);
-    let shown = diff_lines.len().min(max_diff);
-    let truncated = diff_lines.len() > shown && max_diff > 0;
+    let fixed = 2 + summary_lines.len() + actions.len() + 1;
+    let max_diff = max_height.saturating_sub(fixed).min(8);
+    let shown = diff_len.min(max_diff);
+    let truncated = diff_len > shown && max_diff > 0;
     // Leave the pane's title row visible and never underflow `y` on a pane
     // that starts at the top of the screen.
     let height = (fixed + shown + usize::from(truncated))
-        .min(area.height.saturating_sub(1) as usize)
+        .min(max_height)
         .max(3) as u16;
     let rect = Rect {
         x: area.x + 1,
@@ -7035,25 +8233,38 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
         height,
     };
     frame.render_widget(Clear, rect);
+    frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
 
-    let inner = rect.width.saturating_sub(2) as usize;
-    let summary = truncate(&approval.summary, inner.saturating_sub(12));
-    let (risk, risk_color) = approval_risk(&approval.tool);
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "⚠ ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(summary, Style::default().fg(Color::Yellow)),
-        Span::styled(format!("  [{risk}]"), Style::default().fg(risk_color)),
-    ])];
-    for line in diff_lines.iter().take(shown) {
-        lines.push(Line::from(Span::styled(
-            truncate(line, inner),
-            diff_line_style(line, theme),
-        )));
+    let mut lines = Vec::with_capacity(fixed + shown);
+    for (index, summary) in summary_lines.into_iter().enumerate() {
+        let mut spans = Vec::new();
+        if index == 0 {
+            spans.push(Span::styled(
+                "⚠ ",
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(summary, Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                risk_label.clone(),
+                Style::default().fg(risk_color),
+            ));
+        } else {
+            spans.push(Span::raw("  "));
+            spans.push(Span::styled(summary, Style::default().fg(Color::Yellow)));
+        }
+        lines.push(Line::from(spans));
+    }
+    if let Some(mut renderer) = side_by_side {
+        lines.extend(renderer.render(&rows[..rows.len().min(shown)], false, &[], 0));
+    } else {
+        for line in diff_lines.iter().take(shown) {
+            lines.push(Line::from(Span::styled(
+                truncate(line, inner),
+                diff_line_style(line, theme),
+            )));
+        }
     }
     if truncated {
         lines.push(Line::from(Span::styled(
@@ -7094,7 +8305,7 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .style(Style::default().bg(Color::Black)),
+            .style(Style::default().bg(dialog_bg)),
         rect,
     );
 }
@@ -7109,7 +8320,8 @@ fn approval_action_color(action: ApprovalAction) -> Color {
 }
 
 /// Render an `ask_user` question as a keyboard-driven option picker.
-fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput) {
+fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme: Theme) {
+    let dialog_bg = dialog_background(theme);
     if area.width < 24 || area.height < 5 {
         return;
     }
@@ -7123,6 +8335,7 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput) {
         height,
     };
     frame.render_widget(Clear, rect);
+    frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
     let inner = rect.width.saturating_sub(2) as usize;
     let cursor = pending.cursor.min(pending.options.len().saturating_sub(1));
     let mut lines = vec![Line::from(vec![
@@ -7181,7 +8394,7 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput) {
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
-            .style(Style::default().bg(Color::Black)),
+            .style(Style::default().bg(dialog_bg)),
         rect,
     );
 }
@@ -7237,10 +8450,13 @@ fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
-/// A prompt run, reversed while the visual selection covers it.
+/// A prompt run, highlighted while the visual selection covers it.
 fn selection_span(text: String, selected: bool) -> Span<'static> {
     if selected {
-        Span::styled(text, Style::default().add_modifier(Modifier::REVERSED))
+        Span::styled(
+            text,
+            Style::default().fg(COMPOSER_TEXT).bg(COMPOSER_SELECTION),
+        )
     } else {
         Span::raw(text)
     }
@@ -7273,6 +8489,30 @@ fn turn_summary(done: &TurnCompleted) -> String {
         parts.push(format!("${cost:.4}"));
     }
     parts.join(" · ")
+}
+
+/// Current git branch for `cwd`, or a short commit hash when HEAD is detached.
+fn read_git_branch(cwd: &std::path::Path) -> Option<String> {
+    let branch = git_stdout(cwd, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    if branch == "HEAD" {
+        return git_stdout(cwd, &["rev-parse", "--short", "HEAD"]).map(|sha| format!("@{sha}"));
+    }
+    Some(branch)
+}
+
+fn git_stdout(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 /// Replace a leading `$HOME` with `~`.
@@ -7321,6 +8561,260 @@ pub(super) fn truncate(text: &str, max: usize) -> String {
     out
 }
 
+/// The prompt is deliberately transparent: its chrome paints text and borders
+/// over the theme's canvas (or the terminal background) instead of a separate
+/// panel fill.
+fn composer_background(theme: Theme) -> Color {
+    theme.background.unwrap_or(Color::Reset)
+}
+
+/// Background for floating dialogs. Presets may set a full-terminal
+/// background, a panel color, or neither; the default transparent theme falls
+/// back to the terminal background.
+fn dialog_background(theme: Theme) -> Color {
+    theme.background.or(theme.panel).unwrap_or(Color::Reset)
+}
+
+fn composer_text(theme: Theme) -> Color {
+    theme.normal.unwrap_or(COMPOSER_TEXT)
+}
+
+fn composer_muted(theme: Theme) -> Color {
+    theme.comment.unwrap_or(COMPOSER_MUTED)
+}
+
+fn composer_border(theme: Theme) -> Color {
+    theme.comment.unwrap_or(COMPOSER_BORDER)
+}
+
+fn composer_accent(theme: Theme) -> Color {
+    theme.function.unwrap_or(COMPOSER_ACCENT)
+}
+
+fn composer_warn(theme: Theme) -> Color {
+    theme.string.unwrap_or(COMPOSER_WARN)
+}
+
+fn composer_success(theme: Theme) -> Color {
+    theme.diff_add.unwrap_or(COMPOSER_SUCCESS)
+}
+
+fn composer_danger(theme: Theme) -> Color {
+    theme.error.unwrap_or(COMPOSER_DANGER)
+}
+
+/// Session state on the prompt banner uses the same restrained palette as the
+/// transcript instead of the brighter ANSI colors.
+fn composer_status_color(status: SessionStatus, theme: Theme) -> Color {
+    match status {
+        SessionStatus::Idle => composer_muted(theme),
+        SessionStatus::Running => composer_success(theme),
+        SessionStatus::AwaitingApproval => composer_warn(theme),
+        SessionStatus::AwaitingInput => composer_accent(theme),
+        SessionStatus::Error => composer_danger(theme),
+        SessionStatus::Paused => composer_text(theme),
+    }
+}
+
+/// Insert is the active writing mode (green), normal is the Vim home mode
+/// (blue), visual is a selection (amber). Blurred mode badges stay quiet.
+fn composer_mode_color(mode: Mode, theme: Theme) -> Color {
+    match mode {
+        Mode::Insert => composer_success(theme),
+        Mode::Normal => composer_accent(theme),
+        Mode::Visual | Mode::VisualLine => composer_warn(theme),
+    }
+}
+
+fn composer_mode_style(mode: Mode, focused: bool, theme: Theme) -> Style {
+    let color = if focused {
+        composer_mode_color(mode, theme)
+    } else {
+        composer_border(theme)
+    };
+    Style::default()
+        .fg(COMPOSER_BADGE_TEXT)
+        .bg(color)
+        .add_modifier(Modifier::BOLD)
+}
+
+/// Keep a left/right pair of border titles from colliding. The right title is
+/// dropped first; the left one is clipped only when it cannot fit by itself.
+fn fit_title(
+    left: Line<'static>,
+    right: Option<Line<'static>>,
+    width: usize,
+) -> (Line<'static>, Option<Line<'static>>) {
+    let width = width.max(1);
+    let right = right.filter(|right| left.width() + right.width() + 2 <= width);
+    let left = if left.width() > width {
+        truncate_line(left, width)
+    } else {
+        left
+    };
+    (left, right)
+}
+
+fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
+    if width == 0 {
+        return Line::default();
+    }
+    let mut used = 0usize;
+    let mut spans = Vec::new();
+    for span in line.spans {
+        let span_width = UnicodeWidthStr::width(span.content.as_ref());
+        if used + span_width <= width {
+            used += span_width;
+            spans.push(span);
+            continue;
+        }
+        let remaining = width.saturating_sub(used);
+        if remaining > 0 {
+            spans.push(Span::styled(
+                truncate(span.content.as_ref(), remaining),
+                span.style,
+            ));
+        }
+        break;
+    }
+    Line::from(spans)
+}
+
+fn text_line(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
+}
+
+fn normalize_selection(selection: &TextSelection) -> ((usize, usize), (usize, usize)) {
+    let mut start = selection.anchor;
+    let mut end = selection.cursor;
+    if start > end {
+        std::mem::swap(&mut start, &mut end);
+    }
+    (start, end)
+}
+
+/// Extract the selected cells from the plain transcript lines. Cell columns
+/// make the result line up with the reverse-video highlight, including for
+/// wide glyphs.
+fn selection_text(lines: &[String], selection: &TextSelection) -> String {
+    let ((start_line, start_col), (end_line, end_col)) = normalize_selection(selection);
+    if start_line >= lines.len() || start_line > end_line {
+        return String::new();
+    }
+    let end_line = end_line.min(lines.len().saturating_sub(1));
+    let mut selected = Vec::new();
+    for (index, line) in lines
+        .iter()
+        .enumerate()
+        .skip(start_line)
+        .take(end_line + 1 - start_line)
+    {
+        let from = if index == start_line { start_col } else { 0 };
+        let to = if index == end_line {
+            end_col
+        } else {
+            usize::MAX
+        };
+        selected.push(slice_cells(line, from, to).trim_end().to_string());
+    }
+    selected.join("\n").trim_end().to_string()
+}
+
+fn slice_cells(text: &str, start: usize, end: usize) -> String {
+    let mut out = String::new();
+    let mut column = 0usize;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let selected = if width == 0 {
+            column >= start && column < end
+        } else {
+            column < end && column.saturating_add(width) > start
+        };
+        if selected {
+            out.push(ch);
+        }
+        column = column.saturating_add(width);
+    }
+    out
+}
+
+#[cfg(test)]
+fn highlight_selection(lines: &mut [Line<'static>], selection: &TextSelection) {
+    highlight_selection_window(lines, selection, 0);
+}
+
+/// Highlight a visible window whose first line is `first_line` in the full
+/// transcript.
+fn highlight_selection_window(
+    lines: &mut [Line<'static>],
+    selection: &TextSelection,
+    first_line: usize,
+) {
+    let ((start_line, start_col), (end_line, end_col)) = normalize_selection(selection);
+    if start_line == end_line && start_col == end_col {
+        return;
+    }
+    for (offset, line) in lines.iter_mut().enumerate() {
+        let index = first_line.saturating_add(offset);
+        if index < start_line || index > end_line {
+            continue;
+        }
+        let from = if index == start_line { start_col } else { 0 };
+        let to = if index == end_line {
+            end_col
+        } else {
+            usize::MAX
+        };
+        *line = highlight_line(line, from, to);
+    }
+}
+
+fn highlight_line(line: &Line<'static>, start: usize, end: usize) -> Line<'static> {
+    let mut spans = Vec::new();
+    let mut column = 0usize;
+    for span in &line.spans {
+        let mut run = String::new();
+        let mut selected_run = false;
+        for ch in span.content.chars() {
+            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            let selected = if width == 0 {
+                column >= start && column < end
+            } else {
+                column < end && column.saturating_add(width) > start
+            };
+            if run.is_empty() {
+                selected_run = selected;
+            } else if selected != selected_run {
+                let style = if selected_run {
+                    span.style.add_modifier(Modifier::REVERSED)
+                } else {
+                    span.style
+                };
+                spans.push(Span::styled(std::mem::take(&mut run), style));
+                selected_run = selected;
+            }
+            run.push(ch);
+            column = column.saturating_add(width);
+        }
+        if !run.is_empty() {
+            let style = if selected_run {
+                span.style.add_modifier(Modifier::REVERSED)
+            } else {
+                span.style
+            };
+            spans.push(Span::styled(run, style));
+        }
+    }
+    Line {
+        style: line.style,
+        alignment: line.alignment,
+        spans,
+    }
+}
+
 fn fuzzy_score(query: &str, haystack: &str) -> Option<i32> {
     let mut haystack = haystack.chars();
     let mut score = 0;
@@ -7347,8 +8841,6 @@ fn fuzzy_score(query: &str, haystack: &str) -> Option<i32> {
     }
     Some(score)
 }
-
-const SPINNER: [&str; 4] = ["⠋", "⠙", "⠹", "⠸"];
 
 /// Parse a drag-and-drop / clipboard paste as image paths. Returns `None` when
 /// the paste is ordinary text, so callers can fall back to the editor.
@@ -7521,6 +9013,36 @@ mod tests {
     }
 
     #[test]
+    fn adjacent_panes_share_one_border() {
+        let area = Rect::new(0, 0, 100, 40);
+        let two = pane_rects(area, 2);
+        assert!(pane_borders(&two, 0).contains(Borders::RIGHT));
+        assert!(!pane_borders(&two, 1).contains(Borders::LEFT));
+
+        let stacked = vec![Rect::new(0, 0, 20, 10), Rect::new(0, 10, 20, 10)];
+        assert!(!pane_borders(&stacked, 0).contains(Borders::BOTTOM));
+        assert!(pane_borders(&stacked, 1).contains(Borders::TOP));
+    }
+
+    #[test]
+    fn split_panes_render_both_titles() {
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "left pane", "/tmp/left"),
+            Vec::new(),
+        ));
+        app.views.push(SessionView::new(
+            Session::new("s2", "right pane", "/tmp/right"),
+            Vec::new(),
+        ));
+        app.connected = true;
+
+        let rendered = render_text(&mut app, 80, 20);
+        assert!(rendered.contains("left pane"), "{rendered}");
+        assert!(rendered.contains("right pane"), "{rendered}");
+    }
+
+    #[test]
     fn pane_layouts_stay_inside_the_area() {
         let area = Rect::new(0, 0, 100, 40);
         for count in 1..=6 {
@@ -7616,11 +9138,110 @@ mod tests {
         assert!(collapsed.contains("ok"));
         assert!(!collapsed.contains("wrote 5 bytes to out.txt"));
 
-        // Expanding the block reveals the argument and the output.
+        // Expanding the block reveals the written body and the result without
+        // repeating the summary in an `input`/`content`/`output` label.
         view.folds.insert(FoldId::Event(1), true);
         let expanded = render_transcript(&view, 60);
         assert!(expanded.contains("wrote 5 bytes to out.txt"));
-        assert!(expanded.contains("content"));
+        assert!(expanded.contains("hello"));
+        assert!(!expanded.contains("output"), "{expanded}");
+        assert!(!expanded.contains("content"), "{expanded}");
+    }
+
+    #[test]
+    fn expanded_command_omits_redundant_labels_and_gutter() {
+        let session = Session::new("s1", "tools", "/tmp");
+        let events = vec![
+            SessionEvent::new(
+                "s1",
+                1,
+                EventKind::ToolCall,
+                serde_json::json!({
+                    "call_id": "c1",
+                    "tool": "run_command",
+                    "arguments": {"command": "echo hi"},
+                }),
+            ),
+            SessionEvent::new(
+                "s1",
+                2,
+                EventKind::ToolResult,
+                serde_json::json!({
+                    "call_id": "c1",
+                    "tool": "run_command",
+                    "ok": true,
+                    "denied": false,
+                    "output": "hi",
+                }),
+            ),
+        ];
+        let mut view = SessionView::new(session, events);
+        view.folds.insert(FoldId::Event(1), true);
+        let expanded = render_transcript(&view, 60);
+
+        // The header already shows `$ echo hi`; the body is only the output.
+        assert!(!expanded.contains("input"), "{expanded}");
+        assert!(!expanded.contains("output"), "{expanded}");
+        assert!(!expanded.contains('│'), "{expanded}");
+        let output = expanded
+            .lines()
+            .find(|line| line.trim() == "hi")
+            .expect("command output line");
+        assert_eq!(output, "    hi");
+    }
+
+    #[test]
+    fn long_command_wraps_in_header_without_repeating_in_body() {
+        let session = Session::new("s1", "tools", "/tmp");
+        let command = format!("echo {}", "x".repeat(120));
+        let events = vec![
+            SessionEvent::new(
+                "s1",
+                1,
+                EventKind::ToolCall,
+                serde_json::json!({
+                    "call_id": "c1",
+                    "tool": "run_command",
+                    "arguments": {"command": command, "cwd": "/tmp"},
+                }),
+            ),
+            SessionEvent::new(
+                "s1",
+                2,
+                EventKind::ToolResult,
+                serde_json::json!({
+                    "call_id": "c1",
+                    "tool": "run_command",
+                    "ok": true,
+                    "denied": false,
+                    "output": "done",
+                }),
+            ),
+        ];
+        let mut view = SessionView::new(session, events);
+        view.folds.insert(FoldId::Event(1), true);
+        let expanded = render_transcript(&view, 60);
+        let lines: Vec<&str> = expanded.lines().collect();
+
+        // The first header line keeps the status and is no longer elided.
+        assert!(lines[0].contains("$ echo"), "{expanded}");
+        assert!(lines[0].contains("ok"), "{expanded}");
+        assert!(!expanded.contains('…'), "{expanded}");
+        // The command wraps onto continuation lines aligned under the summary.
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.starts_with("      ") && line.contains('x')),
+            "{expanded}"
+        );
+        // No truncated header plus a full repeated command line in the body.
+        assert_eq!(expanded.matches("$ echo").count(), 1, "{expanded}");
+        assert!(
+            !lines.iter().any(|line| line.starts_with("    $ ")),
+            "{expanded}"
+        );
+        // Every byte of the command is shown exactly once.
+        assert_eq!(expanded.matches('x').count(), 120, "{expanded}");
     }
 
     #[test]
@@ -7656,12 +9277,36 @@ mod tests {
             user.starts_with("  "),
             "user turn should be indented: {user:?}"
         );
-        assert!(lines.iter().any(|line| line.contains("▸ Thinking")));
-        // Stored thinking is collapsed until expanded.
-        assert!(!rendered.contains("pondering"));
+        assert!(lines.iter().any(|line| line.contains("▾ Thinking")));
+        // Stored thinking is expanded by default.
+        assert!(rendered.contains("pondering"));
         let mut view = view;
-        view.folds.insert(FoldId::Event(2), true);
-        assert!(render_transcript(&view, 40).contains("pondering"));
+        view.folds.insert(FoldId::Event(2), false);
+        assert!(!render_transcript(&view, 40).contains("pondering"));
+    }
+
+    #[test]
+    fn user_messages_use_a_compact_one_row_bubble() {
+        let session = Session::new("s1", "chat", "/tmp");
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::UserMessage,
+            serde_json::json!({"text": "hi there"}),
+        )];
+        let view = SessionView::new(session, events);
+        let rendered = render_transcript(&view, 40);
+        let bubble: Vec<&str> = rendered.lines().filter(|line| line.contains('│')).collect();
+        assert_eq!(
+            bubble.len(),
+            1,
+            "bubble should not add cap rows: {rendered}"
+        );
+        assert!(bubble[0].contains("│ hi there │"), "{rendered}");
+        assert!(
+            !rendered.contains('╭') && !rendered.contains('╰'),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -7694,6 +9339,235 @@ mod tests {
         assert!(rendered.contains("context cleared"));
         // Clearing context never removes the transcript history.
         assert!(rendered.contains("old question"));
+    }
+
+    #[test]
+    fn transcript_cache_refreshes_after_new_events() {
+        let session = Session::new("s1", "cache", "/tmp");
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::UserMessage,
+            serde_json::json!({ "text": "first turn" }),
+        )];
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, events));
+        app.focused = 0;
+        assert!(render_text(&mut app, 60, 12).contains("first turn"));
+
+        app.views[0].events.push(SessionEvent::new(
+            "s1",
+            2,
+            EventKind::UserMessage,
+            serde_json::json!({ "text": "second turn" }),
+        ));
+        app.views[0].events_rev += 1;
+        assert!(render_text(&mut app, 60, 12).contains("second turn"));
+    }
+
+    #[test]
+    fn live_tail_renders_over_cached_history() {
+        let session = Session::new("s1", "cache", "/tmp");
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::UserMessage,
+            serde_json::json!({ "text": "stored history" }),
+        )];
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, events));
+        app.focused = 0;
+        app.views[0].stream = Some(StreamState {
+            turn_id: "t1".into(),
+            text: "half an answer".into(),
+            reasoning: String::new(),
+        });
+        assert!(render_text(&mut app, 60, 12).contains("half an answer"));
+
+        app.views[0].stream.as_mut().unwrap().text = "full answer".into();
+        assert!(render_text(&mut app, 60, 12).contains("full answer"));
+    }
+
+    #[test]
+    fn cached_history_honors_fold_changes() {
+        let session = Session::new("s1", "cache", "/tmp");
+        let events = vec![SessionEvent::new(
+            "s1",
+            2,
+            EventKind::AssistantMessage,
+            serde_json::json!({
+                "text": "answer",
+                "model": "test",
+                "reasoning": "hidden chain",
+            }),
+        )];
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, events));
+        app.focused = 0;
+        let unfolded = render_text(&mut app, 60, 24);
+        assert!(unfolded.contains("hidden chain"), "{unfolded:?}");
+
+        app.views[0].folds.insert(FoldId::Event(2), false);
+        let folded = render_text(&mut app, 60, 24);
+        assert!(folded.contains("Thinking"));
+        assert!(!folded.contains("hidden chain"));
+    }
+
+    #[test]
+    fn cached_history_renders_only_the_visible_window() {
+        let session = Session::new("s1", "cache", "/tmp");
+        let events: Vec<_> = (0..20)
+            .map(|index| {
+                SessionEvent::new(
+                    "s1",
+                    index + 1,
+                    EventKind::UserMessage,
+                    serde_json::json!({ "text": format!("turn {index}") }),
+                )
+            })
+            .collect();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, events));
+        app.focused = 0;
+        app.views[0].follow = false;
+        app.views[0].scroll = 0;
+        let top = render_text(&mut app, 60, 12);
+        assert!(top.contains("turn 0"), "{top}");
+        assert!(!top.contains("turn 19"), "{top}");
+
+        app.views[0].follow = true;
+        let bottom = render_text(&mut app, 60, 12);
+        assert!(bottom.contains("turn 19"), "{bottom}");
+    }
+
+    #[test]
+    fn history_page_prepends_older_events_and_keeps_scroll() {
+        let session = Session::new("s1", "paged", "/tmp");
+        let recent: Vec<_> = (10..20)
+            .map(|index| {
+                SessionEvent::new(
+                    "s1",
+                    index + 1,
+                    EventKind::UserMessage,
+                    serde_json::json!({ "text": format!("turn {index}") }),
+                )
+            })
+            .collect();
+        let older: Vec<_> = (0..10)
+            .map(|index| {
+                SessionEvent::new(
+                    "s1",
+                    index + 1,
+                    EventKind::UserMessage,
+                    serde_json::json!({ "text": format!("turn {index}") }),
+                )
+            })
+            .collect();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, recent));
+        app.focused = 0;
+        app.views[0].history_has_more = true;
+        render_text(&mut app, 60, 12);
+
+        app.views[0].follow = false;
+        app.views[0].scroll = 4;
+        app.history_page("s1".into(), older, false);
+        assert_eq!(app.views[0].events.len(), 20);
+        assert_eq!(app.views[0].events[0].seq, 1);
+        assert_eq!(app.views[0].events_rev, 1);
+
+        render_text(&mut app, 60, 12);
+        assert!(
+            app.views[0].scroll > 4,
+            "viewport should move by the prepended line count"
+        );
+        assert!(app.views[0]
+            .text_lines
+            .iter()
+            .any(|line| line.contains("turn 0")));
+        assert!(!app.views[0].history_has_more);
+        assert!(app.take_history_request().is_none());
+    }
+
+    #[test]
+    fn history_request_loads_one_page_at_a_time() {
+        let session = Session::new("s1", "paged", "/tmp");
+        let events: Vec<_> = (0..10)
+            .map(|index| {
+                SessionEvent::new(
+                    "s1",
+                    index + 101,
+                    EventKind::UserMessage,
+                    serde_json::json!({ "text": format!("turn {index}") }),
+                )
+            })
+            .collect();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, events));
+        app.focused = 0;
+        app.views[0].history_has_more = true;
+        app.views[0].follow = false;
+        app.views[0].scroll = 0;
+        render_text(&mut app, 60, 12);
+
+        let (session_id, before_seq) = app
+            .take_history_request()
+            .expect("scrolling to the top requests an older page");
+        assert_eq!(session_id, "s1");
+        assert_eq!(before_seq, 101);
+        assert!(app.views[0].history_loading);
+        assert!(!app.views[0].history_armed);
+
+        render_text(&mut app, 60, 12);
+        assert!(
+            app.take_history_request().is_none(),
+            "an in-flight page must not be requested twice"
+        );
+
+        let older: Vec<_> = (1..=100)
+            .map(|seq| {
+                SessionEvent::new(
+                    "s1",
+                    seq,
+                    EventKind::UserMessage,
+                    serde_json::json!({ "text": format!("older {seq}") }),
+                )
+            })
+            .collect();
+        app.history_page(session_id, older, false);
+        render_text(&mut app, 60, 12);
+        assert_eq!(app.views[0].events.len(), 110);
+        assert_eq!(app.views[0].events[0].seq, 1);
+        assert!(!app.views[0].history_loading);
+        assert!(!app.views[0].history_has_more);
+        assert!(app.views[0].scroll > 0);
+        assert!(app.take_history_request().is_none());
+    }
+
+    #[test]
+    fn expanded_tool_card_shows_the_full_long_command() {
+        let session = Session::new("s1", "tools", "/tmp");
+        let command = format!("echo {} ENDMARK", "x".repeat(70));
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "run_command",
+                "arguments": {"command": command, "cwd": "/tmp"},
+            }),
+        )];
+        let mut view = SessionView::new(session, events);
+
+        let open = render_transcript(&view, 60);
+        assert!(open.contains("ENDMARK"), "{open}");
+        assert!(open.contains("cwd: /tmp"), "{open}");
+
+        view.folds.insert(FoldId::Event(1), false);
+        let collapsed = render_transcript(&view, 60);
+        assert!(!collapsed.contains("ENDMARK"), "{collapsed}");
+        assert!(collapsed.contains('…'), "{collapsed}");
     }
 
     #[test]
@@ -7748,21 +9622,106 @@ mod tests {
         app.views.push(view);
         app.pane_areas = vec![Rect::new(0, 0, 40, 10)];
 
-        let click = |row| MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
+        let click = |kind, row| MouseEvent {
+            kind,
             column: 3,
             row,
             modifiers: KeyModifiers::NONE,
         };
-        // The first inner row is the block header.
-        app.handle_mouse(click(1));
+        let press = MouseEventKind::Down(MouseButton::Left);
+        let release = MouseEventKind::Up(MouseButton::Left);
+        // The first inner row is the block header. A click toggles on release
+        // so the same gesture can also start a drag selection.
+        app.handle_mouse(click(press, 1));
+        app.handle_mouse(click(release, 1));
         assert_eq!(app.views[0].folds.get(&FoldId::Event(1)), Some(&true));
         app.views[0].slots[0] = Some(transcript::Fold {
             id: FoldId::Event(1),
             open: true,
         });
-        app.handle_mouse(click(1));
+        app.handle_mouse(click(press, 1));
+        app.handle_mouse(click(release, 1));
         assert_eq!(app.views[0].folds.get(&FoldId::Event(1)), Some(&false));
+    }
+
+    #[test]
+    fn dragging_the_transcript_copies_the_selected_cells() {
+        let mut app = App::new(None);
+        let mut view = SessionView::new(Session::new("s1", "tools", "/tmp"), Vec::new());
+        view.text_lines = vec!["hello world".into(), "second line".into()];
+        app.views.push(view);
+        app.pane_areas = vec![Rect::new(0, 0, 40, 10)];
+
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1));
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 6, 1));
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 1));
+
+        assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
+        assert!(app.status.contains("copied 5 chars"));
+        assert!(app.views[0].selection.is_some());
+
+        // The copied text also seeds the prompt register, so normal-mode `p`
+        // pastes it even without a native clipboard helper.
+        assert!(app.input.has_register_text());
+        app.focus = Focus::Input;
+        app.input.enter_normal();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.input.text(), "hello");
+    }
+
+    #[test]
+    fn selection_text_spans_lines_and_respects_wide_glyphs() {
+        let lines = vec!["hello world".to_string(), "second line".to_string()];
+        let selection = TextSelection {
+            anchor: (0, 6),
+            cursor: (1, 6),
+            dragging: false,
+            moved: true,
+        };
+        assert_eq!(selection_text(&lines, &selection), "world\nsecond");
+
+        let wide = vec!["你a".to_string()];
+        let selection = TextSelection {
+            anchor: (0, 0),
+            cursor: (0, 2),
+            dragging: false,
+            moved: true,
+        };
+        assert_eq!(selection_text(&wide, &selection), "你");
+        let selection = TextSelection {
+            anchor: (0, 0),
+            cursor: (0, 3),
+            dragging: false,
+            moved: true,
+        };
+        assert_eq!(selection_text(&wide, &selection), "你a");
+    }
+
+    #[test]
+    fn selection_highlight_is_reverse_video_and_keeps_text() {
+        let mut lines = vec![Line::from("hello world")];
+        let selection = TextSelection {
+            anchor: (0, 6),
+            cursor: (0, 11),
+            dragging: false,
+            moved: true,
+        };
+        highlight_selection(&mut lines, &selection);
+        assert_eq!(text_line(&lines[0]), "hello world");
+        let reversed: String = lines[0]
+            .spans
+            .iter()
+            .filter(|span| span.style.add_modifier.contains(Modifier::REVERSED))
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert_eq!(reversed, "world");
     }
 
     #[test]
@@ -7871,6 +9830,39 @@ mod tests {
 
         let resolved = SessionView::new(session, vec![approval, result]).pending_approval();
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn approval_card_shows_the_full_long_command() {
+        let command = format!("echo {} ENDMARK", "x".repeat(220));
+        let session = Session::new("s1", "tools", "/tmp");
+        let event = SessionEvent::new(
+            "s1",
+            1,
+            EventKind::ApprovalRequired,
+            serde_json::json!({
+                "approval_id": "a1",
+                "call_id": "c1",
+                "tool": "run_command",
+                "summary": "run_command: echo (truncated)",
+                "arguments": {"command": command, "cwd": "/tmp"},
+            }),
+        );
+        let pending = SessionView::new(session.clone(), vec![event])
+            .pending_approval()
+            .expect("pending command approval");
+        assert_eq!(pending.summary, format!("$ {command}"));
+
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.approvals.insert("s1".to_string(), pending);
+
+        let rendered = render_text(&mut app, 72, 30);
+        assert!(rendered.contains("$ echo"), "{rendered}");
+        assert!(rendered.contains("ENDMARK"), "{rendered}");
+        assert!(rendered.contains("Approve"), "{rendered}");
     }
 
     #[test]
@@ -8036,7 +10028,7 @@ mod tests {
         let (mut app, tx, mut rx) = app_with_diff(None);
         app.sessions.push(Session::new("s1", "tools", "/tmp"));
 
-        app.handle_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::NONE), &tx);
+        app.run_action("approvals", &tx);
         let inbox = app.inbox.as_ref().expect("inbox opened");
         assert_eq!(inbox.items.len(), 1);
         assert_eq!(inbox.items[0].session_name, "tools");
@@ -8248,6 +10240,7 @@ mod tests {
             Session::new("s1", "one", "/tmp"),
             Vec::new(),
         ));
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_transcript_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &tx);
         assert!(app.ledger.is_some());
         assert!(rx.try_recv().is_ok());
@@ -8334,7 +10327,8 @@ mod tests {
             Session::new("s1", "one", "/tmp"),
             Vec::new(),
         ));
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
         assert!(app.process_view.is_some());
         assert!(rx.try_recv().is_ok());
 
@@ -8352,7 +10346,8 @@ mod tests {
             Vec::new(),
         ));
 
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::SHIFT), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE), &tx);
         match rx.try_recv().expect("fork command") {
             Command::Fork {
                 session_id,
@@ -8484,6 +10479,7 @@ mod tests {
         );
         assert!(PickerKind::Sessions.data_kind().is_none());
         assert!(PickerKind::Commands.data_kind().is_none());
+        assert!(PickerKind::Themes.data_kind().is_none());
         assert!(!PickerKind::Files.title().is_empty());
         assert!(!PickerKind::Commands.hint().is_empty());
     }
@@ -8534,6 +10530,138 @@ mod tests {
         app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         assert!(app.help);
         assert!(app.picker.is_none());
+        assert!(app.help_query.is_empty());
+        assert_eq!(app.help_selected, 0);
+    }
+
+    #[test]
+    fn theme_command_opens_picker_and_escape_restores() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.theme_config.preset = Some("github-dark".into());
+        app.theme = Theme::from_config(&app.theme_config);
+        let saved = app.theme;
+
+        assert!(app.handle_prompt_command("/theme", &tx));
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Themes)
+        ));
+        assert!(app.theme_picker_backup.is_some());
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        assert_ne!(app.theme.preset, Some("github-dark"));
+        app.handle_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        assert_eq!(app.theme, saved);
+        assert_eq!(app.theme_config.preset.as_deref(), Some("github-dark"));
+        assert!(app.theme_picker_backup.is_none());
+
+        // Theme arguments no longer switch directly; the picker is the only path.
+        assert!(app.handle_prompt_command("/theme nord", &tx));
+        assert!(app.picker.is_none());
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("usage: /theme")));
+    }
+
+    #[test]
+    fn theme_background_paints_panes_and_dialogs() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.theme_config.preset = Some("nord".into());
+        app.theme = Theme::from_config(&app.theme_config);
+        let session = Session::new("s1", "theme background", "/home/shiyi/git/eix");
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let nord_bg = Color::Rgb(46, 52, 64);
+        assert_eq!(terminal.backend().buffer()[(2, 2)].bg, nord_bg);
+
+        // Previewing the first built-in preset must repaint the pane and the
+        // picker dialog, not leave either on the terminal's default background.
+        app.theme_config = eix_core::ThemeConfig::default();
+        app.theme = Theme::default();
+        app.open_picker(PickerKind::Themes, &tx);
+        app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        assert_eq!(app.theme.preset, Some("github-dark"));
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let preview_bg = Color::Rgb(13, 17, 23);
+        assert_eq!(terminal.backend().buffer()[(2, 2)].bg, preview_bg);
+        // The centered picker's border and body should use the previewed
+        // palette, not the terminal's default background.
+        assert_eq!(terminal.backend().buffer()[(8, 4)].bg, preview_bg);
+        assert_eq!(terminal.backend().buffer()[(10, 7)].bg, preview_bg);
+    }
+
+    #[test]
+    fn theme_picker_enter_commits_the_preview() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.open_picker(PickerKind::Themes, &tx);
+        app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        assert_eq!(app.theme.preset, Some("github-dark"));
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        assert!(app.theme_picker_backup.is_none());
+        assert_eq!(app.theme_config.preset.as_deref(), Some("github-dark"));
+        assert_eq!(app.theme.preset, Some("github-dark"));
+        assert!(app.status.contains("theme → github-dark"));
+    }
+
+    #[test]
+    fn help_overlay_filters_and_selects_key_entries() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.open_help();
+
+        for ch in "approval".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        }
+        assert!(app.help);
+        assert_eq!(app.help_query, "approval");
+        let count = help_entry_count(&app.help_query);
+        assert!(count >= 2, "{count}");
+
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        assert_eq!(app.help_selected, 1);
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE), &tx);
+        assert_eq!(app.help_selected, count - 1);
+
+        // Plain q/j/k are search input, not shortcuts.
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert!(app.help);
+        assert_eq!(app.help_query, "approvalq");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(app.help_query.is_empty());
+        assert_eq!(app.help_selected, 0);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!app.help);
+    }
+
+    #[test]
+    fn help_search_renders_the_selected_match() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.open_help();
+        for ch in "approvals".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        }
+
+        let text = render_text(&mut app, 120, 40);
+        assert!(text.contains("approvals inbox"), "{text}");
+        assert!(!text.contains("prompt commands"), "{text}");
+        assert!(text.contains('›'), "{text}");
     }
 
     #[test]
@@ -8596,13 +10724,18 @@ mod tests {
     }
 
     #[test]
-    fn prompt_height_is_fixed() {
-        // 6 editor rows + 2 borders, independent of focus or draft length.
-        assert_eq!(prompt_input_height(40), 8);
-        assert_eq!(prompt_input_height(100), 8);
-        // Short terminals yield to the transcript, but never to a 1-row box.
-        assert_eq!(prompt_input_height(8), 3);
-        assert_eq!(prompt_input_height(4), 3);
+    fn prompt_height_grows_for_long_drafts() {
+        let mut input = Editor::new();
+        // Short drafts keep the minimum 6 editor rows + 2 borders.
+        assert_eq!(prompt_input_height(40, 80, &input), 8);
+        assert_eq!(prompt_input_height(100, 80, &input), 8);
+
+        // A long command grows the box so wrapped rows stay visible, but the
+        // cap leaves the transcript room and short terminals still win.
+        input.set_text(&"x".repeat(1_000));
+        assert_eq!(prompt_input_height(40, 80, &input), 14);
+        assert_eq!(prompt_input_height(12, 80, &input), 7);
+        assert_eq!(prompt_input_height(8, 80, &input), 3);
     }
 
     #[test]
@@ -8624,6 +10757,28 @@ mod tests {
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
         assert!(matches!(app.focus, Focus::Transcript));
         assert!(app.esc_at.is_none());
+    }
+
+    #[test]
+    fn colon_in_prompt_normal_mode_opens_the_palette() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.focus_input();
+
+        // Insert mode still types a literal colon.
+        app.handle_input_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        assert_eq!(app.input.text(), ":");
+
+        // In normal mode `:` opens the interactive command palette instead of
+        // editing the draft, matching the transcript binding.
+        app.input.clear();
+        app.input.enter_normal();
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Commands)
+        ));
     }
 
     #[test]
@@ -8668,8 +10823,103 @@ mod tests {
     }
 
     #[test]
-    fn leader_n_opens_a_pane_and_q_closes_it() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    fn transcript_leader_matches_the_prompt_leader() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.views.push(SessionView::new(
+            Session::new("s2", "two", "/tmp"),
+            Vec::new(),
+        ));
+        app.focus = Focus::Transcript;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        match rx.try_recv().expect("create command") {
+            Command::Create { worktree, .. } => assert!(!worktree),
+            _ => panic!("expected a create command"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Commands)
+        ));
+
+        app.picker = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), &tx);
+        assert!(app.help);
+    }
+
+    #[test]
+    fn transcript_pane_requires_leader_for_pane_actions() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+
+        // Bare letters are inert: no pane action, no accidental quit.
+        for ch in ['o', 'p', 'n', 'N', 'c', 'w', 'b', 'x', 'a', 'q'] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+            assert!(app.picker.is_none(), "bare {ch} opened a picker");
+            assert!(app.process_view.is_none(), "bare {ch} opened processes");
+            assert!(app.ledger.is_none(), "bare {ch} opened the ledger");
+            assert!(!app.should_quit, "bare {ch} quit the app");
+        }
+        assert!(!app.creating, "bare n created a session");
+        assert!(rx.try_recv().is_err(), "bare keys sent a command");
+
+        // `i` is the vim-style exception: it focuses the prompt in insert mode.
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        assert!(matches!(app.focus, Focus::Input));
+        assert_eq!(app.input.mode(), Mode::Insert);
+        app.focus = Focus::Transcript;
+
+        // The leader retains the action.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::NewPane)
+        ));
+
+        app.picker = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
+        assert!(app.process_view.is_some());
+
+        // Shift+`:` stays available as the command palette shortcut.
+        app.process_view = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT), &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Commands)
+        ));
+
+        // Focus and quit also live behind the leader now.
+        app.picker = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        assert!(matches!(app.focus, Focus::Input));
+        app.focus = Focus::Transcript;
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('Q'), KeyModifiers::NONE), &tx);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn leader_n_creates_a_session_and_q_closes_a_pane() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.views.push(SessionView::new(
             Session::new("s1", "one", "/tmp"),
@@ -8685,15 +10935,82 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        match rx.try_recv().expect("create command") {
+            Command::Create { worktree, .. } => assert!(!worktree),
+            _ => panic!("expected a create command"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views.len(), 1);
+    }
+
+    #[test]
+    fn leader_c_closes_the_focused_pane() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.views.push(SessionView::new(
+            Session::new("s2", "two", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE), &tx);
+
+        assert_eq!(app.views.len(), 1);
+        assert!(
+            app.picker.is_none(),
+            "leader C must not open the context picker"
+        );
+    }
+
+    #[test]
+    fn shifted_angle_brackets_cycle_panes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        for (id, name) in [("s1", "one"), ("s2", "two"), ("s3", "three")] {
+            app.views
+                .push(SessionView::new(Session::new(id, name, "/tmp"), Vec::new()));
+        }
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+
+        for expected in [1, 2, 0] {
+            app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT), &tx);
+            assert_eq!(app.focused, expected);
+        }
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT), &tx);
+        assert_eq!(app.focused, 2);
+
+        // The prompt's normal mode uses the same bindings; insert mode does not.
+        app.focus_input();
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('>'), KeyModifiers::SHIFT), &tx);
+        assert_eq!(app.focused, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT), &tx);
+        assert_eq!(app.focused, 2);
+    }
+
+    #[test]
+    fn leader_o_opens_the_new_pane_picker() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.focus_input();
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
         assert!(matches!(
             app.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::NewPane)
         ));
-
-        app.picker = None;
-        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
-        assert_eq!(app.views.len(), 1);
     }
 
     #[test]
@@ -8721,7 +11038,116 @@ mod tests {
     }
 
     #[test]
-    fn prompt_normal_mode_j_and_k_browse_submitted_history() {
+    fn prompt_header_keeps_build_and_plan_aligned() {
+        fn header(app: &App) -> String {
+            app.header_spans()
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect()
+        }
+
+        let mut app = App::new(None);
+        app.connected = true;
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.views[0].session.model = Some("llmgate/deepseek-v4-flash".into());
+
+        let build = header(&app);
+        assert_eq!(build, " Build · ○ deepseek-v4-flash ");
+        assert!(!build.contains("eix"));
+
+        app.views[0].session.agent = Some("plan".into());
+        let plan = header(&app);
+        assert_eq!(plan, " Plan  · ○ deepseek-v4-flash ");
+        // Padding Plan to Build's width keeps the status and model in place.
+        assert_eq!(build.len(), plan.len());
+        assert_eq!(build.find('○'), plan.find('○'));
+        assert_eq!(build.find("deepseek"), plan.find("deepseek"));
+    }
+
+    #[test]
+    fn prompt_header_uses_icon_for_idle_and_animated_running() {
+        let mut app = App::new(None);
+        assert_eq!(app.status_glyph(SessionStatus::Idle), "○");
+        assert_eq!(app.status_glyph(SessionStatus::Running), "⠋");
+        app.tick = 1;
+        assert_eq!(app.status_glyph(SessionStatus::Running), "⠙");
+        assert_eq!(
+            app.status_glyph(SessionStatus::AwaitingApproval),
+            "⚠ awaiting_approval"
+        );
+    }
+
+    #[test]
+    fn prompt_header_shows_git_branch_and_worktree() {
+        let mut app = App::new(None);
+        let cwd = std::path::PathBuf::from("/tmp/eix-repo");
+        let mut session = Session::new("s1", "one", cwd.clone());
+        session.worktree = Some(cwd.join(".worktrees/feat"));
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.git_cwd = Some(cwd);
+        app.git_branch = Some("eix/feat".into());
+        app.git_checked = Some(Instant::now());
+
+        let text: String = app
+            .header_meta_spans()
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(text.contains("eix/feat"), "{text}");
+        assert!(text.contains("wt:feat"), "{text}");
+
+        // A cached branch for another cwd must not leak into this session.
+        app.git_cwd = Some(std::path::PathBuf::from("/tmp/other"));
+        let text: String = app
+            .header_meta_spans()
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect();
+        assert!(!text.contains("eix/feat"), "{text}");
+    }
+
+    #[test]
+    fn prompt_normal_mode_tab_toggles_build_and_plan() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus_input();
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert_eq!(app.views[0].session.agent.as_deref(), Some("plan"));
+        assert_eq!(app.status, "Plan");
+        match rx.try_recv().expect("set plan agent") {
+            Command::SetAgent { session_id, agent } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(agent.as_deref(), Some("plan"));
+            }
+            _ => panic!("unexpected command"),
+        }
+
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert_eq!(app.views[0].session.agent, None);
+        assert_eq!(app.status, "Build");
+        match rx.try_recv().expect("set build agent") {
+            Command::SetAgent { session_id, agent } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(agent, None);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn prompt_normal_mode_ctrl_j_and_k_browse_submitted_history() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         let events = vec![
@@ -8745,14 +11171,26 @@ mod tests {
         app.input.set_text("draft");
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
 
-        // `k` recalls newest first; the live draft is restored by `j`.
-        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), &tx);
+        // Ctrl-K recalls newest first; the live draft is restored by Ctrl-J.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert_eq!(app.input.text(), "second");
-        app.handle_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE), &tx);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert_eq!(app.input.text(), "first");
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert_eq!(app.input.text(), "second");
-        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert_eq!(app.input.text(), "draft");
         assert!(app.history_index.is_none());
     }
@@ -8967,6 +11405,30 @@ mod tests {
         app.focused = 0;
         app.focus = Focus::Input;
         app.input.set_text("/exit");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(!app.should_quit, "another pane is still open");
+        assert_eq!(app.views.len(), 1);
+        assert_eq!(app.views[0].session.id, "s2");
+        assert!(app.input.is_empty(), "the command line is cleared");
+        match rx.try_recv().expect("draft save") {
+            Command::DraftSet { session_id, text } => {
+                assert_eq!(session_id, "s1");
+                assert!(text.is_empty(), "the command is not kept as a draft");
+            }
+            _ => panic!("expected a draft save"),
+        }
+    }
+
+    #[test]
+    fn slash_close_saves_and_closes_the_focused_pane() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.views.push(session_pane("s2", "two"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.set_text("/close");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
         assert!(!app.should_quit, "another pane is still open");
@@ -9208,6 +11670,126 @@ mod tests {
         app.input.set_text("/hel");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         assert!(app.help, "Enter runs the highlighted command");
+    }
+
+    fn render_text(app: &mut App, width: u16, height: u16) -> String {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn prompt_grows_to_show_a_long_command() {
+        let mut app = App::new(None);
+        app.focus = Focus::Input;
+        app.input
+            .set_text(&format!("echo {} ENDMARK", "x".repeat(500)));
+
+        let rendered = render_text(&mut app, 80, 40);
+        assert!(rendered.contains("echo"), "{rendered}");
+        assert!(rendered.contains("ENDMARK"), "{rendered}");
+    }
+
+    #[test]
+    fn prompt_is_a_minimal_styled_panel_with_command_menu() {
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "prompt polish", "/home/shiyi/git/eix");
+        session.model = Some("openai/gpt-5".into());
+        session.status = SessionStatus::Running;
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.connected = true;
+
+        let empty = render_text(&mut app, 80, 20);
+        assert!(empty.contains("Build · ⠋ gpt-5"), "{empty}");
+        assert!(!empty.contains("eixd"), "no footer statusline: {empty}");
+        assert!(!empty.contains("/cmds"), "no footer hints: {empty}");
+        assert!(empty.contains("1● prompt polish"), "{empty}");
+        assert!(
+            empty.contains('╭'),
+            "the composer keeps its border: {empty}"
+        );
+        assert!(
+            empty.contains('╮'),
+            "the composer keeps its border: {empty}"
+        );
+        assert!(!empty.contains("❯"), "{empty}");
+        assert!(empty.contains(" I "), "{empty}");
+        assert!(!empty.contains("INSERT"), "{empty}");
+        assert!(empty.contains("~/git/eix"), "{empty}");
+        assert!(!empty.contains("Message eix…"), "{empty}");
+        assert!(!empty.contains("C-j newline"), "{empty}");
+        assert!(!empty.contains("Esc normal"), "{empty}");
+
+        app.input.set_text("/cl");
+        let menu = render_text(&mut app, 80, 20);
+        assert!(menu.contains("/ commands"), "{menu}");
+        assert!(menu.contains("❯ /clear"), "{menu}");
+        assert!(!menu.contains("Tab complete"), "{menu}");
+    }
+
+    #[test]
+    fn default_theme_keeps_the_prompt_transparent() {
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.connected = true;
+        assert!(app.theme.background.is_none());
+        assert_eq!(composer_background(app.theme), Color::Reset);
+        assert_eq!(dialog_background(app.theme), Color::Reset);
+
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                assert_ne!(
+                    buffer[(x, y)].bg,
+                    Color::Rgb(30, 33, 42),
+                    "prompt kept an opaque panel at ({x}, {y})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn prompt_errors_render_in_a_dialog_not_the_input_header() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.connected = true;
+        app.error = Some("provider returned 500".into());
+
+        let text = render_text(&mut app, 80, 20);
+        assert!(text.contains("Build ·"), "{text}");
+        assert!(!text.contains("error: provider returned 500"), "{text}");
+        assert!(text.contains(" error "), "{text}");
+        assert!(text.contains("provider returned 500"), "{text}");
+
+        // The dialog is modal; typing does not reach the editor.
+        let mode = app.input.mode();
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        assert!(app.error.is_some());
+        assert_eq!(app.input.mode(), mode);
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.error.is_none());
+        let text = render_text(&mut app, 80, 20);
+        assert!(!text.contains("provider returned 500"), "{text}");
     }
 
     #[test]

@@ -5,18 +5,24 @@
 
 mod app;
 mod controller;
+mod diff;
 mod editor;
 mod keys;
+mod markdown;
+mod math;
 mod net;
+mod syntax;
 mod theme;
 mod transcript;
 
-use std::io::{self, IsTerminal};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Once;
 use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
+use base64::Engine as _;
 use crossterm::cursor::{Hide, Show};
 use crossterm::event::{DisableMouseCapture, EnableMouseCapture, Event as TermEvent, EventStream};
 use crossterm::execute;
@@ -53,6 +59,7 @@ pub async fn run(
     app.osc = osc;
     let loaded = eix_core::Config::load(config.as_deref()).unwrap_or_default();
     app.theme = Theme::from_config(&loaded.theme);
+    app.theme_config = loaded.theme.clone();
     app.keybinds = Keybinds::from_config(&loaded.keys);
     let cli_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     if let Ok(Some(defaults)) = eix_core::load_cli_config(&cli_cwd) {
@@ -75,6 +82,12 @@ pub async fn run(
             outcome = Err(err).context("cannot draw the tui");
             break;
         }
+        if let Some((session_id, before_seq)) = app.take_history_request() {
+            let _ = cmd_tx.send(Command::LoadHistory {
+                session_id,
+                before_seq,
+            });
+        }
         if app.should_quit {
             break;
         }
@@ -83,7 +96,12 @@ pub async fn run(
             maybe = events.next() => match maybe {
                 Some(Ok(TermEvent::Key(key))) => app.handle_key(key, &cmd_tx),
                 Some(Ok(TermEvent::Paste(text))) => app.handle_paste(&text),
-                Some(Ok(TermEvent::Mouse(mouse))) => app.handle_mouse(mouse),
+                Some(Ok(TermEvent::Mouse(mouse))) => {
+                    app.handle_mouse(mouse);
+                    if let Some(text) = app.take_clipboard() {
+                        copy_to_clipboard(&text);
+                    }
+                }
                 Some(Ok(_)) => {}
                 Some(Err(err)) => {
                     outcome = Err(err).context("terminal input error");
@@ -95,7 +113,6 @@ pub async fn run(
                 Some(event) => {
                     app.handle_event(event, &cmd_tx);
                     if app.take_ring() {
-                        use std::io::Write;
                         let message = app
                             .alert_message()
                             .unwrap_or_else(|| "attention needed".to_string());
@@ -129,6 +146,91 @@ pub async fn run(
         eprintln!("eix: {message}");
     }
     outcome
+}
+
+/// Copy selected transcript text with the desktop's native helper, falling
+/// back to OSC 52 (which also works over SSH when the terminal supports it).
+fn copy_to_clipboard(text: &str) {
+    let mut copied = false;
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        copied |= pipe_to_clipboard("wl-copy", &[], text);
+    }
+    if !copied && std::env::var_os("DISPLAY").is_some() {
+        copied |= pipe_to_clipboard("xclip", &["-selection", "clipboard"], text)
+            || pipe_to_clipboard("xsel", &["--clipboard", "--input"], text);
+    }
+    if !copied && cfg!(target_os = "macos") {
+        copied |= pipe_to_clipboard("pbcopy", &[], text);
+    }
+    if !copied && cfg!(target_os = "windows") {
+        copied |= pipe_to_clipboard("clip", &[], text);
+    }
+    if !copied {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+        let mut stdout = io::stdout();
+        let _ = write!(stdout, "\x1b]52;c;{encoded}\x07");
+        let _ = stdout.flush();
+    }
+}
+
+/// Read the desktop clipboard for normal-mode `p` when the editor's own
+/// register is empty. OSC 52 is write-only in practice, so this mirrors the
+/// native helpers used by [`copy_to_clipboard`].
+fn read_clipboard() -> Option<String> {
+    if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if let Some(text) = read_clipboard_command("wl-paste", &["--no-newline"]) {
+            return Some(text);
+        }
+    }
+    if std::env::var_os("DISPLAY").is_some() {
+        if let Some(text) = read_clipboard_command("xclip", &["-selection", "clipboard", "-o"]) {
+            return Some(text);
+        }
+        if let Some(text) = read_clipboard_command("xsel", &["--clipboard", "--output"]) {
+            return Some(text);
+        }
+    }
+    if cfg!(target_os = "macos") {
+        return read_clipboard_command("pbpaste", &[]);
+    }
+    if cfg!(target_os = "windows") {
+        return read_clipboard_command("powershell", &["-NoProfile", "-Command", "Get-Clipboard"]);
+    }
+    None
+}
+
+fn read_clipboard_command(program: &str, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
+fn pipe_to_clipboard(program: &str, args: &[&str], text: &str) -> bool {
+    let mut child = match ProcessCommand::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(text.as_bytes()).is_err() {
+            let _ = child.kill();
+            return false;
+        }
+    }
+    matches!(child.wait(), Ok(status) if status.success())
 }
 
 fn init_terminal() -> Result<Terminal<Backend>> {

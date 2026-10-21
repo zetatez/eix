@@ -13,14 +13,15 @@
 //!   objects (`iw aw`)
 //! * edits: `i a I A o O x X D C s S r ~ J p P u Ctrl-r`
 //! * visual: `v V` + motions, then `d x y c p ~ o`
-//! * plain `j`/`k` scroll the transcript; `3j` / `dj` stay vim motions
+//! * `Ctrl-j`/`Ctrl-k` browse the prompt's submitted history; `j`/`k` stay
+//!   Vim line motions in normal mode
 //! * `<Space>` is the leader for TUI actions, so plain letters stay native.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
-/// Visible editor rows. The prompt is a fixed-height box: normal-mode editing
-/// must never resize it (long drafts scroll instead).
+/// Minimum visible editor rows. Long drafts may grow the prompt up to the
+/// host's cap and then scroll.
 pub const PROMPT_ROWS: u16 = 6;
 
 type Pos = (usize, usize);
@@ -34,12 +35,13 @@ pub enum Mode {
 }
 
 impl Mode {
-    pub fn label(self) -> &'static str {
+    /// Compact badge for the prompt's bottom border.
+    pub fn short_label(self) -> &'static str {
         match self {
-            Self::Normal => "normal",
-            Self::Insert => "insert",
-            Self::Visual => "visual",
-            Self::VisualLine => "v-line",
+            Self::Normal => "N",
+            Self::Insert => "I",
+            Self::Visual => "V",
+            Self::VisualLine => "VL",
         }
     }
 }
@@ -137,6 +139,20 @@ impl Register {
     }
 }
 
+fn register_from_text(text: &str) -> Option<Register> {
+    if text.is_empty() {
+        return None;
+    }
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let linewise = normalized.ends_with('\n');
+    let body = normalized.strip_suffix('\n').unwrap_or(normalized.as_str());
+    let mut lines: Vec<String> = body.split('\n').map(str::to_string).collect();
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    Some(Register { lines, linewise })
+}
+
 #[derive(Debug, Clone)]
 struct Snapshot {
     lines: Vec<String>,
@@ -198,6 +214,43 @@ impl Editor {
 
     pub fn mode(&self) -> Mode {
         self.mode
+    }
+
+    /// True when the unnamed register holds text for `p`/`P`.
+    pub fn has_register_text(&self) -> bool {
+        !self.register.is_empty()
+    }
+
+    /// True when `p`/`P` is a plain normal-mode paste with no pending
+    /// operator, count or leader. The host uses this to substitute the system
+    /// clipboard for the editor's internal register.
+    pub fn normal_paste_ready(&self) -> bool {
+        self.mode == Mode::Normal
+            && self.op.is_none()
+            && self.count.is_none()
+            && !self.pending_g
+            && self.pending_find.is_none()
+            && !self.pending_replace
+            && self.pending_object.is_none()
+            && !self.leader
+    }
+
+    /// Seed the unnamed register from externally copied text. Used after a
+    /// mouse selection so normal-mode `p` can paste it like a yank.
+    pub fn set_register_text(&mut self, text: &str) {
+        if let Some(register) = register_from_text(text) {
+            self.register = register;
+        }
+    }
+
+    /// Paste external text (the system clipboard) at the cursor without
+    /// leaving normal mode. The unnamed register is left untouched so repeated
+    /// `p`/`P` presses read the clipboard again.
+    pub fn paste_external(&mut self, text: &str, after: bool) {
+        let Some(register) = register_from_text(text) else {
+            return;
+        };
+        self.paste_lines(&register.lines, register.linewise, after, 1);
     }
 
     pub fn text(&self) -> String {
@@ -475,8 +528,11 @@ impl Editor {
 
     fn normal_key(&mut self, key: KeyEvent) -> Outcome {
         if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if key.code == KeyCode::Char('r') {
-                self.redo();
+            match key.code {
+                KeyCode::Char('r') => self.redo(),
+                KeyCode::Char('k') => return Outcome::History(-1),
+                KeyCode::Char('j') => return Outcome::History(1),
+                _ => {}
             }
             return Outcome::Ignored;
         }
@@ -498,6 +554,12 @@ impl Editor {
                 self.delete_chars(n);
             }
             KeyCode::Backspace => self.motion_char('h'),
+            // Toggle the focused session between the build and plan agents.
+            // A pending count/operator must not leak into the next motion.
+            KeyCode::Tab => {
+                self.reset_pending();
+                return Outcome::Action("toggle-agent");
+            }
             KeyCode::Char(c) => return self.normal_char(c),
             _ => {}
         }
@@ -506,6 +568,17 @@ impl Editor {
 
     fn normal_char(&mut self, c: char) -> Outcome {
         match c {
+            // Vim's ex `:` opens the TUI command palette, from the prompt's
+            // normal mode as well as from the transcript.
+            ':' if self.op.is_none() && self.count.is_none() => {
+                return Outcome::Action("commands");
+            }
+            '<' if self.op.is_none() && self.count.is_none() => {
+                return Outcome::Action("pane-prev");
+            }
+            '>' if self.op.is_none() && self.count.is_none() => {
+                return Outcome::Action("pane-next");
+            }
             ' ' if self.op.is_none() && self.count.is_none() => {
                 self.leader = true;
                 return Outcome::Ignored;
@@ -521,13 +594,7 @@ impl Editor {
             _ => {}
         }
 
-        // Plain `j`/`k` browse the prompt's own submitted-message history while
-        // the prompt keeps focus. Counts and operators still move within the
-        // draft (`3j`, `dj`).
-        if matches!(c, 'j' | 'k') && self.op.is_none() && self.count.is_none() {
-            return Outcome::History(if c == 'k' { -1 } else { 1 });
-        }
-
+        // `j`/`k` stay Vim line motions; prompt history is on Ctrl-J/Ctrl-K.
         if let Some(op) = self.op {
             let doubled = matches!(
                 (op, c),
@@ -1490,20 +1557,27 @@ impl Editor {
         if self.register.is_empty() || count == 0 {
             return;
         }
+        let lines = self.register.lines.clone();
+        self.paste_lines(&lines, self.register.linewise, after, count);
+    }
+
+    fn paste_lines(&mut self, lines: &[String], linewise: bool, after: bool, count: usize) {
+        if lines.is_empty() || count == 0 {
+            return;
+        }
         self.begin_change();
-        if self.register.linewise {
+        if linewise {
             let at = if after { self.row + 1 } else { self.row };
             for repeat in 0..count {
-                for (offset, line) in self.register.lines.iter().enumerate() {
-                    let index = at + repeat * self.register.lines.len() + offset;
+                for (offset, line) in lines.iter().enumerate() {
+                    let index = at + repeat * lines.len() + offset;
                     self.lines.insert(index.min(self.lines.len()), line.clone());
                 }
             }
             self.row = at.min(self.lines.len() - 1);
             self.col = self.first_non_blank(self.row);
         } else {
-            let text = self.register.lines.join("\n");
-            let text = text.repeat(count);
+            let text = lines.join("\n").repeat(count);
             let mut pos = (self.row, self.col);
             if after && self.line_len() > 0 {
                 pos.1 += 1;
@@ -1733,7 +1807,7 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
 
 /// Leader (`<Space>xx`) actions. These mirror the mappings the embedded editor
 /// used to install: plain letters stay native, TUI features live behind Space.
-fn leader_action(ch: char) -> Option<&'static str> {
+pub(super) fn leader_action(ch: char) -> Option<&'static str> {
     Some(match ch {
         's' => "sessions",
         'o' => "new-pane",
@@ -1741,17 +1815,18 @@ fn leader_action(ch: char) -> Option<&'static str> {
         'w' => "worktrees",
         'b' => "branches",
         'c' => "ledger",
-        'C' => "context",
+        'C' => "close-pane",
         'h' => "history",
         'p' => "processes",
-        'e' => "diagnostics",
         'r' => "approvals",
-        'n' => "new-pane",
-        'N' => "new",
+        'n' | 'N' => "new",
         'W' => "new-worktree",
         'F' => "fork",
         'x' => "cancel",
         'q' => "close-pane",
+        'Q' => "quit",
+        'i' => "input",
+        'A' => "attention",
         'a' | ':' => "commands",
         '?' => "help",
         _ => return None,
@@ -1786,6 +1861,14 @@ mod tests {
     }
 
     #[test]
+    fn mode_badges_are_compact() {
+        assert_eq!(Mode::Normal.short_label(), "N");
+        assert_eq!(Mode::Insert.short_label(), "I");
+        assert_eq!(Mode::Visual.short_label(), "V");
+        assert_eq!(Mode::VisualLine.short_label(), "VL");
+    }
+
+    #[test]
     fn insert_mode_types_and_submits() {
         let mut editor = Editor::new();
         for ch in "hello".chars() {
@@ -1794,6 +1877,22 @@ mod tests {
         assert_eq!(editor.text(), "hello");
         assert_eq!(editor.mode(), Mode::Insert);
         assert_eq!(key(&mut editor, KeyCode::Enter), Outcome::Submit);
+    }
+
+    #[test]
+    fn colon_opens_the_command_palette_from_normal_mode() {
+        let mut editor = editor_with("draft");
+        assert_eq!(
+            key(&mut editor, KeyCode::Char(':')),
+            Outcome::Action("commands")
+        );
+
+        let mut editor = editor_with("draft");
+        assert_eq!(key(&mut editor, KeyCode::Char(' ')), Outcome::Ignored);
+        assert_eq!(
+            key(&mut editor, KeyCode::Char(':')),
+            Outcome::Action("commands")
+        );
     }
 
     #[test]
@@ -1887,6 +1986,29 @@ mod tests {
     }
 
     #[test]
+    fn external_paste_stays_in_normal_mode() {
+        let mut editor = editor_with("ab");
+        assert!(editor.normal_paste_ready());
+        assert!(!editor.has_register_text());
+        editor.paste_external("XY", true);
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(editor.text(), "aXYb");
+        assert!(!editor.has_register_text());
+
+        let mut editor = editor_with("one\ntwo");
+        editor.paste_external("A\nB\n", true);
+        assert_eq!(editor.mode(), Mode::Normal);
+        assert_eq!(editor.text(), "one\nA\nB\ntwo");
+    }
+
+    #[test]
+    fn pending_operator_blocks_external_paste() {
+        let mut editor = editor_with("ab");
+        press(&mut editor, "d");
+        assert!(!editor.normal_paste_ready());
+    }
+
+    #[test]
     fn enter_inserts_a_newline_on_ctrl_j() {
         let mut editor = Editor::new();
         press(&mut editor, "ab");
@@ -1920,10 +2042,44 @@ mod tests {
     }
 
     #[test]
-    fn plain_j_and_k_browse_history_but_counts_and_operators_still_move() {
+    fn normal_angle_brackets_cycle_panes() {
+        let mut editor = editor_with("one");
+        assert_eq!(
+            key(&mut editor, KeyCode::Char('<')),
+            Outcome::Action("pane-prev")
+        );
+        assert_eq!(
+            key(&mut editor, KeyCode::Char('>')),
+            Outcome::Action("pane-next")
+        );
+
+        let mut editor = Editor::new();
+        assert_eq!(key(&mut editor, KeyCode::Char('<')), Outcome::Ignored);
+        assert_eq!(editor.text(), "<");
+    }
+
+    #[test]
+    fn normal_tab_toggles_agent_mode() {
+        let mut editor = editor_with("one two");
+        press(&mut editor, "2d");
+        assert_eq!(
+            key(&mut editor, KeyCode::Tab),
+            Outcome::Action("toggle-agent")
+        );
+        // A half-typed count or operator is cancelled, not carried over.
+        assert_eq!(editor.count, None);
+        assert!(editor.op.is_none());
+    }
+
+    #[test]
+    fn ctrl_j_and_k_browse_history_while_plain_j_k_move_lines() {
         let mut editor = editor_with("one\ntwo\nthree");
-        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::History(-1));
-        assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::History(1));
+        assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Ignored);
+        assert_eq!(editor.row, 1);
+        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::Ignored);
+        assert_eq!(editor.row, 0);
+        assert_eq!(ctrl(&mut editor, 'k'), Outcome::History(-1));
+        assert_eq!(ctrl(&mut editor, 'j'), Outcome::History(1));
         // A count keeps `j`/`k` as vim line motions.
         press(&mut editor, "2");
         assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Ignored);

@@ -19,6 +19,7 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{tool_call_summary, truncate, wrap_text};
+use super::markdown;
 use super::theme::Theme;
 
 /// Tool output is capped so a verbose command cannot flood the transcript.
@@ -100,15 +101,11 @@ enum Block {
     Error {
         text: String,
     },
-    LiveThinking {
-        text: String,
-    },
-    LiveText {
-        text: String,
-    },
 }
 
 /// Render a session's events (plus any in-flight deltas) into chat lines.
+/// Kept for tests and callers that do not cache stored history.
+#[cfg(test)]
 pub fn render(
     events: &[SessionEvent],
     live: Option<Live<'_>>,
@@ -117,10 +114,50 @@ pub fn render(
     width: usize,
     theme: Theme,
 ) -> Transcript {
+    let tail_width = width.saturating_sub(2).max(1);
+    let mut out = render_history(events, folds, width, theme);
+    append_tail(&mut out, live, queued, folds, tail_width, theme);
+    out
+}
+
+/// Render only the stored history. The UI caches this and renders the live
+/// tail separately, so streaming deltas do not reparse the whole session.
+pub fn render_history(
+    events: &[SessionEvent],
+    folds: &HashMap<FoldId, bool>,
+    width: usize,
+    theme: Theme,
+) -> Transcript {
     // Keep a two-cell gutter on the right so right-aligned bubbles, tool
     // statuses and queued prompts never touch the pane border.
     let width = width.saturating_sub(2).max(1);
-    let blocks = collect(events, live);
+    render_blocks(collect(events), folds, width, theme)
+}
+
+/// Render the in-flight turn and queued prompts. This is cheap to call on
+/// every frame because it only looks at text that is still changing.
+pub fn render_tail(
+    live: Option<Live<'_>>,
+    queued: &[String],
+    folds: &HashMap<FoldId, bool>,
+    width: usize,
+    theme: Theme,
+) -> Transcript {
+    let width = width.saturating_sub(2).max(1);
+    let mut out = Transcript {
+        lines: Vec::new(),
+        slots: Vec::new(),
+    };
+    append_tail(&mut out, live, queued, folds, width, theme);
+    out
+}
+
+fn render_blocks(
+    blocks: Vec<Block>,
+    folds: &HashMap<FoldId, bool>,
+    width: usize,
+    theme: Theme,
+) -> Transcript {
     let mut out = Transcript {
         lines: Vec::new(),
         slots: Vec::new(),
@@ -157,32 +194,39 @@ pub fn render(
             Block::Error { text } => {
                 note(&mut out, '!', &text, theme.error.unwrap_or(DANGER), width)
             }
-            Block::LiveThinking { text } => {
-                thinking(&mut out, FoldId::Live, &text, true, width, theme, folds);
-            }
-            Block::LiveText { text } => assistant_message(&mut out, &text, false, width, theme),
+        }
+    }
+    out
+}
+
+fn append_tail(
+    out: &mut Transcript,
+    live: Option<Live<'_>>,
+    queued: &[String],
+    folds: &HashMap<FoldId, bool>,
+    width: usize,
+    theme: Theme,
+) {
+    if let Some(live) = live {
+        if !live.reasoning.is_empty() {
+            thinking(out, FoldId::Live, live.reasoning, true, width, theme, folds);
+        }
+        if !live.text.is_empty() {
+            assistant_message(out, live.text, false, width, theme);
+        } else if live.reasoning.is_empty() {
+            assistant_message(out, "…", false, width, theme);
         }
     }
     if !queued.is_empty() {
         out.blank();
         for text in queued {
-            queued_prompt(&mut out, text, width, theme);
+            queued_prompt(out, text, width, theme);
         }
     }
-    if out.lines.is_empty() {
-        out.push(
-            Line::from(Span::styled(
-                "  no messages yet — type a prompt below",
-                dim(theme),
-            )),
-            None,
-        );
-    }
-    out
 }
 
 /// Flatten the event log into ordered blocks, merging tool call/results.
-fn collect(events: &[SessionEvent], live: Option<Live<'_>>) -> Vec<Block> {
+fn collect(events: &[SessionEvent]) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
     let mut tool_index: Vec<(String, usize)> = Vec::new();
 
@@ -386,20 +430,6 @@ fn collect(events: &[SessionEvent], live: Option<Live<'_>>) -> Vec<Block> {
         }
     }
 
-    if let Some(live) = live {
-        if !live.reasoning.is_empty() {
-            blocks.push(Block::LiveThinking {
-                text: live.reasoning.to_string(),
-            });
-        }
-        if !live.text.is_empty() {
-            blocks.push(Block::LiveText {
-                text: live.text.to_string(),
-            });
-        } else if live.reasoning.is_empty() {
-            blocks.push(Block::LiveText { text: "…".into() });
-        }
-    }
     blocks
 }
 
@@ -462,8 +492,9 @@ fn italic_dim(theme: Theme) -> Style {
         .add_modifier(Modifier::ITALIC)
 }
 
-/// A user turn in a right-aligned rounded bubble. The bubble shrinks to fit
-/// short prompts and wraps long ones at four fifths of the pane.
+/// A user turn in a right-aligned compact bubble. Only the side rules are
+/// drawn, so a one-line prompt costs one row instead of a full box. The bubble
+/// shrinks to fit short prompts and wraps long ones at four fifths of the pane.
 fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usize, theme: Theme) {
     for path in images {
         out.push(
@@ -481,65 +512,52 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
     }
     // Below this width a bubble costs more than it communicates.
     if width < 14 {
-        for segment in wrap_text(text, width.saturating_sub(2).max(1)) {
-            out.push(
-                Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(segment, Style::default().fg(theme.string.unwrap_or(ACCENT))),
-                ]),
-                None,
-            );
+        for line in markdown::render_body(text, width.saturating_sub(2).max(1), theme) {
+            let mut spans = vec![Span::raw("  ")];
+            spans.extend(line.spans);
+            out.push(Line::from(spans), None);
         }
         out.blank();
         return;
     }
 
     let max_content = (width.saturating_mul(4) / 5).saturating_sub(4).max(6);
-    let wrapped = wrap_text(text, max_content);
-    let inner = wrapped
+    let lines = markdown::render_body(text, max_content, theme);
+    let inner = lines
         .iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()))
+        .map(Line::width)
         .max()
         .unwrap_or(1)
         .min(max_content)
         .max(1);
     let total = inner + 4;
     let left = width.saturating_sub(total);
-    let border = Style::default()
+    let side = Style::default()
         .fg(theme.function.unwrap_or(PANEL_BORDER))
         .bg(panel(theme));
     let body = Style::default().fg(text_color(theme)).bg(panel(theme));
     let pad = Span::raw(" ".repeat(left));
 
     out.blank();
-    out.push(
-        Line::from(vec![
-            pad.clone(),
-            Span::styled(format!("╭{}╮", "─".repeat(inner + 2)), border),
-        ]),
-        None,
-    );
-    for segment in &wrapped {
-        let fill = inner.saturating_sub(UnicodeWidthStr::width(segment.as_str()));
-        out.push(
-            Line::from(vec![
-                pad.clone(),
-                Span::styled(format!("│ {segment}{} │", " ".repeat(fill)), body),
-            ]),
-            None,
-        );
+    for line in lines {
+        let used = line.width();
+        let fill = inner.saturating_sub(used);
+        let mut spans = vec![pad.clone(), Span::styled("│ ", side)];
+        for mut span in line.spans {
+            span.style = span.style.bg(panel(theme));
+            spans.push(span);
+        }
+        if fill > 0 {
+            spans.push(Span::styled(" ".repeat(fill), body));
+        }
+        spans.push(Span::styled(" │", side));
+        out.push(Line::from(spans), None);
     }
-    out.push(
-        Line::from(vec![
-            pad,
-            Span::styled(format!("╰{}╯", "─".repeat(inner + 2)), border),
-        ]),
-        None,
-    );
     out.blank();
 }
 
-/// Agent output: indented only enough to breathe, no role label.
+/// Agent output: rendered as Markdown, indented only enough to breathe, with
+/// no role label.
 fn assistant_message(
     out: &mut Transcript,
     text: &str,
@@ -547,15 +565,17 @@ fn assistant_message(
     width: usize,
     theme: Theme,
 ) {
-    let wrapped = wrap_text(text.trim_end_matches('\n'), width.saturating_sub(2).max(1));
-    let last = wrapped.len();
-    let style = Style::default().fg(text_color(theme));
-    for (index, segment) in wrapped.into_iter().enumerate() {
-        let mut spans = vec![Span::raw("  "), Span::styled(segment, style)];
-        if cancelled && index + 1 == last {
-            spans.push(Span::styled("  · cancelled", dim(theme)));
+    let mut lines = markdown::render(text.trim_end_matches('\n'), width.max(1), theme);
+    if lines.is_empty() {
+        lines.push(Line::from("  "));
+    }
+    if cancelled {
+        if let Some(last) = lines.last_mut() {
+            last.spans.push(Span::styled("  · cancelled", dim(theme)));
         }
-        out.push(Line::from(spans), None);
+    }
+    for line in lines {
+        out.push(line, None);
     }
     out.blank();
 }
@@ -591,7 +611,9 @@ fn thinking(
     let inner = width.saturating_sub(6).max(1);
     let wrapped = wrap_text(text.trim_end(), inner);
     let lines = wrapped.len().max(1);
-    let open = folds.get(&id).copied().unwrap_or(streaming);
+    // Thinking is open by default, both while streaming and after the turn is
+    // stored; an explicit click can still collapse it.
+    let open = folds.get(&id).copied().unwrap_or(true);
     let fold = Fold { id, open };
     let marker = if open { '▾' } else { '▸' };
     let header = if streaming {
@@ -621,7 +643,8 @@ fn thinking(
 }
 
 /// A tool invocation: a compact status line that expands into args, approval
-/// diff and output with an aligned gutter.
+/// diff and output. The summary already carries the command/path, so the body
+/// stays quiet: four spaces, no `input`/`output` labels.
 fn tool_block(
     out: &mut Transcript,
     block: &ToolBlock,
@@ -642,42 +665,54 @@ fn tool_block(
     let prefix_width = 6; // "  ▾ ● "
     let summary = tool_summary(block);
     let room = width.saturating_sub(prefix_width + status_width + 1).max(8);
-    let summary = truncate(&summary, room);
-    let used = prefix_width + UnicodeWidthStr::width(summary.as_str()) + status_width;
-    let pad = width.saturating_sub(used).max(1);
-
-    out.push(
-        Line::from(vec![
-            Span::styled(format!("  {} ", if open { "▾" } else { "▸" }), dim(theme)),
-            Span::styled(
+    // Expanded shell calls wrap the command instead of truncating it and then
+    // repeating the full command in the body.
+    let summary_lines = if open && is_command_tool(&block.tool) {
+        wrap_text(&summary, room)
+    } else {
+        vec![truncate(&summary, room)]
+    };
+    let summary_style = Style::default()
+        .fg(text_color(theme))
+        .add_modifier(Modifier::BOLD);
+    for (index, summary) in summary_lines.iter().enumerate() {
+        let first = index == 0;
+        let mut spans = Vec::new();
+        if first {
+            spans.push(Span::styled(
+                format!("  {} ", if open { "▾" } else { "▸" }),
+                dim(theme),
+            ));
+            spans.push(Span::styled(
                 format!("{} ", status_dot(block)),
                 Style::default().fg(color),
-            ),
-            Span::styled(
-                summary,
-                Style::default()
-                    .fg(text_color(theme))
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" ".repeat(pad)),
-            Span::styled(status, Style::default().fg(color)),
-        ]),
-        Some(fold),
-    );
+            ));
+        } else {
+            // Continuation lines align under the summary column (the `$`).
+            spans.push(Span::raw(" ".repeat(prefix_width)));
+        }
+        spans.push(Span::styled(summary.clone(), summary_style));
+        if first {
+            let used = prefix_width + UnicodeWidthStr::width(summary.as_str()) + status_width;
+            let pad = width.saturating_sub(used).max(1);
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled(status, Style::default().fg(color)));
+        }
+        out.push(Line::from(spans), Some(fold));
+    }
 
     if open {
-        let body = width.saturating_sub(6).max(1);
-        push_detail(out, "input", &detail_text(block), body, theme, fold);
+        // `push_*` subtracts `BODY_INDENT` itself, so pass the full line width.
+        push_body(out, &detail_text(block), width, theme, fold);
         if let Some(approval) = &block.approval {
-            push_detail(out, "review", &approval.summary, body, theme, fold);
+            push_body(out, &approval.summary, width, theme, fold);
             if let Some(diff) = &approval.diff {
-                push_diff(out, diff, body, theme, fold);
+                push_diff(out, diff_path(block), diff, width, theme, fold);
             }
         }
         if let Some(patch) = &block.patch {
-            push_detail(out, "patch", &patch.path, body, theme, fold);
             if let Some(diff) = &patch.diff {
-                push_diff(out, diff, body, theme, fold);
+                push_diff(out, diff_path(block), diff, width, theme, fold);
             }
         }
         // A write with no staged diff still shows what is being written.
@@ -688,33 +723,21 @@ fn tool_block(
                 .and_then(Value::as_str)
                 .filter(|text| !text.is_empty())
             {
-                push_output(out, "content", content.trim_end(), body, theme, fold);
+                push_output(out, content.trim_end(), width, theme, fold);
             }
         }
         if let Some(result) = &block.result {
-            let duration = result
-                .duration_ms
-                .map(|ms| format!(" ({ms}ms)"))
-                .unwrap_or_default();
-            let label = if result.denied {
-                "denied".to_string()
-            } else if result.ok {
-                format!("output{duration}")
-            } else {
-                format!("error{duration}")
-            };
-            push_output(out, &label, result.output.trim_end(), body, theme, fold);
+            push_output(out, result.output.trim_end(), width, theme, fold);
         } else if block.approval.is_some() {
-            push_detail(
+            push_body(
                 out,
-                "waiting",
                 "approval required — press y to approve, n to deny",
-                body,
+                width,
                 theme,
                 fold,
             );
         } else {
-            push_detail(out, "running", "…", body, theme, fold);
+            push_body(out, "…", width, theme, fold);
         }
     }
     out.blank();
@@ -750,7 +773,7 @@ fn status_dot(block: &ToolBlock) -> &'static str {
 }
 
 fn tool_summary(block: &ToolBlock) -> String {
-    let summary = if block.arguments.is_null() {
+    if block.arguments.is_null() {
         if let Some(patch) = &block.patch {
             format!("{} {}", block.tool, patch.path)
         } else {
@@ -758,8 +781,7 @@ fn tool_summary(block: &ToolBlock) -> String {
         }
     } else {
         tool_call_summary(&block.tool, &block.arguments)
-    };
-    truncate(&summary, 100)
+    }
 }
 
 fn status_label(block: &ToolBlock) -> &'static str {
@@ -797,10 +819,16 @@ fn status_color(block: &ToolBlock, theme: Theme) -> Color {
     }
 }
 
-const LABEL_WIDTH: usize = 8;
-const GUTTER: &str = "    │ ";
+/// Expanded tool bodies stay close to the left edge; the fold chevron and
+/// summary already provide the visual hierarchy.
+const BODY_INDENT: &str = "    ";
 
-/// The expanded argument detail, tailored to the tool.
+fn is_command_tool(tool: &str) -> bool {
+    matches!(tool, "run_command" | "start_command")
+}
+
+/// The expanded argument detail, tailored to the tool. The header already
+/// carries the command/path, so the body never repeats it.
 fn detail_text(block: &ToolBlock) -> String {
     let string = |key: &str| {
         block
@@ -812,15 +840,13 @@ fn detail_text(block: &ToolBlock) -> String {
     match block.tool.as_str() {
         "run_command" | "start_command" => {
             let cwd = string("cwd");
-            let command = string("command");
             if cwd.is_empty() {
-                format!("$ {command}")
+                String::new()
             } else {
-                format!("$ {command}   (cwd: {cwd})")
+                format!("cwd: {cwd}")
             }
         }
-        "read_file" | "list_dir" => string("path").to_string(),
-        "write_file" => String::new(),
+        "read_file" | "list_dir" | "write_file" => String::new(),
         "spawn_agent" => {
             let name = string("name");
             let prompt = string("prompt");
@@ -860,45 +886,19 @@ fn detail_text(block: &ToolBlock) -> String {
     }
 }
 
-fn detail_prefix(label: &str) -> String {
-    format!("{GUTTER}{label:<LABEL_WIDTH$} ")
-}
-
-fn push_detail(
-    out: &mut Transcript,
-    label: &str,
-    text: &str,
-    width: usize,
-    theme: Theme,
-    fold: Fold,
-) {
-    if text.is_empty() {
-        return;
-    }
-    let prefix = detail_prefix(label);
-    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let wrapped = wrap_text(text, width.saturating_sub(prefix_width).max(1));
-    for (index, segment) in wrapped.iter().enumerate() {
-        let lead = if index == 0 {
-            Span::styled(prefix.clone(), dim(theme))
-        } else {
-            Span::raw(" ".repeat(prefix_width))
-        };
-        out.push(
-            Line::from(vec![
-                lead,
-                Span::styled(segment.clone(), Style::default().fg(text_color(theme))),
-            ]),
-            Some(fold),
-        );
-    }
+fn push_body(out: &mut Transcript, text: &str, width: usize, theme: Theme, fold: Fold) {
+    push_text(out, text, None, width, theme, fold);
 }
 
 /// Tool output, capped at [`OUTPUT_ROWS`] with a trailing ellipsis.
-fn push_output(
+fn push_output(out: &mut Transcript, text: &str, width: usize, theme: Theme, fold: Fold) {
+    push_text(out, text, Some(OUTPUT_ROWS), width, theme, fold);
+}
+
+fn push_text(
     out: &mut Transcript,
-    label: &str,
     text: &str,
+    max_lines: Option<usize>,
     width: usize,
     theme: Theme,
     fold: Fold,
@@ -906,37 +906,63 @@ fn push_output(
     if text.is_empty() {
         return;
     }
-    let prefix = detail_prefix(label);
-    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
-    let continuation = " ".repeat(prefix_width);
+    let prefix_width = BODY_INDENT.len();
+    let limit = max_lines.unwrap_or(usize::MAX);
     let lines: Vec<&str> = text.lines().collect();
-    for (line_index, line) in lines.iter().take(OUTPUT_ROWS).enumerate() {
-        let wrapped = wrap_text(line, width.saturating_sub(prefix_width).max(1));
-        for (index, segment) in wrapped.iter().enumerate() {
-            let lead = if line_index == 0 && index == 0 {
-                Span::styled(prefix.clone(), dim(theme))
-            } else {
-                Span::raw(continuation.clone())
-            };
+    for line in lines.iter().take(limit) {
+        for segment in wrap_text(line, width.saturating_sub(prefix_width).max(1)) {
             out.push(
                 Line::from(vec![
-                    lead,
-                    Span::styled(segment.clone(), Style::default().fg(text_color(theme))),
+                    Span::raw(BODY_INDENT),
+                    Span::styled(segment, Style::default().fg(text_color(theme))),
                 ]),
                 Some(fold),
             );
         }
     }
-    if lines.len() > OUTPUT_ROWS {
+    if lines.len() > limit {
         out.push(
-            Line::from(Span::styled(format!("{GUTTER}…"), dim(theme))),
+            Line::from(Span::styled(format!("{BODY_INDENT}…"), dim(theme))),
             Some(fold),
         );
     }
 }
 
-/// Diff preview with `+`/`-`/`@@` coloring, capped at [`DIFF_ROWS`].
-fn push_diff(out: &mut Transcript, diff: &str, width: usize, theme: Theme, fold: Fold) {
+/// The target path for syntax detection. Patches carry it directly; approval
+/// cards only expose the tool arguments.
+fn diff_path(block: &ToolBlock) -> &str {
+    block
+        .patch
+        .as_ref()
+        .map(|patch| patch.path.as_str())
+        .or_else(|| block.arguments.get("path").and_then(Value::as_str))
+        .unwrap_or("")
+}
+
+/// Side-by-side diff preview with syntax highlighting, capped at
+/// [`DIFF_ROWS`]. Narrow panes fall back to the unified view so both code
+/// columns stay readable.
+fn push_diff(out: &mut Transcript, path: &str, diff: &str, width: usize, theme: Theme, fold: Fold) {
+    let rows = super::diff::rows(&[], Some(diff));
+    let base_bg = super::diff::base_background(theme);
+    if !rows.is_empty() {
+        if let Some(mut renderer) =
+            super::diff::DiffRenderer::new(&rows, width, path, theme, BODY_INDENT, base_bg)
+        {
+            let shown = rows.len().min(DIFF_ROWS);
+            for line in renderer.render(&rows[..shown], false, &[], 0) {
+                out.push(line, Some(fold));
+            }
+            if rows.len() > DIFF_ROWS {
+                out.push(
+                    Line::from(Span::styled(format!("{BODY_INDENT}…"), dim(theme))),
+                    Some(fold),
+                );
+            }
+            return;
+        }
+    }
+
     let add = theme.diff_add.unwrap_or(SUCCESS);
     let delete = theme.diff_delete.unwrap_or(DANGER);
     let lines: Vec<&str> = diff.lines().collect();
@@ -950,10 +976,10 @@ fn push_diff(out: &mut Transcript, diff: &str, width: usize, theme: Theme, fold:
         } else {
             comment(theme)
         };
-        for segment in wrap_text(line, width.saturating_sub(GUTTER.len()).max(1)) {
+        for segment in wrap_text(line, width.saturating_sub(BODY_INDENT.len()).max(1)) {
             out.push(
                 Line::from(vec![
-                    Span::styled(GUTTER, dim(theme)),
+                    Span::raw(BODY_INDENT),
                     Span::styled(segment, Style::default().fg(color)),
                 ]),
                 Some(fold),
@@ -962,7 +988,7 @@ fn push_diff(out: &mut Transcript, diff: &str, width: usize, theme: Theme, fold:
     }
     if lines.len() > DIFF_ROWS {
         out.push(
-            Line::from(Span::styled(format!("{GUTTER}…"), dim(theme))),
+            Line::from(Span::styled(format!("{BODY_INDENT}…"), dim(theme))),
             Some(fold),
         );
     }

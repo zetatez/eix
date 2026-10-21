@@ -31,7 +31,6 @@ pub enum KeyAction {
     ScrollUp,
     Timeline,
     Todos,
-    Diagnostics,
     Undo,
     Redo,
 }
@@ -62,7 +61,6 @@ impl KeyAction {
                 "scroll_up" => Self::ScrollUp,
                 "timeline" => Self::Timeline,
                 "todos" => Self::Todos,
-                "diagnostics" | "lsp" => Self::Diagnostics,
                 "undo" => Self::Undo,
                 "redo" => Self::Redo,
                 _ => return None,
@@ -86,6 +84,12 @@ impl Keybinds {
             let Some(key) = parse_key(spec) else {
                 continue;
             };
+            // Outside the prompt a bare character key is too easy to trigger
+            // by accident. TUI actions must use a leader chord, a named key or
+            // a modified/shifted punctuation key.
+            if !is_safe_binding(key) {
+                continue;
+            }
             bindings.push((key, action));
         }
         Self { bindings }
@@ -112,7 +116,20 @@ impl Keybinds {
     }
 }
 
-/// Parse `C-x`, `S-Tab`, `A-Enter`, `Space`, `F2`, or a single character.
+/// Whether a configured binding is safe outside text entry. Plain letters are
+/// reserved for input editing/navigation; actions need a modifier, a named
+/// key, or punctuation such as `?` / `:`.
+fn is_safe_binding(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char(ch) => {
+            key.modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                || (!ch.is_ascii_alphanumeric() && !ch.is_whitespace())
+        }
+        _ => true,
+    }
+}
+
 /// Parse `C-x`, `S-Tab`, `A-Enter`, `Space`, `F2`, or a single character.
 pub fn parse_key(spec: &str) -> Option<KeyEvent> {
     let spec = spec.trim();
@@ -215,6 +232,28 @@ mod tests {
         assert_eq!(
             binds.action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
             Some(KeyAction::Help)
+        );
+    }
+
+    #[test]
+    fn bare_letter_bindings_are_ignored_outside_the_prompt() {
+        let mut map = BTreeMap::new();
+        map.insert("sessions".to_string(), "o".to_string());
+        map.insert("new_session".to_string(), "P".to_string());
+        map.insert("palette".to_string(), "C-o".to_string());
+        let binds = Keybinds::from_config(&map);
+
+        assert_eq!(
+            binds.action(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            binds.action(KeyEvent::new(KeyCode::Char('P'), KeyModifiers::SHIFT)),
+            None
+        );
+        assert_eq!(
+            binds.action(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(KeyAction::Palette)
         );
     }
 }

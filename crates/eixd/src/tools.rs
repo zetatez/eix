@@ -18,8 +18,10 @@ use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 
-/// Hard cap on provider <-> tool round trips for one user turn.
-pub const MAX_TOOL_ROUNDS: usize = 12;
+/// Hard cap on provider <-> tool round trips for one user turn. Long agent
+/// tasks routinely need more than a dozen rounds; this still bounds runaway
+/// loops while leaving enough headroom.
+pub const MAX_TOOL_ROUNDS: usize = 64;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {

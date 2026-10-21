@@ -23,10 +23,11 @@ pub mod skills;
 pub use agents::{find_agent, load_agents, AgentMode, AgentSpec};
 pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
-    load_cli_config, AutoApproveRule, CliConfig, Config, ConfigError, ContextConfig,
+    load_cli_config, theme_preset, AutoApproveRule, CliConfig, Config, ConfigError, ContextConfig,
     FormatterConfig, ImagesConfig, LspConfig, LspServerConfig, McpConfig, McpServerConfig,
     ModelConfig, ModelInfo, ModelRoute, NotificationsConfig, PermissionAction, PermissionRule,
-    ProviderConfig, SandboxMode, ServerConfig, ThemeConfig, ToolPolicy, ToolsConfig,
+    ProviderConfig, SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolPolicy, ToolsConfig,
+    THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
@@ -47,12 +48,12 @@ pub use picker::{
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{
     AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams, ApprovalListResult,
-    ApprovalRespondParams, ApprovalResult, AttachResult, AuthParams, AuthResult, BtwParams,
-    BtwResult, CancelResult, ContextClearParams, ContextCompactParams, ContextDropParams,
-    ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams, DraftResult, Endpoint,
-    EventsParams, EventsResult, ForkParams, HelloResult, InputRespondParams, InputResult,
-    LspDiagnosticInfo, LspWorkspaceParams, LspWorkspaceResult, McpListResult, McpServerInfo,
-    ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
+    ApprovalRespondParams, ApprovalResult, AttachParams, AttachResult, AuthParams, AuthResult,
+    BtwParams, BtwResult, CancelResult, ContextClearParams, ContextCompactParams,
+    ContextDropParams, ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams,
+    DraftResult, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult, InputRespondParams,
+    InputResult, LspDiagnosticInfo, LspWorkspaceParams, LspWorkspaceResult, McpListResult,
+    McpServerInfo, ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
     PatchRejectParams, PatchResult, PatchReviseParams, PermissionParams, ProcessKillParams,
     ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
     RewindResult, ServerMessage, SessionAgentParams, SessionArchiveParams, SessionCdParams,

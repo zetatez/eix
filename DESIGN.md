@@ -30,7 +30,7 @@
 | 输入 | 一个 client 一个内置模态编辑器，对准聚焦 pane | 零启动/按键延迟；模态语义自持 | 只覆盖常用 vim 子集 |
 | 内核 | 从零手写 | 上下文与工具策略完全可控 | 工作量与质量风险 |
 | provider | 优先 OpenAI 兼容接口 | 一套 adapter 覆盖 OpenAI / Ollama / vLLM / OpenRouter 等，本地模型零成本接入 | 各家非标准字段需归一 |
-| leader | `<Space>`（仅 normal 模式） | 单字母全部留给 vim；落在同一前缀上 | insert 下不可用，用 `<C-g>` 补充 |
+| leader | `<Space>`（输入框 normal / 转录区） | 单字母全部留给 vim；转录区动作也必须经过 leader | insert 下不可用，用 `<C-g>` 补充 |
 | 转录 | ratatui 自绘 + 对话式布局 + 可折叠块 | 流式 reasoning/工具/审批卡片可见，性能可控 | 需维护一套只读导航键位 |
 | 审批 | propose → stage → apply | hunk 级审批才有意义；可回滚 | 需虚拟工作区/补丁暂存 |
 | 上下文 | 可见且可编辑的 context ledger | 既是 UX 也是回答质量 | 中等额外工作量 |
@@ -80,6 +80,7 @@ idle ──submit──> running ──tool──> tool_running ──> running 
 ```
 
 状态符号：`○ idle`、`● running`、`⚠ approval`、`◐ waiting`、`✗ error`、`◌ paused`。
+输入框顶部对 idle / running 只显示图标：idle 为静态 `○`，running 为逐帧切换的 braille spinner。
 
 ### 4.3 attach / detach / 所有权
 
@@ -130,17 +131,24 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | 模式 | 进入 | 主要按键 |
 |---|---|---|
 | insert | `i a I A o O` / 聚焦输入框 | 文本输入、`Backspace`/`Delete`、方向键、`Home`/`End`、`Tab`（4 空格）、`Ctrl-w/u/k/a/e`；`Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 换行；`Enter` 提交 |
-| normal | `Esc` | `h j k l w W b B e E 0 ^ $ gg G f F t T ; ,`；`d c y` + motion / `dd cc yy` / `iw aw`；`x X D C s S r ~ J p P u Ctrl-r`；`v`/`V` |
+| normal | `Esc` | `h j k l w W b B e E 0 ^ $ gg G f F t T ; ,`；`d c y` + motion / `dd cc yy` / `iw aw`；`x X D C s S r ~ J p P u Ctrl-r`；`v`/`V`；`Tab` 切换 Build / Plan |
 | visual / v-line | `v` / `V` | 同 normal 的 motion；`d x y c p ~ o`，选区反色 |
 
 - 计数（`3w`、`2dd`）、preferred column（`j/k`）、`;`/`,` 重复 find 均按 vim 习惯实现。
 - 撤销是快照栈：一次 insert 会话、一次 `dd`/`p` 各算一步；`u` / `Ctrl-r`。
-- 未命名寄存器保存最近一次 yank/delete；`p`/`P` 区分字符与整行。
-- `<Space>` 是 leader（仅 normal）：`s` sessions、`n` 新 pane、`q` 关闭 pane、`f` 文件、
-  `w` worktree、`b` 分支、`c` ledger、`C` context、`h` 历史、`p` 进程、`r` 审批、
-  `N` 新建、`W` 新建 worktree、`F` fork、`x` 取消、`a`/`:` 命令面板、`?` 帮助。
-  单字母完全留给 vim。
-- plain `j`/`k` 上下翻转录历史（`3j`、`dj`、`↑`/`↓` 仍是草稿内行移动）。
+- 未命名寄存器保存最近一次 yank/delete；`p`/`P` 区分字符与整行；寄存器为空时读取
+  系统剪贴板（鼠标选中的转录文本可直接粘贴），且外部粘贴不覆盖内部寄存器。
+- `<Space>` 是 leader（输入框 normal 与转录区共用同一映射）：`s` sessions、`n` 新建 session 并开新 pane、
+  `o` 打开 session picker（已有 session 放进新 pane）、`C`/`q` 关闭 pane、`f` 文件、
+  `w` worktree、`b` 分支、`c` ledger、`h` 历史、`p` 进程、`r` 审批、
+  `N` 新建、`W` 新建 worktree、`F` fork、`x` 取消、`A` attention、`i` 聚焦输入框、
+  `Q` 退出、`a`/`:` 命令面板、`?` 帮助。单字母完全留给 vim；转录区裸字母不触发动作，
+  仅保留 `i`（聚焦输入框）、`j/k`/`g/G` 等导航和 `:`/`?` 等标点入口。
+- `Shift+,` / `Shift+.`（即 `<` / `>`）在转录区和输入框 normal 模式线性切换上一个 / 下一个 pane。
+- `Ctrl-J`/`Ctrl-K` 上下翻转录历史（`j`/`k`、`3j`、`dj`、`↑`/`↓` 是草稿内行移动）。
+- normal 模式下 `Tab` 在 Build / Plan 之间切换：`None` 表示默认 Build，`Some("plan")`
+  选择只读 Plan；状态栏显示 `Build` / `Plan`。本地立即更新以支持连续切换，daemon 的
+  session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
 - `Enter` 只在 insert 提交；normal 的 `<CR>` 是 vim 的“下一行”。
 - `@`（insert，行首/空白后）打开文件 picker；`Ctrl-G` 在任意模式打开 session picker。
@@ -157,17 +165,21 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 ### 5.3 输入条布局
 
 ```
-┌─ eix ○ auth idle deepseek-v4.1-flash ~/git/eix 1/1 [normal] ─┐
-│ > 把登录改成 JWT，并补测试                                   │
-│                                                              │
-│                                                              │
-├──────────────────────────────────────────────────────────────┤
-│ i insert · v visual · Space actions · Esc normal             │
-└──────────────────────────────────────────────────────────────┘
+╭─ Build · ○ deepseek-v4-flash         ~/git/eix  main ─╮
+│   把登录改成 JWT，并补测试                               │
+│                                                           │
+│                                                           │
+╰─ I ───────────────────────────────────────────────────────╯
 ```
 
-- 固定高度：6 行内容 + 上下边框；短终端优先让给转录区；长草稿在框内滚动。
-- 上边框是 sticky banner（session/status/model/cwd/pane + 模式），下边框是模式提示。
+- 最少 6 行内容 + 上下边框；短终端优先让给转录区；长草稿向上生长到 12 行后开始滚动。
+- 顶部左侧固定为 `Build/Plan · <状态图标> <model>`（Build 蓝色、Plan 黄色），右侧对齐 cwd、git 分支/工作树和图片数；
+  idle 显示 `○`，running 显示动画 spinner；其他状态显示符号和状态名；
+  Build/Plan 固定 5 列宽，切换时状态和模型不位移。不再显示 `eix` 品牌和独立的底部
+  statusline；拒绝理由会临时占用这一行，错误则显示在居中的浮动对话框里，
+  按 `Esc` / `Enter` / `q` 关闭，输入框顶部保持 Build/Plan 与 cwd 信息。
+- 底部只保留单字母模式徽标（`N` / `I` / `V` / `VL`），正常状态下不堆叠快捷键提示。
+- 正文左侧留 1 格内边距；不再显示 `❯` 输入槽和占位文案，空输入时只保留光标和模式徽标。
 - 视觉选区逐字符判断并反色渲染；终端光标跟随实际字符位置。
 
 ### 5.4 独立 nvim 前端（`eix nvim`）
@@ -194,17 +206,20 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 ## 6. 布局与焦点
 
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
-- 不再有独立顶部 header 行：session/状态/模型/cwd/pane 的紧凑横幅作为输入框标题行，直接压在
-  prompt 网格上方（cwd 用 `~` 缩写，模型省略 provider 前缀）；底部 statusline 保留连接与 daemon 信息。
-- 焦点：`<C-w>h/j/k/l`（normal 模式与转录区一致）、`<C-w>w` 循环；转录区按 `i` 聚焦输入并进入 insert。
+- 不再有独立顶部 header 行：Build/Plan、session 状态、模型和 cwd 作为输入框标题行，直接压在
+  prompt 网格上方（cwd 用 `~` 缩写，模型省略 provider 前缀）；底部不再保留 statusline。
+- 焦点：`<C-w>h/j/k/l`（normal 模式与转录区一致）、`<C-w>w` 循环；转录区按 `i`、`Enter` 或 `<Space>i` 聚焦输入并进入 insert。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
-- 输入条固定 6 行内容高（加边框；短终端优先让给转录区），与焦点、草稿长度、normal 模式均无关，避免切换
-  模式时编辑区折叠；更长的草稿在框内滚动。左侧不再有常驻 session 栏，session 只经浮动 picker 打开。
+- 输入条最少显示 6 行内容（加边框；短终端优先让给转录区），长草稿会向上生长到 12 行，让长命令
+  和换行文本尽量完整可见；超过上限后在框内滚动。左侧不再有常驻 session 栏，session 只经浮动 picker 打开。
+- 输入条复用转录区的圆角面板与低对比度调色：顶部左/右分栏显示 `Build/Plan · status model` 与
+  cwd、git 分支/工作树/图片数；正文左侧留 1 格内边距；底边只保留单字母模式徽标（`I` 绿 / `N` 蓝 / `V` 琥珀），
+  不再堆叠快捷键提示或占位文案。`/` 补全菜单使用同一套面板样式，选中行整行高亮。
 
 ## 7. 键位总表
 
-> 内置编辑器固定以 `<Space>` 为 leader（normal 模式）；`<C-g>` 是跨模式补充入口。
+> 内置编辑器与转录区共用 `<Space>` leader（输入框 normal 模式 / 转录区）；`<C-g>` 是跨模式补充入口。
 > `eix nvim` 前端沿用你的 `mapleader`（下表以 `<Space>` 为例）。
 
 **全局（转录区 / picker / 任意非输入焦点）**
@@ -231,7 +246,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<leader>a x` | 取消当前生成 |
 | `<leader>a r` | 审批收件箱（跨 session） |
 | `<leader>a q` | detach |
-| `<leader>a ?` | 帮助 / cheatsheet |
+| `<leader>a ?` | 帮助 / cheatsheet（打开后输入即筛选条目，`↑`/`↓` 选择，`Ctrl-U` 清空，`Esc` 关闭） |
 
 **输入条（内置编辑器）**
 
@@ -242,8 +257,10 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<C-j>` / `<C-Enter>` / `<S-Enter>` | 换行（仅 insert） |
 | `@` | 文件 picker（行首/空白后） |
 | `Esc` | insert/visual → normal；normal 下 500ms 内再按一次：有 turn 在跑时中断它，否则回到转录区 |
-| plain `j` / `k` | normal 模式下浏览已提交的 prompt 历史（`3j`、`dj`、方向键仍是草稿内移动） |
-| `<Space>s/f/w/b/c/C/h/p/r/N/W/F/x/q/a/:/?` | TUI 动作（见 5.1） |
+| `Ctrl-J` / `Ctrl-K` | normal 模式下浏览已提交的 prompt 历史（newer / older） |
+| `Tab` | normal 模式下切换 Build / Plan 模式（命令面板的 `Build / Plan` 同义） |
+| `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
+| `<Space>s/f/w/b/c/C/h/p/r/N/W/F/x/q/Q/i/A/a/:/?` | TUI 动作（见 5.1）；裸字母不触发动作 |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
 | `d c y` + motion / `dd cc yy` / `iw aw` | 操作符 |
 | `v V` + `d x y c p ~ o` | visual |
@@ -253,7 +270,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 | 命令 | 行为 |
 |---|---|
-| `/help` | 帮助 |
+| `/help` | 帮助（可输入关键字筛选条目） |
 | `/new [name]` | 在聚焦 session 的 cwd 新建 session 并打开 pane |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
 | `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要 |
@@ -263,23 +280,40 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/queue [clear]` | 查看/清空本 session 的待发送队列 |
 | `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
 | `/permission <level>` | 设置 `read-only` / `workspace-write` / `full` |
-| `/exit` / `/quit` | 保存并关闭当前 pane；最后一个 pane 时退出 TUI |
+| `/exit` / `/quit` / `/close` | 保存并关闭当前 pane；最后一个 pane 时退出 TUI |
 
 队列按 session 保存在 TUI 内存（`HashMap<SessionId, VecDeque<String>>`），tick 时空闲即取一条
 发送；`turn.completed` 与 daemon `turns` 移除之间的竞态用“出错重排到队首、下个 tick 重试”处理。
 
 **转录区**
 
-转录按对话渲染：用户消息是右对齐的圆角气泡（panel 背景），agent 输出左对齐、2 空格缩进，
+转录按对话渲染：用户消息是右对齐的紧凑气泡（panel 背景，只画左右边条，不占上下边框行），agent 输出左对齐、2 空格缩进，
 不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
-以 `Thinking` 模块流式展开，turn 结束后收起；工具调用按 `call_id` 合并
+以 `Thinking` 模块流式展开，turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
 call/approval/patch/result 事件，一行显示状态圆点、命令或路径摘要与右侧状态
-（`ok` / `running` / `needs approval`），展开后以 `│` 对齐显示参数、输出和 diff。
+（`ok` / `running` / `needs approval`），展开后用四空格左缩进直接显示参数、输出和 diff；
+diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syntect 做语法高亮，窄 pane 回退
+unified。命令与路径已由折叠摘要给出，不再重复 `input` / `output` 标签；摘要因宽度截断时，
+展开后会在正文补回完整命令。
 `thinking` 与工具块都可用鼠标点击折叠；排队中的 prompt 以 `⏳ queued` 行显示在转录末尾。
+消息正文（用户气泡与 agent 输出）经 `tui/markdown.rs` 渲染：pulldown-cmark 解析 CommonMark
+与 GFM 表格/任务列表/删除线，转成保留样式的 `Line`；链接显示目标地址，图片显示
+`🖼 alt (path)` 占位，`$...$` / `$$...$$` 数学公式：行内公式转成紧凑 Unicode，块级公式用
+2D Unicode 网格排版（分数横线、根号、上下极限、矩阵、可伸缩括号），不引入 TeX 排版引擎。
+鼠标按住左键拖拽可选择转录文本（反色高亮），松开后自动复制；优先调用
+`wl-copy` / `xclip` / `xsel` / `pbcopy`，不可用时回退到 OSC 52。
+`/theme` 打开带实时预览的主题 picker：上下移动立即重绘界面，`Enter` 应用，`Esc`
+恢复打开前的主题；不再通过 `/theme <name>` 直接切换。预设里的 `background` 会同时应用到
+转录区、主题 picker 和其他浮层；默认主题和没有 `background` 的自定义主题继续使用终端背景。
+输入框不再使用独立的 `panel` 填充，始终跟随主题 `background`（默认即终端背景）。
+转录渲染按 pane 缓存已存储事件：只有 live tail 和当前可见窗口每帧重绘，长会话的滚动、
+选择与流式输出不会反复解析整段历史；事件、宽度、主题或折叠状态变化时才重建缓存。
+attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加载更早的分页，合并后按新增行数
+校正 scroll，避免视口跳动。
 
 | 键 | 行为 |
 |---|---|
-| 鼠标左键 / 滚轮 | 聚焦 pane；点击 `Thinking` / 工具块折叠或展开；滚轮滚动转录 |
+| 鼠标左键 / 滚轮 | 聚焦 pane；拖拽选择转录文本并在松开时自动复制；点击 `Thinking` / 工具块折叠或展开；滚轮滚动转录 |
 | `j/k`、`<C-d>/<C-u>`、`gg/G`、`<C-f>/<C-b>` | 滚动 |
 | `/`、`n/N` | 搜索 |
 | `za`、`zR/zM` | 折叠当前/全部 |
@@ -317,8 +351,8 @@ call/approval/patch/result 事件，一行显示状态圆点、命令或路径�
 - 已实现（2026-10-18，统一 picker 体系）：
   - TUI 用单一 `Picker`（`kind` + `query` + `selected` + `items`）承载所有 provider，左侧列表、右侧预览
     （session 显示 status/cwd/worktree/permission/model；data provider 显示 daemon 给的 `preview` 文本）。
-  - 入口：`p`/`<C-g>`（sessions，切换 pane）、`o`（sessions，新 pane）、`:`（commands，命令面板）、
-    `w`（worktrees）、`b`（branches）、prompt 内 `@`（files）、`Eix pick` 经独立前端选择。
+  - 入口：`<Space>s`/`<C-g>`（sessions，切换 pane）、`<Space>o`（sessions，新 pane）、`:`（commands，命令面板；转录区与输入框 normal 模式都可用）、
+    `<Space>w`（worktrees）、`<Space>b`（branches）、prompt 内 `@`（files）、`Eix pick` 经独立前端选择。
   - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`worktrees`
     （`git worktree list --porcelain`）、`branches`（`git branch`）、`context`（session ledger 条目，
     值为 entry id）。默认 500、上限 5000；跳过 `.git` / `target` 等派生目录。
@@ -359,6 +393,7 @@ j/k or C-n/C-p select · Enter confirm · y/n · x cancel
 
 - 卡片把动作排成选项列表，首个选项是推荐项；`j`/`k`（或 `C-n`/`C-p`）移动、
   `Enter` 执行、`1-9` 直选。`y`/`n` 仍是批准/拒绝快捷方式，`d`/`e`/`o`/`r` 也保留。
+  shell 审批显示完整命令行（按卡片宽度换行），而不是 daemon 摘要里的截断版本。
 - `e`：把 staged 的新内容写到临时文件，交给 `$VISUAL`/`$EDITOR`，保存后走
   `patch.revise` 重算 diff/hunks 再审批（工作区在此前不动）。
 - `o`：在编辑器里打开工作区中的真实文件（仅查看/对照；写操作仍走审批）。
@@ -369,7 +404,9 @@ j/k or C-n/C-p select · Enter confirm · y/n · x cancel
 
 全量 diff 视图（`d`）：
 
-- 左文件树 / 右 hunk；`J/K` 跳 hunk，`Space` 选中，`[`/`]` 跳文件。
+- 左右分栏：左侧旧文件、右侧新文件；行号与 `-`/`+` 标记分列，增删行带绿/红背景。
+- syntect 按目标文件扩展名选择语法；深色/浅色主题分别使用对应的高亮配色。
+- `[`/`]`（或 `J`/`K`）跳 hunk，`Space` 选中，`a` 全选/全不选。
 - `y` 应用选中（未选中则全部），`n` 拒绝。
 - 冲突检测：文件在 stage 后被外部修改 → 标红并要求重新 stage。
 
@@ -528,15 +565,15 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 > 实现快照（2026-10-18）：多 pane TUI 已落地（`eix` 无命令默认打开，或 `eix tui`）。左侧 session 栏 + 右侧自动
 > 平铺 pane（1/2/3/4+ 分别全屏、左右、左大右二、网格），每个 pane 独立维护 session、
-> 转录、滚动与流式跟随；`o` 在新 pane 打开，`p`/`Ctrl-G` 切换聚焦 pane 的 session，
+> 转录、滚动与流式跟随；`<Space>o` 在新 pane 打开，`<Space>s`/`Ctrl-G` 切换聚焦 pane 的 session，
 > `C-w h/j/k/l/w` 切焦点、`C-w v/s` 分屏、`C-w c` 关闭；同一 session 只出现一次，
 > picker 选中已打开 session 会聚焦既有 pane。输入框是自研的 Vim 风格模态编辑器
 > （`tui/editor.rs`）：normal / insert / visual / visual-line，常用 motion + operator +
 > count、`u`/`Ctrl-r`、未命名寄存器；不启动子进程、不加载 nvim 配置，按键零往返。
-> `<CR>` 只在 insert 提交，`<C-j>`/`Shift-Enter` 换行；输入框固定 6 行内容高（加边框），
-> 长草稿框内滚动，提交失败会把 draft 放回 buffer。
+> `<CR>` 只在 insert 提交，`<C-j>`/`Shift-Enter` 换行；输入框最少 6 行内容高（加边框），
+> 长草稿最多增长到 12 行后在框内滚动，提交失败会把 draft 放回 buffer。
 > 后台 pane 的 attention 已接入：daemon 在进入 `awaiting_approval` / `error` 时发送
-> `session.attention`，TUI 标记边框/侧栏并支持 `a` 跳到下一个；重新 attach 会从事件日志
+> `session.attention`，TUI 标记边框/侧栏并支持 `<Space>A` 跳到下一个；重新 attach 会从事件日志
 > 恢复未完成的审批卡片。外部通知也已接入：`[notifications] command` 由 daemon 在 attention
 > 时用 `sh -c` 执行并传入 `EIX_SESSION_ID` / `EIX_SESSION_NAME` / `EIX_SESSION_CWD` /
 > `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；`eix tui` 可用 `bell = true` 在后台
@@ -545,7 +582,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `@<相对路径>` 插入；编辑变化按 200ms tick 镜像到 `draft.set`，切 session 时 `draft.get` 回填。
 > 独立前端补上 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick [KIND]` 与 `:Eix doctor`。
 > 统一 picker（2026-10-18）：TUI 用单一 overlay 承载 sessions / files / worktrees / branches /
-> context / commands，左侧列表右侧预览；`p`/`o`/`:`/`w`/`b`/`@` 为入口，files 插入 `@path`，
+> context / commands，左侧列表右侧预览；`<Space>s`/`<Space>o`/`:`/`<Space>w`/`<Space>b`/`@` 为入口，files 插入 `@path`，
 > worktrees/branches 插入值，context 打开 ledger，commands 直接执行。daemon `picker.query` 新增
 > `worktrees`（porcelain）、`branches`（`git branch`）、`context`（ledger 条目）三个 provider；
 > 独立前端 `:Eix pick files|worktrees|branches|context` 用 `vim.ui.select` 选择。
@@ -554,7 +591,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 只在 insert 换行；`F1` 全局帮助，`Ctrl-C` 在输入框内
 > 等同 `Esc`（中断 insert / 失焦），在其它焦点上仍直接退出。
 > 布局（2026-10-18）：移除左侧常驻 session 栏，pane 占满 body；历史 session 只经浮动
-> picker（`p` / 输入框 `<Space>s`）打开。normal 模式新增 `<Space>xx` leader 动作
+> picker（`<Space>s`）打开。normal 模式新增 `<Space>xx` leader 动作
 > （复用命令面板动作），单键编辑命令全部留给编辑器。
 
 **Phase 2**
@@ -565,13 +602,14 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `read_file` / `list_dir`（只读，自动放行）和 `write_file` / `run_command`（需审批），
 > 所有路径经 workspace 沙箱（拒绝 `..` 与 symlink 逃逸），输出按字节截断，
 > `run_command` 带超时。provider 侧支持 OpenAI `tools` / `tool_calls` 的流式增量累积，
-> 一次 turn 最多 12 轮工具往返；每轮写入 `tool_call` / `approval_required` / `tool_result`
+> 一次 turn 最多 64 轮工具往返；每轮写入 `tool_call` / `approval_required` / `tool_result`
 > 事件并广播 `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
 > 选中的 hunk）。
 > 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。`write_file` 在 stage 时生成
-> unified diff 和逐 hunk 预览并随 `patch_proposed` 事件广播，TUI 卡片（`d` 全屏审阅）
-> 和 CLI 均会展示。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
+> unified diff 和逐 hunk 预览并随 `patch_proposed` 事件广播，TUI 卡片与 `d` 全屏审阅
+> 将 unified diff 转成左旧右新的 side-by-side 视图（syntax highlight，窄宽回退 unified），
+> CLI 保留 unified 输出。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
 > 全不选、`y` 只应用选中的 hunk（全选时整文件），`n` 拒绝；`patch.apply` / `approval.respond`
 > 接受可选 `hunks` 索引列表。应用时用基准内容拼出结果再落盘，并重新校验文件内容：
 > stage 后被外部修改则记 conflict、不覆盖。
@@ -699,7 +737,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 模型：`[[models]]` 提供多 provider 注册（每个条目独立的 `base_url` / `api_key(_env)` /
 > `model` / 成本 / `variants`）；`Config::route` 解析 `id#variant`，变体作为
 > `reasoning_effort` 发送。`model.list` / `session.model` / `/models` picker（含变体行）已接入；
-> `turn.completed` 带 `usage` / `cost` / `duration_ms`，footer 显示 tokens、tok/s 和成本。
+> `turn.completed` 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
 >
 > MCP：`eixd/src/mcp.rs` 实现 stdio JSON-RPC 客户端，`[mcp.servers.<name>]` 懒启动并缓存进程。
 > `tools/list` / `resources/list` / `prompts/list` 都支持分页 cursor；工具名为
@@ -713,8 +751,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `session.timeline` / `session.undo` / `session.redo` / `session.todos` RPC；archive 是持久化
 > 标记且默认列表隐藏，delete 级联事件/草稿/搜索，export/import 保留事件 seq（压缩范围仍然有效）。
 > undo/redo 用 `events.undone` 批次标记隐藏/恢复最近一个 user turn，并同步 FTS 索引；工作区文件
-> 不自动回滚（需要 `rewind`）。TUI 对应 `/undo`、`/redo`、`/timeline`、`/export`、`/archive`、
-> `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`。
+> 不自动回滚（需要 `rewind`）。TUI 对应 `/undo`、`/redo`、`/timeline`、`/archive`、
+> `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI
+> 的 `eix export` / `eix import`。
 >
 > Skills：`eix-core/src/skills.rs` 从全局与项目祖先目录加载 `<name>/SKILL.md`（含 `.opencode` /
 > `.claude` 兼容，同目录 `.eix` > `.opencode` > `.claude`）；system prompt 只放
@@ -737,9 +776,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > LSP：`eixd/src/lsp.rs` 是精简 stdio 客户端（Content-Length framing），按 server+workspace root
 > 懒启动并缓存；写入/编辑/apply 成功后收集 `textDocument/publishDiagnostics`，作为附注追加到工具
 > 输出，`lsp_diagnostics` 只读工具可主动查询。`lsp.workspace` 扫描 workspace（默认 200 文件、上限
-> 2000，跳过 `.git` / `target` / `node_modules` 等，最多 2000 条诊断、5 秒收集窗口），TUI
-> `/diagnostics` / `<Space>e` 在可滚动浮层里展示。初始化失败按 key 缓存；配置热重载 `clear()` 后重建。
-> 只支持 diagnostics，不支持 completion/hover/rename。
+> 2000，跳过 `.git` / `target` / `node_modules` 等，最多 2000 条诊断、5 秒收集窗口），仅保留
+> RPC 能力。初始化失败按 key 缓存；配置热重载 `clear()` 后重建。只支持 diagnostics，不支持
+> completion/hover/rename。
 
 ## 17. 待定
 

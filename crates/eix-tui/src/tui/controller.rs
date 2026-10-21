@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use eix_core::{
     ApprovalDecision, ApprovalResult, AttachResult, CancelResult, ContextLedgerResult, Endpoint,
-    HelloResult, InputResult, LspWorkspaceResult, Notification, ProcessKillResult, ProcessList,
+    EventsResult, HelloResult, InputResult, Notification, ProcessKillResult, ProcessList,
     ProcessOutput, RewindResult, SearchResult, Session, SessionList, SessionResult, SubmitResult,
 };
 use serde_json::{json, Value};
@@ -18,10 +18,21 @@ use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use super::net::{NetEvent, Requester};
 use crate::client::ensure_endpoint;
 
+/// Stored events fetched when a pane first attaches. A long session is opened
+/// at its tail; older pages are loaded when the user scrolls to the top.
+pub const ATTACH_TAIL_EVENTS: usize = 1000;
+/// Number of older events requested per history page.
+pub const HISTORY_PAGE_EVENTS: usize = 500;
+
 pub enum Command {
     Hello,
     List,
     Attach(String),
+    /// Fetch a page of events older than `before_seq`.
+    LoadHistory {
+        session_id: String,
+        before_seq: u64,
+    },
     Create {
         /// Create the session in its own git worktree.
         worktree: bool,
@@ -74,11 +85,6 @@ pub enum Command {
     ListMcp,
     /// Re-read the daemon config files.
     ReloadConfig,
-    /// Write an exported session JSON to a file.
-    ExportSession {
-        session_id: String,
-        path: Option<PathBuf>,
-    },
     /// Hide or restore a session.
     ArchiveSession {
         session_id: String,
@@ -101,11 +107,6 @@ pub enum Command {
     /// Read the model-managed task list.
     ListTodos {
         session_id: String,
-    },
-    /// Aggregate language-server diagnostics for the whole workspace.
-    Diagnostics {
-        session_id: String,
-        max_files: Option<usize>,
     },
     /// Hide or restore the newest turn.
     Undo {
@@ -209,6 +210,7 @@ impl Command {
             Self::Hello => "connect",
             Self::List => "list",
             Self::Attach(_) => "attach",
+            Self::LoadHistory { .. } => "history",
             Self::Create { .. } => "create",
             Self::SetCwd { .. } => "cd",
             Self::ClearContext { .. } => "clear",
@@ -219,12 +221,10 @@ impl Command {
             Self::ListModels | Self::ListAgents { .. } => "catalog",
             Self::ListMcp => "mcp",
             Self::ReloadConfig => "reload",
-            Self::ExportSession { .. } => "export",
             Self::ArchiveSession { .. } => "archive",
             Self::DeleteSession { .. } => "delete",
             Self::TimelineData { .. } => "timeline",
             Self::ListTodos { .. } => "todos",
-            Self::Diagnostics { .. } => "diagnostics",
             Self::RunShell { .. } => "shell",
             Self::Undo { redo: false, .. } => "undo",
             Self::Undo { redo: true, .. } => "redo",
@@ -254,6 +254,12 @@ pub enum Event {
     Hello(HelloResult),
     Sessions(Vec<Session>),
     Attached(AttachResult),
+    /// An older page of stored events, ready to prepend to a pane.
+    HistoryPage {
+        session_id: String,
+        events: Vec<eix_core::Event>,
+        has_more: bool,
+    },
     Created(Session),
     /// A session's cwd or permission changed; the view replays it.
     Updated(Session),
@@ -309,15 +315,11 @@ pub enum Event {
     ConfigReloaded {
         paths: Vec<String>,
     },
-    Exported {
-        path: Option<PathBuf>,
-    },
     Archived(Session),
     Deleted(String),
     Timeline(Vec<eix_core::TimelineItem>),
     Rewritten(String),
     Todos(Vec<eix_core::TodoItem>),
-    Diagnostics(LspWorkspaceResult),
     ShellRan {
         ok: bool,
         output: String,
@@ -420,9 +422,39 @@ async fn dispatch(
         }
         Command::Attach(session_id) => {
             let value = requester
-                .request("session.attach", json!({ "session_id": session_id }))
+                .request(
+                    "session.attach",
+                    json!({
+                        "session_id": session_id,
+                        "tail": ATTACH_TAIL_EVENTS,
+                    }),
+                )
                 .await?;
             send(events, Event::Attached(decode(value)?))
+        }
+        Command::LoadHistory {
+            session_id,
+            before_seq,
+        } => {
+            let value = requester
+                .request(
+                    "session.events",
+                    json!({
+                        "session_id": session_id,
+                        "before_seq": before_seq,
+                        "limit": HISTORY_PAGE_EVENTS,
+                    }),
+                )
+                .await?;
+            let result: EventsResult = decode(value)?;
+            send(
+                events,
+                Event::HistoryPage {
+                    session_id,
+                    events: result.events,
+                    has_more: result.has_more,
+                },
+            )
         }
         Command::Create {
             worktree,
@@ -544,20 +576,6 @@ async fn dispatch(
             let result: eix_core::McpListResult = decode(value)?;
             send(events, Event::Mcp(result.servers))
         }
-        Command::ExportSession { session_id, path } => {
-            let value = requester
-                .request("session.export", json!({ "session_id": session_id }))
-                .await?;
-            let result: eix_core::SessionExportResult = decode(value)?;
-            if let Some(path) = path {
-                tokio::fs::write(&path, &result.json)
-                    .await
-                    .with_context(|| format!("cannot write {}", path.display()))?;
-                send(events, Event::Exported { path: Some(path) })
-            } else {
-                send(events, Event::Exported { path: None })
-            }
-        }
         Command::ArchiveSession {
             session_id,
             archived,
@@ -612,18 +630,6 @@ async fn dispatch(
                 .await?;
             let result: eix_core::TodoList = decode(value)?;
             send(events, Event::Todos(result.items))
-        }
-        Command::Diagnostics {
-            session_id,
-            max_files,
-        } => {
-            let value = requester
-                .request(
-                    "lsp.workspace",
-                    json!({ "session_id": session_id, "max_files": max_files }),
-                )
-                .await?;
-            send(events, Event::Diagnostics(decode(value)?))
         }
         Command::Undo { session_id, redo } => {
             let method = if redo { "session.redo" } else { "session.undo" };

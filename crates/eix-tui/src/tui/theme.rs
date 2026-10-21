@@ -7,10 +7,13 @@
 
 use ratatui::style::Color;
 
-use eix_core::ThemeConfig;
+use eix_core::{theme_preset, ThemeConfig, ThemePreset};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Theme {
+    /// Whole-terminal background. Only set by a built-in preset, so the
+    /// fallback stays "whatever the terminal is already using".
+    pub background: Option<Color>,
     pub normal: Option<Color>,
     pub comment: Option<Color>,
     pub string: Option<Color>,
@@ -20,21 +23,37 @@ pub struct Theme {
     pub diff_delete: Option<Color>,
     /// Bubble/menu background.
     pub panel: Option<Color>,
+    /// Name of the preset this palette came from, if any.
+    pub preset: Option<&'static str>,
 }
 
 impl Theme {
-    /// Build a palette from config. Unknown colors fall back to the default
-    /// `None`, which makes each consumer use its built-in color.
+    /// Build a palette from config: the `preset` (if any) first, then explicit
+    /// per-slot overrides. Unknown colors fall back to the default `None`,
+    /// which makes each consumer use its built-in color.
     pub fn from_config(config: &ThemeConfig) -> Self {
+        let preset = config.preset.as_deref().and_then(theme_preset);
+        let base = |slot: fn(&ThemePreset) -> Option<&'static str>| {
+            preset.and_then(slot).and_then(parse_color)
+        };
+        let effective =
+            |value: &Option<String>, slot: fn(&ThemePreset) -> Option<&'static str>| match value
+                .as_deref()
+            {
+                Some(value) => parse_color(value).or_else(|| base(slot)),
+                None => base(slot),
+            };
         Self {
-            normal: config.normal.as_deref().and_then(parse_color),
-            comment: config.comment.as_deref().and_then(parse_color),
-            string: config.string.as_deref().and_then(parse_color),
-            function: config.function.as_deref().and_then(parse_color),
-            error: config.error.as_deref().and_then(parse_color),
-            diff_add: config.diff_add.as_deref().and_then(parse_color),
-            diff_delete: config.diff_delete.as_deref().and_then(parse_color),
-            panel: config.panel.as_deref().and_then(parse_color),
+            background: base(|preset| preset.background),
+            normal: effective(&config.normal, |preset| preset.normal),
+            comment: effective(&config.comment, |preset| preset.comment),
+            string: effective(&config.string, |preset| preset.string),
+            function: effective(&config.function, |preset| preset.function),
+            error: effective(&config.error, |preset| preset.error),
+            diff_add: effective(&config.diff_add, |preset| preset.diff_add),
+            diff_delete: effective(&config.diff_delete, |preset| preset.diff_delete),
+            panel: effective(&config.panel, |preset| preset.panel),
+            preset: preset.map(|preset| preset.name),
         }
     }
 }

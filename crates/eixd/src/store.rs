@@ -704,6 +704,50 @@ impl Store {
         Ok(events)
     }
 
+    /// Fetch up to `limit` events older than `before_seq`, in ascending order.
+    /// The boolean is true when still older events exist.
+    pub fn events_before(
+        &self,
+        id: &str,
+        before_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        let limit = limit.max(1);
+        let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let before_seq = before_seq.min(i64::MAX as u64) as i64;
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT seq, ts, kind, payload FROM events
+             WHERE session_id = ?1 AND seq < ?2 AND undone = 0
+             ORDER BY seq DESC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![id, before_seq, fetch], |row| {
+            let kind: String = row.get(2)?;
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: id.to_string(),
+                seq: row.get::<_, i64>(0)? as u64,
+                ts: row.get(1)?,
+                kind: kind.parse::<EventKind>().map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("unknown event kind {kind:?}").into(),
+                    )
+                })?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        events.reverse();
+        Ok((events, has_more))
+    }
+
     /// Search user and assistant message text across sessions.
     ///
     /// Queries containing a term of three or more characters use the FTS5
@@ -1074,6 +1118,34 @@ mod tests {
         }
         assert_eq!(store.events_after("s1", 1).unwrap().len(), 2);
         assert_eq!(store.events_after("s1", 3).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn events_before_seq_pages_backwards() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        for i in 0..5 {
+            store
+                .append_event(
+                    "s1",
+                    EventKind::UserMessage,
+                    serde_json::json!({"text": format!("m{i}")}),
+                )
+                .unwrap();
+        }
+        let (page, has_more) = store.events_before("s1", 5, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+        assert!(has_more);
+
+        let (page, has_more) = store.events_before("s1", 3, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(!has_more);
     }
 
     #[test]

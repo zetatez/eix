@@ -437,6 +437,11 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
+    /// Built-in palette name (`github-dark`, `github-light`, `gruvbox-dark`,
+    /// `solarized-dark`, `nord`, `dracula`, …). Explicit fields below override
+    /// individual slots of the preset; without a preset the terminal palette is
+    /// used (transparent background).
+    pub preset: Option<String>,
     pub normal: Option<String>,
     pub comment: Option<String>,
     pub string: Option<String>,
@@ -445,6 +450,164 @@ pub struct ThemeConfig {
     pub diff_add: Option<String>,
     pub diff_delete: Option<String>,
     pub panel: Option<String>,
+}
+
+/// A built-in `[theme] preset` palette. `None` slots mean "use the color the
+/// consumer would use without any theme at all".
+pub struct ThemePreset {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub background: Option<&'static str>,
+    pub normal: Option<&'static str>,
+    pub comment: Option<&'static str>,
+    pub string: Option<&'static str>,
+    pub function: Option<&'static str>,
+    pub error: Option<&'static str>,
+    pub diff_add: Option<&'static str>,
+    pub diff_delete: Option<&'static str>,
+    pub panel: Option<&'static str>,
+}
+
+impl ThemePreset {
+    pub fn slot(&self, name: &str) -> Option<&'static str> {
+        match name {
+            "background" => self.background,
+            "normal" => self.normal,
+            "comment" => self.comment,
+            "string" => self.string,
+            "function" => self.function,
+            "error" => self.error,
+            "diff_add" => self.diff_add,
+            "diff_delete" => self.diff_delete,
+            "panel" => self.panel,
+            _ => None,
+        }
+    }
+}
+
+/// Every built-in preset, in picker order. Aliases resolve through
+/// [`theme_preset`].
+pub const THEME_PRESETS: [ThemePreset; 8] = [
+    ThemePreset {
+        name: "github-dark",
+        description: "GitHub Dark / Primer",
+        background: Some("#0d1117"),
+        normal: Some("#e6edf3"),
+        comment: Some("#8b949e"),
+        string: Some("#a5d6ff"),
+        function: Some("#d2a8ff"),
+        error: Some("#ff7b72"),
+        diff_add: Some("#3fb950"),
+        diff_delete: Some("#f85149"),
+        panel: Some("#161b22"),
+    },
+    ThemePreset {
+        name: "github-light",
+        description: "GitHub Light / Primer",
+        background: Some("#ffffff"),
+        normal: Some("#1f2328"),
+        comment: Some("#656d76"),
+        string: Some("#032f62"),
+        function: Some("#8250df"),
+        error: Some("#cf222e"),
+        diff_add: Some("#1a7f37"),
+        diff_delete: Some("#cf222e"),
+        panel: Some("#f6f8fa"),
+    },
+    ThemePreset {
+        name: "gruvbox-dark",
+        description: "Gruvbox Dark",
+        background: Some("#282828"),
+        normal: Some("#ebdbb2"),
+        comment: Some("#928374"),
+        string: Some("#b8bb26"),
+        function: Some("#fabd2f"),
+        error: Some("#fb4934"),
+        diff_add: Some("#98971a"),
+        diff_delete: Some("#cc241d"),
+        panel: Some("#3c3836"),
+    },
+    ThemePreset {
+        name: "solarized-dark",
+        description: "Solarized Dark",
+        background: Some("#002b36"),
+        normal: Some("#839496"),
+        comment: Some("#586e75"),
+        string: Some("#2aa198"),
+        function: Some("#268bd2"),
+        error: Some("#dc322f"),
+        diff_add: Some("#859900"),
+        diff_delete: Some("#dc322f"),
+        panel: Some("#073642"),
+    },
+    ThemePreset {
+        name: "solarized-light",
+        description: "Solarized Light",
+        background: Some("#fdf6e3"),
+        normal: Some("#657b83"),
+        comment: Some("#93a1a1"),
+        string: Some("#2aa198"),
+        function: Some("#268bd2"),
+        error: Some("#dc322f"),
+        diff_add: Some("#859900"),
+        diff_delete: Some("#dc322f"),
+        panel: Some("#eee8d5"),
+    },
+    ThemePreset {
+        name: "nord",
+        description: "Nord",
+        background: Some("#2e3440"),
+        normal: Some("#d8dee9"),
+        comment: Some("#616e88"),
+        string: Some("#a3be8c"),
+        function: Some("#88c0d0"),
+        error: Some("#bf616a"),
+        diff_add: Some("#a3be8c"),
+        diff_delete: Some("#bf616a"),
+        panel: Some("#3b4252"),
+    },
+    ThemePreset {
+        name: "dracula",
+        description: "Dracula",
+        background: Some("#282a36"),
+        normal: Some("#f8f8f2"),
+        comment: Some("#6272a4"),
+        string: Some("#f1fa8c"),
+        function: Some("#50fa7b"),
+        error: Some("#ff5555"),
+        diff_add: Some("#50fa7b"),
+        diff_delete: Some("#ff5555"),
+        panel: Some("#44475a"),
+    },
+    ThemePreset {
+        name: "catppuccin-mocha",
+        description: "Catppuccin Mocha",
+        background: Some("#1e1e2e"),
+        normal: Some("#cdd6f4"),
+        comment: Some("#6c7086"),
+        string: Some("#a6e3a1"),
+        function: Some("#89b4fa"),
+        error: Some("#f38ba8"),
+        diff_add: Some("#a6e3a1"),
+        diff_delete: Some("#f38ba8"),
+        panel: Some("#313244"),
+    },
+];
+
+/// Look up a preset by name, accepting case/`-`/`_` variations plus a few
+/// aliases (`github-dark-default`, `mocha`, …).
+pub fn theme_preset(name: &str) -> Option<&'static ThemePreset> {
+    let normalized = name.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    let canonical = match normalized.as_str() {
+        "github-dark-default" | "github" | "primer-dark" => "github-dark",
+        "github-light-default" | "primer-light" => "github-light",
+        "gruvbox" | "gruvbox-dark-hard" | "gruvbox-dark-medium" => "gruvbox-dark",
+        "solarized" | "solarized-dark-high-contrast" => "solarized-dark",
+        "solarized-light-high-contrast" => "solarized-light",
+        "catppuccin" | "catppuccin-mocha-dark" | "mocha" => "catppuccin-mocha",
+        other => other,
+    };
+    THEME_PRESETS.iter().find(|preset| preset.name == canonical)
 }
 
 /// Run a command after a file tool writes real content. `$1` is appended to
@@ -955,6 +1118,16 @@ impl Config {
             return Err(ConfigError::Invalid(
                 "formatter.timeout_secs must be > 0".into(),
             ));
+        }
+        if let Some(preset) = self.theme.preset.as_deref() {
+            if theme_preset(preset).is_none() {
+                let names: Vec<&str> = THEME_PRESETS.iter().map(|item| item.name).collect();
+                return Err(ConfigError::Invalid(format!(
+                    "theme.preset {:?} is unknown (available: {})",
+                    preset,
+                    names.join(", ")
+                )));
+            }
         }
         for (index, rule) in self.tools.auto_approve.iter().enumerate() {
             if rule.tool.trim().is_empty() {
@@ -1528,6 +1701,14 @@ mod tests {
     }
 
     #[test]
+    fn retired_neutral_theme_presets_are_gone() {
+        assert!(theme_preset("dark").is_none());
+        assert!(theme_preset("light").is_none());
+        assert!(theme_preset("github-dark").is_some());
+        assert!(Config::default().theme.preset.is_none());
+    }
+
+    #[test]
     fn model_catalog_puts_default_first_and_skips_duplicates() {
         let config = Config {
             provider: ProviderConfig {
@@ -1952,7 +2133,7 @@ extensions = ["rs"]
 initialization_options = { checkOnSave = true }
 
 [keys]
-sessions = "P"
+sessions = "C-t"
 help = "F2"
 "#,
         )
@@ -1965,7 +2146,7 @@ help = "F2"
             rust.initialization_options.as_ref().unwrap()["checkOnSave"],
             true
         );
-        assert_eq!(config.keys.get("sessions").unwrap(), "P");
+        assert_eq!(config.keys.get("sessions").unwrap(), "C-t");
     }
 
     #[test]

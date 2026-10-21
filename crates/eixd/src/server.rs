@@ -19,13 +19,13 @@ use base64::Engine as _;
 use eix_core::{
     now_ms, payload, AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams,
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
-    AttachResult, AuthParams, BtwParams, BtwResult, CancelResult, ChatMessage, Config,
-    ContextClearParams, ContextClearedPayload, ContextCompactParams, ContextCompactedPayload,
-    ContextDropParams, ContextDropPayload, ContextLedgerParams, ContextPinParams,
-    ContextPinPayload, CreateSessionParams, DraftParams, DraftResult, ErrorPayload, Event,
-    EventKind, EventsParams, EventsResult, ForkParams, FunctionCall, HelloResult,
-    InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams, InputResult,
-    LspWorkspaceParams, McpListResult, McpServerInfo, ModelListResult, Notification,
+    AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult, ChatMessage,
+    Config, ContextClearParams, ContextClearedPayload, ContextCompactParams,
+    ContextCompactedPayload, ContextDropParams, ContextDropPayload, ContextLedgerParams,
+    ContextPinParams, ContextPinPayload, CreateSessionParams, DraftParams, DraftResult,
+    ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
+    HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams,
+    InputResult, LspWorkspaceParams, McpListResult, McpServerInfo, ModelListResult, Notification,
     PatchApplyParams, PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams,
     PatchResult, PatchResultPayload, PatchReviseParams, PermissionAction, PermissionLevel,
     PermissionParams, PermissionPayload, PickerItem, PickerParams, PickerResult, ProcessKillParams,
@@ -904,19 +904,42 @@ impl Daemon {
                 })?)
             }
             "session.attach" => {
-                let params: SessionRef = parse_params(request.params.clone())?;
+                let params: AttachParams = parse_params(request.params.clone())?;
                 let session = self.require_session(&params.session_id)?;
-                let events = self.store.events(&params.session_id)?;
-                Ok(serde_json::to_value(AttachResult { session, events })?)
+                let (events, has_more) = match params.tail {
+                    Some(tail) => self
+                        .store
+                        .events_before(&params.session_id, u64::MAX, tail)?,
+                    None => (self.store.events(&params.session_id)?, false),
+                };
+                Ok(serde_json::to_value(AttachResult {
+                    session,
+                    events,
+                    has_more,
+                })?)
             }
             "session.events" => {
                 let params: EventsParams = parse_params(request.params.clone())?;
                 self.require_session(&params.session_id)?;
-                Ok(serde_json::to_value(EventsResult {
-                    events: self
-                        .store
-                        .events_after(&params.session_id, params.after_seq)?,
-                })?)
+                let (events, has_more) = match params.before_seq {
+                    Some(before_seq) => self.store.events_before(
+                        &params.session_id,
+                        before_seq,
+                        params.limit.unwrap_or(usize::MAX),
+                    )?,
+                    None => {
+                        let mut events = self
+                            .store
+                            .events_after(&params.session_id, params.after_seq)?;
+                        let limit = params.limit.map(|limit| limit.max(1));
+                        let has_more = limit.is_some_and(|limit| events.len() > limit);
+                        if let Some(limit) = limit {
+                            events.truncate(limit);
+                        }
+                        (events, has_more)
+                    }
+                };
+                Ok(serde_json::to_value(EventsResult { events, has_more })?)
             }
             "context.ledger" => {
                 let params: ContextLedgerParams = parse_params(request.params.clone())?;
