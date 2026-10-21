@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "session": {
+    "id": "9c7a1c34-2a5c-43af-958e-c65060655d21",
+    "name": "eix",
+    "cwd": "/home/shiyi/git/eix",
+    "status": "idle",
+    "model": null,
+    "parent_id": null,
+    "forked_from_seq": null,
+    "worktree": null,
+    "origin": "user",
+    "permission": "workspace-write",
+    "agent": null,
+    "archived": false,
+    "created_at": 1792515377670,
+    "updated_at": 1792515377670
+  },
+  "events": []
+}

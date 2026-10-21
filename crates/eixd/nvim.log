@@ -1,0 +1,2 @@
+WRN 2026-10-22T02:38:45.582 ?.1671     server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.1671.0
+WRN 2026-10-22T02:39:16.808 ?.492      server_start:197: Failed to start server: read-only file system: /run/user/1000/nvim.492.0
