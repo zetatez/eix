@@ -143,11 +143,12 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `w` worktree、`b` 分支、`c` ledger、`h` 历史、`p` 进程、`r` 审批、
   `N` 新建、`W` 新建 worktree、`F` fork、`x` 取消、`A` attention、`i` 聚焦输入框、
   `Q` 退出、`a`/`:` 命令面板、`?` 帮助。单字母完全留给 vim；转录区裸字母不触发动作，
-  仅保留 `i`（聚焦输入框）、`j/k`/`g/G` 等导航和 `:`/`?` 等标点入口。
+  仅保留 `i`（聚焦输入框）、`j/k`/`g/G` 等导航和 `:`/`?` 等标点入口；布局动作同样走
+  leader（`V`/`T`/`R`/`L`）。
 - `Shift+,` / `Shift+.`（即 `<` / `>`）在转录区和输入框 normal 模式线性切换上一个 / 下一个 pane。
 - `Ctrl-J`/`Ctrl-K` 上下翻转录历史（`j`/`k`、`3j`、`dj`、`↑`/`↓` 是草稿内行移动）。
 - normal 模式下 `Tab` 在 Build / Plan 之间切换：`None` 表示默认 Build，`Some("plan")`
-  选择只读 Plan；状态栏显示 `Build` / `Plan`。本地立即更新以支持连续切换，daemon 的
+  选择只读 Plan；输入框标题行显示 `Build` / `Plan`。本地立即更新以支持连续切换，daemon 的
   session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
 - `Enter` 只在 insert 提交；normal 的 `<CR>` 是 vim 的“下一行”。
@@ -169,17 +170,19 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 │   把登录改成 JWT，并补测试                               │
 │                                                           │
 │                                                           │
-╰─ I ───────────────────────────────────────────────────────╯
+╰───────────────────────────────────────────────────────────╯
+ N  prompt polish · running                     gpt-5 · 1/2
 ```
 
 - 最少 6 行内容 + 上下边框；短终端优先让给转录区；长草稿向上生长到 12 行后开始滚动。
 - 顶部左侧固定为 `Build/Plan · <状态图标> <model>`（Build 蓝色、Plan 黄色），右侧对齐 cwd、git 分支/工作树和图片数；
   idle 显示 `○`，running 显示动画 spinner；其他状态显示符号和状态名；
-  Build/Plan 固定 5 列宽，切换时状态和模型不位移。不再显示 `eix` 品牌和独立的底部
-  statusline；拒绝理由会临时占用这一行，错误则显示在居中的浮动对话框里，
-  按 `Esc` / `Enter` / `q` 关闭，输入框顶部保持 Build/Plan 与 cwd 信息。
-- 底部只保留单字母模式徽标（`N` / `I` / `V` / `VL`），正常状态下不堆叠快捷键提示。
-- 正文左侧留 1 格内边距；不再显示 `❯` 输入槽和占位文案，空输入时只保留光标和模式徽标。
+  Build/Plan 固定 5 列宽，切换时状态和模型不位移。不再显示 `eix` 品牌；拒绝理由会临时占用这一行，
+  错误则显示在居中的浮动对话框里，按 `Esc` / `Enter` / `q` 关闭，输入框顶部保持 Build/Plan 与 cwd 信息。
+- 输入框下方保留一条 Vim 风格 statusline：左侧是彩色的单字母模式徽标（`N` / `I` / `V` / `VL`）、
+  当前 session 名和最近状态；右侧是模型、多 pane 时的 `当前/总数`、排队数和 attention 数。
+- 输入框底边保持普通边框，不再挂模式徽标，也不堆叠快捷键提示。
+- 正文左侧留 1 格内边距；不再显示 `❯` 输入槽和占位文案，空输入时只保留光标。
 - 视觉选区逐字符判断并反色渲染；终端光标跟随实际字符位置。
 
 ### 5.4 独立 nvim 前端（`eix nvim`）
@@ -206,16 +209,25 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 ## 6. 布局与焦点
 
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
+- 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首占 55% 高度）、`tabby`（顶部 tab，
+  只渲染当前 session）、`fibonacci`（tab + 左/上/右/下循环切分的螺旋分屏）。用 leader
+  `<Space>V/T/R` 切换，`<Space>L` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session。
+- 活跃队列：`views` 顺序即队列顺序，位置 0 是 pane 1。turn 完成、等待审批/输入时把对应
+  session 移到队首；提交流程（包括排队和 `!` shell）把它移到队尾。重排时保持聚焦槽位，
+  因此用户停在 pane 1 就能看到下一个就绪 session；若被移动的正是聚焦 session，promotion
+  会跟随到队首，demotion 则留在原槽位等待下一个 session。
 - 不再有独立顶部 header 行：Build/Plan、session 状态、模型和 cwd 作为输入框标题行，直接压在
-  prompt 网格上方（cwd 用 `~` 缩写，模型省略 provider 前缀）；底部不再保留 statusline。
+  prompt 网格上方（cwd 用 `~` 缩写，模型省略 provider 前缀）；输入框下方保留一行 statusline，
+  左侧显示模式、session 和最近状态，右侧显示模型与队列/attention 信息。
 - 焦点：`<C-w>h/j/k/l`（normal 模式与转录区一致）、`<C-w>w` 循环；转录区按 `i`、`Enter` 或 `<Space>i` 聚焦输入并进入 insert。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
 - 输入条最少显示 6 行内容（加边框；短终端优先让给转录区），长草稿会向上生长到 12 行，让长命令
   和换行文本尽量完整可见；超过上限后在框内滚动。左侧不再有常驻 session 栏，session 只经浮动 picker 打开。
 - 输入条复用转录区的圆角面板与低对比度调色：顶部左/右分栏显示 `Build/Plan · status model` 与
-  cwd、git 分支/工作树/图片数；正文左侧留 1 格内边距；底边只保留单字母模式徽标（`I` 绿 / `N` 蓝 / `V` 琥珀），
-  不再堆叠快捷键提示或占位文案。`/` 补全菜单使用同一套面板样式，选中行整行高亮。
+  cwd、git 分支/工作树/图片数；正文左侧留 1 格内边距；底边保持普通边框，模式与状态信息移到下方
+  statusline（单字母模式徽标 `I` 绿 / `N` 蓝 / `V` 琥珀），不堆叠快捷键提示或占位文案。
+  `/` 补全菜单使用同一套面板样式，选中行整行高亮。
 
 ## 7. 键位总表
 
@@ -230,6 +242,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<C-g><C-g>` | 回到上一个 session |
 | `<C-w>h/j/k/l` | 切换 pane 焦点 |
 | `<C-w>w` | 循环 pane |
+| `<Space>V/T/R` | horizontal / tabby / fibonacci 布局 |
+| `<Space>L` | 循环 grid / horizontal / tabby / fibonacci |
+| `Ctrl-1…9` | 聚焦第 N 个已打开 session |
 
 **`eix nvim` 前端（`:Eix` palette）**
 
@@ -296,7 +311,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 **转录区**
 
-转录按对话渲染：用户消息是右对齐的两行紧凑气泡（panel 背景，圆角顶边 + 左右边条，前后不额外留空行），agent 输出左对齐、2 空格缩进，
+转录按对话渲染：用户消息和 agent 输出都使用普通文本、左对齐并保留 2 空格缩进，不使用气泡，
 不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
 以 `Thinking` 模块流式展开，turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
 call/approval/patch/result 事件，一行显示状态圆点、命令或路径摘要与右侧状态
@@ -305,7 +320,7 @@ diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syn
 unified。命令与路径已由折叠摘要给出，不再重复 `input` / `output` 标签；摘要因宽度截断时，
 展开后会在正文补回完整命令。
 `thinking` 与工具块都可用鼠标点击折叠；排队中的 prompt 以 `⏳ queued` 行显示在转录末尾。
-消息正文（用户气泡与 agent 输出）经 `tui/markdown.rs` 渲染：pulldown-cmark 解析 CommonMark
+消息正文（用户消息与 agent 输出）经 `tui/markdown.rs` 渲染：pulldown-cmark 解析 CommonMark
 与 GFM 表格/任务列表/删除线，转成保留样式的 `Line`；链接显示目标地址，图片显示
 `🖼 alt (path)` 占位，`$...$` / `$$...$$` 数学公式：行内公式转成紧凑 Unicode，块级公式用
 2D Unicode 网格排版（分数横线、根号、上下极限、矩阵、可伸缩括号），不引入 TeX 排版引擎。
@@ -384,7 +399,11 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 
 - **propose → stage → apply**：agent 的写操作先进入 staging 视图（补丁/影子目录），用户批准后才落到真实工作区。
 - agent 的读操作看到的是 `真实工作区 + 已 stage 改动` 的合并视图，避免"自己改了什么自己不知道"。
-- shell 命令无法 stage：走审批门禁 + 执行前快照（git stash 或目录快照），风险等级单独标注。
+- shell 命令无法 stage：写操作走审批门禁 + 执行前快照（git stash 或目录快照），风险等级单独标注。
+- 只读 shell 命令（`grep` / `rg` / `fd` / `find` / `cat` / `head` / `tail` / `wc` /
+  `ls` / `stat` / `diff` 等）走保守白名单，不弹审批、不抓快照。重定向、后台运行、
+  命令替换、子 shell、`find -exec` / `-delete`、`rg --pre`、`fd -x` 以及所有未知命令
+  仍按写操作处理，避免白名单被 shell 语法绕过。
 
 ### 9.2 审批 UI
 
@@ -438,7 +457,8 @@ j/k or C-n/C-p select · Enter confirm · y/n · x cancel
   （旧库自动迁移，默认 `workspace-write`）。`session.create` 可带 `permission`；
   `session.permission` 可在运行时切换，`temporary: true` 只存内存并在事件日志留下
   `permission` 事件，daemon 重启后回到持久值。
-  - `read-only`：不向模型暴露写工具，运行时也拒绝 `write_file` / `run_command` / `start_command`。
+  - `read-only`：不向模型暴露写工具，运行时拒绝 `write_file` / `start_command` 和会修改文件的
+    `run_command`；白名单内的只读 shell 命令仍可执行（例如用户显式 `shell.run cat ...`）。
   - `workspace-write`：仍受全局 `[tools] policy` 的 `ask` / `auto` 约束，路径限制在 workspace 内。
   - `full`：跳过审批直接执行写工具（路径限制仍作为纵深防御保留）；全局 `read-only` 仍是硬上限。
   - 子 agent 永远只读，与父 session 的级别无关。
@@ -534,8 +554,12 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 ## 14. 安全
 
 - 工具沙箱：bubblewrap。工作区 rw，`/tmp` tmpfs，home 只读（缓存目录按需 rw），网络开关。
-- 环境变量白名单；密钥不进入事件日志。
-- 网络/破坏性命令默认需要审批。
+- 环境变量白名单；密钥不进入 daemon 日志。
+- 发往 provider 的消息在 `Provider::stream_chat` 边界做可逆脱敏：密码、API key、token、
+  Bearer、URL 凭据、PEM 私钥和敏感赋值替换为 per-provider salt 哈希出的占位符；模型返回的
+  tool-call 参数和文本在本地执行/持久化前还原。映射不离开进程，事件日志和 TUI 保留原文。
+  图片不做文本脱敏。
+- 网络/破坏性命令默认需要审批；只读 shell 命令的白名单见 §9.1。
 - 配置文件与日志权限收紧；不把 API key 写进项目目录。
 
 ## 15. 风险

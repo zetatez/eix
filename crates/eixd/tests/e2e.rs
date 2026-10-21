@@ -231,6 +231,85 @@ async fn daemon_retries_transient_provider_failures() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn daemon_discards_partial_output_before_retrying() -> anyhow::Result<()> {
+    let dir = temp_dir("retry-partial");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(partial_failure_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.provider.retry_attempts = 2;
+    config.provider.retry_base_ms = 1;
+    config.provider.retry_max_secs = 1;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir));
+
+    let mut client = connect(&socket).await?;
+    let _: HelloResult = client.request("hello", Value::Null).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "partial", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "hello"}),
+        )
+        .await?;
+
+    let mut text = String::new();
+    let mut resets = 0;
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "message.delta" => text.push_str(notification.params["delta"].as_str().unwrap()),
+            "message.reset" => {
+                resets += 1;
+                text.clear();
+            }
+            "turn.completed"
+                if notification.params["session_id"] == session_id.as_str()
+                    && notification.params["turn_id"] == submitted.turn_id.as_str() =>
+            {
+                break notification.params.clone();
+            }
+            _ => {}
+        }
+    };
+
+    assert_eq!(resets, 1);
+    assert_eq!(text, "recovered");
+    assert!(completed["error"].is_null());
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let assistant = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .expect("assistant event");
+    assert_eq!(assistant.payload["text"], "recovered");
+    assert!(!assistant.payload["text"]
+        .as_str()
+        .unwrap()
+        .contains("partial"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_does_not_retry_an_exhausted_quota() -> anyhow::Result<()> {
     let dir = temp_dir("quota");
     std::fs::create_dir_all(&dir)?;
@@ -1666,6 +1745,118 @@ async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> 
         .join("files/src/keep.txt");
     assert_eq!(std::fs::read_to_string(&saved)?, "before");
     assert_eq!(std::fs::read_to_string(dir.join("src/keep.txt"))?, "after");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn read_only_commands_run_without_approval_and_secrets_stay_local() -> anyhow::Result<()> {
+    let dir = temp_dir("readonly-redact");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(
+        dir.join("secret.txt"),
+        "PASSWORD=hunter2\nOPENAI_API_KEY=sk-live-e2e-secret-1234567890\n",
+    )?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(secret_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "redact", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "inspect the secret file"}),
+        )
+        .await?;
+
+    let mut prompted = false;
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "tool.approval_required" => prompted = true,
+            "turn.completed"
+                if notification.params["session_id"] == session_id.as_str()
+                    && notification.params["turn_id"] == submitted.turn_id.as_str() =>
+            {
+                break notification.params.clone();
+            }
+            _ => {}
+        }
+    };
+    assert!(!prompted, "`cat` must run without an approval prompt");
+    assert!(completed["error"].is_null(), "{completed}");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let assistant = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .expect("assistant message");
+    // The model only saw a placeholder and echoed it; the daemon restored the
+    // original before persisting/displaying the assistant message.
+    assert_eq!(assistant.payload["text"], "captured hunter2");
+    assert!(attached.events.iter().any(|event| {
+        event.kind == EventKind::ToolResult
+            && event.payload["tool"] == "run_command"
+            && event.payload["ok"] == true
+    }));
+    assert!(
+        !attached.events.iter().any(|event| {
+            event.kind == EventKind::Snapshot && event.payload["tool"] == "run_command"
+        }),
+        "read-only commands must not capture a workspace snapshot"
+    );
+    let write_call = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolCall && event.payload["tool"] == "write_file")
+        .expect("write_file call");
+    assert_eq!(write_call.payload["arguments"]["content"], "hunter2");
+    assert_eq!(write_call.payload["arguments"]["path"], "out.txt");
+
+    let bodies = bodies.lock().await;
+    assert!(bodies.len() >= 3, "expected three provider requests");
+    for (index, body) in bodies.iter().enumerate() {
+        assert!(
+            !body.contains("hunter2"),
+            "request {index} leaked the password: {body}"
+        );
+        assert!(
+            !body.contains("sk-live-e2e-secret-1234567890"),
+            "request {index} leaked the API key: {body}"
+        );
+    }
+    assert!(
+        bodies[1].contains("{{eix_secret_"),
+        "the tool result should contain a placeholder: {}",
+        bodies[1]
+    );
+    drop(bodies);
 
     daemon.abort();
     mock.abort();
@@ -3813,6 +4004,46 @@ async fn flaky_provider(listener: TcpListener, failures: usize, bodies: Arc<Mute
     }
 }
 
+async fn partial_failure_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    let first = Arc::new(Mutex::new(true));
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        let first = Arc::clone(&first);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            bodies.lock().await.push(body);
+            let first = {
+                let mut first = first.lock().await;
+                let value = *first;
+                *first = false;
+                value
+            };
+            if first {
+                // Advertise more bytes than we send, then close: the partial
+                // delta reaches the client before the transport fails.
+                let events = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{events}",
+                    events.len() + 1024
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                return;
+            }
+            let events = concat!(
+                "data: {\"model\":\"mock-retry\",\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            write_sse(&mut socket, events).await;
+        });
+    }
+}
+
 async fn quota_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
@@ -4909,8 +5140,8 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
 }
 
 #[tokio::test]
-async fn user_shell_commands_are_recorded_and_refused_in_read_only_sessions() -> anyhow::Result<()>
-{
+async fn user_shell_commands_are_recorded_and_read_only_sessions_only_allow_safe_commands(
+) -> anyhow::Result<()> {
     let dir = temp_dir("shell-run");
     std::fs::create_dir_all(&dir)?;
     let mut config = Config::default();
@@ -4953,13 +5184,26 @@ async fn user_shell_commands_are_recorded_and_refused_in_read_only_sessions() ->
             json!({"name": "readonly", "cwd": dir, "permission": "read-only"}),
         )
         .await?;
+    let allowed: eix_core::ShellRunResult = client
+        .request(
+            "shell.run",
+            json!({"session_id": readonly.session.id, "command": "printf safe"}),
+        )
+        .await?;
+    assert!(allowed.ok, "{}", allowed.output);
+    assert!(allowed.output.contains("safe"));
+
     assert!(client
         .request::<eix_core::ShellRunResult>(
             "shell.run",
-            json!({"session_id": readonly.session.id, "command": "printf nope"}),
+            json!({
+                "session_id": readonly.session.id,
+                "command": "printf nope > blocked.txt",
+            }),
         )
         .await
         .is_err());
+    assert!(!dir.join("blocked.txt").exists());
 
     daemon.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
@@ -5273,6 +5517,83 @@ async fn agent_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
             write_sse(&mut socket, &events).await;
         });
     }
+}
+
+/// Reads a file containing secrets, then asks the daemon to write a value that
+/// the daemon must restore from a provider placeholder.
+async fn secret_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let tool_results = value["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                })
+                .unwrap_or(0);
+            let events = match tool_results {
+                0 => tool_call_event(
+                    json!({"command": "cat secret.txt"}),
+                    "run_command",
+                    "call_1",
+                ),
+                1 => {
+                    let placeholder = first_placeholder(&value).unwrap_or_default();
+                    tool_call_event(
+                        json!({"path": "out.txt", "content": placeholder}),
+                        "write_file",
+                        "call_2",
+                    )
+                }
+                _ => {
+                    let placeholder = first_placeholder(&value).unwrap_or_default();
+                    let chunk = json!({
+                        "model": "mock-secret",
+                        "choices": [{"delta": {"content": format!("captured {placeholder}")}, "finish_reason": "stop"}],
+                    });
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                }
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+fn tool_call_event(arguments: Value, tool: &str, call_id: &str) -> String {
+    let chunk = json!({
+        "model": "mock-secret",
+        "choices": [{
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": call_id,
+                    "type": "function",
+                    "function": {"name": tool, "arguments": arguments.to_string()},
+                }]
+            },
+            "finish_reason": "tool_calls",
+        }],
+    });
+    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+}
+
+fn first_placeholder(value: &Value) -> Option<String> {
+    let text = serde_json::to_string(value).ok()?;
+    let start = text.find("{{eix_secret_")?;
+    let rest = &text[start..];
+    let end = rest.find("}}")? + 2;
+    Some(rest[..end].to_string())
 }
 
 async fn command_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {

@@ -1,6 +1,6 @@
 //! Small Markdown renderer for the transcript.
 //!
-//! Agent replies are Markdown, so the transcript renders them into styled
+//! Messages are Markdown, so the transcript renders them into styled
 //! `ratatui` lines instead of showing raw `**`, backticks and `[](...)`. The
 //! renderer deliberately stays terminal-friendly: links show their target,
 //! images become a labelled placeholder, and TeX math is approximated with
@@ -23,16 +23,10 @@ const PANEL: Color = Color::Rgb(38, 41, 51);
 const ACCENT: Color = Color::Rgb(122, 162, 247);
 const SUCCESS: Color = Color::Rgb(126, 199, 149);
 
-/// Render an agent reply. Lines are indented by two cells, matching the
+/// Render a transcript message. Lines are indented by two cells, matching the
 /// transcript's left gutter.
 pub fn render(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
     render_with_indent(text, width, theme, "  ")
-}
-
-/// Render Markdown without the transcript gutter. Used by user bubbles, where
-/// the bubble border already provides the inset.
-pub fn render_body(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
-    render_with_indent(text, width, theme, "")
 }
 
 fn render_with_indent(text: &str, width: usize, theme: Theme, indent: &str) -> Vec<Line<'static>> {

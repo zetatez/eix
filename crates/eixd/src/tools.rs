@@ -13,6 +13,7 @@ use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
+use eix_core::commands::tokenize;
 use eix_core::{sandbox, Config, HunkInfo, SandboxMode, ToolDefinition};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -373,6 +374,228 @@ pub fn requires_approval(tool: &str) -> bool {
         "write_file" | "edit" | "patch" | "run_command" | "start_command"
     )
 }
+
+/// Whether this specific call needs approval. `run_command` is the exception:
+/// recognized lookup commands (`grep`, `rg`, `fd`, `find`, `cat`, ...) only
+/// read, so they bypass the approval card and the read-only session cap.
+pub fn requires_approval_for(tool: &str, args: &Value) -> bool {
+    if tool == "run_command" {
+        return !is_read_only_command_args(args);
+    }
+    requires_approval(tool)
+}
+
+pub fn is_read_only_command_args(args: &Value) -> bool {
+    args.get("command")
+        .and_then(Value::as_str)
+        .map(is_read_only_command)
+        .unwrap_or(false)
+}
+
+/// Conservative shell classifier for read-only commands.
+///
+/// This is intentionally an allow-list, not a deny-list. Anything that could
+/// write, spawn an arbitrary command, redirect output, or change shell state
+/// keeps the normal approval path. Pipelines and `&&`/`;` chains are allowed
+/// only when every segment is itself a recognized read-only command.
+pub fn is_read_only_command(command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() {
+        return false;
+    }
+    let Some(segments) = split_shell_segments(command) else {
+        return false;
+    };
+    !segments.is_empty() && segments.iter().all(|segment| is_read_only_segment(segment))
+}
+
+fn split_shell_segments(command: &str) -> Option<Vec<&str>> {
+    let chars: Vec<(usize, char)> = command.char_indices().collect();
+    let mut segments = Vec::new();
+    let mut quote: Option<char> = None;
+    let mut start = 0usize;
+    let mut i = 0usize;
+    while i < chars.len() {
+        let (idx, ch) = chars[i];
+        if let Some(open) = quote {
+            // Double quotes still expand `$` and backticks. Single quotes are
+            // literal, so only the opening/closing quote matters there.
+            if open == '"' && matches!(ch, '\\' | '$' | '`') {
+                return None;
+            }
+            if ch == open {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match ch {
+            '\'' | '"' => {
+                quote = Some(ch);
+                i += 1;
+            }
+            '\\' | '$' | '`' | '\n' | '\r' | '(' | ')' | '<' | '>' | '{' | '}' => return None,
+            '&' => {
+                if chars.get(i + 1).map(|(_, next)| *next) != Some('&') {
+                    return None;
+                }
+                if !push_segment(command, start, idx, &mut segments) {
+                    return None;
+                }
+                i += 2;
+                start = chars.get(i).map(|(next, _)| *next).unwrap_or(command.len());
+            }
+            '|' => {
+                let doubled = chars.get(i + 1).map(|(_, next)| *next) == Some('|');
+                if !push_segment(command, start, idx, &mut segments) {
+                    return None;
+                }
+                i += if doubled { 2 } else { 1 };
+                start = chars.get(i).map(|(next, _)| *next).unwrap_or(command.len());
+            }
+            ';' => {
+                if !push_segment(command, start, idx, &mut segments) {
+                    return None;
+                }
+                i += 1;
+                start = chars.get(i).map(|(next, _)| *next).unwrap_or(command.len());
+            }
+            _ => i += 1,
+        }
+    }
+    if quote.is_some() || !push_segment(command, start, command.len(), &mut segments) {
+        return None;
+    }
+    Some(segments)
+}
+
+fn push_segment<'a>(command: &'a str, start: usize, end: usize, out: &mut Vec<&'a str>) -> bool {
+    let segment = command[start..end].trim();
+    if segment.is_empty() {
+        return false;
+    }
+    out.push(segment);
+    true
+}
+
+fn is_read_only_segment(segment: &str) -> bool {
+    let tokens = tokenize(segment);
+    let Some(command) = tokens.first() else {
+        return false;
+    };
+    // `./cat` or `/bin/cat` could point at a workspace binary. Only trust the
+    // commands the user actually has on PATH.
+    if command.contains('/') {
+        return false;
+    }
+    match command.as_str() {
+        "find" => !tokens.iter().any(|arg| {
+            matches!(
+                arg.as_str(),
+                "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls"
+            ) || arg.starts_with("-fprint")
+                || arg.starts_with("-fprintf")
+        }),
+        "rg" => !tokens.iter().any(|arg| {
+            arg == "--pre"
+                || arg.starts_with("--pre=")
+                || arg == "--hostname-bin"
+                || arg.starts_with("--hostname-bin=")
+        }),
+        "fd" | "fdfind" => !tokens.iter().any(|arg| {
+            arg.starts_with("-x")
+                || arg.starts_with("-X")
+                || arg == "--exec"
+                || arg == "--exec-batch"
+                || arg.starts_with("--exec=")
+                || arg.starts_with("--exec-batch=")
+        }),
+        "sort" => !tokens.iter().any(|arg| {
+            arg == "-o"
+                || (arg.starts_with("-o") && !arg.starts_with("--"))
+                || arg == "--output"
+                || arg.starts_with("--output=")
+                || arg == "--compress-program"
+                || arg.starts_with("--compress-program=")
+                || arg == "-T"
+                || (arg.starts_with("-T") && !arg.starts_with("--"))
+                || arg == "--temporary-directory"
+                || arg.starts_with("--temporary-directory=")
+        }),
+        "tree" => !tokens
+            .iter()
+            .any(|arg| arg == "-o" || arg.starts_with("-o") || arg.starts_with("--output")),
+        "ss" => !tokens
+            .iter()
+            .any(|arg| arg.starts_with("-K") || arg == "--kill" || arg.starts_with("--kill=")),
+        other => READ_ONLY_COMMANDS.contains(&other),
+    }
+}
+
+/// Commands that only read files or process input and write to stdout. All of
+/// them are used with shell redirection disabled by `split_shell_segments`.
+const READ_ONLY_COMMANDS: &[&str] = &[
+    "basename",
+    "b2sum",
+    "cat",
+    "cksum",
+    "cmp",
+    "comm",
+    "column",
+    "cut",
+    "df",
+    "diff",
+    "dirname",
+    "du",
+    "echo",
+    "false",
+    "fd",
+    "fdfind",
+    "find",
+    "free",
+    "grep",
+    "head",
+    "id",
+    "join",
+    "jq",
+    "locate",
+    "ls",
+    "lsof",
+    "md5sum",
+    "netstat",
+    "nl",
+    "od",
+    "paste",
+    "pgrep",
+    "printenv",
+    "printf",
+    "ps",
+    "pwd",
+    "readlink",
+    "realpath",
+    "rg",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "sort",
+    "ss",
+    "stat",
+    "strings",
+    "tac",
+    "tail",
+    "tr",
+    "tree",
+    "true",
+    "type",
+    "uniq",
+    "uname",
+    "uptime",
+    "wc",
+    "whereis",
+    "which",
+    "whoami",
+    "xxd",
+];
 
 /// One-line description shown in the approval card / notification.
 pub fn summarize(tool: &str, args: &Value) -> String {
@@ -2257,6 +2480,61 @@ mod tests {
         assert!(is_known("ask_user"));
         assert!(is_known("grep"));
         assert!(!requires_approval("ask_user"));
+    }
+
+    #[test]
+    fn read_only_commands_bypass_approval_but_writes_do_not() {
+        for command in [
+            "cat Cargo.toml",
+            "rg -n secret src",
+            "grep -R token .",
+            "fd '\\.rs$'",
+            "find . -name '*.rs'",
+            "cat file | head -20",
+            "rg foo src && wc -l src/lib.rs",
+        ] {
+            assert!(is_read_only_command(command), "{command}");
+            assert!(
+                !requires_approval_for("run_command", &json!({"command": command})),
+                "{command}"
+            );
+        }
+
+        for command in [
+            "rm -rf /",
+            "cat file > out.txt",
+            "cat file >> out.txt",
+            "cat $(rm -rf /)",
+            "cat `rm -rf /`",
+            "cat file && rm file",
+            "cat file; rm file",
+            "find . -delete",
+            "find . -exec rm {} +",
+            "find . -fprint out.txt",
+            "rg --pre ./evil foo",
+            "rg --pre=./evil foo",
+            "fd -x rm",
+            "fd -xrm",
+            "ss -Kt",
+            "fd --exec rm",
+            "fd --exec=rm",
+            "fd --exec-batch rm",
+            "fd --exec-batch=rm",
+            "sort -o out.txt input.txt",
+            "tree -o out.txt",
+            "sh -c 'cat file'",
+            // Git subcommands can invoke configured hooks/filters, so even
+            // apparently read-only ones stay behind the approval gate.
+            "git status",
+            "git checkout main",
+            "./cat file",
+        ] {
+            assert!(!is_read_only_command(command), "{command}");
+            assert!(
+                requires_approval_for("run_command", &json!({"command": command})),
+                "{command}"
+            );
+        }
     }
 
     #[test]

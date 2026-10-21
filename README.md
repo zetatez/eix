@@ -175,13 +175,14 @@ extensions = ["py"]
 `eix-core/src/protocol.rs` 是唯一契约来源。
 
 当前限制：`write_file` 在 `ask` 策略下先 stage 到 shadow workspace、不阻塞 turn，读取
-（以及后续写入）看到的是“真实工作区 + staged”合并视图；`run_command` 仍在审批处阻塞
-（shell 无法 stage）。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
+（以及后续写入）看到的是“真实工作区 + staged”合并视图；`run_command` 的写操作仍在审批处
+阻塞（shell 无法 stage），白名单内的只读命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮和
 `a` 跳转提示，外部通知命令（dwm/tmux）已接入（见 `[notifications]`）；输入框使用内置的
 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：顶部左侧显示
 `Build · ○ deepseek-v4-flash`（当前模式 · 状态图标 + 模型，Plan 为黄色），右侧对齐 cwd、git 分支和工作树；
-正文左侧留 1 格内边距，底部只保留 `N` / `I` / `V` / `VL` 模式徽标，不再有独立的底部状态栏。
+正文左侧留 1 格内边距，底边保持普通边框；输入框下方是一行 statusline，左侧显示 `N` / `I` / `V` / `VL`
+模式徽标、session 名和最近状态，右侧显示模型、pane 位置、排队数和 attention。
 
 ## TUI（v1）
 
@@ -194,11 +195,18 @@ Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板�
 （1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+ 个近似网格），每个 pane
 独立显示一个 session 的转录、滚动位置和流式输出；相邻 pane 共用一条边框线。
 底部输入条只作用于当前聚焦 pane。
+
+用 leader 快捷键 `<Space>V` / `<Space>T` / `<Space>R` 可切换 `horizontal`（纵向排列、队首更大）、
+`tabby`（顶部 tab，只显示当前 session）和 `fibonacci`（tab + 螺旋分屏）；`<Space>L` 在四种布局
+（含默认 grid）间循环。所有布局共享同一个**活跃队列**：turn 完成或 session 等待审批/输入时，
+它自动移到队首（pane 1）；给它发送任务后移到队尾，用户始终只需关注 pane 1。
+`Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session。
+
 历史 session 不再占用左侧栏：按 `<Space>s` 打开浮动 picker，输入即模糊搜索，`Enter` 选择、
 `Esc` 关闭。输入框标题行直接显示 Build/Plan、session 状态和模型，cwd 右对齐并以 `~` 缩写，
-模型省略 provider 前缀；底部不再有单独状态栏。
+模型省略 provider 前缀；输入框下方保留一行 statusline 展示模式、session、最近状态和队列信息。
 
-转录区按对话渲染：用户消息是右对齐的两行紧凑气泡（圆角顶边 + 左右边条，前后不额外留空行），agent 输出左侧留白、不加角色前缀。agent 的
+转录区按对话渲染：用户消息和 agent 输出都使用普通文本（左侧 2 空格缩进，不加角色前缀），不再使用气泡；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
 显示为一行状态徽标（状态点、命令/路径摘要、右侧 `ok` / `running` / `needs approval`），
 展开后用四空格左缩进直接显示参数、side-by-side diff 和输出；diff 左侧是改动前、右侧是改动后，
@@ -207,7 +215,7 @@ Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板�
 展开（包括已结束的 turn），工具块在流式中展开、结束后收起为一行摘要。等待发送的 prompt 会以
 `⏳ queued` 行显示在转录末尾。
 
-agent 输出和用户气泡都按 Markdown 渲染：标题、粗体/斜体/删除线、行内代码与围栏代码块、
+agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删除线、行内代码与围栏代码块、
 有序/无序/任务列表、引用、分隔线、表格、链接（在文本后显示目标地址）、图片（显示为
 `🖼 alt (path)` 占位）以及 `$...$` / `$$...$$` 数学公式。行内公式转成紧凑 Unicode；
 块级公式用 2D Unicode 网格排版（分数横线、根号、上下极限、矩阵、可伸缩括号），仍是终端近似，
@@ -235,6 +243,8 @@ agent 输出和用户气泡都按 Markdown 渲染：标题、粗体/斜体/删�
 | `C-w c` | 关闭聚焦 pane（至少保留一个） |
 | `C-w w` | 循环切换 pane |
 | `Shift+,` / `Shift+.` | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式） |
+| `<Space>V` / `<Space>T` / `<Space>R` | horizontal / tabby / fibonacci 布局；`<Space>L` 循环所有布局 |
+| `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session（队首是 1，输入框内也可用） |
 | `Tab` / `S-Tab` | 聚焦 pane 切到下一个 / 上一个 session（转录区） |
 | `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；有待审批时卡片上的 `n` 仍是 deny |
 | `<Space>W` | 新建 session，同时在 `.worktrees/<name>` 建 git worktree |
@@ -290,8 +300,8 @@ agent 输出和用户气泡都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/todos` | 打开任务列表 picker（搜索任务，显示状态和详情；内存态，daemon 重启后清空） |
 | `/image <path>` | 把图片挂到下一条 prompt（png / jpg / gif / webp，最多 4 张、每张 8 MB）；不带参数时显示已挂图片，`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI |
 
-在 prompt 里以 `!` 开头（例如 `!cargo test`）会直接在当前 session 的 cwd 里执行 shell：走同样的沙箱、
-先抓 tree snapshot，只读 session 会拒绝。命令和输出以 tool 卡片的形式留在转录里。
+在 prompt 里以 `!` 开头（例如 `!cargo test`）会直接在当前 session 的 cwd 里执行 shell：走同样的沙箱；
+写命令先抓 tree snapshot，只读 session 只允许白名单内的只读命令。命令和输出以 tool 卡片的形式留在转录里。
 | `/timeline [n]` | 只读浮层：最近 n 条 user / assistant / tool 事件（`j/k` 滚动，`Esc` 关闭） |
 | `/archive` | 归档当前 session（从 picker/列表隐藏，事件保留） |
 | `/delete` | 删除当前 session；需要连续执行两次确认 |
@@ -427,7 +437,7 @@ branches / context 由 daemon 的 `picker.query` 提供，其余（sessions、�
 常驻，只通过这个浮动 picker 打开（`<Space>s`）。
 
 输入框是自研的 Vim 风格编辑器（不再内嵌 Neovim 进程，输入零往返延迟）。外框使用透明背景的
-圆角边框，跟随主题的 `background`（未设置时用终端背景），顶部显示 `Build · ○ deepseek-v4-flash`（idle 为静态圆点，running 为动画 spinner），右侧对齐 cwd、git 分支/工作树和图片数，底部只显示彩色单字母模式徽标；
+圆角边框，跟随主题的 `background`（未设置时用终端背景），顶部显示 `Build · ○ deepseek-v4-flash`（idle 为静态圆点，running 为动画 spinner），右侧对齐 cwd、git 分支/工作树和图片数；底边保持普通边框，输入框下方一行 statusline 显示彩色单字母模式徽标、session 名和最近状态，右侧显示模型、pane 位置、排队数和 attention；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
@@ -448,7 +458,8 @@ picker、`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 
 `<Space>w`/`b` worktree/分支、`<Space>c` ledger、`<Space>h` 历史、
 `<Space>p` 进程、`<Space>r` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
 `<Space>F` fork、`<Space>x` 取消、`<Space>A` attention、`<Space>i` 聚焦输入框、
-`<Space>Q` 退出、`<Space>a` 或 `<Space>:` 命令面板、`<Space>?` 帮助。裸字母
+`<Space>V`/`T`/`R` 布局、`<Space>L` 循环布局、`<Space>Q` 退出、`<Space>a` 或
+`<Space>:` 命令面板、`<Space>?` 帮助。裸字母
 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
 insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
 和 `@`（文件 picker）。所有 picker / 历史搜索都支持 `Ctrl-J`/`Ctrl-K` 或
@@ -466,8 +477,8 @@ insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`
 未勾选任何 hunk 时 `y` 会提示先选择。`e` 把 staged 内容写进临时文件交给
 `$EDITOR`，保存后通过 `patch.revise` 更新 diff 再审批；`o` 打开工作区里的真实文件；
 `r` 输入拒绝理由，随 `approval.respond` 一起发给模型；卡片标题会标出
-`[shell]` / `[workspace-write]` / `[agent]` / `[read]` 风险级别。`run_command` 仍走阻塞式
-审批卡片。session 栏显示 `⚠`；也可以从命令行用
+`[shell]` / `[workspace-write]` / `[agent]` / `[read]` 风险级别。写操作的 `run_command`
+仍走阻塞式审批卡片，白名单内的只读命令不会打断 turn。session 栏显示 `⚠`；也可以从命令行用
 `eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk，
 `eix deny --reason "..."` 会记录理由）。模型调用 `ask_user` 时 pane 底部出现同样的选项
 卡片：`j/k` 或 `C-n/C-p` 选择、`Enter` 确认、`1-6` 直接选，第一个选项标为推荐；
@@ -551,7 +562,7 @@ daemon 目前向模型暴露这些工具：
 | `write_file` | stage 到 shadow workspace，审批后写入 cwd 内文件（自动建父目录） | stage + 审批落盘 |
 | `edit` | 精确字符串替换（默认要求唯一匹配，`replaceAll` 可全部替换），同样走 stage | stage + 审批落盘 |
 | `patch` | 多文件 `*** Begin Patch` / Add / Update / Delete，先全量校验再写入 | 需要审批 |
-| `run_command` | 在 cwd 内用 `sh -c` 执行命令，带超时；默认套 bubblewrap 沙箱 | 需要审批 |
+| `run_command` | 在 cwd 内用 `sh -c` 执行命令，带超时；默认套 bubblewrap 沙箱 | 只读命令自动放行，其余需要审批 |
 | `start_command` | 在沙箱里启动后台进程并立即返回 id，日志落盘 | 需要审批 |
 | `process_output` | 读取后台进程的尾部输出（只读） | 自动放行 |
 | `spawn_agent` | 起一个只读子 agent 并发处理独立问题，可用 `agent` 指定自定义 agent | 自动放行（子 agent 只读） |
@@ -559,7 +570,21 @@ daemon 目前向模型暴露这些工具：
 | `mcp__*` | MCP server 暴露的工具 | 需要审批 |
 
 所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出按
-`max_output_bytes` 截断。`write_file` 会先生成 unified diff 和逐 hunk 预览，TUI 审批卡片、
+`max_output_bytes` 截断。
+
+`run_command` 的只读判定是保守白名单：`grep` / `rg` / `fd` / `find` / `cat` / `head` /
+`tail` / `wc` / `ls` / `stat` / `diff` 等只读命令，以及由它们组成的 `|`、`&&`、`;` 管道，
+不会弹出审批卡片，也不触发执行前快照。重定向、后台运行、命令替换、子 shell、`find -exec` /
+`-delete`、`rg --pre`、`fd -x` 等可能执行任意命令或写文件的形式仍然需要审批；不在白名单里的
+命令（包括 `git`、`sed`、`awk`、构建工具和脚本解释器）也保持审批。
+
+隐私边界：daemon 在把消息发给 provider 之前，会把密码、`sk-…` / Stripe / GitHub / Slack
+等 token、Bearer、URL 凭据、PEM 私钥和 `password=` / `api_key:` 等赋值替换成带随机 salt 的
+占位符。模型返回的工具参数和文本中的占位符会在本地执行/写回前还原，因此模型拿不到原文，而
+`write_file` / `run_command` 仍使用真实值。占位符映射只在当前 provider 进程内保存；本地事件
+日志和 TUI 仍显示原文，方便审阅。图片内容不做文本脱敏，敏感截图不要上传。
+
+`write_file` 会先生成 unified diff 和逐 hunk 预览，TUI 审批卡片、
 `eix chat` 和 `eix log` 都会显示；在 TUI 里用 `d` 全屏审阅可以按 hunk 选择应用，命令行用
 `eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。策略由 `[tools]` 配置或环境变量控制：
 
@@ -903,7 +928,7 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
 - [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）
 - [x] 客户端通知（`bell` + OSC 9/777 + 终端标题，`[notifications] osc`）
-- [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）
+- [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）与 provider 上下行可逆脱敏
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
 - [x] 按 session 权限级别（`read-only` / `workspace-write` / `full`；`session.permission` 支持临时升级并记录事件）
 - [x] 自动批准规则（`[[tools.auto_approve]]`：工具名 + 路径 glob + 命令前缀/正则；只放宽 `ask`）

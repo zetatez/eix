@@ -602,10 +602,13 @@ impl Daemon {
                     return Err(rpc("invalid", "shell command is empty"));
                 }
                 let session = self.require_session(&params.session_id)?;
-                if self.session_permission(&session) == PermissionLevel::ReadOnly {
+                let read_only_command = tools::is_read_only_command(command);
+                if self.session_permission(&session) == PermissionLevel::ReadOnly
+                    && !read_only_command
+                {
                     return Err(rpc(
                         "permission",
-                        "read-only sessions cannot run shell commands",
+                        "read-only sessions cannot run mutating shell commands",
                     ));
                 }
                 let cwd = session.cwd.clone();
@@ -629,7 +632,7 @@ impl Daemon {
                     }),
                 )?;
                 self.emit_event(&event);
-                if self.config.load().tools.snapshots {
+                if self.config.load().tools.snapshots && !read_only_command {
                     let result = self
                         .snapshots
                         .capture_tree(&params.session_id, "run_command", &call_id, &cwd)
@@ -2713,7 +2716,7 @@ impl Daemon {
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
         }
-        let needs_approval = tools::requires_approval(tool) || mcp_known;
+        let needs_approval = tools::requires_approval_for(tool, &args) || mcp_known;
 
         // A loaded skill may restrict the tools available for the rest of the
         // turn. `use_skill` itself is always allowed so another skill can be
@@ -4109,7 +4112,9 @@ impl Daemon {
         plan: Option<&tools::WritePlan>,
     ) -> Result<Option<String>> {
         let is_mcp = tool.starts_with(crate::mcp::PREFIX);
-        if !(tools::requires_approval(tool) || is_mcp) || !self.config.load().tools.snapshots {
+        if !(tools::requires_approval_for(tool, args) || is_mcp)
+            || !self.config.load().tools.snapshots
+        {
             return Ok(None);
         }
         let cwd = self.require_session(session_id)?.cwd;

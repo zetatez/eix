@@ -1822,6 +1822,10 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'n' | 'N' => "new",
         'W' => "new-worktree",
         'F' => "fork",
+        'V' => "layout-horizontal",
+        'T' => "layout-tabby",
+        'R' => "layout-fibonacci",
+        'L' => "layout-cycle",
         'x' => "cancel",
         'q' => "close-pane",
         'Q' => "quit",
@@ -2039,6 +2043,23 @@ mod tests {
         let mut editor = Editor::new();
         key(&mut editor, KeyCode::Char(' '));
         assert_eq!(editor.text(), " ");
+    }
+
+    #[test]
+    fn leader_letters_select_layouts() {
+        let mut editor = editor_with("");
+        for (letter, action) in [
+            ('V', "layout-horizontal"),
+            ('T', "layout-tabby"),
+            ('R', "layout-fibonacci"),
+            ('L', "layout-cycle"),
+        ] {
+            let _ = key(&mut editor, KeyCode::Char(' '));
+            assert_eq!(
+                key(&mut editor, KeyCode::Char(letter)),
+                Outcome::Action(action)
+            );
+        }
     }
 
     #[test]

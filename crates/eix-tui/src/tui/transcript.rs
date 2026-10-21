@@ -128,8 +128,8 @@ pub fn render_history(
     width: usize,
     theme: Theme,
 ) -> Transcript {
-    // Keep a two-cell gutter on the right so right-aligned bubbles, tool
-    // statuses and queued prompts never touch the pane border.
+    // Keep a two-cell gutter on the right so tool statuses and queued prompts
+    // never touch the pane border.
     let width = width.saturating_sub(2).max(1);
     render_blocks(collect(events), folds, width, theme)
 }
@@ -455,21 +455,10 @@ impl Transcript {
         }
         self.push(Line::from(""), None);
     }
-
-    /// Drop separator rows left by the previous block. User bubbles provide
-    /// their own border, so they do not need extra padding above them.
-    fn trim_blank_tail(&mut self) {
-        while self.lines.last().is_some_and(|line| line.width() == 0) {
-            self.lines.pop();
-            self.slots.pop();
-        }
-    }
 }
 
 const TEXT: Color = Color::Rgb(220, 223, 228);
 const MUTED: Color = Color::Rgb(110, 116, 129);
-const PANEL: Color = Color::Rgb(38, 41, 51);
-const PANEL_BORDER: Color = Color::Rgb(74, 88, 120);
 const ACCENT: Color = Color::Rgb(122, 162, 247);
 const SUCCESS: Color = Color::Rgb(126, 199, 149);
 const DANGER: Color = Color::Rgb(231, 130, 132);
@@ -487,10 +476,6 @@ fn accent(theme: Theme) -> Color {
     theme.function.unwrap_or(ACCENT)
 }
 
-fn panel(theme: Theme) -> Color {
-    theme.panel.unwrap_or(PANEL)
-}
-
 fn dim(theme: Theme) -> Style {
     Style::default().fg(comment(theme))
 }
@@ -501,12 +486,9 @@ fn italic_dim(theme: Theme) -> Style {
         .add_modifier(Modifier::ITALIC)
 }
 
-/// A user turn in a right-aligned compact bubble. It keeps the rounded top
-/// edge and side rules, but the filled panel row closes the bubble instead of
-/// spending another row on a bottom border. There are no blank padding rows
-/// around it. Long prompts wrap at four fifths of the pane.
+/// A user turn as ordinary Markdown text, using the same left gutter as agent
+/// output rather than a right-aligned bubble.
 fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usize, theme: Theme) {
-    out.trim_blank_tail();
     for path in images {
         out.push(
             Line::from(Span::styled(
@@ -521,55 +503,10 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
         out.blank();
         return;
     }
-    // Below this width a bubble costs more than it communicates.
-    if width < 14 {
-        for line in markdown::render_body(text, width.saturating_sub(2).max(1), theme) {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(line.spans);
-            out.push(Line::from(spans), None);
-        }
-        out.blank();
-        return;
+    for line in markdown::render(text, width.max(1), theme) {
+        out.push(line, None);
     }
-
-    let max_content = (width.saturating_mul(4) / 5).saturating_sub(4).max(6);
-    let lines = markdown::render_body(text, max_content, theme);
-    let inner = lines
-        .iter()
-        .map(Line::width)
-        .max()
-        .unwrap_or(1)
-        .min(max_content)
-        .max(1);
-    let total = inner + 4;
-    let left = width.saturating_sub(total);
-    let border = Style::default()
-        .fg(theme.function.unwrap_or(PANEL_BORDER))
-        .bg(panel(theme));
-    let body = Style::default().fg(text_color(theme)).bg(panel(theme));
-    let pad = Span::raw(" ".repeat(left));
-
-    out.push(
-        Line::from(vec![
-            pad.clone(),
-            Span::styled(format!("╭{}╮", "─".repeat(inner + 2)), border),
-        ]),
-        None,
-    );
-    for line in lines {
-        let used = line.width();
-        let fill = inner.saturating_sub(used);
-        let mut spans = vec![pad.clone(), Span::styled("│ ", body)];
-        for mut span in line.spans {
-            span.style = span.style.bg(panel(theme));
-            spans.push(span);
-        }
-        if fill > 0 {
-            spans.push(Span::styled(" ".repeat(fill), body));
-        }
-        spans.push(Span::styled(" │", body));
-        out.push(Line::from(spans), None);
-    }
+    out.blank();
 }
 
 /// Agent output: rendered as Markdown, indented only enough to breathe, with

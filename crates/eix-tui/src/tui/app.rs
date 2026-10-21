@@ -126,7 +126,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("sessions", "", "open the session picker"),
         builtin("models", "[id]", "list or pin a model for this session"),
         builtin("agents", "[name]", "choose the session's primary agent"),
-        builtin("mcp", "", "show MCP servers and their tools"),
+        builtin("mcp", "", "browse MCP servers and their tools"),
         builtin("reload", "", "re-read the daemon config files"),
         builtin(
             "timeline",
@@ -142,7 +142,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "[name] [args]",
             "browse skills with a preview, or insert one",
         ),
-        builtin("todos", "", "show the model's task list"),
+        builtin("todos", "", "browse the model's task list"),
         builtin("image", "<path>", "attach an image to the next prompt"),
         builtin("theme", "", "choose a color preset with live preview"),
         builtin(
@@ -859,6 +859,49 @@ enum Direction {
     Down,
 }
 
+/// How open sessions are arranged in the body.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaneLayout {
+    /// The original automatic tiling.
+    Grid,
+    /// One column of panes; the active pane gets most of the height.
+    Horizontal,
+    /// A session tab bar with only the active session below it.
+    Tabby,
+    /// A tab bar plus a spiral tiling that gives the active pane the most space.
+    Fibonacci,
+}
+
+enum FocusAfterMove {
+    Follow,
+    KeepSlot,
+    KeepSession,
+}
+
+impl PaneLayout {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Grid => "grid",
+            Self::Horizontal => "horizontal",
+            Self::Tabby => "tabby",
+            Self::Fibonacci => "fibonacci",
+        }
+    }
+
+    fn shows_tabs(self) -> bool {
+        matches!(self, Self::Tabby | Self::Fibonacci)
+    }
+
+    fn next(self) -> Self {
+        match self {
+            Self::Grid => Self::Horizontal,
+            Self::Horizontal => Self::Tabby,
+            Self::Tabby => Self::Fibonacci,
+            Self::Fibonacci => Self::Grid,
+        }
+    }
+}
+
 pub struct App {
     pub should_quit: bool,
     pub exit_message: Option<String>,
@@ -869,6 +912,8 @@ pub struct App {
     views: Vec<SessionView>,
     /// Index into `views` of the focused pane.
     focused: usize,
+    /// Session pane arrangement. The queue order is always `views` order.
+    layout: PaneLayout,
     pending_attach: Option<PendingAttach>,
     initial_session: Option<String>,
     initialized: bool,
@@ -999,6 +1044,7 @@ impl App {
             selected: 0,
             views: Vec::new(),
             focused: 0,
+            layout: PaneLayout::Grid,
             pending_attach: None,
             initial_session,
             initialized: false,
@@ -2114,11 +2160,12 @@ impl App {
             .iter_mut()
             .find(|view| view.session.id == submitted.session.id)
         {
-            view.session = submitted.session;
+            view.session = submitted.session.clone();
             view.stream = Some(StreamState::new(submitted.turn_id));
             view.folds.remove(&FoldId::Live);
             view.follow = true;
         }
+        self.demote_session(&submitted.session.id);
         self.error = None;
         self.status = "running".into();
     }
@@ -2132,11 +2179,25 @@ impl App {
             "session.updated" => {
                 if let Ok(session) = serde_json::from_value::<Session>(notification.params) {
                     let id = session.id.clone();
+                    let new_status = session.status;
                     let index = self.views.iter().position(|view| view.session.id == id);
+                    let previous = index.map(|index| self.views[index].session.status);
                     if let Some(index) = index {
                         self.views[index].session = session.clone();
                         if index != self.focused && self.pane_needs_attention(index) {
                             self.status = format!("{} needs attention", session.name);
+                        }
+                    }
+                    // The daemon reports idle / awaiting_input / awaiting_approval
+                    // as separate status updates; promote on the transition so a
+                    // finished background session slides into pane 1. Resuming
+                    // from a card (approval / answer) is work again, so demote it.
+                    let ready = !new_status.is_busy() || new_status.needs_attention();
+                    if previous.is_some_and(|status| status != new_status) {
+                        if new_status == SessionStatus::Running {
+                            self.demote_session(&id);
+                        } else if ready {
+                            self.promote_session(&id);
                         }
                     }
                     self.upsert_session(session, false);
@@ -2173,6 +2234,9 @@ impl App {
                         if self.bell || self.osc {
                             self.ring = true;
                         }
+                    }
+                    if params.status.needs_attention() {
+                        self.promote_session(&params.session_id);
                     }
                 }
             }
@@ -2331,6 +2395,9 @@ impl App {
                         self.focus = Focus::Transcript;
                     }
                     self.status = format!("approval needed: {}", params.summary);
+                    // A blocked session is ready for the user: put it at the
+                    // head of the queue so pane 1 shows the card.
+                    self.promote_session(&params.session_id);
                     self.approvals.insert(
                         params.session_id,
                         PendingApproval {
@@ -2369,6 +2436,7 @@ impl App {
                         self.focus = Focus::Transcript;
                     }
                     self.status = format!("question: {}", truncate(&params.question, 60));
+                    self.promote_session(&params.session_id);
                     self.inputs.insert(
                         params.session_id,
                         PendingInput {
@@ -2480,6 +2548,9 @@ impl App {
                         self.status = turn_summary(&done);
                         self.clear_pending_draft(&done.session_id);
                     }
+                    // Completed, cancelled and failed turns all hand control
+                    // back to the user; make this session the queue head.
+                    self.promote_session(&done.session_id);
                 }
             }
             "context.updated" => {
@@ -2761,6 +2832,15 @@ impl App {
         if self.picker.is_some() {
             self.handle_picker_key(key, tx);
             return;
+        }
+
+        // Queue-position shortcuts work from both the prompt and transcript:
+        // Ctrl-1 is the active head, Ctrl-N the Nth open session.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            if let KeyCode::Char(ch @ '1'..='9') = key.code {
+                self.focus_tab(ch as usize - '1' as usize);
+                return;
+            }
         }
 
         if self.focus == Focus::Input {
@@ -3047,7 +3127,7 @@ impl App {
                 && !key.modifiers.contains(KeyModifiers::ALT)
             {
                 self.pending_leader = true;
-                self.status = "leader: s/f/w/b · n new · o pane · C/q close · a commands · i input · Q quit · ? help · Esc cancel"
+                self.status = "leader: s/f/w/b · n new · o pane · V/T/R/L layout · C/q close · a commands · i input · Q quit · ? help · Esc cancel"
                     .into();
                 return;
             }
@@ -4080,6 +4160,13 @@ impl App {
             "close-pane" => self.close_focused_pane(),
             "pane-prev" => self.cycle_pane(-1),
             "pane-next" => self.cycle_pane(1),
+            "layout-horizontal" => self.set_layout(PaneLayout::Horizontal),
+            "layout-tabby" => self.set_layout(PaneLayout::Tabby),
+            "layout-fibonacci" => self.set_layout(PaneLayout::Fibonacci),
+            "layout-cycle" => {
+                let next = self.layout.next();
+                self.set_layout(next);
+            }
             "help" => self.open_help(),
             "quit" => {
                 self.sync_draft(tx);
@@ -4206,6 +4293,7 @@ impl App {
             self.last_saved_draft.clear();
             self.reset_history();
             self.error = None;
+            self.demote_session(&session_id);
             let _ = tx.send(Command::RunShell {
                 session_id: session_id.clone(),
                 command: command.to_string(),
@@ -4265,6 +4353,9 @@ impl App {
     /// Park a prompt until its session goes idle. The prompt box is cleared so
     /// the user can keep typing the next one.
     fn enqueue(&mut self, session_id: String, text: &str, tx: &UnboundedSender<Command>) {
+        // Queued work still counts as work for this session: move it off the
+        // head so another ready session can be handled first.
+        self.demote_session(&session_id);
         let queue = self.queues.entry(session_id.clone()).or_default();
         queue.push_back(text.to_string());
         let pending = queue.len();
@@ -5419,7 +5510,93 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
+    fn set_layout(&mut self, layout: PaneLayout) {
+        self.layout = layout;
+        self.status = format!("layout: {}", layout.label());
+    }
+
+    /// Focus the Nth session by queue position (`Ctrl-1` is the head).
+    fn focus_tab(&mut self, index: usize) {
+        if index >= self.views.len() {
+            self.status = format!("session {} is not open", index + 1);
+            return;
+        }
+        self.focus_pane(index);
+    }
+
+    /// Where focus should land after a queue reorder.
+    fn move_view(&mut self, from: usize, to: usize, focus_after: FocusAfterMove) {
+        if from >= self.views.len() {
+            return;
+        }
+        let to = to.min(self.views.len().saturating_sub(1));
+        if from == to {
+            return;
+        }
+        let focused_id = self
+            .views
+            .get(self.focused)
+            .map(|view| view.session.id.clone());
+        let view = self.views.remove(from);
+        self.views.insert(to, view);
+        self.focused = match focus_after {
+            FocusAfterMove::Follow => to,
+            FocusAfterMove::KeepSlot => self.focused.min(self.views.len() - 1),
+            // A background completion should not swap the session under a
+            // prompt the user is actively editing.
+            FocusAfterMove::KeepSession => focused_id
+                .and_then(|id| self.views.iter().position(|view| view.session.id == id))
+                .unwrap_or_else(|| self.focused.min(self.views.len() - 1)),
+        };
+        self.sync_selected_to_focus();
+    }
+
+    /// A session that finished a turn (or is waiting for the user) becomes the
+    /// queue head, i.e. pane 1 in every layout.
+    fn promote_session(&mut self, session_id: &str) {
+        let Some(index) = self.open_session(session_id) else {
+            return;
+        };
+        let focus_after = if index == self.focused {
+            // The user was watching this session; follow it to the head.
+            FocusAfterMove::Follow
+        } else if self.focused == 0 {
+            // Pane 1 is the watch slot: let the newly ready session slide
+            // underneath the focused position.
+            FocusAfterMove::KeepSlot
+        } else {
+            FocusAfterMove::KeepSession
+        };
+        self.move_view(index, 0, focus_after);
+    }
+
+    /// Sending work moves that session to the queue tail so the user can stay
+    /// on the first slot and pick up whatever becomes ready next.
+    fn demote_session(&mut self, session_id: &str) {
+        let Some(index) = self.open_session(session_id) else {
+            return;
+        };
+        let Some(last) = self.views.len().checked_sub(1) else {
+            return;
+        };
+        let focus_after = if index == self.focused {
+            // Keep the slot, not the session: the next queued session should
+            // be waiting in the same place.
+            FocusAfterMove::KeepSlot
+        } else {
+            FocusAfterMove::KeepSession
+        };
+        self.move_view(index, last, focus_after);
+    }
+
     fn focus_direction(&mut self, direction: Direction) {
+        if self.layout == PaneLayout::Tabby {
+            match direction {
+                Direction::Left | Direction::Up => self.cycle_pane(-1),
+                Direction::Right | Direction::Down => self.cycle_pane(1),
+            }
+            return;
+        }
         if self.views.len() < 2 || self.pane_areas.len() != self.views.len() {
             return;
         }
@@ -5587,12 +5764,19 @@ already exists, update it in place rather than rewriting it from scratch.";
 
         // Grow with the draft up to a small cap so long command lines are
         // readable; beyond that the editor scrolls instead of taking the pane.
+        // The status bar owns the last row when the terminal has room for it.
+        let status_height = u16::from(area.height >= 7);
         let input_height = prompt_input_height(area.height, area.width, &self.input);
-        let chunks =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(input_height)]).split(area);
+        let chunks = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(input_height),
+            Constraint::Length(status_height),
+        ])
+        .split(area);
 
         self.draw_body(frame, chunks[0]);
         self.draw_input(frame, chunks[1]);
+        self.draw_status_bar(frame, chunks[2]);
         if self.command_menu_open() {
             self.draw_command_menu(frame, chunks[1]);
         }
@@ -5784,7 +5968,59 @@ already exists, update it in place rather than rewriting it from scratch.";
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         // Sessions live in the floating picker (`p` / `<Space>s`), not in a
         // permanent sidebar: panes get the whole body.
-        self.draw_panes(frame, area);
+        if !self.views.is_empty() && self.layout.shows_tabs() && area.height > 1 {
+            let chunks = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).split(area);
+            self.draw_tab_bar(frame, chunks[0]);
+            self.draw_panes(frame, chunks[1]);
+        } else {
+            self.draw_panes(frame, area);
+        }
+    }
+
+    fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let theme = self.theme;
+        let focused = self.focused.min(self.views.len().saturating_sub(1));
+        let mut spans = Vec::with_capacity(self.views.len() * 2);
+        for (index, view) in self.views.iter().enumerate() {
+            let active = index == focused;
+            let attention = !active
+                && (view.session.status.needs_attention()
+                    || self.approvals.contains_key(&view.session.id)
+                    || self.inputs.contains_key(&view.session.id));
+            let marker = if attention { "!" } else { "" };
+            // Reserve enough room for the index and marker; the Paragraph
+            // clips the rest when more tabs are open than fit.
+            let name = truncate(&view.session.name, 24);
+            let label = if active {
+                format!("[{} {name}{marker}]", index + 1)
+            } else {
+                format!(" {} {name}{marker} ", index + 1)
+            };
+            let style = if active {
+                Style::default()
+                    .fg(composer_accent(theme))
+                    .add_modifier(Modifier::BOLD)
+            } else if attention {
+                Style::default().fg(composer_warn(theme))
+            } else {
+                Style::default().fg(composer_muted(theme))
+            };
+            spans.push(Span::styled(label, style));
+            if index + 1 < self.views.len() {
+                spans.push(Span::styled(
+                    "│",
+                    Style::default().fg(composer_border(theme)),
+                ));
+            }
+        }
+        frame.render_widget(
+            Paragraph::new(Line::from(spans))
+                .style(Style::default().bg(composer_background(theme))),
+            area,
+        );
     }
 
     fn draw_panes(&mut self, frame: &mut Frame, area: Rect) {
@@ -5794,7 +6030,16 @@ already exists, update it in place rather than rewriting it from scratch.";
             return;
         }
         self.focused = self.focused.min(self.views.len() - 1);
-        let rects = pane_rects(area, self.views.len());
+        if self.layout == PaneLayout::Tabby {
+            // Only the active tab is visible; leave zero-sized hit boxes for
+            // the hidden panes so clicks cannot reach them.
+            let mut areas = vec![Rect::new(0, 0, 0, 0); self.views.len()];
+            areas[self.focused] = area;
+            self.pane_areas = areas;
+            self.draw_pane(frame, area, self.focused);
+            return;
+        }
+        let rects = layout_pane_rects(self.layout, area, self.views.len());
         self.pane_areas = rects.clone();
         for (index, rect) in rects.into_iter().enumerate() {
             if index >= self.views.len() {
@@ -5825,7 +6070,11 @@ already exists, update it in place rather than rewriting it from scratch.";
                 || self.approvals.contains_key(&session_id)
                 || self.inputs.contains_key(&session_id));
         let theme = self.theme;
-        let borders = pane_borders(&self.pane_areas, index);
+        let borders = if self.layout == PaneLayout::Tabby {
+            Borders::ALL
+        } else {
+            pane_borders(&self.pane_areas, index)
+        };
         let border_cols = u16::from(borders.contains(Borders::LEFT))
             + u16::from(borders.contains(Borders::RIGHT));
         let border_rows = u16::from(borders.contains(Borders::TOP))
@@ -6031,7 +6280,6 @@ already exists, update it in place rather than rewriting it from scratch.";
 
     fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
         let focused = self.focus == Focus::Input;
-        let mode = self.input.mode();
         let panel = composer_background(self.theme);
         let text = composer_text(self.theme);
         let border_color = if focused {
@@ -6040,9 +6288,10 @@ already exists, update it in place rather than rewriting it from scratch.";
             Color::Rgb(46, 50, 60)
         };
 
-        // The top border is the session banner; the bottom border carries only
-        // the mode chip. Deny reasons temporarily replace the banner; errors
-        // live in a floating dialog so the prompt chrome stays stable.
+        // The top border is the session banner. Deny reasons temporarily
+        // replace it; errors live in a floating dialog so the prompt chrome
+        // stays stable. The bottom border is plain: the mode chip now lives in
+        // the status bar below.
         let title_width = area.width.saturating_sub(2) as usize;
         let (top_left, top_right) = if let Some(prompt) = &self.reason_prompt {
             let line = Line::from(vec![
@@ -6070,10 +6319,6 @@ already exists, update it in place rather than rewriting it from scratch.";
                 title_width,
             )
         };
-        let bottom_left = Line::from(Span::styled(
-            format!(" {} ", mode.short_label()),
-            composer_mode_style(mode, focused, self.theme),
-        ));
 
         let mut block = Block::default()
             .borders(Borders::ALL)
@@ -6082,8 +6327,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             .style(Style::default().bg(panel))
             .title_style(Style::default().bg(panel))
             .padding(Padding::new(1, 1, 0, 0))
-            .title_top(top_left)
-            .title_bottom(bottom_left);
+            .title_top(top_left);
         if let Some(title) = top_right {
             block = block.title_top(title.right_aligned());
         }
@@ -6114,6 +6358,117 @@ already exists, update it in place rather than rewriting it from scratch.";
                 .min(inner_height.saturating_sub(1));
             let y = area.y + 1 + row as u16;
             frame.set_cursor_position((x, y));
+        }
+    }
+
+    /// Vim-style statusline: mode on the left, then the focused session and
+    /// the latest app status; the right side carries model and queue counters.
+    fn status_bar_left(&self) -> Line<'static> {
+        let theme = self.theme;
+        let panel = composer_background(theme);
+        let muted = composer_muted(theme);
+        let text = composer_text(theme);
+        let active = self.focus == Focus::Input;
+        let mode = if active {
+            self.input.mode()
+        } else {
+            Mode::Normal
+        };
+        let mut spans = vec![
+            Span::styled(
+                format!(" {} ", mode.short_label()),
+                composer_mode_style(mode, active, theme),
+            ),
+            Span::styled(" ", Style::default().bg(panel)),
+        ];
+        if let Some(view) = self.focused_view() {
+            spans.push(Span::styled(
+                view.session.name.clone(),
+                Style::default()
+                    .fg(text)
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+            let status = if self.status.is_empty() {
+                view.session.status.as_str()
+            } else {
+                self.status.as_str()
+            };
+            spans.push(Span::styled(
+                status.to_string(),
+                Style::default().fg(muted).bg(panel),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "no session",
+                Style::default().fg(muted).bg(panel),
+            ));
+        }
+        Line::from(spans)
+    }
+
+    fn status_bar_right(&self) -> Line<'static> {
+        let theme = self.theme;
+        let panel = composer_background(theme);
+        let muted = composer_muted(theme);
+        let accent = composer_accent(theme);
+        let warn = composer_warn(theme);
+        let mut spans = Vec::new();
+        let push = |spans: &mut Vec<Span<'static>>, text: String, color: Color| {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+            }
+            spans.push(Span::styled(text, Style::default().fg(color).bg(panel)));
+        };
+        if self.focused_view().is_some() {
+            let model = short_model(self.model());
+            if model != "-" {
+                push(&mut spans, model.to_string(), accent);
+            }
+        }
+        if self.views.len() > 1 {
+            push(
+                &mut spans,
+                format!("{}/{}", self.focused + 1, self.views.len()),
+                muted,
+            );
+        }
+        if let Some(view) = self.focused_view() {
+            let queued = self.queue_len(&view.session.id);
+            if queued > 0 {
+                push(&mut spans, format!("⏳{queued}"), warn);
+            }
+        }
+        let attention = self.attention_count();
+        if attention > 0 {
+            push(&mut spans, format!("⚠{attention}"), warn);
+        }
+        if !spans.is_empty() {
+            spans.insert(0, Span::styled(" ", Style::default().bg(panel)));
+        }
+        Line::from(spans)
+    }
+
+    fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let panel = composer_background(self.theme);
+        let background = Style::default().bg(panel);
+        let left = self.status_bar_left();
+        let right = self.status_bar_right();
+        let right_width = (right.width() as u16).min(area.width);
+        let chunks =
+            Layout::horizontal([Constraint::Min(0), Constraint::Length(right_width)]).split(area);
+        frame.render_widget(Paragraph::new(left).style(background), chunks[0]);
+        if right_width > 0 {
+            frame.render_widget(
+                Paragraph::new(right)
+                    .alignment(Alignment::Right)
+                    .style(background),
+                chunks[1],
+            );
         }
     }
 
@@ -7769,6 +8124,22 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt normal & transcript: previous / next pane",
             },
             HelpEntry {
+                key: "Space V / Space T / Space R",
+                description: "horizontal / tabby / fibonacci layout",
+            },
+            HelpEntry {
+                key: "Space L",
+                description: "cycle grid / horizontal / tabby / fibonacci layout",
+            },
+            HelpEntry {
+                key: "Ctrl-1 … Ctrl-9",
+                description: "focus the Nth open session (the active queue head is 1)",
+            },
+            HelpEntry {
+                key: "active queue",
+                description: "finished or waiting sessions move to pane 1; sending work moves them to the tail",
+            },
+            HelpEntry {
                 key: "Space N/W/F",
                 description: "prompt & transcript: new session / new worktree / fork",
             },
@@ -8309,6 +8680,87 @@ fn pane_borders(areas: &[Rect], index: usize) -> Borders {
         }
     }
     borders
+}
+
+fn layout_pane_rects(layout: PaneLayout, area: Rect, count: usize) -> Vec<Rect> {
+    match layout {
+        PaneLayout::Grid => pane_rects(area, count),
+        PaneLayout::Horizontal => horizontal_pane_rects(area, count),
+        PaneLayout::Fibonacci => fibonacci_pane_rects(area, count),
+        PaneLayout::Tabby => vec![area],
+    }
+}
+
+/// One column, with the head of the queue taking over half the height.
+fn horizontal_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
+    match count {
+        0 => Vec::new(),
+        1 => vec![area],
+        _ => {
+            let rest = count - 1;
+            // Keep the smaller panes usable (border plus one content row) and
+            // give whatever remains to the queue head, capped at 55% so it
+            // still reads as the same layout on tall terminals.
+            let min_rest = 4usize;
+            let needed = rest.saturating_mul(min_rest).saturating_add(4);
+            let first = if area.height as usize >= needed {
+                (area.height as usize * 55 / 100)
+                    .max(4)
+                    .min(area.height as usize - rest * min_rest)
+            } else {
+                (area.height as usize / count).max(1)
+            };
+            let mut constraints = Vec::with_capacity(count);
+            constraints.push(Constraint::Length(first as u16));
+            constraints.extend((0..rest).map(|_| Constraint::Fill(1)));
+            Layout::vertical(constraints).split(area).to_vec()
+        }
+    }
+}
+
+/// Spiral tiling: each pane takes a slice of the remaining rectangle. Cuts
+/// cycle left, top, right, bottom, so the queue head gets the largest,
+/// full-height pane and the rest spiral inward.
+fn fibonacci_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
+    if count == 0 {
+        return Vec::new();
+    }
+    let mut rects = Vec::with_capacity(count);
+    let mut remaining = area;
+    for index in 0..count {
+        if index + 1 == count {
+            rects.push(remaining);
+            break;
+        }
+        let (vertical, take_second) = match index % 4 {
+            0 => (true, false),
+            1 => (false, false),
+            2 => (true, true),
+            _ => (false, true),
+        };
+        let first = if index == 0 { 55 } else { 50 };
+        let parts = if vertical {
+            Layout::horizontal([
+                Constraint::Percentage(first),
+                Constraint::Percentage(100 - first),
+            ])
+            .split(remaining)
+        } else {
+            Layout::vertical([
+                Constraint::Percentage(first),
+                Constraint::Percentage(100 - first),
+            ])
+            .split(remaining)
+        };
+        if take_second {
+            rects.push(parts[1]);
+            remaining = parts[0];
+        } else {
+            rects.push(parts[0]);
+            remaining = parts[1];
+        }
+    }
+    rects
 }
 
 fn pane_rects(area: Rect, count: usize) -> Vec<Rect> {
@@ -9374,6 +9826,186 @@ mod tests {
     }
 
     #[test]
+    fn horizontal_layout_gives_the_head_most_height() {
+        let area = Rect::new(0, 0, 100, 40);
+        let rects = layout_pane_rects(PaneLayout::Horizontal, area, 5);
+        assert_eq!(rects.len(), 5);
+        assert!(rects[0].height > rects[1].height);
+        for rect in &rects {
+            assert_eq!(rect.x, area.x);
+            assert_eq!(rect.width, area.width);
+            assert!(rect.y + rect.height <= area.y + area.height);
+        }
+        for pair in rects.windows(2) {
+            assert_eq!(pair[0].y + pair[0].height, pair[1].y);
+        }
+    }
+
+    #[test]
+    fn fibonacci_layout_spirals_from_the_head() {
+        let area = Rect::new(0, 0, 100, 40);
+        for count in 1..=7 {
+            let rects = layout_pane_rects(PaneLayout::Fibonacci, area, count);
+            assert_eq!(rects.len(), count);
+            for rect in &rects {
+                assert!(rect.x >= area.x);
+                assert!(rect.y >= area.y);
+                assert!(rect.x + rect.width <= area.x + area.width);
+                assert!(rect.y + rect.height <= area.y + area.height);
+            }
+            if count > 1 {
+                assert_eq!(rects[0].height, area.height);
+                assert!(rects[0].width > rects[1].width);
+                assert_eq!(rects[1].x, rects[0].x + rects[0].width);
+                assert_eq!(rects[1].y, area.y);
+            }
+            if count >= 4 {
+                // The spiral turns around the right edge after the top pane.
+                assert!(rects[2].x > rects[3].x);
+            }
+        }
+    }
+
+    fn app_with_panes(ids: &[&str]) -> App {
+        let mut app = App::new(None);
+        for id in ids {
+            app.views.push(SessionView::new(
+                Session::new(*id, format!("session {id}"), "/tmp"),
+                Vec::new(),
+            ));
+        }
+        app.connected = true;
+        app
+    }
+
+    fn view_order(app: &App) -> Vec<&str> {
+        app.views
+            .iter()
+            .map(|view| view.session.id.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn active_queue_promotes_ready_and_demotes_sent_sessions() {
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.focused = 0;
+
+        app.promote_session("c");
+        assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+        assert_eq!(app.focused, 0);
+
+        // Sending from the head moves that session to the tail and leaves the
+        // user in the first slot, now showing the next session.
+        app.demote_session("c");
+        assert_eq!(view_order(&app), vec!["a", "b", "c"]);
+        assert_eq!(app.focused, 0);
+        assert_eq!(app.views[app.focused].session.id, "a");
+    }
+
+    #[test]
+    fn session_status_transitions_follow_the_active_queue() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.focused = 0;
+        app.views[0].session.status = SessionStatus::Idle;
+
+        let mut running = app.views[0].session.clone();
+        running.status = SessionStatus::Running;
+        app.notification(
+            eix_core::Notification::new("session.updated", serde_json::to_value(running).unwrap()),
+            &tx,
+        );
+        assert_eq!(view_order(&app), vec!["b", "c", "a"]);
+        assert_eq!(app.focused, 0);
+
+        let mut idle = app.views[2].session.clone();
+        idle.status = SessionStatus::Idle;
+        app.notification(
+            eix_core::Notification::new("session.updated", serde_json::to_value(idle).unwrap()),
+            &tx,
+        );
+        assert_eq!(view_order(&app), vec!["a", "b", "c"]);
+        assert_eq!(app.focused, 0);
+    }
+
+    #[test]
+    fn background_promotion_does_not_steal_focus_from_a_working_pane() {
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.focused = 1;
+        app.promote_session("c");
+        assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+        assert_eq!(app.views[app.focused].session.id, "b");
+
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.focused = 2;
+        app.promote_session("c");
+        assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+        assert_eq!(app.focused, 0);
+        assert_eq!(app.views[app.focused].session.id, "c");
+    }
+
+    #[test]
+    fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.focus = Focus::Transcript;
+        app.focused = 0;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('2'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.focused, 1);
+
+        for (leader, expected) in [
+            ('V', PaneLayout::Horizontal),
+            ('T', PaneLayout::Tabby),
+            ('R', PaneLayout::Fibonacci),
+            ('L', PaneLayout::Grid),
+        ] {
+            app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(leader), KeyModifiers::NONE),
+                &tx,
+            );
+            assert_eq!(app.layout, expected, "leader {leader}");
+        }
+    }
+
+    #[test]
+    fn every_layout_renders_a_three_pane_session_set() {
+        for layout in [
+            PaneLayout::Grid,
+            PaneLayout::Horizontal,
+            PaneLayout::Tabby,
+            PaneLayout::Fibonacci,
+        ] {
+            let mut app = app_with_panes(&["a", "b", "c"]);
+            app.layout = layout;
+            app.focused = 0;
+            let rendered = render_text(&mut app, 80, 30);
+            assert!(
+                rendered.contains("session a"),
+                "{layout:?} lost the queue head:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_layout_renders_all_tabs_but_only_the_active_pane() {
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.layout = PaneLayout::Tabby;
+        app.focused = 1;
+
+        let rendered = render_text(&mut app, 80, 20);
+        assert!(rendered.contains("session a"), "{rendered}");
+        assert!(rendered.contains("session b"), "{rendered}");
+        assert!(rendered.contains("session c"), "{rendered}");
+        // The active tab is bracketed; inactive tabs are not separate panes.
+        assert!(rendered.contains("[2 session b]"), "{rendered}");
+    }
+
+    #[test]
     fn direction_prefers_aligned_neighbor() {
         let rects = pane_rects(Rect::new(0, 0, 100, 40), 4);
         assert_eq!(pick_direction(&rects, 0, Direction::Right), Some(1));
@@ -9575,7 +10207,7 @@ mod tests {
         ];
         let view = SessionView::new(session, events);
         let rendered = render_transcript(&view, 40);
-        // No role prefixes; the user turn is right-aligned.
+        // No role prefixes; user and agent turns share the left gutter.
         assert!(!rendered.contains("you>"));
         assert!(!rendered.contains("eix>"));
         let lines: Vec<&str> = rendered.lines().collect();
@@ -9593,7 +10225,7 @@ mod tests {
     }
 
     #[test]
-    fn user_messages_use_a_two_row_bubble_without_margins() {
+    fn user_messages_render_as_plain_text() {
         let session = Session::new("s1", "chat", "/tmp");
         let events = vec![SessionEvent::new(
             "s1",
@@ -9604,14 +10236,9 @@ mod tests {
         let view = SessionView::new(session, events);
         let rendered = render_transcript(&view, 40);
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(
-            lines.len(),
-            2,
-            "bubble should be one cap plus content: {rendered}"
-        );
-        assert!(lines[0].contains('╭'), "{rendered}");
-        assert!(lines[1].contains("│ hi there │"), "{rendered}");
-        assert!(!rendered.contains('╰'), "{rendered}");
+        assert_eq!(lines, vec!["  hi there"], "{rendered}");
+        assert!(!rendered.contains('╭'), "{rendered}");
+        assert!(!rendered.contains('│'), "{rendered}");
     }
 
     #[test]
@@ -10084,13 +10711,21 @@ mod tests {
             )),
             &tx,
         );
-        assert_eq!(app.views[1].session.status, SessionStatus::AwaitingApproval);
-        assert!(app.pane_needs_attention(1));
+        // The active queue promotes a waiting session to pane 1, underneath
+        // the focused slot.
+        assert_eq!(app.views[0].session.id, "s2");
+        assert_eq!(app.views[0].session.status, SessionStatus::AwaitingApproval);
+        assert_eq!(app.focused, 0);
+        assert!(!app.pane_needs_attention(0));
+
+        // Looking at another pane marks the queue head as background attention.
+        app.focus_pane(1);
+        assert!(app.pane_needs_attention(0));
         assert_eq!(app.attention_count(), 1);
 
         app.focus_next_attention();
-        assert_eq!(app.focused, 1);
-        assert!(!app.pane_needs_attention(1));
+        assert_eq!(app.focused, 0);
+        assert!(!app.pane_needs_attention(0));
         assert_eq!(app.attention_count(), 0);
     }
 
@@ -10120,12 +10755,12 @@ mod tests {
         assert!(!app.take_ring());
 
         app.bell = true;
-        // The focused pane is already visible.
-        app.handle_event(attention("s1"), &tx);
+        // The queue head is the focused pane and already visible.
+        app.handle_event(attention("s2"), &tx);
         assert!(!app.take_ring());
 
-        // A background pane rings exactly once.
-        app.handle_event(attention("s2"), &tx);
+        // The other session is background work and rings exactly once.
+        app.handle_event(attention("s1"), &tx);
         assert!(app.take_ring());
         assert!(!app.take_ring());
     }
@@ -12178,7 +12813,7 @@ mod tests {
 
         let empty = render_text(&mut app, 80, 20);
         assert!(empty.contains("Build · ⠋ gpt-5"), "{empty}");
-        assert!(!empty.contains("eixd"), "no footer statusline: {empty}");
+        assert!(!empty.contains("eixd"), "no footer brand: {empty}");
         assert!(!empty.contains("/cmds"), "no footer hints: {empty}");
         assert!(empty.contains("1● prompt polish"), "{empty}");
         assert!(
@@ -12202,6 +12837,31 @@ mod tests {
         assert!(menu.contains("/ commands"), "{menu}");
         assert!(menu.contains("❯ /clear"), "{menu}");
         assert!(!menu.contains("Tab complete"), "{menu}");
+    }
+
+    #[test]
+    fn status_bar_shows_mode_session_and_latest_status() {
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "status test", "/tmp");
+        session.model = Some("openai/gpt-5".into());
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.connected = true;
+        app.status = "retrying 2/5".into();
+
+        let text = render_text(&mut app, 80, 20);
+        let bar = text.lines().nth(19).expect("status bar row");
+        assert!(bar.contains(" I "), "{bar}");
+        assert!(bar.contains("status test"), "{bar}");
+        assert!(bar.contains("retrying 2/5"), "{bar}");
+        assert!(bar.contains("gpt-5"), "{bar}");
+
+        // The statusline follows the active context, not the editor buffer.
+        app.focus = Focus::Transcript;
+        let text = render_text(&mut app, 80, 20);
+        let bar = text.lines().nth(19).expect("status bar row");
+        assert!(bar.contains(" N "), "{bar}");
     }
 
     #[test]

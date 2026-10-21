@@ -6,6 +6,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
+use eix_core::redact::SecretRedactor;
 use eix_core::{ChatMessage, Config, FunctionCall, ModelRoute, ToolCall, ToolDefinition, Usage};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -111,6 +112,10 @@ pub enum StreamDelta<'a> {
 pub struct Provider {
     client: reqwest::Client,
     model: String,
+    /// Random per-provider salt for reversible secret placeholders. It never
+    /// leaves this process; without it the hashed ids cannot be dictionary
+    /// attacked for low-entropy passwords.
+    redaction_salt: String,
 }
 
 impl Provider {
@@ -124,6 +129,7 @@ impl Provider {
         Ok(Self {
             client,
             model: config.provider.model.clone(),
+            redaction_salt: uuid::Uuid::new_v4().to_string(),
         })
     }
 
@@ -131,10 +137,38 @@ impl Provider {
         &self.model
     }
 
-    /// Stream a completion, invoking `on_delta` for each non-empty content or
-    /// reasoning fragment. Returns the assembled message. Checks `cancel`
-    /// between chunks.
+    /// Stream a completion with reversible secret redaction at the provider
+    /// boundary. Outbound messages are scrubbed before serialization, and any
+    /// placeholders the model echoes back are restored before the caller sees
+    /// the completion. This covers normal turns, `/btw`, and automatic context
+    /// summaries because they all go through this method.
     pub async fn stream_chat<F>(
+        &self,
+        messages: &[ChatMessage],
+        route: &ModelRoute,
+        tools: &[ToolDefinition],
+        cancel: &AtomicBool,
+        mut on_delta: F,
+    ) -> Result<Completion, ProviderError>
+    where
+        F: FnMut(StreamDelta<'_>) + Send,
+    {
+        let mut redactor = SecretRedactor::new(self.redaction_salt.clone());
+        let sanitized = redactor.redact_messages(messages);
+        let mut result = self
+            .stream_chat_inner(&sanitized, route, tools, cancel, &mut on_delta)
+            .await;
+        if let Ok(completion) = &mut result {
+            completion.text = redactor.restore(&completion.text);
+            completion.reasoning = redactor.restore(&completion.reasoning);
+            for call in &mut completion.tool_calls {
+                call.function.arguments = redactor.restore_json(&call.function.arguments);
+            }
+        }
+        result
+    }
+
+    async fn stream_chat_inner<F>(
         &self,
         messages: &[ChatMessage],
         route: &ModelRoute,
@@ -226,6 +260,14 @@ impl Provider {
         if !acc.saw_event {
             return Err(ProviderError::Decode(
                 "stream ended without any events".to_string(),
+            ));
+        }
+        // Reaching this point means no `[DONE]` was seen. A clean EOF without
+        // a finish reason usually means the connection dropped mid-answer;
+        // treat it as retryable instead of persisting a truncated response.
+        if acc.finish_reason.is_none() {
+            return Err(ProviderError::Decode(
+                "stream ended before a finish_reason or [DONE]".to_string(),
             ));
         }
         Ok(acc.finish())
