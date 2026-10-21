@@ -2987,7 +2987,8 @@ impl App {
         }
         // In normal mode the prompt behaves like a focused pane for the TUI
         // actions the editor does not own. A half-typed vim prefix keeps the
-        // key for the editor instead.
+        // key for the editor instead. This runs before the clipboard paste
+        // path so leader+`p` still opens processes instead of pasting.
         if self.input.mode() == Mode::Normal
             && self.input.normal_idle()
             && self.handle_shared_normal_key(key, tx)
@@ -12268,24 +12269,25 @@ mod tests {
             app
         }
 
-        fn snapshot(
-            app: &App,
-        ) -> (
-            bool,
-            bool,
-            Option<PickerKind>,
-            usize,
-            usize,
-            Option<(usize, bool)>,
-        ) {
-            (
-                app.help,
-                app.search_view.is_some(),
-                app.picker.as_ref().map(|picker| picker.kind),
-                app.views.len(),
-                app.focused,
-                app.focused_view().map(|view| (view.scroll, view.follow)),
-            )
+        #[derive(Debug, PartialEq, Eq)]
+        struct Snapshot {
+            help: bool,
+            search: bool,
+            picker: Option<u8>,
+            panes: usize,
+            focused: usize,
+            scroll: Option<(usize, bool)>,
+        }
+
+        fn snapshot(app: &App) -> Snapshot {
+            Snapshot {
+                help: app.help,
+                search: app.search_view.is_some(),
+                picker: app.picker.as_ref().map(|picker| picker.kind as u8),
+                panes: app.views.len(),
+                focused: app.focused,
+                scroll: app.focused_view().map(|view| (view.scroll, view.follow)),
+            }
         }
 
         let scenarios = vec![

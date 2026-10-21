@@ -930,7 +930,7 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] 全文搜索（FTS5 trigram + 短查询子串回退、TUI `#`、`eix search`）
 - [x] 按连接过滤广播（`session.subscribe`，`null` = 全部；`eix nvim` 只订阅当前 session）
 - [x] 审批增强（`e` 编辑 staged 内容、`o` 打开真实文件、`r` 带理由拒绝、`<Space>R` 跨 session 审批 inbox、风险标签）
-- [x] 审批卡片改为选项列表（`j/k` / `C-n/C-p` 选择、`Enter` 执行、`1-9` 直选、首项推荐；`y/n` 快捷方式保留）
+- [x] 审批/提问卡片改为 Markdown checkbox 列表（`Ctrl-J/K` / `j/k` 选择、`Enter` 执行、`1-9` 直选、首项推荐；prompt 聚焦和 `tabby` 布局下按键优先给卡片）
 - [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
 - [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）
 - [x] 客户端通知（后台 attention 在底部状态栏居中提示，可选 `bell`，不弹桌面通知）
