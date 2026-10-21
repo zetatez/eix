@@ -198,9 +198,11 @@ Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板�
 
 用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、
 `tabby`（顶部 tab，只显示当前 session）和 `fibonacci`（tab + 螺旋分屏）；`<Space>l` 在四种布局
-（含默认 grid）间循环。所有布局共享同一个**活跃队列**：turn 完成或 session 等待审批/输入时，
-它自动移到队首（pane 1）；给它发送任务后移到队尾，用户始终只需关注 pane 1。
-`Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session。
+（含默认 grid）间循环。所有布局共享同一个**活跃队列**：pane 1 是当前工作槽位；turn 完成或
+session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；
+给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。
+`Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session；在 `tabby` 布局下就是切换到第 N 个 tab
+（输入框内也可用）。
 
 历史 session 不再占用左侧栏：按 `<Space>s` 打开浮动 picker，输入即模糊搜索，`Enter` 选择、
 `Esc` 关闭。输入框标题行直接显示 Build/Plan、session 状态和模型，cwd 右对齐并以 `~` 缩写，
@@ -227,8 +229,8 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `i` / `Enter` / `<Space>i` | 聚焦输入框（进入 insert 模式） |
 | `Esc` / `Esc Esc` | 单次 `Esc` 回到 normal 模式并**保持输入框焦点**（不计数）；normal 模式下 500ms 内连按两次：有 turn 在跑时中断它，否则回到转录区 |
 | `Enter` | 发送到聚焦 pane（仅 insert 模式）；turn 还在跑时自动排队，结束后按顺序发出 |
-| `/exit` / `/quit` | 保存草稿并关闭聚焦 pane 的 session；如果它是最后一个 pane，直接退出 TUI |
-| `/close` | 保存草稿并关闭聚焦 pane；至少保留一个 pane（最后一个 pane 用 `/quit` 退出） |
+| `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
+| `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
 | `Tab`（normal） | 在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
 | `<Space>s` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
@@ -244,7 +246,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `C-w w` | 循环切换 pane |
 | `Shift+,` / `Shift+.` | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式） |
 | `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
-| `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session（队首是 1，输入框内也可用） |
+| `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用） |
 | `Tab` / `S-Tab` | 聚焦 pane 切到下一个 / 上一个 session（转录区） |
 | `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；有待审批时卡片上的 `n` 仍是 deny |
 | `<Space>W` | 新建 session，同时在 `.worktrees/<name>` 建 git worktree |
@@ -308,8 +310,8 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/undo` / `/redo` | 隐藏/恢复最近一个 user turn（事件仍在日志里，可通过 redo 恢复） |
 | `/fork [name]` | fork 当前 session（在 git 仓库里自动建 worktree） |
 | `/permission <level>` | 设置工具权限：`read-only` / `workspace-write` / `full` |
-| `/exit` / `/quit` | 保存并关闭聚焦 pane；最后一个 pane 时退出 TUI |
-| `/close` | 保存并关闭聚焦 pane；保留最后一个 pane，改用 `/quit` 退出 |
+| `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
+| `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
 ### Skills
 

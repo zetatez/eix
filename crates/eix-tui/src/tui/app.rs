@@ -152,9 +152,13 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("fork", "[name]", "fork this session into a new pane"),
         builtin("commands", "", "reload user-defined Markdown commands"),
-        builtin("exit", "", "save and close this session"),
-        builtin("quit", "", "save and close this session"),
-        builtin("close", "", "save and close this session"),
+        builtin("exit", "", "save the draft and quit eix"),
+        builtin("quit", "", "save the draft and quit eix"),
+        builtin(
+            "close",
+            "",
+            "save the draft and close this session (quits on the last pane)",
+        ),
     ]
 }
 
@@ -1198,6 +1202,16 @@ impl App {
         self.help_selected = (selected + delta).clamp(0, count as isize - 1) as usize;
     }
 
+    /// Replace the prompt text without pulling a user who is in normal mode
+    /// back into insert mode.
+    fn replace_prompt_text(&mut self, text: &str) {
+        let mode = self.input.mode();
+        self.input.set_text(text);
+        if mode == Mode::Normal {
+            self.input.enter_normal();
+        }
+    }
+
     /// Put the last submitted draft back after a failed turn, if it belongs to
     /// `session_id` and the prompt is still empty (the user may already be
     /// typing the next message).
@@ -1215,7 +1229,7 @@ impl App {
         }
         if let Some((_, draft)) = self.pending_draft.take() {
             if self.input.is_empty() {
-                self.input.set_text(&draft);
+                self.replace_prompt_text(&draft);
             }
         }
     }
@@ -1317,7 +1331,13 @@ impl App {
                     });
                 }
             }
+            // Switching panes is not an edit: keep the prompt in normal mode
+            // instead of letting `clear()` reset it to insert.
+            let normal = self.input.mode() == Mode::Normal;
             self.input.clear();
+            if normal {
+                self.input.enter_normal();
+            }
             self.last_saved_draft.clear();
             self.input_session = focused;
             if let Some(session_id) = self.input_session.clone() {
@@ -1843,9 +1863,11 @@ impl App {
                 }
                 // The prompt was cleared on switch; load the daemon draft, but
                 // never clobber text typed while the request was in flight.
+                // Keep normal mode: a late draft load must not turn the
+                // prompt back into insert mode under the user.
                 if self.input.is_empty() {
                     if !text.is_empty() {
-                        self.input.set_text(&text);
+                        self.replace_prompt_text(&text);
                     }
                     self.last_saved_draft = self.input.text();
                 }
@@ -2028,8 +2050,8 @@ impl App {
                             } else {
                                 // The prompt was cleared when the request was
                                 // sent; put the draft back so it can be edited
-                                // or retried.
-                                self.input.set_text(&draft);
+                                // or retried without changing the mode.
+                                self.replace_prompt_text(&draft);
                             }
                         }
                     }
@@ -2190,7 +2212,7 @@ impl App {
                     }
                     // The daemon reports idle / awaiting_input / awaiting_approval
                     // as separate status updates; promote on the transition so a
-                    // finished background session slides into pane 1. Resuming
+                    // finished background session slides into pane 2. Resuming
                     // from a card (approval / answer) is work again, so demote it.
                     let ready = !new_status.is_busy() || new_status.needs_attention();
                     if previous.is_some_and(|status| status != new_status) {
@@ -2395,8 +2417,9 @@ impl App {
                         self.focus = Focus::Transcript;
                     }
                     self.status = format!("approval needed: {}", params.summary);
-                    // A blocked session is ready for the user: put it at the
-                    // head of the queue so pane 1 shows the card.
+                    // A blocked session is ready for the user: put it in the
+                    // ready slot so pane 2 shows the card without replacing
+                    // the user's working pane.
                     self.promote_session(&params.session_id);
                     self.approvals.insert(
                         params.session_id,
@@ -2549,7 +2572,7 @@ impl App {
                         self.clear_pending_draft(&done.session_id);
                     }
                     // Completed, cancelled and failed turns all hand control
-                    // back to the user; make this session the queue head.
+                    // back to the user; move this session to the ready slot.
                     self.promote_session(&done.session_id);
                 }
             }
@@ -2834,9 +2857,14 @@ impl App {
             return;
         }
 
-        // Queue-position shortcuts work from both the prompt and transcript:
-        // Ctrl-1 is the active head, Ctrl-N the Nth open session.
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
+        // Queue-position shortcuts work from both the prompt and transcript.
+        // Ctrl-1..9 needs a terminal with keyboard disambiguation (kitty
+        // protocol); Alt-1..9 is the fallback for terminals that fold those
+        // chords into control bytes such as NUL or Esc.
+        if key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
             if let KeyCode::Char(ch @ '1'..='9') = key.code {
                 self.focus_tab(ch as usize - '1' as usize);
                 return;
@@ -4965,21 +4993,28 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
-    /// Persist the prompt, detach the focused session and, when it was the last
-    /// open pane, quit the TUI. Session history is already durable in the
-    /// daemon; the only state to save here is the (cleared) draft.
+    /// Persist the (cleared) draft and quit the whole TUI. Open sessions stay
+    /// alive in the daemon; `/close` is the command that closes a session pane.
     fn exit_session(&mut self, tx: &UnboundedSender<Command>) {
-        self.detach_focused_session(tx, true)
+        if let Some(view) = self.focused_view() {
+            let session_id = view.session.id.clone();
+            let name = view.session.name.clone();
+            // Do not persist the command line itself as the next draft.
+            self.input.clear();
+            self.last_saved_draft.clear();
+            let _ = tx.send(Command::DraftSet {
+                session_id,
+                text: String::new(),
+            });
+            self.status = format!("saved {name} · quitting");
+        }
+        self.should_quit = true;
     }
 
-    /// Close the focused pane without quitting when it is the last one.
+    /// Close the focused session pane. Closing the last pane leaves the client
+    /// with nothing to render, so it also quits the TUI.
     fn close_session(&mut self, tx: &UnboundedSender<Command>) {
-        self.detach_focused_session(tx, false)
-    }
-
-    fn detach_focused_session(&mut self, tx: &UnboundedSender<Command>, quit_when_last: bool) {
         let Some(view) = self.focused_view() else {
-            self.should_quit = true;
             return;
         };
         let session_id = view.session.id.clone();
@@ -4992,12 +5027,8 @@ already exists, update it in place rather than rewriting it from scratch.";
             text: String::new(),
         });
         if self.views.len() <= 1 {
-            if quit_when_last {
-                self.status = format!("saved {name} · quitting");
-                self.should_quit = true;
-            } else {
-                self.status = "cannot close the last pane · use /quit to exit".into();
-            }
+            self.status = format!("saved {name} · quitting");
+            self.should_quit = true;
             return;
         }
         self.close_focused_pane();
@@ -5499,7 +5530,12 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
         self.focused = index;
         self.sync_selected_to_focus();
-        self.status = format!("pane {}/{} focused", index + 1, self.views.len());
+        let unit = if self.layout == PaneLayout::Tabby {
+            "tab"
+        } else {
+            "pane"
+        };
+        self.status = format!("{unit} {}/{} focused", index + 1, self.views.len());
     }
 
     fn sync_selected_to_focus(&mut self) {
@@ -5515,7 +5551,8 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.status = format!("layout: {}", layout.label());
     }
 
-    /// Focus the Nth session by queue position (`Ctrl-1` is the head).
+    /// Focus the Nth session by queue position (`Ctrl-1` is the head). In
+    /// tabby layout the focused session is also the active tab.
     fn focus_tab(&mut self, index: usize) {
         if index >= self.views.len() {
             self.status = format!("session {} is not open", index + 1);
@@ -5551,23 +5588,24 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.sync_selected_to_focus();
     }
 
-    /// A session that finished a turn (or is waiting for the user) becomes the
-    /// queue head, i.e. pane 1 in every layout.
+    /// A session that finished a turn (or is waiting for the user) moves to
+    /// the second slot, leaving pane 1 as the user's working slot.
     fn promote_session(&mut self, session_id: &str) {
         let Some(index) = self.open_session(session_id) else {
             return;
         };
         let focus_after = if index == self.focused {
-            // The user was watching this session; follow it to the head.
+            // The user was watching this session; follow it to the ready
+            // slot.
             FocusAfterMove::Follow
         } else if self.focused == 0 {
-            // Pane 1 is the watch slot: let the newly ready session slide
-            // underneath the focused position.
+            // Pane 1 is the working slot: let the newly ready session slide
+            // into pane 2 without replacing the user's pane.
             FocusAfterMove::KeepSlot
         } else {
             FocusAfterMove::KeepSession
         };
-        self.move_view(index, 0, focus_after);
+        self.move_view(index, 1, focus_after);
     }
 
     /// Sending work moves that session to the queue tail so the user can stay
@@ -8068,11 +8106,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/exit · /quit",
-                description: "save and close this session (quits on the last pane)",
+                description: "save the draft and quit eix",
             },
             HelpEntry {
                 key: "/close",
-                description: "save and close the focused pane (keeps the last pane)",
+                description: "save the draft and close the focused session (the last one quits eix)",
             },
         ],
     },
@@ -8133,11 +8171,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Ctrl-1 … Ctrl-9",
-                description: "focus the Nth open session (the active queue head is 1)",
+                description: "focus the Nth open session (the Nth tab in tabby)",
             },
             HelpEntry {
                 key: "active queue",
-                description: "finished or waiting sessions move to pane 1; sending work moves them to the tail",
+                description: "finished or waiting sessions move to pane 2; sending work moves them to the tail",
             },
             HelpEntry {
                 key: "Space N/W/F",
@@ -9886,20 +9924,41 @@ mod tests {
     }
 
     #[test]
-    fn active_queue_promotes_ready_and_demotes_sent_sessions() {
+    fn active_queue_promotes_ready_to_the_second_slot_and_demotes_sent_sessions() {
         let mut app = app_with_panes(&["a", "b", "c"]);
         app.focused = 0;
 
+        // A finished background session moves to pane 2, so pane 1 keeps the
+        // user's working session.
         app.promote_session("c");
-        assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+        assert_eq!(view_order(&app), vec!["a", "c", "b"]);
         assert_eq!(app.focused, 0);
+        assert_eq!(app.views[app.focused].session.id, "a");
 
-        // Sending from the head moves that session to the tail and leaves the
-        // user in the first slot, now showing the next session.
+        // Sending a session moves it behind everything else.
         app.demote_session("c");
         assert_eq!(view_order(&app), vec!["a", "b", "c"]);
         assert_eq!(app.focused, 0);
         assert_eq!(app.views[app.focused].session.id, "a");
+    }
+
+    #[test]
+    fn ready_session_does_not_replace_the_focused_draft() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["a", "b"]);
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input_session = Some("a".to_string());
+        app.input.set_text("draft for a");
+
+        app.promote_session("b");
+        assert_eq!(app.focused_session_id().as_deref(), Some("a"));
+        assert_eq!(app.input.text(), "draft for a");
+
+        // The tick-driven draft sync must keep the text attached to pane 1.
+        app.tick(&tx);
+        assert_eq!(app.focused_session_id().as_deref(), Some("a"));
+        assert_eq!(app.input.text(), "draft for a");
     }
 
     #[test]
@@ -9924,7 +9983,7 @@ mod tests {
             eix_core::Notification::new("session.updated", serde_json::to_value(idle).unwrap()),
             &tx,
         );
-        assert_eq!(view_order(&app), vec!["a", "b", "c"]);
+        assert_eq!(view_order(&app), vec!["b", "a", "c"]);
         assert_eq!(app.focused, 0);
     }
 
@@ -9933,15 +9992,45 @@ mod tests {
         let mut app = app_with_panes(&["a", "b", "c"]);
         app.focused = 1;
         app.promote_session("c");
-        assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+        assert_eq!(view_order(&app), vec!["a", "c", "b"]);
         assert_eq!(app.views[app.focused].session.id, "b");
 
         let mut app = app_with_panes(&["a", "b", "c"]);
         app.focused = 2;
         app.promote_session("c");
-        assert_eq!(view_order(&app), vec!["c", "a", "b"]);
-        assert_eq!(app.focused, 0);
+        assert_eq!(view_order(&app), vec!["a", "c", "b"]);
+        assert_eq!(app.focused, 1);
         assert_eq!(app.views[app.focused].session.id, "c");
+    }
+
+    #[test]
+    fn ctrl_digits_switch_tabby_tabs_in_insert_mode() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["a", "b", "c"]);
+        app.layout = PaneLayout::Tabby;
+        app.focus_input();
+        app.focused = 0;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('3'), KeyModifiers::CONTROL),
+            &tx,
+        );
+
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.views[app.focused].session.id, "c");
+        assert_eq!(app.input.mode(), Mode::Insert);
+        assert_eq!(app.status, "tab 3/3 focused");
+
+        // The global shortcut also works while the prompt is in normal mode.
+        app.input.enter_normal();
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.focused, 0);
+        assert_eq!(app.views[app.focused].session.id, "a");
+        assert_eq!(app.input.mode(), Mode::Normal);
+        assert_eq!(app.status, "tab 1/3 focused");
     }
 
     #[test]
@@ -10711,21 +10800,19 @@ mod tests {
             )),
             &tx,
         );
-        // The active queue promotes a waiting session to pane 1, underneath
-        // the focused slot.
-        assert_eq!(app.views[0].session.id, "s2");
-        assert_eq!(app.views[0].session.status, SessionStatus::AwaitingApproval);
+        // The active queue moves a waiting session to pane 2, leaving the
+        // focused working pane in place.
+        assert_eq!(app.views[0].session.id, "s1");
+        assert_eq!(app.views[1].session.id, "s2");
+        assert_eq!(app.views[1].session.status, SessionStatus::AwaitingApproval);
         assert_eq!(app.focused, 0);
         assert!(!app.pane_needs_attention(0));
-
-        // Looking at another pane marks the queue head as background attention.
-        app.focus_pane(1);
-        assert!(app.pane_needs_attention(0));
+        assert!(app.pane_needs_attention(1));
         assert_eq!(app.attention_count(), 1);
 
         app.focus_next_attention();
-        assert_eq!(app.focused, 0);
-        assert!(!app.pane_needs_attention(0));
+        assert_eq!(app.focused, 1);
+        assert!(!app.pane_needs_attention(1));
         assert_eq!(app.attention_count(), 0);
     }
 
@@ -10755,13 +10842,14 @@ mod tests {
         assert!(!app.take_ring());
 
         app.bell = true;
-        // The queue head is the focused pane and already visible.
+        // The ready session is in pane 2, so it is background work and rings
+        // exactly once.
         app.handle_event(attention("s2"), &tx);
+        assert!(app.take_ring());
         assert!(!app.take_ring());
 
-        // The other session is background work and rings exactly once.
+        // The focused working pane does not ring.
         app.handle_event(attention("s1"), &tx);
-        assert!(app.take_ring());
         assert!(!app.take_ring());
     }
 
@@ -11921,6 +12009,39 @@ mod tests {
     }
 
     #[test]
+    fn leader_n_keeps_the_prompt_in_normal_mode_after_attaching() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus_input();
+        app.input.enter_normal();
+        app.input_session = Some("s1".to_string());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+
+        let created = Session::new("s2", "two", "/tmp");
+        app.handle_event(Event::Created(created.clone()), &tx);
+        app.handle_event(
+            Event::Attached(AttachResult {
+                session: created,
+                events: Vec::new(),
+                has_more: false,
+            }),
+            &tx,
+        );
+        app.tick(&tx);
+
+        assert_eq!(app.focused, 1);
+        assert!(matches!(app.focus, Focus::Input));
+        assert_eq!(app.input.mode(), Mode::Normal);
+    }
+
+    #[test]
     fn leader_c_closes_the_focused_pane() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
@@ -12371,7 +12492,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_exit_saves_and_closes_the_focused_pane() {
+    fn slash_exit_quits_without_closing_session_panes() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.views.push(session_pane("s1", "one"));
@@ -12381,9 +12502,9 @@ mod tests {
         app.input.set_text("/exit");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
-        assert!(!app.should_quit, "another pane is still open");
-        assert_eq!(app.views.len(), 1);
-        assert_eq!(app.views[0].session.id, "s2");
+        assert!(app.should_quit, "exit quits the whole TUI");
+        assert_eq!(app.views.len(), 2, "exit leaves session panes open");
+        assert_eq!(app.views[0].session.id, "s1");
         assert!(app.input.is_empty(), "the command line is cleared");
         match rx.try_recv().expect("draft save") {
             Command::DraftSet { session_id, text } => {
@@ -12392,6 +12513,21 @@ mod tests {
             }
             _ => panic!("expected a draft save"),
         }
+    }
+
+    #[test]
+    fn slash_quit_quits_with_multiple_panes_open() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.views.push(session_pane("s2", "two"));
+        app.focused = 1;
+        app.focus = Focus::Input;
+        app.input.set_text("/quit");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.should_quit, "quit quits the whole TUI");
+        assert_eq!(app.views.len(), 2, "quit leaves session panes open");
     }
 
     #[test]
@@ -12419,7 +12555,7 @@ mod tests {
     }
 
     #[test]
-    fn slash_close_keeps_the_last_pane_open() {
+    fn slash_close_on_the_last_pane_quits_the_client() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.views.push(session_pane("s1", "one"));
@@ -12428,9 +12564,9 @@ mod tests {
         app.input.set_text("/close");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
-        assert!(!app.should_quit);
+        assert!(app.should_quit, "closing the last pane quits the TUI");
         assert_eq!(app.views.len(), 1);
-        assert!(app.status.contains("cannot close the last pane"));
+        assert!(app.status.contains("quitting"));
         match rx.try_recv().expect("draft save") {
             Command::DraftSet { session_id, .. } => assert_eq!(session_id, "s1"),
             _ => panic!("expected a draft save"),
@@ -12656,6 +12792,35 @@ mod tests {
         assert!(app.input.is_empty());
         assert!(app.error.is_none());
         assert!(!app.submitting);
+    }
+
+    #[test]
+    fn leader_x_keeps_the_prompt_in_normal_mode() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.views[0].session.status = SessionStatus::Running;
+        app.focus = Focus::Input;
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &tx);
+
+        assert_eq!(app.input.mode(), Mode::Normal);
+        assert!(matches!(rx.try_recv(), Ok(Command::Cancel(id)) if id == "s1"));
+
+        // A delayed draft load must not push the prompt back into insert mode.
+        app.input_session = Some("s1".to_string());
+        app.handle_event(
+            Event::Draft {
+                session_id: "s1".to_string(),
+                text: "restored draft".to_string(),
+            },
+            &tx,
+        );
+        assert_eq!(app.input.mode(), Mode::Normal);
+        assert_eq!(app.input.text(), "restored draft");
     }
 
     #[test]

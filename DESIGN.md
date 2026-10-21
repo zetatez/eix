@@ -211,11 +211,13 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
 - 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首占 55% 高度）、`tabby`（顶部 tab，
   只渲染当前 session）、`fibonacci`（tab + 左/上/右/下循环切分的螺旋分屏）。用 leader
-  `<Space>v/t/r` 切换，`<Space>l` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session。
-- 活跃队列：`views` 顺序即队列顺序，位置 0 是 pane 1。turn 完成、等待审批/输入时把对应
-  session 移到队首；提交流程（包括排队和 `!` shell）把它移到队尾。重排时保持聚焦槽位，
-  因此用户停在 pane 1 就能看到下一个就绪 session；若被移动的正是聚焦 session，promotion
-  会跟随到队首，demotion 则留在原槽位等待下一个 session。
+  `<Space>v/t/r` 切换，`<Space>l` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session，
+  在 `tabby` 下即切换到第 N 个 tab。
+- 活跃队列：`views` 顺序即队列顺序，位置 0 是 pane 1，也是当前工作槽位。turn 完成、等待
+  审批/输入时把对应 session 移到第二个位置（position 1，即 pane 2），避免替换 pane 1 正在
+  编辑的内容；提交流程（包括排队和 `!` shell）把它移到队尾。重排时保持聚焦槽位，因此发送后
+  第二个位置的 session 会补到 pane 1；若被移动的正是聚焦 session，promotion 会跟随到
+  第二个位置，demotion 则留在原槽位等待下一个 session。
 - 不再有独立顶部 header 行：Build/Plan、session 状态、模型和 cwd 作为输入框标题行，直接压在
   prompt 网格上方（cwd 用 `~` 缩写，模型省略 provider 前缀）；输入框下方保留一行 statusline，
   左侧显示模式、session 和最近状态，右侧显示模型与队列/attention 信息。
@@ -245,7 +247,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
 | `<Space>l` | 循环 grid / horizontal / tabby / fibonacci |
 | `<Space>R` | 跨 session 审批收件箱 |
-| `Ctrl-1…9` | 聚焦第 N 个已打开 session |
+| `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab） |
 
 **`eix nvim` 前端（`:Eix` palette）**
 
@@ -304,8 +306,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
 | `/cancel` / `/toggle-agent` | 取消运行 / 切换 Build·Plan |
 | `/permission <level>` | 设置 `read-only` / `workspace-write` / `full` |
-| `/exit` / `/quit` | 保存并关闭当前 pane；最后一个 pane 时退出 TUI |
-| `/close` | 保存并关闭当前 pane；保留最后一个 pane，改用 `/quit` 退出 |
+| `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
+| `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
 队列按 session 保存在 TUI 内存（`HashMap<SessionId, VecDeque<String>>`），tick 时空闲即取一条
 发送；`turn.completed` 与 daemon `turns` 移除之间的竞态用“出错重排到队首、下个 tick 重试”处理。
