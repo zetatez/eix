@@ -211,7 +211,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
 - 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首占 55% 高度）、`tabby`（顶部 tab，
   只渲染当前 session）、`fibonacci`（tab + 左/上/右/下循环切分的螺旋分屏）。用 leader
-  `<Space>V/T/R` 切换，`<Space>L` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session。
+  `<Space>v/t/r` 切换，`<Space>l` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session。
 - 活跃队列：`views` 顺序即队列顺序，位置 0 是 pane 1。turn 完成、等待审批/输入时把对应
   session 移到队首；提交流程（包括排队和 `!` shell）把它移到队尾。重排时保持聚焦槽位，
   因此用户停在 pane 1 就能看到下一个就绪 session；若被移动的正是聚焦 session，promotion
@@ -242,8 +242,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<C-g><C-g>` | 回到上一个 session |
 | `<C-w>h/j/k/l` | 切换 pane 焦点 |
 | `<C-w>w` | 循环 pane |
-| `<Space>V/T/R` | horizontal / tabby / fibonacci 布局 |
-| `<Space>L` | 循环 grid / horizontal / tabby / fibonacci |
+| `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
+| `<Space>l` | 循环 grid / horizontal / tabby / fibonacci |
+| `<Space>R` | 跨 session 审批收件箱 |
 | `Ctrl-1…9` | 聚焦第 N 个已打开 session |
 
 **`eix nvim` 前端（`:Eix` palette）**
@@ -275,7 +276,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `Ctrl-J` / `Ctrl-K` | normal 模式下浏览已提交的 prompt 历史（newer / older） |
 | `Tab` | normal 模式下切换 Build / Plan 模式（命令面板的 `Build / Plan` 同义） |
 | `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
-| `<Space>s/f/w/b/c/C/h/p/r/N/W/F/x/q/Q/i/A/a/:/?` | TUI 动作（见 5.1）；裸字母不触发动作 |
+| `<Space>s/f/w/b/c/C/h/p/R/N/W/F/v/t/r/l/x/q/Q/i/A/a/:/?` | TUI 动作（见 5.1）；裸字母不触发动作 |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
 | `d c y` + motion / `dd cc yy` / `iw aw` | 操作符 |
 | `v V` + `d x y c p ~ o` | visual |

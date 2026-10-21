@@ -3127,7 +3127,7 @@ impl App {
                 && !key.modifiers.contains(KeyModifiers::ALT)
             {
                 self.pending_leader = true;
-                self.status = "leader: s/f/w/b · n new · o pane · V/T/R/L layout · C/q close · a commands · i input · Q quit · ? help · Esc cancel"
+                self.status = "leader: s/f/w/b · n new · o pane · v/t/r/l layout · R approvals · C/q close · a commands · i input · Q quit · ? help · Esc cancel"
                     .into();
                 return;
             }
@@ -9958,10 +9958,10 @@ mod tests {
         assert_eq!(app.focused, 1);
 
         for (leader, expected) in [
-            ('V', PaneLayout::Horizontal),
-            ('T', PaneLayout::Tabby),
-            ('R', PaneLayout::Fibonacci),
-            ('L', PaneLayout::Grid),
+            ('v', PaneLayout::Horizontal),
+            ('t', PaneLayout::Tabby),
+            ('r', PaneLayout::Fibonacci),
+            ('l', PaneLayout::Grid),
         ] {
             app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
             app.handle_key(

@@ -196,8 +196,8 @@ Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板�
 独立显示一个 session 的转录、滚动位置和流式输出；相邻 pane 共用一条边框线。
 底部输入条只作用于当前聚焦 pane。
 
-用 leader 快捷键 `<Space>V` / `<Space>T` / `<Space>R` 可切换 `horizontal`（纵向排列、队首更大）、
-`tabby`（顶部 tab，只显示当前 session）和 `fibonacci`（tab + 螺旋分屏）；`<Space>L` 在四种布局
+用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、
+`tabby`（顶部 tab，只显示当前 session）和 `fibonacci`（tab + 螺旋分屏）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个**活跃队列**：turn 完成或 session 等待审批/输入时，
 它自动移到队首（pane 1）；给它发送任务后移到队尾，用户始终只需关注 pane 1。
 `Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session。
@@ -243,7 +243,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `C-w c` | 关闭聚焦 pane（至少保留一个） |
 | `C-w w` | 循环切换 pane |
 | `Shift+,` / `Shift+.` | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式） |
-| `<Space>V` / `<Space>T` / `<Space>R` | horizontal / tabby / fibonacci 布局；`<Space>L` 循环所有布局 |
+| `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
 | `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session（队首是 1，输入框内也可用） |
 | `Tab` / `S-Tab` | 聚焦 pane 切到下一个 / 上一个 session（转录区） |
 | `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；有待审批时卡片上的 `n` 仍是 deny |
@@ -254,7 +254,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | 提问卡片 | 模型用 `ask_user` 提问时显示选项：`j`/`k` 选择、`Enter` 确认（`1-6` 直接选）；无头场景用 `eix answer N` |
 | `e` / `o` | 编辑 staged 的新内容（改完重新 stage）/ 在 `$EDITOR` 打开真实文件 |
 | `r` | 输入理由并拒绝（Enter 发送，Esc 取消） |
-| `<Space>r` | 跨 session 审批 inbox（`j/k` 选择、`Enter` 跳转、`y/n` 处理、`Esc` 关闭） |
+| `<Space>R` | 跨 session 审批 inbox（`j/k` 选择、`Enter` 跳转、`y/n` 处理、`Esc` 关闭） |
 | `d` | 全屏审阅待审批写入的 side-by-side diff（左旧右新、语法高亮）；有 hunk 时 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/全不选、`y` 应用选中、`n` 拒绝 |
 | `<Space>c` | context ledger：`j/k` 移动、`o` 展开、`p` pin、`d` drop/恢复、`m` 标记、`s` 压缩（单条或 mark 到光标的范围）、`f` fork、`w` rewind 并回滚工作区、`Esc` 关闭 |
 | `<Space>p` | 后台进程：`j/k` 选择、`x` kill、`r` 刷新、`PgUp`/`PgDn` 滚动输出、`Esc` 关闭 |
@@ -456,9 +456,9 @@ TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **lea
 picker、`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
 （`<Space>C` / `<Space>q` 关闭当前 pane）、`<Space>f` 文件、
 `<Space>w`/`b` worktree/分支、`<Space>c` ledger、`<Space>h` 历史、
-`<Space>p` 进程、`<Space>r` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
+`<Space>p` 进程、`<Space>R` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
 `<Space>F` fork、`<Space>x` 取消、`<Space>A` attention、`<Space>i` 聚焦输入框、
-`<Space>V`/`T`/`R` 布局、`<Space>L` 循环布局、`<Space>Q` 退出、`<Space>a` 或
+`<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>Q` 退出、`<Space>a` 或
 `<Space>:` 命令面板、`<Space>?` 帮助。裸字母
 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
 insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
@@ -923,7 +923,7 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] 远程 attach（TCP + 强制 token、首请求 `auth`、CLI `--tcp/--token`）
 - [x] 全文搜索（FTS5 trigram + 短查询子串回退、TUI `#`、`eix search`）
 - [x] 按连接过滤广播（`session.subscribe`，`null` = 全部；`eix nvim` 只订阅当前 session）
-- [x] 审批增强（`e` 编辑 staged 内容、`o` 打开真实文件、`r` 带理由拒绝、`<Space>r` 跨 session 审批 inbox、风险标签）
+- [x] 审批增强（`e` 编辑 staged 内容、`o` 打开真实文件、`r` 带理由拒绝、`<Space>R` 跨 session 审批 inbox、风险标签）
 - [x] 审批卡片改为选项列表（`j/k` / `C-n/C-p` 选择、`Enter` 执行、`1-9` 直选、首项推荐；`y/n` 快捷方式保留）
 - [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
 - [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）

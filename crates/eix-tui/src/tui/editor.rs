@@ -1818,14 +1818,14 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'C' => "close-pane",
         'h' => "history",
         'p' => "processes",
-        'r' => "approvals",
+        'R' => "approvals",
         'n' | 'N' => "new",
         'W' => "new-worktree",
         'F' => "fork",
-        'V' => "layout-horizontal",
-        'T' => "layout-tabby",
-        'R' => "layout-fibonacci",
-        'L' => "layout-cycle",
+        'v' => "layout-horizontal",
+        't' => "layout-tabby",
+        'r' => "layout-fibonacci",
+        'l' => "layout-cycle",
         'x' => "cancel",
         'q' => "close-pane",
         'Q' => "quit",
@@ -2049,10 +2049,10 @@ mod tests {
     fn leader_letters_select_layouts() {
         let mut editor = editor_with("");
         for (letter, action) in [
-            ('V', "layout-horizontal"),
-            ('T', "layout-tabby"),
-            ('R', "layout-fibonacci"),
-            ('L', "layout-cycle"),
+            ('v', "layout-horizontal"),
+            ('t', "layout-tabby"),
+            ('r', "layout-fibonacci"),
+            ('l', "layout-cycle"),
         ] {
             let _ = key(&mut editor, KeyCode::Char(' '));
             assert_eq!(
@@ -2060,6 +2060,16 @@ mod tests {
                 Outcome::Action(action)
             );
         }
+    }
+
+    #[test]
+    fn leader_shift_r_opens_approvals() {
+        let mut editor = editor_with("");
+        let _ = key(&mut editor, KeyCode::Char(' '));
+        assert_eq!(
+            key(&mut editor, KeyCode::Char('R')),
+            Outcome::Action("approvals")
+        );
     }
 
     #[test]
