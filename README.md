@@ -194,7 +194,7 @@ Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板�
 `Esc` 关闭。输入框标题行直接显示 Build/Plan、session 状态和模型，cwd 右对齐并以 `~` 缩写，
 模型省略 provider 前缀；底部不再有单独状态栏。
 
-转录区按对话渲染：用户消息是右对齐的紧凑气泡（只画左右边条，不占上下边框行），agent 输出左侧留白、不加角色前缀。agent 的
+转录区按对话渲染：用户消息是右对齐的圆角气泡（前后不额外留空行），agent 输出左侧留白、不加角色前缀。agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
 显示为一行状态徽标（状态点、命令/路径摘要、右侧 `ok` / `running` / `needs approval`），
 展开后用四空格左缩进直接显示参数、side-by-side diff 和输出；diff 左侧是改动前、右侧是改动后，
@@ -215,7 +215,8 @@ agent 输出和用户气泡都按 Markdown 渲染：标题、粗体/斜体/删�
 | `i` / `Enter` / `<Space>i` | 聚焦输入框（进入 insert 模式） |
 | `Esc` / `Esc Esc` | 单次 `Esc` 回到 normal 模式并**保持输入框焦点**（不计数）；normal 模式下 500ms 内连按两次：有 turn 在跑时中断它，否则回到转录区 |
 | `Enter` | 发送到聚焦 pane（仅 insert 模式）；turn 还在跑时自动排队，结束后按顺序发出 |
-| `/exit` / `/quit` / `/close` | 保存草稿并关闭聚焦 pane 的 session；如果它是最后一个 pane，直接退出 TUI |
+| `/exit` / `/quit` | 保存草稿并关闭聚焦 pane 的 session；如果它是最后一个 pane，直接退出 TUI |
+| `/close` | 保存草稿并关闭聚焦 pane；至少保留一个 pane（最后一个 pane 用 `/quit` 退出） |
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
 | `Tab`（normal） | 在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
 | `<Space>s` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
@@ -285,7 +286,8 @@ agent 输出和用户气泡都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/undo` / `/redo` | 隐藏/恢复最近一个 user turn（事件仍在日志里，可通过 redo 恢复） |
 | `/fork [name]` | fork 当前 session（在 git 仓库里自动建 worktree） |
 | `/permission <level>` | 设置工具权限：`read-only` / `workspace-write` / `full` |
-| `/exit` / `/quit` / `/close` | 保存并关闭聚焦 pane；最后一个 pane 时退出 TUI |
+| `/exit` / `/quit` | 保存并关闭聚焦 pane；最后一个 pane 时退出 TUI |
+| `/close` | 保存并关闭聚焦 pane；保留最后一个 pane，改用 `/quit` 退出 |
 
 ### Skills
 

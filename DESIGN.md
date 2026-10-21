@@ -280,14 +280,15 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/queue [clear]` | 查看/清空本 session 的待发送队列 |
 | `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
 | `/permission <level>` | 设置 `read-only` / `workspace-write` / `full` |
-| `/exit` / `/quit` / `/close` | 保存并关闭当前 pane；最后一个 pane 时退出 TUI |
+| `/exit` / `/quit` | 保存并关闭当前 pane；最后一个 pane 时退出 TUI |
+| `/close` | 保存并关闭当前 pane；保留最后一个 pane，改用 `/quit` 退出 |
 
 队列按 session 保存在 TUI 内存（`HashMap<SessionId, VecDeque<String>>`），tick 时空闲即取一条
 发送；`turn.completed` 与 daemon `turns` 移除之间的竞态用“出错重排到队首、下个 tick 重试”处理。
 
 **转录区**
 
-转录按对话渲染：用户消息是右对齐的紧凑气泡（panel 背景，只画左右边条，不占上下边框行），agent 输出左对齐、2 空格缩进，
+转录按对话渲染：用户消息是右对齐的圆角气泡（panel 背景，前后不额外留空行），agent 输出左对齐、2 空格缩进，
 不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
 以 `Thinking` 模块流式展开，turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
 call/approval/patch/result 事件，一行显示状态圆点、命令或路径摘要与右侧状态

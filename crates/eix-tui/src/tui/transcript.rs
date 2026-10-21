@@ -455,6 +455,15 @@ impl Transcript {
         }
         self.push(Line::from(""), None);
     }
+
+    /// Drop separator rows left by the previous block. User bubbles provide
+    /// their own border, so they do not need extra padding above them.
+    fn trim_blank_tail(&mut self) {
+        while self.lines.last().is_some_and(|line| line.width() == 0) {
+            self.lines.pop();
+            self.slots.pop();
+        }
+    }
 }
 
 const TEXT: Color = Color::Rgb(220, 223, 228);
@@ -492,10 +501,12 @@ fn italic_dim(theme: Theme) -> Style {
         .add_modifier(Modifier::ITALIC)
 }
 
-/// A user turn in a right-aligned compact bubble. Only the side rules are
-/// drawn, so a one-line prompt costs one row instead of a full box. The bubble
-/// shrinks to fit short prompts and wraps long ones at four fifths of the pane.
+/// A user turn in a right-aligned compact bubble. It keeps the rounded top
+/// edge and side rules, but the filled panel row closes the bubble instead of
+/// spending another row on a bottom border. There are no blank padding rows
+/// around it. Long prompts wrap at four fifths of the pane.
 fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usize, theme: Theme) {
+    out.trim_blank_tail();
     for path in images {
         out.push(
             Line::from(Span::styled(
@@ -532,17 +543,23 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
         .max(1);
     let total = inner + 4;
     let left = width.saturating_sub(total);
-    let side = Style::default()
+    let border = Style::default()
         .fg(theme.function.unwrap_or(PANEL_BORDER))
         .bg(panel(theme));
     let body = Style::default().fg(text_color(theme)).bg(panel(theme));
     let pad = Span::raw(" ".repeat(left));
 
-    out.blank();
+    out.push(
+        Line::from(vec![
+            pad.clone(),
+            Span::styled(format!("╭{}╮", "─".repeat(inner + 2)), border),
+        ]),
+        None,
+    );
     for line in lines {
         let used = line.width();
         let fill = inner.saturating_sub(used);
-        let mut spans = vec![pad.clone(), Span::styled("│ ", side)];
+        let mut spans = vec![pad.clone(), Span::styled("│ ", body)];
         for mut span in line.spans {
             span.style = span.style.bg(panel(theme));
             spans.push(span);
@@ -550,10 +567,9 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
         if fill > 0 {
             spans.push(Span::styled(" ".repeat(fill), body));
         }
-        spans.push(Span::styled(" │", side));
+        spans.push(Span::styled(" │", body));
         out.push(Line::from(spans), None);
     }
-    out.blank();
 }
 
 /// Agent output: rendered as Markdown, indented only enough to breathe, with

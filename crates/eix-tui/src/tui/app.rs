@@ -7426,8 +7426,12 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "set read-only · workspace-write · full",
             },
             HelpEntry {
-                key: "/exit · /quit · /close",
+                key: "/exit · /quit",
                 description: "save and close this session (quits on the last pane)",
+            },
+            HelpEntry {
+                key: "/close",
+                description: "save and close the focused pane (keeps the last pane)",
             },
         ],
     },
@@ -9286,7 +9290,7 @@ mod tests {
     }
 
     #[test]
-    fn user_messages_use_a_compact_one_row_bubble() {
+    fn user_messages_use_a_two_row_bubble_without_margins() {
         let session = Session::new("s1", "chat", "/tmp");
         let events = vec![SessionEvent::new(
             "s1",
@@ -9296,17 +9300,15 @@ mod tests {
         )];
         let view = SessionView::new(session, events);
         let rendered = render_transcript(&view, 40);
-        let bubble: Vec<&str> = rendered.lines().filter(|line| line.contains('│')).collect();
+        let lines: Vec<&str> = rendered.lines().collect();
         assert_eq!(
-            bubble.len(),
-            1,
-            "bubble should not add cap rows: {rendered}"
+            lines.len(),
+            2,
+            "bubble should be one cap plus content: {rendered}"
         );
-        assert!(bubble[0].contains("│ hi there │"), "{rendered}");
-        assert!(
-            !rendered.contains('╭') && !rendered.contains('╰'),
-            "{rendered}"
-        );
+        assert!(lines[0].contains('╭'), "{rendered}");
+        assert!(lines[1].contains("│ hi there │"), "{rendered}");
+        assert!(!rendered.contains('╰'), "{rendered}");
     }
 
     #[test]
@@ -11440,6 +11442,25 @@ mod tests {
                 assert_eq!(session_id, "s1");
                 assert!(text.is_empty(), "the command is not kept as a draft");
             }
+            _ => panic!("expected a draft save"),
+        }
+    }
+
+    #[test]
+    fn slash_close_keeps_the_last_pane_open() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.set_text("/close");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(!app.should_quit);
+        assert_eq!(app.views.len(), 1);
+        assert!(app.status.contains("cannot close the last pane"));
+        match rx.try_recv().expect("draft save") {
+            Command::DraftSet { session_id, .. } => assert_eq!(session_id, "s1"),
             _ => panic!("expected a draft save"),
         }
     }
