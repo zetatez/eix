@@ -48,7 +48,7 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::context::Ledger;
+use crate::context::{estimate_request_tokens, Ledger};
 use crate::process::ProcessRegistry;
 use crate::provider::{Provider, ProviderError, RetryClass};
 use crate::snapshot::{Scope, Snapshotter};
@@ -99,6 +99,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         notified: std::sync::Mutex::new(HashMap::new()),
         temporary_permissions: std::sync::Mutex::new(HashMap::new()),
         skill_tools: Mutex::new(HashMap::new()),
+        token_scales: std::sync::Mutex::new(HashMap::new()),
     });
     let restored = daemon.staging.load();
     if restored > 0 {
@@ -331,6 +332,10 @@ pub(crate) struct Daemon {
     /// Tools allowed by skills loaded with `use_skill`, unioned per session.
     /// Cleared when a new user prompt starts.
     skill_tools: Mutex<HashMap<SessionId, Vec<String>>>,
+    /// Per-model multiplier that calibrates local token estimates against
+    /// provider-reported prompt usage. Starts at 1.0 and is updated with a
+    /// bounded EWMA after each completed request.
+    token_scales: std::sync::Mutex<HashMap<String, f64>>,
 }
 
 struct PendingApproval {
@@ -2190,11 +2195,13 @@ impl Daemon {
             .clone()
             .unwrap_or_else(|| self.config.load().provider.model.clone().to_string());
         let turn_started = Instant::now();
-        let ledger = self.build_ledger(session_id).await?;
+        let ledger = self
+            .build_ledger_with_tools(session_id, allowed_tools)
+            .await?;
         let keep_turns = self.config.load().context.auto_compact_keep_turns;
         let (ledger, _) =
             if self.config.load().context.auto_compact && session.origin != SessionOrigin::Agent {
-                self.auto_compact_if_needed(session_id, ledger, false, keep_turns)
+                self.auto_compact_if_needed(session_id, ledger, false, keep_turns, allowed_tools)
                     .await
             } else {
                 (ledger, false)
@@ -2227,12 +2234,14 @@ impl Daemon {
             // updates, and lets auto-compaction run mid-turn instead of only
             // before the first request.
             if round > 0 {
-                let refreshed = self.build_ledger(session_id).await?;
+                let refreshed = self
+                    .build_ledger_with_tools(session_id, allowed_tools)
+                    .await?;
                 let auto_compact = self.config.load().context.auto_compact
                     && session.origin != SessionOrigin::Agent;
                 let keep = self.config.load().context.auto_compact_keep_turns;
                 let (refreshed, compacted) = if auto_compact && auto_compactions < 2 {
-                    self.auto_compact_if_needed(session_id, refreshed, false, keep)
+                    self.auto_compact_if_needed(session_id, refreshed, false, keep, allowed_tools)
                         .await
                 } else {
                     (refreshed, false)
@@ -2252,6 +2261,7 @@ impl Daemon {
                 let tid = turn_id.to_string();
                 let mut streamed = String::new();
                 let mut streamed_reasoning = String::new();
+                let estimated_prompt = estimate_request_tokens(&messages, tools);
                 let outcome = provider
                     .stream_chat(&messages, &route, tools, cancel, |delta| match delta {
                         crate::provider::StreamDelta::Content(text) => {
@@ -2290,6 +2300,10 @@ impl Daemon {
                     return Ok(());
                 }
 
+                if let Ok(completion) = &outcome {
+                    self.observe_prompt_usage(&model, estimated_prompt, completion.usage.as_ref());
+                }
+
                 let (reason, delay) = match outcome {
                     Ok(completion)
                         if completion.tool_calls.is_empty()
@@ -2318,7 +2332,9 @@ impl Daemon {
                             && context_recoveries < 2 =>
                     {
                         context_recoveries += 1;
-                        let ledger = self.build_ledger(session_id).await?;
+                        let ledger = self
+                            .build_ledger_with_tools(session_id, allowed_tools)
+                            .await?;
                         // The first recovery keeps the configured recent turns;
                         // the second is deliberately aggressive.
                         let keep = if context_recoveries == 1 {
@@ -2327,7 +2343,7 @@ impl Daemon {
                             1
                         };
                         let (ledger, compacted) = self
-                            .auto_compact_if_needed(session_id, ledger, true, keep)
+                            .auto_compact_if_needed(session_id, ledger, true, keep, allowed_tools)
                             .await;
                         if !compacted {
                             return Err(anyhow::anyhow!("{err}"));
@@ -3387,9 +3403,47 @@ impl Daemon {
         Ok(())
     }
 
-    /// Rebuild the context ledger for a session. Used by reads, by the
-    /// `context.*` requests, and at the start of every turn.
+    /// Rebuild the context ledger for a session. Used by reads and the
+    /// `context.*` requests, where the exact turn tool list is not available.
     async fn build_ledger(&self, session_id: &str) -> Result<Ledger> {
+        let session = self.require_session(session_id)?;
+        let tools = self.standard_tool_definitions(&session);
+        self.build_ledger_with_tools(session_id, &tools).await
+    }
+
+    /// The tools a normal turn would see, without starting MCP servers.
+    /// Dynamic MCP tool schemas are only known after a turn starts, so ledger
+    /// reads outside the turn use the built-in set and MCP meta-tools.
+    fn standard_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
+        let read_only = self.session_permission(session) == PermissionLevel::ReadOnly;
+        let sub_agent = session.origin == SessionOrigin::Agent;
+        let mut definitions = if read_only {
+            tools::definitions()
+                .into_iter()
+                .filter(|tool| !tools::requires_approval(&tool.function.name))
+                .collect::<Vec<_>>()
+        } else {
+            tools::definitions()
+        };
+        let mcp_configured = self
+            .config
+            .load()
+            .mcp
+            .servers
+            .values()
+            .any(|server| server.enabled);
+        if !mcp_configured || read_only || sub_agent {
+            definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
+        }
+        definitions
+    }
+
+    /// Rebuild the ledger with the exact tool schemas the request will carry.
+    async fn build_ledger_with_tools(
+        &self,
+        session_id: &str,
+        tools: &[ToolDefinition],
+    ) -> Result<Ledger> {
         let session = self.require_session(session_id)?;
         let events = self.store.events(session_id)?;
         let permission = self.session_permission(&session);
@@ -3402,6 +3456,10 @@ impl Daemon {
             .unwrap_or_default();
         let tasks = (!todos.is_empty()).then(|| todo_context(&todos));
         let memory = self.memory.read(&session.cwd).await;
+        let model = session
+            .model
+            .clone()
+            .unwrap_or_else(|| self.config.load().provider.model.clone());
         Ok(Ledger::build_with_state(
             &self.config.load(),
             system_prompt(&self.config.load(), &session, permission),
@@ -3410,8 +3468,39 @@ impl Daemon {
             Some(&self.blobs),
             memory,
             tasks,
+            tools,
+            self.token_scale(&model),
         )
         .await)
+    }
+
+    fn token_scale(&self, model: &str) -> f64 {
+        let scales = match self.token_scales.lock() {
+            Ok(scales) => scales,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        scales.get(model).copied().unwrap_or(1.0)
+    }
+
+    /// Feed provider-reported prompt usage back into the estimate. The observed
+    /// ratio is clamped and smoothed so one odd provider response cannot make
+    /// the next request wildly over- or under-trim.
+    fn observe_prompt_usage(&self, model: &str, estimated: usize, usage: Option<&eix_core::Usage>) {
+        let Some(actual) = usage
+            .map(|usage| usage.prompt_tokens as usize)
+            .filter(|tokens| *tokens > 0)
+        else {
+            return;
+        };
+        if estimated == 0 {
+            return;
+        }
+        let mut scales = match self.token_scales.lock() {
+            Ok(scales) => scales,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let scale = scales.entry(model.to_string()).or_insert(1.0);
+        *scale = calibrated_scale(*scale, estimated, actual);
     }
 
     fn emit_context(&self, session_id: &str, ledger: &Ledger) {
@@ -3626,6 +3715,7 @@ impl Daemon {
         ledger: Ledger,
         force: bool,
         keep: usize,
+        tools: &[ToolDefinition],
     ) -> (Ledger, bool) {
         let info = ledger.info();
         let threshold = self.config.load().context.auto_compact_threshold;
@@ -3693,7 +3783,7 @@ impl Daemon {
                 "auto": true,
             }),
         );
-        match self.build_ledger(session_id).await {
+        match self.build_ledger_with_tools(session_id, tools).await {
             Ok(ledger) => {
                 self.emit_context(session_id, &ledger);
                 (ledger, true)
@@ -4830,6 +4920,17 @@ fn retry_delay(
     base.saturating_mul(factor).min(max)
 }
 
+/// Blend a new provider observation into the current estimate scale. The
+/// ratio is clamped so a single anomalous usage report cannot dominate, and
+/// the final scale stays within 0.5x–2x.
+fn calibrated_scale(current: f64, estimated: usize, actual: usize) -> f64 {
+    if estimated == 0 || actual == 0 {
+        return current;
+    }
+    let observed = (actual as f64 / estimated as f64).clamp(0.5, 2.0);
+    (current * 0.7 + observed * 0.3).clamp(0.5, 2.0)
+}
+
 /// Sleep, but wake up promptly when the turn is cancelled.
 async fn sleep_cancellable(delay: Duration, cancel: &AtomicBool) -> bool {
     let deadline = Instant::now() + delay;
@@ -5340,6 +5441,17 @@ mod tests {
         assert!(SessionStatus::Running.is_busy());
         assert!(SessionStatus::AwaitingApproval.is_busy());
         assert!(!SessionStatus::Error.is_busy());
+    }
+
+    #[test]
+    fn prompt_usage_calibration_is_smoothed_and_bounded() {
+        let close = |a: f64, b: f64| assert!((a - b).abs() < 1e-9, "{a} != {b}");
+        close(calibrated_scale(1.0, 1_000, 2_000), 1.3);
+        close(calibrated_scale(1.0, 1_000, 0), 1.0);
+        close(calibrated_scale(1.0, 0, 2_000), 1.0);
+        close(calibrated_scale(1.0, 1_000, 100_000), 1.3);
+        close(calibrated_scale(1.9, 1_000, 100_000), 1.93);
+        close(calibrated_scale(0.6, 1_000, 1), 0.57);
     }
 
     #[test]

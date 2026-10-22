@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use eix_core::{
     AssistantMessagePayload, ChatMessage, Config, ContextCompactedPayload, ContextDropPayload,
     ContextEntryInfo, ContextLedgerResult, ContextPinPayload, ContextSectorInfo, Event, EventKind,
-    ImagePart, Sector, ToolResultPayload, UserMessagePayload,
+    ImagePart, Sector, ToolDefinition, ToolResultPayload, UserMessagePayload,
 };
 use serde::de::DeserializeOwned;
 use tokio::time::{timeout, Duration};
@@ -29,6 +29,9 @@ use crate::blob::BlobStore;
 const KEEP_NEWEST: usize = 4;
 /// Default per-result context cap for callers that do not pass a config.
 const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 4_000;
+/// Conservative per-image estimate. The exact vision token count depends on
+/// the model, image dimensions and detail level; counting zero was much worse.
+const IMAGE_TOKEN_ESTIMATE: usize = 1_000;
 const MAX_DETAIL_CHARS: usize = 2_000;
 const MAX_PREVIEW_CHARS: usize = 160;
 const MAX_INSTRUCTION_CHARS: usize = 64_000;
@@ -119,7 +122,7 @@ impl Policy {
 impl Ledger {
     /// Load instructions and the workspace summary, then assemble the ledger.
     pub async fn build(config: &Config, system: String, cwd: &Path, events: &[Event]) -> Self {
-        Self::build_with_state(config, system, cwd, events, None, None, None).await
+        Self::build_with_state(config, system, cwd, events, None, None, None, &[], 1.0).await
     }
 
     /// Like [`build`](Self::build), but resolves image blob references so
@@ -131,11 +134,13 @@ impl Ledger {
         events: &[Event],
         blobs: Option<&BlobStore>,
     ) -> Self {
-        Self::build_with_state(config, system, cwd, events, blobs, None, None).await
+        Self::build_with_state(config, system, cwd, events, blobs, None, None, &[], 1.0).await
     }
 
     /// Full assembly used by the daemon: instructions, workspace summary,
-    /// cross-session memory, the current task list and image blobs.
+    /// cross-session memory, the current task list, image blobs and the tool
+    /// schemas sent with the request. `token_scale` calibrates the cheap local
+    /// estimate against provider-reported prompt usage.
     pub async fn build_with_state(
         config: &Config,
         system: String,
@@ -144,6 +149,8 @@ impl Ledger {
         blobs: Option<&BlobStore>,
         memory: Option<String>,
         tasks: Option<String>,
+        tools: &[ToolDefinition],
+        token_scale: f64,
     ) -> Self {
         let instructions = load_instructions(config, cwd).await;
         let workspace = if config.context.workspace_summary {
@@ -162,6 +169,8 @@ impl Ledger {
             config.context.budget_tokens,
             config.context.tool_output_tokens,
             &images,
+            tools,
+            token_scale,
         )
     }
 
@@ -183,6 +192,8 @@ impl Ledger {
             budget_tokens,
             DEFAULT_TOOL_OUTPUT_TOKENS,
             &HashMap::new(),
+            &[],
+            1.0,
         )
     }
 
@@ -196,6 +207,8 @@ impl Ledger {
         budget_tokens: usize,
         tool_output_tokens: usize,
         images: &HashMap<String, ImagePart>,
+        tools: &[ToolDefinition],
+        token_scale: f64,
     ) -> Self {
         let policy = Policy::from_events(events);
         let mut entries = Vec::new();
@@ -228,6 +241,9 @@ impl Ledger {
                 &policy,
             ));
         }
+        if !tools.is_empty() {
+            entries.push(tool_schema_entry(tools));
+        }
         if let Some(text) = memory {
             entries.push(synthesized(
                 "memory",
@@ -250,8 +266,8 @@ impl Ledger {
         }
         entries.extend(event_entries(events, &policy, images, tool_output_tokens));
 
-        let entries = apply_compactions(entries, &policy.compactions);
-        let mut entries = entries;
+        let mut entries = apply_compactions(entries, &policy.compactions);
+        scale_entries(&mut entries, token_scale);
         let trimmed = trim(&mut entries, budget_tokens);
         let result = summarize(&entries, budget_tokens, trimmed);
 
@@ -371,6 +387,25 @@ impl Ledger {
         }
         Some((from, cutoff - 1))
     }
+}
+
+fn tool_schema_entry(tools: &[ToolDefinition]) -> Entry {
+    let tokens = estimate_tool_schema_tokens(tools);
+    let mut entry = make_entry(
+        "tools:schema".to_string(),
+        Sector::Tools,
+        "tool_schema".to_string(),
+        Vec::new(),
+        None,
+        false,
+    );
+    entry.info.tokens = tokens;
+    entry.info.preview = format!("{} tool definitions", tools.len());
+    entry.info.detail = format!(
+        "Tool JSON schemas are sent with every request ({} tools).",
+        tools.len()
+    );
+    entry
 }
 
 fn synthesized(
@@ -605,6 +640,73 @@ fn with_policy(mut entry: Entry, policy: &Policy) -> Entry {
     entry
 }
 
+/// Estimate one provider message, including tool-call arguments and images.
+/// The old implementation only counted `content`, which made a tool-heavy
+/// request look much smaller than the JSON the provider actually receives.
+pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    let mut tokens = estimate_tokens(&message.content) + 4;
+    if let Some(name) = &message.name {
+        tokens += estimate_tokens(name) + 2;
+    }
+    if let Some(call_id) = &message.tool_call_id {
+        tokens += estimate_tokens(call_id) + 4;
+    }
+    if let Some(calls) = &message.tool_calls {
+        for call in calls {
+            tokens += estimate_tokens(&call.id)
+                + estimate_tokens(&call.function.name)
+                + estimate_tokens(&call.function.arguments)
+                + 8;
+        }
+    }
+    tokens += message.images.len() * IMAGE_TOKEN_ESTIMATE;
+    tokens
+}
+
+pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
+    messages.iter().map(estimate_message_tokens).sum()
+}
+
+/// Tool definitions are part of every request even though they are not chat
+/// messages. Serialize them so names, descriptions and parameter schemas are
+/// all accounted for.
+pub fn estimate_tool_schema_tokens(tools: &[ToolDefinition]) -> usize {
+    tools
+        .iter()
+        .map(|tool| {
+            let text = serde_json::to_string(tool).unwrap_or_else(|_| {
+                format!(
+                    "{} {} {}",
+                    tool.function.name, tool.function.description, tool.function.parameters
+                )
+            });
+            estimate_tokens(&text) + 4
+        })
+        .sum()
+}
+
+/// Total prompt estimate used for calibration: messages plus tool schemas.
+pub fn estimate_request_tokens(messages: &[ChatMessage], tools: &[ToolDefinition]) -> usize {
+    estimate_messages_tokens(messages) + estimate_tool_schema_tokens(tools)
+}
+
+fn scale_tokens(tokens: usize, scale: f64) -> usize {
+    if tokens == 0 || !scale.is_finite() || (scale - 1.0).abs() <= f64::EPSILON {
+        return tokens;
+    }
+    let scale = scale.clamp(0.25, 4.0);
+    (tokens as f64 * scale).ceil() as usize
+}
+
+fn scale_entries(entries: &mut [Entry], scale: f64) {
+    if !scale.is_finite() || (scale - 1.0).abs() <= f64::EPSILON {
+        return;
+    }
+    for entry in entries {
+        entry.info.tokens = scale_tokens(entry.info.tokens, scale);
+    }
+}
+
 fn make_entry(
     id: String,
     sector: Sector,
@@ -617,8 +719,7 @@ fn make_entry(
     let mut chars = 0;
     let mut parts = Vec::new();
     for message in &messages {
-        // Role/formatting overhead, roughly what chat templates add.
-        tokens += estimate_tokens(&message.content) + 4;
+        tokens += estimate_message_tokens(message);
         chars += message.content.chars().count();
         if !message.content.is_empty() {
             parts.push(message.content.clone());
@@ -705,9 +806,16 @@ fn summary_entry(compaction: &Compaction) -> Entry {
 /// [`KEEP_NEWEST`] and anything pinned. Returns nothing; callers read the
 /// `auto` flags afterwards.
 fn trim_sector(entries: &mut [Entry], sector: Sector, cap: usize) {
+    // Tool schemas are fixed request overhead: the total budget counts them,
+    // but they must not consume the trimmable tool-output share.
     let mut total: usize = entries
         .iter()
-        .filter(|entry| entry.info.sector == sector && !entry.info.dropped && !entry.info.compacted)
+        .filter(|entry| {
+            entry.info.sector == sector
+                && entry.info.kind != "tool_schema"
+                && !entry.info.dropped
+                && !entry.info.compacted
+        })
         .map(|entry| entry.info.tokens)
         .sum();
     if total <= cap {
@@ -1175,6 +1283,137 @@ mod tests {
     }
 
     #[test]
+    fn message_estimate_counts_tool_arguments_and_images() {
+        let plain = ChatMessage::assistant("");
+        let mut call = call("call_1");
+        call.function.arguments = format!("{{\"path\":\"{}\"}}", "x".repeat(4_000));
+        let with_tool = ChatMessage::assistant_with_tools("", vec![call]);
+        assert!(
+            estimate_message_tokens(&with_tool) > estimate_message_tokens(&plain) + 900,
+            "tool-call arguments must be part of the request estimate"
+        );
+
+        let text_only = ChatMessage::user("look");
+        let image = ImagePart {
+            mime: "image/png".into(),
+            data: "aGVsbG8=".into(),
+        };
+        let with_image = ChatMessage::user_with_images("look", vec![image]);
+        assert_eq!(
+            estimate_message_tokens(&with_image),
+            estimate_message_tokens(&text_only) + IMAGE_TOKEN_ESTIMATE
+        );
+    }
+
+    #[test]
+    fn tool_schemas_are_visible_but_not_editable_or_sent_as_messages() {
+        let tools = vec![ToolDefinition::function(
+            "read_file",
+            "Read a file from disk",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" } },
+                "required": ["path"]
+            }),
+        )];
+        let events = vec![user(1, "hello")];
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            None,
+            None,
+            None,
+            &events,
+            10_000,
+            4_000,
+            &HashMap::new(),
+            &tools,
+            1.0,
+        );
+        let info = ledger.info();
+        let schema = info
+            .entries
+            .iter()
+            .find(|entry| entry.id == "tools:schema")
+            .expect("tool schema entry");
+        assert_eq!(schema.sector, Sector::Tools);
+        assert_eq!(schema.kind, "tool_schema");
+        assert!(!schema.editable);
+        assert!(schema.tokens > 0);
+        // It contributes tokens but no chat message.
+        assert_eq!(ledger.messages().len(), 2);
+        assert!(info.total_tokens >= schema.tokens);
+
+        // Even under heavy pressure the schema stays: tools cannot be called
+        // without it, so it must never be auto-dropped.
+        let tight = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            None,
+            None,
+            None,
+            &events,
+            1_000,
+            400,
+            &HashMap::new(),
+            &tools,
+            1.0,
+        );
+        let schema = tight
+            .info()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "tools:schema")
+            .expect("tool schema entry");
+        assert!(!schema.dropped);
+    }
+
+    #[test]
+    fn calibration_scale_is_applied_before_trimming() {
+        let events = vec![user(1, "hello")];
+        let base = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            None,
+            None,
+            None,
+            &events,
+            10_000,
+            4_000,
+            &HashMap::new(),
+            &[],
+            1.0,
+        );
+        let scaled = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            None,
+            None,
+            None,
+            &events,
+            10_000,
+            4_000,
+            &HashMap::new(),
+            &[],
+            2.0,
+        );
+        let base_user = base
+            .info()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "e1")
+            .unwrap();
+        let scaled_user = scaled
+            .info()
+            .entries
+            .into_iter()
+            .find(|entry| entry.id == "e1")
+            .unwrap();
+        assert_eq!(scaled_user.tokens, base_user.tokens * 2);
+        assert!(scaled.info().total_tokens > base.info().total_tokens);
+    }
+
+    #[test]
     fn entries_follow_the_event_log_and_map_to_messages() {
         let events = vec![user(1, "hello"), assistant(2, "hi there")];
         let ledger = Ledger::assemble(
@@ -1486,6 +1725,8 @@ mod tests {
             100_000,
             100,
             &HashMap::new(),
+            &[],
+            1.0,
         );
         let tool = ledger
             .messages()
@@ -1515,6 +1756,8 @@ mod tests {
             10_000,
             4_000,
             &HashMap::new(),
+            &[],
+            1.0,
         );
         let info = ledger.info();
         assert!(info.entries.iter().any(|entry| entry.id == "memory"));
@@ -1550,6 +1793,8 @@ mod tests {
             1_500,
             400,
             &HashMap::new(),
+            &[],
+            1.0,
         );
         let info = ledger.info();
         assert!(info.total_tokens <= info.budget_tokens, "{info:?}");

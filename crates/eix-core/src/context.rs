@@ -82,7 +82,7 @@ pub struct ContextEntryInfo {
     pub id: String,
     pub sector: Sector,
     /// `system`, `instructions`, `workspace`, `user`, `assistant`, `tool_step`,
-    /// `tool` or `summary`.
+    /// `tool`, `tool_schema` or `summary`.
     pub kind: String,
     pub tokens: usize,
     pub chars: usize,
