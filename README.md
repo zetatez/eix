@@ -944,10 +944,13 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 make release                  # 构建当前 OS/arch 并生成原生安装包
 make dist                     # 构建当前 OS 支持的所有格式
 make package-arch             # Arch Linux: dist/eix-<version>-1-<arch>.pkg.tar.zst
-make package-deb              # Debian/Ubuntu: dist/eix_<version>_<amd64|arm64>.deb
+make package-deb              # Debian/Ubuntu: dist/eix_<version>_<x86_64|arm64>.deb
 make package-tar              # 通用包: dist/eix-<version>-<os>-<arch>.tar.gz
-make package-macos            # macOS: tar.gz + Homebrew formula
+make package-darwin           # Darwin/macOS: tar.gz + Homebrew formula
 ```
+
+`package-deb` 的文件名使用 `x86_64`/`arm64`，但 `DEBIAN/control` 仍写入 Debian 要求的
+`amd64`/`arm64`/`armhf`，避免 `dpkg` 拒绝安装。
 
 产物都在 `dist/`（Arch 的 `makepkg` 工作目录也在 `dist/makepkg/`，不会污染仓库根目录）。
 macOS 会生成二进制 tarball 和对应的 Homebrew formula（例如 `dist/eix-arm64.rb`），可以直接本地安装：
