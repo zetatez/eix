@@ -45,10 +45,10 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
-use crate::context::{estimate_request_tokens, Ledger};
+use crate::context::{estimate_request_tokens, estimate_tool_schema_tokens, Ledger, StaticContext};
 use crate::process::ProcessRegistry;
 use crate::provider::{Provider, ProviderError, RetryClass};
 use crate::snapshot::{Scope, Snapshotter};
@@ -100,6 +100,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         temporary_permissions: std::sync::Mutex::new(HashMap::new()),
         skill_tools: Mutex::new(HashMap::new()),
         token_scales: std::sync::Mutex::new(HashMap::new()),
+        model_catalog: Mutex::new(ModelCatalogCache::default()),
     });
     let restored = daemon.staging.load();
     if restored > 0 {
@@ -336,6 +337,16 @@ pub(crate) struct Daemon {
     /// provider-reported prompt usage. Starts at 1.0 and is updated with a
     /// bounded EWMA after each completed request.
     token_scales: std::sync::Mutex<HashMap<String, f64>>,
+    /// Cached merged model catalog. `/model` may be opened repeatedly; don't
+    /// hit every provider on each open.
+    model_catalog: Mutex<ModelCatalogCache>,
+}
+
+#[derive(Default)]
+struct ModelCatalogCache {
+    fetched_at: Option<Instant>,
+    models: Vec<eix_core::ModelInfo>,
+    warnings: Vec<String>,
 }
 
 struct PendingApproval {
@@ -773,9 +784,10 @@ impl Daemon {
                     session: self.create_session(params).await?,
                 })?)
             }
-            "model.list" => Ok(serde_json::to_value(ModelListResult {
-                models: self.config.load().models(),
-            })?),
+            "model.list" => {
+                let (models, warnings) = self.model_catalog().await;
+                Ok(serde_json::to_value(ModelListResult { models, warnings })?)
+            }
             "config.reload" => {
                 let paths = self.reload_config().await?;
                 Ok(json!({ "reloaded": true, "paths": paths }))
@@ -1941,6 +1953,40 @@ impl Daemon {
             .collect()
     }
 
+    /// Merged static catalog plus provider `/models` results. Fetch failures
+    /// are warnings, never hard errors: a local or offline provider must not
+    /// hide the models that are configured explicitly.
+    async fn model_catalog(&self) -> (Vec<eix_core::ModelInfo>, Vec<String>) {
+        const CACHE_TTL: Duration = Duration::from_secs(300);
+        const FAILED_CACHE_TTL: Duration = Duration::from_secs(30);
+        {
+            let cache = self.model_catalog.lock().await;
+            let ttl = if cache.warnings.is_empty() {
+                CACHE_TTL
+            } else {
+                // Retry a temporarily offline provider sooner than a healthy
+                // catalog, without hammering it on every picker open.
+                FAILED_CACHE_TTL
+            };
+            if cache
+                .fetched_at
+                .is_some_and(|fetched| fetched.elapsed() < ttl)
+            {
+                return (cache.models.clone(), cache.warnings.clone());
+            }
+        }
+
+        let config = self.config.load_full();
+        let configured = config.models();
+        let (fetched, warnings) = crate::model_catalog::fetch_all(&config).await;
+        let models = crate::model_catalog::merge(configured, fetched);
+        let mut cache = self.model_catalog.lock().await;
+        cache.fetched_at = Some(Instant::now());
+        cache.models = models.clone();
+        cache.warnings = warnings.clone();
+        (models, warnings)
+    }
+
     /// Re-read the config layers and rebuild the provider. Existing sessions
     /// keep their model and permission; new tool/context/MCP settings apply to
     /// the next turn. A bad file keeps the previous config in place.
@@ -1959,6 +2005,7 @@ impl Daemon {
         self.blobs.set_config(next.images.clone());
         self.provider.store(Arc::new(provider));
         self.config.store(Arc::new(next));
+        *self.model_catalog.lock().await = ModelCatalogCache::default();
         self.mcp.lock().await.clear();
         self.lsp.lock().await.clear();
         Ok(paths)
@@ -2162,10 +2209,26 @@ impl Daemon {
             definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
         }
         if !read_only && !sub_agent && mcp_configured {
-            let mut mcp = self.mcp.lock().await;
-            mcp.ensure_loaded(self.config.load().as_ref()).await;
-            mcp.refresh(self.config.load().as_ref()).await;
-            definitions.extend(mcp.tool_definitions());
+            let config = self.config.load_full();
+            let mcp_tools = {
+                let mut mcp = self.mcp.lock().await;
+                mcp.ensure_loaded(&config).await;
+                mcp.refresh(&config).await;
+                mcp.tool_definitions()
+            };
+            // Tool schemas are paid for on every request. Built-ins always fit;
+            // cap dynamic MCP schemas so a large server cannot consume the
+            // whole context before the model sees the user's message.
+            let cap = config.context.max_tool_schema_tokens;
+            let (kept, omitted) =
+                cap_tool_schemas(std::mem::take(&mut definitions), mcp_tools, cap);
+            definitions = kept;
+            if omitted > 0 {
+                eprintln!(
+                    "eixd: omitted {omitted} MCP tool(s) to keep tool schemas under \
+                     {cap} tokens; narrow mcp.servers.*.allowed_tools to expose them"
+                );
+            }
         }
         if let Err(err) = self
             .run_turn_inner(&session_id, &turn_id, &cancel, &definitions)
@@ -2186,38 +2249,47 @@ impl Daemon {
         self: &Arc<Self>,
         session_id: &str,
         turn_id: &str,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
         allowed_tools: &[ToolDefinition],
     ) -> Result<()> {
         let session = self.require_session(session_id)?;
+        let config = self.config.load_full();
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| self.config.load().provider.model.clone().to_string());
+            .unwrap_or_else(|| config.provider.model.clone());
         let turn_started = Instant::now();
+        let static_context = StaticContext::load(&config, &session.cwd).await;
+        let mut events = self.store.events_async(session_id).await?;
+        let mut last_seq = events.last().map(|event| event.seq).unwrap_or(0);
         let ledger = self
-            .build_ledger_with_tools(session_id, allowed_tools)
+            .build_ledger_from_events(session_id, allowed_tools, &events, &static_context)
             .await?;
-        let keep_turns = self.config.load().context.auto_compact_keep_turns;
-        let (ledger, _) =
-            if self.config.load().context.auto_compact && session.origin != SessionOrigin::Agent {
-                self.auto_compact_if_needed(session_id, ledger, false, keep_turns, allowed_tools)
-                    .await
-            } else {
-                (ledger, false)
-            };
+        let keep_turns = config.context.auto_compact_keep_turns;
+        let (ledger, _) = if config.context.auto_compact && session.origin != SessionOrigin::Agent {
+            self.auto_compact_if_needed(
+                session_id,
+                ledger,
+                false,
+                keep_turns,
+                allowed_tools,
+                &mut events,
+                &mut last_seq,
+                &static_context,
+            )
+            .await
+        } else {
+            (ledger, false)
+        };
         let mut messages = ledger.messages();
         self.emit_context(session_id, &ledger);
         let tools = allowed_tools;
-        let route = self.config.load().route(&model);
-        let (max_retries, retry_base, retry_max) = {
-            let config = self.config.load();
-            (
-                config.provider.retry_attempts,
-                Duration::from_millis(config.provider.retry_base_ms.max(1)),
-                Duration::from_secs(config.provider.retry_max_secs.max(1)),
-            )
-        };
+        let route = config.route(&model);
+        let (max_retries, retry_base, retry_max) = (
+            config.provider.retry_attempts,
+            Duration::from_millis(config.provider.retry_base_ms.max(1)),
+            Duration::from_secs(config.provider.retry_max_secs.max(1)),
+        );
         // Bound expensive summaries and context-window recoveries so a broken
         // provider/model pair cannot loop forever inside one user turn.
         let mut auto_compactions = 0u32;
@@ -2234,15 +2306,26 @@ impl Daemon {
             // updates, and lets auto-compaction run mid-turn instead of only
             // before the first request.
             if round > 0 {
+                self.refresh_turn_events(session_id, &mut events, &mut last_seq)
+                    .await?;
                 let refreshed = self
-                    .build_ledger_with_tools(session_id, allowed_tools)
+                    .build_ledger_from_events(session_id, allowed_tools, &events, &static_context)
                     .await?;
                 let auto_compact = self.config.load().context.auto_compact
                     && session.origin != SessionOrigin::Agent;
                 let keep = self.config.load().context.auto_compact_keep_turns;
                 let (refreshed, compacted) = if auto_compact && auto_compactions < 2 {
-                    self.auto_compact_if_needed(session_id, refreshed, false, keep, allowed_tools)
-                        .await
+                    self.auto_compact_if_needed(
+                        session_id,
+                        refreshed,
+                        false,
+                        keep,
+                        allowed_tools,
+                        &mut events,
+                        &mut last_seq,
+                        &static_context,
+                    )
+                    .await
                 } else {
                     (refreshed, false)
                 };
@@ -2263,30 +2346,36 @@ impl Daemon {
                 let mut streamed_reasoning = String::new();
                 let estimated_prompt = estimate_request_tokens(&messages, tools);
                 let outcome = provider
-                    .stream_chat(&messages, &route, tools, cancel, |delta| match delta {
-                        crate::provider::StreamDelta::Content(text) => {
-                            streamed.push_str(text);
-                            let _ = bus.send(Notification::new(
-                                "message.delta",
-                                json!({
-                                    "session_id": sid,
-                                    "turn_id": tid,
-                                    "delta": text,
-                                }),
-                            ));
-                        }
-                        crate::provider::StreamDelta::Reasoning(text) => {
-                            streamed_reasoning.push_str(text);
-                            let _ = bus.send(Notification::new(
-                                "reasoning.delta",
-                                json!({
-                                    "session_id": sid,
-                                    "turn_id": tid,
-                                    "delta": text,
-                                }),
-                            ));
-                        }
-                    })
+                    .stream_chat(
+                        &messages,
+                        &route,
+                        tools,
+                        cancel.as_ref(),
+                        |delta| match delta {
+                            crate::provider::StreamDelta::Content(text) => {
+                                streamed.push_str(text);
+                                let _ = bus.send(Notification::new(
+                                    "message.delta",
+                                    json!({
+                                        "session_id": sid,
+                                        "turn_id": tid,
+                                        "delta": text,
+                                    }),
+                                ));
+                            }
+                            crate::provider::StreamDelta::Reasoning(text) => {
+                                streamed_reasoning.push_str(text);
+                                let _ = bus.send(Notification::new(
+                                    "reasoning.delta",
+                                    json!({
+                                        "session_id": sid,
+                                        "turn_id": tid,
+                                        "delta": text,
+                                    }),
+                                ));
+                            }
+                        },
+                    )
                     .await;
 
                 if cancel.load(Ordering::SeqCst) {
@@ -2332,8 +2421,15 @@ impl Daemon {
                             && context_recoveries < 2 =>
                     {
                         context_recoveries += 1;
+                        self.refresh_turn_events(session_id, &mut events, &mut last_seq)
+                            .await?;
                         let ledger = self
-                            .build_ledger_with_tools(session_id, allowed_tools)
+                            .build_ledger_from_events(
+                                session_id,
+                                allowed_tools,
+                                &events,
+                                &static_context,
+                            )
                             .await?;
                         // The first recovery keeps the configured recent turns;
                         // the second is deliberately aggressive.
@@ -2343,7 +2439,16 @@ impl Daemon {
                             1
                         };
                         let (ledger, compacted) = self
-                            .auto_compact_if_needed(session_id, ledger, true, keep, allowed_tools)
+                            .auto_compact_if_needed(
+                                session_id,
+                                ledger,
+                                true,
+                                keep,
+                                allowed_tools,
+                                &mut events,
+                                &mut last_seq,
+                                &static_context,
+                            )
                             .await;
                         if !compacted {
                             return Err(anyhow::anyhow!("{err}"));
@@ -2508,7 +2613,7 @@ impl Daemon {
         turn_id: &str,
         calls: &[ToolCall],
         messages: &mut Vec<ChatMessage>,
-        cancel: &AtomicBool,
+        cancel: &Arc<AtomicBool>,
     ) -> Result<()> {
         // A batch made entirely of read-only tools can run concurrently. This
         // is the common "inspect several files/directories" pattern; keeping
@@ -2518,35 +2623,59 @@ impl Daemon {
                 .iter()
                 .all(|call| tools::parallel_safe(&call.function.name))
         {
-            let results = futures_util::future::join_all(
-                calls
-                    .iter()
-                    .map(|call| self.run_readonly_call(session_id, turn_id, call, cancel)),
-            )
-            .await;
+            // Bound fan-out: a provider can ask for dozens of reads in one
+            // turn, and each one may open files or hit the network.
+            const READONLY_CONCURRENCY: usize = 8;
+            let limit = Arc::new(Semaphore::new(READONLY_CONCURRENCY));
+            let results = futures_util::future::join_all(calls.iter().map(|call| {
+                let daemon = Arc::clone(self);
+                let limit = Arc::clone(&limit);
+                async move {
+                    let _permit = limit.acquire_owned().await.expect("semaphore open");
+                    daemon
+                        .run_readonly_call(session_id, turn_id, call, cancel.as_ref())
+                        .await
+                }
+            }));
+            let results = results.await;
             for result in results {
                 messages.push(result?);
             }
             return Ok(());
         }
 
-        let mut agents: Vec<(String, tokio::task::JoinHandle<Result<String>>)> = Vec::new();
+        // Run writes/commands first, then sub-agents. A child is read-only but
+        // shares the workspace; starting it before the parent's writes in the
+        // same batch would let it observe a half-applied change.
+        let mut agent_calls = Vec::new();
         for call in calls {
             if call.function.name == "spawn_agent" {
-                let daemon = Arc::clone(self);
-                let call = call.clone();
-                let call_id = call.id.clone();
-                let sid = session_id.to_string();
-                let tid = turn_id.to_string();
-                let handle =
-                    tokio::spawn(async move { daemon.spawn_agent(&sid, &tid, &call).await });
-                agents.push((call_id, handle));
+                agent_calls.push(call.clone());
             } else {
-                self.run_tool_call(session_id, turn_id, call, messages, cancel)
+                self.run_tool_call(session_id, turn_id, call, messages, cancel.as_ref())
                     .await?;
             }
             if cancel.load(Ordering::SeqCst) {
                 break;
+            }
+        }
+
+        const AGENT_CONCURRENCY: usize = 2;
+        let agent_limit = Arc::new(Semaphore::new(AGENT_CONCURRENCY));
+        let mut agents: Vec<(String, tokio::task::JoinHandle<Result<String>>)> = Vec::new();
+        if !cancel.load(Ordering::SeqCst) {
+            for call in agent_calls {
+                let daemon = Arc::clone(self);
+                let call_id = call.id.clone();
+                let sid = session_id.to_string();
+                let tid = turn_id.to_string();
+                let limit = Arc::clone(&agent_limit);
+                let parent_cancel = Arc::clone(cancel);
+                let handle = tokio::spawn(async move {
+                    let _permit = limit.acquire_owned().await.expect("semaphore open");
+                    daemon.spawn_agent(&sid, &tid, &call, parent_cancel).await
+                });
+                agents.push((call_id, handle));
             }
         }
         for (call_id, handle) in agents {
@@ -2623,7 +2752,16 @@ impl Daemon {
             .await
         {
             Some(outcome) => outcome,
-            None => tools::execute(tool, &args, &session.cwd, &self.config.load()).await,
+            None => {
+                tools::execute_with_cancel(
+                    tool,
+                    &args,
+                    &session.cwd,
+                    &self.config.load(),
+                    Some(cancel),
+                )
+                .await
+            }
         };
         let (ok, output, duration_ms) = (outcome.ok, outcome.output, outcome.duration_ms);
         self.record_tool_result(session_id, call, ok, false, &output, duration_ms)?;
@@ -2653,8 +2791,12 @@ impl Daemon {
         parent_id: &'a str,
         parent_turn: &'a str,
         call: &'a ToolCall,
+        parent_cancel: Arc<AtomicBool>,
     ) -> futures_util::future::BoxFuture<'a, Result<String>> {
-        Box::pin(async move { self.spawn_agent_outer(parent_id, parent_turn, call).await })
+        Box::pin(async move {
+            self.spawn_agent_outer(parent_id, parent_turn, call, parent_cancel)
+                .await
+        })
     }
 
     async fn spawn_agent_outer(
@@ -2662,6 +2804,7 @@ impl Daemon {
         parent_id: &str,
         parent_turn: &str,
         call: &ToolCall,
+        parent_cancel: Arc<AtomicBool>,
     ) -> Result<String> {
         let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
         let event = self.store.append_event(
@@ -2676,7 +2819,9 @@ impl Daemon {
         self.emit_event(&event);
 
         let parent = self.require_session(parent_id)?;
-        let result = self.spawn_agent_inner(&parent, parent_turn, &args).await;
+        let result = self
+            .spawn_agent_inner(&parent, parent_turn, &args, parent_cancel)
+            .await;
         let (ok, output) = match result {
             Ok(output) => (true, output),
             Err(err) => (false, format!("{err:#}")),
@@ -2704,6 +2849,7 @@ impl Daemon {
         parent: &Session,
         parent_turn: &str,
         args: &Value,
+        parent_cancel: Arc<AtomicBool>,
     ) -> Result<String> {
         if parent.origin == SessionOrigin::Agent {
             bail!("sub-agents cannot spawn further sub-agents (depth limit is 1)");
@@ -2752,11 +2898,11 @@ impl Daemon {
         self.store.create_session(&child)?;
         self.emit_session(&child);
 
-        let cancel = Arc::new(AtomicBool::new(false));
+        let child_cancel = Arc::new(AtomicBool::new(false));
         self.turns
             .lock()
             .await
-            .insert(child.id.clone(), Arc::clone(&cancel));
+            .insert(child.id.clone(), Arc::clone(&child_cancel));
         self.emit_value(
             "agent.spawned",
             json!({
@@ -2767,7 +2913,21 @@ impl Daemon {
             }),
         );
 
-        let run = self.run_child_turn(&child, prompt).await;
+        // Cancelling the parent must also stop the child. The watcher keeps the
+        // child's own `turns` entry authoritative, so `prompt.cancel` on the
+        // child and parent cancellation both land on the same flag.
+        let watcher = {
+            let child_cancel = Arc::clone(&child_cancel);
+            let parent_cancel = Arc::clone(&parent_cancel);
+            tokio::spawn(async move {
+                wait_for_cancel(&parent_cancel).await;
+                child_cancel.store(true, Ordering::SeqCst);
+            })
+        };
+        let run = self
+            .run_child_turn(&child, prompt, Arc::clone(&child_cancel))
+            .await;
+        watcher.abort();
         self.turns.lock().await.remove(&child.id);
 
         let text = run?;
@@ -2795,7 +2955,12 @@ impl Daemon {
     }
 
     /// Run one bounded, read-only turn for a sub-agent and return its answer.
-    async fn run_child_turn(self: &Arc<Self>, child: &Session, prompt: &str) -> Result<String> {
+    async fn run_child_turn(
+        self: &Arc<Self>,
+        child: &Session,
+        prompt: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<String> {
         let event = self.store.append_event(
             &child.id,
             EventKind::UserMessage,
@@ -2808,7 +2973,6 @@ impl Daemon {
         self.transition(&child.id, SessionStatus::Running)?;
 
         let turn_id = Uuid::new_v4().to_string();
-        let cancel = AtomicBool::new(false);
         let readonly = tools::readonly_definitions();
         self.emit_value(
             "turn.started",
@@ -2829,7 +2993,7 @@ impl Daemon {
             return Err(err);
         }
 
-        let events = self.store.events(&child.id)?;
+        let events = self.store.events_async(&child.id).await?;
         for event in events.iter().rev() {
             if event.kind != EventKind::AssistantMessage {
                 continue;
@@ -3134,7 +3298,14 @@ impl Daemon {
                         {
                             Some(outcome) => outcome,
                             None => {
-                                tools::execute(tool, &args, &session.cwd, &self.config.load()).await
+                                tools::execute_with_cancel(
+                                    tool,
+                                    &args,
+                                    &session.cwd,
+                                    &self.config.load(),
+                                    Some(cancel),
+                                )
+                                .await
                             }
                         }
                     }
@@ -3408,7 +3579,7 @@ impl Daemon {
     async fn build_ledger(&self, session_id: &str) -> Result<Ledger> {
         let session = self.require_session(session_id)?;
         let tools = self.standard_tool_definitions(&session);
-        self.build_ledger_with_tools(session_id, &tools).await
+        self.build_ledger_with_tools(session_id, &tools, None).await
     }
 
     /// The tools a normal turn would see, without starting MCP servers.
@@ -3439,13 +3610,40 @@ impl Daemon {
     }
 
     /// Rebuild the ledger with the exact tool schemas the request will carry.
+    /// When `static_context` is supplied, instructions and the workspace
+    /// summary are reused instead of walking the repository again.
     async fn build_ledger_with_tools(
         &self,
         session_id: &str,
         tools: &[ToolDefinition],
+        static_context: Option<&StaticContext>,
     ) -> Result<Ledger> {
         let session = self.require_session(session_id)?;
-        let events = self.store.events(session_id)?;
+        let events = self.store.events_async(session_id).await?;
+        let loaded;
+        let static_context = match static_context {
+            Some(context) => context,
+            None => {
+                let config = self.config.load_full();
+                loaded = StaticContext::load(&config, &session.cwd).await;
+                &loaded
+            }
+        };
+        self.build_ledger_from_events(session_id, tools, &events, static_context)
+            .await
+    }
+
+    /// Assemble the ledger from an event snapshot. The turn loop keeps this
+    /// snapshot and appends only new events after each tool batch.
+    async fn build_ledger_from_events(
+        &self,
+        session_id: &str,
+        tools: &[ToolDefinition],
+        events: &[Event],
+        static_context: &StaticContext,
+    ) -> Result<Ledger> {
+        let session = self.require_session(session_id)?;
+        let config = self.config.load_full();
         let permission = self.session_permission(&session);
         let todos = self
             .todos
@@ -3459,19 +3657,38 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| self.config.load().provider.model.clone());
-        Ok(Ledger::build_with_state(
-            &self.config.load(),
-            system_prompt(&self.config.load(), &session, permission),
-            &session.cwd,
-            &events,
+            .unwrap_or_else(|| config.provider.model.clone());
+        let route = config.route(&model);
+        let budget = config.context.effective_budget_tokens(route.context_tokens);
+        Ok(Ledger::build_with_state_and_static(
+            &config,
+            system_prompt(&config, &session, permission),
+            static_context,
+            events,
             Some(&self.blobs),
             memory,
             tasks,
             tools,
             self.token_scale(&model),
+            budget,
         )
         .await)
+    }
+
+    /// Append events written since the last snapshot. Compaction events and
+    /// tool results are picked up here without re-reading the whole log.
+    async fn refresh_turn_events(
+        &self,
+        session_id: &str,
+        events: &mut Vec<Event>,
+        last_seq: &mut u64,
+    ) -> Result<()> {
+        let new_events = self.store.events_after_async(session_id, *last_seq).await?;
+        if let Some(last) = new_events.last() {
+            *last_seq = last.seq;
+        }
+        events.extend(new_events);
+        Ok(())
     }
 
     fn token_scale(&self, model: &str) -> f64 {
@@ -3709,6 +3926,7 @@ impl Daemon {
     /// threshold after the provider reports a context-length error. Summary
     /// failures are logged and ignored: a provider hiccup must not block the
     /// turn.
+    #[allow(clippy::too_many_arguments)]
     async fn auto_compact_if_needed(
         &self,
         session_id: &str,
@@ -3716,6 +3934,9 @@ impl Daemon {
         force: bool,
         keep: usize,
         tools: &[ToolDefinition],
+        events: &mut Vec<Event>,
+        last_seq: &mut u64,
+        static_context: &StaticContext,
     ) -> (Ledger, bool) {
         let info = ledger.info();
         let threshold = self.config.load().context.auto_compact_threshold;
@@ -3783,7 +4004,14 @@ impl Daemon {
                 "auto": true,
             }),
         );
-        match self.build_ledger_with_tools(session_id, tools).await {
+        if let Err(err) = self.refresh_turn_events(session_id, events, last_seq).await {
+            eprintln!("eixd: auto-compaction event refresh failed: {err:#}");
+            return (ledger, true);
+        }
+        match self
+            .build_ledger_from_events(session_id, tools, events, static_context)
+            .await
+        {
             Ok(ledger) => {
                 self.emit_context(session_id, &ledger);
                 (ledger, true)
@@ -5253,6 +5481,27 @@ fn is_mcp_meta(tool: &str) -> bool {
     )
 }
 
+/// Keep built-in schemas and append dynamic MCP schemas while they fit. The
+/// caller logs `omitted` so a truncated tool list is never silent.
+fn cap_tool_schemas(
+    mut builtins: Vec<ToolDefinition>,
+    dynamic: Vec<ToolDefinition>,
+    cap: usize,
+) -> (Vec<ToolDefinition>, usize) {
+    let mut used = estimate_tool_schema_tokens(&builtins);
+    let mut omitted = 0;
+    for tool in dynamic {
+        let cost = estimate_tool_schema_tokens(std::slice::from_ref(&tool));
+        if used.saturating_add(cost) <= cap {
+            used += cost;
+            builtins.push(tool);
+        } else {
+            omitted += 1;
+        }
+    }
+    (builtins, omitted)
+}
+
 /// Tiny wildcard matcher for skill tool restrictions (`*` and `?`).
 fn wildcard_matches(pattern: &str, text: &str) -> bool {
     fn inner(pattern: &[u8], text: &[u8]) -> bool {
@@ -5452,6 +5701,37 @@ mod tests {
         close(calibrated_scale(1.0, 1_000, 100_000), 1.3);
         close(calibrated_scale(1.9, 1_000, 100_000), 1.93);
         close(calibrated_scale(0.6, 1_000, 1), 0.57);
+    }
+
+    #[test]
+    fn dynamic_tool_schemas_are_omitted_when_they_exceed_the_cap() {
+        let builtin = vec![ToolDefinition::function(
+            "read_file",
+            "Read a file",
+            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
+        )];
+        let dynamic = vec![
+            ToolDefinition::function(
+                "mcp__one__tool",
+                "First dynamic tool",
+                json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+            ),
+            ToolDefinition::function(
+                "mcp__two__tool",
+                "Second dynamic tool",
+                json!({"type": "object", "properties": {"b": {"type": "string"}}}),
+            ),
+        ];
+        let builtin_cost = estimate_tool_schema_tokens(&builtin);
+        let first_cost = estimate_tool_schema_tokens(&dynamic[..1]);
+        let (kept, omitted) =
+            cap_tool_schemas(builtin.clone(), dynamic.clone(), builtin_cost + first_cost);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(omitted, 1);
+        // Built-ins survive even when the cap is already exhausted.
+        let (kept, omitted) = cap_tool_schemas(builtin, dynamic, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(omitted, 2);
     }
 
     #[test]

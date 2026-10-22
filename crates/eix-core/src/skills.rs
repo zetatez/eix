@@ -43,10 +43,8 @@ pub fn load_skills(cwd: &Path) -> Vec<Skill> {
     if let Some(home) = dirs::home_dir() {
         sources.push(home.join(".claude/skills"));
     }
-    if let Some(config) = dirs::config_dir() {
-        sources.push(config.join("opencode/skills"));
-        sources.push(config.join("eix/skills"));
-    }
+    sources.push(crate::config::config_home().join("opencode/skills"));
+    sources.push(crate::config::skills_dir());
     let mut ancestors: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
     ancestors.reverse();
     for ancestor in ancestors {

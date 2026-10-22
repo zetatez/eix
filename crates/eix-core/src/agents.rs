@@ -121,10 +121,8 @@ pub fn load_agents(cwd: &Path) -> Vec<AgentSpec> {
         .collect();
 
     let mut sources: Vec<PathBuf> = Vec::new();
-    if let Some(config) = dirs::config_dir() {
-        sources.push(config.join("eix/agents"));
-        sources.push(config.join("opencode/agents"));
-    }
+    sources.push(crate::config::config_home().join("opencode/agents"));
+    sources.push(crate::config::config_dir().join("agents"));
     let mut ancestors: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
     ancestors.reverse();
     for ancestor in ancestors {

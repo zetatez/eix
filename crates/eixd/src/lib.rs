@@ -9,6 +9,7 @@ pub mod http;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;
+pub mod model_catalog;
 pub mod picker;
 pub mod process;
 pub mod provider;

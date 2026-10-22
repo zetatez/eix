@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AttachResult, Config, EventKind, EventsResult, HelloResult, ModelConfig, PermissionLevel,
-    Request, Response, SearchResult, ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
+    AttachResult, Config, EventKind, EventsResult, HelloResult, ModelConfig, NamedProviderConfig,
+    PermissionLevel, Request, Response, SearchResult, ServerMessage, SessionResult, SubmitResult,
+    PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -812,6 +813,14 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
         variants: vec!["high".to_string()],
         ..ModelConfig::default()
     }];
+    config.providers.insert(
+        "remote".to_string(),
+        NamedProviderConfig {
+            name: Some("Remote".to_string()),
+            base_url: format!("http://{addr}/v1"),
+            ..NamedProviderConfig::default()
+        },
+    );
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -823,11 +832,20 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
     let session_id = created.session.id.clone();
 
     let models: eix_core::ModelListResult = client.request("model.list", Value::Null).await?;
-    assert_eq!(models.models.len(), 2);
+    assert!(models.warnings.is_empty(), "{:?}", models.warnings);
+    assert_eq!(models.models.len(), 6);
     assert_eq!(models.models[0].id, "mock-model");
     assert!(models.models[0].default);
     assert_eq!(models.models[1].id, "mock/second");
     assert_eq!(models.models[1].variants, vec!["high"]);
+    // Both the default provider and the named provider expose the mock's
+    // `/models` catalog, with provider-qualified selection ids.
+    assert_eq!(models.models[2].id, "default/mock-auto");
+    assert_eq!(models.models[3].id, "default/mock-other");
+    assert_eq!(models.models[3].context_tokens, Some(12_345));
+    assert_eq!(models.models[4].id, "remote/mock-auto");
+    assert_eq!(models.models[4].provider, "Remote");
+    assert_eq!(models.models[5].id, "remote/mock-other");
 
     let pinned: SessionResult = client
         .request(
@@ -3386,6 +3404,78 @@ async fn spawn_agent_runs_a_readonly_child_and_returns_its_answer() -> anyhow::R
 }
 
 #[tokio::test]
+async fn cancelling_the_parent_stops_a_running_sub_agent() -> anyhow::Result<()> {
+    let dir = temp_dir("agent-cancel");
+    std::fs::create_dir_all(&dir)?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(hanging_agent_provider(listener));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "parent", "cwd": dir}))
+        .await?;
+    let parent = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": parent, "text": "investigate"}),
+        )
+        .await?;
+
+    // Wait until the child exists and its request is hanging.
+    let child = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "agent.spawned" {
+            break notification.params["agent_id"]
+                .as_str()
+                .expect("agent id")
+                .to_string();
+        }
+    };
+    let cancelled: eix_core::CancelResult = client
+        .request("prompt.cancel", json!({"session_id": parent}))
+        .await?;
+    assert!(cancelled.cancelled);
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break notification.params.clone();
+        }
+    };
+    assert_eq!(completed["cancelled"], true);
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": child}))
+        .await?;
+    assert_eq!(attached.session.status, eix_core::SessionStatus::Idle);
+    let assistant = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .unwrap_or_else(|| panic!("child cancellation event: {:?}", attached.events));
+    assert_eq!(assistant.payload["cancelled"], true);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn ask_user_blocks_the_turn_until_the_user_answers() -> anyhow::Result<()> {
     let dir = temp_dir("ask");
     std::fs::create_dir_all(&dir)?;
@@ -3944,6 +4034,18 @@ async fn mock_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
                     break;
                 }
                 buf.extend_from_slice(&chunk[..n]);
+            }
+            if headers.starts_with("get /v1/models") || headers.starts_with("get /models") {
+                let body =
+                    r#"{"data":[{"id":"mock-auto"},{"id":"mock-other","context_length":12345}]}"#;
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
+                return;
             }
             let body = String::from_utf8_lossy(&buf[header_end..header_end + length]).to_string();
             bodies.lock().await.push(body);
@@ -5516,6 +5618,58 @@ async fn agent_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             };
             write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+/// Asks the parent to spawn one child, then never answers the child's request.
+/// The test cancels the parent and expects the daemon to close the child's
+/// provider call promptly instead of waiting for the HTTP timeout.
+async fn hanging_agent_provider(listener: TcpListener) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let can_spawn = value["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "spawn_agent")
+                })
+                .unwrap_or(false);
+            if can_spawn {
+                write_sse(
+                    &mut socket,
+                    &tool_call_event(
+                        json!({"prompt": "investigate", "name": "scout"}),
+                        "spawn_agent",
+                        "call_agent",
+                    ),
+                )
+                .await;
+            } else {
+                // Send one delta, then hold the connection open. Cancellation
+                // must end the stream and persist the partial answer.
+                use tokio::io::AsyncWriteExt;
+                let chunk = json!({
+                    "model": "mock-agent",
+                    "choices": [{"delta": {"content": "child partial"}, "finish_reason": null}],
+                });
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\ndata: {chunk}\n\n"
+                );
+                if socket.write_all(response.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
         });
     }
 }

@@ -12,7 +12,7 @@ use crossterm::event::{
 use eix_core::{
     theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
     ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
-    InputAnsweredPayload, InputOption, InputRequiredPayload, PatchProposedPayload,
+    InputAnsweredPayload, InputOption, InputRequiredPayload, ModelInfo, PatchProposedPayload,
     PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo, ProcessList, ProcessOutput,
     ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult, TodoItem,
     ToolResultPayload, UserMessagePayload, THEME_PRESETS,
@@ -127,7 +127,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "show or clear prompts waiting for the session",
         ),
         builtin("sessions", "", "open the session picker"),
-        builtin("models", "[id]", "list or pin a model for this session"),
+        builtin(
+            "model",
+            "[id]",
+            "search providers/models and switch this session",
+        ),
         builtin("agents", "[name]", "choose the session's primary agent"),
         builtin("mcp", "", "browse MCP servers and their tools"),
         builtin("reload", "", "re-read the daemon config files"),
@@ -188,15 +192,17 @@ fn merge_commands(cwd: &std::path::Path) -> Vec<CommandSpec> {
     commands
 }
 
-/// Prompt height: [`super::editor::PROMPT_ROWS`] content rows plus the two
-/// borders. Long drafts grow the box up to a small cap before the editor
-/// starts scrolling, and short terminals always keep transcript rows.
+/// Prompt height: at least [`super::editor::PROMPT_ROWS`] content rows plus the
+/// two borders and one footer row. Long drafts grow the box up to eight total
+/// rows before the editor starts scrolling, and short terminals always keep
+/// transcript rows.
 fn prompt_input_height(area_height: u16, area_width: u16, input: &Editor) -> u16 {
-    const PROMPT_MAX_ROWS: usize = 12;
+    // Five editor rows + two borders + the footer = eight rows total.
+    const PROMPT_MAX_ROWS: usize = 5;
     let inner_width = area_width.saturating_sub(4).max(1) as usize;
     let rows = input.layout(inner_width, 1).segments.len();
     let visible = rows.clamp(super::editor::PROMPT_ROWS as usize, PROMPT_MAX_ROWS) as u16;
-    (visible + 2).min(area_height.saturating_sub(5).max(3))
+    (visible + 3).min(area_height.saturating_sub(5).max(4))
 }
 
 // Keep the prompt readable without a separate panel: its chrome paints over
@@ -516,7 +522,7 @@ impl PickerKind {
             Self::Branches => "branches — insert name",
             Self::Context => "context — open ledger",
             Self::Commands => "commands",
-            Self::Models => "models — pin this session",
+            Self::Models => "model — search and switch",
             Self::Agents => "agents — choose the primary agent",
             Self::Skills => "skills — preview and insert",
             Self::Themes => "themes — live preview",
@@ -534,7 +540,7 @@ impl PickerKind {
             Self::Branches => "Enter insert name · ↑/↓ or C-j/C-k · Esc close",
             Self::Context => "Enter open ledger · ↑/↓ or C-j/C-k · Esc close",
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k · Esc close",
-            Self::Models => "Enter pin · Esc close",
+            Self::Models => "type to search · Enter switch · Esc close",
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
@@ -901,6 +907,9 @@ pub struct App {
     pub should_quit: bool,
     pub exit_message: Option<String>,
     hello: Option<HelloResult>,
+    /// Latest `model.list` catalog, kept for the prompt header's model,
+    /// provider and variant labels.
+    models: Vec<ModelInfo>,
     sessions: Vec<Session>,
     selected: usize,
     /// Open panes, in layout order.
@@ -1033,6 +1042,7 @@ impl App {
             should_quit: false,
             exit_message: None,
             hello: None,
+            models: Vec::new(),
             sessions: Vec::new(),
             selected: 0,
             views: Vec::new(),
@@ -1572,6 +1582,9 @@ impl App {
                 }
                 self.status = format!("connected to eixd {}", hello.version);
                 self.hello = Some(hello);
+                // Fetch the catalog once so the prompt header can show the
+                // raw model id and provider before `/model` is opened.
+                let _ = tx.send(Command::ListModels);
             }
             Event::Sessions(sessions) => {
                 self.sessions = sessions;
@@ -1708,15 +1721,28 @@ impl App {
                     self.status = format!("{count} {kind} row(s)");
                 }
             }
-            Event::Models(models) => {
+            Event::Models { models, warnings } => {
+                let count = models.len();
+                self.models = models;
+                let current = self
+                    .focused_view()
+                    .and_then(|view| view.session.model.clone());
+                let items = model_picker_items(&self.models);
+                let selected = current
+                    .as_deref()
+                    .and_then(|model| items.iter().position(|item| item.value == model))
+                    .unwrap_or(0);
                 if let Some(picker) = &mut self.picker {
                     if picker.kind == PickerKind::Models {
-                        picker.items = model_picker_items(&models);
-                        picker.selected = 0;
+                        picker.items = items;
+                        picker.selected = selected;
                         picker.loading = false;
                     }
                 }
-                self.status = format!("{} model(s)", models.len());
+                self.status = format!("{count} model(s)");
+                if let Some(warning) = warnings.first() {
+                    self.status.push_str(&format!(" · {warning}"));
+                }
             }
             Event::Agents(agents) => {
                 if let Some(picker) = &mut self.picker {
@@ -2862,6 +2888,14 @@ impl App {
                 self.focus_tab(ch as usize - '1' as usize);
                 return;
             }
+        }
+
+        // Global reasoning shortcut: cycle low → medium → high → none → low.
+        // Updating the session locally first keeps rapid presses advancing
+        // even before the daemon round-trip lands.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
+            self.cycle_reasoning(tx);
+            return;
         }
 
         if self.focus == Focus::Input {
@@ -4149,7 +4183,7 @@ impl App {
             picker.items = command_items();
         } else if kind == PickerKind::Models {
             picker.loading = true;
-            self.status = "models: loading…".into();
+            self.status = "model: loading provider catalogs…".into();
             let _ = tx.send(Command::ListModels);
         } else if kind == PickerKind::Agents {
             let Some(session_id) = self.focused_session_id() else {
@@ -4205,7 +4239,7 @@ impl App {
             "files" => self.open_picker(PickerKind::Files, tx),
             "worktrees" => self.open_picker(PickerKind::Worktrees, tx),
             "branches" => self.open_picker(PickerKind::Branches, tx),
-            "models" => self.open_picker(PickerKind::Models, tx),
+            "model" => self.open_picker(PickerKind::Models, tx),
             "agents" => self.open_picker(PickerKind::Agents, tx),
             "toggle-agent" => self.toggle_agent_mode(tx),
             "skills" => self.open_picker(PickerKind::Skills, tx),
@@ -4622,7 +4656,7 @@ impl App {
                 self.open_picker(PickerKind::Sessions, tx);
                 true
             }
-            "models" => {
+            "model" => {
                 if args.is_empty() {
                     self.open_picker(PickerKind::Models, tx);
                 } else if let Some(session_id) = self.focused_session_id() {
@@ -5815,6 +5849,69 @@ already exists, update it in place rather than rewriting it from scratch.";
             .unwrap_or("-")
     }
 
+    /// Model id, provider and variant shown in the prompt header. The catalog
+    /// supplies the raw API id so named providers do not repeat their routing
+    /// prefix in front of the model name.
+    fn model_header_parts(&self) -> (String, String, Option<String>) {
+        let selection = self.model();
+        let (base, variant) = split_model_variant(selection);
+        let variant = variant.map(str::to_string);
+        if let Some(info) = self.models.iter().find(|info| info.id == base) {
+            return (
+                info.display_id().to_string(),
+                info.provider.clone(),
+                variant,
+            );
+        }
+        if let Some(rest) = base.strip_prefix("default/") {
+            return (rest.to_string(), "default".to_string(), variant);
+        }
+        let provider = base
+            .split_once('/')
+            .map(|(provider, _)| provider.to_string())
+            .unwrap_or_else(|| "default".to_string());
+        (base.to_string(), provider, variant)
+    }
+
+    /// Cycle the focused session's reasoning variant:
+    /// none → low → medium → high → none.
+    fn cycle_reasoning(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "reasoning: no session".into();
+            return;
+        };
+        let selection = self.model().to_string();
+        if selection.is_empty() || selection == "-" {
+            self.status = "reasoning: no model".into();
+            return;
+        }
+        let (base, current) = split_model_variant(&selection);
+        let next: Option<&'static str> = match current {
+            None => Some("low"),
+            Some("low") => Some("medium"),
+            Some("medium") => Some("high"),
+            Some("high") => None,
+            Some(_) => Some("low"),
+        };
+        let model = match next {
+            Some(variant) => format!("{base}#{variant}"),
+            None => base.to_string(),
+        };
+        if let Some(view) = self
+            .views
+            .iter_mut()
+            .find(|view| view.session.id == session_id)
+        {
+            view.session.model = Some(model.clone());
+        }
+        self.pending_leader = false;
+        let _ = tx.send(Command::SetModel {
+            session_id,
+            model: Some(model),
+        });
+        self.status = format!("reasoning: {}", next.unwrap_or("none"));
+    }
+
     pub fn draw(&mut self, frame: &mut Frame) {
         let area = frame.area();
         if area.height < 4 || area.width < 20 {
@@ -5895,9 +5992,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
-    /// Prompt header: current agent mode, session status and model. The old
-    /// `eix` brand chip and the footer statusline are intentionally gone so the
-    /// line above the input stays quiet.
+    /// Session banner rendered inside the prompt's bottom-left: agent mode,
+    /// status, model, provider and reasoning variant. The old `eix` brand chip
+    /// and footer statusline are intentionally gone so the line stays quiet.
     fn header_spans(&self) -> Vec<Span<'static>> {
         let session = self
             .focused_view()
@@ -5935,11 +6032,15 @@ already exists, update it in place rather than rewriting it from scratch.";
                 status,
                 Style::default().fg(status_color).bg(panel),
             ));
-            spans.push(Span::styled(" ", Style::default().bg(panel)));
-            spans.push(Span::styled(
-                short_model(self.model()).to_string(),
-                Style::default().fg(accent).bg(panel),
-            ));
+            let (model, provider, variant) = self.model_header_parts();
+            spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+            spans.push(Span::styled(model, Style::default().fg(accent).bg(panel)));
+            spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+            spans.push(Span::styled(provider, Style::default().fg(muted).bg(panel)));
+            if let Some(variant) = variant {
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                spans.push(Span::styled(variant, Style::default().fg(warn).bg(panel)));
+            }
             let queued = self.queue_len(&session.id);
             if queued > 0 {
                 spans.push(Span::styled(
@@ -6035,9 +6136,9 @@ already exists, update it in place rather than rewriting it from scratch.";
             self.draw_panes(frame, area);
             return;
         }
-        // Keep the tab strip against the prompt's Build line instead of the
-        // top of the transcript. Fibonacci shows every pane, so it needs no
-        // tab strip at all.
+        // Keep the tab strip against the prompt box instead of the top of the
+        // transcript. Fibonacci shows every pane, so it needs no tab strip at
+        // all.
         let chunks = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area);
         self.draw_panes(frame, chunks[0]);
         self.draw_tab_bar(frame, chunks[1]);
@@ -6354,10 +6455,9 @@ already exists, update it in place rather than rewriting it from scratch.";
             Color::Rgb(46, 50, 60)
         };
 
-        // The top border is the session banner. Deny reasons temporarily
-        // replace it; errors live in a floating dialog so the prompt chrome
-        // stays stable. The bottom border is plain: the mode chip now lives in
-        // the status bar below.
+        // The top border carries workspace metadata; deny reasons temporarily
+        // replace it. The session banner (mode, status, model, provider and
+        // reasoning variant) lives inside the box at the bottom-left.
         let title_width = area.width.saturating_sub(2) as usize;
         let (top_left, top_right) = if let Some(prompt) = &self.reason_prompt {
             let line = Line::from(vec![
@@ -6379,11 +6479,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             ]);
             (truncate_line(line, title_width), None)
         } else {
-            fit_title(
-                Line::from(self.header_spans()),
-                self.header_meta_line(),
-                title_width,
-            )
+            fit_title(Line::default(), self.header_meta_line(), title_width)
         };
 
         let mut block = Block::default()
@@ -6399,20 +6495,37 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
 
         // One cell of left padding keeps the text close to the border; one
-        // cell on the right mirrors it. The old `❯` gutter marker is gone.
+        // cell on the right mirrors it. The last inner row is reserved for the
+        // session banner, so it never covers the draft or the cursor.
         let inner_width = area.width.saturating_sub(4).max(1) as usize;
-        let inner_height = area.height.saturating_sub(2).max(1) as usize;
+        let inner_height = area.height.saturating_sub(3).max(1) as usize;
         let layout = self.input.layout(inner_width, inner_height);
         let lines: Vec<Line> = layout
             .segments
             .iter()
+            .skip(layout.offset)
+            .take(inner_height)
             .map(|segment| self.input_line(segment))
             .collect();
         let paragraph = Paragraph::new(lines)
             .block(block)
-            .style(Style::default().fg(text).bg(panel))
-            .scroll((layout.offset.min(u16::MAX as usize) as u16, 0));
+            .style(Style::default().fg(text).bg(panel));
         frame.render_widget(paragraph, area);
+
+        let footer_width = area.width.saturating_sub(4) as usize;
+        if self.reason_prompt.is_none() && footer_width > 0 && area.height >= 3 {
+            let footer_area = Rect::new(
+                area.x.saturating_add(2),
+                area.y + area.height.saturating_sub(2),
+                footer_width as u16,
+                1,
+            );
+            let footer = truncate_line(Line::from(self.header_spans()), footer_width);
+            frame.render_widget(
+                Paragraph::new(footer).style(Style::default().bg(panel)),
+                footer_area,
+            );
+        }
 
         // The error dialog covers the prompt; don't leave a blinking input
         // cursor on top of it.
@@ -7423,15 +7536,37 @@ already exists, update it in place rather than rewriting it from scratch.";
                 } else {
                     Color::DarkGray
                 };
+                // Keep the provider column aligned under the longest model id
+                // in the catalog, not just the currently filtered rows.
+                let model_width = if kind == PickerKind::Models {
+                    picker
+                        .items
+                        .iter()
+                        .map(|item| item.label.chars().count())
+                        .max()
+                        .unwrap_or(0)
+                } else {
+                    0
+                };
+                let separator = if kind == PickerKind::Models {
+                    "    "
+                } else {
+                    "  "
+                };
                 filtered
                     .iter()
                     .filter_map(|&index| picker.items.get(index))
                     .map(|item| {
-                        let mut spans = vec![Span::styled(item.label.clone(), label_style)];
+                        let label = if kind == PickerKind::Models {
+                            format!("{:<width$}", item.label, width = model_width)
+                        } else {
+                            item.label.clone()
+                        };
+                        let mut spans = vec![Span::styled(label, label_style)];
                         if let Some(detail) = &item.detail {
                             if !detail.is_empty() {
                                 spans.push(Span::styled(
-                                    format!("  {detail}"),
+                                    format!("{separator}{detail}"),
                                     Style::default().fg(detail_color),
                                 ));
                             }
@@ -7525,30 +7660,26 @@ fn theme_slot(value: Option<&'static str>) -> &'static str {
     value.unwrap_or("—")
 }
 
-/// Rows for `/models`. `@default` clears the session's pinned model.
+/// Rows for `/model`. `@default` clears the session's pinned model.
 fn model_picker_items(models: &[eix_core::ModelInfo]) -> Vec<PickerItem> {
     let mut items = vec![PickerItem::new("@default")
-        .with_label("(daemon default)")
-        .with_detail("use the model from [provider]")
-        .with_preview("Clear this session's model override.\n\nUse /models to pin a model again.")];
+        .with_label("@default")
+        .with_detail("daemon default")
+        .with_preview("Clear this session's model override.\n\nUse /model to pin a model again.")];
     for model in models {
-        let mut detail = model.name.clone();
-        if model.name != model.id {
-            detail = format!("{}  {}", model.name, model.id);
-        }
-        if model.default {
-            detail.push_str("  · default");
-        }
-        if !model.variants.is_empty() {
-            detail.push_str(&format!("  · variants: {}", model.variants.join(", ")));
-        }
-        if let (Some(input), Some(output)) = (model.input_cost, model.output_cost) {
-            detail.push_str(&format!("  · ${input:.2}/${output:.2} per M"));
-        }
+        // The configured default model belongs to the built-in `default`
+        // provider even when its id starts with a model-family prefix.
+        let provider = if model.default {
+            "default".to_string()
+        } else {
+            model.provider.clone()
+        };
+        // The model id is the bold first column. The provider is rendered as
+        // the aligned second column by `picker_rows`.
         let mut preview = vec![
             model.id.clone(),
             model.name.clone(),
-            format!("provider  {}", model.provider),
+            format!("provider  {provider}"),
         ];
         if model.default {
             preview.push("default   yes".to_string());
@@ -7567,19 +7698,22 @@ fn model_picker_items(models: &[eix_core::ModelInfo]) -> Vec<PickerItem> {
         }
         items.push(
             PickerItem::new(&model.id)
-                .with_detail(detail)
+                .with_label(model.display_id())
+                .with_detail(provider.clone())
                 .with_preview(preview.join("\n")),
         );
         // A variant is a separate row so it is discoverable without knowing
         // the `id#variant` syntax.
         for variant in &model.variants {
             let id = format!("{}#{variant}", model.id);
+            let label = format!("{}#{variant}", model.display_id());
             items.push(
                 PickerItem::new(&id)
-                    .with_detail(format!("{}  · variant: {variant}", model.name))
+                    .with_label(label)
+                    .with_detail(provider.clone())
                     .with_preview(format!(
                         "{id}\n{} ({}) with reasoning variant `{variant}`.",
-                        model.name, model.provider
+                        model.name, provider
                     )),
             );
         }
@@ -7796,9 +7930,9 @@ fn command_items() -> Vec<PickerItem> {
             "Browse installed skills with a body preview",
         ),
         (
-            "models",
-            "models",
-            "Pin the focused session to a configured model",
+            "model",
+            "model",
+            "Search provider model catalogs and switch this session",
         ),
         ("theme", "theme", "Choose a color preset with live preview"),
         (
@@ -8233,6 +8367,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "Space s / Ctrl-G",
                 description: "session picker",
+            },
+            HelpEntry {
+                key: "Ctrl-T",
+                description: "cycle reasoning: low / medium / high / none",
             },
             HelpEntry {
                 key: "Space o",
@@ -9295,6 +9433,14 @@ fn short_model(model: &str) -> &str {
         .unwrap_or(model)
 }
 
+/// Split `model#variant` into its routing id and reasoning variant.
+fn split_model_variant(selection: &str) -> (&str, Option<&str>) {
+    match selection.rsplit_once('#') {
+        Some((id, variant)) if !variant.is_empty() => (id, Some(variant)),
+        _ => (selection, None),
+    }
+}
+
 /// Compact usage summary for the footer: tokens, throughput and cost.
 fn turn_summary(done: &TurnCompleted) -> String {
     let Some(usage) = &done.usage else {
@@ -10130,7 +10276,8 @@ mod tests {
         // The active tab is bracketed; inactive tabs are not separate panes.
         assert!(rendered.contains("[2 session b]"), "{rendered}");
 
-        // Tabs sit directly above the prompt's Build line.
+        // Tabs sit directly above the prompt box; the session banner now lives
+        // on the last inner row, just above the bottom border.
         let lines: Vec<&str> = rendered.lines().collect();
         let tab_row = lines
             .iter()
@@ -10140,7 +10287,13 @@ mod tests {
             .iter()
             .position(|line| line.contains("Build ·"))
             .expect("prompt header");
-        assert_eq!(tab_row + 1, build_row, "{rendered}");
+        let prompt_top = tab_row + 1;
+        assert!(lines[prompt_top].contains('╭'), "{rendered}");
+        let prompt_bottom = lines
+            .iter()
+            .rposition(|line| line.contains('╰'))
+            .expect("prompt bottom");
+        assert_eq!(build_row + 1, prompt_bottom, "{rendered}");
     }
 
     #[test]
@@ -11840,16 +11993,16 @@ mod tests {
     #[test]
     fn prompt_height_grows_for_long_drafts() {
         let mut input = Editor::new();
-        // Short drafts keep the minimum 6 editor rows + 2 borders.
-        assert_eq!(prompt_input_height(40, 80, &input), 8);
-        assert_eq!(prompt_input_height(100, 80, &input), 8);
+        // Short drafts keep the minimum 3 editor rows + 2 borders + 1 footer.
+        assert_eq!(prompt_input_height(40, 80, &input), 6);
+        assert_eq!(prompt_input_height(100, 80, &input), 6);
 
         // A long command grows the box so wrapped rows stay visible, but the
-        // cap leaves the transcript room and short terminals still win.
+        // cap is 8 rows total and short terminals still win.
         input.set_text(&"x".repeat(1_000));
-        assert_eq!(prompt_input_height(40, 80, &input), 14);
+        assert_eq!(prompt_input_height(40, 80, &input), 8);
         assert_eq!(prompt_input_height(12, 80, &input), 7);
-        assert_eq!(prompt_input_height(8, 80, &input), 3);
+        assert_eq!(prompt_input_height(8, 80, &input), 4);
     }
 
     #[test]
@@ -12323,15 +12476,32 @@ mod tests {
             Vec::new(),
         ));
         app.focused = 0;
-        app.views[0].session.model = Some("llmgate/deepseek-v4-flash".into());
+        app.views[0].session.model = Some("llmgate/deepseek/deepseek-v4.1-flash#high".into());
+        app.models.push(ModelInfo {
+            id: "llmgate/deepseek/deepseek-v4.1-flash".into(),
+            api_model: Some("deepseek/deepseek-v4.1-flash".into()),
+            name: "deepseek/deepseek-v4.1-flash".into(),
+            provider: "llmgate".into(),
+            default: false,
+            variants: vec!["high".into()],
+            input_cost: None,
+            output_cost: None,
+            context_tokens: None,
+        });
 
         let build = header(&app);
-        assert_eq!(build, " Build · ○ deepseek-v4-flash ");
+        assert_eq!(
+            build,
+            " Build · ○ · deepseek/deepseek-v4.1-flash · llmgate · high "
+        );
         assert!(!build.contains("eix"));
 
         app.views[0].session.agent = Some("plan".into());
         let plan = header(&app);
-        assert_eq!(plan, " Plan  · ○ deepseek-v4-flash ");
+        assert_eq!(
+            plan,
+            " Plan  · ○ · deepseek/deepseek-v4.1-flash · llmgate · high "
+        );
         // Padding Plan to Build's width keeps the status and model in place.
         assert_eq!(build.len(), plan.len());
         assert_eq!(build.find('○'), plan.find('○'));
@@ -12995,6 +13165,66 @@ mod tests {
     }
 
     #[test]
+    fn model_command_opens_the_picker_and_preselects_the_current_model() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut pane = session_pane("s1", "one");
+        pane.session.model = Some("router/gpt-5".into());
+        app.views.push(pane);
+        app.focused = 0;
+
+        assert!(app.handle_prompt_command("/model", &tx));
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Models)
+        ));
+        assert!(app.picker.as_ref().unwrap().loading);
+
+        app.handle_event(
+            Event::Models {
+                models: vec![
+                    eix_core::ModelInfo {
+                        id: "default/gpt-4o".into(),
+                        api_model: Some("gpt-4o".into()),
+                        name: "gpt-4o".into(),
+                        provider: "default".into(),
+                        default: false,
+                        variants: Vec::new(),
+                        input_cost: None,
+                        output_cost: None,
+                        context_tokens: None,
+                    },
+                    eix_core::ModelInfo {
+                        id: "router/gpt-5".into(),
+                        api_model: Some("gpt-5".into()),
+                        name: "GPT-5".into(),
+                        provider: "Router".into(),
+                        default: false,
+                        variants: Vec::new(),
+                        input_cost: None,
+                        output_cost: None,
+                        context_tokens: None,
+                    },
+                ],
+                warnings: vec!["local: HTTP 401".into()],
+            },
+            &tx,
+        );
+        let picker = app.picker.as_ref().expect("model picker");
+        assert!(!picker.loading);
+        assert_eq!(picker.items[picker.selected].value, "router/gpt-5");
+        assert_eq!(picker.items[0].label, "@default");
+        assert_eq!(picker.items[0].detail.as_deref(), Some("daemon default"));
+        assert_eq!(picker.items[1].label, "gpt-4o");
+        assert_eq!(picker.items[1].value, "default/gpt-4o");
+        assert_eq!(picker.items[1].detail.as_deref(), Some("default"));
+        assert_eq!(picker.items[2].label, "gpt-5");
+        assert_eq!(picker.items[2].value, "router/gpt-5");
+        assert_eq!(picker.items[2].detail.as_deref(), Some("Router"));
+        assert!(app.status.contains("local: HTTP 401"));
+    }
+
+    #[test]
     fn slash_quit_on_the_last_pane_quits_after_saving() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
@@ -13271,11 +13501,90 @@ mod tests {
         let mut app = App::new(None);
         app.focus = Focus::Input;
         app.input
-            .set_text(&format!("echo {} ENDMARK", "x".repeat(500)));
+            .set_text(&format!("echo {} ENDMARK", "x".repeat(300)));
 
         let rendered = render_text(&mut app, 80, 40);
         assert!(rendered.contains("echo"), "{rendered}");
         assert!(rendered.contains("ENDMARK"), "{rendered}");
+    }
+
+    #[test]
+    fn prompt_footer_stays_below_the_draft_inside_the_box() {
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "one", "/tmp");
+        session.model = Some("llmgate/deepseek/deepseek-v4.1-flash#high".into());
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.connected = true;
+        app.models.push(ModelInfo {
+            id: "llmgate/deepseek/deepseek-v4.1-flash".into(),
+            api_model: Some("deepseek/deepseek-v4.1-flash".into()),
+            name: "deepseek/deepseek-v4.1-flash".into(),
+            provider: "llmgate".into(),
+            default: false,
+            variants: vec!["high".into()],
+            input_cost: None,
+            output_cost: None,
+            context_tokens: None,
+        });
+        app.input.set_text("hello footer");
+
+        let rendered = render_text(&mut app, 80, 20);
+        let lines: Vec<&str> = rendered.lines().collect();
+        let text_row = lines
+            .iter()
+            .position(|line| line.contains("hello footer"))
+            .expect("draft");
+        let footer_row = lines
+            .iter()
+            .position(|line| line.contains("Build ·"))
+            .expect("session banner");
+        assert!(
+            lines[footer_row].contains("deepseek/deepseek-v4.1-flash · llmgate · high"),
+            "{rendered}"
+        );
+        assert!(text_row < footer_row, "{rendered}");
+        let bottom_row = lines
+            .iter()
+            .rposition(|line| line.contains('╰'))
+            .expect("prompt bottom");
+        assert_eq!(footer_row + 1, bottom_row, "{rendered}");
+    }
+
+    #[test]
+    fn ctrl_t_cycles_reasoning_strength() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "one", "/tmp");
+        session.model = Some("deepseek/deepseek-v4.1-flash".into());
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.enter_insert();
+        app.connected = true;
+
+        for (expected, status) in [
+            ("deepseek/deepseek-v4.1-flash#low", "reasoning: low"),
+            ("deepseek/deepseek-v4.1-flash#medium", "reasoning: medium"),
+            ("deepseek/deepseek-v4.1-flash#high", "reasoning: high"),
+            ("deepseek/deepseek-v4.1-flash", "reasoning: none"),
+            ("deepseek/deepseek-v4.1-flash#low", "reasoning: low"),
+        ] {
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+                &tx,
+            );
+            assert_eq!(app.views[0].session.model.as_deref(), Some(expected));
+            assert_eq!(app.status, status);
+            assert!(app.input.text().is_empty());
+            match rx.try_recv().expect("set model command") {
+                Command::SetModel { model, .. } => {
+                    assert_eq!(model.as_deref(), Some(expected));
+                }
+                _ => panic!("unexpected command"),
+            }
+        }
     }
 
     #[test]
@@ -13290,7 +13599,10 @@ mod tests {
         app.connected = true;
 
         let empty = render_text(&mut app, 80, 20);
-        assert!(empty.contains("Build · ⠋ gpt-5"), "{empty}");
+        assert!(
+            empty.contains("Build · ⠋ · openai/gpt-5 · openai"),
+            "{empty}"
+        );
         assert!(!empty.contains("eixd"), "no footer brand: {empty}");
         assert!(!empty.contains("/cmds"), "no footer hints: {empty}");
         assert!(empty.contains("1● prompt polish"), "{empty}");

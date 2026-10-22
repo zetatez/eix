@@ -75,7 +75,7 @@ pub enum Command {
         session_id: String,
         agent: Option<String>,
     },
-    /// List models configured for `/models`.
+    /// List configured models plus each provider's auto-fetched catalog.
     ListModels,
     /// List agents visible from a session's workspace.
     ListAgents {
@@ -309,7 +309,10 @@ pub enum Event {
         kind: String,
         items: Vec<eix_core::PickerItem>,
     },
-    Models(Vec<eix_core::ModelInfo>),
+    Models {
+        models: Vec<eix_core::ModelInfo>,
+        warnings: Vec<String>,
+    },
     Agents(Vec<eix_core::AgentSpec>),
     Mcp(Vec<eix_core::McpServerInfo>),
     ConfigReloaded {
@@ -562,7 +565,13 @@ async fn dispatch(
         Command::ListModels => {
             let value = requester.request("model.list", Value::Null).await?;
             let result: eix_core::ModelListResult = decode(value)?;
-            send(events, Event::Models(result.models))
+            send(
+                events,
+                Event::Models {
+                    models: result.models,
+                    warnings: result.warnings,
+                },
+            )
         }
         Command::ListAgents { session_id } => {
             let value = requester

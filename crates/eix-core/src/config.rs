@@ -1,8 +1,9 @@
 //! Configuration and XDG paths.
 //!
-//! The config is deliberately small: a single OpenAI-compatible provider plus a
-//! few runtime knobs. Environment variables override the file so ad-hoc use
-//! (`EIX_MODEL=... eix chat`) does not require editing anything.
+//! The config keeps the built-in `[provider]` plus optional
+//! `[providers.<name>]` OpenAI-compatible endpoints and a few runtime knobs.
+//! Environment variables override the file so ad-hoc use (`EIX_MODEL=... eix
+//! chat`) does not require editing anything.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -43,8 +44,11 @@ pub struct Config {
     pub context: ContextConfig,
     pub server: ServerConfig,
     /// Additional OpenAI-compatible models. The default `[provider]` entry is
-    /// always available and appears first in `/models`.
+    /// always available and appears first in `/model`.
     pub models: Vec<ModelConfig>,
+    /// Named OpenAI-compatible providers, e.g. `[providers.openrouter]`.
+    /// Their model catalogs are fetched automatically by `/model`.
+    pub providers: BTreeMap<String, NamedProviderConfig>,
     /// Model Context Protocol servers (stdio transport).
     pub mcp: McpConfig,
     /// Prompt image limits and blob retention.
@@ -676,6 +680,10 @@ pub struct ContextConfig {
     /// The full output remains in the event log; older/short results are left
     /// untouched. This prevents one noisy command from crowding out the task.
     pub tool_output_tokens: usize,
+    /// Hard cap for the tool schemas sent in one request. Built-in schemas are
+    /// always kept; MCP tools that would exceed the cap are omitted until the
+    /// user narrows them with `mcp.servers.*.allowed_tools`.
+    pub max_tool_schema_tokens: usize,
 }
 
 impl Default for ContextConfig {
@@ -688,7 +696,24 @@ impl Default for ContextConfig {
             auto_compact_threshold: 0.8,
             auto_compact_keep_turns: 2,
             tool_output_tokens: 4_000,
+            max_tool_schema_tokens: 12_000,
         }
+    }
+}
+
+impl ContextConfig {
+    /// Budget actually used for one request. A configured model window always
+    /// wins over the static default so a 32k budget cannot be sent to an 8k
+    /// model. The reserve leaves room for the completion and provider-side
+    /// tokenization differences.
+    pub fn effective_budget_tokens(&self, model_context_tokens: Option<usize>) -> usize {
+        let Some(window) = model_context_tokens.filter(|tokens| *tokens > 0) else {
+            return self.budget_tokens.max(1);
+        };
+        let reserve = (window / 4).clamp(1_024, 8_000);
+        self.budget_tokens
+            .min(window.saturating_sub(reserve).max(1))
+            .max(1)
     }
 }
 
@@ -703,6 +728,9 @@ pub struct ProviderConfig {
     pub api_key_env: String,
     /// Overall request timeout. Streaming responses are bounded by this.
     pub timeout_secs: u64,
+    /// Advertised context window for the default model, when known. The
+    /// daemon uses this to cap `context.budget_tokens` below the model limit.
+    pub context_tokens: Option<usize>,
     /// Extra attempts after the first one for transient failures (network,
     /// upstream 5xx, rate limits, malformed/empty responses). `0` disables
     /// automatic retries.
@@ -724,6 +752,7 @@ impl Default for ProviderConfig {
             api_key: None,
             api_key_env: "OPENAI_API_KEY".to_string(),
             timeout_secs: 300,
+            context_tokens: None,
             retry_attempts: 5,
             retry_base_ms: 500,
             retry_max_secs: 30,
@@ -732,18 +761,52 @@ impl Default for ProviderConfig {
     }
 }
 
-/// One additional model exposed by `/models`. Each entry may point at its own
+/// A named OpenAI-compatible endpoint. `/model` lists its models as
+/// `<name>/<api-model-id>` after fetching `GET <base_url>/models`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NamedProviderConfig {
+    /// Friendly name; defaults to the table key.
+    pub name: Option<String>,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    /// Environment variable holding the key. Empty falls back to no auth.
+    pub api_key_env: Option<String>,
+}
+
+impl NamedProviderConfig {
+    pub fn api_key(&self) -> Option<String> {
+        if let Some(key) = self
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+        {
+            return Some(key.to_string());
+        }
+        self.api_key_env
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .and_then(env_var)
+    }
+}
+
+/// One additional model exposed by `/model`. Each entry may point at its own
 /// OpenAI-compatible endpoint, so one installation can mix providers.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelConfig {
-    /// Selection id shown in `/models`, e.g. `openai/gpt-4o`.
+    /// Selection id shown in `/model`, e.g. `openai/gpt-4o`.
     pub id: String,
     /// API model id. Defaults to the part after the first `/` in `id`, which
     /// makes `openai/gpt-4o` work against an OpenAI-compatible endpoint.
     pub model: Option<String>,
     /// Friendly name; defaults to `id`.
     pub name: Option<String>,
+    /// Named provider from `[providers.*]`. When set, `base_url` is optional
+    /// and the provider's endpoint/key are used.
+    pub provider: Option<String>,
     pub base_url: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
@@ -905,6 +968,11 @@ impl Default for LspServerConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ModelInfo {
     pub id: String,
+    /// Model id accepted by the provider API, without the synthetic
+    /// `default/` or `<provider>/` selection prefix. Frontends show this in
+    /// pickers while `id` remains the value used for routing.
+    #[serde(default)]
+    pub api_model: Option<String>,
     pub name: String,
     pub provider: String,
     pub default: bool,
@@ -912,6 +980,25 @@ pub struct ModelInfo {
     pub input_cost: Option<f64>,
     pub output_cost: Option<f64>,
     pub context_tokens: Option<usize>,
+}
+
+impl ModelInfo {
+    /// Id shown in pickers: the raw API id when known, otherwise the full
+    /// selection id.
+    pub fn display_id(&self) -> &str {
+        self.api_model.as_deref().unwrap_or(&self.id)
+    }
+}
+
+/// One endpoint whose `/models` catalog should be fetched. The built-in
+/// `[provider]` is exposed as `default`; named entries keep their table key.
+#[derive(Debug, Clone)]
+pub struct ProviderSource {
+    pub key: String,
+    pub name: String,
+    pub base_url: String,
+    pub api_key: Option<String>,
+    pub default: bool,
 }
 
 /// Everything the provider needs for one request, resolved from the selected
@@ -924,6 +1011,8 @@ pub struct ModelRoute {
     pub reasoning_effort: Option<String>,
     pub input_cost: Option<f64>,
     pub output_cost: Option<f64>,
+    /// Advertised context window for this model, when known.
+    pub context_tokens: Option<usize>,
 }
 
 impl ModelRoute {
@@ -1081,6 +1170,10 @@ impl Config {
         if let Some(value) = env_var("EIX_CONTEXT_TOOL_OUTPUT_TOKENS").and_then(|v| v.parse().ok())
         {
             self.context.tool_output_tokens = value;
+        }
+        if let Some(value) = env_var("EIX_CONTEXT_TOOL_SCHEMA_TOKENS").and_then(|v| v.parse().ok())
+        {
+            self.context.max_tool_schema_tokens = value;
         }
         if let Some(value) = env_var("EIX_CONTEXT_AUTO_COMPACT") {
             self.context.auto_compact = matches!(value.as_str(), "1" | "true" | "yes" | "on");
@@ -1265,9 +1358,50 @@ impl Config {
                 return Err(ConfigError::Invalid(format!("keys.{action} is empty")));
             }
         }
+        for (name, provider) in &self.providers {
+            if name.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "providers contains an empty name".into(),
+                ));
+            }
+            if name == "default" {
+                return Err(ConfigError::Invalid(
+                    "providers.default is reserved for [provider]".into(),
+                ));
+            }
+            if name.contains('/') || name.contains('#') || name.chars().any(char::is_whitespace) {
+                return Err(ConfigError::Invalid(format!(
+                    "providers.{name} must not contain '/', '#' or whitespace"
+                )));
+            }
+            let base = provider.base_url.trim();
+            if base.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "providers.{name}.base_url is empty"
+                )));
+            }
+            if !(base.starts_with("http://") || base.starts_with("https://")) {
+                return Err(ConfigError::Invalid(format!(
+                    "providers.{name}.base_url must start with http:// or https:// (got {:?})",
+                    provider.base_url
+                )));
+            }
+        }
         for (index, model) in self.models.iter().enumerate() {
             if model.id.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!("models[{index}].id is empty")));
+            }
+            if let Some(provider) = model
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+            {
+                if provider != "default" && !self.providers.contains_key(provider) {
+                    return Err(ConfigError::Invalid(format!(
+                        "models[{index}].provider {provider:?} is not configured"
+                    )));
+                }
             }
             if self
                 .models
@@ -1352,6 +1486,11 @@ impl Config {
                 "context.tool_output_tokens must be > 0".into(),
             ));
         }
+        if self.context.max_tool_schema_tokens == 0 {
+            return Err(ConfigError::Invalid(
+                "context.max_tool_schema_tokens must be > 0".into(),
+            ));
+        }
         let token_missing = self
             .server
             .token
@@ -1387,7 +1526,35 @@ impl Config {
         Ok(())
     }
 
-    /// Models shown by `/models`: the default provider first, then configured
+    /// Endpoints whose `/models` catalogs are fetched for `/model`. The
+    /// default `[provider]` comes first and is addressed as `default`.
+    pub fn provider_sources(&self) -> Vec<ProviderSource> {
+        let mut out = vec![ProviderSource {
+            key: "default".to_string(),
+            name: "default".to_string(),
+            base_url: self.provider.base_url.clone(),
+            api_key: self.api_key(),
+            default: true,
+        }];
+        for (key, provider) in &self.providers {
+            out.push(ProviderSource {
+                key: key.clone(),
+                name: provider
+                    .name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or(key)
+                    .to_string(),
+                base_url: provider.base_url.clone(),
+                api_key: provider.api_key(),
+                default: false,
+            });
+        }
+        out
+    }
+
+    /// Models shown by `/model`: the default provider first, then configured
     /// entries. Duplicate ids keep the first occurrence.
     pub fn models(&self) -> Vec<ModelInfo> {
         let mut out = Vec::new();
@@ -1396,6 +1563,7 @@ impl Config {
             out.push(ModelInfo {
                 name: default_id.clone(),
                 id: default_id.clone(),
+                api_model: None,
                 provider: default_id
                     .split_once('/')
                     .map(|(provider, _)| provider.to_string())
@@ -1404,7 +1572,7 @@ impl Config {
                 variants: Vec::new(),
                 input_cost: None,
                 output_cost: None,
-                context_tokens: None,
+                context_tokens: self.provider.context_tokens,
             });
         }
         for model in &self.models {
@@ -1414,6 +1582,12 @@ impl Config {
             }
             out.push(ModelInfo {
                 id: id.to_string(),
+                api_model: model
+                    .model
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|api_model| !api_model.is_empty())
+                    .map(str::to_string),
                 name: model
                     .name
                     .as_deref()
@@ -1421,9 +1595,13 @@ impl Config {
                     .filter(|name| !name.is_empty())
                     .unwrap_or(id)
                     .to_string(),
-                provider: id
-                    .split_once('/')
-                    .map(|(provider, _)| provider.to_string())
+                provider: model
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|provider| !provider.is_empty())
+                    .map(str::to_string)
+                    .or_else(|| id.split_once('/').map(|(provider, _)| provider.to_string()))
                     .unwrap_or_else(|| "custom".to_string()),
                 default: false,
                 variants: model.variants.clone(),
@@ -1446,48 +1624,112 @@ impl Config {
             _ => (selection, None),
         };
         let configured = self.models.iter().find(|model| model.id.trim() == base_id);
+        let default_id = self.provider.model.trim();
 
-        let (base_url, api_key, default_model, input_cost, output_cost) = match configured {
-            Some(model) => (
-                if model.base_url.trim().is_empty() {
-                    self.provider.base_url.clone()
-                } else {
+        let (base_url, api_key, api_model, input_cost, output_cost) =
+            if let Some(model) = configured {
+                let provider_name = model
+                    .provider
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty());
+                let provider = provider_name.and_then(|name| self.providers.get(name));
+                let base_url = if !model.base_url.trim().is_empty() {
                     model.base_url.clone()
-                },
-                model
+                } else if let Some(provider) = provider {
+                    provider.base_url.clone()
+                } else {
+                    self.provider.base_url.clone()
+                };
+                let api_key = model
                     .api_key
                     .as_deref()
                     .map(str::trim)
                     .filter(|key| !key.is_empty())
                     .map(str::to_string)
                     .or_else(|| model.api_key_env.as_deref().and_then(env_var))
-                    .or_else(|| self.api_key()),
-                model
+                    .or_else(|| match provider_name {
+                        Some("default") | None => self.api_key(),
+                        Some(_) => provider.and_then(NamedProviderConfig::api_key),
+                    });
+                let api_model = model
                     .model
                     .as_deref()
                     .map(str::trim)
                     .filter(|model| !model.is_empty())
                     .map(str::to_string)
                     .or_else(|| base_id.split_once('/').map(|(_, model)| model.to_string()))
-                    .unwrap_or_else(|| base_id.to_string()),
-                model.input_cost,
-                model.output_cost,
-            ),
-            None => (
-                self.provider.base_url.clone(),
-                self.api_key(),
-                if base_id.is_empty() {
-                    self.provider.model.clone()
+                    .unwrap_or_else(|| base_id.to_string());
+                (
+                    base_url,
+                    api_key,
+                    api_model,
+                    model.input_cost,
+                    model.output_cost,
+                )
+            } else if !base_id.is_empty() && base_id == default_id {
+                (
+                    self.provider.base_url.clone(),
+                    self.api_key(),
+                    base_id.to_string(),
+                    None,
+                    None,
+                )
+            } else if let Some((provider_key, model_id)) = base_id.split_once('/') {
+                if provider_key == "default" {
+                    (
+                        self.provider.base_url.clone(),
+                        self.api_key(),
+                        model_id.to_string(),
+                        None,
+                        None,
+                    )
+                } else if let Some(provider) = self.providers.get(provider_key) {
+                    (
+                        provider.base_url.clone(),
+                        provider.api_key(),
+                        model_id.to_string(),
+                        None,
+                        None,
+                    )
                 } else {
-                    base_id.to_string()
-                },
-                None,
-                None,
-            ),
+                    // Unknown ids keep the old behavior: send them verbatim to
+                    // the default endpoint.
+                    (
+                        self.provider.base_url.clone(),
+                        self.api_key(),
+                        base_id.to_string(),
+                        None,
+                        None,
+                    )
+                }
+            } else {
+                (
+                    self.provider.base_url.clone(),
+                    self.api_key(),
+                    if base_id.is_empty() {
+                        self.provider.model.clone()
+                    } else {
+                        base_id.to_string()
+                    },
+                    None,
+                    None,
+                )
+            };
+        let context_tokens = match configured {
+            Some(model) => model.context_tokens,
+            None => match base_id.split_once('/') {
+                Some((provider_key, _))
+                    if provider_key != "default" && self.providers.contains_key(provider_key) =>
+                {
+                    None
+                }
+                _ => self.provider.context_tokens,
+            },
         };
 
         ModelRoute {
-            model: default_model,
+            model: api_model,
             endpoint: chat_endpoint(&base_url),
             api_key,
             // Most OpenAI-compatible servers accept this for reasoning models;
@@ -1495,6 +1737,7 @@ impl Config {
             reasoning_effort: variant,
             input_cost,
             output_cost,
+            context_tokens,
         }
     }
 
@@ -1526,6 +1769,19 @@ fn chat_endpoint(base_url: &str) -> String {
         base.to_string()
     } else {
         format!("{base}/chat/completions")
+    }
+}
+
+/// OpenAI-compatible model catalog URL. Accepts the same base forms as
+/// [`chat_endpoint`], including an explicit `/chat/completions` endpoint.
+pub fn models_endpoint(base_url: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if let Some(base) = base.strip_suffix("/chat/completions") {
+        format!("{base}/models")
+    } else if base.ends_with("/models") {
+        base.to_string()
+    } else {
+        format!("{base}/models")
     }
 }
 
@@ -1608,14 +1864,44 @@ fn interpolate(text: &str, base_dir: &Path) -> Result<String, ConfigError> {
     Ok(out)
 }
 
+/// Cross-platform config root used by eix's own files.
+///
+/// eix deliberately keeps its files in `~/.config/eix` on every Unix-like
+/// platform, including macOS where `dirs::config_dir()` points at
+/// `~/Library/Application Support`. `XDG_CONFIG_HOME` overrides the base
+/// directory and `EIX_CONFIG_DIR` overrides the final eix directory.
+pub fn config_home() -> PathBuf {
+    if let Some(path) = env_var("XDG_CONFIG_HOME") {
+        return PathBuf::from(path);
+    }
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".config")
+}
+
+/// The eix config directory (`~/.config/eix` by default).
+pub fn config_dir() -> PathBuf {
+    if let Some(path) = env_var("EIX_CONFIG_DIR") {
+        return PathBuf::from(path);
+    }
+    config_home().join("eix")
+}
+
+/// Directory for user-installed skills.
+pub fn skills_dir() -> PathBuf {
+    config_dir().join("skills")
+}
+
+/// Directory for user-defined prompt commands.
+pub fn cmds_dir() -> PathBuf {
+    config_dir().join("cmds")
+}
+
 pub fn default_config_path() -> PathBuf {
     if let Some(path) = env_var("EIX_CONFIG") {
         return PathBuf::from(path);
     }
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("eix")
-        .join("config.toml")
+    config_dir().join("config.toml")
 }
 
 /// Project-local CLI defaults. This is separate from `config.toml` because it
@@ -1702,15 +1988,23 @@ pub fn daemon_log_path() -> PathBuf {
 }
 
 /// Prefer the per-user runtime dir (tmpfs), which is the right lifetime for a
-/// socket. Fall back to a user-specific path in the temp dir.
+/// socket. Linux distributions such as Arch normally set `XDG_RUNTIME_DIR`.
+/// macOS has no runtime dir, so use the per-user cache dir instead; this keeps
+/// the path short enough for the Unix socket limit and avoids sharing `/tmp`
+/// with other users. The final fallback is a user-specific temp path.
 pub fn socket_path() -> PathBuf {
     if let Some(path) = env_var("EIX_SOCKET") {
         return PathBuf::from(path);
     }
-    if let Some(runtime) = env_var("XDG_RUNTIME_DIR") {
-        return PathBuf::from(runtime).join("eix.sock");
+    if let Some(runtime) = dirs::runtime_dir() {
+        return runtime.join("eix.sock");
     }
-    let user = env_var("USER").unwrap_or_else(|| "eix".to_string());
+    if let Some(cache) = dirs::cache_dir() {
+        return cache.join("eix").join("eix.sock");
+    }
+    let user = env_var("USER")
+        .or_else(|| env_var("USERNAME"))
+        .unwrap_or_else(|| "eix".to_string());
     env::temp_dir().join(format!("eix-{user}.sock"))
 }
 
@@ -1757,6 +2051,24 @@ mod tests {
     }
 
     #[test]
+    fn effective_budget_reserves_room_for_the_completion() {
+        let context = ContextConfig {
+            budget_tokens: 32_000,
+            ..ContextConfig::default()
+        };
+        // No known window: keep the configured budget.
+        assert_eq!(context.effective_budget_tokens(None), 32_000);
+        assert_eq!(context.effective_budget_tokens(Some(0)), 32_000);
+
+        // A high configured budget is clamped below a small real window.
+        assert_eq!(context.effective_budget_tokens(Some(8_000)), 6_000);
+        // A large window still uses the configured budget.
+        assert_eq!(context.effective_budget_tokens(Some(1_000_000)), 32_000);
+        // Tiny windows never collapse to zero.
+        assert_eq!(context.effective_budget_tokens(Some(1)), 1);
+    }
+
+    #[test]
     fn retired_neutral_theme_presets_are_gone() {
         assert!(theme_preset("dark").is_none());
         assert!(theme_preset("light").is_none());
@@ -1778,6 +2090,7 @@ mod tests {
                 },
                 ModelConfig {
                     id: "openai/gpt-5".into(),
+                    model: Some("gpt-5".into()),
                     name: Some("GPT-5".into()),
                     variants: vec!["high".into(), "low".into()],
                     input_cost: Some(1.25),
@@ -1791,11 +2104,144 @@ mod tests {
         let models = config.models();
         assert_eq!(models.len(), 2);
         assert_eq!(models[0].id, "local/llama");
+        assert_eq!(models[0].display_id(), "local/llama");
         assert!(models[0].default);
         assert_eq!(models[0].provider, "local");
+        assert_eq!(models[1].id, "openai/gpt-5");
+        assert_eq!(models[1].api_model.as_deref(), Some("gpt-5"));
+        assert_eq!(models[1].display_id(), "gpt-5");
         assert_eq!(models[1].name, "GPT-5");
         assert_eq!(models[1].provider, "openai");
         assert_eq!(models[1].variants, vec!["high", "low"]);
+    }
+
+    #[test]
+    fn named_providers_route_fetched_model_ids() {
+        let mut config: Config = toml::from_str(
+            r#"
+[provider]
+base_url = "https://default.test/v1"
+model = "default-model"
+api_key = "default-key"
+
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.test/api/v1"
+api_key = "router-key"
+
+[providers.local]
+base_url = "http://127.0.0.1:11434/v1"
+"#,
+        )
+        .expect("parse");
+
+        let sources = config.provider_sources();
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].key, "default");
+        assert_eq!(sources[0].api_key.as_deref(), Some("default-key"));
+        assert_eq!(sources[1].key, "local");
+        assert!(sources[1].api_key.is_none());
+        assert_eq!(sources[2].name, "OpenRouter");
+        assert_eq!(sources[2].api_key.as_deref(), Some("router-key"));
+
+        // Fetched catalog ids use `<provider>/<api model>`; the API model may
+        // itself contain slashes.
+        let route = config.route("openrouter/openai/gpt-5#high");
+        assert_eq!(route.model, "openai/gpt-5");
+        assert_eq!(
+            route.endpoint,
+            "https://openrouter.test/api/v1/chat/completions"
+        );
+        assert_eq!(route.api_key.as_deref(), Some("router-key"));
+        assert_eq!(route.reasoning_effort.as_deref(), Some("high"));
+
+        let local = config.route("local/llama3");
+        assert_eq!(local.model, "llama3");
+        assert_eq!(local.endpoint, "http://127.0.0.1:11434/v1/chat/completions");
+        assert!(local.api_key.is_none());
+
+        let default_alias = config.route("default/gpt-5");
+        assert_eq!(default_alias.model, "gpt-5");
+        assert_eq!(default_alias.endpoint, config.chat_endpoint());
+        assert_eq!(default_alias.api_key.as_deref(), Some("default-key"));
+
+        // A configured default model keeps routing to [provider] verbatim.
+        let default_model = config.route("default-model");
+        assert_eq!(default_model.model, "default-model");
+        assert_eq!(default_model.endpoint, config.chat_endpoint());
+
+        // Unknown prefixes keep the old fallback behavior.
+        let unknown = config.route("other/foo");
+        assert_eq!(unknown.model, "other/foo");
+        assert_eq!(unknown.endpoint, config.chat_endpoint());
+
+        // Explicit [[models]] entries can reuse a named provider's endpoint.
+        config.models.push(ModelConfig {
+            id: "openrouter/claude".into(),
+            provider: Some("openrouter".into()),
+            model: Some("anthropic/claude-sonnet".into()),
+            ..ModelConfig::default()
+        });
+        let explicit = config.route("openrouter/claude");
+        assert_eq!(explicit.model, "anthropic/claude-sonnet");
+        assert_eq!(
+            explicit.endpoint,
+            "https://openrouter.test/api/v1/chat/completions"
+        );
+        assert_eq!(explicit.api_key.as_deref(), Some("router-key"));
+    }
+
+    #[test]
+    fn model_catalog_endpoint_accepts_base_and_chat_urls() {
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1/"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1/chat/completions"),
+            "https://api.openai.com/v1/models"
+        );
+        assert_eq!(
+            models_endpoint("https://api.openai.com/v1/models"),
+            "https://api.openai.com/v1/models"
+        );
+    }
+
+    #[test]
+    fn invalid_named_providers_are_rejected() {
+        let reserved = Config {
+            providers: BTreeMap::from([(
+                "default".to_string(),
+                NamedProviderConfig {
+                    base_url: "https://example.test/v1".into(),
+                    ..NamedProviderConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        assert!(reserved.validate().is_err());
+
+        let bad_url = Config {
+            providers: BTreeMap::from([(
+                "local".to_string(),
+                NamedProviderConfig {
+                    base_url: "localhost:11434".into(),
+                    ..NamedProviderConfig::default()
+                },
+            )]),
+            ..Config::default()
+        };
+        assert!(bad_url.validate().is_err());
+
+        let unknown_model_provider = Config {
+            models: vec![ModelConfig {
+                id: "x/y".into(),
+                provider: Some("missing".into()),
+                ..ModelConfig::default()
+            }],
+            ..Config::default()
+        };
+        assert!(unknown_model_provider.validate().is_err());
     }
 
     #[test]

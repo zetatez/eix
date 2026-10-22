@@ -1,12 +1,14 @@
 //! User-defined prompt commands loaded from Markdown files.
 //!
-//! A command is a `.md` file below a `commands/` directory:
+//! A command is a `.md` file below a `cmds/` directory:
 //!
 //! ```text
-//! ~/.config/eix/commands/review.md
-//! <project>/.eix/commands/team/review.md
+//! ~/.config/eix/cmds/review.md
+//! <project>/.eix/cmds/team/review.md
 //! <project>/.opencode/commands/review.md   (OpenCode compatibility)
 //! ```
+//!
+//! The legacy `commands/` directory names remain readable.
 //!
 //! The file body is the prompt template. Optional frontmatter sets
 //! `description`, `agent`, and `model`. `$ARGUMENTS` expands to the whole
@@ -32,17 +34,31 @@ pub struct CustomCommand {
 /// Load every command visible from `cwd`. Nearer project sources override
 /// global and ancestor sources with the same name.
 pub fn load_commands(cwd: &Path) -> Vec<CustomCommand> {
+    load_commands_with_roots(
+        cwd,
+        &crate::config::config_home(),
+        &crate::config::config_dir(),
+    )
+}
+
+fn load_commands_with_roots(
+    cwd: &Path,
+    config_home: &Path,
+    config_dir: &Path,
+) -> Vec<CustomCommand> {
     let mut sources: Vec<PathBuf> = Vec::new();
-    if let Some(config) = dirs::config_dir() {
-        sources.push(config.join("eix/commands"));
-        sources.push(config.join("opencode/commands"));
-    }
+    sources.push(config_home.join("opencode/commands"));
+    // Legacy global directory, then the current `cmds/` directory so a file in
+    // either place is picked up and `cmds/` wins when both define a name.
+    sources.push(config_dir.join("commands"));
+    sources.push(config_dir.join("cmds"));
 
     let mut ancestors: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
     ancestors.reverse();
     for ancestor in ancestors {
         sources.push(ancestor.join(".eix/commands"));
         sources.push(ancestor.join(".opencode/commands"));
+        sources.push(ancestor.join(".eix/cmds"));
     }
 
     let mut by_name: BTreeMap<String, CustomCommand> = BTreeMap::new();
@@ -236,7 +252,7 @@ mod tests {
             "eix-commands-{label}-{}-{nanos}",
             std::process::id()
         ));
-        std::fs::create_dir_all(dir.join(".eix/commands/team")).unwrap();
+        std::fs::create_dir_all(dir.join(".eix/cmds/team")).unwrap();
         dir
     }
 
@@ -244,15 +260,11 @@ mod tests {
     fn loads_nested_markdown_with_frontmatter() {
         let cwd = temp_dir("load");
         std::fs::write(
-            cwd.join(".eix/commands/review.md"),
+            cwd.join(".eix/cmds/review.md"),
             "---\ndescription: Review code\nagent: plan\nmodel: openai/gpt-5\n---\n\nReview $ARGUMENTS for bugs.\n",
         )
         .unwrap();
-        std::fs::write(
-            cwd.join(".eix/commands/team/check.md"),
-            "Check $1 and $2.\n",
-        )
-        .unwrap();
+        std::fs::write(cwd.join(".eix/cmds/team/check.md"), "Check $1 and $2.\n").unwrap();
 
         let commands = load_commands(&cwd);
         let review = commands
@@ -265,6 +277,28 @@ mod tests {
         assert_eq!(review.template, "Review $ARGUMENTS for bugs.");
         assert!(commands.iter().any(|command| command.name == "team/check"));
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn loads_global_cmds_and_prefers_them_over_legacy_commands() {
+        let config_home = temp_dir("global-home");
+        let config_dir = config_home.join("eix");
+        std::fs::create_dir_all(config_dir.join("cmds")).unwrap();
+        std::fs::create_dir_all(config_dir.join("commands")).unwrap();
+        std::fs::write(config_dir.join("commands/global.md"), "legacy template\n").unwrap();
+        std::fs::write(config_dir.join("cmds/global.md"), "cmds template\n").unwrap();
+        std::fs::write(config_dir.join("cmds/review.md"), "Review $ARGUMENTS.\n").unwrap();
+        let cwd = config_home.join("project");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let commands = load_commands_with_roots(&cwd, &config_home, &config_dir);
+        let global = commands
+            .iter()
+            .find(|command| command.name == "global")
+            .expect("global");
+        assert_eq!(global.template, "cmds template");
+        assert!(commands.iter().any(|command| command.name == "review"));
+        let _ = std::fs::remove_dir_all(&config_home);
     }
 
     #[test]

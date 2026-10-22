@@ -23,11 +23,11 @@ pub mod skills;
 pub use agents::{find_agent, load_agents, AgentMode, AgentSpec};
 pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
-    load_cli_config, theme_preset, AutoApproveRule, CliConfig, Config, ConfigError, ContextConfig,
-    FormatterConfig, ImagesConfig, LspConfig, LspServerConfig, McpConfig, McpServerConfig,
-    ModelConfig, ModelInfo, ModelRoute, NotificationsConfig, PermissionAction, PermissionRule,
-    ProviderConfig, SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolPolicy, ToolsConfig,
-    THEME_PRESETS,
+    load_cli_config, models_endpoint, theme_preset, AutoApproveRule, CliConfig, Config,
+    ConfigError, ContextConfig, FormatterConfig, ImagesConfig, LspConfig, LspServerConfig,
+    McpConfig, McpServerConfig, ModelConfig, ModelInfo, ModelRoute, NamedProviderConfig,
+    NotificationsConfig, PermissionAction, PermissionRule, ProviderConfig, ProviderSource,
+    SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolPolicy, ToolsConfig, THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{

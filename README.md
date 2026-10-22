@@ -40,7 +40,9 @@ echo 'review the diff' | ./target/debug/eix send
 ```
 
 `eix` 第一次连接时会在后台拉起 `eixd`（新进程组，关终端不会杀掉 daemon）。
-socket 默认 `$XDG_RUNTIME_DIR/eix.sock`，数据默认 `~/.local/share/eix/`（SQLite + `eixd.log`）。
+socket 在 Linux / Arch 默认 `$XDG_RUNTIME_DIR/eix.sock`；macOS 没有 XDG runtime dir，回退到
+`~/Library/Caches/eix/eix.sock`（其他没有 runtime dir 的平台回退到 `~/.cache/eix/eix.sock`）。
+数据默认 `~/.local/share/eix/`（SQLite + `eixd.log`）。可以用 `EIX_SOCKET` / `--socket` 覆盖。
 
 配置：
 
@@ -70,16 +72,30 @@ auto_compact_threshold = 0.8   # 占 budget_tokens 的比例 (0, 1]
 auto_compact_keep_turns = 2    # 最近 N 个 user turn 原样保留
 tool_output_tokens = 4000      # 单条工具结果进入 provider 上下文的 token 上限
 
-# 额外模型（可选，每个条目可指向不同的 OpenAI 兼容 endpoint）
+# 额外 provider（可选）。/model 会自动请求每个 provider 的 GET /models，
+# 选择 id 为 "<provider>/<api-model-id>"；模型 id 里的 "/" 会保留。
+# [provider] 的自动项使用 "default/<api-model-id>"，默认模型仍排在第一位。
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.local]
+base_url = "http://localhost:11434/v1"
+# api_key 或 api_key_env 可选；本地端点通常不需要
+# provider 名不能是 default，也不能包含 "/"、"#" 或空白。
+
+# 手动固定的模型（可选）。适合给模型补充成本、上下文或 variants，
+# 也可用 provider 复用 [providers.*] 的 endpoint/key。
 [[models]]
-id = "openai/gpt-5"            # /models 里的选择 id；API model 默认取 "/" 之后
-name = "GPT-5"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
+id = "openrouter/gpt-5"        # /model 里的选择 id；API model 默认取 "/" 之后
+name = "GPT-5 via OpenRouter"
+provider = "openrouter"        # 可选；引用 [providers.openrouter]
+model = "openai/gpt-5"         # 可选；显式指定 API model id
 input_cost = 1.25              # USD / 1M tokens，用于成本统计
 output_cost = 10.0
 context_tokens = 400000
-variants = ["high", "medium", "low"]  # 可在 /models 里选 id#variant
+variants = ["high", "medium", "low"]  # 可在 /model 里选 id#variant
 
 # MCP server（stdio，可选）
 [mcp.servers.files]
@@ -144,7 +160,10 @@ extensions = ["py"]
 `EIX_TOOL_SANDBOX_READ_HOME`、`EIX_TOOL_SNAPSHOTS`、`EIX_CONTEXT_BUDGET`、
 `EIX_CONTEXT_AUTO_COMPACT`、`EIX_CONTEXT_AUTO_COMPACT_THRESHOLD`、`EIX_CONTEXT_TOOL_OUTPUT_TOKENS`、
 `EIX_CONTEXT_WORKSPACE`、`EIX_NOTIFY_COMMAND`、`EIX_NOTIFY_COOLDOWN_SECS`、
-`EIX_NOTIFY_BELL`、`EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`、`EIX_CLI_CONFIG`。
+`EIX_NOTIFY_BELL`、`EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`、`EIX_CONFIG_DIR`、`EIX_CLI_CONFIG`。
+
+eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `~/Library/Application Support`）：
+`config.toml`、`AGENTS.md`、`skills/`、`cmds/`、`agents/`。可用 `EIX_CONFIG_DIR` 覆盖这个目录。
 
 配置分层（daemon 从启动目录向上查找）：
 
@@ -235,6 +254,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
 | `Tab` | normal 模式与转录区：在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
 | `<Space>s` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
+| `Ctrl-T` | 快速轮换推理强度：low → medium → high → 空 → low（输入框内外都可用） |
 | `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
 | `:` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
 | `<Space>w` | worktree picker：选中后把路径插入聚焦 pane 的输入框 |
@@ -289,7 +309,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/history` | 打开全文历史搜索弹窗 |
 | `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
 | `/attention` / `/cancel` / `/toggle-agent` | 跳到下一个需要 attention 的 pane / 取消运行 / 切换 Build·Plan |
-| `/models [id]` | 打开模型 picker（含变体行）；直接 `/models provider/model#variant` 可固定到某个模型 |
+| `/model [id]` | 打开可搜索的模型 picker：合并 `[provider]`、`[providers.*]` 自动拉取的 `/models` 和 `[[models]]`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
 | `/commands` | 从磁盘重新加载自定义 Markdown 命令 |
@@ -339,16 +359,19 @@ frontmatter 支持 `name`、`description`、`allowed-tools`；正文是完整指
 Markdown 文件放在以下目录（越靠近项目越优先）：
 
 ```text
-~/.config/eix/commands/*.md          # 全局命令
+~/.config/eix/cmds/*.md              # 全局命令
+~/.config/eix/commands/*.md          # 旧路径，仍兼容
 ~/.config/opencode/commands/*.md     # OpenCode 兼容
-<project>/.eix/commands/*.md         # 项目命令（可嵌套，team/name.md → /team/name）
+<project>/.eix/cmds/*.md             # 项目命令（可嵌套，team/name.md → /team/name）
+<project>/.eix/commands/*.md         # 旧路径，仍兼容
 <project>/.opencode/commands/*.md
 
 ~/.config/eix/agents/*.md            # 全局 agent
 <project>/.eix/agents/*.md           # 项目 agent
 ```
 
-命令的 frontmatter 支持 `description`、`agent`、`model`；正文是模板，支持
+命令本质上就是提示词模板：`~/.config/eix/cmds/review.md` 会出现在 `/` 命令菜单里，输入
+`/review <args>` 即展开模板并发送到当前 session。frontmatter 支持 `description`、`agent`、`model`；正文是模板，支持
 `$ARGUMENTS`（全部参数）和 `$1`..`$9`（最高位占位符吃掉剩余参数）。没有占位符时参数
 追加到末尾。例：
 
@@ -912,6 +935,35 @@ eix nvim [--session ID]      # 也可用 EIX_NVIM 覆盖 nvim 可执行文件
 turn，第二个 prompt 在忙时会被拒绝。attach 后前端会发 `session.subscribe`，只接收当前
 session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独立前端互不影响。
 
+## 构建与打包
+
+需要 Rust stable、`cargo`、`make`。在 Arch 上还需要 `base-devel`；打 Debian/Ubuntu 包需要
+`dpkg-deb`；macOS 包必须在 macOS 上构建。
+
+```sh
+make release                  # 构建当前 OS/arch 并生成原生安装包
+make dist                     # 构建当前 OS 支持的所有格式
+make package-arch             # Arch Linux: dist/eix-<version>-1-<arch>.pkg.tar.zst
+make package-deb              # Debian/Ubuntu: dist/eix_<version>_<amd64|arm64>.deb
+make package-tar              # 通用包: dist/eix-<version>-<os>-<arch>.tar.gz
+make package-macos            # macOS: tar.gz + Homebrew formula
+```
+
+产物都在 `dist/`（Arch 的 `makepkg` 工作目录也在 `dist/makepkg/`，不会污染仓库根目录）。
+macOS 会生成二进制 tarball 和对应的 Homebrew formula（例如 `dist/eix-arm64.rb`），可以直接本地安装：
+
+```sh
+brew install --formula ./dist/eix-arm64.rb
+```
+
+`make release` / `make package` 只针对当前主机和架构；跨 OS/架构的 release 由
+[`.github/workflows/release.yml`](./.github/workflows/release.yml) 的原生 runner matrix 生成：
+Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。Windows 不在支持范围内。
+
+> Debian 包最好在目标发行版或 CI 的 Ubuntu runner 上构建。在 Arch 上构建的 `.deb` 会链接
+> 当前 Arch 的 glibc，较老的 Debian/Ubuntu 可能无法运行。CI 使用 Ubuntu 22.04 作为 Linux
+> glibc baseline，macOS 使用 `MACOSX_DEPLOYMENT_TARGET=11.0`。
+
 ## Status
 
 - [x] 设计文档 v0.1
@@ -969,7 +1021,7 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] 草稿镜像（编辑器变更同步到 `draft.set`，切 session 时从 daemon 回填）
 - [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / worktrees / branches / context，`p`/`o`/`:`/`w`/`b`/`@` 入口；独立前端 `:Eix pick [KIND]`）
 - [x] 工具补齐：`grep` / `glob` / `edit` / `patch`，`read_file` 行号 + `offset`/`limit` 分页（只读工具自动放行）
-- [x] 自定义 Markdown 命令（`~/.config/eix/commands`、项目 `.eix/commands`、OpenCode 兼容目录；`$ARGUMENTS` / `$1..$9`、frontmatter `description`/`agent`/`model`）
+- [x] 自定义 Markdown 命令（`~/.config/eix/cmds`、项目 `.eix/cmds`，兼容旧 `commands` 目录；`/name` 快速调用、`$ARGUMENTS` / `$1..$9`、frontmatter `description`/`agent`/`model`）
 - [x] 自定义 Markdown agent（`~/.config/eix/agents`、项目 `.eix/agents`；`mode`/`model`/`permission`，`/agents` 选择 primary、`spawn_agent agent:` 选择 subagent）
-- [x] 模型目录与多 provider（`[[models]]` 各自 base_url/key、`variants`、`/models` picker、内部统计 tokens / tok/s / 成本）
+- [x] 多 provider 模型目录（`[providers.*]` 命名 endpoint、自动拉取 `/models`、`[[models]]` 手动补充成本/变体、`/model` 搜索切换、内部统计 tokens / tok/s / 成本）
 - [x] MCP stdio client（`[mcp.servers.*]`、懒启动、`tools/list` / `tools/call` / `resources/*` / `prompts/*`、分页、`list_changed` 刷新、`allowed_tools` / `denied_tools`、`mcp__server__tool` 审批 + 树快照、`/mcp` 状态）

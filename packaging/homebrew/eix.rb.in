@@ -1,0 +1,17 @@
+class @CLASS@ < Formula
+  desc "Coding agent with a multi-session TUI and Neovim frontend"
+  homepage "https://github.com/zetatez/eix"
+  url "file://#{File.expand_path("@TARBALL@", __dir__)}"
+  sha256 "@SHA256@"
+  version "@VERSION@"
+  license "MIT"
+
+  def install
+    bin.install "eix"
+    bin.install "eixd"
+  end
+
+  test do
+    assert_match "eix", shell_output("#{bin}/eix --version")
+  end
+end

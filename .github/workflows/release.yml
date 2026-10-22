@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  MACOSX_DEPLOYMENT_TARGET: "11.0"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-22.04
+            package: dist-linux
+            artifact: linux-x86_64
+          - name: linux-aarch64
+            os: ubuntu-22.04-arm
+            package: dist-linux
+            artifact: linux-aarch64
+          - name: macos-x86_64
+            os: macos-15-intel
+            package: package-macos
+            artifact: macos-x86_64
+          - name: macos-arm64
+            os: macos-15
+            package: package-macos
+            artifact: macos-arm64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build packages
+        run: make ${{ matrix.package }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/*.rb
+          if-no-files-found: error
+
+  arch:
+    name: arch-x86_64
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+    steps:
+      - name: Install git
+        run: pacman -Syu --noconfirm git
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: pacman -S --noconfirm rust
+      - name: Build Arch package
+        run: |
+          useradd -m builder
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE' && make package-arch"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arch-x86_64
+          path: "dist/*.pkg.tar.*"
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, arch]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

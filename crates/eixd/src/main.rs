@@ -64,7 +64,8 @@ USAGE:
     eixd [OPTIONS]
 
 OPTIONS:
-    --socket <path>     Unix socket path (default: $XDG_RUNTIME_DIR/eix.sock)
+    --socket <path>     Unix socket path (default: $XDG_RUNTIME_DIR/eix.sock;
+                        macOS: ~/Library/Caches/eix/eix.sock)
     --data-dir <path>   state directory (default: ~/.local/share/eix)
     --config <path>     config file (default: ~/.config/eix/config.toml)
     -h, --help          show this help
@@ -72,7 +73,8 @@ OPTIONS:
 
 ENVIRONMENT:
     EIX_BASE_URL, EIX_MODEL, EIX_API_KEY, EIX_API_KEY_ENV,
-    EIX_SYSTEM_PROMPT, EIX_TIMEOUT_SECS, EIX_SOCKET, EIX_DATA_DIR, EIX_CONFIG
+    EIX_SYSTEM_PROMPT, EIX_TIMEOUT_SECS, EIX_SOCKET, EIX_DATA_DIR, EIX_CONFIG,
+    EIX_CONFIG_DIR
 
 The daemon runs in the foreground. `eix` starts it automatically."
     );

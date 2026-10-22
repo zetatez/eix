@@ -213,13 +213,23 @@ impl Provider {
             request = request.bearer_auth(key);
         }
 
-        let response = request.send().await.map_err(|e| {
-            if cancel.load(Ordering::Relaxed) {
-                ProviderError::Cancelled
-            } else {
-                ProviderError::Http(e.to_string())
-            }
-        })?;
+        // Waiting for the first byte can outlast the user's patience. Poll the
+        // turn flag and drop the request future on cancel; reqwest then closes
+        // the connection instead of leaving the turn stuck in `sending`.
+        let response = tokio::select! {
+            result = request.send() => result.map_err(|e| {
+                if cancel.load(Ordering::Relaxed) {
+                    ProviderError::Cancelled
+                } else {
+                    ProviderError::Http(e.to_string())
+                }
+            })?,
+            _ = async {
+                while !cancel.load(Ordering::Relaxed) {
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+            } => return Err(ProviderError::Cancelled),
+        };
 
         let status = response.status();
         if !status.is_success() {
@@ -240,13 +250,23 @@ impl Provider {
             .unwrap_or(false);
 
         if !is_sse {
-            return self.non_streaming(response, model, on_delta).await;
+            return self.non_streaming(response, model, cancel, on_delta).await;
         }
 
         let mut decoder = SseDecoder::new();
         let mut acc = Accumulator::new(model);
         let mut stream = response.bytes_stream();
-        while let Some(chunk) = stream.next().await {
+        loop {
+            // A provider can send headers and one event, then stop writing.
+            // Poll the flag while waiting for the next chunk so cancel does not
+            // depend on the server closing the connection.
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = wait_for_cancel(cancel) => return Err(ProviderError::Cancelled),
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             if cancel.load(Ordering::Relaxed) {
                 return Err(ProviderError::Cancelled);
             }
@@ -283,15 +303,16 @@ impl Provider {
         &self,
         response: reqwest::Response,
         model: &str,
+        cancel: &AtomicBool,
         mut on_delta: F,
     ) -> Result<Completion, ProviderError>
     where
         F: FnMut(StreamDelta<'_>),
     {
-        let text = response
-            .text()
-            .await
-            .map_err(|e| ProviderError::Http(e.to_string()))?;
+        let text = tokio::select! {
+            text = response.text() => text.map_err(|e| ProviderError::Http(e.to_string()))?,
+            _ = wait_for_cancel(cancel) => return Err(ProviderError::Cancelled),
+        };
         let value: Value = serde_json::from_str(&text)
             .map_err(|e| ProviderError::Decode(format!("non-streaming response: {e}")))?;
         if let Some(error) = value.get("error") {
@@ -682,6 +703,12 @@ fn block_data(block: &[u8]) -> Option<String> {
         None
     } else {
         Some(data.join("\n"))
+    }
+}
+
+async fn wait_for_cancel(cancel: &AtomicBool) {
+    while !cancel.load(Ordering::Relaxed) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
 

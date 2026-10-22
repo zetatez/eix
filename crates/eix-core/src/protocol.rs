@@ -290,6 +290,10 @@ pub struct SessionAgentParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelListResult {
     pub models: Vec<crate::ModelInfo>,
+    /// Providers whose automatic catalog fetch failed. Configured models are
+    /// still present in `models`.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -17,12 +17,14 @@
 //!   Vim line motions in normal mode
 //! * `<Space>` is the leader for TUI actions, so plain letters stay native.
 
+use std::cell::Cell;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use unicode_width::UnicodeWidthChar;
 
 /// Minimum visible editor rows. Long drafts may grow the prompt up to the
 /// host's cap and then scroll.
-pub const PROMPT_ROWS: u16 = 6;
+pub const PROMPT_ROWS: u16 = 3;
 
 type Pos = (usize, usize);
 
@@ -166,6 +168,9 @@ pub struct Editor {
     row: usize,
     col: usize,
     mode: Mode,
+    /// First visible rendered row. Kept across redraws so moving the cursor
+    /// inside the viewport does not scroll the draft under it.
+    scroll: Cell<usize>,
     /// Column remembered across `j`/`k`.
     preferred: Option<usize>,
     /// Digits typed before a command.
@@ -196,6 +201,7 @@ impl Editor {
             row: 0,
             col: 0,
             mode: Mode::Insert,
+            scroll: Cell::new(0),
             preferred: None,
             count: None,
             op: None,
@@ -474,12 +480,21 @@ impl Editor {
             });
         }
 
-        let offset = if segments.len() > height {
-            (cursor_line + 1)
-                .saturating_sub(height)
-                .min(segments.len().saturating_sub(height))
+        let max_offset = segments.len().saturating_sub(height);
+        let offset = if height <= 1 {
+            // The host probes with height 1 to measure the draft; don't let
+            // that probe move the real viewport.
+            cursor_line.min(max_offset)
         } else {
-            0
+            let mut offset = self.scroll.get().min(max_offset);
+            if cursor_line < offset {
+                offset = cursor_line;
+            } else if cursor_line >= offset + height {
+                offset = cursor_line + 1 - height;
+            }
+            let offset = offset.min(max_offset);
+            self.scroll.set(offset);
+            offset
         };
 
         Layout {
@@ -2161,6 +2176,33 @@ mod tests {
         // An operator keeps `j` as a linewise motion (`dj`).
         press(&mut editor, "d");
         assert_eq!(key(&mut editor, KeyCode::Char('j')), Outcome::Ignored);
+    }
+
+    #[test]
+    fn k_moves_up_from_the_last_line() {
+        let mut editor = editor_with("one\ntwo\nthree");
+        press(&mut editor, "G");
+        assert_eq!(editor.row, 2);
+        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::Ignored);
+        assert_eq!(editor.row, 1);
+        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::Ignored);
+        assert_eq!(editor.row, 0);
+    }
+
+    #[test]
+    fn k_from_the_last_line_moves_up_inside_a_scrolled_viewport() {
+        let mut editor = editor_with("0\n1\n2\n3\n4\n5\n6\n7");
+        press(&mut editor, "G");
+        let before = editor.layout(20, 4);
+        assert_eq!(before.cursor_line, 7);
+        assert_eq!(before.cursor_line - before.offset, 3);
+        // The host measures the draft with a one-row probe before every draw.
+        let _ = editor.layout(20, 1);
+        assert_eq!(key(&mut editor, KeyCode::Char('k')), Outcome::Ignored);
+        let after = editor.layout(20, 4);
+        assert_eq!(after.cursor_line, 6);
+        assert_eq!(after.offset, before.offset);
+        assert_eq!(after.cursor_line - after.offset, 2);
     }
 
     #[test]

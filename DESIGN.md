@@ -17,7 +17,7 @@
 
 **非目标（v1）**
 
-- GUI / Web 前端；多人实时协作；插件市场；Windows / macOS 优先。
+- GUI / Web 前端；多人实时协作；插件市场。
 
 ## 2. 核心决策
 
@@ -279,6 +279,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `@` | 文件 picker（行首/空白后） |
 | `Esc` | insert/visual → normal；normal 下 500ms 内再按一次：有 turn 在跑时中断它，否则回到转录区 |
 | `Ctrl-J` / `Ctrl-K` | normal 模式下浏览已提交的 prompt 历史（newer / older） |
+| `Ctrl-T` | 任意焦点：推理强度 low → medium → high → 空 → low |
 | `Tab` | normal 模式下切换 Build / Plan 模式（命令面板的 `Build / Plan` 同义） |
 | `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
 | `<Space>s/o/f/w/b/c/C/h/p/R/n/N/W/F/v/t/r/l/x/i/A/a/:` | TUI 动作（见 5.1）；裸字母不触发动作 |
@@ -394,9 +395,13 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 - 仍待做：history 仍走独立的 `#` 全文搜索视图（未并入 picker）；diff hunks provider、
   多选（多文件插入、多 session 开 pane、多 hunk 审批）、frecency 排序与 `#` 匹配度模式、外挂
   `agent pick`/`fzf`、file 语法高亮预览。
-- 已补（2026-10-19）：`/models` 打开客户端生成的模型 picker（含 `id#variant` 行），
-  `/agents` 打开 primary agent picker；两者都复用同一个 overlay，数据来自 `model.list` /
-  `agent.list`，选中后发 `session.model` / `session.agent`。
+- 已补（2026-10-19）：`/model` 打开客户端生成的模型 picker（含 `id#variant` 行），
+  `/agents` 打开 primary agent picker；两者都复用同一个 overlay，数据来自
+  `model.list` / `agent.list`，选中后发 `session.model` / `session.agent`。
+- 已补（2026-10-22）：`[providers.<name>]` 注册多个 OpenAI 兼容 provider；`model.list`
+  并发拉取每个 provider 的 `GET /models`，失败只降级为该 provider 的 warning，静态
+  `[provider]` / `[[models]]` 始终保留。健康结果缓存 5 分钟，有失败时 30 秒后重试，
+  `/reload` 清空缓存。
 - 模糊匹配用 `fuzzy-matcher`（skim 算法）；不做自研打分。
 
 ## 9. 审批与工作区
@@ -779,17 +784,20 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > Add/Update/Delete，先校验全部文件再写入，并抓工作区树快照。`grep` / `glob` 目前看不到
 > staged 内容（MVP 限制）。
 >
-> 扩展：`eix-core/src/commands.rs` 从 `~/.config/eix/commands`、`~/.config/opencode/commands`
-> 和项目祖先目录的 `.eix/commands` / `.opencode/commands` 加载 Markdown 命令；嵌套目录映射为
+> 扩展：`eix-core/src/commands.rs` 从 `~/.config/eix/cmds`（兼容旧的 `commands/`）、
+> `~/.config/opencode/commands` 和项目祖先目录的 `.eix/cmds` / `.eix/commands` /
+> `.opencode/commands` 加载 Markdown 命令；命令就是提示词模板，嵌套目录映射为
 > `team/name`，frontmatter 支持 `description` / `agent` / `model`，模板支持 `$ARGUMENTS` 和
 > `$1..$9`。`eix-core/src/agents.rs` 用同样的目录规则加载 agent，frontmatter 支持
 > `mode` / `model` / `permission`，正文追加到 system prompt；内置 `build` / `plan` / `explore`。
 > `session.agent` 持久化到 `sessions.agent`，`spawn_agent` 接受 `agent` 参数，权限只能收紧。
 >
-> 模型：`[[models]]` 提供多 provider 注册（每个条目独立的 `base_url` / `api_key(_env)` /
-> `model` / 成本 / `variants`）；`Config::route` 解析 `id#variant`，变体作为
-> `reasoning_effort` 发送。`model.list` / `session.model` / `/models` picker（含变体行）已接入；
-> `turn.completed` 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
+> 模型：`[providers.<name>]` 提供命名 OpenAI 兼容 endpoint；`/model` 自动拉取每个 provider
+> 的 `/models`，选择 id 为 `<provider>/<api-model-id>`（`[provider]` 的自动项用 `default/`
+> 前缀）。`[[models]]` 仍可手动固定模型、补充成本/上下文/variants，或用 `provider` 复用命名
+> endpoint。`Config::route` 解析 provider 前缀和 `id#variant`，变体作为 `reasoning_effort`
+> 发送。`model.list` / `session.model` / `/model` picker（含变体行）已接入；`turn.completed`
+> 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
 >
 > MCP：`eixd/src/mcp.rs` 实现 stdio JSON-RPC 客户端，`[mcp.servers.<name>]` 懒启动并缓存进程。
 > `tools/list` / `resources/list` / `prompts/list` 都支持分页 cursor；工具名为
@@ -857,4 +865,6 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 - 仓库 / crate 前缀：`eix-*` → `eix-core`、`eixd`、`eix-tui`。
 - 二进制：`eix`（TUI + CLI）、`eixd`（daemon，通常由 `eix` 自动拉起）。
-- 路径：配置 `~/.config/eix/`，数据 `~/.local/share/eix/`，socket `$XDG_RUNTIME_DIR/eix.sock`。
+- 路径：配置统一 `~/.config/eix/`（macOS 同样；含 `skills/`、`cmds/`、`agents/`），数据
+  `~/.local/share/eix/`，socket 优先 `$XDG_RUNTIME_DIR/eix.sock`，macOS 回退
+  `~/Library/Caches/eix/eix.sock`。

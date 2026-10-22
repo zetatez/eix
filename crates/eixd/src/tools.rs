@@ -10,6 +10,7 @@
 
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -29,6 +30,159 @@ pub struct ToolOutcome {
     pub ok: bool,
     pub output: String,
     pub duration_ms: u64,
+}
+
+/// Single source of truth for tool policy. Definitions stay separate because
+/// they are large JSON schemas, but every list/approval decision derives from
+/// this table so a new tool cannot silently drift between them.
+#[derive(Debug, Clone, Copy)]
+struct ToolSpec {
+    name: &'static str,
+    /// May be used by a read-only sub-agent.
+    subagent_allowed: bool,
+    /// Safe to run concurrently with other read-only tools in one batch.
+    parallel_safe: bool,
+    /// Requires the normal approval gate under the default `ask` policy.
+    requires_approval: bool,
+}
+
+const TOOL_SPECS: &[ToolSpec] = &[
+    ToolSpec {
+        name: "read_file",
+        subagent_allowed: true,
+        parallel_safe: true,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "use_skill",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "todo",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "memory",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "webfetch",
+        subagent_allowed: true,
+        parallel_safe: true,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "websearch",
+        subagent_allowed: true,
+        parallel_safe: true,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "list_dir",
+        subagent_allowed: true,
+        parallel_safe: true,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "grep",
+        subagent_allowed: true,
+        parallel_safe: true,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "glob",
+        subagent_allowed: true,
+        parallel_safe: true,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "lsp_diagnostics",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "write_file",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: true,
+    },
+    ToolSpec {
+        name: "edit",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: true,
+    },
+    ToolSpec {
+        name: "patch",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: true,
+    },
+    ToolSpec {
+        name: "run_command",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: true,
+    },
+    ToolSpec {
+        name: "start_command",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: true,
+    },
+    ToolSpec {
+        name: "process_output",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "spawn_agent",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "ask_user",
+        subagent_allowed: false,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "mcp_list_resources",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "mcp_read_resource",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "mcp_list_prompts",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+    ToolSpec {
+        name: "mcp_get_prompt",
+        subagent_allowed: true,
+        parallel_safe: false,
+        requires_approval: false,
+    },
+];
+
+fn spec(tool: &str) -> Option<&'static ToolSpec> {
+    TOOL_SPECS.iter().find(|spec| spec.name == tool)
 }
 
 /// Tool definitions sent to the provider. Keep descriptions short: they are
@@ -330,54 +484,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
 pub fn readonly_definitions() -> Vec<ToolDefinition> {
     definitions()
         .into_iter()
-        .filter(|tool| {
-            matches!(
-                tool.function.name.as_str(),
-                "read_file"
-                    | "list_dir"
-                    | "grep"
-                    | "glob"
-                    | "lsp_diagnostics"
-                    | "use_skill"
-                    | "todo"
-                    | "webfetch"
-                    | "websearch"
-                    | "process_output"
-                    | "mcp_list_resources"
-                    | "mcp_read_resource"
-                    | "mcp_list_prompts"
-                    | "mcp_get_prompt"
-            )
-        })
+        .filter(|tool| spec(&tool.function.name).is_some_and(|spec| spec.subagent_allowed))
         .collect()
 }
 
 pub fn is_known(tool: &str) -> bool {
-    matches!(
-        tool,
-        "read_file"
-            | "list_dir"
-            | "grep"
-            | "glob"
-            | "lsp_diagnostics"
-            | "use_skill"
-            | "todo"
-            | "memory"
-            | "webfetch"
-            | "websearch"
-            | "write_file"
-            | "edit"
-            | "patch"
-            | "run_command"
-            | "start_command"
-            | "process_output"
-            | "spawn_agent"
-            | "ask_user"
-            | "mcp_list_resources"
-            | "mcp_read_resource"
-            | "mcp_list_prompts"
-            | "mcp_get_prompt"
-    )
+    spec(tool).is_some()
 }
 
 /// Read-only tools that can safely run concurrently in one assistant batch.
@@ -385,18 +497,12 @@ pub fn is_known(tool: &str) -> bool {
 /// user, so a model that requests several independent reads does not pay their
 /// latency sequentially.
 pub fn parallel_safe(tool: &str) -> bool {
-    matches!(
-        tool,
-        "read_file" | "list_dir" | "grep" | "glob" | "webfetch" | "websearch"
-    )
+    spec(tool).is_some_and(|spec| spec.parallel_safe)
 }
 
 /// Mutating tools need an approval decision under the default `ask` policy.
 pub fn requires_approval(tool: &str) -> bool {
-    matches!(
-        tool,
-        "write_file" | "edit" | "patch" | "run_command" | "start_command"
-    )
+    spec(tool).is_some_and(|spec| spec.requires_approval)
 }
 
 /// Whether this specific call needs approval. `run_command` is the exception:
@@ -1078,6 +1184,18 @@ fn unified_diff(path: &str, old: &str, new: &str) -> String {
 }
 
 pub async fn execute(tool: &str, args: &Value, cwd: &Path, config: &Config) -> ToolOutcome {
+    execute_with_cancel(tool, args, cwd, config, None).await
+}
+
+/// Like [`execute`], but long-running commands observe the turn's cancellation
+/// flag and are killed instead of blocking until `command_timeout_secs`.
+pub async fn execute_with_cancel(
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    config: &Config,
+    cancel: Option<&AtomicBool>,
+) -> ToolOutcome {
     let started = Instant::now();
     let result = match tool {
         "read_file" => read_file(args, cwd, config).await,
@@ -1091,7 +1209,7 @@ pub async fn execute(tool: &str, args: &Value, cwd: &Path, config: &Config) -> T
         "write_file" => write_file(args, cwd, config).await,
         "edit" => edit(args, cwd, config).await,
         "patch" => patch(args, cwd, config).await,
-        "run_command" => run_command(args, cwd, config).await,
+        "run_command" => run_command(args, cwd, config, cancel).await,
         "start_command" | "process_output" => {
             Err(anyhow::anyhow!("{tool} is handled by the daemon"))
         }
@@ -1949,7 +2067,12 @@ pub fn command_plan(
     })
 }
 
-async fn run_command(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
+async fn run_command(
+    args: &Value,
+    cwd: &Path,
+    config: &Config,
+    cancel: Option<&AtomicBool>,
+) -> Result<String> {
     let command = required_string(args, "command")?;
     let plan = command_plan(command, optional_string(args, "cwd"), cwd, config)?;
     let command_cwd = plan.cwd.clone();
@@ -1963,14 +2086,21 @@ async fn run_command(args: &Value, cwd: &Path, config: &Config) -> Result<String
         .with_context(|| format!("cannot run command in {}", command_cwd.display()))?;
 
     let timeout = Duration::from_secs(config.tools.command_timeout_secs);
-    let output = match tokio::time::timeout(timeout, child.wait_with_output()).await {
-        Ok(result) => result.context("command failed")?,
-        Err(_) => {
-            return Ok(format!(
-                "command timed out after {}s",
-                config.tools.command_timeout_secs
-            ));
+    let output = tokio::select! {
+        result = tokio::time::timeout(timeout, child.wait_with_output()) => {
+            match result {
+                Ok(result) => result.context("command failed")?,
+                Err(_) => {
+                    return Ok(format!(
+                        "command timed out after {}s",
+                        config.tools.command_timeout_secs
+                    ));
+                }
+            }
         }
+        // `child` has `kill_on_drop`, so dropping the wait future on cancel
+        // terminates the process instead of leaving it running until timeout.
+        _ = wait_for_cancel(cancel) => bail!("command cancelled"),
     };
 
     let mut text = String::new();
@@ -1998,6 +2128,16 @@ async fn run_command(args: &Value, cwd: &Path, config: &Config) -> Result<String
         text.push_str(&format!("\nexit status: {code}"));
     }
     Ok(cap_output(text, config.tools.max_output_bytes))
+}
+
+async fn wait_for_cancel(cancel: Option<&AtomicBool>) {
+    let Some(cancel) = cancel else {
+        std::future::pending::<()>().await;
+        return;
+    };
+    while !cancel.load(Ordering::SeqCst) {
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
 }
 
 /// Resolve `raw` inside `cwd`, rejecting traversal and symlink escapes.
@@ -2123,6 +2263,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_cwd(label: &str) -> PathBuf {
@@ -2485,6 +2626,79 @@ mod tests {
         .await;
         assert!(out.ok, "{}", out.output);
         assert_eq!(out.output, "x");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn tool_specs_cover_every_definition_and_keep_policy_consistent() {
+        let definitions = definitions();
+        for tool in &definitions {
+            let name = tool.function.name.as_str();
+            assert!(is_known(name), "{name} has no ToolSpec");
+        }
+        for spec in TOOL_SPECS {
+            assert!(
+                definitions
+                    .iter()
+                    .any(|tool| tool.function.name == spec.name),
+                "{} has a ToolSpec but no definition",
+                spec.name
+            );
+            assert!(
+                !(spec.subagent_allowed && spec.requires_approval),
+                "{} would let a read-only sub-agent mutate the workspace",
+                spec.name
+            );
+            assert!(
+                !(spec.parallel_safe && spec.requires_approval),
+                "{} cannot be both mutating and parallel-safe",
+                spec.name
+            );
+        }
+        // The derived lists agree with the table.
+        for tool in readonly_definitions() {
+            let name = tool.function.name.as_str();
+            assert!(spec(name).is_some_and(|spec| spec.subagent_allowed));
+        }
+        for spec in TOOL_SPECS {
+            assert_eq!(parallel_safe(spec.name), spec.parallel_safe);
+            assert_eq!(requires_approval(spec.name), spec.requires_approval);
+        }
+    }
+
+    #[tokio::test]
+    async fn run_command_cancellation_kills_the_process() {
+        let cwd = temp_cwd("cancel-command");
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = {
+            let cwd = cwd.clone();
+            let cancel = Arc::clone(&cancel);
+            tokio::spawn(async move {
+                let config = Config {
+                    tools: eix_core::ToolsConfig {
+                        command_timeout_secs: 30,
+                        ..eix_core::ToolsConfig::default()
+                    },
+                    ..Config::default()
+                };
+                execute_with_cancel(
+                    "run_command",
+                    &json!({"command": "sleep 30"}),
+                    &cwd,
+                    &config,
+                    Some(cancel.as_ref()),
+                )
+                .await
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel.store(true, Ordering::SeqCst);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .expect("cancelled command must not wait for the timeout")
+            .expect("task panicked");
+        assert!(!outcome.ok, "{}", outcome.output);
+        assert!(outcome.output.contains("cancelled"), "{}", outcome.output);
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

@@ -5,11 +5,13 @@
 //! from. Policies (drop / pin / compact) are ordinary events; replaying them is
 //! deterministic, so a restart never changes what a session sends.
 //!
-//! Budgets are soft. `tools` and `history` are trimmed oldest-first to their
-//! share of `context.budget_tokens`, but the newest few entries (and anything
-//! pinned) always survive. `system`, `instructions` and `workspace` are only
-//! reported, never dropped automatically: silently hiding an `AGENTS.md` would
-//! change the agent's behaviour behind the user's back.
+//! Budgets are enforced in two stages. `tools` and `history` are trimmed
+//! oldest-first to their share of `context.budget_tokens`, but the newest few
+//! entries (and anything pinned) always survive. If those are not enough,
+//! instructions, workspace and memory are dropped oldest-first and marked
+//! `auto` in the ledger; this is visible rather than silently hiding an
+//! `AGENTS.md`. The system prompt is never dropped, but it is capped at 25% of
+//! the budget with an explicit truncation marker.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -35,6 +37,32 @@ const IMAGE_TOKEN_ESTIMATE: usize = 1_000;
 const MAX_DETAIL_CHARS: usize = 2_000;
 const MAX_PREVIEW_CHARS: usize = 160;
 const MAX_INSTRUCTION_CHARS: usize = 64_000;
+const MAX_SYSTEM_CHARS: usize = 32_000;
+const MAX_SUMMARY_CHARS: usize = 12_000;
+
+/// The parts of the ledger that do not change between tool rounds in one turn.
+/// Loading instructions walks the repository and `workspace_summary` runs git;
+/// caching both avoids paying that cost for every tool batch.
+#[derive(Debug, Clone, Default)]
+pub struct StaticContext {
+    instructions: Vec<(String, String)>,
+    workspace: Option<String>,
+}
+
+impl StaticContext {
+    pub async fn load(config: &Config, cwd: &Path) -> Self {
+        let instructions = load_instructions(config, cwd).await;
+        let workspace = if config.context.workspace_summary {
+            workspace_summary(cwd).await
+        } else {
+            None
+        };
+        Self {
+            instructions,
+            workspace,
+        }
+    }
+}
 
 pub struct Ledger {
     entries: Vec<Entry>,
@@ -72,6 +100,20 @@ struct Policy {
 }
 
 impl Policy {
+    /// True when this history entry can never reach the provider. Used to skip
+    /// decoding and base64-encoding image blobs for dropped/compacted messages.
+    fn hides_seq(&self, seq: u64) -> bool {
+        if self.cleared_seq.is_some_and(|cleared| seq <= cleared) {
+            return true;
+        }
+        if self.dropped.contains(&format!("e{seq}")) {
+            return true;
+        }
+        self.compactions
+            .iter()
+            .any(|compaction| seq >= compaction.from_seq && seq <= compaction.to_seq)
+    }
+
     fn from_events(events: &[Event]) -> Self {
         let mut policy = Self::default();
         for event in events {
@@ -141,6 +183,7 @@ impl Ledger {
     /// cross-session memory, the current task list, image blobs and the tool
     /// schemas sent with the request. `token_scale` calibrates the cheap local
     /// estimate against provider-reported prompt usage.
+    #[allow(clippy::too_many_arguments)]
     pub async fn build_with_state(
         config: &Config,
         system: String,
@@ -152,21 +195,49 @@ impl Ledger {
         tools: &[ToolDefinition],
         token_scale: f64,
     ) -> Self {
-        let instructions = load_instructions(config, cwd).await;
-        let workspace = if config.context.workspace_summary {
-            workspace_summary(cwd).await
-        } else {
-            None
-        };
+        let static_context = StaticContext::load(config, cwd).await;
+        Self::build_with_state_and_static(
+            config,
+            system,
+            &static_context,
+            events,
+            blobs,
+            memory,
+            tasks,
+            tools,
+            token_scale,
+            config.context.budget_tokens,
+        )
+        .await
+    }
+
+    /// Full assembly with preloaded instructions/workspace and an explicit
+    /// budget. The daemon uses this to reuse static context across tool rounds
+    /// and to clamp the budget to the selected model's real context window.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn build_with_state_and_static(
+        config: &Config,
+        system: String,
+        static_context: &StaticContext,
+        events: &[Event],
+        blobs: Option<&BlobStore>,
+        memory: Option<String>,
+        tasks: Option<String>,
+        tools: &[ToolDefinition],
+        token_scale: f64,
+        budget_tokens: usize,
+    ) -> Self {
         let images = load_images(events, blobs).await;
+        let budget_tokens = budget_tokens.max(1);
+        let system = cap_system(system, budget_tokens);
         Self::assemble_full(
             system,
-            instructions,
-            workspace,
+            static_context.instructions.clone(),
+            static_context.workspace.clone(),
             memory,
             tasks,
             events,
-            config.context.budget_tokens,
+            budget_tokens,
             config.context.tool_output_tokens,
             &images,
             tools,
@@ -197,6 +268,7 @@ impl Ledger {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn assemble_full(
         system: String,
         instructions: Vec<(String, String)>,
@@ -435,9 +507,13 @@ async fn load_images(events: &[Event], blobs: Option<&BlobStore>) -> HashMap<Str
     let Some(blobs) = blobs else {
         return HashMap::new();
     };
+    // Compaction and `/clear` are common in long sessions. Loading image bytes
+    // for messages that are no longer in the request wastes time and memory,
+    // and each blob would be base64-encoded again on every tool round.
+    let policy = Policy::from_events(events);
     let mut mimes: HashMap<String, String> = HashMap::new();
     for event in events {
-        if event.kind != EventKind::UserMessage {
+        if event.kind != EventKind::UserMessage || policy.hides_seq(event.seq) {
             continue;
         }
         let Some(payload) = decode::<UserMessagePayload>(event) else {
@@ -785,9 +861,10 @@ fn apply_compactions(entries: Vec<Entry>, compactions: &[Compaction]) -> Vec<Ent
 }
 
 fn summary_entry(compaction: &Compaction) -> Entry {
+    let summary = cap_text(&compaction.summary, MAX_SUMMARY_CHARS);
     let text = format!(
-        "[compacted {} messages (~{} tokens)]\n{}",
-        compaction.messages, compaction.tokens, compaction.summary
+        "[compacted {} messages (~{} tokens)]\n{summary}",
+        compaction.messages, compaction.tokens
     );
     let mut entry = make_entry(
         format!("c{}-{}", compaction.from_seq, compaction.to_seq),
@@ -872,6 +949,25 @@ fn drop_oldest(entries: &mut [Entry], sector: Sector) -> bool {
     true
 }
 
+/// Drop the oldest entry from a normally-fixed sector. These entries are not
+/// part of the normal tool/history budget, but when instructions or workspace
+/// alone exceed the request budget the alternative is a guaranteed provider
+/// context-length error. The `auto` flag makes the loss visible in the ledger.
+fn drop_fixed(entries: &mut [Entry], sector: Sector) -> bool {
+    let Some(index) = entries.iter().position(|entry| {
+        entry.info.sector == sector
+            && !entry.info.dropped
+            && !entry.info.compacted
+            && !entry.info.pinned
+            && !entry.summary
+    }) else {
+        return false;
+    };
+    entries[index].info.dropped = true;
+    entries[index].info.auto = true;
+    true
+}
+
 fn trim(entries: &mut [Entry], budget: usize) -> usize {
     trim_sector(
         entries,
@@ -914,6 +1010,27 @@ fn trim(entries: &mut [Entry], budget: usize) -> usize {
     // make every later provider request fail with a context-length error.
     if total > budget {
         emergency_trim(entries, budget, total);
+        total = entries
+            .iter()
+            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
+            .map(|entry| entry.info.tokens)
+            .sum();
+    }
+
+    // Fixed sectors are normally protected, but a huge instruction file or
+    // workspace summary must not defeat the budget entirely. Drop them
+    // oldest-first and mark them `auto` so the UI can explain the loss.
+    for sector in [Sector::Instructions, Sector::Workspace, Sector::Memory] {
+        while total > budget && drop_fixed(entries, sector) {
+            total = entries
+                .iter()
+                .filter(|entry| !entry.info.dropped && !entry.info.compacted)
+                .map(|entry| entry.info.tokens)
+                .sum();
+        }
+        if total <= budget {
+            break;
+        }
     }
 
     entries.iter().filter(|entry| entry.info.auto).count()
@@ -1041,12 +1158,40 @@ fn instruction_dirs(cwd: &Path) -> Vec<PathBuf> {
     chain
 }
 
+fn cap_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
 fn cap_instruction(text: String) -> String {
     if text.chars().count() <= MAX_INSTRUCTION_CHARS {
         return text;
     }
     let mut out: String = text.chars().take(MAX_INSTRUCTION_CHARS).collect();
     out.push_str("\n[truncated by eix: instruction file too large]");
+    out
+}
+
+/// Keep the system prompt inside a fixed share of the request budget. A custom
+/// `[provider].system_prompt` can otherwise be the one sector that makes every
+/// request overflow before any history is even considered.
+fn cap_system(text: String, budget_tokens: usize) -> String {
+    let max_tokens = (budget_tokens / 4).max(256);
+    // One char can be one token (CJK), so using the token budget as the char
+    // cap is the only simple bound that holds for mixed-script prompts.
+    let max_chars = MAX_SYSTEM_CHARS.min(max_tokens);
+    if estimate_tokens(&text) <= max_tokens && text.chars().count() <= max_chars {
+        return text;
+    }
+    let mut out = cap_text(&text, max_chars);
+    out.push_str(&format!(
+        "\n[truncated by eix: system prompt exceeded {} tokens]",
+        max_tokens
+    ));
     out
 }
 
@@ -1465,6 +1610,38 @@ mod tests {
     }
 
     #[test]
+    fn hidden_history_is_known_before_loading_images() {
+        let events = vec![
+            user(1, "one"),
+            user(2, "two"),
+            user(3, "three"),
+            event(
+                4,
+                EventKind::ContextDropped,
+                payload(&eix_core::ContextDropPayload {
+                    entry: "e1".into(),
+                    dropped: true,
+                }),
+            ),
+            event(
+                5,
+                EventKind::ContextCompacted,
+                payload(&ContextCompactedPayload {
+                    from_seq: 2,
+                    to_seq: 2,
+                    messages: 1,
+                    tokens: 1,
+                    summary: "two".into(),
+                }),
+            ),
+        ];
+        let policy = Policy::from_events(&events);
+        assert!(policy.hides_seq(1));
+        assert!(policy.hides_seq(2));
+        assert!(!policy.hides_seq(3));
+    }
+
+    #[test]
     fn compaction_replaces_a_range_with_one_summary() {
         let events = vec![
             user(1, "one"),
@@ -1547,6 +1724,53 @@ mod tests {
         assert!(dropped > 0, "expected tool entries to be trimmed");
         assert!(dropped < tools.len(), "newest tools must survive");
         assert!(ledger.info().trimmed > 0);
+    }
+
+    #[test]
+    fn system_prompt_cap_counts_wide_characters_as_tokens() {
+        let capped = cap_system("你".repeat(20_000), 8_000);
+        // 25% of an 8k budget is 2k tokens; 20k CJK chars would otherwise be
+        // 20k tokens even though the character cap looked satisfied.
+        assert!(
+            estimate_tokens(&capped) <= 2_100,
+            "{}",
+            estimate_tokens(&capped)
+        );
+        assert!(capped.contains("truncated by eix"));
+    }
+
+    #[test]
+    fn oversized_fixed_sectors_are_dropped_and_marked_auto() {
+        let ledger = Ledger::assemble(
+            "sys".into(),
+            vec![("AGENTS.md".into(), "instructions ".repeat(4_000))],
+            Some("workspace ".repeat(4_000)),
+            &[user(1, "hello")],
+            400,
+        );
+        let info = ledger.info();
+        let instructions = info
+            .entries
+            .iter()
+            .find(|entry| entry.id == "instructions:AGENTS.md")
+            .expect("instruction entry");
+        assert!(
+            instructions.dropped && instructions.auto,
+            "an instruction file that cannot fit must be visibly dropped"
+        );
+        let workspace = info
+            .entries
+            .iter()
+            .find(|entry| entry.sector == Sector::Workspace)
+            .expect("workspace entry");
+        assert!(workspace.dropped && workspace.auto);
+        assert!(info.total_tokens <= 400, "{}", info.total_tokens);
+        assert!(info.trimmed > 0);
+        // The newest user message still reaches the model.
+        assert!(ledger
+            .messages()
+            .iter()
+            .any(|message| message.content == "hello"));
     }
 
     #[test]

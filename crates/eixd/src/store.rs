@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
 use eix_core::{now_ms, Event, EventKind, PermissionLevel, SearchHit, Session, SessionStatus};
@@ -672,6 +672,29 @@ impl Store {
 
     pub fn events(&self, id: &str) -> Result<Vec<Event>> {
         self.events_after(id, 0)
+    }
+
+    /// Async wrapper for full-log reads. `events()` can scan a large session;
+    /// keeping it off the runtime thread avoids stalling unrelated sessions.
+    pub async fn events_async(self: &Arc<Self>, id: &str) -> Result<Vec<Event>> {
+        let store = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.events(&id))
+            .await
+            .context("event query task failed")?
+    }
+
+    /// Async wrapper for incremental event reads used by the turn loop.
+    pub async fn events_after_async(
+        self: &Arc<Self>,
+        id: &str,
+        after_seq: u64,
+    ) -> Result<Vec<Event>> {
+        let store = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.events_after(&id, after_seq))
+            .await
+            .context("event query task failed")?
     }
 
     pub fn events_after(&self, id: &str, after_seq: u64) -> Result<Vec<Event>> {

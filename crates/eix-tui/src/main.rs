@@ -2457,7 +2457,8 @@ COMMANDS:
     help                       show this help
 
 OPTIONS:
-    --socket <path>     daemon socket (default: $XDG_RUNTIME_DIR/eix.sock)
+    --socket <path>     daemon socket (default: $XDG_RUNTIME_DIR/eix.sock;
+                        macOS: ~/Library/Caches/eix/eix.sock)
     --data-dir <path>   state directory (default: ~/.local/share/eix)
     --config <path>     config file (default: ~/.config/eix/config.toml)
     --tcp <host:port>   connect to a remote daemon instead of the socket
