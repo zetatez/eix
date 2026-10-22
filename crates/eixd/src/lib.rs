@@ -8,6 +8,7 @@ pub mod context;
 pub mod http;
 pub mod lsp;
 pub mod mcp;
+pub mod memory;
 pub mod picker;
 pub mod process;
 pub mod provider;

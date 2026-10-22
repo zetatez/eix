@@ -487,15 +487,20 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 | sector | 内容 | 预算 |
 |---|---|---|
 | system | 系统提示 | 5% |
-| instructions | AGENTS.md、项目约定 | 5% |
+| instructions | AGENTS.md（仓库根 → cwd）、项目约定 | 5% |
 | workspace | 文件树、git 状态、选中文件 | 15% |
 | history | 对话历史 | 60% |
 | tools | 工具输出（可截断/引用 blob） | 10% |
-| memory | 跨 session 笔记/事实 | 5% |
+| memory | 跨 session 记忆 + 当前任务列表 | 5% |
 
 - 操作：`dd` 删除、`p` pin、`o` 展开、`s` 压缩、`/` 搜索、`y` 复制、`<CR>` 打开来源。
 - 每条显示 token 成本；底部显示总预算与剩余。
+- 工具结果先按 `tools.max_output_bytes` 截断，再按 `context.tool_output_tokens` 对 provider
+  视图做 head/tail 省略；完整输出保留在事件日志。
+- `tools` / `history` 超预算时保留最新 4 条；若总预算仍超，emergency trim 只保护当前 user
+  消息和最新工具结果，避免一轮大输出让后续请求永久失败。
 - 压缩是**显式事件**：历史里出现 `compacted 12 messages → summary`，可展开查看原文。
+- 自动压缩在每个工具批次后也会检查；provider 报 context-length 时强制压缩并重试。
 - 删除/pin 是 session 级策略，可保存为项目默认。
 
 ## 11. 事件与协议（草案）
@@ -678,12 +683,15 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > Context ledger 已落地：`eixd/src/context.rs` 从事件日志重建 provider 上下文并按 sector
 > 记账（system 5% / instructions 5% / workspace 15% / history 60% / tools 10% / memory 5%），
 > `context.ledger|drop|pin|compact` 请求与 `context.updated|compacted` 通知已接入；
-> `AGENTS.md`（cwd 与 config 目录）注入 `instructions` sector，workspace summary 注入顶层
+> `AGENTS.md`（仓库根 → cwd 与 config 目录）注入 `instructions` sector，workspace summary 注入顶层
 > 文件树与 git branch/status。drop / pin / compact 落成事件
 > （`context_dropped|pinned|compacted`），重启后重放一致；`tools` / `history` 超预算时从最旧
-> 未 pin 条目自动裁剪（保留最新 4 条），system / instructions / workspace 不自动裁剪。TUI `c`
-> 打开全屏 ledger（`o` 展开、`p` pin、`d` drop、`m` 标记、`s` 压缩范围），CLI 为
-> `eix context [--drop|--undrop|--pin|--unpin|--compact]`。
+> 未 pin 条目自动裁剪（保留最新 4 条，必要时 emergency trim 到最新一条），system / instructions /
+> workspace / memory 不自动裁剪。`memory` 工具把 workspace 记忆写入 `<data>/memory/<hash>.md`，
+> 每次重建上下文都注入 `memory` sector；当前 todo 也作为固定任务状态注入。自动压缩在 turn
+> 开始和每个工具批次后运行；provider 返回 context-length 错误时强制压缩并重试。只读工具批次
+> 并发执行，结果保持调用顺序。TUI `c` 打开全屏 ledger（`o` 展开、`p` pin、`d` drop、`m` 标记、
+> `s` 压缩范围），CLI 为 `eix context [--drop|--undrop|--pin|--unpin|--compact]`。
 > Process view 已落地：新增 `start_command {command, cwd?}`（与 `run_command` 共用
 > `command_plan`，同一沙箱与审批门禁）在 daemon 内启动后台进程并立即返回 id，以及只读的
 > `process_output {process_id?, max_bytes?}`（缺省取本 session 最新进程）。进程归属 daemon、

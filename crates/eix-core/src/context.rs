@@ -20,7 +20,7 @@ pub enum Sector {
     History,
     /// Tool calls and their output.
     Tools,
-    /// Cross-session notes (not implemented yet).
+    /// Cross-session notes plus the current task list (`memory` / `tasks`).
     Memory,
 }
 

@@ -40,6 +40,9 @@ pub enum RetryClass {
     RateLimited,
     /// The plan/credits are exhausted. Retrying immediately cannot help.
     Quota,
+    /// The prompt is larger than the model's context window. The caller must
+    /// compact or trim before retrying; a plain backoff would repeat the error.
+    ContextLength,
     /// Configuration, authentication, or request errors that need the user.
     Fatal,
 }
@@ -61,6 +64,9 @@ impl ProviderError {
                 let body = body.to_ascii_lowercase();
                 if looks_like_quota(&body) || *status == 402 {
                     return RetryClass::Quota;
+                }
+                if looks_like_context_length(&body) {
+                    return RetryClass::ContextLength;
                 }
                 if *status == 429 {
                     return RetryClass::RateLimited;
@@ -568,6 +574,25 @@ fn looks_like_quota(body: &str) -> bool {
     .any(|needle| body.contains(needle))
 }
 
+fn looks_like_context_length(body: &str) -> bool {
+    [
+        "context_length_exceeded",
+        "context length exceeded",
+        "maximum context length",
+        "max context length",
+        "context window",
+        "prompt is too long",
+        "input is too long",
+        "too many tokens",
+        "request too large",
+        "reduce the length of the messages",
+        "上下文长度",
+        "超出上下文",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
+
 fn looks_like_transient(body: &str) -> bool {
     [
         "rate limit",
@@ -799,6 +824,23 @@ mod tests {
         assert!(ProviderError::Decode("truncated stream".into())
             .retry_class()
             .is_retryable());
+    }
+
+    #[test]
+    fn classifies_context_window_failures_separately() {
+        for body in [
+            r#"{"error":{"code":"context_length_exceeded","message":"prompt is too long"}}"#,
+            "maximum context length is 128000 tokens",
+            "too many tokens in request",
+        ] {
+            let err = ProviderError::Api {
+                status: 400,
+                body: body.into(),
+                retry_after_secs: None,
+            };
+            assert_eq!(err.retry_class(), RetryClass::ContextLength, "{body}");
+            assert!(!err.retry_class().is_retryable());
+        }
     }
 
     #[test]

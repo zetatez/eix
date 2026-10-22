@@ -672,6 +672,10 @@ pub struct ContextConfig {
     pub auto_compact_threshold: f64,
     /// Number of newest user turns to keep verbatim.
     pub auto_compact_keep_turns: usize,
+    /// Maximum estimated tokens kept for one tool result in provider context.
+    /// The full output remains in the event log; older/short results are left
+    /// untouched. This prevents one noisy command from crowding out the task.
+    pub tool_output_tokens: usize,
 }
 
 impl Default for ContextConfig {
@@ -683,6 +687,7 @@ impl Default for ContextConfig {
             auto_compact: true,
             auto_compact_threshold: 0.8,
             auto_compact_keep_turns: 2,
+            tool_output_tokens: 4_000,
         }
     }
 }
@@ -1073,6 +1078,10 @@ impl Config {
         if let Some(value) = env_var("EIX_CONTEXT_WORKSPACE") {
             self.context.workspace_summary = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
+        if let Some(value) = env_var("EIX_CONTEXT_TOOL_OUTPUT_TOKENS").and_then(|v| v.parse().ok())
+        {
+            self.context.tool_output_tokens = value;
+        }
         if let Some(value) = env_var("EIX_CONTEXT_AUTO_COMPACT") {
             self.context.auto_compact = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
@@ -1336,6 +1345,11 @@ impl Config {
         if self.context.auto_compact_keep_turns == 0 {
             return Err(ConfigError::Invalid(
                 "context.auto_compact_keep_turns must be > 0".into(),
+            ));
+        }
+        if self.context.tool_output_tokens == 0 {
+            return Err(ConfigError::Invalid(
+                "context.tool_output_tokens must be > 0".into(),
             ));
         }
         let token_missing = self

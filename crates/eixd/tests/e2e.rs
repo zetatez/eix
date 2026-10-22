@@ -1,6 +1,7 @@
 //! End-to-end test: real Unix socket, real SQLite, streaming mock provider.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -5864,4 +5865,435 @@ fn temp_dir(label: &str) -> PathBuf {
         .unwrap()
         .as_nanos();
     std::env::temp_dir().join(format!("eix-e2e-{label}-{}-{nanos}", std::process::id()))
+}
+
+/// Provider for the memory test: persist a note on the first call, then answer.
+/// A second session sees the note in its first request and reports it.
+async fn memory_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let messages = value["messages"].as_array().cloned().unwrap_or_default();
+            let last_is_tool = messages
+                .last()
+                .map(|message| message["role"] == "tool")
+                .unwrap_or(false);
+            let has_memory = messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("prefers tabs")
+            });
+            let chunk = if last_is_tool {
+                json!({
+                    "model": "mock-memory",
+                    "choices": [{"delta": {"content": "remembered"}, "finish_reason": "stop"}],
+                })
+            } else if has_memory {
+                json!({
+                    "model": "mock-memory",
+                    "choices": [{"delta": {"content": "memory visible"}, "finish_reason": "stop"}],
+                })
+            } else {
+                let arguments = json!({"action": "add", "text": "prefers tabs"}).to_string();
+                json!({
+                    "model": "mock-memory",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "mem_1",
+                                "type": "function",
+                                "function": {"name": "memory", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn memory_tool_persists_across_sessions() -> anyhow::Result<()> {
+    let dir = temp_dir("memory");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(memory_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-memory".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "memory-one", "cwd": dir}))
+        .await?;
+    let first: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "remember my preference"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == first.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": created.session.id}))
+        .await?;
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| { event.kind == EventKind::ToolCall && event.payload["tool"] == "memory" }));
+
+    let second: SessionResult = client
+        .request("session.create", json!({"name": "memory-two", "cwd": dir}))
+        .await?;
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": second.session.id, "text": "what do you remember?"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": second.session.id}))
+        .await?;
+    let answer = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .map(|event| {
+            event.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(answer, "memory visible");
+
+    let bodies = bodies.lock().await;
+    assert!(bodies
+        .iter()
+        .any(|body| { body.contains("Project memory") && body.contains("prefers tabs") }));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// Provider that asks for two independent file reads in one batch. The daemon
+/// should run them concurrently and still append the tool results in call order.
+async fn parallel_read_provider(listener: TcpListener) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let messages = value["messages"].as_array().cloned().unwrap_or_default();
+            let tool_messages: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            let chunk = if tool_messages.len() >= 2 {
+                let first = tool_messages[tool_messages.len() - 2]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let second = tool_messages[tool_messages.len() - 1]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let answer = if first.contains("AAA") && second.contains("BBB") {
+                    "order ok"
+                } else {
+                    "wrong order"
+                };
+                json!({
+                    "model": "mock-parallel",
+                    "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
+                })
+            } else {
+                json!({
+                    "model": "mock-parallel",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "read_a",
+                                    "type": "function",
+                                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "read_b",
+                                    "type": "function",
+                                    "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn read_only_tool_batch_keeps_call_order() -> anyhow::Result<()> {
+    let dir = temp_dir("parallel-read");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("a.txt"), "AAA\n")?;
+    std::fs::write(dir.join("b.txt"), "BBB\n")?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(parallel_read_provider(listener));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-parallel".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "parallel", "cwd": dir}))
+        .await?;
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "read both files"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": created.session.id}))
+        .await?;
+    let answer = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .map(|event| {
+            event.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(answer, "order ok");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// Provider used by the context-window recovery test. `fail_next` makes the
+/// next request return a real 400 context-length error. After the summary
+/// request, the retried turn answers `recovered`.
+async fn recovery_provider(
+    listener: TcpListener,
+    fail_next: Arc<AtomicBool>,
+    seen_summary: Arc<AtomicBool>,
+) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let fail_next = Arc::clone(&fail_next);
+        let seen_summary = Arc::clone(&seen_summary);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            if fail_next.swap(false, Ordering::SeqCst) {
+                let error = r#"{"error":{"code":"context_length_exceeded","message":"prompt is too long"}}"#;
+                write_http_error(&mut socket, "400 Bad Request", error).await;
+                return;
+            }
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let messages = value["messages"].as_array().cloned().unwrap_or_default();
+            let is_summary = messages.iter().any(|message| {
+                message["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Summarize the conversation")
+            });
+            let content = if is_summary {
+                seen_summary.store(true, Ordering::SeqCst);
+                "summary text"
+            } else if seen_summary.load(Ordering::SeqCst) {
+                "recovered"
+            } else {
+                "ok"
+            };
+            let chunk = json!({
+                "model": "mock-recovery",
+                "choices": [{"delta": {"content": content}, "finish_reason": "stop"}],
+            });
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn context_length_error_forces_compaction_and_retries() -> anyhow::Result<()> {
+    let dir = temp_dir("context-recovery");
+    std::fs::create_dir_all(&dir)?;
+
+    let fail_next = Arc::new(AtomicBool::new(false));
+    let seen_summary = Arc::new(AtomicBool::new(false));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(recovery_provider(
+        listener,
+        Arc::clone(&fail_next),
+        Arc::clone(&seen_summary),
+    ));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-recovery".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.budget_tokens = 100_000;
+    config.context.auto_compact = true;
+    config.context.auto_compact_threshold = 0.99;
+    config.context.auto_compact_keep_turns = 2;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "recovery", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    for text in ["one", "two", "three"] {
+        let submitted: SubmitResult = client
+            .request(
+                "prompt.submit",
+                json!({"session_id": session_id, "text": text}),
+            )
+            .await?;
+        loop {
+            let notification = client.next_notification().await?;
+            if notification.method == "turn.completed"
+                && notification.params["turn_id"] == submitted.turn_id.as_str()
+            {
+                assert!(notification.params["error"].is_null());
+                break;
+            }
+        }
+    }
+
+    fail_next.store(true, Ordering::SeqCst);
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "four"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            assert!(
+                notification.params["error"].is_null(),
+                "{}",
+                notification.params["error"]
+            );
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::ContextCompacted));
+    let answer = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .map(|event| {
+            event.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(answer, "recovered");
+    assert!(seen_summary.load(Ordering::SeqCst));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
 }

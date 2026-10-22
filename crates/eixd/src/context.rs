@@ -12,7 +12,7 @@
 //! change the agent's behaviour behind the user's back.
 
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use eix_core::{
     AssistantMessagePayload, ChatMessage, Config, ContextCompactedPayload, ContextDropPayload,
@@ -27,6 +27,8 @@ use crate::blob::BlobStore;
 /// Never auto-drop the newest few entries in a sector: the model still needs
 /// the tool output it just received.
 const KEEP_NEWEST: usize = 4;
+/// Default per-result context cap for callers that do not pass a config.
+const DEFAULT_TOOL_OUTPUT_TOKENS: usize = 4_000;
 const MAX_DETAIL_CHARS: usize = 2_000;
 const MAX_PREVIEW_CHARS: usize = 160;
 const MAX_INSTRUCTION_CHARS: usize = 64_000;
@@ -117,7 +119,7 @@ impl Policy {
 impl Ledger {
     /// Load instructions and the workspace summary, then assemble the ledger.
     pub async fn build(config: &Config, system: String, cwd: &Path, events: &[Event]) -> Self {
-        Self::build_with_blobs(config, system, cwd, events, None).await
+        Self::build_with_state(config, system, cwd, events, None, None, None).await
     }
 
     /// Like [`build`](Self::build), but resolves image blob references so
@@ -129,6 +131,20 @@ impl Ledger {
         events: &[Event],
         blobs: Option<&BlobStore>,
     ) -> Self {
+        Self::build_with_state(config, system, cwd, events, blobs, None, None).await
+    }
+
+    /// Full assembly used by the daemon: instructions, workspace summary,
+    /// cross-session memory, the current task list and image blobs.
+    pub async fn build_with_state(
+        config: &Config,
+        system: String,
+        cwd: &Path,
+        events: &[Event],
+        blobs: Option<&BlobStore>,
+        memory: Option<String>,
+        tasks: Option<String>,
+    ) -> Self {
         let instructions = load_instructions(config, cwd).await;
         let workspace = if config.context.workspace_summary {
             workspace_summary(cwd).await
@@ -136,12 +152,15 @@ impl Ledger {
             None
         };
         let images = load_images(events, blobs).await;
-        Self::assemble_with_images(
+        Self::assemble_full(
             system,
             instructions,
             workspace,
+            memory,
+            tasks,
             events,
             config.context.budget_tokens,
+            config.context.tool_output_tokens,
             &images,
         )
     }
@@ -154,22 +173,28 @@ impl Ledger {
         events: &[Event],
         budget_tokens: usize,
     ) -> Self {
-        Self::assemble_with_images(
+        Self::assemble_full(
             system,
             instructions,
             workspace,
+            None,
+            None,
             events,
             budget_tokens,
+            DEFAULT_TOOL_OUTPUT_TOKENS,
             &HashMap::new(),
         )
     }
 
-    fn assemble_with_images(
+    fn assemble_full(
         system: String,
         instructions: Vec<(String, String)>,
         workspace: Option<String>,
+        memory: Option<String>,
+        tasks: Option<String>,
         events: &[Event],
         budget_tokens: usize,
+        tool_output_tokens: usize,
         images: &HashMap<String, ImagePart>,
     ) -> Self {
         let policy = Policy::from_events(events);
@@ -203,7 +228,27 @@ impl Ledger {
                 &policy,
             ));
         }
-        entries.extend(event_entries(events, &policy, images));
+        if let Some(text) = memory {
+            entries.push(synthesized(
+                "memory",
+                Sector::Memory,
+                "memory",
+                format!("Project memory (persisted across sessions; do not treat as user input):\n{text}"),
+                true,
+                &policy,
+            ));
+        }
+        if let Some(text) = tasks {
+            entries.push(synthesized(
+                "tasks",
+                Sector::Memory,
+                "tasks",
+                text,
+                true,
+                &policy,
+            ));
+        }
+        entries.extend(event_entries(events, &policy, images, tool_output_tokens));
 
         let entries = apply_compactions(entries, &policy.compactions);
         let mut entries = entries;
@@ -390,20 +435,27 @@ fn event_entries(
     events: &[Event],
     policy: &Policy,
     blob_images: &HashMap<String, ImagePart>,
+    tool_output_tokens: usize,
 ) -> Vec<Entry> {
     // Tool results are matched to the assistant message that requested them so
     // a dropped or compacted step never produces a `tool` message without its
-    // preceding `tool_calls`.
-    let mut results: HashMap<String, (u64, String, String)> = HashMap::new();
+    // preceding `tool_calls`. Keep every result for a call id: some providers
+    // reuse ids like `call_1` across turns, so matching by id alone would pair
+    // a new result with an old assistant message.
+    let mut results: HashMap<String, Vec<(u64, String, String)>> = HashMap::new();
     for event in events {
         if event.kind == EventKind::ToolResult {
             if let Some(payload) = decode::<ToolResultPayload>(event) {
-                results.insert(
-                    payload.call_id.clone(),
-                    (event.seq, payload.tool.clone(), payload.output.clone()),
-                );
+                results.entry(payload.call_id.clone()).or_default().push((
+                    event.seq,
+                    payload.tool.clone(),
+                    payload.output.clone(),
+                ));
             }
         }
+    }
+    for matches in results.values_mut() {
+        matches.sort_by_key(|(seq, _, _)| *seq);
     }
 
     let mut claimed: HashSet<u64> = HashSet::new();
@@ -458,11 +510,18 @@ fn event_entries(
                 // that actually produced output.
                 let mut completed = Vec::new();
                 for call in &payload.tool_calls {
-                    if let Some((seq, tool, output)) = results.remove(&call.id) {
+                    let matched = results.get_mut(&call.id).and_then(|matches| {
+                        let index = matches.iter().position(|(seq, _, _)| *seq > event.seq)?;
+                        Some(matches.remove(index))
+                    });
+                    if let Some((seq, tool, output)) = matched {
                         claimed.insert(seq);
                         tool_previews.push(format!("{tool}: {}", first_line(&output)));
                         completed.push(call.clone());
-                        tool_messages.push(ChatMessage::tool(call.id.clone(), output));
+                        tool_messages.push(ChatMessage::tool(
+                            call.id.clone(),
+                            truncate_tool_output(&output, tool_output_tokens),
+                        ));
                     }
                 }
                 let used_tools = !completed.is_empty();
@@ -509,7 +568,10 @@ fn event_entries(
                 let Some(payload) = decode::<ToolResultPayload>(event) else {
                     continue;
                 };
-                let message = ChatMessage::tool(payload.call_id.clone(), payload.output.clone());
+                let message = ChatMessage::tool(
+                    payload.call_id.clone(),
+                    truncate_tool_output(&payload.output, tool_output_tokens),
+                );
                 let mut entry = make_entry(
                     format!("e{}", event.seq),
                     Sector::Tools,
@@ -651,6 +713,7 @@ fn trim_sector(entries: &mut [Entry], sector: Sector, cap: usize) {
     if total <= cap {
         return;
     }
+    let latest_user = latest_user_seq(entries);
     let candidates: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -660,6 +723,7 @@ fn trim_sector(entries: &mut [Entry], sector: Sector, cap: usize) {
                 && !entry.summary
                 && !entry.info.pinned
                 && !entry.info.dropped
+                && !(entry.info.kind == "user" && entry.seq == latest_user)
         })
         .map(|(index, _)| index)
         .collect();
@@ -677,6 +741,7 @@ fn trim_sector(entries: &mut [Entry], sector: Sector, cap: usize) {
 /// Trim once more against the total budget, alternating sectors. This only
 /// matters when the fixed sectors (system/instructions/workspace) are large.
 fn drop_oldest(entries: &mut [Entry], sector: Sector) -> bool {
+    let latest_user = latest_user_seq(entries);
     let candidates: Vec<usize> = entries
         .iter()
         .enumerate()
@@ -686,6 +751,7 @@ fn drop_oldest(entries: &mut [Entry], sector: Sector) -> bool {
                 && !entry.summary
                 && !entry.info.pinned
                 && !entry.info.dropped
+                && !(entry.info.kind == "user" && entry.seq == latest_user)
         })
         .map(|(index, _)| index)
         .collect();
@@ -733,7 +799,51 @@ fn trim(entries: &mut [Entry], budget: usize) -> usize {
             .sum();
     }
 
+    // The normal pass protects the newest four entries so the model does not
+    // lose the tool result it just received. If four large results still exceed
+    // the whole budget, keep the newest one plus the current user message and
+    // drop older tool/history entries. Without this, a single noisy turn could
+    // make every later provider request fail with a context-length error.
+    if total > budget {
+        emergency_trim(entries, budget, total);
+    }
+
     entries.iter().filter(|entry| entry.info.auto).count()
+}
+
+fn latest_user_seq(entries: &[Entry]) -> Option<u64> {
+    entries
+        .iter()
+        .filter(|entry| entry.info.kind == "user" && !entry.info.dropped && !entry.info.compacted)
+        .filter_map(|entry| entry.seq)
+        .max()
+}
+
+fn emergency_trim(entries: &mut [Entry], budget: usize, mut total: usize) {
+    let latest_user = latest_user_seq(entries);
+    let newest_active = entries
+        .iter()
+        .rposition(|entry| entry.trimmable && !entry.info.dropped && !entry.info.compacted);
+
+    let mut guard = 0;
+    while total > budget && guard < entries.len() {
+        guard += 1;
+        let candidate = entries.iter().enumerate().find(|(index, entry)| {
+            entry.trimmable
+                && !entry.summary
+                && !entry.info.pinned
+                && !entry.info.dropped
+                && !entry.info.compacted
+                && Some(*index) != newest_active
+                && !(entry.info.kind == "user" && entry.seq == latest_user)
+        });
+        let Some((index, _)) = candidate else {
+            break;
+        };
+        entries[index].info.dropped = true;
+        entries[index].info.auto = true;
+        total = total.saturating_sub(entries[index].info.tokens);
+    }
 }
 
 fn summarize(entries: &[Entry], budget: usize, trimmed: usize) -> ContextLedgerResult {
@@ -767,23 +877,60 @@ fn summarize(entries: &[Entry], budget: usize, trimmed: usize) -> ContextLedgerR
 
 async fn load_instructions(config: &Config, cwd: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
+    let mut seen = HashSet::new();
+
     if let Some(dir) = eix_core::config::default_config_path().parent() {
         let path = dir.join("AGENTS.md");
-        if let Ok(text) = tokio::fs::read_to_string(&path).await {
-            if !text.trim().is_empty() {
-                out.push(("global AGENTS.md".to_string(), cap_instruction(text)));
+        if seen.insert(path.clone()) {
+            if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                if !text.trim().is_empty() {
+                    out.push(("global AGENTS.md".to_string(), cap_instruction(text)));
+                }
             }
         }
     }
-    for name in &config.context.instructions_files {
-        let path = cwd.join(name);
-        if let Ok(text) = tokio::fs::read_to_string(&path).await {
-            if !text.trim().is_empty() {
-                out.push((name.clone(), cap_instruction(text)));
+
+    // Codex-style instruction hierarchy: load AGENTS.md from the repository
+    // root down to the session cwd. More specific files come later, so they can
+    // refine (or override) the outer instructions. Outside a repository only
+    // the cwd is considered, avoiding unrelated files from `$HOME`.
+    for dir in instruction_dirs(cwd) {
+        for name in &config.context.instructions_files {
+            let path = dir.join(name);
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            if let Ok(text) = tokio::fs::read_to_string(&path).await {
+                if !text.trim().is_empty() {
+                    let label = path
+                        .strip_prefix(cwd)
+                        .map(|relative| relative.display().to_string())
+                        .unwrap_or_else(|_| path.display().to_string());
+                    out.push((label, cap_instruction(text)));
+                }
             }
         }
     }
     out
+}
+
+fn instruction_dirs(cwd: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut found_root = false;
+    let mut current = Some(cwd);
+    while let Some(dir) = current {
+        chain.push(dir.to_path_buf());
+        if dir.join(".git").exists() {
+            found_root = true;
+            break;
+        }
+        current = dir.parent();
+    }
+    if !found_root {
+        chain.truncate(1);
+    }
+    chain.reverse();
+    chain
 }
 
 fn cap_instruction(text: String) -> String {
@@ -895,6 +1042,69 @@ fn is_wide(ch: char) -> bool {
         | 0xFF00..=0xFF60
         | 0xFFE0..=0xFFE6
         | 0x20000..=0x3FFFD)
+}
+
+/// Keep a tool result bounded while preserving its beginning (usually the
+/// command/result header) and its end (usually errors or the final summary).
+/// The event log keeps the complete output; only the provider view is elided.
+fn truncate_tool_output(text: &str, max_tokens: usize) -> String {
+    let max_tokens = max_tokens.max(1);
+    if estimate_tokens(text) <= max_tokens {
+        return text.to_string();
+    }
+
+    // Work in quarter-token units so narrow ASCII (4 chars/token) and wide CJK
+    // (1 char/token) share one budget.
+    let max_quarters = max_tokens.saturating_mul(4);
+    let head_quarters = max_quarters.saturating_mul(3) / 4;
+    let tail_quarters = max_quarters.saturating_sub(head_quarters + 24).max(1);
+
+    let mut head_end = 0;
+    let mut used = 0;
+    for (index, ch) in text.char_indices() {
+        let cost = char_quarters(ch);
+        if used + cost > head_quarters {
+            break;
+        }
+        used += cost;
+        head_end = index + ch.len_utf8();
+    }
+
+    let mut tail_start = text.len();
+    let mut used = 0;
+    for (index, ch) in text.char_indices().rev() {
+        let cost = char_quarters(ch);
+        if used + cost > tail_quarters {
+            break;
+        }
+        used += cost;
+        tail_start = index;
+    }
+
+    if tail_start <= head_end {
+        let mut out: String = text
+            .chars()
+            .take(max_tokens.saturating_mul(4).max(256))
+            .collect();
+        out.push_str("\n… [tool output truncated to fit context]");
+        return out;
+    }
+
+    let omitted = text[head_end..tail_start].chars().count();
+    format!(
+        "{}\n\n… [tool output truncated: {omitted} chars elided to fit context; \
+         full output remains in the session log] …\n\n{}",
+        &text[..head_end],
+        &text[tail_start..]
+    )
+}
+
+fn char_quarters(ch: char) -> usize {
+    if is_wide(ch) {
+        4
+    } else {
+        1
+    }
 }
 
 fn snippet(text: &str, max: usize) -> String {
@@ -1257,5 +1467,143 @@ mod tests {
         events.push(assistant(11, "a5"));
         let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 100_000);
         assert_eq!(ledger.auto_compact_range(2), Some((5, 6)));
+    }
+
+    #[test]
+    fn tool_output_is_elided_for_the_provider_but_kept_whole_in_the_log() {
+        let events = vec![
+            user(1, "run it"),
+            tool_step(2, "", vec![call("call_1")]),
+            tool_result(3, "call_1", &format!("HEAD\n{}\nTAIL", "x".repeat(20_000))),
+        ];
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            None,
+            None,
+            None,
+            &events,
+            100_000,
+            100,
+            &HashMap::new(),
+        );
+        let tool = ledger
+            .messages()
+            .into_iter()
+            .find(|message| message.role == Role::Tool)
+            .unwrap();
+        assert!(tool.content.contains("HEAD"));
+        assert!(tool.content.contains("TAIL"));
+        assert!(tool.content.contains("truncated"));
+        assert!(tool.content.chars().count() < 1_000);
+        // The event payload still has the full output.
+        let original =
+            serde_json::from_value::<ToolResultPayload>(events[2].payload.clone()).unwrap();
+        assert!(original.output.chars().count() > 20_000);
+    }
+
+    #[test]
+    fn memory_and_task_state_are_fixed_context_entries() {
+        let events = vec![user(1, "do it")];
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            None,
+            Some("prefers focused diffs".into()),
+            Some("Current task list:\n[ ] fix it".into()),
+            &events,
+            10_000,
+            4_000,
+            &HashMap::new(),
+        );
+        let info = ledger.info();
+        assert!(info.entries.iter().any(|entry| entry.id == "memory"));
+        assert!(info.entries.iter().any(|entry| entry.id == "tasks"));
+        let memory = info
+            .sectors
+            .iter()
+            .find(|sector| sector.sector == Sector::Memory)
+            .unwrap();
+        assert_eq!(memory.entries, 2);
+        assert!(memory.tokens > 0);
+    }
+
+    #[test]
+    fn emergency_trim_keeps_the_current_user_turn_and_newest_tool_result() {
+        let mut events = Vec::new();
+        let mut seq = 1;
+        for index in 0..6 {
+            events.push(user(seq, "go"));
+            seq += 1;
+            events.push(tool_step(seq, "", vec![call(&format!("c{index}"))]));
+            seq += 1;
+            events.push(tool_result(seq, &format!("c{index}"), &"x".repeat(20_000)));
+            seq += 1;
+        }
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            None,
+            None,
+            None,
+            &events,
+            1_500,
+            400,
+            &HashMap::new(),
+        );
+        let info = ledger.info();
+        assert!(info.total_tokens <= info.budget_tokens, "{info:?}");
+        let entries = info.entries;
+        assert!(entries
+            .iter()
+            .any(|entry| entry.kind == "user" && entry.id == format!("e{}", seq - 3)));
+        assert!(entries
+            .iter()
+            .filter(|entry| entry.sector == Sector::Tools)
+            .any(|entry| !entry.dropped));
+    }
+
+    #[test]
+    fn instruction_chain_stops_at_the_repository_root() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("eix-instructions-{nanos}"));
+        let crate_dir = root.join("crate");
+        std::fs::create_dir_all(root.join(".git")).unwrap();
+        std::fs::create_dir_all(&crate_dir).unwrap();
+        let dirs = instruction_dirs(&crate_dir);
+        assert_eq!(dirs, vec![root.clone(), crate_dir.clone()]);
+        // A directory outside a repository only contributes itself.
+        let loose = std::env::temp_dir().join(format!("eix-loose-{nanos}"));
+        std::fs::create_dir_all(&loose).unwrap();
+        assert_eq!(instruction_dirs(&loose), vec![loose.clone()]);
+        let _ = std::fs::remove_dir_all(root);
+        let _ = std::fs::remove_dir_all(loose);
+    }
+
+    #[test]
+    fn reused_tool_call_ids_match_the_following_result() {
+        // Some providers return `call_1` on every turn. The result after each
+        // assistant message must pair with that message, not with the first
+        // turn's call of the same id.
+        let events = vec![
+            user(1, "first"),
+            tool_step(2, "", vec![call("call_1")]),
+            tool_result(3, "call_1", "first result"),
+            user(4, "second"),
+            tool_step(5, "", vec![call("call_1")]),
+            tool_result(6, "call_1", "second result"),
+        ];
+        let messages = Ledger::assemble("sys".into(), vec![], None, &events, 10_000).messages();
+        let tools: Vec<_> = messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(tools, vec!["first result", "second result"]);
+        assert_eq!(messages.last().unwrap().content, "second result");
     }
 }

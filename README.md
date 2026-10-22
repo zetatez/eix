@@ -63,11 +63,12 @@ cooldown_secs = 10
 
 [context]
 budget_tokens = 32000          # soft ceiling for one request
-instructions_files = ["AGENTS.md"]  # cwd-relative; also reads <config>/AGENTS.md
+instructions_files = ["AGENTS.md"]  # repo root → cwd；也读 <config>/AGENTS.md
 workspace_summary = true       # top-level entries + git branch/status
 auto_compact = true            # 超过阈值时先总结旧历史再继续本轮
 auto_compact_threshold = 0.8   # 占 budget_tokens 的比例 (0, 1]
 auto_compact_keep_turns = 2    # 最近 N 个 user turn 原样保留
+tool_output_tokens = 4000      # 单条工具结果进入 provider 上下文的 token 上限
 
 # 额外模型（可选，每个条目可指向不同的 OpenAI 兼容 endpoint）
 [[models]]
@@ -141,7 +142,7 @@ extensions = ["py"]
 `EIX_RETRY_MAX_SECS`、`EIX_TOOL_POLICY`、`EIX_TOOL_MAX_OUTPUT`、
 `EIX_TOOL_TIMEOUT_SECS`、`EIX_TOOL_SANDBOX`、`EIX_TOOL_SANDBOX_NETWORK`、
 `EIX_TOOL_SANDBOX_READ_HOME`、`EIX_TOOL_SNAPSHOTS`、`EIX_CONTEXT_BUDGET`、
-`EIX_CONTEXT_AUTO_COMPACT`、`EIX_CONTEXT_AUTO_COMPACT_THRESHOLD`、
+`EIX_CONTEXT_AUTO_COMPACT`、`EIX_CONTEXT_AUTO_COMPACT_THRESHOLD`、`EIX_CONTEXT_TOOL_OUTPUT_TOKENS`、
 `EIX_CONTEXT_WORKSPACE`、`EIX_NOTIFY_COMMAND`、`EIX_NOTIFY_COOLDOWN_SECS`、
 `EIX_NOTIFY_BELL`、`EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`、`EIX_CLI_CONFIG`。
 
@@ -558,6 +559,7 @@ daemon 目前向模型暴露这些工具：
 | `glob` | 按 glob 查找工作区路径（`**/*.rs`），可含隐藏文件 | 自动放行 |
 | `use_skill` | 按名字加载 `.eix/skills` 里的 Markdown skill 正文 | 自动放行 |
 | `todo` | 整表替换当前 session 的任务列表（pending / in_progress / completed / cancelled） | 自动放行 |
+| `memory` | 读写当前 workspace 的跨 session 记忆（`add` / `replace` / `clear`） | 自动放行（只改 daemon 数据目录） |
 | `lsp_diagnostics` | 查询某个文件的语言服务器 diagnostics（未配置对应扩展时返回 no-op） | 自动放行 |
 | `webfetch` | 抓取 http(s) URL 并转成纯文本（HTML 去标签，约 100 KB 上限） | 自动放行 |
 | `websearch` | DuckDuckGo HTML 搜索，返回标题和链接（无需 API key） | 自动放行 |
@@ -571,8 +573,10 @@ daemon 目前向模型暴露这些工具：
 | `ask_user` | 让用户从 2-6 个选项中选择 | 交互，不修改文件 |
 | `mcp__*` | MCP server 暴露的工具 | 需要审批 |
 
-所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出按
-`max_output_bytes` 截断。
+所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出先按
+`max_output_bytes` 截断，进入 provider 上下文时再按 `context.tool_output_tokens` 做 head/tail
+省略，完整输出仍保留在事件日志。同一批次全是只读工具（`read_file` / `list_dir` / `grep` /
+`glob` / `webfetch` / `websearch`）时并发执行，结果按调用顺序回填。
 
 `run_command` 的只读判定是保守白名单：`grep` / `rg` / `fd` / `find` / `cat` / `head` /
 `tail` / `wc` / `ls` / `stat` / `diff` 等只读命令，以及由它们组成的 `|`、`&&`、`;` 管道，
@@ -725,27 +729,39 @@ workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具�
 | sector | 内容 | 预算 |
 | --- | --- | --- |
 | system | 内置系统提示 | 5% |
-| instructions | `AGENTS.md`（session cwd，以及 `<config>/AGENTS.md`） | 5% |
+| instructions | `AGENTS.md`（仓库根 → session cwd，以及 `<config>/AGENTS.md`） | 5% |
 | workspace | 顶层文件树 + git branch/status | 15% |
 | history | 对话（user / assistant） | 60% |
 | tools | 工具调用与输出（同一 assistant 的 tool_calls 与其结果算一步） | 10% |
-| memory | 预留 | 5% |
+| memory | 跨 session 记忆 + 当前任务列表（`todo`） | 5% |
 
 - token 是启发式估算：ASCII 约 4 字符/token，CJK 约 1 字符/token，每条消息另加 4 token
   结构开销；底部显示总量、预算和剩余。
-- `tools` / `history` 超出 sector 预算时，最旧的未 pin 条目会自动标 `cut`；始终保留最新 4 条
-  （模型刚拿到的工具输出不会立刻消失）。`system` / `instructions` / `workspace` 不会被自动
-  裁剪，只显示用量——静默丢掉 `AGENTS.md` 会改变 agent 行为。
+- `tools` / `history` 超出 sector 预算时，最旧的未 pin 条目会自动标 `cut`；通常保留最新 4 条
+  （模型刚拿到的工具输出不会立刻消失）。若 4 条大输出仍超过总预算，会进入 emergency trim：
+  保留当前 user 消息和最新工具结果，继续丢弃更旧的历史/工具步骤。`system` / `instructions` /
+  `workspace` / `memory` 不会被自动裁剪，只显示用量——静默丢掉 `AGENTS.md` 或记忆会改变
+  agent 行为。
+- 单条工具结果超过 `context.tool_output_tokens`（默认 4000）时只对 provider 视图做
+  head/tail 省略，事件日志和 TUI 中的完整输出不受影响。
 - TUI：`j/k` 移动、`o` 展开、`p` pin/unpin、`d` drop/恢复、`m` 标记、`s` 压缩（单条，或从
   mark 到光标的范围）、`Esc` 关闭。`eix context --drop/--undrop/--pin/--unpin/--compact` 等价。
 - drop / pin / compact 都是事件（`context_dropped` / `context_pinned` /
   `context_compacted`），重启后重放一致。compact 把一段历史换成一条 summary；原始事件仍在
   日志里并显示为 `sum`，但不再发给 provider；范围不能与已有 summary 重叠。
-- workspace summary 和 instructions 在每次 turn 开始时重新读取，所以改 `AGENTS.md` 或切
-  branch 后下一条消息就会生效。`[context]` 可改预算、指令文件名或关掉 workspace summary。
-- 自动压缩：每轮开始前如果 ledger token 超过 `auto_compact_threshold`（默认 0.8），daemon
-  先把最旧的 turn 总结掉，保留最近 `auto_compact_keep_turns` 个 user turn，再发本轮请求。
-  摘要失败只记录日志，不会阻塞本轮；事件同样是 `context_compacted`。
+- workspace summary、instructions 和 memory 在每次重建上下文时重新读取，所以改 `AGENTS.md`
+  或切 branch 后下一次请求就会生效。`[context]` 可改预算、指令文件名或关掉 workspace summary。
+- 自动压缩：每轮开始前**以及每个工具批次之后**都会重建 ledger；如果 token 超过
+  `auto_compact_threshold`（默认 0.8），daemon 先把最旧的 turn 总结掉，保留最近
+  `auto_compact_keep_turns` 个 user turn，再发下一次请求。摘要使用固定结构（目标/约束、
+  决策、文件、命令与错误、任务状态、未决问题），并带上当前 todo。摘要失败只记录日志，不会
+  阻塞本轮；事件同样是 `context_compacted`。
+- provider 返回 context-length / prompt-too-long 类错误时，daemon 会强制压缩并重试当前请求，
+  最多两次；第一次优先保留配置的 turn 数（没有可压缩范围时退到 1），第二次只保留 1 个 user
+  turn。这比盲目退避更有用。
+- 记忆：`memory` 工具把 durable workspace facts 写到 `<data>/memory/<hash>.md`，下一次
+  turn（包括新 session）会以固定 `memory` 条目注入；`todo` 的当前任务列表也放在同一个
+  sector，因此压缩后计划不会丢。
 
 ### 全文搜索
 
@@ -792,8 +808,8 @@ cooldown_secs = 10
 任意 subagent-capable 的 Markdown agent（内置 `explore`），其正文会作为子 session 的
 额外 system prompt，`model` / `permission` 也随之生效（权限只会收紧）。
 
-一个 assistant 批次里的多个 `spawn_agent` 会并发跑（`tokio::spawn`），其它工具仍按顺序
-执行；结果按调用顺序回填给父模型。子 agent 的 turn 完整写进它自己的事件日志，因此
+一个 assistant 批次里的多个 `spawn_agent` 会并发跑（`tokio::spawn`）；全是只读工具的批次也会
+并发执行，其它工具仍按顺序执行；结果按调用顺序回填给父模型。子 agent 的 turn 完整写进它自己的事件日志，因此
 `eix ls` 能看到、`eix log` 能回放、TUI 侧栏用 `↳` 标出。子 agent 失败时会作为 tool
 结果返回给父模型（父可以重试或忽略），不会把父 turn 直接打成 error。
 

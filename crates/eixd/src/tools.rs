@@ -82,6 +82,18 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::function(
+            "memory",
+            "Persist durable, workspace-specific facts across sessions (conventions, recurring commands, non-obvious constraints). Use `add` for one concise note, `replace` to rewrite the memory, or `clear` to delete it. Never store secrets or transient task details.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["add", "replace", "clear"]},
+                    "text": {"type": "string", "description": "Markdown note. Required for add/replace; ignored for clear."}
+                },
+                "required": ["action"]
+            }),
+        ),
+        ToolDefinition::function(
             "webfetch",
             "Fetch an http(s) URL and return readable text (HTML is stripped). Truncated to roughly 100 KB.",
             json!({
@@ -350,6 +362,7 @@ pub fn is_known(tool: &str) -> bool {
             | "lsp_diagnostics"
             | "use_skill"
             | "todo"
+            | "memory"
             | "webfetch"
             | "websearch"
             | "write_file"
@@ -364,6 +377,17 @@ pub fn is_known(tool: &str) -> bool {
             | "mcp_read_resource"
             | "mcp_list_prompts"
             | "mcp_get_prompt"
+    )
+}
+
+/// Read-only tools that can safely run concurrently in one assistant batch.
+/// They do not mutate the workspace or daemon state and do not block on the
+/// user, so a model that requests several independent reads does not pay their
+/// latency sequentially.
+pub fn parallel_safe(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file" | "list_dir" | "grep" | "glob" | "webfetch" | "websearch"
     )
 }
 

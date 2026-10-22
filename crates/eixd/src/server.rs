@@ -14,6 +14,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::blob::BlobStore;
 use crate::lsp::LspSet;
+use crate::memory::MemoryStore;
 use anyhow::{bail, Context, Result};
 use base64::Engine as _;
 use eix_core::{
@@ -49,7 +50,7 @@ use uuid::Uuid;
 
 use crate::context::Ledger;
 use crate::process::ProcessRegistry;
-use crate::provider::{Provider, ProviderError};
+use crate::provider::{Provider, ProviderError, RetryClass};
 use crate::snapshot::{Scope, Snapshotter};
 use crate::staging::{StagedPatch, Staging};
 use crate::store::Store;
@@ -82,6 +83,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         config: arc_swap::ArcSwap::from_pointee(config),
         bus,
         blobs,
+        memory: MemoryStore::new(data_dir.join("memory")),
         started: Instant::now(),
         snapshots,
         staging,
@@ -296,6 +298,8 @@ pub(crate) struct Daemon {
     pub(crate) bus: broadcast::Sender<Notification>,
     /// Prompt images, content-addressed on disk.
     blobs: BlobStore,
+    /// Cross-session project notes, injected as a fixed context sector.
+    memory: MemoryStore,
     started: Instant,
     /// Pre-execution snapshots for mutating tools.
     snapshots: Snapshotter,
@@ -2187,11 +2191,13 @@ impl Daemon {
             .unwrap_or_else(|| self.config.load().provider.model.clone().to_string());
         let turn_started = Instant::now();
         let ledger = self.build_ledger(session_id).await?;
-        let ledger =
+        let keep_turns = self.config.load().context.auto_compact_keep_turns;
+        let (ledger, _) =
             if self.config.load().context.auto_compact && session.origin != SessionOrigin::Agent {
-                self.auto_compact_if_needed(session_id, ledger).await
+                self.auto_compact_if_needed(session_id, ledger, false, keep_turns)
+                    .await
             } else {
-                ledger
+                (ledger, false)
             };
         let mut messages = ledger.messages();
         self.emit_context(session_id, &ledger);
@@ -2205,11 +2211,37 @@ impl Daemon {
                 Duration::from_secs(config.provider.retry_max_secs.max(1)),
             )
         };
+        // Bound expensive summaries and context-window recoveries so a broken
+        // provider/model pair cannot loop forever inside one user turn.
+        let mut auto_compactions = 0u32;
+        let mut context_recoveries = 0u32;
 
         for round in 0..=tools::MAX_TOOL_ROUNDS {
             if cancel.load(Ordering::SeqCst) {
                 self.finish_cancelled(session_id, turn_id, "", "", &model)?;
                 return Ok(());
+            }
+
+            // Rebuild from the event log after every tool batch. This applies
+            // budget trimming to the newly added outputs, picks up todo/memory
+            // updates, and lets auto-compaction run mid-turn instead of only
+            // before the first request.
+            if round > 0 {
+                let refreshed = self.build_ledger(session_id).await?;
+                let auto_compact = self.config.load().context.auto_compact
+                    && session.origin != SessionOrigin::Agent;
+                let keep = self.config.load().context.auto_compact_keep_turns;
+                let (refreshed, compacted) = if auto_compact && auto_compactions < 2 {
+                    self.auto_compact_if_needed(session_id, refreshed, false, keep)
+                        .await
+                } else {
+                    (refreshed, false)
+                };
+                if compacted {
+                    auto_compactions += 1;
+                }
+                messages = refreshed.messages();
+                self.emit_context(session_id, &refreshed);
             }
 
             let provider = self.provider.load_full();
@@ -2280,6 +2312,41 @@ impl Daemon {
                             &model,
                         )?;
                         return Ok(());
+                    }
+                    Err(err)
+                        if err.retry_class() == RetryClass::ContextLength
+                            && context_recoveries < 2 =>
+                    {
+                        context_recoveries += 1;
+                        let ledger = self.build_ledger(session_id).await?;
+                        // The first recovery keeps the configured recent turns;
+                        // the second is deliberately aggressive.
+                        let keep = if context_recoveries == 1 {
+                            self.config.load().context.auto_compact_keep_turns
+                        } else {
+                            1
+                        };
+                        let (ledger, compacted) = self
+                            .auto_compact_if_needed(session_id, ledger, true, keep)
+                            .await;
+                        if !compacted {
+                            return Err(anyhow::anyhow!("{err}"));
+                        }
+                        messages = ledger.messages();
+                        self.emit_context(session_id, &ledger);
+                        if !streamed.is_empty() || !streamed_reasoning.is_empty() {
+                            self.emit_value(
+                                "message.reset",
+                                json!({
+                                    "session_id": session_id,
+                                    "turn_id": turn_id,
+                                }),
+                            );
+                        }
+                        eprintln!(
+                            "eixd: turn {turn_id} context window exceeded; compacted and retrying"
+                        );
+                        continue;
                     }
                     Err(err) if err.retry_class().is_retryable() && attempt < max_retries => {
                         let delay =
@@ -2427,6 +2494,26 @@ impl Daemon {
         messages: &mut Vec<ChatMessage>,
         cancel: &AtomicBool,
     ) -> Result<()> {
+        // A batch made entirely of read-only tools can run concurrently. This
+        // is the common "inspect several files/directories" pattern; keeping
+        // the results in call order preserves the provider contract.
+        if !calls.is_empty()
+            && calls
+                .iter()
+                .all(|call| tools::parallel_safe(&call.function.name))
+        {
+            let results = futures_util::future::join_all(
+                calls
+                    .iter()
+                    .map(|call| self.run_readonly_call(session_id, turn_id, call, cancel)),
+            )
+            .await;
+            for result in results {
+                messages.push(result?);
+            }
+            return Ok(());
+        }
+
         let mut agents: Vec<(String, tokio::task::JoinHandle<Result<String>>)> = Vec::new();
         for call in calls {
             if call.function.name == "spawn_agent" {
@@ -2457,6 +2544,86 @@ impl Daemon {
             messages.push(ChatMessage::tool(call_id, output));
         }
         Ok(())
+    }
+
+    /// Execute one read-only call without borrowing `messages`, so a whole
+    /// batch can be joined concurrently. Event recording and notifications are
+    /// the same as the sequential path.
+    async fn run_readonly_call(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        cancel: &AtomicBool,
+    ) -> Result<ChatMessage> {
+        let tool = call.function.name.as_str();
+        let args: Value = match serde_json::from_str(&call.function.arguments) {
+            Ok(args) => args,
+            Err(err) => {
+                let output = format!("invalid JSON arguments: {err}");
+                self.record_tool_result(session_id, call, false, false, &output, 0)?;
+                return Ok(ChatMessage::tool(call.id.clone(), output));
+            }
+        };
+        let event = self.store.append_event(
+            session_id,
+            EventKind::ToolCall,
+            payload(&ToolCallPayload {
+                call_id: call.id.clone(),
+                tool: tool.to_string(),
+                arguments: args.clone(),
+            }),
+        )?;
+        self.emit_event(&event);
+
+        if cancel.load(Ordering::SeqCst) {
+            let output = "cancelled".to_string();
+            self.record_tool_result(session_id, call, false, false, &output, 0)?;
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+        if !tools::is_known(tool) {
+            let output = format!("unknown tool {tool:?}");
+            self.record_tool_result(session_id, call, false, false, &output, 0)?;
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+        if !self.skill_allows(session_id, tool).await {
+            let output = format!("the active skill does not allow the {tool} tool");
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+
+        let session = self.require_session(session_id)?;
+        self.emit_value(
+            "tool.started",
+            json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "call_id": call.id,
+                "tool": tool,
+            }),
+        );
+        let outcome = match self
+            .read_with_staging(session_id, tool, &args, &session.cwd)
+            .await
+        {
+            Some(outcome) => outcome,
+            None => tools::execute(tool, &args, &session.cwd, &self.config.load()).await,
+        };
+        let (ok, output, duration_ms) = (outcome.ok, outcome.output, outcome.duration_ms);
+        self.record_tool_result(session_id, call, ok, false, &output, duration_ms)?;
+        self.emit_value(
+            "tool.completed",
+            json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "call_id": call.id,
+                "tool": tool,
+                "ok": ok,
+                "denied": false,
+                "duration_ms": duration_ms,
+            }),
+        );
+        Ok(ChatMessage::tool(call.id.clone(), output))
     }
 
     /// Start one sub-agent and return its final answer as tool output.
@@ -2769,6 +2936,38 @@ impl Daemon {
                 }
             };
             self.record_tool_result(session_id, call, true, true, &output, 0)?;
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        }
+
+        // `memory` persists a small note outside the workspace. Like `todo` it
+        // changes daemon state rather than files, so it bypasses approval.
+        if tool == "memory" {
+            let action = args.get("action").and_then(Value::as_str).unwrap_or("add");
+            let text = args.get("text").and_then(Value::as_str).unwrap_or("");
+            let result = match action {
+                "add" if text.trim().is_empty() => {
+                    Err(anyhow::anyhow!("memory add needs non-empty `text`"))
+                }
+                "add" => self.memory.append(&session.cwd, text).await,
+                "replace" if text.trim().is_empty() => Err(anyhow::anyhow!(
+                    "memory replace needs non-empty `text`; use action=clear to delete"
+                )),
+                "replace" => self.memory.write(&session.cwd, text).await,
+                "clear" => self
+                    .memory
+                    .clear(&session.cwd)
+                    .await
+                    .map(|_| "memory cleared".to_string()),
+                other => Err(anyhow::anyhow!(
+                    "unknown memory action {other:?}; use add, replace or clear"
+                )),
+            };
+            let (ok, output) = match result {
+                Ok(text) => (true, text),
+                Err(err) => (false, format!("{err:#}")),
+            };
+            self.record_tool_result(session_id, call, ok, false, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
         }
@@ -3194,12 +3393,23 @@ impl Daemon {
         let session = self.require_session(session_id)?;
         let events = self.store.events(session_id)?;
         let permission = self.session_permission(&session);
-        Ok(Ledger::build_with_blobs(
+        let todos = self
+            .todos
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks = (!todos.is_empty()).then(|| todo_context(&todos));
+        let memory = self.memory.read(&session.cwd).await;
+        Ok(Ledger::build_with_state(
             &self.config.load(),
             system_prompt(&self.config.load(), &session, permission),
             &session.cwd,
             &events,
             Some(&self.blobs),
+            memory,
+            tasks,
         )
         .await)
     }
@@ -3358,9 +3568,34 @@ impl Daemon {
         session_id: &str,
         mut messages: Vec<ChatMessage>,
     ) -> Result<String> {
+        let todos = self
+            .todos
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let mut system = String::from(
+            "You are compacting a coding-agent conversation. The summary replaces the older \
+             messages, so preserve everything needed to continue the task without re-reading \
+             the log. Use these sections:\n\
+             1. Goal and constraints (including explicit user preferences)\n\
+             2. Decisions and rejected alternatives\n\
+             3. Files, symbols, and code changes (exact paths)\n\
+             4. Commands and important results/errors\n\
+             5. Task state (what is done, in progress, blocked)\n\
+             6. Open questions and the next concrete step\n\
+             Be concise but specific. Keep exact paths, commands, error text, and identifiers. \
+             Do not invent facts or add commentary.",
+        );
+        if !todos.is_empty() {
+            system.push_str("\n\nCurrent task list (preserve it):\n");
+            system.push_str(&todo_context(&todos));
+        }
+        messages.insert(0, ChatMessage::system(system));
         messages.push(ChatMessage::user(
-            "Summarize the conversation so far for a fresh context window. Keep decisions, \
-             file paths, commands and open questions. Do not add new commentary.",
+            "Summarize the conversation so far for a fresh context window. Write the compacted \
+             summary now. Return only the summary.",
         ));
         let model = self
             .require_session(session_id)?
@@ -3380,27 +3615,44 @@ impl Daemon {
         Ok(summary)
     }
 
-    /// Before a turn, summarize the oldest history if the request is about to
-    /// cross `context.auto_compact_threshold` of the budget. Summary failures
-    /// are logged and ignored: a provider hiccup must not block the turn.
-    async fn auto_compact_if_needed(&self, session_id: &str, ledger: Ledger) -> Ledger {
+    /// Summarize the oldest history when the request is about to cross
+    /// `context.auto_compact_threshold` of the budget. `force` bypasses the
+    /// threshold after the provider reports a context-length error. Summary
+    /// failures are logged and ignored: a provider hiccup must not block the
+    /// turn.
+    async fn auto_compact_if_needed(
+        &self,
+        session_id: &str,
+        ledger: Ledger,
+        force: bool,
+        keep: usize,
+    ) -> (Ledger, bool) {
         let info = ledger.info();
         let threshold = self.config.load().context.auto_compact_threshold;
         if info.budget_tokens == 0
-            || (info.total_tokens as f64) <= threshold * info.budget_tokens as f64
+            || (!force && (info.total_tokens as f64) <= threshold * info.budget_tokens as f64)
         {
-            return ledger;
+            return (ledger, false);
         }
-        let keep = self.config.load().context.auto_compact_keep_turns;
-        let Some((from_seq, to_seq)) = ledger.auto_compact_range(keep) else {
-            return ledger;
+        // Forced recovery may have only two user turns, in which case the
+        // configured keep count leaves nothing to summarize. Fall back to
+        // keeping one turn rather than giving up on the request.
+        let range = ledger.auto_compact_range(keep.max(1)).or_else(|| {
+            if force {
+                ledger.auto_compact_range(1)
+            } else {
+                None
+            }
+        });
+        let Some((from_seq, to_seq)) = range else {
+            return (ledger, false);
         };
         if ledger.overlaps_compaction(from_seq, to_seq) {
-            return ledger;
+            return (ledger, false);
         }
         let (messages, tokens) = ledger.range_stats(from_seq, to_seq);
         if messages == 0 {
-            return ledger;
+            return (ledger, false);
         }
         let summary = match self
             .summarize_messages(session_id, ledger.messages_in_range(from_seq, to_seq))
@@ -3409,7 +3661,7 @@ impl Daemon {
             Ok(summary) => summary,
             Err(err) => {
                 eprintln!("eixd: auto-compaction skipped: {err:#}");
-                return ledger;
+                return (ledger, false);
             }
         };
         let event = match self.store.append_event(
@@ -3426,7 +3678,7 @@ impl Daemon {
             Ok(event) => event,
             Err(err) => {
                 eprintln!("eixd: auto-compaction skipped: {err:#}");
-                return ledger;
+                return (ledger, false);
             }
         };
         self.emit_event(&event);
@@ -3444,11 +3696,11 @@ impl Daemon {
         match self.build_ledger(session_id).await {
             Ok(ledger) => {
                 self.emit_context(session_id, &ledger);
-                ledger
+                (ledger, true)
             }
             Err(err) => {
                 eprintln!("eixd: auto-compaction reload failed: {err:#}");
-                ledger
+                (ledger, true)
             }
         }
     }
@@ -4810,6 +5062,23 @@ fn parse_todos(args: &Value) -> Result<Vec<eix_core::TodoItem>> {
     Ok(parsed)
 }
 
+/// Stable task-state block for the context ledger. Unlike the tool result, it
+/// is phrased as current state so a compacted conversation still knows what is
+/// in progress and what remains.
+fn todo_context(items: &[eix_core::TodoItem]) -> String {
+    let mut out = String::from("Current task list (keep this up to date):\n");
+    for item in items {
+        let marker = match item.status.as_str() {
+            "completed" => "[x]",
+            "in_progress" => "[>]",
+            "cancelled" => "[-]",
+            _ => "[ ]",
+        };
+        out.push_str(&format!("{marker} {}\n", item.content));
+    }
+    out.trim_end().to_string()
+}
+
 fn render_todos(items: &[eix_core::TodoItem]) -> String {
     if items.is_empty() {
         return "task list cleared".to_string();
@@ -5002,7 +5271,12 @@ fn system_prompt(config: &Config, session: &Session, permission: PermissionLevel
         format!(
             "You are eix, a coding agent in the user's terminal. Work inside `{}`.\n\
              Be concise, concrete, and honest. If you are unsure, inspect the workspace or ask.\n\
-             Do not claim to have run commands or changed files unless you actually did.{permission_note}",
+             Do not claim to have run commands or changed files unless you actually did.\n\
+             For multi-step work, keep a short task list with the `todo` tool and update it as \
+             work progresses. Inspect the relevant code before editing, make the smallest \
+             coherent change, and verify it with focused tests or builds. When a tool fails, \
+             read the error and adjust instead of repeating the same call. Use `memory` only for \
+             durable workspace facts that will help future sessions.{permission_note}",
             session.cwd.display()
         )
     };
