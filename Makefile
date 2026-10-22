@@ -38,13 +38,15 @@ endif
 ARCHIVE = $(DIST_DIR)/eix-$(VERSION)-$(OS_NAME)-$(PKG_ARCH).tar.gz
 BREW_FORMULA = $(DIST_DIR)/eix-$(PKG_ARCH).rb
 BREW_CLASS := $(if $(filter x86_64,$(PKG_ARCH)),EixX8664,$(if $(filter arm64,$(PKG_ARCH)),EixArm64,$(if $(filter armv7,$(PKG_ARCH)),EixArmv7,Eix)))
-DEB_FILE = $(DIST_DIR)/eix_$(VERSION)_$(DEB_ARCH).deb
+# Artifact names use host labels (x86_64/arm64); DEBIAN/control keeps Debian
+# architecture names (amd64/arm64/armhf) so dpkg accepts the package.
+DEB_FILE = $(DIST_DIR)/eix_$(VERSION)_$(PKG_ARCH).deb
 
 .DEFAULT_GOAL := help
 
 .PHONY: help build build-release test run install release package package-arch \
 	package-deb package-darwin package-brew package-tar \
-	dist dist-linux dist-macos clean
+	dist dist-linux dist-darwin clean
 
 help: ## Show this help
 	@printf 'Usage: make [target]\n\nTargets:\n'
@@ -127,7 +129,7 @@ package-tar: build-release ## Build a portable tar.gz for this OS/arch
 	@rmdir '$(STAGE_DIR)' 2>/dev/null || true
 	@printf 'Portable archive: %s\n' '$(ARCHIVE)'
 
-package-darwin: ## Build macOS tar.gz + Homebrew binary formula
+package-darwin: ## Build Darwin/macOS tar.gz + Homebrew binary formula
 	@[ "$(UNAME_S)" = "Darwin" ] || { \
 		printf 'macOS packages must be built on macOS (current host: %s)\n' '$(UNAME_S)' >&2; exit 1; \
 	}
@@ -155,7 +157,7 @@ package-brew: package-darwin
 dist: ## Build every package format supported by this OS/arch
 	@case "$(UNAME_S)" in \
 		Linux) $(MAKE) dist-linux ;; \
-		Darwin) $(MAKE) dist-macos ;; \
+		Darwin) $(MAKE) dist-darwin ;; \
 		*) printf 'unsupported OS: %s\n' "$(UNAME_S)" >&2; exit 1 ;; \
 	esac
 
@@ -168,7 +170,7 @@ dist-linux:
 	fi
 	@$(MAKE) package-tar
 
-dist-macos: package-darwin
+dist-darwin: package-darwin
 	@:
 
 clean: ## Remove build and packaging artifacts
