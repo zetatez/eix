@@ -95,7 +95,7 @@ model = "openai/gpt-5"         # 可选；显式指定 API model id
 input_cost = 1.25              # USD / 1M tokens，用于成本统计
 output_cost = 10.0
 context_tokens = 400000
-variants = ["high", "medium", "low"]  # 可在 /model 里选 id#variant
+variants = ["high", "medium", "low"]  # 可在 /model 里选 id#variant；未指定时默认 medium
 
 # MCP server（stdio，可选）
 [mcp.servers.files]
@@ -254,7 +254,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
 | `Tab` | normal 模式与转录区：在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
 | `<Space>s` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
-| `Ctrl-T` | 快速轮换推理强度：low → medium → high → 空 → low（输入框内外都可用） |
+| `Ctrl-T` | 快速轮换推理强度：low → medium → high → 空 → low（默认 medium，输入框内外都可用） |
 | `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
 | `:` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
 | `<Space>w` | worktree picker：选中后把路径插入聚焦 pane 的输入框 |
@@ -953,7 +953,7 @@ make package-darwin           # Darwin/macOS: tar.gz + Homebrew formula
 `amd64`/`arm64`/`armhf`，避免 `dpkg` 拒绝安装。
 
 产物都在 `dist/`（Arch 的 `makepkg` 工作目录也在 `dist/makepkg/`，不会污染仓库根目录）。
-macOS 会生成二进制 tarball 和对应的 Homebrew formula（例如 `dist/eix-arm64.rb`），可以直接本地安装：
+Darwin/macOS 会生成二进制 tarball 和对应的 Homebrew formula（例如 `dist/eix-arm64.rb`），可以直接本地安装：
 
 ```sh
 brew install --formula ./dist/eix-arm64.rb
