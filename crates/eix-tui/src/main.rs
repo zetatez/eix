@@ -9,7 +9,7 @@ mod nvim_frontend;
 mod tui;
 
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use eix_core::config as core_config;
@@ -1871,13 +1871,25 @@ async fn resolve_session(
             _ => bail!("session id {needle:?} is ambiguous"),
         };
     }
-    if let Some(session) = sessions.first() {
-        return Ok(session.clone());
+    if let Ok(cwd) = std::env::current_dir() {
+        if let Some(session) = session_for_cwd(&sessions, &cwd) {
+            return Ok(session.clone());
+        }
     }
     if create {
         return create_session(client, None, None, None, false, None).await;
     }
+    if let Some(session) = sessions.first() {
+        return Ok(session.clone());
+    }
     bail!("no sessions yet — run `eix new` first")
+}
+
+/// Prefer the most recently updated user session bound to this workspace.
+fn session_for_cwd<'a>(sessions: &'a [Session], cwd: &Path) -> Option<&'a Session> {
+    sessions
+        .iter()
+        .find(|session| !session.is_agent() && session.cwd_matches(cwd))
 }
 
 async fn attach_events(client: &mut Client, session_id: &str) -> Result<Vec<Event>> {
@@ -2588,5 +2600,19 @@ mod tests {
             Command::Tui { session } => assert_eq!(session.as_deref(), Some("abc")),
             _ => panic!("expected tui"),
         }
+    }
+    #[test]
+    fn resolves_a_session_for_the_current_workspace() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let other = Session::new("other", "other", "/tmp/eix-other-workspace");
+        let mut child = Session::new("child", "child", cwd.clone());
+        child.origin = eix_core::SessionOrigin::Agent;
+        let user = Session::new("user", "user", cwd.clone());
+        let sessions = vec![other, child, user];
+        assert_eq!(
+            session_for_cwd(&sessions, &cwd).map(|session| session.id.as_str()),
+            Some("user")
+        );
+        assert!(session_for_cwd(&sessions, Path::new("/tmp/eix-no-session")).is_none());
     }
 }

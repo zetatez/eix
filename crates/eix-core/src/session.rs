@@ -1,7 +1,7 @@
 //! Sessions are persistent daemon-side entities. Frontends attach to them and
 //! render their event log; they never own session state.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -233,6 +233,15 @@ impl Session {
         self.worktree.is_some()
     }
 
+    /// Whether this session is bound to the given working directory. Paths are
+    /// canonicalized when possible so symlinked launch directories still match.
+    pub fn cwd_matches(&self, cwd: &Path) -> bool {
+        fn normalize(path: &Path) -> PathBuf {
+            path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
+        }
+        normalize(&self.cwd) == normalize(cwd)
+    }
+
     pub fn is_agent(&self) -> bool {
         self.origin == SessionOrigin::Agent
     }
@@ -302,5 +311,13 @@ mod tests {
         assert!("nonsense".parse::<PermissionLevel>().is_err());
         assert!(!PermissionLevel::ReadOnly.can_write());
         assert!(PermissionLevel::Full.can_write());
+    }
+
+    #[test]
+    fn session_matches_its_working_directory() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let session = Session::new("s1", "here", cwd.clone());
+        assert!(session.cwd_matches(&cwd));
+        assert!(!session.cwd_matches(&std::env::temp_dir().join("eix-other-cwd")));
     }
 }

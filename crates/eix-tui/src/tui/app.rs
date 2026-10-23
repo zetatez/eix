@@ -1630,20 +1630,29 @@ impl App {
                 self.sessions = sessions;
                 if !self.initialized {
                     self.initialized = true;
-                    if self.sessions.is_empty() {
-                        self.create_session(tx, false);
-                    } else {
-                        let index = match self.initial_session.as_deref() {
-                            Some(needle) => match self.find_session(needle) {
-                                Some(index) => index,
-                                None => {
-                                    self.error = Some(format!("unknown session {needle:?}"));
-                                    self.selected.min(self.sessions.len() - 1)
-                                }
-                            },
-                            None => 0,
-                        };
-                        self.select_session(index, tx);
+                    let index = match self.initial_session.as_deref() {
+                        Some(needle) => match self.find_session(needle) {
+                            Some(index) => Some(index),
+                            None => {
+                                self.error = Some(format!("unknown session {needle:?}"));
+                                (!self.sessions.is_empty())
+                                    .then(|| self.selected.min(self.sessions.len() - 1))
+                            }
+                        },
+                        None => match std::env::current_dir() {
+                            Ok(cwd) => self.sessions.iter().position(|session| {
+                                !session.is_agent() && session.cwd_matches(&cwd)
+                            }),
+                            // Without a usable launch directory, preserve the
+                            // previous "most recent session" fallback.
+                            Err(_) => (!self.sessions.is_empty()).then_some(0),
+                        },
+                    };
+                    match index {
+                        Some(index) => self.select_session(index, tx),
+                        // A launch from a new directory gets its own session
+                        // instead of attaching to an unrelated one.
+                        None => self.create_session(tx, false),
                     }
                 } else {
                     self.reselect_current();
@@ -10134,6 +10143,42 @@ mod tests {
         assert!(fuzzy_score("ses", "session").is_some());
         assert!(fuzzy_score("xyz", "session").is_none());
         assert!(fuzzy_score("", "anything").is_some());
+    }
+
+    #[test]
+    fn startup_attaches_the_session_for_the_launch_directory() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut app = App::new(None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let other = Session::new("other", "other", "/tmp/eix-other-workspace");
+        let here = Session::new("here", "here", cwd);
+        app.handle_event(Event::Sessions(vec![other, here]), &tx);
+
+        assert_eq!(app.selected, 1);
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "here"));
+    }
+
+    #[test]
+    fn startup_creates_a_session_when_the_launch_directory_has_none() {
+        let mut app = App::new(None);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_event(
+            Event::Sessions(vec![Session::new(
+                "other",
+                "other",
+                "/tmp/eix-other-workspace",
+            )]),
+            &tx,
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Command::Create {
+                worktree: false,
+                cwd: None,
+                ..
+            })
+        ));
     }
 
     #[test]

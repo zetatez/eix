@@ -40,6 +40,9 @@ echo 'review the diff' | ./target/debug/eix send
 ```
 
 `eix` 第一次连接时会在后台拉起 `eixd`（新进程组，关终端不会杀掉 daemon）。
+客户端断开或退出不会取消正在运行的 turn；重新启动 TUI、`eix chat` 或 `eix send` 且没有
+指定 `--session` 时，会优先 attach 当前目录最近更新的 user session，当前目录没有 session
+则新建一个。`eix log` 等只读子命令找不到当前目录 session 时仍回退到最近 session。
 socket 在 Linux / Arch 默认 `$XDG_RUNTIME_DIR/eix.sock`；macOS 没有 XDG runtime dir，回退到
 `~/Library/Caches/eix/eix.sock`（其他没有 runtime dir 的平台回退到 `~/.cache/eix/eix.sock`）。
 数据默认 `~/.local/share/eix/`（SQLite + `eixd.log`）。可以用 `EIX_SOCKET` / `--socket` 覆盖。

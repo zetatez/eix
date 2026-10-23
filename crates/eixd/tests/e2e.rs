@@ -159,6 +159,78 @@ async fn daemon_streams_and_persists_a_turn() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn disconnecting_a_client_does_not_cancel_the_turn() -> anyhow::Result<()> {
+    let dir = temp_dir("client-disconnect");
+    std::fs::create_dir_all(&dir)?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(slow_provider(listener));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut first = connect(&socket).await?;
+    let created: SessionResult = first
+        .request("session.create", json!({"name": "disconnect", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = first
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "keep going"}),
+        )
+        .await?;
+    assert!(!submitted.turn_id.is_empty());
+
+    // Wait until the provider has started streaming, then close the client
+    // without cancelling the turn.
+    loop {
+        let notification = first.next_notification().await?;
+        if notification.method == "message.delta"
+            && notification.params["session_id"] == session_id.as_str()
+        {
+            break;
+        }
+    }
+    drop(first);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut second = connect(&socket).await?;
+    let mut attached = None;
+    for _ in 0..100 {
+        let current: AttachResult = second
+            .request("session.attach", json!({"session_id": session_id}))
+            .await?;
+        if current.session.status == eix_core::SessionStatus::Idle {
+            attached = Some(current);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let attached = attached.expect("the turn should finish after the client disconnects");
+    let assistant = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .expect("assistant message persisted");
+    let text = assistant.payload["text"].as_str().unwrap_or_default();
+    assert!(text.starts_with("part"), "{text}");
+    assert_eq!(attached.session.status, eix_core::SessionStatus::Idle);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_retries_transient_provider_failures() -> anyhow::Result<()> {
     let dir = temp_dir("retry");
     std::fs::create_dir_all(&dir)?;

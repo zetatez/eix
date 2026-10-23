@@ -85,6 +85,8 @@ idle ──submit──> running ──tool──> tool_running ──> running 
 ### 4.3 attach / detach / 所有权
 
 - session 常驻 daemon；client attach 只是订阅 + 渲染。
+- TUI / `chat` / `send` 未指定 session 时，按启动目录选择最近更新的 user session attach；
+  当前目录没有 session 则新建。其他只读 CLI 命令找不到当前目录 session 时回退到最近 session。
 - 同一 session 可被多 client 观察，但**只有一个输入所有者（controller）**。
 - 所有者断开 → 自动转移给最早的 watcher；显式抢占用 `<leader>a C`（claim，避免与 context ledger 的 `<leader>a c` 冲突）。
 - draft 由 daemon 持有，client 的 nvim 只是视图；所有权切换时重新加载 draft。
