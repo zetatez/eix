@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AttachResult, Config, EventKind, EventsResult, HelloResult, ModelConfig, NamedProviderConfig,
-    PermissionAction, PermissionLevel, PermissionRule, Request, Response, SearchResult,
+    AttachResult, Config, EventKind, EventsResult, HelloResult, ModelConfig, PermissionAction,
+    PermissionLevel, PermissionRule, ProviderConfig, Request, Response, SearchResult,
     ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
@@ -28,10 +28,10 @@ async fn daemon_streams_and_persists_a_turn() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -168,10 +168,10 @@ async fn disconnecting_a_client_does_not_cancel_the_turn() -> anyhow::Result<()>
     let mock = tokio::spawn(slow_provider(listener));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -231,6 +231,67 @@ async fn disconnecting_a_client_does_not_cancel_the_turn() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn auto_names_an_unnamed_session_after_two_turns() -> anyhow::Result<()> {
+    let dir = temp_dir("auto-name");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let original_name = created.session.name.clone();
+    assert!(!original_name.is_empty());
+
+    for text in ["first request", "second request"] {
+        client
+            .request::<SubmitResult>(
+                "prompt.submit",
+                json!({"session_id": session_id, "text": text}),
+            )
+            .await?;
+        wait_turn(&mut client).await?;
+    }
+
+    let mut renamed = None;
+    for _ in 0..100 {
+        let attached: AttachResult = client
+            .request("session.attach", json!({"session_id": session_id}))
+            .await?;
+        if attached.session.name == "HelloFromMock" {
+            renamed = Some(attached.session);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let session = renamed.expect("the second turn should generate a session name");
+    assert_ne!(session.name, original_name);
+    assert!(
+        session.name.chars().all(char::is_alphanumeric),
+        "{}",
+        session.name
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn daemon_retries_transient_provider_failures() -> anyhow::Result<()> {
     let dir = temp_dir("retry");
     std::fs::create_dir_all(&dir)?;
@@ -241,13 +302,13 @@ async fn daemon_retries_transient_provider_failures() -> anyhow::Result<()> {
     let mock = tokio::spawn(flaky_provider(listener, 2, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
-    config.provider.retry_attempts = 3;
-    config.provider.retry_base_ms = 1;
-    config.provider.retry_max_secs = 1;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.provider_runtime.retry_attempts = 3;
+    config.provider_runtime.retry_base_ms = 1;
+    config.provider_runtime.retry_max_secs = 1;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -316,13 +377,13 @@ async fn daemon_honours_rate_limit_retry_after() -> anyhow::Result<()> {
     let mock = tokio::spawn(rate_limit_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
-    config.provider.retry_attempts = 2;
-    config.provider.retry_base_ms = 500;
-    config.provider.retry_max_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.provider_runtime.retry_attempts = 2;
+    config.provider_runtime.retry_base_ms = 500;
+    config.provider_runtime.retry_max_secs = 30;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -388,13 +449,13 @@ async fn daemon_discards_partial_output_before_retrying() -> anyhow::Result<()> 
     let mock = tokio::spawn(partial_failure_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
-    config.provider.retry_attempts = 2;
-    config.provider.retry_base_ms = 1;
-    config.provider.retry_max_secs = 1;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.provider_runtime.retry_attempts = 2;
+    config.provider_runtime.retry_base_ms = 1;
+    config.provider_runtime.retry_max_secs = 1;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -467,13 +528,13 @@ async fn daemon_does_not_retry_an_exhausted_quota() -> anyhow::Result<()> {
     let mock = tokio::spawn(quota_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
-    config.provider.retry_attempts = 3;
-    config.provider.retry_base_ms = 1;
-    config.provider.retry_max_secs = 1;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.provider_runtime.retry_attempts = 3;
+    config.provider_runtime.retry_base_ms = 1;
+    config.provider_runtime.retry_max_secs = 1;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -525,10 +586,10 @@ async fn context_ledger_reports_sectors_and_honours_policies() -> anyhow::Result
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -728,10 +789,10 @@ async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -813,10 +874,10 @@ async fn context_compact_can_generate_a_summary() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -890,10 +951,10 @@ async fn session_cd_moves_the_workspace() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::new(Mutex::new(Vec::new()))));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -946,9 +1007,9 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::new(Mutex::new(Vec::new()))));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
     config.models = vec![ModelConfig {
         id: "mock/second".to_string(),
         name: Some("Second".to_string()),
@@ -960,10 +1021,10 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
     }];
     config.providers.insert(
         "remote".to_string(),
-        NamedProviderConfig {
+        ProviderConfig {
             name: Some("Remote".to_string()),
             base_url: format!("http://{addr}/v1"),
-            ..NamedProviderConfig::default()
+            ..ProviderConfig::default()
         },
     );
 
@@ -985,8 +1046,8 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
     assert_eq!(models.models[1].variants, vec!["high"]);
     // Both the default provider and the named provider expose the mock's
     // `/models` catalog, with provider-qualified selection ids.
-    assert_eq!(models.models[2].id, "default/mock-auto");
-    assert_eq!(models.models[3].id, "default/mock-other");
+    assert_eq!(models.models[2].id, "openai/mock-auto");
+    assert_eq!(models.models[3].id, "openai/mock-other");
     assert_eq!(models.models[3].context_tokens, Some(12_345));
     assert_eq!(models.models[4].id, "remote/mock-auto");
     assert_eq!(models.models[4].provider, "Remote");
@@ -1125,10 +1186,10 @@ for line in sys.stdin:
     let mock = tokio::spawn(mcp_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.mcp.servers.insert(
         "mock".to_string(),
         eix_core::McpServerConfig {
@@ -1244,10 +1305,10 @@ async fn btw_answers_without_touching_the_log() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -1346,10 +1407,10 @@ async fn cancel_keeps_the_partial_answer_and_returns_to_idle() -> anyhow::Result
     let mock = tokio::spawn(slow_provider(listener));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -1428,10 +1489,10 @@ async fn staged_write_is_applied_after_approval() -> anyhow::Result<()> {
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -1597,10 +1658,10 @@ async fn read_only_session_refuses_writes_and_permission_is_logged() -> anyhow::
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -1750,10 +1811,10 @@ async fn staged_write_can_be_revised_before_approval() -> anyhow::Result<()> {
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -1840,10 +1901,10 @@ async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> 
     let mock = tokio::spawn(command_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     // The snapshot, not the filesystem sandbox, is under test here.
     config.tools.sandbox = eix_core::SandboxMode::Off;
 
@@ -1939,10 +2000,10 @@ async fn read_only_commands_run_without_approval_and_secrets_stay_local() -> any
     let mock = tokio::spawn(secret_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.tools.sandbox = eix_core::SandboxMode::Off;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
@@ -2048,10 +2109,10 @@ async fn permission_rule_skips_the_prompt() -> anyhow::Result<()> {
     let mock = tokio::spawn(command_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.tools.sandbox = eix_core::SandboxMode::Off;
     config.tools.rules = vec![PermissionRule {
         tool: "run_command".to_string(),
@@ -2127,10 +2188,10 @@ async fn permission_rule_cannot_bypass_a_read_only_session() -> anyhow::Result<(
     let mock = tokio::spawn(command_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.tools.sandbox = eix_core::SandboxMode::Off;
     // A catch-all rule must still lose to the session's read-only level.
     config.tools.rules = vec![PermissionRule {
@@ -2206,10 +2267,10 @@ async fn staged_write_applies_only_the_selected_hunks() -> anyhow::Result<()> {
     ));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -2287,10 +2348,10 @@ async fn attention_runs_the_notification_command() -> anyhow::Result<()> {
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     let notified_path = dir.join("notified");
     config.notifications.command = Some(format!(
         "printf '%s %s' \"$EIX_SESSION_NAME\" \"$EIX_STATUS\" > {}",
@@ -2341,10 +2402,10 @@ async fn staged_write_can_be_rejected_and_keeps_the_workspace_untouched() -> any
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -2428,10 +2489,10 @@ async fn staged_write_reports_a_conflict_when_the_file_changed() -> anyhow::Resu
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -2507,10 +2568,10 @@ async fn staged_writes_are_visible_to_reads() -> anyhow::Result<()> {
     let mock = tokio::spawn(staging_read_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -2573,10 +2634,10 @@ async fn background_process_streams_output_and_can_be_killed() -> anyhow::Result
     let mock = tokio::spawn(start_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.tools.approval = eix_core::ApprovalMode::Auto;
     config.tools.sandbox = eix_core::SandboxMode::Off;
 
@@ -2710,10 +2771,10 @@ async fn fork_copies_a_prefix_into_a_new_idle_session() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -2830,10 +2891,10 @@ async fn search_indexes_messages_across_sessions_and_short_queries() -> anyhow::
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -2940,7 +3001,7 @@ async fn recovers_sessions_left_running() -> anyhow::Result<()> {
     }
 
     let mut config = Config::default();
-    config.provider.base_url = "http://127.0.0.1:1/v1".to_string();
+    config.default_provider_mut().base_url = "http://127.0.0.1:1/v1".to_string();
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir));
 
@@ -2972,10 +3033,10 @@ async fn rewind_restores_the_workspace_before_a_write() -> anyhow::Result<()> {
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     // Execute the write immediately so the snapshot and the write land in one
     // turn; `ask` would stage it and defer the snapshot until apply.
     config.tools.approval = eix_core::ApprovalMode::Auto;
@@ -3083,7 +3144,7 @@ async fn worktree_sessions_are_created_forked_and_removed() -> anyhow::Result<()
     let repo = dir.canonicalize()?;
 
     let mut config = Config::default();
-    config.provider.base_url = "http://127.0.0.1:1/v1".to_string();
+    config.default_provider_mut().base_url = "http://127.0.0.1:1/v1".to_string();
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
 
@@ -3232,7 +3293,7 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
     drop(probe);
 
     let mut config = Config::default();
-    config.provider.base_url = "http://127.0.0.1:1/v1".to_string();
+    config.default_provider_mut().base_url = "http://127.0.0.1:1/v1".to_string();
     config.server.tcp = Some(addr.clone());
     config.server.token = Some("s3cret".to_string());
     let socket = dir.join("eix.sock");
@@ -3313,10 +3374,10 @@ async fn session_subscribe_filters_broadcasts_per_connection() -> anyhow::Result
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -3405,9 +3466,9 @@ async fn drafts_round_trip_and_clear() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
 
     let socket = dir.join("eix.sock");
     let data_dir = dir.join("data");
@@ -3472,10 +3533,10 @@ async fn spawn_agent_runs_a_readonly_child_and_returns_its_answer() -> anyhow::R
     let mock = tokio::spawn(agent_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -3568,10 +3629,10 @@ async fn cancelling_the_parent_stops_a_running_sub_agent() -> anyhow::Result<()>
     let mock = tokio::spawn(hanging_agent_provider(listener));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -3641,10 +3702,10 @@ async fn ask_user_blocks_the_turn_until_the_user_answers() -> anyhow::Result<()>
     let mock = tokio::spawn(ask_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -3779,10 +3840,10 @@ async fn nvim_headless_renders_the_transcript() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir.clone()));
@@ -3902,6 +3963,20 @@ async fn picker_query_lists_workspace_files() -> anyhow::Result<()> {
         .await?;
     assert_eq!(filtered.items.len(), 1);
     assert_eq!(filtered.items[0].value, "src/main.rs");
+
+    let preview: eix_core::PickerPreviewResult = client
+        .request(
+            "picker.preview",
+            json!({
+                "kind": "files",
+                "session_id": session_id,
+                "value": "src/main.rs",
+            }),
+        )
+        .await?;
+    assert_eq!(preview.kind, eix_core::KIND_FILES);
+    assert_eq!(preview.value, "src/main.rs");
+    assert!(preview.text.contains("fn main() {}"), "{}", preview.text);
 
     // The session must belong to the daemon, and the kind must be known.
     assert_eq!(
@@ -4506,10 +4581,10 @@ async fn skills_are_listed_in_the_prompt_and_loadable_with_use_skill() -> anyhow
     let mock = tokio::spawn(skill_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
     config.compations.claude_code = true;
@@ -4572,10 +4647,10 @@ async fn skills_expand_arguments_and_enforce_allowed_tools() -> anyhow::Result<(
     let mock = tokio::spawn(skill_guard_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
 
@@ -4752,10 +4827,10 @@ async fn todo_tool_updates_the_session_task_list() -> anyhow::Result<()> {
     let mock = tokio::spawn(todo_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
 
@@ -4860,10 +4935,10 @@ async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Resul
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
     config.context.budget_tokens = 100_000;
@@ -4989,14 +5064,14 @@ async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
     let config_path = dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"first-model\"\n\
+        "[providers.openai]\ndefault = true\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"first-model\"\n\
          api_key = \"test\"\ntimeout_secs = 5\n",
     )?;
 
     let mut config = Config::default();
-    config.provider.base_url = "http://127.0.0.1:9/v1".into();
-    config.provider.model = "first-model".into();
-    config.provider.api_key = Some("test".into());
+    config.default_provider_mut().base_url = "http://127.0.0.1:9/v1".into();
+    config.default_provider_mut().model = "first-model".into();
+    config.default_provider_mut().api_key = Some("test".into());
     // Mark the file as the authoritative source so `reload` reads it again.
     config.explicit_path = Some(config_path.clone());
     config.load_cwd = dir.clone();
@@ -5014,7 +5089,7 @@ async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
 
     std::fs::write(
         &config_path,
-        "[provider]\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"second-model\"\n\
+        "[providers.openai]\ndefault = true\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"second-model\"\n\
          api_key = \"test\"\ntimeout_secs = 5\n",
     )?;
     let reloaded: Value = client.request("config.reload", Value::Null).await?;
@@ -5043,10 +5118,10 @@ async fn sessions_can_be_exported_imported_archived_and_deleted() -> anyhow::Res
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -5146,6 +5221,70 @@ async fn sessions_can_be_exported_imported_archived_and_deleted() -> anyhow::Res
 }
 
 #[tokio::test]
+async fn unused_sessions_can_be_discarded_without_losing_work() -> anyhow::Result<()> {
+    let dir = temp_dir("delete-empty");
+    std::fs::create_dir_all(&dir)?;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(
+        Config::default(),
+        socket.clone(),
+        dir.join("data"),
+    ));
+    let mut client = connect(&socket).await?;
+
+    let empty: SessionResult = client
+        .request("session.create", json!({"name": "empty", "cwd": dir}))
+        .await?;
+    let drafted: SessionResult = client
+        .request("session.create", json!({"name": "drafted", "cwd": dir}))
+        .await?;
+
+    client
+        .request::<eix_core::DraftResult>(
+            "draft.set",
+            json!({"session_id": drafted.session.id, "text": "keep me"}),
+        )
+        .await?;
+    let kept: Value = client
+        .request(
+            "session.delete_if_empty",
+            json!({"session_id": drafted.session.id}),
+        )
+        .await?;
+    assert_eq!(kept["deleted"], false);
+
+    let discarded: Value = client
+        .request(
+            "session.delete_if_empty",
+            json!({"session_id": empty.session.id}),
+        )
+        .await?;
+    assert_eq!(discarded["deleted"], true);
+    let list: eix_core::SessionList = client.request("session.list", Value::Null).await?;
+    assert!(!list.sessions.iter().any(|s| s.id == empty.session.id));
+
+    // Clearing the draft makes that session discardable too.
+    client
+        .request::<eix_core::DraftResult>(
+            "draft.set",
+            json!({"session_id": drafted.session.id, "text": ""}),
+        )
+        .await?;
+    let discarded: Value = client
+        .request(
+            "session.delete_if_empty",
+            json!({"session_id": drafted.session.id}),
+        )
+        .await?;
+    assert_eq!(discarded["deleted"], true);
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn image_attachments_are_stored_and_sent_as_content_parts() -> anyhow::Result<()> {
     let dir = temp_dir("images");
     std::fs::create_dir_all(&dir)?;
@@ -5156,10 +5295,10 @@ async fn image_attachments_are_stored_and_sent_as_content_parts() -> anyhow::Res
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
     let socket = dir.join("eix.sock");
@@ -5518,10 +5657,10 @@ async fn undo_and_redo_toggle_the_newest_turn() -> anyhow::Result<()> {
     let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -5607,10 +5746,10 @@ async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::R
     let mock = tokio::spawn(repeat_tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-model".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -6312,10 +6451,10 @@ async fn memory_tool_persists_across_sessions() -> anyhow::Result<()> {
     let mock = tokio::spawn(memory_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-memory".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-memory".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
     config.context.auto_compact = false;
@@ -6471,10 +6610,10 @@ async fn read_only_tool_batch_keeps_call_order() -> anyhow::Result<()> {
     let mock = tokio::spawn(parallel_read_provider(listener));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-parallel".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-parallel".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
     config.context.auto_compact = false;
@@ -6588,10 +6727,10 @@ async fn context_length_error_forces_compaction_and_retries() -> anyhow::Result<
     ));
 
     let mut config = Config::default();
-    config.provider.base_url = format!("http://{addr}/v1");
-    config.provider.model = "mock-recovery".to_string();
-    config.provider.api_key = None;
-    config.provider.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-recovery".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
     config.context.budget_tokens = 100_000;

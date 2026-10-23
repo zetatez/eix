@@ -308,6 +308,27 @@ impl Store {
             .optional()?)
     }
 
+    /// Delete a session only when it has no events, no non-empty draft, and no
+    /// worktree. The checks and delete run in one statement so a concurrent
+    /// prompt or draft save cannot be lost. Undone events still count as input.
+    pub fn delete_session_if_unused(&self, id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "DELETE FROM sessions
+             WHERE id = ?1
+               AND worktree IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM events WHERE events.session_id = ?1
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM drafts
+                   WHERE drafts.session_id = ?1 AND trim(drafts.text) <> ''
+               )",
+            params![id],
+        )?;
+        Ok(changed > 0)
+    }
+
     /// Delete a session and (via `ON DELETE CASCADE`) its events, draft and
     /// search rows. Returns false when the session did not exist.
     pub fn delete_session(&self, id: &str) -> Result<bool> {
@@ -1109,6 +1130,36 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].payload["text"], "hi");
         assert_eq!(events[1].payload["text"], "hello");
+    }
+
+    #[test]
+    fn unused_sessions_are_only_deleted_without_events_drafts_or_worktrees() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("empty")).unwrap();
+        assert!(store.delete_session_if_unused("empty").unwrap());
+        assert!(store.get_session("empty").unwrap().is_none());
+        assert!(!store.delete_session_if_unused("missing").unwrap());
+
+        store.create_session(&session("drafted")).unwrap();
+        store.set_draft("drafted", "draft").unwrap();
+        assert!(!store.delete_session_if_unused("drafted").unwrap());
+        store.set_draft("drafted", "   ").unwrap();
+        assert!(store.delete_session_if_unused("drafted").unwrap());
+
+        store.create_session(&session("used")).unwrap();
+        store
+            .append_event(
+                "used",
+                EventKind::UserMessage,
+                serde_json::json!({"text": "hi"}),
+            )
+            .unwrap();
+        assert!(!store.delete_session_if_unused("used").unwrap());
+
+        let mut worktree = session("worktree");
+        worktree.worktree = Some(PathBuf::from("/tmp/worktree"));
+        store.create_session(&worktree).unwrap();
+        assert!(!store.delete_session_if_unused("worktree").unwrap());
     }
 
     #[test]

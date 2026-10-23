@@ -90,7 +90,17 @@ pub async fn run(
                 before_seq,
             });
         }
+        if let Some((kind, session_id, value)) = app.take_picker_preview_request() {
+            let _ = cmd_tx.send(Command::PickerPreview {
+                kind,
+                session_id,
+                value,
+            });
+        }
         if app.should_quit {
+            // A pane opened for a brand-new session should not leave an empty
+            // row in history when the user quits without sending anything.
+            app.cleanup_empty_sessions(&cmd_tx);
             break;
         }
 

@@ -29,16 +29,17 @@ use eix_core::{
     InputResult, LspWorkspaceParams, McpListResult, McpServerInfo, ModelListResult, Notification,
     PatchApplyParams, PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams,
     PatchResult, PatchResultPayload, PatchReviseParams, PermissionAction, PermissionLevel,
-    PermissionParams, PermissionPayload, PermissionRule, PickerItem, PickerParams, PickerResult,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    RenameParams, Request, Response, RewindParams, RewindResult, RuleSource, SearchParams,
-    SearchResult, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
-    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
-    SessionList, SessionModelParams, SessionOrigin, SessionRef, SessionResult, SessionStatus,
-    ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult, StatusChangedPayload,
-    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult,
-    ToolCall, ToolCallPayload, ToolDefinition, ToolResultPayload, UserMessagePayload,
-    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    PermissionParams, PermissionPayload, PermissionRule, PickerItem, PickerParams,
+    PickerPreviewParams, PickerPreviewResult, PickerResult, ProcessKillParams, ProcessKillResult,
+    ProcessList, ProcessListParams, ProcessOutputParams, RenameParams, Request, Response,
+    RewindParams, RewindResult, RuleSource, SearchParams, SearchResult, ServerMessage, Session,
+    SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
+    SessionId, SessionImportParams, SessionList, SessionModelParams, SessionOrigin, SessionRef,
+    SessionResult, SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
+    StatusChangedPayload, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
+    TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition, ToolResultPayload,
+    UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -172,10 +173,10 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         env!("CARGO_PKG_VERSION"),
         socket.display()
     );
-    eprintln!("  model  {}", daemon.config.load().provider.model);
+    eprintln!("  model  {}", daemon.config.load().default_model());
     eprintln!(
         "  api    {}",
-        redact(&daemon.config.load().provider.base_url)
+        redact(&daemon.config.load().default_provider().base_url)
     );
     eprintln!("  data   {}", db_path.display());
 
@@ -561,8 +562,8 @@ impl Daemon {
                 protocol: PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 pid: std::process::id(),
-                model: self.config.load().provider.model.clone().to_string(),
-                base_url: self.config.load().provider.base_url.clone(),
+                model: self.config.load().default_model().to_string(),
+                base_url: self.config.load().default_provider().base_url.clone(),
                 sessions: self.store.session_count()?,
             })?),
             "ping" => Ok(json!({ "pong": true, "ts": now_ms() })),
@@ -601,6 +602,28 @@ impl Daemon {
                 );
                 let _ = self.gc_blobs().await;
                 Ok(json!({ "deleted": true }))
+            }
+            // Frontends open a session before the first prompt so they can
+            // render the composer and bind a daemon-side draft. If the pane is
+            // closed without any input, discard that unused row instead of
+            // leaving it in the session picker forever.
+            "session.delete_if_empty" => {
+                let params: SessionRef = parse_params(request.params.clone())?;
+                // A running turn may not have persisted its first event yet;
+                // never race it with a cleanup delete.
+                if self.turns.lock().await.contains_key(&params.session_id) {
+                    return Ok(json!({ "deleted": false }));
+                }
+                let deleted = self.store.delete_session_if_unused(&params.session_id)?;
+                if deleted {
+                    self.todos.lock().await.remove(&params.session_id);
+                    self.emit_value(
+                        "session.deleted",
+                        json!({ "session_id": params.session_id }),
+                    );
+                    let _ = self.gc_blobs().await;
+                }
+                Ok(json!({ "deleted": deleted }))
             }
             "session.undo" | "session.redo" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
@@ -1057,6 +1080,46 @@ impl Daemon {
                     }
                 };
                 Ok(serde_json::to_value(result)?)
+            }
+            "picker.preview" => {
+                let params: PickerPreviewParams = parse_params(request.params.clone())?;
+                let preview = match params.kind.as_str() {
+                    eix_core::KIND_FILES => {
+                        let session_id = params.session_id.as_deref().ok_or_else(|| {
+                            rpc("invalid_params", "session_id is required for files")
+                        })?;
+                        let session = self.require_session(session_id)?;
+                        crate::picker::file_preview(
+                            &session.cwd,
+                            &params.value,
+                            self.config.load().as_ref(),
+                            params.limit,
+                        )
+                        .await?
+                    }
+                    eix_core::KIND_SESSION_PREVIEW => {
+                        self.require_session(&params.value)?;
+                        // A long turn may end with many tool events. Fetch a
+                        // wider window than the rendered message count so the
+                        // preview still finds recent user/assistant turns.
+                        let wanted = params.limit.unwrap_or(120).clamp(1, 500);
+                        let fetch = wanted.saturating_mul(4).min(2_000);
+                        let (events, _) =
+                            self.store.events_before(&params.value, u64::MAX, fetch)?;
+                        crate::picker::session_preview(&params.value, &events, Some(wanted))
+                    }
+                    other => {
+                        return Err(rpc(
+                            "invalid_params",
+                            format!("unknown preview kind {other:?}"),
+                        ))
+                    }
+                };
+                Ok(serde_json::to_value(PickerPreviewResult {
+                    kind: preview.kind,
+                    value: preview.value,
+                    text: preview.text,
+                })?)
             }
             "process.list" => {
                 let params: ProcessListParams = parse_params(request.params.clone())?;
@@ -1581,7 +1644,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| self.config.load().provider.model.clone().to_string());
+            .unwrap_or_else(|| self.config.load().default_model().to_string());
         tokio::spawn(async move {
             daemon.run_btw(session_id, id, question, model).await;
         });
@@ -1953,7 +2016,7 @@ impl Daemon {
             json!({
                 "session_id": session.id.clone(),
                 "turn_id": turn_id.clone(),
-                "model": session.model.clone().unwrap_or_else(|| self.config.load().provider.model.clone().to_string()),
+                "model": session.model.clone().unwrap_or_else(|| self.config.load().default_model().to_string()),
             }),
         );
 
@@ -2083,20 +2146,6 @@ impl Daemon {
         }
         // A skill's tool restrictions last for one user turn.
         self.skill_tools.lock().await.remove(&session_id);
-
-        // First prompt names an unnamed session; keep it short and one-line.
-        let mut session = session;
-        if needs_auto_name(&session) {
-            let name = auto_name(if text.trim().is_empty() {
-                "image"
-            } else {
-                &text
-            });
-            if let Some(renamed) = self.store.rename_session(&session.id, &name)? {
-                session = renamed;
-                self.emit_session(&session);
-            }
-        }
 
         let event = self.store.append_event(
             &session.id,
@@ -2270,6 +2319,9 @@ impl Daemon {
         }
         self.approvals.lock().await.remove(&session_id);
         self.turns.lock().await.remove(&session_id);
+        // Naming is deliberately off the critical path: the turn has already
+        // completed, and a provider hiccup falls back to a local title.
+        self.maybe_auto_name_session(&session_id).await;
     }
 
     async fn run_turn_inner(
@@ -2284,7 +2336,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.provider.model.clone());
+            .unwrap_or_else(|| config.default_model().to_string());
         let turn_started = Instant::now();
         let static_context = StaticContext::load(&config, &session.cwd).await;
         let mut events = self.store.events_async(session_id).await?;
@@ -2313,9 +2365,9 @@ impl Daemon {
         let tools = allowed_tools;
         let route = config.route(&model);
         let (max_retries, retry_base, retry_max) = (
-            config.provider.retry_attempts,
-            Duration::from_millis(config.provider.retry_base_ms.max(1)),
-            Duration::from_secs(config.provider.retry_max_secs.max(1)),
+            config.provider_runtime.retry_attempts,
+            Duration::from_millis(config.provider_runtime.retry_base_ms.max(1)),
+            Duration::from_secs(config.provider_runtime.retry_max_secs.max(1)),
         );
         // Bound expensive summaries and context-window recoveries so a broken
         // provider/model pair cannot loop forever inside one user turn.
@@ -3024,7 +3076,7 @@ impl Daemon {
                 "model": child
                     .model
                     .clone()
-                    .unwrap_or_else(|| self.config.load().provider.model.clone().to_string()),
+                    .unwrap_or_else(|| self.config.load().default_model().to_string()),
             }),
         );
         if let Err(err) = self
@@ -3541,7 +3593,7 @@ impl Daemon {
             blob_bytes,
             skills: eix_core::load_skills(&config.load_cwd, &config.compations).len(),
             mcp_servers: config.mcp.servers.len(),
-            default_model: config.provider.model.clone(),
+            default_model: config.default_model().to_string(),
         })
     }
 
@@ -3699,7 +3751,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.provider.model.clone());
+            .unwrap_or_else(|| config.default_model().to_string());
         let route = config.route(&model);
         let budget = config.context.effective_budget_tokens(route.context_tokens);
         Ok(Ledger::build_with_state_and_static(
@@ -3948,7 +4000,7 @@ impl Daemon {
         let model = self
             .require_session(session_id)?
             .model
-            .unwrap_or_else(|| self.config.load().provider.model.clone().to_string());
+            .unwrap_or_else(|| self.config.load().default_model().to_string());
         let cancel = AtomicBool::new(false);
         let route = self.config.load().route(&model);
         let provider = self.provider.load_full();
@@ -5852,8 +5904,174 @@ fn auto_name(text: &str) -> String {
     }
 }
 
+/// Session titles are identifiers, not prose: keep Unicode letters/digits,
+/// turn word boundaries into CamelCase for ASCII, and drop spaces/punctuation.
+fn sanitize_session_name(text: &str) -> String {
+    const MAX: usize = 32;
+    let mut out = String::new();
+    let mut boundary = true;
+    let mut count = 0usize;
+    for ch in text.chars() {
+        if ch.is_alphanumeric() {
+            if count >= MAX {
+                break;
+            }
+            if boundary && ch.is_ascii_alphabetic() {
+                out.push(ch.to_ascii_uppercase());
+            } else {
+                out.push(ch);
+            }
+            boundary = false;
+            count += 1;
+        } else {
+            boundary = true;
+        }
+    }
+    out
+}
+
+/// Models occasionally wrap the answer in prose or quotes despite the prompt.
+fn clean_generated_name(text: &str) -> String {
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    let lower = line.to_ascii_lowercase();
+    let line = if lower.starts_with("session name:") {
+        line["session name:".len()..].trim()
+    } else if lower.starts_with("name:") {
+        line["name:".len()..].trim()
+    } else if lower.starts_with("title:") {
+        line["title:".len()..].trim()
+    } else {
+        line
+    };
+    let line = line
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch == '`' || ch == '#' || ch == '*')
+        .trim();
+    sanitize_session_name(line)
+}
+
+impl Daemon {
+    /// After the second user turn, ask the model for a short title and update
+    /// the session row. A manually renamed session is never overwritten.
+    async fn maybe_auto_name_session(&self, session_id: &str) {
+        let Ok(session) = self.require_session(session_id) else {
+            return;
+        };
+        if session.origin == SessionOrigin::Agent || !needs_auto_name(&session) {
+            return;
+        }
+        let Ok(events) = self.store.events(session_id) else {
+            return;
+        };
+        let mut user_count = 0usize;
+        let mut first_user = String::new();
+        let mut transcript = String::new();
+        for event in &events {
+            match event.kind {
+                EventKind::UserMessage => {
+                    let Ok(message) =
+                        serde_json::from_value::<UserMessagePayload>(event.payload.clone())
+                    else {
+                        continue;
+                    };
+                    user_count += 1;
+                    if user_count > 2 {
+                        break;
+                    }
+                    if first_user.is_empty() {
+                        first_user = message.text.clone();
+                    }
+                    let text = if message.text.trim().is_empty() {
+                        "[image]".to_string()
+                    } else {
+                        cap_text(message.text.trim(), 1_500)
+                    };
+                    transcript.push_str(&format!("User: {text}\n\n"));
+                }
+                EventKind::AssistantMessage => {
+                    if user_count == 0 || user_count > 2 {
+                        continue;
+                    }
+                    let Ok(message) = serde_json::from_value::<eix_core::AssistantMessagePayload>(
+                        event.payload.clone(),
+                    ) else {
+                        continue;
+                    };
+                    if message.text.trim().is_empty() {
+                        continue;
+                    }
+                    transcript.push_str(&format!(
+                        "Assistant: {}\n\n",
+                        cap_text(message.text.trim(), 1_500)
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if user_count < 2 {
+            return;
+        }
+        let fallback = sanitize_session_name(&auto_name(if first_user.trim().is_empty() {
+            "session"
+        } else {
+            &first_user
+        }));
+        let generated = self
+            .generate_session_name(&session, &transcript)
+            .await
+            .and_then(|raw| {
+                let name = clean_generated_name(&raw);
+                (!name.is_empty()).then_some(name)
+            });
+        let name = generated.unwrap_or(fallback);
+        let name = if name.is_empty() {
+            "session".to_string()
+        } else {
+            name
+        };
+        // Re-read after the provider call: a manual rename wins.
+        let Ok(latest) = self.require_session(session_id) else {
+            return;
+        };
+        if !needs_auto_name(&latest) {
+            return;
+        }
+        if let Ok(Some(renamed)) = self.store.rename_session(session_id, &name) {
+            self.emit_session(&renamed);
+        }
+    }
+
+    async fn generate_session_name(&self, session: &Session, transcript: &str) -> Option<String> {
+        let config = self.config.load_full();
+        let model = session
+            .model
+            .clone()
+            .unwrap_or_else(|| config.default_model().to_string());
+        let route = config.route(&model);
+        let messages = vec![
+            ChatMessage::system(
+                "You name coding-agent sessions. Read the conversation and reply with only a                  short session title. Requirements: 2-6 words, at most 32 characters, use the                  user's language, no spaces, no punctuation, no quotes, no markdown. Use                  CamelCase for English words.",
+            ),
+            ChatMessage::user(format!(
+                "Conversation:\n\n{}\nReturn only the session title.",
+                cap_text(transcript.trim(), 8_000)
+            )),
+        ];
+        let cancel = AtomicBool::new(false);
+        let provider = self.provider.load_full();
+        let completion = provider
+            .stream_chat(&messages, &route, &[], &cancel, |_| {})
+            .await
+            .ok()?;
+        Some(completion.text)
+    }
+}
+
 fn system_prompt(config: &Config, session: &Session, permission: PermissionLevel) -> String {
-    let mut prompt = if let Some(prompt) = &config.provider.system_prompt {
+    let mut prompt = if let Some(prompt) = &config.provider_runtime.system_prompt {
         prompt.clone()
     } else {
         let permission_note = match permission {
@@ -5916,6 +6134,22 @@ mod tests {
         let name = auto_name(&long);
         assert_eq!(name.chars().count(), 49);
         assert!(name.ends_with('…'));
+    }
+
+    #[test]
+    fn generated_names_have_no_spaces_or_punctuation() {
+        assert_eq!(sanitize_session_name("fix: auth_bug!"), "FixAuthBug");
+        assert_eq!(sanitize_session_name("  登录 / 修复  "), "登录修复");
+        assert_eq!(sanitize_session_name("Hello, world."), "HelloWorld");
+        assert_eq!(sanitize_session_name("!!!"), "");
+        assert_eq!(clean_generated_name("Session name: `FixAuth`"), "FixAuth");
+        assert_eq!(
+            clean_generated_name("Title: refactor cache"),
+            "RefactorCache"
+        );
+        let long = sanitize_session_name(&"x".repeat(80));
+        assert_eq!(long.chars().count(), 32);
+        assert!(long.chars().all(char::is_alphanumeric));
     }
 
     #[test]

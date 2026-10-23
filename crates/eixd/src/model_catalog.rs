@@ -2,7 +2,7 @@
 //!
 //! Each configured provider is queried concurrently. A provider that is
 //! offline or does not implement `GET /models` only contributes a warning; the
-//! statically configured `[provider]` / `[[models]]` entries always remain
+//! statically configured default provider / `[[models]]` entries always remain
 //! selectable.
 
 use std::time::Duration;
@@ -24,7 +24,7 @@ pub async fn fetch_all(config: &Config) -> (Vec<ModelInfo>, Vec<String>) {
         Err(err) => return (Vec::new(), vec![format!("model catalog client: {err}")]),
     };
 
-    let default_id = config.provider.model.trim().to_string();
+    let default_id = config.default_model().to_string();
     let results = join_all(config.provider_sources().into_iter().map(|source| {
         let client = client.clone();
         let default_id = default_id.clone();
@@ -94,15 +94,11 @@ fn parse_models(value: &Value, source: &ProviderSource, default_id: &str) -> Vec
             continue;
         }
         // The statically configured default already appears first in the
-        // catalog; do not duplicate it under the `default/` alias.
+        // catalog; do not duplicate it.
         if source.default && api_id == default_id {
             continue;
         }
-        let id = if source.default {
-            format!("default/{api_id}")
-        } else {
-            format!("{}/{api_id}", source.key)
-        };
+        let id = format!("{}/{api_id}", source.key);
         let name = item
             .get("name")
             .and_then(Value::as_str)
@@ -189,9 +185,9 @@ mod tests {
                 {"id": ""}
             ]
         });
-        let models = parse_models(&value, &source("default", true), "current");
+        let models = parse_models(&value, &source("openai", true), "current");
         assert_eq!(models.len(), 1);
-        assert_eq!(models[0].id, "default/openai/gpt-5");
+        assert_eq!(models[0].id, "openai/openai/gpt-5");
         assert_eq!(models[0].api_model.as_deref(), Some("openai/gpt-5"));
         assert_eq!(models[0].name, "GPT-5");
         assert_eq!(models[0].context_tokens, Some(400_000));
@@ -209,10 +205,10 @@ mod tests {
     #[test]
     fn merge_keeps_configured_rows_first() {
         let configured = vec![ModelInfo {
-            id: "default/current".into(),
+            id: "openai/current".into(),
             api_model: None,
             name: "current".into(),
-            provider: "default".into(),
+            provider: "openai".into(),
             default: true,
             variants: Vec::new(),
             input_cost: None,
@@ -221,10 +217,10 @@ mod tests {
         }];
         let fetched = vec![
             ModelInfo {
-                id: "default/current".into(),
+                id: "openai/current".into(),
                 api_model: Some("current".into()),
                 name: "duplicate".into(),
-                provider: "default".into(),
+                provider: "openai".into(),
                 default: false,
                 variants: Vec::new(),
                 input_cost: None,
@@ -245,7 +241,7 @@ mod tests {
         ];
         let merged = merge(configured, fetched);
         assert_eq!(merged.len(), 2);
-        assert_eq!(merged[0].id, "default/current");
+        assert_eq!(merged[0].id, "openai/current");
         assert_eq!(merged[1].id, "router/new");
     }
 }

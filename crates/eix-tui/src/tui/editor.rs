@@ -1837,7 +1837,6 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
 /// used to install: plain letters stay native, TUI features live behind Space.
 pub(super) fn leader_action(ch: char) -> Option<&'static str> {
     Some(match ch {
-        's' => "sessions",
         'o' => "new-pane",
         'f' => "files",
         'w' => "worktrees",
@@ -2070,8 +2069,8 @@ mod tests {
         let mut editor = editor_with("");
         let _ = key(&mut editor, KeyCode::Char(' '));
         assert_eq!(
-            key(&mut editor, KeyCode::Char('s')),
-            Outcome::Action("sessions")
+            key(&mut editor, KeyCode::Char('o')),
+            Outcome::Action("new-pane")
         );
         // In insert mode space is a literal.
         let mut editor = Editor::new();

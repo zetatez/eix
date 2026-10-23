@@ -44,8 +44,14 @@ enum Focus {
 /// Two `Esc` presses within this window leave the prompt for the transcript.
 const ESC_WINDOW: Duration = Duration::from_millis(500);
 
+/// Two `Ctrl-W` presses within this window focus the next pane.
+const CTRL_W_WINDOW: Duration = Duration::from_millis(1000);
+
 /// Background-attention alerts stay centered in the status bar this long.
 const ALERT_DISPLAY: Duration = Duration::from_secs(8);
+
+/// Keep the Vim `:` history bounded for long-running clients.
+const CMDLINE_HISTORY_LIMIT: usize = 100;
 
 /// Picker value for "no preset" (keep the terminal/default palette).
 const THEME_DEFAULT_VALUE: &str = "@default";
@@ -151,7 +157,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("todos", "", "browse the model's task list"),
         builtin("image", "<path>", "attach an image to the next prompt"),
-        builtin("theme", "", "choose a color preset with live preview"),
+        builtin("colorscheme", "", "choose a colorscheme with live preview"),
         builtin(
             "permission",
             "<level>",
@@ -550,6 +556,15 @@ impl PickerKind {
         }
     }
 
+    /// Provider used for the row's lazy right-pane preview, if any.
+    fn preview_kind(self) -> Option<&'static str> {
+        match self {
+            Self::Files => Some(eix_core::KIND_FILES),
+            Self::Sessions | Self::NewPane => Some(eix_core::KIND_SESSION_PREVIEW),
+            _ => None,
+        }
+    }
+
     fn title(self) -> &'static str {
         match self {
             Self::Sessions => "sessions — switch focused pane",
@@ -562,7 +577,7 @@ impl PickerKind {
             Self::Models => "model — search and switch",
             Self::Agents => "agents — choose the primary agent",
             Self::Skills => "skills — preview and insert",
-            Self::Themes => "themes — live preview",
+            Self::Themes => "colorschemes — live preview",
             Self::Mcp => "mcp — servers and tools",
             Self::Todos => "todos — model task list",
         }
@@ -587,6 +602,15 @@ impl PickerKind {
     }
 }
 
+#[derive(Default)]
+struct PickerPreview {
+    /// Row value the current text/loading state belongs to.
+    key: Option<String>,
+    text: Option<String>,
+    error: Option<String>,
+    loading: bool,
+}
+
 struct Picker {
     kind: PickerKind,
     query: String,
@@ -597,6 +621,10 @@ struct Picker {
     /// True until the daemon answers a data kind, so the overlay can say
     /// "loading" instead of "no matches".
     loading: bool,
+    /// Lazy right-pane content for the selected file/session.
+    preview: PickerPreview,
+    /// Request queued by the last draw; the event loop sends it after drawing.
+    preview_request: Option<(String, Option<String>, String)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -714,6 +742,129 @@ struct PendingInput {
 struct ReasonPrompt {
     session_id: String,
     text: String,
+}
+
+/// Vim-style `:` command line. The cursor is a character index so editing
+/// stays correct for CJK and other multibyte text.
+struct CmdLine {
+    /// Prompt character: `:` normally, or the normal-mode search key (`/`,
+    /// `?`, `#`) that opened this command line.
+    prompt: char,
+    text: String,
+    cursor: usize,
+}
+
+impl CmdLine {
+    fn new(prompt: char) -> Self {
+        Self {
+            prompt,
+            text: String::new(),
+            cursor: 0,
+        }
+    }
+
+    fn cursor_byte(&self) -> usize {
+        self.text
+            .char_indices()
+            .nth(self.cursor)
+            .map(|(index, _)| index)
+            .unwrap_or(self.text.len())
+    }
+
+    fn insert_char(&mut self, ch: char) {
+        let index = self.cursor_byte();
+        self.text.insert(index, ch);
+        self.cursor += 1;
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        let text: String = text
+            .chars()
+            .map(|ch| if ch.is_control() { ' ' } else { ch })
+            .collect();
+        if text.is_empty() {
+            return;
+        }
+        let index = self.cursor_byte();
+        self.text.insert_str(index, &text);
+        self.cursor += text.chars().count();
+    }
+
+    fn set_text(&mut self, text: String) {
+        self.cursor = text.chars().count();
+        self.text = text;
+    }
+
+    fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let end = self.cursor_byte();
+        let start = self.text[..end]
+            .char_indices()
+            .next_back()
+            .map(|(index, _)| index)
+            .unwrap_or(0);
+        self.text.replace_range(start..end, "");
+        self.cursor -= 1;
+    }
+
+    fn delete(&mut self) {
+        let start = self.cursor_byte();
+        let Some(ch) = self.text[start..].chars().next() else {
+            return;
+        };
+        self.text.replace_range(start..start + ch.len_utf8(), "");
+    }
+
+    fn left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    fn right(&mut self) {
+        self.cursor = (self.cursor + 1).min(self.text.chars().count());
+    }
+
+    fn home(&mut self) {
+        self.cursor = 0;
+    }
+
+    fn end(&mut self) {
+        self.cursor = self.text.chars().count();
+    }
+
+    fn kill_to_start(&mut self) {
+        let end = self.cursor_byte();
+        self.text.replace_range(..end, "");
+        self.cursor = 0;
+    }
+
+    fn kill_to_end(&mut self) {
+        let start = self.cursor_byte();
+        self.text.truncate(start);
+    }
+
+    fn kill_word(&mut self) {
+        let end = self.cursor_byte();
+        let mut start = end;
+        let before = &self.text[..end];
+        for (index, ch) in before.char_indices().rev() {
+            if ch.is_whitespace() {
+                start = index;
+            } else {
+                break;
+            }
+        }
+        let trimmed = &self.text[..start];
+        for (index, ch) in trimmed.char_indices().rev() {
+            if ch.is_whitespace() {
+                break;
+            }
+            start = index;
+        }
+        self.text.replace_range(start..end, "");
+        self.cursor = self.text[..start].chars().count();
+    }
 }
 
 /// A `/btw` side question: answered with a throwaway context so the main
@@ -875,7 +1026,20 @@ impl ProcessView {
     }
 }
 
-/// Full-screen history search, opened with `#` from the transcript.
+/// Vim-style search inside the focused session's rendered transcript.
+#[derive(Clone, Debug)]
+struct TranscriptSearch {
+    session_id: String,
+    query: String,
+    /// Absolute rendered-line indices.
+    matches: Vec<usize>,
+    /// Index into `matches`.
+    current: usize,
+    /// Search direction; used only for status text.
+    forward: bool,
+}
+
+/// Full-screen history search, opened via `:history` or the command palette.
 struct SearchView {
     query: String,
     hits: Vec<SearchHit>,
@@ -986,12 +1150,17 @@ pub struct App {
     timeline_scroll: usize,
     /// First `/delete` arms a confirmation; the second one deletes.
     pending_delete: Option<String>,
+    /// Sessions created by this client during this run. On quit, unused ones
+    /// are deleted so opening a pane without typing does not pollute history.
+    created_sessions: HashSet<String>,
     /// Images attached with `/image`, sent with the next prompt.
     pending_images: Vec<String>,
     /// Images belonging to an in-flight prompt, restored if submit fails.
     inflight_images: Vec<String>,
     /// `<Space>` was pressed in the transcript; the next key is a leader action.
     pending_leader: bool,
+    /// Status text replaced by the leader hint, restored on the next key.
+    leader_status_backup: Option<String>,
     /// Text selected with the mouse, waiting for the event loop to copy it to
     /// the system clipboard.
     pending_clipboard: Option<String>,
@@ -1013,6 +1182,8 @@ pub struct App {
     process_view: Option<ProcessView>,
     /// Full-screen history search, when open.
     search_view: Option<SearchView>,
+    /// Vim-style `/` / `?` search within the focused transcript.
+    transcript_search: Option<TranscriptSearch>,
     status: String,
     error: Option<String>,
     connected: bool,
@@ -1050,7 +1221,7 @@ pub struct App {
     inbox: Option<InboxView>,
     /// Colors used by the transcript and approval cards.
     pub(crate) theme: Theme,
-    /// `[theme]` as loaded from config, kept so `/theme` can re-derive a
+    /// `[theme]` as loaded from config, kept so `/colorscheme` can re-derive a
     /// palette from a different preset without losing explicit slot overrides.
     pub(crate) theme_config: eix_core::ThemeConfig,
     /// Palette/config captured when the theme picker opened. Esc restores it;
@@ -1061,6 +1232,9 @@ pub struct App {
     /// When the previous `Esc` reached the prompt, for the double-Esc
     /// "leave the input" gesture.
     esc_at: Option<Instant>,
+    /// When the previous normal-mode `Ctrl-W` arrived, for the double-press
+    /// "focus the next pane" gesture.
+    ctrl_w_at: Option<Instant>,
     /// Prompt history cursor: `None` is the live draft, `Some(i)` is `i`
     /// entries back from the newest submitted prompt.
     history_index: Option<usize>,
@@ -1083,6 +1257,23 @@ pub struct App {
     compat: eix_core::CompatConfig,
     /// `/` command menu was dismissed with Esc for the current draft.
     command_dismissed: bool,
+    /// Active Vim-style `:` command line; when present it owns the keyboard.
+    cmdline: Option<CmdLine>,
+    /// The dynamic command menu only appears after the user asks for it with Tab.
+    cmdline_menu_armed: bool,
+    /// Filter snapshot captured when the menu opens. Keeping it lets Tab
+    /// complete the first match without discarding the other matches, so
+    /// Ctrl-J/K can still move through the full list.
+    cmdline_menu_prefix: Option<String>,
+    /// Explicitly selected menu row; `None` means the first match.
+    cmdline_menu_cursor: Option<usize>,
+    /// Executed command-line entries, newest last.
+    cmdline_history: Vec<String>,
+    /// `Some(i)` browses history `i` entries back from newest; `None` is the
+    /// live command-line draft.
+    cmdline_history_index: Option<usize>,
+    /// Draft captured when command-line history browsing starts.
+    cmdline_history_draft: String,
     /// Streaming `/btw` side answer, shown above the prompt.
     btw: Option<BtwView>,
 }
@@ -1117,9 +1308,11 @@ impl App {
             timeline: None,
             timeline_scroll: 0,
             pending_delete: None,
+            created_sessions: HashSet::new(),
             pending_images: Vec::new(),
             inflight_images: Vec::new(),
             pending_leader: false,
+            leader_status_backup: None,
             pending_clipboard: None,
             copy_toast: None,
             pending_history: None,
@@ -1130,6 +1323,7 @@ impl App {
             ledger: None,
             process_view: None,
             search_view: None,
+            transcript_search: None,
             status: "connecting…".into(),
             error: None,
             connected: false,
@@ -1156,6 +1350,7 @@ impl App {
             theme_picker_backup: None,
             keybinds: Keybinds::default(),
             esc_at: None,
+            ctrl_w_at: None,
             history_index: None,
             history_draft: String::new(),
             queues: HashMap::new(),
@@ -1165,6 +1360,13 @@ impl App {
             commands: merge_commands(&launch_cwd, &compat),
             compat,
             command_dismissed: false,
+            cmdline: None,
+            cmdline_menu_armed: false,
+            cmdline_menu_prefix: None,
+            cmdline_menu_cursor: None,
+            cmdline_history: Vec::new(),
+            cmdline_history_index: None,
+            cmdline_history_draft: String::new(),
             btw: None,
         }
     }
@@ -1194,6 +1396,119 @@ impl App {
             && self.btw.is_none()
             && self.error.is_none()
             && self.reason_prompt.is_none()
+    }
+
+    /// Search the focused session transcript, Vim style. `/` starts forward,
+    /// `?` and `#` start backward. An empty query repeats the last search.
+    fn search_transcript(&mut self, query: &str, forward: bool) {
+        let query = query.trim();
+        let query = if query.is_empty() {
+            self.transcript_search
+                .as_ref()
+                .map(|search| search.query.clone())
+                .unwrap_or_default()
+        } else {
+            query.to_string()
+        };
+        if query.is_empty() {
+            self.status = "no previous search".into();
+            return;
+        }
+        let Some(view) = self.focused_view() else {
+            self.status = "no session to search".into();
+            return;
+        };
+        let session_id = view.session.id.clone();
+        let needle = query.to_lowercase();
+        let matches: Vec<usize> = view
+            .text_lines
+            .iter()
+            .enumerate()
+            .filter_map(|(line, text)| text.to_lowercase().contains(&needle).then_some(line))
+            .collect();
+        if matches.is_empty() {
+            self.transcript_search = Some(TranscriptSearch {
+                session_id,
+                query,
+                matches,
+                current: 0,
+                forward,
+            });
+            self.status = "no matches".into();
+            return;
+        }
+        let start = view.scroll;
+        let current = if forward {
+            matches.iter().position(|line| *line >= start).unwrap_or(0)
+        } else {
+            matches
+                .iter()
+                .rposition(|line| *line < start)
+                .unwrap_or(matches.len() - 1)
+        };
+        let line = matches[current];
+        let total = matches.len();
+        let query = query.clone();
+        self.transcript_search = Some(TranscriptSearch {
+            session_id,
+            query: query.clone(),
+            matches,
+            current,
+            forward,
+        });
+        if let Some(view) = self.focused_view_mut() {
+            view.follow = false;
+            view.scroll = line.saturating_sub(2);
+        }
+        self.status = format!(
+            "{}{} · {}/{}",
+            if forward { "/" } else { "?" },
+            query,
+            current + 1,
+            total
+        );
+    }
+
+    /// Move to the next/previous match from the current in-session search.
+    fn search_transcript_next(&mut self, reverse: bool) {
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            return;
+        };
+        let Some(search) = self.transcript_search.as_mut() else {
+            return;
+        };
+        if search.session_id != session_id || search.matches.is_empty() {
+            return;
+        }
+        let len = search.matches.len();
+        search.current = if reverse {
+            (search.current + len - 1) % len
+        } else {
+            (search.current + 1) % len
+        };
+        let line = search.matches[search.current];
+        let current = search.current + 1;
+        let query = search.query.clone();
+        let forward = search.forward;
+        if let Some(view) = self.focused_view_mut() {
+            view.follow = false;
+            view.scroll = line.saturating_sub(2);
+        }
+        self.status = format!(
+            "{}{} · {}/{}",
+            if forward { "/" } else { "?" },
+            query,
+            current,
+            len
+        );
+    }
+
+    /// Open the cross-session history search. Normal-mode `/`, `?` and `#`
+    /// only open the command line; use `:history` or the command palette here.
+    fn open_history_search(&mut self) {
+        self.pending_leader = false;
+        self.search_view = Some(SearchView::new());
+        self.status = "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
     }
 
     /// Open the help overlay with a fresh filter and selection.
@@ -1329,6 +1644,57 @@ impl App {
         self.pending_history.take()
     }
 
+    /// A lazy picker preview request produced by the last draw.
+    pub fn take_picker_preview_request(&mut self) -> Option<(String, Option<String>, String)> {
+        self.picker.as_mut()?.preview_request.take()
+    }
+
+    /// Whether a session created by this client still has local work that must
+    /// not be raced by a cleanup delete.
+    fn created_session_is_in_use(&self, session_id: &str) -> bool {
+        let in_flight = self.submitting_session.as_deref() == Some(session_id)
+            || self
+                .queued_inflight
+                .as_ref()
+                .is_some_and(|(id, _)| id == session_id);
+        let queued = self
+            .queues
+            .get(session_id)
+            .is_some_and(|queue| !queue.is_empty());
+        let loading_draft = self.draft_loading.as_deref() == Some(session_id);
+        let local_draft = !self.input.text().is_empty()
+            && (self.input_session.as_deref() == Some(session_id)
+                || self
+                    .focused_view()
+                    .is_some_and(|view| view.session.id == session_id));
+        in_flight || queued || loading_draft || local_draft
+    }
+
+    /// Drop sessions created by this client that were never used. The daemon
+    /// re-checks the event log and draft, so an in-flight prompt or a saved
+    /// draft can never be deleted by this cleanup.
+    pub fn cleanup_empty_sessions(&mut self, tx: &UnboundedSender<Command>) {
+        let session_ids = std::mem::take(&mut self.created_sessions);
+        for session_id in session_ids {
+            if self.created_session_is_in_use(&session_id) {
+                continue;
+            }
+            let _ = tx.send(Command::DeleteSessionIfEmpty { session_id });
+        }
+    }
+
+    /// Ask the daemon to discard a created session after its pane closes. It
+    /// stays in `created_sessions` until `session.deleted` arrives, so a failed
+    /// or deferred check can be retried when the TUI quits.
+    fn cleanup_created_session(&mut self, session_id: &str, tx: &UnboundedSender<Command>) {
+        if self.created_sessions.contains(session_id) && !self.created_session_is_in_use(session_id)
+        {
+            let _ = tx.send(Command::DeleteSessionIfEmpty {
+                session_id: session_id.to_string(),
+            });
+        }
+    }
+
     pub fn tick(&mut self, tx: &UnboundedSender<Command>) {
         self.tick = self.tick.wrapping_add(1);
         self.refresh_git_branch();
@@ -1415,12 +1781,40 @@ impl App {
         }
     }
 
+    /// Explicit `:w`: persist the prompt draft without switching panes or
+    /// clearing the buffer.
+    fn save_draft_now(&mut self, tx: &UnboundedSender<Command>) {
+        if self.draft_loading.is_some() {
+            self.status = "draft still loading…".into();
+            return;
+        }
+        let Some(session_id) = self
+            .input_session
+            .clone()
+            .or_else(|| self.focused_session_id())
+        else {
+            self.status = "no session".into();
+            return;
+        };
+        let text = self.current_draft_text();
+        self.last_saved_draft = text.clone();
+        let _ = tx.send(Command::DraftSet { session_id, text });
+        self.status = "draft saved".into();
+    }
+
     /// Current prompt contents.
     fn current_draft_text(&self) -> String {
         self.input.text()
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        if self.cmdline.is_some() {
+            if let Some(cmdline) = self.cmdline.as_mut() {
+                cmdline.insert_str(text);
+            }
+            self.reset_cmdline_menu_selection();
+            return;
+        }
         self.focus = Focus::Input;
         // Terminal drag-and-drop usually arrives as a bracketed paste of one
         // or more paths. Attach them instead of dumping quoted paths into the
@@ -1448,6 +1842,8 @@ impl App {
     /// it on release. A click without a drag still toggles the block under the
     /// cursor. The wheel scrolls the pane under the cursor.
     pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+        self.ctrl_w_at = None;
+        self.restore_leader_status();
         self.pending_leader = false;
         let (x, y) = (mouse.column, mouse.row);
         let pane = self.pane_areas.iter().position(|rect| {
@@ -1696,6 +2092,9 @@ impl App {
             Event::Created(session) => {
                 self.creating = false;
                 let id = session.id.clone();
+                if session.worktree.is_none() {
+                    self.created_sessions.insert(id.clone());
+                }
                 self.upsert_session(session, true);
                 self.selected = self
                     .sessions
@@ -1799,6 +2198,22 @@ impl App {
                     self.status = format!("{count} {kind} row(s)");
                 }
             }
+            Event::PickerPreview {
+                kind,
+                value,
+                text,
+                error,
+            } => {
+                if let Some(picker) = &mut self.picker {
+                    if picker.preview.key.as_deref() == Some(value.as_str())
+                        && picker.kind.preview_kind() == Some(kind.as_str())
+                    {
+                        picker.preview.text = text;
+                        picker.preview.error = error;
+                        picker.preview.loading = false;
+                    }
+                }
+            }
             Event::Models { models, warnings } => {
                 let count = models.len();
                 self.models = models;
@@ -1873,6 +2288,7 @@ impl App {
             }
             Event::Archived(session) => {
                 let id = session.id.clone();
+                self.created_sessions.remove(&id);
                 self.sessions.retain(|existing| existing.id != id);
                 self.views.retain(|view| view.session.id != id);
                 if self.focused >= self.views.len() {
@@ -1882,6 +2298,7 @@ impl App {
                 self.status = format!("archived {}", session.name);
             }
             Event::Deleted(id) => {
+                self.created_sessions.remove(&id);
                 self.sessions.retain(|existing| existing.id != id);
                 self.views.retain(|view| view.session.id != id);
                 if self.focused >= self.views.len() {
@@ -1890,7 +2307,33 @@ impl App {
                 self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
                 self.status = "session deleted".into();
             }
-            Event::ShellRan { ok, output } => {
+            Event::ShellRan {
+                ok,
+                output,
+                insert_output,
+            } => {
+                if insert_output {
+                    let text = output.trim_end_matches(['\r', '\n']);
+                    if text.is_empty() {
+                        self.status = if ok {
+                            "shell output empty".into()
+                        } else {
+                            "shell failed with no output".into()
+                        };
+                    } else {
+                        self.focus = Focus::Input;
+                        self.pending_leader = false;
+                        self.error = None;
+                        let prefix = if self.input.is_empty() { "" } else { "\n" };
+                        self.input.insert_text(&format!("{prefix}{text}"));
+                        self.status = format!(
+                            "read {} line(s) from shell{}",
+                            text.lines().count(),
+                            if ok { "" } else { " (failed)" }
+                        );
+                    }
+                    return;
+                }
                 let first = output.lines().next().unwrap_or_default();
                 self.status = if first.is_empty() {
                     if ok {
@@ -2263,6 +2706,7 @@ impl App {
     }
 
     fn submitted(&mut self, submitted: SubmitResult) {
+        self.created_sessions.remove(&submitted.session.id);
         self.inflight_images.clear();
         self.submitting = false;
         self.submitting_session = None;
@@ -2365,6 +2809,9 @@ impl App {
             "session.event" => {
                 if let Ok(event) = serde_json::from_value::<SessionEvent>(notification.params) {
                     let id = event.session_id.clone();
+                    // Any persisted event means the session was used, even if
+                    // it is not currently open in a pane.
+                    self.created_sessions.remove(&id);
                     let relevant = matches!(
                         event.kind,
                         EventKind::ToolResult
@@ -2835,9 +3282,30 @@ impl App {
         }
     }
 
+    /// Hide the `<Space>` leader hint as soon as the next key arrives. The
+    /// action that consumes the key can still publish its own status.
+    fn restore_leader_status(&mut self) {
+        let Some(status) = self.leader_status_backup.take() else {
+            return;
+        };
+        if self.status.starts_with("leader:") {
+            self.status = status;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
         if key.kind == KeyEventKind::Release {
             return;
+        }
+        // Any other key breaks the double-Ctrl-W gesture, so a later Ctrl-W
+        // cannot accidentally pair with one pressed earlier.
+        if !(key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W')))
+        {
+            self.ctrl_w_at = None;
+        }
+        if self.pending_leader {
+            self.restore_leader_status();
         }
         // Ctrl-C / Ctrl-D quit the TUI from every mode, including insert and
         // any open overlay. Save the draft first so quitting never loses it.
@@ -2860,6 +3328,12 @@ impl App {
             ) {
                 self.error = None;
             }
+            return;
+        }
+        // The `:` command line is modal: every key edits it or submits/cancels
+        // it until it closes.
+        if self.cmdline.is_some() {
+            self.handle_cmdline_key(key, tx);
             return;
         }
         if matches!(key.code, KeyCode::F(1)) {
@@ -3038,6 +3512,23 @@ impl App {
             return;
         }
 
+        // Vim-style command line: `:` in normal mode, or from the transcript.
+        // Insert/visual modes keep typing a literal colon.
+        if key.code == KeyCode::Char(':')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && self.overlay_closed()
+            && !self.pending_leader
+            && self.focused_approval().is_none()
+            && self.focused_input().is_none()
+            && (self.focus == Focus::Transcript
+                || (self.input.mode() == Mode::Normal && self.input.normal_idle()))
+        {
+            self.open_cmdline();
+            return;
+        }
+
         if self.focus == Focus::Input {
             self.handle_input_key(key, tx);
         } else {
@@ -3069,7 +3560,8 @@ impl App {
             // under it, and never let the editor start a second one either.
             if self.focused_approval().is_none() && self.focused_input().is_none() {
                 self.pending_leader = true;
-                self.status = "leader: s/f/w/b · n new · o pane · v/t/r/l layout · R approvals · C ledger · c close · a commands · i input · Z quit · Esc cancel"
+                self.leader_status_backup = Some(std::mem::take(&mut self.status));
+                self.status = "leader: f/w/b · n new · o pane · v/t/r/l layout · R approvals · C ledger · c close · a commands · i input · Z quit · Esc cancel"
                     .into();
             }
             return true;
@@ -3080,8 +3572,29 @@ impl App {
                 return true;
             }
         }
+        // In transcript and prompt normal mode, Enter makes the focused pane
+        // the first one. Insert mode keeps using Enter to submit.
+        if key.code == KeyCode::Enter
+            && key.modifiers.is_empty()
+            && self.focused_approval().is_none()
+            && self.focused_input().is_none()
+        {
+            self.promote_focused_pane();
+            return true;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
+                KeyCode::Char('w') | KeyCode::Char('W') => {
+                    let now = Instant::now();
+                    let double = self
+                        .ctrl_w_at
+                        .is_some_and(|last| now.duration_since(last) < CTRL_W_WINDOW);
+                    self.ctrl_w_at = (!double).then_some(now);
+                    if double {
+                        self.cycle_pane(1);
+                    }
+                    return true;
+                }
                 KeyCode::Char('p') | KeyCode::Char('P') => {
                     self.open_picker(PickerKind::Commands, tx);
                     return true;
@@ -3093,15 +3606,18 @@ impl App {
                 _ => {}
             }
         }
+        if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && self.transcript_search.is_some()
+        {
+            self.search_transcript_next(matches!(key.code, KeyCode::Char('N')));
+            return true;
+        }
         match key.code {
-            KeyCode::Char('?') => {
-                self.open_help();
-                true
-            }
-            KeyCode::Char('#') => {
-                self.search_view = Some(SearchView::new());
-                self.status =
-                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
+            KeyCode::Char(ch @ ('/' | '?' | '#')) => {
+                self.open_cmdline_with(ch);
                 true
             }
             KeyCode::PageDown => {
@@ -3218,6 +3734,14 @@ impl App {
         // running turn; when nothing is running they hand the keyboard back to
         // the transcript.
         if matches!(key.code, KeyCode::Esc) {
+            // A running `/` or `?` search owns a single Esc: drop its
+            // highlights before the double-Esc focus gesture can fire.
+            if self.input.mode() == Mode::Normal && self.transcript_search.is_some() {
+                self.transcript_search = None;
+                self.esc_at = None;
+                self.status = "search cleared".into();
+                return;
+            }
             let editing = self.input.mode() != Mode::Normal;
             let _ = self.input.handle_key(key);
             if editing {
@@ -3312,6 +3836,430 @@ impl App {
         };
         self.input.set_text(&text);
         self.command_cursor = 0;
+    }
+
+    /// Whether the `:` command line should show its dynamic command list.
+    fn cmdline_menu_open(&self) -> bool {
+        self.cmdline_menu_armed
+            && self.cmdline.as_ref().is_some_and(|cmdline| {
+                cmdline.prompt == ':' && !cmdline.text.contains(char::is_whitespace)
+            })
+    }
+
+    fn cmdline_matches(&self) -> Vec<&CommandSpec> {
+        let Some(cmdline) = self.cmdline.as_ref() else {
+            return Vec::new();
+        };
+        if cmdline.prompt != ':' {
+            return Vec::new();
+        }
+        let text = self.cmdline_menu_prefix.as_deref().unwrap_or(&cmdline.text);
+        if text.contains(char::is_whitespace) {
+            return Vec::new();
+        }
+        let prefix = text.trim_start_matches(':').to_ascii_lowercase();
+        self.commands
+            .iter()
+            .filter(|spec| spec.name.to_ascii_lowercase().starts_with(&prefix))
+            .collect()
+    }
+
+    fn selected_cmdline_match(&self) -> Option<&CommandSpec> {
+        let matches = self.cmdline_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        let cursor = self.cmdline_menu_cursor.unwrap_or(0).min(matches.len() - 1);
+        matches.get(cursor).copied()
+    }
+
+    fn move_cmdline_menu(&mut self, delta: isize) -> bool {
+        let len = self.cmdline_matches().len();
+        if len == 0 {
+            return false;
+        }
+        if len == 1 {
+            return true;
+        }
+        let current = self.cmdline_menu_cursor.unwrap_or(0).min(len - 1);
+        self.cmdline_menu_cursor =
+            Some((current as isize + delta).rem_euclid(len as isize) as usize);
+        true
+    }
+
+    /// Drop the menu's filter snapshot and explicit row. Called whenever the
+    /// command line text changes so the menu filters from the new input.
+    fn reset_cmdline_menu_selection(&mut self) {
+        self.cmdline_menu_prefix = None;
+        self.cmdline_menu_cursor = None;
+    }
+
+    fn cmdline_name_exists(&self, name: &str) -> bool {
+        self.commands.iter().any(|spec| spec.name == name)
+            || ["q", "qa", "qall", "quitall", "w", "wq", "x"].contains(&name)
+    }
+
+    fn open_cmdline(&mut self) {
+        self.open_cmdline_with(':');
+    }
+
+    fn open_cmdline_with(&mut self, prompt: char) {
+        self.cmdline = Some(CmdLine::new(prompt));
+        self.cmdline_menu_armed = false;
+        self.cmdline_menu_prefix = None;
+        self.cmdline_menu_cursor = None;
+        self.cmdline_history_index = None;
+        self.cmdline_history_draft.clear();
+        self.pending_leader = false;
+        self.esc_at = None;
+        self.command_dismissed = true;
+    }
+
+    fn close_cmdline(&mut self) {
+        self.cmdline = None;
+        self.cmdline_menu_armed = false;
+        self.cmdline_menu_prefix = None;
+        self.cmdline_menu_cursor = None;
+        self.cmdline_history_index = None;
+        self.cmdline_history_draft.clear();
+    }
+
+    fn handle_cmdline_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                // The menu is a transient overlay: Esc dismisses it first and
+                // leaves the command-line text untouched. A second Esc closes
+                // the command line itself.
+                if self.cmdline_menu_open() && !self.cmdline_matches().is_empty() {
+                    self.cmdline_menu_armed = false;
+                    self.reset_cmdline_menu_selection();
+                } else {
+                    self.close_cmdline();
+                }
+            }
+            // Terminals without kitty keyboard disambiguation report Ctrl-J
+            // as Ctrl-Enter, so accept both spellings.
+            KeyCode::Enter if ctrl => {
+                if self.cmdline_menu_open() {
+                    self.move_cmdline_menu(1);
+                } else {
+                    self.submit_cmdline(tx);
+                }
+            }
+            KeyCode::Enter => self.submit_cmdline(tx),
+            KeyCode::Backspace => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.backspace();
+                }
+                self.reset_cmdline_menu_selection();
+            }
+            KeyCode::Delete => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.delete();
+                }
+                self.reset_cmdline_menu_selection();
+            }
+            KeyCode::Left => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.end();
+                }
+            }
+            KeyCode::Up => self.cmdline_history_prev(),
+            KeyCode::Down => self.cmdline_history_next(),
+            KeyCode::Tab => {
+                // Only the `:` command line has a command menu. `/`, `?` and
+                // `#` are transcript searches, so Tab must not complete command
+                // names into their query.
+                if self
+                    .cmdline
+                    .as_ref()
+                    .is_some_and(|cmdline| cmdline.prompt == ':')
+                {
+                    self.cmdline_menu_armed = true;
+                    if self.cmdline_menu_prefix.is_none() {
+                        if let Some(text) =
+                            self.cmdline.as_ref().map(|cmdline| cmdline.text.clone())
+                        {
+                            if !text.contains(char::is_whitespace) {
+                                self.cmdline_menu_prefix = Some(text);
+                                self.cmdline_menu_cursor = None;
+                            }
+                        }
+                    }
+                    self.complete_cmdline();
+                }
+            }
+            KeyCode::Char('j') if ctrl => {
+                if self.cmdline_menu_open() {
+                    self.move_cmdline_menu(1);
+                }
+            }
+            KeyCode::Char('k') if ctrl => {
+                if !(self.cmdline_menu_open() && self.move_cmdline_menu(-1)) {
+                    if let Some(cmdline) = self.cmdline.as_mut() {
+                        cmdline.kill_to_end();
+                    }
+                    self.reset_cmdline_menu_selection();
+                }
+            }
+            KeyCode::Char('p') if ctrl => {
+                if !(self.cmdline_menu_open() && self.move_cmdline_menu(-1)) {
+                    self.cmdline_history_prev();
+                }
+            }
+            KeyCode::Char('n') if ctrl => {
+                if !(self.cmdline_menu_open() && self.move_cmdline_menu(1)) {
+                    self.cmdline_history_next();
+                }
+            }
+            KeyCode::Char('b') if ctrl => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.left();
+                }
+            }
+            KeyCode::Char('f') if ctrl => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.right();
+                }
+            }
+            KeyCode::Char('h') if ctrl => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.backspace();
+                }
+                self.reset_cmdline_menu_selection();
+            }
+            KeyCode::Char('a') if ctrl => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.home();
+                }
+            }
+            KeyCode::Char('e') if ctrl => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.end();
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.kill_to_start();
+                }
+                self.reset_cmdline_menu_selection();
+            }
+            KeyCode::Char('w') if ctrl => {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.kill_word();
+                }
+                self.reset_cmdline_menu_selection();
+            }
+            KeyCode::Char(ch)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                if let Some(cmdline) = self.cmdline.as_mut() {
+                    cmdline.insert_char(ch);
+                }
+                self.reset_cmdline_menu_selection();
+            }
+            _ => {}
+        }
+    }
+
+    fn cmdline_history_prev(&mut self) {
+        if self.cmdline_history.is_empty() {
+            return;
+        }
+        let current = self
+            .cmdline
+            .as_ref()
+            .map(|cmdline| cmdline.text.clone())
+            .unwrap_or_default();
+        let next = match self.cmdline_history_index {
+            None => {
+                self.cmdline_history_draft = current;
+                0
+            }
+            Some(index) => (index + 1).min(self.cmdline_history.len() - 1),
+        };
+        self.cmdline_history_index = Some(next);
+        let text = self.cmdline_history[self.cmdline_history.len() - 1 - next].clone();
+        if let Some(cmdline) = self.cmdline.as_mut() {
+            cmdline.set_text(text);
+        }
+        self.reset_cmdline_menu_selection();
+    }
+
+    fn cmdline_history_next(&mut self) {
+        let Some(index) = self.cmdline_history_index else {
+            return;
+        };
+        if index == 0 {
+            self.cmdline_history_index = None;
+            let draft = std::mem::take(&mut self.cmdline_history_draft);
+            if let Some(cmdline) = self.cmdline.as_mut() {
+                cmdline.set_text(draft);
+            }
+            self.reset_cmdline_menu_selection();
+            return;
+        }
+        let next = index - 1;
+        self.cmdline_history_index = Some(next);
+        let text = self.cmdline_history[self.cmdline_history.len() - 1 - next].clone();
+        if let Some(cmdline) = self.cmdline.as_mut() {
+            cmdline.set_text(text);
+        }
+        self.reset_cmdline_menu_selection();
+    }
+
+    fn complete_cmdline(&mut self) {
+        let Some(name) = self.selected_cmdline_match().map(|spec| spec.name.clone()) else {
+            return;
+        };
+        if self.cmdline_menu_cursor.is_none() {
+            let Some(cmdline) = self.cmdline.as_ref() else {
+                return;
+            };
+            let text = cmdline.text.trim_start_matches(':');
+            // Preserve the old Tab behavior: an empty line stays empty, and an
+            // already-complete command (including `:q` aliases) is not
+            // rewritten to a different command.
+            if text.is_empty() || self.cmdline_name_exists(text) {
+                return;
+            }
+        }
+        if let Some(cmdline) = self.cmdline.as_mut() {
+            cmdline.set_text(name);
+        }
+    }
+
+    fn remember_cmdline(&mut self, text: &str) {
+        if self.cmdline_history.last().is_some_and(|last| last == text) {
+            return;
+        }
+        self.cmdline_history.push(text.to_string());
+        if self.cmdline_history.len() > CMDLINE_HISTORY_LIMIT {
+            self.cmdline_history.remove(0);
+        }
+    }
+
+    fn run_cmdline_shell(
+        &mut self,
+        command: &str,
+        insert_output: bool,
+        tx: &UnboundedSender<Command>,
+    ) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session yet".into();
+            return;
+        };
+        let command = command.trim();
+        if command.is_empty() {
+            self.status = if insert_output {
+                "usage: :r!<shell command>".into()
+            } else {
+                "usage: :!<shell command>".into()
+            };
+            return;
+        }
+        self.error = None;
+        self.pending_leader = false;
+        let _ = tx.send(Command::RunShell {
+            session_id,
+            command: command.to_string(),
+            insert_output,
+        });
+        self.status = if insert_output {
+            "reading shell output…".into()
+        } else {
+            "running shell command…".into()
+        };
+    }
+
+    fn submit_cmdline(&mut self, tx: &UnboundedSender<Command>) {
+        // Ctrl-J/K (and Ctrl-N/P) move a separate menu cursor; accept that
+        // row without rewriting the command line on every keypress.
+        let selected = if self.cmdline_menu_cursor.is_some() && self.cmdline_menu_open() {
+            self.selected_cmdline_match().map(|spec| spec.name.clone())
+        } else {
+            None
+        };
+        let Some(cmdline) = self.cmdline.take() else {
+            return;
+        };
+        self.cmdline_menu_armed = false;
+        self.cmdline_menu_prefix = None;
+        self.cmdline_menu_cursor = None;
+        self.cmdline_history_index = None;
+        self.cmdline_history_draft.clear();
+        let prompt = cmdline.prompt;
+        let raw = selected.unwrap_or_else(|| cmdline.text.trim().to_string());
+        if matches!(prompt, '/' | '?' | '#') {
+            self.search_transcript(&raw, prompt == '/');
+            return;
+        }
+        if raw.is_empty() {
+            return;
+        }
+        self.remember_cmdline(&raw);
+        let raw = raw.trim_start_matches(':').trim();
+        // Vim-style shell commands. `:!cmd` executes directly; `:r!cmd` (and
+        // the spaced `:r !cmd`) inserts the command's output into the prompt.
+        if let Some(command) = raw.strip_prefix('!') {
+            self.run_cmdline_shell(command, false, tx);
+            return;
+        }
+        if let Some(command) = raw.strip_prefix("r!").or_else(|| raw.strip_prefix("r !")) {
+            self.run_cmdline_shell(command, true, tx);
+            return;
+        }
+        let (name, args) = raw
+            .split_once(char::is_whitespace)
+            .map(|(name, args)| (name, args.trim()))
+            .unwrap_or((raw, ""));
+        let name = name.trim().trim_start_matches(':');
+        if name.is_empty() {
+            return;
+        }
+        // Vim-style aliases. eix auto-saves drafts, so `:w` is just an
+        // explicit sync and `:wq`/`:x` close the pane after saving.
+        let base = name.strip_suffix('!').unwrap_or(name);
+        match base {
+            "q" => {
+                self.handle_command_text("/close", tx, false);
+            }
+            "qa" | "qall" | "quitall" => {
+                self.handle_command_text("/quit", tx, false);
+            }
+            "w" => {
+                self.save_draft_now(tx);
+            }
+            "wq" | "x" => {
+                self.handle_command_text("/close", tx, false);
+            }
+            _ => {
+                let line = if args.is_empty() {
+                    format!("/{name}")
+                } else {
+                    format!("/{name} {args}")
+                };
+                self.handle_command_text(&line, tx, false);
+            }
+        }
     }
 
     /// Apply a `delta` step to prompt-history browsing. Negative is older.
@@ -3513,6 +4461,12 @@ impl App {
         if self.handle_shared_normal_key(key, tx) {
             return;
         }
+        if key.code == KeyCode::Esc && self.transcript_search.is_some() {
+            self.transcript_search = None;
+            self.esc_at = None;
+            self.status = "search cleared".into();
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
             self.open_picker(PickerKind::Sessions, tx);
             return;
@@ -3534,7 +4488,8 @@ impl App {
             KeyCode::Char('>') => self.cycle_pane(1),
             // `i` is the one bare letter that stays: focusing the prompt is
             // the normal way out of the transcript, like vim insert mode.
-            KeyCode::Char('i') | KeyCode::Enter => self.focus_input(),
+            // Enter (pane promotion) is shared with prompt normal mode.
+            KeyCode::Char('i') => self.focus_input(),
             KeyCode::Tab => self.toggle_agent_mode(tx),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_focused(-1),
@@ -3573,11 +4528,7 @@ impl App {
             KeyAction::Ledger => self.open_ledger(tx),
             KeyAction::Processes => self.open_processes(tx),
             KeyAction::Inbox => self.open_inbox(),
-            KeyAction::Search => {
-                self.search_view = Some(SearchView::new());
-                self.status =
-                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
-            }
+            KeyAction::Search => self.open_history_search(),
             KeyAction::Fork => self.fork_focused(tx, None),
             KeyAction::Attention => self.focus_next_attention(),
             KeyAction::Cancel => self.cancel(tx),
@@ -4069,9 +5020,7 @@ impl App {
             KeyCode::Enter => self.picker_enter(kind, tx),
             KeyCode::Char('#') if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) => {
                 self.picker = None;
-                self.search_view = Some(SearchView::new());
-                self.status =
-                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
+                self.open_history_search();
             }
             KeyCode::Backspace => {
                 if let Some(picker) = &mut self.picker {
@@ -4144,7 +5093,7 @@ impl App {
         if let Some((config, theme)) = self.theme_picker_backup.take() {
             self.theme_config = config;
             self.theme = theme;
-            self.status = "theme unchanged".into();
+            self.status = "colorscheme unchanged".into();
         }
         self.picker = None;
     }
@@ -4154,11 +5103,11 @@ impl App {
         self.theme_config.preset = (value != THEME_DEFAULT_VALUE).then(|| value.to_string());
         self.theme = Theme::from_config(&self.theme_config);
         self.status = if value == THEME_DEFAULT_VALUE {
-            "theme → default".into()
+            "colorscheme → default".into()
         } else if let Some(preset) = theme_preset(value) {
-            format!("theme → {} ({})", preset.name, preset.description)
+            format!("colorscheme → {} ({})", preset.name, preset.description)
         } else {
-            format!("theme → {value}")
+            format!("colorscheme → {value}")
         };
         self.picker = None;
     }
@@ -4308,6 +5257,8 @@ impl App {
             selected: 0,
             items: Vec::new(),
             loading: false,
+            preview: PickerPreview::default(),
+            preview_request: None,
         };
         if let Some(provider) = kind.data_kind() {
             let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
@@ -4362,7 +5313,7 @@ impl App {
                 .position(|item| item.value == current)
                 .unwrap_or(0);
             self.theme_picker_backup = Some((self.theme_config.clone(), self.theme));
-            self.status = "theme preview · Enter apply · Esc cancel".into();
+            self.status = "colorscheme preview · Enter apply · Esc cancel".into();
         } else {
             picker.selected = self.selected.min(self.sessions.len().saturating_sub(1));
         }
@@ -4384,13 +5335,9 @@ impl App {
             "agents" => self.open_picker(PickerKind::Agents, tx),
             "toggle-agent" => self.toggle_agent_mode(tx),
             "skills" => self.open_picker(PickerKind::Skills, tx),
-            "theme" => self.open_picker(PickerKind::Themes, tx),
+            "colorscheme" => self.open_picker(PickerKind::Themes, tx),
             "context" => self.open_picker(PickerKind::Context, tx),
-            "history" => {
-                self.search_view = Some(SearchView::new());
-                self.status =
-                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
-            }
+            "history" => self.open_history_search(),
             "processes" => self.open_processes(tx),
             "approvals" => self.open_inbox(),
             "mcp" => self.open_picker(PickerKind::Mcp, tx),
@@ -4402,7 +5349,15 @@ impl App {
             "cancel" => self.cancel(tx),
             "attention" => self.focus_next_attention(),
             "input" => self.focus_input(),
-            "close-pane" => self.close_focused_pane(),
+            "close-pane" => {
+                // Persist the prompt without switching panes; closing an
+                // unsaved draft would otherwise make the cleanup check think
+                // the session is unused.
+                self.save_draft_now(tx);
+                if let Some(session_id) = self.close_focused_pane() {
+                    self.cleanup_created_session(&session_id, tx);
+                }
+            }
             "pane-prev" => self.cycle_pane(-1),
             "pane-next" => self.cycle_pane(1),
             "layout-horizontal" => self.set_layout(PaneLayout::Horizontal),
@@ -4538,6 +5493,7 @@ impl App {
             let _ = tx.send(Command::RunShell {
                 session_id: session_id.clone(),
                 command: command.to_string(),
+                insert_output: false,
             });
             let _ = tx.send(Command::DraftSet {
                 session_id,
@@ -4659,6 +5615,17 @@ impl App {
     /// Prompt commands are typed as the whole message (`/name args`). They never
     /// reach the model.
     fn handle_prompt_command(&mut self, text: &str, tx: &UnboundedSender<Command>) -> bool {
+        self.handle_command_text(text, tx, true)
+    }
+
+    /// Run a `/command` line. `clear_prompt` is false for the `:` command
+    /// line, where the prompt buffer is an unrelated draft that must survive.
+    fn handle_command_text(
+        &mut self,
+        text: &str,
+        tx: &UnboundedSender<Command>,
+        clear_prompt: bool,
+    ) -> bool {
         let trimmed = text.trim();
         let (name, args) = match trimmed.split_once(char::is_whitespace) {
             Some((name, args)) => (name, args.trim()),
@@ -4672,27 +5639,39 @@ impl App {
             self.error = Some(format!("unknown command /{name} · /help lists them"));
             return true;
         };
-        // Commands are not drafts: drop the typed line (and its saved draft)
-        // before dispatching. `/init` installs its own prompt afterwards.
-        self.input.clear();
-        self.last_saved_draft.clear();
-        self.reset_history();
-        // `/exit`, `/quit` and `/close` save the (now empty) draft themselves.
-        if !matches!(name, "exit" | "quit" | "close") {
-            if let Some(session_id) = self.focused_session_id() {
-                let _ = tx.send(Command::DraftSet {
-                    session_id,
-                    text: String::new(),
-                });
+        if clear_prompt {
+            // Commands are not drafts: drop the typed line (and its saved
+            // draft) before dispatching. `/init` installs its own prompt
+            // afterwards. The `:` command line leaves the prompt draft alone.
+            self.input.clear();
+            self.last_saved_draft.clear();
+            self.reset_history();
+            // `/exit`, `/quit` and `/close` save the (now empty) draft
+            // themselves.
+            if !matches!(name, "exit" | "quit" | "close") {
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::DraftSet {
+                        session_id,
+                        text: String::new(),
+                    });
+                }
             }
         }
         match name {
             "exit" | "quit" => {
-                self.exit_session(tx);
+                if clear_prompt {
+                    self.exit_session(tx);
+                } else {
+                    self.quit_preserving_draft(tx);
+                }
                 true
             }
             "close" => {
-                self.close_session(tx);
+                if clear_prompt {
+                    self.close_session(tx);
+                } else {
+                    self.close_preserving_draft(tx);
+                }
                 true
             }
             "help" => {
@@ -4740,9 +5719,7 @@ impl App {
                 true
             }
             "history" => {
-                self.search_view = Some(SearchView::new());
-                self.status =
-                    "search history · Enter runs · ↑/↓ or C-j/C-k select · Esc closes".into();
+                self.open_history_search();
                 true
             }
             "processes" => {
@@ -4822,11 +5799,11 @@ impl App {
                 self.status = "reloading config…".into();
                 true
             }
-            "theme" => {
+            "colorscheme" => {
                 if args.is_empty() {
                     self.open_picker(PickerKind::Themes, tx);
                 } else {
-                    self.error = Some("usage: /theme (opens the theme picker)".into());
+                    self.error = Some("usage: /colorscheme (opens the colorscheme picker)".into());
                 }
                 true
             }
@@ -4924,6 +5901,7 @@ impl App {
                     if let Some(skill) = eix_core::find_skill(&cwd, name, &self.compat) {
                         self.input
                             .set_text(&eix_core::expand_command(&skill.body, arguments));
+                        self.input.enter_insert();
                         self.focus = Focus::Input;
                         self.status = format!("inserted skill {}", skill.name);
                     } else {
@@ -5091,6 +6069,7 @@ actually work here, code style conventions, and any non-obvious constraints futu
 contributors must respect. Read the existing docs and config first. If an AGENTS.md \
 already exists, update it in place rather than rewriting it from scratch.";
         self.input.set_text(prompt);
+        self.input.enter_insert();
         self.focus = Focus::Input;
         self.reset_history();
         self.status = "review the /init prompt, then press Enter to run it".into();
@@ -5244,7 +6223,48 @@ already exists, update it in place rather than rewriting it from scratch.";
             self.should_quit = true;
             return;
         }
-        self.close_focused_pane();
+        if let Some(session_id) = self.close_focused_pane() {
+            self.cleanup_created_session(&session_id, tx);
+        }
+        self.status = format!("{name} saved · pane closed");
+    }
+
+    /// Quit from the `:` command line. Unlike `/quit`, the prompt holds a real
+    /// draft rather than the command text, so persist it first.
+    fn quit_preserving_draft(&mut self, tx: &UnboundedSender<Command>) {
+        let name = self.focused_view().map(|view| view.session.name.clone());
+        self.save_draft_now(tx);
+        self.status = match name {
+            Some(name) => format!("saved {name} · quitting"),
+            None => "quitting".into(),
+        };
+        self.should_quit = true;
+    }
+
+    /// Close the focused pane from the `:` command line without treating the
+    /// prompt as command text. The next pane loads its own draft normally.
+    fn close_preserving_draft(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(view) = self.focused_view() else {
+            return;
+        };
+        let name = view.session.name.clone();
+        if self.draft_loading.is_some() {
+            self.status = "draft still loading…".into();
+            return;
+        }
+        self.save_draft_now(tx);
+        if self.views.len() <= 1 {
+            self.status = format!("saved {name} · quitting");
+            self.should_quit = true;
+            return;
+        }
+        self.input.clear();
+        self.last_saved_draft.clear();
+        self.input_session = None;
+        if let Some(session_id) = self.close_focused_pane() {
+            self.cleanup_created_session(&session_id, tx);
+        }
+        self.sync_draft(tx);
         self.status = format!("{name} saved · pane closed");
     }
 
@@ -5801,6 +6821,24 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.sync_selected_to_focus();
     }
 
+    /// Move the focused pane to the first slot and keep focus on it.
+    fn promote_focused_pane(&mut self) {
+        let unit = if self.layout == PaneLayout::Tabby {
+            "tab"
+        } else {
+            "pane"
+        };
+        let Some(name) = self.focused_view().map(|view| view.session.name.clone()) else {
+            return;
+        };
+        if self.focused == 0 {
+            self.status = format!("already the first {unit}");
+            return;
+        }
+        self.move_view(self.focused, 0, FocusAfterMove::Follow);
+        self.status = format!("promoted {name} · {unit} 1/{}", self.views.len());
+    }
+
     /// A session that finished a turn (or is waiting for the user) moves to
     /// the second slot, leaving pane 1 as the user's working slot.
     fn promote_session(&mut self, session_id: &str) {
@@ -5849,15 +6887,16 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.focus_pane(next);
     }
 
-    fn close_focused_pane(&mut self) {
+    fn close_focused_pane(&mut self) -> Option<String> {
         if self.views.len() <= 1 {
             self.status = "cannot close the last pane".into();
-            return;
+            return None;
         }
-        self.views.remove(self.focused);
+        let removed = self.views.remove(self.focused);
         self.focused = self.focused.min(self.views.len().saturating_sub(1));
         self.sync_selected_to_focus();
         self.status = "pane closed".into();
+        Some(removed.session.id)
     }
 
     fn cycle_session(&mut self, delta: isize, tx: &UnboundedSender<Command>) {
@@ -6072,19 +7111,28 @@ already exists, update it in place rather than rewriting it from scratch.";
 
         // Grow with the draft up to a small cap so long command lines are
         // readable; beyond that the editor scrolls instead of taking the pane.
-        // The status bar owns the last row when the terminal has room for it.
+        // The status bar and the `:` line own the bottom two rows when the
+        // terminal has room for them; very short terminals only show the
+        // command line while it is open.
+        let show_cmdline = self.cmdline.is_some() || area.height >= 7;
         let status_height = u16::from(area.height >= 7);
+        let cmdline_height = u16::from(show_cmdline);
         let input_height = prompt_input_height(area.height, area.width, &self.input);
         let chunks = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(input_height),
             Constraint::Length(status_height),
+            Constraint::Length(cmdline_height),
         ])
         .split(area);
 
         self.draw_body(frame, chunks[0]);
         self.draw_input(frame, chunks[1]);
         self.draw_status_bar(frame, chunks[2]);
+        self.draw_cmdline(frame, chunks[3]);
+        if self.cmdline_menu_open() {
+            self.draw_cmdline_menu(frame, chunks[3]);
+        }
         if self.command_menu_open() {
             self.draw_command_menu(frame, chunks[1]);
         }
@@ -6180,8 +7228,8 @@ already exists, update it in place rather than rewriting it from scratch.";
     }
 
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
-        // Sessions live in the floating picker (`p` / `<Space>s`), not in a
-        // permanent sidebar: panes get the whole body.
+        // Sessions live in the floating picker (`Ctrl-G` / `/sessions`), not in
+        // a permanent sidebar: panes get the whole body.
         if self.views.is_empty() || self.layout != PaneLayout::Tabby || area.height <= 1 {
             self.draw_panes(frame, area);
             return;
@@ -6413,6 +7461,27 @@ already exists, update it in place rather than rewriting it from scratch.";
         if let Some(selection) = self.views[index].selection {
             highlight_selection_window(&mut lines, &selection, scroll);
         }
+        if let Some(search) = self.transcript_search.as_ref() {
+            if search.session_id == session_id {
+                for (offset, line) in lines.iter_mut().enumerate() {
+                    let absolute = scroll + offset;
+                    if !search.matches.contains(&absolute) {
+                        continue;
+                    }
+                    let style = if search.matches.get(search.current) == Some(&absolute) {
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().bg(Color::Rgb(74, 68, 34))
+                    };
+                    for span in &mut line.spans {
+                        span.style = span.style.patch(style);
+                    }
+                }
+            }
+        }
         let view = &self.views[index];
         let name = truncate(
             &view.session.name,
@@ -6570,7 +7639,7 @@ already exists, update it in place rather than rewriting it from scratch.";
 
         // The error dialog covers the prompt; don't leave a blinking input
         // cursor on top of it.
-        if focused && self.error.is_none() {
+        if focused && self.error.is_none() && self.cmdline.is_none() {
             let x = area.x + 2 + layout.cursor_col.min(inner_width.saturating_sub(1)) as u16;
             let row = layout
                 .cursor_line
@@ -6602,15 +7671,23 @@ already exists, update it in place rather than rewriting it from scratch.";
         } else {
             Mode::Normal
         };
+        let cmdline = self.cmdline.is_some();
+        let mode_label = if cmdline {
+            "C"
+        } else {
+            input_mode.short_label()
+        };
+        let mode_style = if cmdline {
+            composer_mode_style(Mode::Normal, true, theme)
+        } else {
+            composer_mode_style(input_mode, active, theme)
+        };
         let session = self.status_session();
         let plan = session.is_some_and(|session| session.agent.as_deref() == Some("plan"));
         let agent_mode = if plan { "Plan" } else { "Build" };
         let agent_color = if plan { warn } else { accent };
         let mut spans = vec![
-            Span::styled(
-                format!(" {} ", input_mode.short_label()),
-                composer_mode_style(input_mode, active, theme),
-            ),
+            Span::styled(format!(" {mode_label} "), mode_style),
             Span::styled("· ", Style::default().fg(muted).bg(panel)),
             // Keep Build/Plan the same cell width so the status does not shift
             // when the mode changes.
@@ -6901,6 +7978,38 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
+    /// Vim-style command line below the status bar. It is always visible when
+    /// the terminal has room, but stays blank until `:` opens it.
+    fn draw_cmdline(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let panel = composer_background(self.theme);
+        let background = Style::default().bg(panel);
+        let Some(cmdline) = self.cmdline.as_ref() else {
+            frame.render_widget(Paragraph::new(Line::default()).style(background), area);
+            return;
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                cmdline.prompt.to_string(),
+                Style::default()
+                    .fg(composer_accent(self.theme))
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                cmdline.text.clone(),
+                Style::default().fg(composer_text(self.theme)).bg(panel),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(background), area);
+        let cursor = UnicodeWidthStr::width(&cmdline.text[..cmdline.cursor_byte()]) as u16;
+        let max_x = area.x + area.width.saturating_sub(1);
+        let x = (area.x + 1 + cursor).min(max_x);
+        frame.set_cursor_position((x, area.y));
+    }
+
     /// `/` suggestion menu floated just above the prompt.
     fn draw_command_menu(&mut self, frame: &mut Frame, input_area: Rect) {
         if input_area.y < 3 {
@@ -6979,6 +8088,107 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
         let title_left = Line::from(Span::styled(
             " / commands ",
+            Style::default()
+                .fg(accent)
+                .bg(panel)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent).bg(panel))
+            .style(Style::default().bg(panel))
+            .title_style(Style::default().bg(panel))
+            .title_top(title_left);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().fg(text).bg(panel)),
+            rect,
+        );
+    }
+
+    /// Dynamic `:` command list floated just above the command line. Typing
+    /// filters it; Tab completes a match, while Ctrl-J/K and Ctrl-N/P move the
+    /// selection without rewriting the typed prefix.
+    fn draw_cmdline_menu(&mut self, frame: &mut Frame, cmdline_area: Rect) {
+        // Keep the statusline visible: the menu grows upward from the row
+        // immediately above the command line.
+        let status_y = cmdline_area.y.saturating_sub(1);
+        if status_y < 3 {
+            return;
+        }
+        let matches = self.cmdline_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let height = (matches.len() as u16 + 2).min(15).min(status_y);
+        let visible = height.saturating_sub(2) as usize;
+        if visible == 0 {
+            return;
+        }
+        let cursor = self.cmdline_menu_cursor.unwrap_or(0).min(matches.len() - 1);
+        let start = cursor.saturating_sub(visible.saturating_sub(1));
+        let width = cmdline_area.width.min(88);
+        let rect = Rect::new(cmdline_area.x, status_y - height, width, height);
+        frame.render_widget(Clear, rect);
+
+        let panel = composer_background(self.theme);
+        let muted = composer_muted(self.theme);
+        let text = composer_text(self.theme);
+        let accent = composer_accent(self.theme);
+        let inner = width.saturating_sub(2) as usize;
+        let marker_width = 3usize;
+        let name_width = 22.min(inner.saturating_sub(marker_width + 2));
+        let desc_width = inner
+            .saturating_sub(marker_width + name_width)
+            .saturating_sub(2);
+        let mut lines = Vec::new();
+        for (offset, spec) in matches.iter().skip(start).take(visible).enumerate() {
+            let index = start + offset;
+            let selected = index == cursor;
+            let row_bg = if selected { COMPOSER_SELECTION } else { panel };
+            let marker_style = if selected {
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(muted).bg(row_bg)
+            };
+            let name_style = if selected {
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text).bg(row_bg)
+            };
+            let desc_style = if selected {
+                Style::default().fg(text).bg(row_bg)
+            } else {
+                Style::default().fg(muted).bg(row_bg)
+            };
+            let name = if spec.args.is_empty() {
+                format!(":{}", spec.name)
+            } else {
+                format!(":{} {}", spec.name, spec.args)
+            };
+            let name = pad_to(&truncate(&name, name_width), name_width);
+            let description = pad_to(&truncate(&spec.description, desc_width), desc_width);
+            let gap = inner.saturating_sub(marker_width + name_width + desc_width);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", if selected { "❯" } else { " " }),
+                    marker_style,
+                ),
+                Span::styled(name, name_style),
+                Span::styled(" ".repeat(gap), desc_style),
+                Span::styled(description, desc_style),
+            ]));
+        }
+        let title_left = Line::from(Span::styled(
+            " : commands ",
             Style::default()
                 .fg(accent)
                 .bg(panel)
@@ -7604,6 +8814,10 @@ already exists, update it in place rather than rewriting it from scratch.";
             .map(|picker| picker.query.clone())
             .unwrap_or_default();
         let loading = self.picker.as_ref().is_some_and(|picker| picker.loading);
+        // Queue a lazy preview whenever the selected row changes. The event
+        // loop sends it after this draw so the UI never blocks on file/history
+        // reads.
+        self.sync_picker_preview(&filtered, selected);
         // The theme picker previews the highlighted palette immediately, so
         // its own chrome should follow that palette too (not a fixed cyan).
         let theme_picker = kind == PickerKind::Themes;
@@ -7670,19 +8884,25 @@ already exists, update it in place rather than rewriting it from scratch.";
         if let Some(preview_area) = preview_area {
             let lines = self.picker_preview_lines(&filtered);
             let width = preview_area.width.saturating_sub(2) as usize;
-            let body: Vec<Line> = lines
-                .into_iter()
-                .take(preview_area.height as usize)
-                .map(|line| Line::from(truncate(&line, width)))
+            let height = preview_area.height as usize;
+            let mut wrapped: Vec<String> = lines
+                .iter()
+                .flat_map(|line| wrap_text(line, width))
                 .collect();
+            // Session previews are conversations: keep the newest lines in
+            // view instead of showing the oldest part of the fetched window.
+            if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) && wrapped.len() > height
+            {
+                wrapped.drain(..wrapped.len() - height);
+            }
+            let body: Vec<Line> = wrapped.into_iter().take(height).map(Line::from).collect();
             let preview = Paragraph::new(body)
                 .style(Style::default().fg(preview_text).bg(dialog_bg))
                 .block(
                     Block::default()
                         .borders(Borders::LEFT)
                         .border_style(Style::default().fg(muted).bg(dialog_bg)),
-                )
-                .wrap(ratatui::widgets::Wrap { trim: false });
+                );
             frame.render_widget(preview, preview_area);
         }
     }
@@ -7797,6 +9017,49 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
+    /// Queue a preview request for the selected file or session row.
+    fn sync_picker_preview(&mut self, filtered: &[usize], selected: usize) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let Some(provider) = picker.kind.preview_kind() else {
+            return;
+        };
+        let Some(&index) = filtered.get(selected) else {
+            return;
+        };
+        let value = match picker.kind {
+            PickerKind::Sessions | PickerKind::NewPane => {
+                self.sessions.get(index).map(|session| session.id.clone())
+            }
+            PickerKind::Files => picker.items.get(index).map(|item| item.value.clone()),
+            _ => None,
+        };
+        let Some(value) = value else {
+            return;
+        };
+        if picker.preview.key.as_deref() == Some(value.as_str()) {
+            return;
+        }
+        let session_id = if picker.kind == PickerKind::Files {
+            let Some(session_id) = self.focused_session_id() else {
+                return;
+            };
+            Some(session_id)
+        } else {
+            None
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.preview = PickerPreview {
+                key: Some(value.clone()),
+                text: None,
+                error: None,
+                loading: true,
+            };
+            picker.preview_request = Some((provider.to_string(), session_id, value));
+        }
+    }
+
     /// Right-pane preview lines for the selected picker row.
     fn picker_preview_lines(&self, filtered: &[usize]) -> Vec<String> {
         let Some(picker) = &self.picker else {
@@ -7807,6 +9070,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         };
         match picker.kind {
             PickerKind::Sessions | PickerKind::NewPane => {
+                if let Some(text) = &picker.preview.text {
+                    return text.lines().map(str::to_string).collect();
+                }
                 let Some(session) = self.sessions.get(index) else {
                     return Vec::new();
                 };
@@ -7825,7 +9091,32 @@ already exists, update it in place rather than rewriting it from scratch.";
                     "model       {}",
                     session.model.as_deref().unwrap_or("(daemon default)")
                 ));
+                if let Some(error) = &picker.preview.error {
+                    lines.push(String::new());
+                    lines.push(format!("conversation preview: {error}"));
+                } else if picker.preview.loading {
+                    lines.push(String::new());
+                    lines.push("loading conversation…".into());
+                }
                 lines
+            }
+            PickerKind::Files => {
+                if let Some(text) = &picker.preview.text {
+                    return text.lines().map(str::to_string).collect();
+                }
+                if let Some(error) = &picker.preview.error {
+                    return vec![format!("preview: {error}")];
+                }
+                if picker.preview.loading {
+                    return vec!["loading file…".into()];
+                }
+                let Some(item) = picker.items.get(index) else {
+                    return Vec::new();
+                };
+                item.preview
+                    .as_ref()
+                    .map(|preview| preview.lines().map(str::to_string).collect())
+                    .unwrap_or_else(|| vec![item.label.clone()])
             }
             _ => {
                 let Some(item) = picker.items.get(index) else {
@@ -7843,7 +9134,7 @@ already exists, update it in place rather than rewriting it from scratch.";
     }
 }
 
-/// Rows for the interactive `/theme` picker. The first row clears the preset;
+/// Rows for the interactive `/colorscheme` picker. The first row clears the preset;
 /// the rest are the built-in palettes in `THEME_PRESETS` order.
 fn theme_picker_items() -> Vec<PickerItem> {
     let mut items = vec![PickerItem::new(THEME_DEFAULT_VALUE)
@@ -8153,7 +9444,11 @@ fn command_items() -> Vec<PickerItem> {
             "model",
             "Search provider model catalogs and switch this session",
         ),
-        ("theme", "theme", "Choose a color preset with live preview"),
+        (
+            "colorscheme",
+            "colorscheme",
+            "Choose a colorscheme with live preview",
+        ),
         (
             "help",
             "key help",
@@ -8503,6 +9798,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "attach images (paste/drop a path or file:// URI); png/jpg/gif/webp",
             },
             HelpEntry {
+                key: "/colorscheme",
+                description: "browse colorschemes with live preview; Enter applies, Esc restores",
+            },
+            HelpEntry {
                 key: "!<cmd>",
                 description: "run a shell command in the session cwd (sandboxed, snapshotted)",
             },
@@ -8528,7 +9827,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
         title: "keys",
         entries: &[
             HelpEntry {
-                key: "i / Enter / Space i",
+                key: "i / Space i",
                 description: "focus the prompt in insert mode",
             },
             HelpEntry {
@@ -8540,20 +9839,24 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt: normal mode (keeps focus)",
             },
             HelpEntry {
+                key: ":",
+                description: "normal mode: open the command line (:q closes the pane, :qa quits)",
+            },
+            HelpEntry {
                 key: "Esc Esc",
                 description: "normal mode: interrupt the running turn, or leave for the transcript",
             },
             HelpEntry {
                 key: "Enter",
-                description: "send (insert mode); prompts sent while busy are queued",
+                description: "normal modes: promote the focused pane to first; insert: send (queued while busy)",
             },
             HelpEntry {
                 key: "Ctrl-J",
                 description: "newline (insert mode)",
             },
             HelpEntry {
-                key: "Space s/f/w/b",
-                description: "prompt & transcript: sessions / files / worktrees / branches",
+                key: "Space o/f/w/b",
+                description: "prompt & transcript: new pane / files / worktrees / branches",
             },
             HelpEntry {
                 key: "Space C/h/p",
@@ -8570,6 +9873,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "Shift+, / Shift+.",
                 description: "prompt normal & transcript: previous / next pane",
+            },
+            HelpEntry {
+                key: "Ctrl-W Ctrl-W",
+                description: "prompt normal & transcript: focus the next pane (wraps around)",
             },
             HelpEntry {
                 key: "Space V / Space T / Space R",
@@ -8608,8 +9915,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "command palette (prompt normal mode and transcript)",
             },
             HelpEntry {
-                key: "Space s / Ctrl-G",
-                description: "session picker",
+                key: "Ctrl-G",
+                description: "session picker (switch the focused pane's session)",
             },
             HelpEntry {
                 key: "Ctrl-T",
@@ -8700,11 +10007,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "fork the session (git worktree when inside a repo)",
             },
             HelpEntry {
-                key: "#",
-                description: "search message history (Enter runs / opens)",
+                key: "/ · ? · #",
+                description: "search this transcript (/ forward; ?/# backward; n/N next/prev; Esc clears)",
             },
             HelpEntry {
-                key: "? / F1",
+                key: "F1 · /help",
                 description: "open this help (F1 anywhere)",
             },
             HelpEntry {
@@ -10389,6 +11696,12 @@ mod tests {
             .collect()
     }
 
+    fn type_text(app: &mut App, tx: &UnboundedSender<Command>, text: &str) {
+        for ch in text.chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), tx);
+        }
+    }
+
     #[test]
     fn active_queue_promotes_ready_to_the_second_slot_and_demotes_sent_sessions() {
         let mut app = app_with_panes(&["a", "b", "c"]);
@@ -10577,10 +11890,7 @@ mod tests {
             .expect("tab strip");
         let prompt_top = tab_row + 1;
         assert!(lines[prompt_top].contains('╭'), "{rendered}");
-        assert!(
-            lines.last().is_some_and(|line| line.contains("Build ·")),
-            "{rendered}"
-        );
+        assert!(status_bar_row(&rendered).contains("Build ·"), "{rendered}");
     }
 
     #[test]
@@ -12020,6 +13330,187 @@ mod tests {
     }
 
     #[test]
+    fn slash_and_question_search_the_current_transcript_vim_style() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.views[0].text_lines = ["zero", "one", "alpha here", "three", "alpha again"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "alpha");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        let search = app.transcript_search.as_ref().expect("transcript search");
+        assert_eq!(search.query, "alpha");
+        assert_eq!(search.matches, vec![2, 4]);
+        assert_eq!(search.current, 0);
+        assert_eq!(app.views[0].scroll, 0);
+        assert!(app.status.contains("/alpha · 1/2"));
+
+        // n / N cycle matches without leaving normal mode.
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.transcript_search.as_ref().unwrap().current, 1);
+        assert_eq!(app.views[0].scroll, 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.transcript_search.as_ref().unwrap().current, 0);
+
+        // `?` searches backward from the current viewport.
+        app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT), &tx);
+        type_text(&mut app, &tx, "alpha");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let search = app.transcript_search.as_ref().unwrap();
+        assert_eq!(search.current, 1);
+        assert!(app.status.contains("?alpha · 2/2"));
+
+        // Esc leaves search mode and removes the highlight state.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.transcript_search.is_none());
+        assert_eq!(app.status, "search cleared");
+    }
+
+    #[test]
+    fn command_line_shows_a_dynamic_filtered_command_menu() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert!(!app.cmdline_menu_open(), "the menu must wait for Tab");
+        assert!(!app.cmdline_matches().is_empty());
+
+        type_text(&mut app, &tx, "mod");
+        assert!(!app.cmdline_menu_open(), "typing alone must not open it");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert!(app.cmdline_menu_open(), "Tab enables the command menu");
+        let names: Vec<&str> = app
+            .cmdline_matches()
+            .into_iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert!(names.contains(&"model"), "{names:?}");
+        assert!(names.iter().all(|name| name.starts_with("mod")));
+
+        // Arguments hide the command menu.
+        type_text(&mut app, &tx, " provider/model");
+        assert!(!app.cmdline_menu_open());
+
+        // `/` and `?` command lines are transcript searches, not command menus.
+        app.cmdline = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE), &tx);
+        assert!(!app.cmdline_menu_open());
+        assert!(app.cmdline_matches().is_empty());
+    }
+
+    #[test]
+    fn command_line_menu_navigates_with_ctrl_keys() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "h");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("help")
+        );
+        let names: Vec<&str> = app
+            .cmdline_matches()
+            .into_iter()
+            .map(|spec| spec.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["help", "history"]);
+        assert_eq!(app.cmdline_menu_cursor, None);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.cmdline_menu_cursor, Some(1));
+        assert_eq!(
+            app.selected_cmdline_match().map(|spec| spec.name.as_str()),
+            Some("history")
+        );
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("help"),
+            "moving the menu cursor must not rewrite the typed prefix"
+        );
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.cmdline_menu_cursor, Some(0));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.cmdline_menu_cursor, Some(1));
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.cmdline_menu_cursor, Some(0));
+
+        // Terminals may report Ctrl-J as Ctrl-Enter; both move the menu.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &tx);
+        assert_eq!(app.cmdline_menu_cursor, Some(1));
+        // Enter accepts the highlighted row, not the completed first match.
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.search_view.is_some());
+        assert!(app.cmdline.is_none());
+    }
+
+    #[test]
+    fn normal_search_keys_open_the_command_line_not_history_search() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        for (focus, key, prompt) in [
+            (
+                Focus::Input,
+                KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE),
+                '/',
+            ),
+            (
+                Focus::Input,
+                KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT),
+                '?',
+            ),
+            (
+                Focus::Transcript,
+                KeyEvent::new(KeyCode::Char('#'), KeyModifiers::SHIFT),
+                '#',
+            ),
+        ] {
+            let mut app = app_with_panes(&["s1"]);
+            app.focus = focus;
+            if focus == Focus::Input {
+                app.input.enter_normal();
+            }
+            app.handle_key(key, &tx);
+            let cmdline = app.cmdline.as_ref().expect("command line");
+            assert_eq!(cmdline.prompt, prompt);
+            assert!(cmdline.text.is_empty());
+            assert!(app.search_view.is_none(), "it must not open history search");
+        }
+
+        // `:history` remains the way to open the history search.
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "history");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.search_view.is_some());
+    }
+
+    #[test]
     fn search_overlay_runs_a_query_and_opens_the_selected_hit() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
@@ -12028,8 +13519,12 @@ mod tests {
             Vec::new(),
         ));
 
-        // `#` from the transcript opens the overlay.
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('#'), KeyModifiers::SHIFT), &tx);
+        // `:history` opens the overlay.
+        app.focus_input();
+        app.input.enter_normal();
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "history");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         assert!(app.search_view.is_some());
 
         // Typing edits the query; the first Enter runs the search.
@@ -12123,11 +13618,128 @@ mod tests {
             selected: 0,
             items: vec![PickerItem::new("src/main.rs"), PickerItem::new("README.md")],
             loading: false,
+            preview: PickerPreview::default(),
+            preview_request: None,
         });
         app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         assert!(app.picker.is_none());
         assert_eq!(app.input.text(), "@src/main.rs");
         assert!(matches!(app.focus, Focus::Input));
+    }
+
+    #[test]
+    fn file_picker_preview_requests_the_selected_file() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.picker = Some(Picker {
+            kind: PickerKind::Files,
+            query: String::new(),
+            selected: 0,
+            items: vec![PickerItem::new("src/a.rs"), PickerItem::new("src/b.rs")],
+            loading: false,
+            preview: PickerPreview::default(),
+            preview_request: None,
+        });
+
+        let filtered = app.picker_filtered();
+        app.sync_picker_preview(&filtered, 0);
+        let (kind, session_id, value) = app.take_picker_preview_request().unwrap();
+        assert_eq!(kind, eix_core::KIND_FILES);
+        assert_eq!(session_id.as_deref(), Some("s1"));
+        assert_eq!(value, "src/a.rs");
+
+        app.picker.as_mut().unwrap().selected = 1;
+        let filtered = app.picker_filtered();
+        app.sync_picker_preview(&filtered, 1);
+        let (_, _, value) = app.take_picker_preview_request().unwrap();
+        assert_eq!(value, "src/b.rs");
+
+        // A response for the previous row must not overwrite the new preview.
+        app.handle_event(
+            Event::PickerPreview {
+                kind: eix_core::KIND_FILES.into(),
+                value: "src/a.rs".into(),
+                text: Some("old contents".into()),
+                error: None,
+            },
+            &tx,
+        );
+        assert!(app.picker.as_ref().unwrap().preview.text.is_none());
+        app.handle_event(
+            Event::PickerPreview {
+                kind: eix_core::KIND_FILES.into(),
+                value: "src/b.rs".into(),
+                text: Some("fn b() {}".into()),
+                error: None,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.picker_preview_lines(&filtered),
+            vec!["fn b() {}".to_string()]
+        );
+    }
+
+    #[test]
+    fn file_picker_draws_the_lazy_preview_on_the_right() {
+        let mut app = app_with_panes(&["s1"]);
+        app.picker = Some(Picker {
+            kind: PickerKind::Files,
+            query: String::new(),
+            selected: 0,
+            items: vec![PickerItem::new("src/a.rs")],
+            loading: false,
+            preview: PickerPreview {
+                key: Some("src/a.rs".into()),
+                text: Some("   1 │ fn a() {}".into()),
+                error: None,
+                loading: false,
+            },
+            preview_request: None,
+        });
+
+        let rendered = render_text(&mut app, 100, 24);
+        assert!(rendered.contains("fn a() {}"), "{rendered}");
+    }
+
+    #[test]
+    fn session_picker_preview_requests_the_selected_session_history() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.sessions = vec![
+            Session::new("s1", "one", "/tmp"),
+            Session::new("s2", "two", "/tmp"),
+        ];
+        app.picker = Some(Picker {
+            kind: PickerKind::NewPane,
+            query: String::new(),
+            selected: 0,
+            items: Vec::new(),
+            loading: false,
+            preview: PickerPreview::default(),
+            preview_request: None,
+        });
+
+        let filtered = app.picker_filtered();
+        app.sync_picker_preview(&filtered, 0);
+        let (kind, session_id, value) = app.take_picker_preview_request().unwrap();
+        assert_eq!(kind, eix_core::KIND_SESSION_PREVIEW);
+        assert!(session_id.is_none());
+        assert_eq!(value, "s1");
+
+        app.handle_event(
+            Event::PickerPreview {
+                kind: eix_core::KIND_SESSION_PREVIEW.into(),
+                value: "s1".into(),
+                text: Some("you:\n  hello".into()),
+                error: None,
+            },
+            &tx,
+        );
+        assert_eq!(
+            app.picker_preview_lines(&filtered),
+            vec!["you:".to_string(), "  hello".to_string()]
+        );
     }
 
     #[test]
@@ -12152,14 +13764,14 @@ mod tests {
     }
 
     #[test]
-    fn theme_command_opens_picker_and_escape_restores() {
+    fn colorscheme_command_opens_picker_and_escape_restores() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.theme_config.preset = Some("github-dark".into());
         app.theme = Theme::from_config(&app.theme_config);
         let saved = app.theme;
 
-        assert!(app.handle_prompt_command("/theme", &tx));
+        assert!(app.handle_prompt_command("/colorscheme", &tx));
         assert!(matches!(
             app.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Themes)
@@ -12174,13 +13786,25 @@ mod tests {
         assert_eq!(app.theme_config.preset.as_deref(), Some("github-dark"));
         assert!(app.theme_picker_backup.is_none());
 
-        // Theme arguments no longer switch directly; the picker is the only path.
-        assert!(app.handle_prompt_command("/theme nord", &tx));
+        // Colorscheme arguments no longer switch directly; the picker is the only path.
+        assert!(app.handle_prompt_command("/colorscheme nord", &tx));
         assert!(app.picker.is_none());
         assert!(app
             .error
             .as_deref()
-            .is_some_and(|error| error.contains("usage: /theme")));
+            .is_some_and(|error| error.contains("usage: /colorscheme")));
+    }
+
+    #[test]
+    fn theme_alias_is_not_available() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        assert!(app.handle_prompt_command("/theme", &tx));
+        assert!(app.picker.is_none());
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown command /theme")));
     }
 
     #[test]
@@ -12228,7 +13852,7 @@ mod tests {
         assert!(app.theme_picker_backup.is_none());
         assert_eq!(app.theme_config.preset.as_deref(), Some("github-dark"));
         assert_eq!(app.theme.preset, Some("github-dark"));
-        assert!(app.status.contains("theme → github-dark"));
+        assert!(app.status.contains("colorscheme → github-dark"));
     }
 
     #[test]
@@ -12385,6 +14009,7 @@ mod tests {
         // Insert mode still types a literal colon.
         app.handle_input_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
         assert!(app.picker.is_none());
+        assert!(app.cmdline.is_none());
         assert_eq!(app.input.text(), ":");
 
         // In normal mode Ctrl-P opens the interactive command palette instead
@@ -12400,10 +14025,362 @@ mod tests {
             Some(PickerKind::Commands)
         ));
 
-        // The old bare-colon binding no longer opens the palette.
+        // A bare colon in normal mode opens the Vim command line, not the
+        // palette, and leaves the draft untouched.
         app.picker = None;
         app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
         assert!(app.picker.is_none());
+        assert!(app.cmdline.is_some());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn colon_command_line_preserves_the_prompt_draft() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.set_text("draft");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert!(app.cmdline.is_some());
+        type_text(&mut app, &tx, "help");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.help);
+        assert!(app.cmdline.is_none());
+        assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn command_line_colorscheme_opens_the_picker() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.set_text("draft");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "colorscheme");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.cmdline.is_none());
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Themes)
+        ));
+        assert!(app.theme_picker_backup.is_some());
+        assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn command_line_bang_runs_a_shell_command() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "!printf hi");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.cmdline.is_none());
+        match rx.try_recv().expect("shell command") {
+            Command::RunShell {
+                session_id,
+                command,
+                insert_output,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(command, "printf hi");
+                assert!(!insert_output);
+            }
+            _ => panic!("unexpected command"),
+        }
+    }
+
+    #[test]
+    fn command_line_read_shell_inserts_output_into_the_prompt() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "r!printf hi");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.cmdline.is_none());
+        app.handle_event(
+            Event::ShellRan {
+                ok: true,
+                output: "hi\n".into(),
+                insert_output: true,
+            },
+            &tx,
+        );
+        assert_eq!(app.input.text(), "hi");
+        assert!(matches!(app.focus, Focus::Input));
+        assert!(app.status.contains("read 1 line"));
+    }
+
+    #[test]
+    fn command_line_esc_cancels_without_running_the_command() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.set_text("draft");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "quit");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+
+        assert!(!app.should_quit);
+        assert!(app.cmdline.is_none());
+        assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn command_line_edits_at_the_cursor() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "hep");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "l");
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("help")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.help);
+    }
+
+    #[test]
+    fn command_line_unknown_commands_keep_the_draft() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.set_text("draft");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "nope");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown command")));
+        assert!(app.cmdline.is_none());
+        assert_eq!(app.input.text(), "draft");
+    }
+
+    #[test]
+    fn command_line_history_browses_previous_entries() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.set_text("draft");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "w");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert_eq!(app.status, "draft saved");
+        assert_eq!(app.input.text(), "draft");
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("w")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("")
+        );
+
+        // With the command menu closed, Ctrl-P/N keep browsing history.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("w")
+        );
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("")
+        );
+    }
+
+    #[test]
+    fn command_line_tab_completes_command_names() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "hel");
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some("help")
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.help);
+    }
+
+    #[test]
+    fn command_line_esc_dismisses_menu_before_closing() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "mod");
+        assert!(!app.cmdline_menu_open());
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+        assert!(app.cmdline_menu_open());
+        let text = app
+            .cmdline
+            .as_ref()
+            .map(|cmdline| cmdline.text.clone())
+            .expect("command line");
+
+        // The first Esc closes only the popup and keeps the typed command.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(!app.cmdline_menu_open());
+        assert!(!app.cmdline_menu_armed);
+        assert_eq!(
+            app.cmdline.as_ref().map(|cmdline| cmdline.text.as_str()),
+            Some(text.as_str())
+        );
+
+        // A second Esc closes the command line itself.
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.cmdline.is_none());
+        assert_eq!(app.input.mode(), Mode::Normal);
+        assert!(app.search_view.is_none());
+    }
+
+    #[test]
+    fn command_line_q_closes_the_pane_and_saves_the_draft() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1", "s2"]);
+        app.focus_input();
+        app.input.set_text("keep me");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "q");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert_eq!(view_order(&app), vec!["s2"]);
+        let mut saved = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::DraftSet { session_id, text } = command {
+                if session_id == "s1" {
+                    saved = Some(text);
+                }
+            }
+        }
+        assert_eq!(saved.as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn command_line_qa_quits_after_saving_the_draft() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.set_text("keep me");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "qa");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert!(app.should_quit);
+        let mut saved = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::DraftSet { session_id, text } = command {
+                if session_id == "s1" {
+                    saved = Some(text);
+                }
+            }
+        }
+        assert_eq!(saved.as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn command_line_is_visible_by_default() {
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+
+        let text = render_text(&mut app, 80, 20);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.last().unwrap().trim().is_empty(), "{text}");
+        assert!(!lines.last().unwrap().contains(':'), "{text}");
+        assert!(
+            status_bar_row(&text).trim_start().starts_with("N · Build"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn command_line_renders_below_the_status_bar() {
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "model");
+
+        let text = render_text(&mut app, 80, 20);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.last().unwrap().trim_end(), ":model");
+        assert!(
+            status_bar_row(&text).trim_start().starts_with("C · Build"),
+            "{text}"
+        );
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        let text = render_text(&mut app, 80, 20);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines.last().unwrap().trim().is_empty(), "{text}");
+        assert!(
+            status_bar_row(&text).trim_start().starts_with("N · Build"),
+            "{text}"
+        );
+        assert!(!lines.last().unwrap().contains(":model"), "{text}");
+    }
+
+    #[test]
+    fn colon_from_the_transcript_opens_the_command_line() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus = Focus::Transcript;
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert!(app.cmdline.is_some());
     }
 
     #[test]
@@ -12478,7 +14455,44 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), &tx);
         assert!(!app.help, "leader+? no longer opens help");
         app.handle_key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE), &tx);
-        assert!(app.help, "bare ? still opens help");
+        assert!(app.cmdline.is_some(), "bare ? opens the command line");
+        assert!(
+            app.search_view.is_none(),
+            "? no longer opens history search"
+        );
+        assert!(!app.help, "? no longer opens help");
+        app.cmdline = None;
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), &tx);
+        assert!(app.help, "F1 still opens help");
+    }
+
+    #[test]
+    fn leader_hint_disappears_on_the_next_key() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus = Focus::Transcript;
+        app.status = "previous status".into();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        assert!(app.pending_leader);
+        assert!(app.status.starts_with("leader:"));
+
+        // An unknown leader key still dismisses the hint and restores the
+        // status that was visible before `<Space>`.
+        app.handle_key(KeyEvent::new(KeyCode::Char('z'), KeyModifiers::NONE), &tx);
+        assert!(!app.pending_leader);
+        assert_eq!(app.status, "previous status");
+        let text = render_text(&mut app, 80, 20);
+        assert!(!text.contains("leader:"), "{text}");
+
+        // A working leader action also replaces the hint rather than leaving
+        // it on screen.
+        app.focus = Focus::Transcript;
+        app.status = "previous status".into();
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        assert!(matches!(app.focus, Focus::Input));
+        assert_eq!(app.status, "previous status");
     }
 
     #[test]
@@ -12508,6 +14522,11 @@ mod tests {
         assert!(matches!(app.focus, Focus::Input));
         assert_eq!(app.input.mode(), Mode::Insert);
         app.focus = Focus::Transcript;
+
+        // leader+s no longer switches the focused pane's session.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none(), "leader+s still opened sessions");
 
         // The leader retains the action.
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
@@ -12776,6 +14795,99 @@ mod tests {
         assert_eq!(app.focused, 0);
         app.handle_key(KeyEvent::new(KeyCode::Char('<'), KeyModifiers::SHIFT), &tx);
         assert_eq!(app.focused, 2);
+    }
+
+    #[test]
+    fn double_ctrl_w_cycles_panes_and_wraps() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let ctrl_w = || KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL);
+
+        for focus in [Focus::Transcript, Focus::Input] {
+            let mut app = app_with_panes(&["s1", "s2", "s3"]);
+            app.focused = 0;
+            if focus == Focus::Input {
+                app.focus_input();
+                app.input.enter_normal();
+            } else {
+                app.focus = Focus::Transcript;
+            }
+
+            // A single Ctrl-W only arms the gesture.
+            app.handle_key(ctrl_w(), &tx);
+            assert_eq!(app.focused, 0);
+            for expected in [1, 2, 0] {
+                app.handle_key(ctrl_w(), &tx);
+                assert_eq!(app.focused, expected);
+                if expected != 0 {
+                    app.handle_key(ctrl_w(), &tx);
+                }
+            }
+            assert!(app.focus == focus, "pane focus changed");
+        }
+
+        // A stale first press does not pair with a much later one.
+        let mut app = app_with_panes(&["s1", "s2"]);
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.ctrl_w_at = Some(Instant::now() - CTRL_W_WINDOW);
+        app.handle_key(ctrl_w(), &tx);
+        assert_eq!(app.focused, 0);
+        app.handle_key(ctrl_w(), &tx);
+        assert_eq!(app.focused, 1);
+
+        // Another key between the two presses also breaks the gesture.
+        app.focused = 0;
+        app.ctrl_w_at = None;
+        app.handle_key(ctrl_w(), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+        app.handle_key(ctrl_w(), &tx);
+        assert_eq!(app.focused, 0);
+    }
+
+    #[test]
+    fn enter_promotes_the_focused_pane_to_first() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        for focus in [Focus::Transcript, Focus::Input] {
+            let mut app = app_with_panes(&["a", "b", "c"]);
+            app.focused = 2;
+            if focus == Focus::Input {
+                app.focus_input();
+                app.input.enter_normal();
+            } else {
+                app.focus = Focus::Transcript;
+            }
+
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+            assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+            assert_eq!(app.focused, 0);
+            assert_eq!(app.focused_session_id().as_deref(), Some("c"));
+            assert_eq!(app.status, "promoted session c · pane 1/3");
+            assert!(
+                app.focus == focus,
+                "Enter changed the input/transcript focus"
+            );
+
+            // Pressing Enter on the first pane is a no-op.
+            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+            assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+            assert_eq!(app.status, "already the first pane");
+        }
+    }
+
+    #[test]
+    fn ctrl_w_still_deletes_a_word_in_insert_mode() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1", "s2"]);
+        app.focused = 0;
+        app.focus_input();
+        type_text(&mut app, &tx, "one two");
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.focused, 0);
+        assert_eq!(app.input.text(), "one ");
     }
 
     #[test]
@@ -13423,6 +15535,52 @@ mod tests {
     }
 
     #[test]
+    fn cleanup_deletes_a_created_session_that_was_never_used() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.handle_event(Event::Created(Session::new("s1", "one", "/tmp")), &tx);
+        while rx.try_recv().is_ok() {}
+
+        app.cleanup_empty_sessions(&tx);
+        match rx.try_recv().expect("delete command") {
+            Command::DeleteSessionIfEmpty { session_id } => assert_eq!(session_id, "s1"),
+            _ => panic!("expected a conditional delete"),
+        }
+    }
+
+    #[test]
+    fn cleanup_keeps_a_created_session_after_an_event_or_draft() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.handle_event(Event::Created(Session::new("s1", "one", "/tmp")), &tx);
+        while rx.try_recv().is_ok() {}
+
+        let event = SessionEvent {
+            session_id: "s1".into(),
+            seq: 1,
+            ts: 0,
+            kind: EventKind::UserMessage,
+            payload: serde_json::json!({"text": "hi"}),
+        };
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new("session.event", event)),
+            &tx,
+        );
+        app.cleanup_empty_sessions(&tx);
+        assert!(rx.try_recv().is_err(), "a used session must be kept");
+
+        // A draft in the prompt is also input.
+        app.handle_event(Event::Created(Session::new("s2", "two", "/tmp")), &tx);
+        while rx.try_recv().is_ok() {}
+        app.input_session = Some("s2".into());
+        app.input.set_text("unsent draft");
+        app.cleanup_empty_sessions(&tx);
+        assert!(rx.try_recv().is_err(), "a draft must keep the session");
+    }
+
+    #[test]
     fn slash_exit_quits_without_closing_session_panes() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
@@ -13469,6 +15627,7 @@ mod tests {
         app.views.push(session_pane("s2", "two"));
         app.focused = 0;
         app.focus = Focus::Input;
+        app.created_sessions.insert("s1".into());
         app.input.set_text("/close");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
@@ -13482,6 +15641,33 @@ mod tests {
                 assert!(text.is_empty(), "the command is not kept as a draft");
             }
             _ => panic!("expected a draft save"),
+        }
+        match rx.try_recv().expect("conditional delete") {
+            Command::DeleteSessionIfEmpty { session_id } => assert_eq!(session_id, "s1"),
+            _ => panic!("expected a conditional delete"),
+        }
+    }
+
+    #[test]
+    fn closing_a_created_pane_queues_a_conditional_delete() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(session_pane("s1", "one"));
+        app.views.push(session_pane("s2", "two"));
+        app.focused = 0;
+        app.created_sessions.insert("s1".into());
+
+        app.run_action("close-pane", &tx);
+
+        assert_eq!(app.views.len(), 1);
+        assert_eq!(app.views[0].session.id, "s2");
+        match rx.try_recv().expect("draft save") {
+            Command::DraftSet { session_id, .. } => assert_eq!(session_id, "s1"),
+            _ => panic!("expected a draft save"),
+        }
+        match rx.try_recv().expect("conditional delete") {
+            Command::DeleteSessionIfEmpty { session_id } => assert_eq!(session_id, "s1"),
+            _ => panic!("expected a conditional delete"),
         }
     }
 
@@ -13632,10 +15818,10 @@ mod tests {
             Event::Models {
                 models: vec![
                     eix_core::ModelInfo {
-                        id: "default/gpt-4o".into(),
+                        id: "openai/gpt-4o".into(),
                         api_model: Some("gpt-4o".into()),
                         name: "gpt-4o".into(),
-                        provider: "default".into(),
+                        provider: "openai".into(),
                         default: false,
                         variants: Vec::new(),
                         input_cost: None,
@@ -13664,8 +15850,8 @@ mod tests {
         assert_eq!(picker.items[0].label, "@default");
         assert_eq!(picker.items[0].detail.as_deref(), Some("daemon default"));
         assert_eq!(picker.items[1].label, "gpt-4o");
-        assert_eq!(picker.items[1].value, "default/gpt-4o");
-        assert_eq!(picker.items[1].detail.as_deref(), Some("default"));
+        assert_eq!(picker.items[1].value, "openai/gpt-4o");
+        assert_eq!(picker.items[1].detail.as_deref(), Some("openai"));
         assert_eq!(picker.items[2].label, "gpt-5");
         assert_eq!(picker.items[2].value, "router/gpt-5");
         assert_eq!(picker.items[2].detail.as_deref(), Some("Router"));
@@ -13984,6 +16170,13 @@ mod tests {
         out
     }
 
+    /// The status bar sits directly above the always-visible command line.
+    fn status_bar_row(rendered: &str) -> &str {
+        let mut lines = rendered.lines().rev();
+        lines.next().expect("command line row");
+        lines.next().expect("status bar row")
+    }
+
     #[test]
     fn prompt_grows_to_show_a_long_command() {
         let mut app = App::new(None);
@@ -14032,7 +16225,7 @@ mod tests {
             .expect("prompt bottom");
         assert!(!lines[bottom_row - 1].contains("Build"), "{rendered}");
         assert!(!lines[bottom_row - 1].contains("deepseek"), "{rendered}");
-        let status_row = lines.last().expect("status bar");
+        let status_row = status_bar_row(&rendered);
         assert!(status_row.contains(" I · Build ·"), "{rendered}");
         assert!(status_row.contains("deepseek-v4.1-flash"), "{rendered}");
         assert!(status_row.contains("llmgate"), "{rendered}");
@@ -14062,7 +16255,7 @@ mod tests {
         app.git_branch = Some("main".into());
 
         let rendered = render_text(&mut app, 40, 20);
-        let bar = rendered.lines().last().expect("status bar");
+        let bar = status_bar_row(&rendered);
         assert!(bar.contains("/tmp · main"), "{bar}");
         assert!(bar.contains("Build ·"), "{bar}");
         assert!(UnicodeWidthStr::width(bar) <= 40, "{bar}");
@@ -14144,7 +16337,7 @@ mod tests {
             .iter()
             .rposition(|line| line.contains('╰'))
             .expect("prompt bottom");
-        let status_bar = lines.last().expect("status bar");
+        let status_bar = status_bar_row(&empty);
         assert!(!lines[top_border].contains("~/git/eix"), "{empty}");
         assert!(!lines[prompt_bottom - 1].contains(" I "), "{empty}");
         assert!(!lines[prompt_bottom - 1].contains("Build"), "{empty}");
@@ -14179,26 +16372,26 @@ mod tests {
         // already shows the session name.
         app.status = "attached".into();
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().last().expect("status bar row");
+        let bar = status_bar_row(&text);
         assert!(!bar.contains("attached"), "{bar}");
         assert!(!bar.contains("status test"), "{bar}");
 
         app.status = "connected to eixd 0.1.0".into();
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().last().expect("status bar row");
+        let bar = status_bar_row(&text);
         assert!(!bar.contains("connected"), "{bar}");
 
         // The spinner/status glyph already conveys idle/running.
         for hidden in ["idle", "running"] {
             app.status = hidden.into();
             let text = render_text(&mut app, 80, 20);
-            let bar = text.lines().last().expect("status bar row");
+            let bar = status_bar_row(&text);
             assert!(!bar.contains(hidden), "{bar}");
         }
 
         app.status = "retrying 2/5".into();
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().last().expect("status bar row");
+        let bar = status_bar_row(&text);
         assert!(bar.contains("Build ·"), "{bar}");
         assert!(bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");
@@ -14224,7 +16417,7 @@ mod tests {
         // The mode badge follows the active context, not the editor buffer.
         app.focus = Focus::Transcript;
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().last().expect("status bar row");
+        let bar = status_bar_row(&text);
         assert!(bar.trim_start().starts_with("N · Build ·"), "{text}");
     }
 
@@ -14242,7 +16435,7 @@ mod tests {
         app.alert_at = Some(Instant::now());
 
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().last().expect("status bar row");
+        let bar = status_bar_row(&text);
         let alert = bar
             .find("worker · awaiting approval")
             .expect("center alert");
@@ -14254,7 +16447,7 @@ mod tests {
         // expires the session status and model context come back.
         app.alert_at = Some(Instant::now() - ALERT_DISPLAY);
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().last().expect("status bar row");
+        let bar = status_bar_row(&text);
         assert!(!bar.contains("worker · awaiting approval"), "{bar}");
         assert!(bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");

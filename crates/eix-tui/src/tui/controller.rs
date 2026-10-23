@@ -94,6 +94,11 @@ pub enum Command {
     DeleteSession {
         session_id: String,
     },
+    /// Delete a session only when it has no events and no draft. Used when a
+    /// pane created for a fresh session is closed without any input.
+    DeleteSessionIfEmpty {
+        session_id: String,
+    },
     /// Fetch recent turns/tool calls for the status line.
     TimelineData {
         session_id: String,
@@ -103,6 +108,9 @@ pub enum Command {
     RunShell {
         session_id: String,
         command: String,
+        /// Insert the command's output into the prompt instead of only showing
+        /// it in the transcript/status line (`:r!`).
+        insert_output: bool,
     },
     /// Read the model-managed task list.
     ListTodos {
@@ -179,6 +187,15 @@ pub enum Command {
         /// Daemon provider (`files`, `worktrees`, `branches`, `context`).
         kind: String,
     },
+    /// Fetch the selected row's content for the picker preview pane.
+    PickerPreview {
+        /// Preview provider (`files` or `sessions`).
+        kind: String,
+        /// Workspace context for file previews.
+        session_id: Option<String>,
+        /// Workspace-relative file path or target session id.
+        value: String,
+    },
     DraftGet {
         session_id: String,
     },
@@ -223,6 +240,7 @@ impl Command {
             Self::ReloadConfig => "reload",
             Self::ArchiveSession { .. } => "archive",
             Self::DeleteSession { .. } => "delete",
+            Self::DeleteSessionIfEmpty { .. } => "delete",
             Self::TimelineData { .. } => "timeline",
             Self::ListTodos { .. } => "todos",
             Self::RunShell { .. } => "shell",
@@ -242,6 +260,7 @@ impl Command {
             Self::Rewind { .. } => "rewind",
             Self::Search { .. } => "search",
             Self::PickerData { .. } => "picker",
+            Self::PickerPreview { .. } => "picker preview",
             Self::DraftGet { .. } => "draft",
             Self::DraftSet { .. } => "draft",
             Self::PatchGet { .. } => "patch",
@@ -309,6 +328,12 @@ pub enum Event {
         kind: String,
         items: Vec<eix_core::PickerItem>,
     },
+    PickerPreview {
+        kind: String,
+        value: String,
+        text: Option<String>,
+        error: Option<String>,
+    },
     Models {
         models: Vec<eix_core::ModelInfo>,
         warnings: Vec<String>,
@@ -326,6 +351,7 @@ pub enum Event {
     ShellRan {
         ok: bool,
         output: String,
+        insert_output: bool,
     },
     Draft {
         session_id: String,
@@ -604,6 +630,19 @@ async fn dispatch(
                 .await?;
             send(events, Event::Deleted(session_id))
         }
+        Command::DeleteSessionIfEmpty { session_id } => {
+            let result = requester
+                .request(
+                    "session.delete_if_empty",
+                    json!({ "session_id": &session_id }),
+                )
+                .await?;
+            if result.get("deleted").and_then(Value::as_bool) == Some(true) {
+                send(events, Event::Deleted(session_id))
+            } else {
+                Ok(())
+            }
+        }
         Command::TimelineData { session_id, limit } => {
             let value = requester
                 .request(
@@ -617,6 +656,7 @@ async fn dispatch(
         Command::RunShell {
             session_id,
             command,
+            insert_output,
         } => {
             let value = requester
                 .request(
@@ -630,6 +670,7 @@ async fn dispatch(
                 Event::ShellRan {
                     ok: result.ok,
                     output: result.output,
+                    insert_output,
                 },
             )
         }
@@ -889,6 +930,45 @@ async fn dispatch(
                     items: result.items,
                 },
             )
+        }
+        Command::PickerPreview {
+            kind,
+            session_id,
+            value,
+        } => {
+            let request = requester
+                .request(
+                    "picker.preview",
+                    json!({
+                        "kind": &kind,
+                        "session_id": &session_id,
+                        "value": &value,
+                    }),
+                )
+                .await;
+            match request {
+                Ok(response) => {
+                    let result: eix_core::PickerPreviewResult = decode(response)?;
+                    send(
+                        events,
+                        Event::PickerPreview {
+                            kind: result.kind,
+                            value: result.value,
+                            text: Some(result.text),
+                            error: None,
+                        },
+                    )
+                }
+                Err(err) => send(
+                    events,
+                    Event::PickerPreview {
+                        kind,
+                        value,
+                        text: None,
+                        error: Some(format!("{err:#}")),
+                    },
+                ),
+            }
         }
         Command::DraftGet { session_id } => {
             let value = requester

@@ -2,8 +2,9 @@
 //!
 //! DESIGN.md §8 describes one unified `query → filter → preview → action`
 //! overlay with pluggable providers. The daemon owns the providers that need
-//! workspace access; frontends ask for rows with `picker.query` and add their
-//! own fuzzy filtering and previews.
+//! workspace access; frontends ask for rows with `picker.query`, fetch the
+//! selected row's body with `picker.preview`, and add their own fuzzy filtering
+//! and actions.
 //!
 //! Providers today: `files` (workspace paths), `worktrees` and `branches` (git),
 //! and `context` (the session's ledger). Frontends may also synthesize rows
@@ -22,6 +23,8 @@ pub const KIND_WORKTREES: &str = "worktrees";
 pub const KIND_BRANCHES: &str = "branches";
 /// Provider name for the session's context-ledger entries.
 pub const KIND_CONTEXT: &str = "context";
+/// Preview provider name for a session's recent conversation.
+pub const KIND_SESSION_PREVIEW: &str = "sessions";
 
 /// Every provider the daemon answers for `picker.query`.
 pub const DATA_KINDS: [&str; 4] = [KIND_FILES, KIND_WORKTREES, KIND_BRANCHES, KIND_CONTEXT];
@@ -92,4 +95,29 @@ pub struct PickerParams {
 pub struct PickerResult {
     pub kind: String,
     pub items: Vec<PickerItem>,
+}
+
+/// Request a lazy preview for one picker row. The list query only sends paths
+/// and metadata; previews are fetched on selection so large files and long
+/// session histories never inflate the initial payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickerPreviewParams {
+    /// Preview provider: `files` or [`KIND_SESSION_PREVIEW`].
+    pub kind: String,
+    /// Workspace context for `files`. Sessions previews use `value` instead.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// Row value: workspace-relative file path or target session id.
+    pub value: String,
+    /// Optional line/event cap for providers that support paging.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PickerPreviewResult {
+    pub kind: String,
+    pub value: String,
+    /// Plain text for the picker's right pane.
+    pub text: String,
 }

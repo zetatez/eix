@@ -149,12 +149,12 @@ impl Provider {
         let client = reqwest::Client::builder()
             .user_agent(format!("eix/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(config.provider.timeout_secs))
+            .timeout(Duration::from_secs(config.provider_runtime.timeout_secs))
             .build()
             .map_err(|e| ProviderError::Http(e.to_string()))?;
         Ok(Self {
             client,
-            model: config.provider.model.clone(),
+            model: config.default_model().to_string(),
             redaction_salt: uuid::Uuid::new_v4().to_string(),
         })
     }

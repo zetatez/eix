@@ -28,9 +28,8 @@ pub use config::{
     load_cli_config, models_endpoint, theme_preset, ApprovalMode, CliConfig, CompatConfig, Config,
     ConfigError, ContextConfig, FormatterConfig, FormattersConfig, ImagesConfig, LspConfig,
     LspServerConfig, McpConfig, McpServerConfig, ModelConfig, ModelInfo, ModelRoute,
-    NamedProviderConfig, NotificationsConfig, PermissionAction, PermissionRule, ProviderConfig,
-    ProviderSource, RuleSource, SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolsConfig,
-    THEME_PRESETS,
+    NotificationsConfig, PermissionAction, PermissionRule, ProviderConfig, ProviderSource,
+    RuleSource, SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
@@ -45,8 +44,8 @@ pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, ImagePart, Role, ToolCall, ToolDefinition, Usage,
 };
 pub use picker::{
-    is_data_kind, PickerItem, PickerParams, PickerResult, DATA_KINDS, KIND_BRANCHES, KIND_CONTEXT,
-    KIND_FILES, KIND_WORKTREES,
+    is_data_kind, PickerItem, PickerParams, PickerPreviewParams, PickerPreviewResult, PickerResult,
+    DATA_KINDS, KIND_BRANCHES, KIND_CONTEXT, KIND_FILES, KIND_SESSION_PREVIEW, KIND_WORKTREES,
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{

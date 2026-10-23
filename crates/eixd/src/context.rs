@@ -1194,7 +1194,7 @@ fn cap_instruction(text: String) -> String {
 }
 
 /// Keep the system prompt inside a fixed share of the request budget. A custom
-/// `[provider].system_prompt` can otherwise be the one sector that makes every
+/// `provider_runtime.system_prompt` can otherwise be the one sector that makes every
 /// request overflow before any history is even considered.
 fn cap_system(text: String, budget_tokens: usize) -> String {
     let max_tokens = (budget_tokens / 4).max(256);

@@ -43,6 +43,11 @@ echo 'review the diff' | ./target/debug/eix send
 客户端断开或退出不会取消正在运行的 turn；重新启动 TUI、`eix chat` 或 `eix send` 且没有
 指定 `--session` 时，会优先 attach 当前目录最近更新的 user session，当前目录没有 session
 则新建一个。`eix log` 等只读子命令找不到当前目录 session 时仍回退到最近 session。
+
+未手动命名的 session 在前两轮对话完成后，daemon 会让模型总结这段对话并生成一个短标题；
+标题只保留 Unicode 字母/数字，最多 32 个字符，自动去掉空格和标点（英文词转 CamelCase），
+然后通过 `session.updated` 更新 TUI pane 标题和 tab。手动 `eix rename` / TUI 重命名会阻止
+自动覆盖；模型失败时使用首条 prompt 派生的本地标题。
 socket 在 Linux / Arch 默认 `$XDG_RUNTIME_DIR/eix.sock`；macOS 没有 XDG runtime dir，回退到
 `~/Library/Caches/eix/eix.sock`（其他没有 runtime dir 的平台回退到 `~/.cache/eix/eix.sock`）。
 数据默认 `~/.local/share/eix/`（SQLite + `eixd.log`）。可以用 `EIX_SOCKET` / `--socket` 覆盖。
@@ -51,15 +56,36 @@ socket 在 Linux / Arch 默认 `$XDG_RUNTIME_DIR/eix.sock`；macOS 没有 XDG ru
 
 ```toml
 # ~/.config/eix/config.toml
-[provider]
+# 所有 OpenAI 兼容 provider 放在同一张表里；恰好一个标记 default = true。
+# 表名就是 /model 里的 provider 前缀，默认 provider 的名字不要求是 "default"。
+[providers.openai]
+default = true
+name = "OpenAI"               # 可选显示名
 base_url = "https://api.openai.com/v1"
-model = "gpt-4o-mini"
+model = "gpt-4o-mini"          # 默认模型的全局 fallback
 api_key_env = "OPENAI_API_KEY"
-timeout_secs = 300
-retry_attempts = 8            # 首次失败后的自动重试次数；0 关闭
-retry_base_ms = 250           # 抖动指数退避起点
-retry_max_secs = 60           # 单次等待上限（也限制 Retry-After）
+
+# provider 运行参数单独配置，不放在 provider 表里。
+[provider_runtime]
+timeout_secs = 300             # 单次请求/流式响应超时
+retry_attempts = 8             # 首次失败后的自动重试次数；0 关闭
+retry_base_ms = 250            # 抖动指数退避起点
+retry_max_secs = 60            # 单次等待上限（也限制 Retry-After）
+# context_tokens = 128000      # 默认模型上下文窗口
 # system_prompt = "..."
+
+# 额外 provider（可选）。/model 会自动请求每个 provider 的 GET /models，
+# 选择 id 为 "<provider>/<api-model-id>"；模型 id 里的 "/" 会保留。
+[providers.openrouter]
+name = "OpenRouter"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.local]
+base_url = "http://localhost:11434/v1"
+# api_key 或 api_key_env 可选；本地端点通常不需要。
+# provider 表名不能包含 "/"、"#" 或空白；default 标记只能出现一次。
+# 旧的单表 [provider] 会自动迁移为 [providers.default]（default = true）。
 
 [notifications]
 # command = "notify-send eix \"$EIX_SESSION_NAME $EIX_STATUS\""
@@ -82,19 +108,6 @@ opencode = false               # ~/.config/opencode + 项目 .opencode：skills 
 codex_cli = false              # $CODEX_HOME + 项目 .codex：skills / prompts / AGENTS.md
 gemini_cli = false             # ~/.gemini + 项目 .gemini：skills / commands(.toml) / agents / GEMINI.md
 pi = false                     # $PI_CODING_AGENT_DIR + 项目 .pi：skills / prompts / AGENTS.md / CLAUDE.md
-
-# 额外 provider（可选）。/model 会自动请求每个 provider 的 GET /models，
-# 选择 id 为 "<provider>/<api-model-id>"；模型 id 里的 "/" 会保留。
-# [provider] 的自动项使用 "default/<api-model-id>"，默认模型仍排在第一位。
-[providers.openrouter]
-name = "OpenRouter"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
-
-[providers.local]
-base_url = "http://localhost:11434/v1"
-# api_key 或 api_key_env 可选；本地端点通常不需要
-# provider 名不能是 default，也不能包含 "/"、"#" 或空白。
 
 # 手动固定的模型（可选）。适合给模型补充成本、上下文或 variants，
 # 也可用 provider 复用 [providers.*] 的 endpoint/key。
@@ -222,9 +235,15 @@ ask 写入、以及 `run_command` 的写操作仍在审批处阻塞（shell 无�
 （见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：
 默认 3 行内容 + 上下边框（共 5 行，长草稿最多 10 行内容 / 12 行总高）；正文左侧留 1 格内边距，
 底边保持普通边框；输入框下方是一行 statusline，左侧依次显示
-`N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning`，右侧靠右显示
-`cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数以及 pane/队列/attention 计数在空间允许时
+`N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning`（命令行激活时模式徽标显示 `C`），
+右侧靠右显示 `cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数以及 pane/队列/attention 计数在空间允许时
 显示在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用中间区域（约 8 秒）。
+终端高度足够时，statusline 下方常驻一行空白命令行；normal 模式按 `:` 激活并显示 `:` 前缀：
+`Enter` 执行；`Esc` 先收起命令菜单并保留已输入内容，再按一次关闭命令行；`↑`/`↓` 浏览历史，`Tab` 显示匹配命令并补全首个命令；菜单打开后
+`Ctrl-J`/`Ctrl-K` 或 `Ctrl-N`/`Ctrl-P` 上下选择匹配项，`Enter` 执行选中项；它接受与 `/命令` 相同的名字，并支持 `:q`（关闭 pane）、
+`:qa`（退出）、`:w`（保存草稿）、`:wq` / `:x`（保存并关闭）。`:!<cmd>` 直接在当前
+session 执行 shell；`:r!<cmd>`（也接受 `:r !<cmd>`）把命令输出插入当前输入框。两者都走
+与 prompt `!` 相同的沙箱、快照和只读限制。
 
 ## TUI（v1）
 
@@ -242,14 +261,16 @@ ask 写入、以及 `run_command` 的写操作仍在审批处阻塞（shell 无�
 `tabby`（输入框上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个**活跃队列**：pane 1 是当前工作槽位；turn 完成或
 session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；
-给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。
+给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。点击或切换到某个 pane 后，
+在转录区或输入框 normal 模式按 `Enter` 可把它手动提升到第一位，并继续保持焦点。
 `Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session；在 `tabby` 布局下就是切换到第 N 个 tab
 （输入框内也可用）。终端需要支持 kitty 键盘协议才能完整区分这些组合键；不支持时可用
 `Alt-1` … `Alt-9`。`Ctrl-7` 在部分终端等价于 `Ctrl-/`，会打开模型 picker；第 7 个
-session 请用 `Alt-7`。
+session 请用 `Alt-7`。在转录区或输入框 normal 模式下，1 秒内连续按两次 `Ctrl-W` 会聚焦
+下一个 pane；已经是最后一个时回绕到第一个。
 
-历史 session 不再占用左侧栏：按 `<Space>s` 打开浮动 picker，输入即模糊搜索，`Enter` 选择、
-`Esc` 关闭。输入框只保留正文和边框；下方 statusline 左侧按
+历史 session 不再占用左侧栏：按 `Ctrl-G`（或 `/sessions`）打开浮动 picker，输入即模糊搜索、
+`Enter` 选择、`Esc` 关闭。输入框只保留正文和边框；下方 statusline 左侧按
 `N/I/V/VL · Build/Plan · 状态 · 模型 · provider · reasoning` 排列，右侧靠右显示
 `cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数、pane/队列/attention 计数在空间允许时
 出现在中部或右侧；后台提醒会临时占用中间区域。
@@ -272,23 +293,28 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | 键 | 行为 |
 | --- | --- |
 | 鼠标左键 / 滚轮 | 聚焦 pane；点击 `Thinking` / 工具块折叠或展开；拖拽选择转录文本并在松开时自动复制，右上角短暂显示 `Copied N chars`；滚轮滚动转录 |
-| `i` / `Enter` / `<Space>i` | 聚焦输入框（进入 insert 模式） |
+| `i` / `<Space>i` | 聚焦输入框（进入 insert 模式） |
 | `Esc` / `Esc Esc` | 单次 `Esc` 回到 normal 模式并**保持输入框焦点**（不计数）；normal 模式下 500ms 内连按两次：有 turn 在跑时中断它，否则回到转录区 |
-| `Enter` | 发送到聚焦 pane（仅 insert 模式）；turn 还在跑时自动排队，结束后按顺序发出 |
+| `:`（normal 模式） | 激活 statusline 下方的常驻命令行；按 `Tab` 才显示匹配命令列表并补全首个命令，普通输入不弹窗；菜单中 `Ctrl-J`/`Ctrl-K`、`Ctrl-N`/`Ctrl-P` 上下选择，`Enter` 执行选中项；菜单打开时 `Esc` 先收起菜单并保留输入，再按一次退出命令行回到 normal，`↑`/`↓` 历史；支持所有 `/命令` 名以及 `:q` / `:qa` / `:w` / `:wq` / `:x`；`:!cmd` 直接执行 shell，`:r!cmd` 把输出插入输入框 |
+| `/` / `?` / `#`（normal 模式） | 打开带对应前缀的命令行：`/xxx` 在当前 session 对话中向后搜索，`?xxx` / `#xxx` 向后搜索；`n` / `N` 跳到下一个/上一个匹配，`Esc` 清除高亮 |
+| `F1` / `/help` | 打开可搜索的帮助/按键参考；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭 |
+| `Enter` | insert 模式：发送到聚焦 pane（turn 还在跑时自动排队，结束后按顺序发出）；转录区或输入框 normal 模式：把当前聚焦 pane 提升到第一位并保持聚焦 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
 | `Tab` | normal 模式与转录区：在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
-| `<Space>s` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
+| `Ctrl-G` | session picker：切换聚焦 pane 的 session，右侧实时预览该 session 的最近对话（输入框内外都可用） |
 | `Ctrl-T` | 快速轮换推理强度：low → medium → high → 空 → low（默认 medium，输入框内外都可用） |
 | `Ctrl-/` | 打开可搜索的模型 picker：输入筛选、`Enter` 切换、`Esc` 关闭（输入框内外都可用；部分终端为 `Ctrl-_` / `Ctrl-7`） |
-| `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
+| `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane），右侧实时预览最近对话 |
+| `<Space>f` | 文件 picker：搜索 workspace 文件，右侧实时预览文件内容，选中后插入 `@相对路径` |
 | `Ctrl-P` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
 | `<Space>w` | worktree picker：选中后把路径插入聚焦 pane 的输入框 |
 | `<Space>b` | branch picker：选中后把分支名插入输入框 |
 | `@`（输入框内） | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发） |
 | `<Space>A` | 跳到下一个需要 attention 的 pane（审批/错误） |
 | `Shift+,` / `Shift+.` | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式） |
+| `Ctrl-W` `Ctrl-W` | 1 秒内连续按两次：聚焦下一个 pane，最后一个回绕到第一个（转录区与输入框 normal 模式） |
 | `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
 | `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用；`Ctrl-7` 可能用于模型 picker） |
 | `Alt-1` … `Alt-9` | 同上；用于终端无法区分 `Ctrl-1…9` 的情况 |
@@ -305,17 +331,20 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `<Space>C` | context ledger：`j/k` 移动、`o` 展开、`p` pin、`d` drop/恢复、`m` 标记、`s` 压缩（单条或 mark 到光标的范围）、`f` fork、`w` rewind 并回滚工作区、`Esc` 关闭 |
 | `<Space>p` | 后台进程：`j/k` 选择、`x` kill、`r` 刷新、`PgUp`/`PgDn` 滚动输出、`Esc` 关闭 |
 | `<Space>F` | fork 当前 session；在 git 仓库里自动建 worktree，仓库外共享工作区 |
-| `#` | 全文搜索历史消息：输入查询回车执行，`↑/↓` 选择，再回车打开对应 session |
+| `:history` / `Ctrl-P` | 打开跨 session 聊天记录搜索：输入 query 回车搜索，`↑/↓` 选择，再回车打开对应 session |
 | `<Space>x` | 取消聚焦 pane 的 turn |
 | `j` / `k` / `PgUp` / `PgDn` | 转录区聚焦时滚动；输入框 normal 模式下 `j`/`k` 是草稿内行移动，`Ctrl-J`/`Ctrl-K` 浏览已提交的 prompt 历史 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
-| `?` / `F1` | 帮助（F1 任意位置可用）；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭 |
+| `F1` / `/help` | 帮助（F1 任意位置可用）；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭；`/`、`?`、`#` 在 normal 模式打开命令行 |
 | `Z` / `Ctrl-C` / `Ctrl-D` | 退出 eix TUI（任意模式；退出前会保存当前草稿） |
 
 ### prompt 命令
 
 在输入框里把 `/命令` 作为整条消息发送（不会传给模型）。输入 `/` 时会在输入框上方弹出
 补全菜单：`↑`/`↓` 或 `Ctrl-N`/`Ctrl-P` 选择，`Tab` 补全，`Enter` 直接执行。
+normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`），并保留当前草稿；另外提供
+`:q` / `:q!`（关闭 pane）、`:qa` / `:qa!`（退出）、`:w`（保存草稿）、`:wq` / `:x`（保存并关闭）、
+`:!<cmd>`（直接执行 shell）和 `:r!<cmd>` / `:r !<cmd>`（读取输出并插入输入框）。
 
 | 命令 | 行为 |
 | --- | --- |
@@ -336,12 +365,12 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/history` | 打开全文历史搜索弹窗 |
 | `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
 | `/attention` / `/cancel` / `/toggle-agent` | 跳到下一个需要 attention 的 pane / 取消运行 / 切换 Build·Plan |
-| `/model [id]` | 打开可搜索的模型 picker：合并 `[provider]`、`[providers.*]` 自动拉取的 `/models` 和 `[[models]]`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
+| `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `[providers.*]` 自动拉取的 `/models` 和 `[[models]]`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
 | `/commands` | 从磁盘重新加载自定义 Markdown 命令 |
 | `/reload` | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC） |
-| `/theme` | 打开主题 picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原主题 |
+| `/colorscheme` | 打开 colorscheme picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原配色 |
 | `/skills [name] [args]` | 打开 skill picker（右侧预览正文）；带名字时把正文放进输入框并展开 `$ARGUMENTS` / `$1..$9` |
 | `/todos` | 打开任务列表 picker（搜索任务，显示状态和详情；内存态，daemon 重启后清空） |
 | `/image <path>` | 把图片挂到下一条 prompt（png / jpg / gif / webp，最多 4 张、每张 8 MB）；不带参数时显示已挂图片，`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI |
@@ -512,8 +541,8 @@ resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server �
 在 turn 运行时会被拒绝，先 `Esc Esc` 中断（或按 `<Space>x`）再执行。
 
 **转录区不响应裸字母快捷键**：动作一律走 `<Space>` leader（见下），但 `i` 仍用于聚焦
-输入框并进入 insert 模式；`j`/`k` 等导航键和 `?`/`#` 等标点键也保留。输入框聚焦时（normal 模式）单字母是 vim 命令，TUI 动作同样用
-leader；`?`、`#`、翻页/滚动和 `[keys]` 绑定也与转录区一致，只有输入框自己的
+输入框并进入 insert 模式；`j`/`k` 等导航键和 `/`/`?`/`#` 等搜索入口也保留。输入框聚焦时（normal 模式）单字母是 vim 命令，TUI 动作同样用
+leader；`/`、`?`、`#` 当前对话搜索、翻页/滚动和 `[keys]` 绑定也与转录区一致，只有输入框自己的
 vim 编辑键（如 `j`/`k` 行移动、`Tab` 切换 Build/Plan）保留编辑器语义。
 转录区动作可以通过 `[keys]` 覆盖，但裸字母会被忽略，请用 `C-`/`A-` 修饰键或
 命名键，例如 `sessions = "C-t"`、`new_session = "C-n"`、`help = "F2"`。可用动作：`quit`、`help`、`new_session`、
@@ -524,12 +553,13 @@ vim 编辑键（如 `j`/`k` 行移动、`Tab` 切换 Build/Plan）保留编辑�
 `F1`..`F12` 以及 `C-` / `S-` / `A-` 修饰符；裸字母会被忽略，标点键（如 `?`、`#`）可用。
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
-所有 picker 共用同一个 overlay：上方输入框做模糊过滤，左侧是候选列表，右侧是预览
-（session 显示 id/status/cwd/worktree/permission/model；文件、worktree、branch、context
-显示 daemon 给出的详情；skills 显示来源、allowed-tools 和正文）。files / worktrees /
-branches / context 由 daemon 的 `picker.query` 提供，其余（sessions、命令面板、skills）在
-客户端生成。历史 session 不在左侧栏
-常驻，只通过这个浮动 picker 打开（`<Space>s`）。
+所有 picker 共用同一个 overlay：上方输入框做模糊过滤，左侧是候选列表，右侧是预览。
+files picker 会按当前选择读取文件内容（带行号，超长自动截断）；sessions picker 会按当前
+选择读取该 session 的最近对话事件，并在右侧显示最新的 you / assistant / tool / error 记录。
+worktree、branch、context 显示 daemon 给出的详情；skills 显示来源、allowed-tools 和正文。
+files / worktrees / branches / context 由 daemon 的 `picker.query` 提供，预览由
+`picker.preview` 懒加载，其余（sessions、命令面板、skills）在客户端生成。历史 session 不在左侧栏
+常驻，只通过这个浮动 picker 打开（`Ctrl-G` / `/sessions`）。
 
 输入框是自研的 Vim 风格编辑器（不再内嵌 Neovim 进程，输入零往返延迟）。外框使用透明背景的
 圆角边框，跟随主题的 `background`（未设置时用终端背景），默认 3 行内容 + 上下边框（共 5 行，
@@ -549,10 +579,11 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
 - 浏览历史：normal 模式下 `Ctrl-K` / `Ctrl-J` 在已提交的 prompt 之间上下浏览（更早 / 更新）；
   越过最新一条会恢复当前草稿。`j`、`k`、`3j`、`dj`、方向键是草稿内的行移动
 - 模式切换：输入框 normal 模式与转录区都可用 `Tab` 在 Build / Plan 之间切换；Plan 只读，Build 可执行工具
-- `Enter` 只在 insert 模式提交；turn 运行中提交的内容自动排队（`/queue` 查看，`Esc Esc` 中断当前 turn）
+- `Enter` 在 insert 模式提交；turn 运行中提交的内容自动排队（`/queue` 查看，`Esc Esc` 中断当前 turn）。
+  转录区或输入框 normal 模式按 `Enter` 会把当前聚焦 pane 提升到第一位
 
-TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：`<Space>s` session
-picker、`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
+TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：
+`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
 （`<Space>c` 关闭当前 pane）、`<Space>f` 文件、
 `<Space>w`/`b` worktree/分支、`<Space>C` ledger、`<Space>h` 历史、
 `<Space>p` 进程、`<Space>R` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
@@ -560,9 +591,12 @@ picker、`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>a` 或
 `Ctrl-P` 命令面板。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
 除此之外，裸字母 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
+
+新建 session 后如果既没有提交内容、也没有保留草稿就退出，空 session 会从历史列表删除；
+有草稿的 session 会保留。worktree session 不自动删除，避免误删工作区。
 insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
 和 `@`（文件 picker）。所有 picker / 历史搜索都支持 `Ctrl-J`/`Ctrl-K` 或
-`Ctrl-N`/`Ctrl-P`（以及 `↑`/`↓`）上下选择。normal 模式下 `Esc Esc` 先中断运行中的 turn；
+`Ctrl-N`/`Ctrl-P`（以及 `↑`/`↓`）上下选择；`:` 命令菜单打开后也支持这组键。normal 模式下 `Esc Esc` 先中断运行中的 turn；
 空闲时回到转录区。
 输入框默认 3 行内容（加边框共 5 行；终端过矮时优先让给转录区），长草稿最多向上生长到
 10 行内容（总 12 行），再在框内滚动；normal 模式不会让输入框折叠。

@@ -1,19 +1,36 @@
 //! Picker providers served by the daemon.
 //!
 //! The daemon is the only component that knows a session's workspace, so it
-//! answers `picker.query`. Frontends still own fuzzy filtering, previews and
-//! the final action; this module only produces candidate rows.
+//! answers `picker.query` and the lazy `picker.preview` reads. Frontends still
+//! own fuzzy filtering and the final action.
 
 use std::path::Path;
 use std::process::Stdio;
 
-use eix_core::{PickerItem, PickerResult, KIND_BRANCHES, KIND_FILES, KIND_WORKTREES};
+use anyhow::{bail, Context};
+use eix_core::{
+    Config, Event, EventKind, PickerItem, PickerPreviewResult, PickerResult, KIND_BRANCHES,
+    KIND_FILES, KIND_SESSION_PREVIEW, KIND_WORKTREES,
+};
+use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 
 /// Hard ceiling so a huge repository cannot flood the socket.
 const MAX_ROWS: usize = 5_000;
 /// Default when the caller does not ask for a specific count.
 const DEFAULT_ROWS: u32 = 500;
+/// Read at most this much of a file for the picker preview.
+const PREVIEW_BYTES: usize = 64 * 1024;
+/// Keep the right pane from becoming a full-file viewer.
+const PREVIEW_LINES: usize = 400;
+/// Avoid giant single-line files (minified JavaScript, data files, ...).
+const PREVIEW_LINE_CHARS: usize = 400;
+/// Fetch enough recent events to fill a typical preview without replaying a
+/// long session from the beginning.
+const SESSION_PREVIEW_EVENTS: usize = 120;
+/// Cap one message so a single long answer cannot crowd out the rest.
+const SESSION_PREVIEW_TEXT_CHARS: usize = 800;
+const SESSION_PREVIEW_LINES: usize = 400;
 
 fn clamp_rows(limit: Option<u32>) -> usize {
     limit.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS as u32) as usize
@@ -101,6 +118,180 @@ fn walk_files(root: &Path, needle: Option<&str>, limit: usize) -> Vec<PickerItem
     }
     items.sort_by(|left, right| left.value.cmp(&right.value));
     items
+}
+
+/// Read a workspace file for the picker's right pane. The path is resolved
+/// through the same sandbox as `read_file`; the payload is capped so selecting
+/// a huge file cannot stall the UI.
+pub async fn file_preview(
+    cwd: &Path,
+    value: &str,
+    config: &Config,
+    limit: Option<usize>,
+) -> anyhow::Result<PickerPreviewResult> {
+    let path = crate::tools::resolve_path_in(cwd, value, config)
+        .with_context(|| format!("cannot preview {value}"))?;
+    let metadata = tokio::fs::metadata(&path)
+        .await
+        .with_context(|| format!("cannot stat {}", path.display()))?;
+    if !metadata.is_file() {
+        bail!("not a file: {value}");
+    }
+    let file = tokio::fs::File::open(&path)
+        .await
+        .with_context(|| format!("cannot open {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.take((PREVIEW_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .await
+        .with_context(|| format!("cannot read {}", path.display()))?;
+    let truncated = bytes.len() > PREVIEW_BYTES;
+    bytes.truncate(PREVIEW_BYTES);
+    let text = if bytes.iter().take(8192).any(|byte| *byte == 0) {
+        format!("(binary file · {} bytes)", metadata.len())
+    } else {
+        render_file_preview(&String::from_utf8_lossy(&bytes), limit, truncated)
+    };
+    Ok(PickerPreviewResult {
+        kind: KIND_FILES.to_string(),
+        value: value.to_string(),
+        text,
+    })
+}
+
+fn render_file_preview(text: &str, limit: Option<usize>, truncated: bool) -> String {
+    let max_lines = limit.unwrap_or(PREVIEW_LINES).clamp(1, 2_000);
+    let mut out = String::new();
+    let mut shown = 0usize;
+    for (index, line) in text.lines().enumerate() {
+        if index >= max_lines {
+            break;
+        }
+        out.push_str(&format!(
+            "{:>4} │ {}\n",
+            index + 1,
+            truncate_chars(line, PREVIEW_LINE_CHARS)
+        ));
+        shown += 1;
+    }
+    if shown == 0 {
+        out.push_str("(empty file)\n");
+    } else if truncated || text.lines().count() > shown {
+        out.push_str("… [preview truncated]\n");
+    }
+    out.trim_end().to_string()
+}
+
+/// Render the most recent conversation events for a session picker preview.
+/// The TUI shows the tail of this text, so the newest turn stays visible.
+pub fn session_preview(value: &str, events: &[Event], limit: Option<usize>) -> PickerPreviewResult {
+    let max_events = limit.unwrap_or(SESSION_PREVIEW_EVENTS).clamp(1, 500);
+    let mut picked: Vec<&Event> = events
+        .iter()
+        .filter(|event| conversation_text(event).is_some())
+        .collect();
+    if picked.len() > max_events {
+        picked.drain(..picked.len() - max_events);
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    for event in picked {
+        let Some((role, text)) = conversation_text(event) else {
+            continue;
+        };
+        let text = truncate_chars(text.trim(), SESSION_PREVIEW_TEXT_CHARS);
+        if text.is_empty() {
+            continue;
+        }
+        if !lines.is_empty() {
+            lines.push(String::new());
+        }
+        lines.push(format!("{role}:"));
+        let rendered = text.lines().take(16).count();
+        for line in text.lines().take(16) {
+            lines.push(format!("  {line}"));
+        }
+        if rendered < text.lines().count() {
+            lines.push("  …".to_string());
+        }
+    }
+    // Keep the newest part when the conversation is longer than the preview.
+    // The TUI also tails this text, so trimming the oldest lines here preserves
+    // the most relevant turn instead of the beginning of the fetched window.
+    if lines.len() > SESSION_PREVIEW_LINES {
+        lines.drain(..lines.len() - SESSION_PREVIEW_LINES);
+        while lines.first().is_some_and(|line| line.is_empty()) {
+            lines.remove(0);
+        }
+    }
+
+    PickerPreviewResult {
+        kind: KIND_SESSION_PREVIEW.to_string(),
+        value: value.to_string(),
+        text: if lines.is_empty() {
+            "(no conversation yet)".to_string()
+        } else {
+            lines.join("\n")
+        },
+    }
+}
+
+fn conversation_text(event: &Event) -> Option<(&'static str, String)> {
+    match event.kind {
+        EventKind::UserMessage | EventKind::AssistantMessage => {
+            let role = if event.kind == EventKind::UserMessage {
+                "you"
+            } else {
+                "assistant"
+            };
+            Some((
+                role,
+                event.payload.get("text")?.as_str()?.trim().to_string(),
+            ))
+        }
+        EventKind::ToolCall => {
+            let tool = event
+                .payload
+                .get("tool")
+                .or_else(|| event.payload.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let text = match event
+                .payload
+                .get("arguments")
+                .filter(|arguments| !arguments.is_null())
+            {
+                Some(arguments) => crate::tools::summarize(tool, arguments),
+                None => event
+                    .payload
+                    .get("summary")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|summary| format!("{tool} {summary}"))
+                    .unwrap_or_else(|| tool.to_string()),
+            };
+            Some(("tool", text))
+        }
+        EventKind::Error => Some((
+            "error",
+            event
+                .payload
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("error")
+                .to_string(),
+        )),
+        EventKind::ContextCompacted => Some(("context", "compacted".to_string())),
+        _ => None,
+    }
+}
+
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
 }
 
 /// Git worktrees reachable from `cwd`'s repository.
@@ -291,6 +482,98 @@ mod tests {
         let result = files(&dir, None, Some(3)).await;
         assert_eq!(result.items.len(), 3);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn file_preview_reads_the_selected_workspace_file() {
+        let dir = temp_dir("file-preview");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("src/main.rs"), "fn main() {}\nlet x = 1;\n").unwrap();
+
+        let result = file_preview(&dir, "src/main.rs", &Config::default(), Some(1))
+            .await
+            .unwrap();
+        assert_eq!(result.kind, KIND_FILES);
+        assert_eq!(result.value, "src/main.rs");
+        assert!(result.text.contains("1 │ fn main() {}"), "{}", result.text);
+        assert!(result.text.contains("preview truncated"), "{}", result.text);
+        assert!(!result.text.contains("let x = 1"));
+
+        let binary = dir.join("image.bin");
+        std::fs::write(&binary, [0u8, 1, 2, 3]).unwrap();
+        let result = file_preview(&dir, "image.bin", &Config::default(), None)
+            .await
+            .unwrap();
+        assert!(result.text.contains("binary file"), "{}", result.text);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn session_preview_renders_recent_conversation() {
+        let events = vec![
+            Event::new(
+                "s1",
+                1,
+                EventKind::UserMessage,
+                serde_json::json!({ "text": "hello" }),
+            ),
+            Event::new(
+                "s1",
+                2,
+                EventKind::AssistantMessage,
+                serde_json::json!({ "text": "hi there" }),
+            ),
+            Event::new(
+                "s1",
+                3,
+                EventKind::ToolCall,
+                serde_json::json!({
+                    "call_id": "c1",
+                    "tool": "read_file",
+                    "arguments": { "path": "src/a.rs" }
+                }),
+            ),
+        ];
+        let preview = session_preview("s1", &events, None);
+        assert_eq!(preview.kind, KIND_SESSION_PREVIEW);
+        assert_eq!(preview.value, "s1");
+        assert!(preview.text.contains("you:\n  hello"), "{}", preview.text);
+        assert!(
+            preview.text.contains("assistant:\n  hi there"),
+            "{}",
+            preview.text
+        );
+        assert!(
+            preview.text.contains("tool:\n  read_file src/a.rs"),
+            "{}",
+            preview.text
+        );
+
+        let recent = session_preview("s1", &events, Some(1));
+        assert!(!recent.text.contains("you:\n  hello"), "{}", recent.text);
+        assert!(
+            recent.text.contains("tool:\n  read_file src/a.rs"),
+            "{}",
+            recent.text
+        );
+    }
+
+    #[test]
+    fn session_preview_keeps_the_newest_lines_when_it_is_long() {
+        let mut events = Vec::new();
+        for index in 0..60 {
+            let text = format!("message {index}\n{}", "body\n".repeat(8));
+            events.push(Event::new(
+                "s1",
+                index + 1,
+                EventKind::UserMessage,
+                serde_json::json!({ "text": text }),
+            ));
+        }
+        let preview = session_preview("s1", &events, None);
+        assert!(preview.text.contains("message 59"), "{}", preview.text);
+        assert!(!preview.text.contains("message 0\n"), "{}", preview.text);
+        assert!(preview.text.lines().count() <= SESSION_PREVIEW_LINES);
     }
 
     #[test]

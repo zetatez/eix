@@ -1730,7 +1730,7 @@ async fn doctor(cli: &Cli) -> Result<()> {
     let config = Config::load(cli.config_path.as_deref());
     match &config {
         Ok(config) => {
-            println!("model    {}", config.provider.model);
+            println!("model    {}", config.default_model());
             println!("api      {}", config.chat_endpoint());
             println!(
                 "key      {}",
