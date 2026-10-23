@@ -6664,43 +6664,41 @@ already exists, update it in place rather than rewriting it from scratch.";
                 Style::default().fg(muted).bg(panel),
             ));
         }
-        spans.push(Span::styled(" ", Style::default().bg(panel)));
         Line::from(spans)
     }
 
-    /// Secondary statusline context: session name, latest status, worktree and
-    /// pending image count. It is dropped first when the bar gets narrow.
+    /// Secondary statusline context: transient app status, worktree and pending
+    /// image count. It is dropped first when the bar gets narrow.
     fn status_bar_middle(&self) -> Option<Line<'static>> {
         let theme = self.theme;
         let panel = composer_background(theme);
         let muted = composer_muted(theme);
-        let text = composer_text(theme);
         let warn = composer_warn(theme);
         let mut spans = Vec::new();
-        if let Some(session) = self.status_session() {
+        // Lifecycle chatter is redundant here: the pane title already carries
+        // the session name, and the status glyph carries the connection state.
+        let status = self.status.as_str();
+        let show_status = !status.is_empty()
+            && status != "attached"
+            && status != "connecting…"
+            && !status.starts_with("connected to eixd")
+            && status != "idle"
+            && status != "running";
+        if show_status {
             spans.push(Span::styled(
-                session.name.clone(),
-                Style::default()
-                    .fg(text)
-                    .bg(panel)
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
-            let status = if self.status.is_empty() {
-                session.status.as_str()
-            } else {
-                self.status.as_str()
-            };
-            spans.push(Span::styled(
-                status.to_string(),
+                self.status.clone(),
                 Style::default().fg(muted).bg(panel),
             ));
+        }
+        if let Some(session) = self.status_session() {
             if let Some(worktree) = &session.worktree {
                 let name = worktree
                     .file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .unwrap_or_else(|| "worktree".into());
-                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                if !spans.is_empty() {
+                    spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                }
                 spans.push(Span::styled(
                     format!("wt:{name}"),
                     Style::default().fg(warn).bg(panel),
@@ -12799,14 +12797,14 @@ mod tests {
         let build = left(&app);
         assert_eq!(
             build,
-            " I · Build · ○ · deepseek-v4.1-flash · llmgate · high "
+            " I · Build · ○ · deepseek-v4.1-flash · llmgate · high"
         );
 
         app.views[0].session.agent = Some("plan".into());
         let plan = left(&app);
         assert_eq!(
             plan,
-            " I · Plan  · ○ · deepseek-v4.1-flash · llmgate · high "
+            " I · Plan  · ○ · deepseek-v4.1-flash · llmgate · high"
         );
         // Padding Plan to Build's width keeps the status in place.
         assert_eq!(build.len(), plan.len());
@@ -14115,7 +14113,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_session_and_latest_status() {
+    fn status_bar_shows_latest_status() {
         let mut app = App::new(None);
         let mut session = Session::new("s1", "status test", "/tmp");
         session.model = Some("openai/gpt-5".into());
@@ -14123,12 +14121,32 @@ mod tests {
         app.focused = 0;
         app.focus = Focus::Input;
         app.connected = true;
-        app.status = "retrying 2/5".into();
 
+        // Attach/lifecycle chatter stays out of the statusline; the pane title
+        // already shows the session name.
+        app.status = "attached".into();
+        let text = render_text(&mut app, 80, 20);
+        let bar = text.lines().last().expect("status bar row");
+        assert!(!bar.contains("attached"), "{bar}");
+        assert!(!bar.contains("status test"), "{bar}");
+
+        app.status = "connected to eixd 0.1.0".into();
+        let text = render_text(&mut app, 80, 20);
+        let bar = text.lines().last().expect("status bar row");
+        assert!(!bar.contains("connected"), "{bar}");
+
+        // The spinner/status glyph already conveys idle/running.
+        for hidden in ["idle", "running"] {
+            app.status = hidden.into();
+            let text = render_text(&mut app, 80, 20);
+            let bar = text.lines().last().expect("status bar row");
+            assert!(!bar.contains(hidden), "{bar}");
+        }
+
+        app.status = "retrying 2/5".into();
         let text = render_text(&mut app, 80, 20);
         let bar = text.lines().last().expect("status bar row");
         assert!(bar.contains("Build ·"), "{bar}");
-        assert!(bar.contains("status test"), "{bar}");
         assert!(bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");
         // The primary group is ordered Vim mode → agent mode → status → model

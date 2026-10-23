@@ -186,9 +186,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   模型 · provider · reasoning`（模式徽标 `I` 绿 / `N` 蓝 / `V` 琥珀，失焦时降低对比度；
   Build 蓝色、Plan 黄色；idle 显示 `○`，running 显示动画 spinner，其他状态显示符号和状态名；
   Build/Plan 固定 5 列宽，切换时状态不位移）。右侧靠右显示 `cwd（~ 缩写） · git 分支`；
-  session 名、最近状态、worktree/图片数，以及多 pane 时的 `当前/总数`、排队数和 attention 数
-  在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用
-  中间区域。
+  最近状态、worktree/图片数，以及多 pane 时的 `当前/总数`、排队数和 attention 数在空间允许时
+  出现在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用中间区域。
 - 输入框底边保持普通边框，不挂模式徽标，也不堆叠快捷键提示。
 - 正文左侧留 1 格内边距；不再显示 `❯` 输入槽和占位文案，空输入时只保留光标。
 - 视觉选区逐字符判断并反色渲染；终端光标跟随实际字符位置。
@@ -229,8 +228,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   第二个位置，demotion 则留在原槽位等待下一个 session。
 - 不再有独立顶部 header 行，输入框也不再有底部信息行；输入框下方保留一行 statusline，
   左侧按 `N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
-  cwd（`~` 缩写）和 git 分支；session 名、最近状态、worktree/图片数、pane 位置和队列/attention
-  信息在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。
+  cwd（`~` 缩写）和 git 分支；最近状态、worktree/图片数、pane 位置和队列/attention 信息在空间
+  允许时出现在中部或右侧，变窄时优先保留 cwd/branch。
 - 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i`、`Enter` 或 `<Space>i` 聚焦输入并进入 insert。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。

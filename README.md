@@ -223,8 +223,8 @@ ask 写入、以及 `run_command` 的写操作仍在审批处阻塞（shell 无�
 默认 3 行内容 + 上下边框（共 5 行，长草稿最多 10 行内容 / 12 行总高）；正文左侧留 1 格内边距，
 底边保持普通边框；输入框下方是一行 statusline，左侧依次显示
 `N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning`，右侧靠右显示
-`cwd（~ 缩写） · git 分支`；session 名、最近状态、worktree/图片数以及 pane/队列/attention 计数在空间
-允许时显示在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用中间区域（约 8 秒）。
+`cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数以及 pane/队列/attention 计数在空间允许时
+显示在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用中间区域（约 8 秒）。
 
 ## TUI（v1）
 
@@ -251,8 +251,8 @@ session 请用 `Alt-7`。
 历史 session 不再占用左侧栏：按 `<Space>s` 打开浮动 picker，输入即模糊搜索，`Enter` 选择、
 `Esc` 关闭。输入框只保留正文和边框；下方 statusline 左侧按
 `N/I/V/VL · Build/Plan · 状态 · 模型 · provider · reasoning` 排列，右侧靠右显示
-`cwd（~ 缩写） · git 分支`；session 名、最近状态、worktree/图片数、pane/队列/attention 计数
-在空间允许时出现在中部或右侧；后台提醒会临时占用中间区域。
+`cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数、pane/队列/attention 计数在空间允许时
+出现在中部或右侧；后台提醒会临时占用中间区域。
 
 转录区按对话渲染：用户消息和 agent 输出都使用普通文本（左侧 2 空格缩进，不加角色前缀），不再使用气泡；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
@@ -535,8 +535,8 @@ branches / context 由 daemon 的 `picker.query` 提供，其余（sessions、�
 圆角边框，跟随主题的 `background`（未设置时用终端背景），默认 3 行内容 + 上下边框（共 5 行，
 长草稿最多 10 行内容 / 12 行总高）；底边保持普通边框，输入框下方一行 statusline 左侧按
 `N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
-`cwd（~ 缩写） · git 分支`；session 名、最近状态、worktree/图片数以及 pane/排队/attention 计数
-在空间允许时显示在中部或右侧；后台 attention 提醒会临时占用中间区域（约 8 秒）；
+`cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数以及 pane/排队/attention 计数在空间允许时
+显示在中部或右侧；后台 attention 提醒会临时占用中间区域（约 8 秒）；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
