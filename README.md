@@ -275,7 +275,7 @@ session 请用 `Alt-7`。在转录区或输入框 normal 模式下，1 秒内连
 `cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数、pane/队列/attention 计数在空间允许时
 出现在中部或右侧；后台提醒会临时占用中间区域。
 
-转录区按对话渲染：用户消息和 agent 输出都使用普通文本（左侧 2 空格缩进，不加角色前缀），不再使用气泡；agent 的
+转录区按对话渲染：用户消息右对齐，agent 输出左对齐（保留 2 空格缩进）；都使用普通文本、不加角色前缀，也不使用气泡；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
 显示为一行状态徽标（状态点、命令/路径摘要、右侧 `ok` / `running` / `needs approval`），
 展开后用四空格左缩进直接显示参数、side-by-side diff 和输出；diff 左侧是改动前、右侧是改动后，
@@ -333,7 +333,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `<Space>F` | fork 当前 session；在 git 仓库里自动建 worktree，仓库外共享工作区 |
 | `:history` / `Ctrl-P` | 打开跨 session 聊天记录搜索：输入 query 回车搜索，`↑/↓` 选择，再回车打开对应 session |
 | `<Space>x` | 取消聚焦 pane 的 turn |
-| `j` / `k` / `PgUp` / `PgDn` | 转录区聚焦时滚动；输入框 normal 模式下 `j`/`k` 是草稿内行移动，`Ctrl-J`/`Ctrl-K` 浏览已提交的 prompt 历史 |
+| `j` / `k` / `PgUp` / `PgDn` / `Ctrl-B` / `Ctrl-F` | 转录区聚焦时滚动，`Ctrl-B`/`Ctrl-F` 快速向上/向下翻页；输入框 normal 模式以及帮助、选择器、历史搜索、ledger、inbox、进程、diff、timeline、btw 等浮层也支持 `Ctrl-B`/`Ctrl-F` 快速翻页；输入框 normal 模式下 `j`/`k` 是草稿内行移动，`Ctrl-J`/`Ctrl-K` 浏览已提交的 prompt 历史 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
 | `F1` / `/help` | 帮助（F1 任意位置可用）；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭；`/`、`?`、`#` 在 normal 模式打开命令行 |
 | `Z` / `Ctrl-C` / `Ctrl-D` | 退出 eix TUI（任意模式；退出前会保存当前草稿） |

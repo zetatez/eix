@@ -345,8 +345,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 **转录区**
 
-转录按对话渲染：用户消息和 agent 输出都使用普通文本、左对齐并保留 2 空格缩进，不使用气泡，
-不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
+转录按对话渲染：用户消息右对齐，agent 输出左对齐并保留 2 空格缩进；都使用普通文本，
+不使用气泡，也不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
 以 `Thinking` 模块流式展开，turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
 call/approval/patch/result 事件，一行显示状态圆点、命令或路径摘要与右侧状态
 （`ok` / `running` / `needs approval`），展开后用四空格左缩进直接显示参数、输出和 diff；

@@ -1556,6 +1556,8 @@ impl App {
                 let step = if key.code == KeyCode::PageDown { 8 } else { 1 };
                 self.move_help_selection(step);
             }
+            KeyCode::Char('b') | KeyCode::Char('B') if control => self.move_help_selection(-8),
+            KeyCode::Char('f') | KeyCode::Char('F') if control => self.move_help_selection(8),
             KeyCode::Char('p') if control => self.move_help_selection(-1),
             KeyCode::Char('n') if control => self.move_help_selection(1),
             KeyCode::Home => self.help_selected = 0,
@@ -3383,6 +3385,20 @@ impl App {
                         btw.scroll = btw.scroll.saturating_sub(8);
                     }
                 }
+                KeyCode::Char('b') | KeyCode::Char('B')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_sub(8);
+                    }
+                }
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    if let Some(btw) = self.btw.as_mut() {
+                        btw.scroll = btw.scroll.saturating_add(8);
+                    }
+                }
                 _ => {}
             }
             return;
@@ -3397,6 +3413,16 @@ impl App {
                 }
                 KeyCode::PageDown => self.timeline_scroll += 10,
                 KeyCode::PageUp => self.timeline_scroll = self.timeline_scroll.saturating_sub(10),
+                KeyCode::Char('b') | KeyCode::Char('B')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.timeline_scroll = self.timeline_scroll.saturating_sub(10)
+                }
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    self.timeline_scroll += 10
+                }
                 _ => {}
             }
             if let Some(items) = &self.timeline {
@@ -3597,6 +3623,14 @@ impl App {
                 }
                 KeyCode::Char('p') | KeyCode::Char('P') => {
                     self.open_picker(PickerKind::Commands, tx);
+                    return true;
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    self.scroll_focused(-10);
+                    return true;
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.scroll_focused(10);
                     return true;
                 }
                 KeyCode::Char('u') => {
@@ -4600,6 +4634,16 @@ impl App {
             KeyCode::PageUp => {
                 ledger.cursor = ledger.cursor.saturating_sub(10);
             }
+            KeyCode::Char('b') | KeyCode::Char('B')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                ledger.cursor = ledger.cursor.saturating_sub(10);
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                ledger.cursor = (ledger.cursor + 10).min(len.saturating_sub(1));
+            }
             KeyCode::Char('g') => ledger.cursor = 0,
             KeyCode::Char('G') => ledger.cursor = len.saturating_sub(1),
             KeyCode::Char('o') | KeyCode::Enter => {
@@ -4782,6 +4826,20 @@ impl App {
                     inbox.cursor = cursor.saturating_sub(1);
                 }
             }
+            KeyCode::Char('b') | KeyCode::Char('B')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if let Some(inbox) = self.inbox.as_mut() {
+                    inbox.cursor = cursor.saturating_sub(10);
+                }
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if let Some(inbox) = self.inbox.as_mut() {
+                    inbox.cursor = (cursor + 10).min(len.saturating_sub(1));
+                }
+            }
             KeyCode::Char('y') | KeyCode::Char('n') => {
                 let Some(item) = self
                     .inbox
@@ -4854,6 +4912,16 @@ impl App {
             KeyCode::Char('G') => view.scroll = 0,
             KeyCode::PageUp => view.scroll = view.scroll.saturating_add(20),
             KeyCode::PageDown => view.scroll = view.scroll.saturating_sub(20),
+            KeyCode::Char('b') | KeyCode::Char('B')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                view.scroll = view.scroll.saturating_add(20);
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                view.scroll = view.scroll.saturating_sub(20);
+            }
             KeyCode::Char('r') => {
                 let session_id = view.session_id.clone();
                 let _ = tx.send(Command::ProcessList { session_id });
@@ -4904,6 +4972,18 @@ impl App {
                 }
                 KeyCode::Down => {
                     view.move_cursor(1);
+                    None
+                }
+                KeyCode::Char('b') | KeyCode::Char('B')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    view.move_cursor(-10);
+                    None
+                }
+                KeyCode::Char('f') | KeyCode::Char('F')
+                    if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    view.move_cursor(10);
                     None
                 }
                 KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -5002,6 +5082,14 @@ impl App {
                 }
                 KeyCode::Char('k') | KeyCode::Char('p') => {
                     self.move_picker(-1);
+                    return;
+                }
+                KeyCode::Char('b') | KeyCode::Char('B') => {
+                    self.move_picker(-10);
+                    return;
+                }
+                KeyCode::Char('f') | KeyCode::Char('F') => {
+                    self.move_picker(10);
                     return;
                 }
                 _ => {}
@@ -6672,6 +6760,16 @@ already exists, update it in place rather than rewriting it from scratch.";
             }
             KeyCode::PageDown => self.set_diff_scroll(scroll + 10, total),
             KeyCode::PageUp => self.set_diff_scroll(scroll.saturating_sub(10), total),
+            KeyCode::Char('b') | KeyCode::Char('B')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.set_diff_scroll(scroll.saturating_sub(10), total)
+            }
+            KeyCode::Char('f') | KeyCode::Char('F')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                self.set_diff_scroll(scroll + 10, total)
+            }
             KeyCode::Char('g') => self.set_diff_scroll(0, total),
             KeyCode::Char('G') => self.set_diff_scroll(usize::MAX, total),
             _ => {}
@@ -12103,14 +12201,14 @@ mod tests {
         ];
         let view = SessionView::new(session, events);
         let rendered = render_transcript(&view, 40);
-        // No role prefixes; user and agent turns share the left gutter.
+        // No role prefixes; user turns sit right and agent turns sit left.
         assert!(!rendered.contains("you>"));
         assert!(!rendered.contains("eix>"));
         let lines: Vec<&str> = rendered.lines().collect();
         let user = lines.iter().find(|line| line.contains("hi there")).unwrap();
         assert!(
-            user.starts_with("  "),
-            "user turn should be indented: {user:?}"
+            user.starts_with(' ') && user.ends_with("hi there"),
+            "user turn should be right-aligned: {user:?}"
         );
         assert!(lines.iter().any(|line| line.contains("▾ Thinking")));
         // Stored thinking is expanded by default.
@@ -12132,7 +12230,10 @@ mod tests {
         let view = SessionView::new(session, events);
         let rendered = render_transcript(&view, 40);
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines, vec!["  hi there"], "{rendered}");
+        assert_eq!(lines.len(), 1, "{rendered}");
+        assert!(lines[0].ends_with("hi there"), "{rendered:?}");
+        assert!(lines[0].starts_with(' '), "{rendered:?}");
+        assert_eq!(UnicodeWidthStr::width(lines[0]), 38, "{rendered:?}");
         assert!(!rendered.contains('╭'), "{rendered}");
         assert!(!rendered.contains('│'), "{rendered}");
     }
@@ -12191,6 +12292,65 @@ mod tests {
         ));
         app.views[0].events_rev += 1;
         assert!(render_text(&mut app, 60, 12).contains("second turn"));
+    }
+
+    #[test]
+    fn transcript_aligns_user_right_and_agent_left() {
+        let session = Session::new("s1", "align", "/tmp");
+        let events = vec![
+            SessionEvent::new(
+                "s1",
+                1,
+                EventKind::UserMessage,
+                serde_json::json!({ "text": "question" }),
+            ),
+            SessionEvent::new(
+                "s1",
+                2,
+                EventKind::AssistantMessage,
+                serde_json::json!({ "text": "answer", "model": "test" }),
+            ),
+        ];
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(session, events));
+        app.focused = 0;
+        render_text(&mut app, 40, 12);
+
+        let lines = &app.views[0].history_cache.as_ref().unwrap().lines;
+        let user = lines
+            .iter()
+            .find(|line| text_line(line).contains("question"))
+            .expect("user line");
+        let agent = lines
+            .iter()
+            .find(|line| text_line(line).contains("answer"))
+            .expect("agent line");
+        let indent = |line: &Line<'static>| {
+            let text = text_line(line);
+            text.len().saturating_sub(text.trim_start().len())
+        };
+        assert!(
+            indent(user) > indent(agent),
+            "user line should sit right of the agent line: {:?} vs {:?}",
+            text_line(user),
+            text_line(agent)
+        );
+
+        let rendered = render_text(&mut app, 40, 12);
+        let user_x = rendered
+            .lines()
+            .find(|line| line.contains("question"))
+            .and_then(|line| line.find("question"))
+            .expect("rendered user line");
+        let agent_x = rendered
+            .lines()
+            .find(|line| line.contains("answer"))
+            .and_then(|line| line.find("answer"))
+            .expect("rendered agent line");
+        assert!(
+            user_x > agent_x,
+            "user text should render right of agent text: {rendered}"
+        );
     }
 
     #[test]
@@ -14721,6 +14881,8 @@ mod tests {
             vec![KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)],
             vec![KeyEvent::new(KeyCode::Char('#'), KeyModifiers::SHIFT)],
             vec![KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)],
+            vec![KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL)],
+            vec![KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)],
             vec![
                 KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
                 KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
@@ -14768,6 +14930,184 @@ mod tests {
                 "transcript and prompt normal mode disagreed on {keys:?}"
             );
         }
+    }
+
+    #[test]
+    fn prompt_normal_mode_ctrl_b_f_page_the_transcript() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.enter_normal();
+        app.views[0].follow = true;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('f'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.views[0].scroll, 10);
+        assert!(!app.views[0].follow);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.views[0].scroll, 0);
+    }
+
+    #[test]
+    fn ctrl_b_f_page_dialog_overlays() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let control = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+
+        // Help filter results.
+        let mut app = App::new(None);
+        app.open_help();
+        let help_last = help_entry_count("").saturating_sub(1);
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.help_selected, 8.min(help_last));
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.help_selected, 0);
+        app.help = false;
+
+        // Picker rows.
+        app.sessions = (0..15)
+            .map(|i| Session::new(format!("s{i}"), format!("s{i}"), "/tmp"))
+            .collect();
+        app.open_picker(PickerKind::Sessions, &tx);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 10);
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+        app.picker = None;
+
+        // History search hits.
+        let hit = |seq: u64| SearchHit {
+            session_id: format!("s{seq}"),
+            session_name: format!("s{seq}"),
+            seq,
+            role: "user".into(),
+            ts: 0,
+            snippet: format!("hit {seq}"),
+        };
+        app.search_view = Some(SearchView {
+            query: "hit".into(),
+            hits: (0..15).map(hit).collect(),
+            cursor: 0,
+            searching: false,
+            dirty: false,
+        });
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.search_view.as_ref().unwrap().cursor, 10);
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.search_view.as_ref().unwrap().cursor, 0);
+        app.search_view = None;
+
+        // Context ledger entries.
+        let entries = (0..15)
+            .map(|i| ledger_entry(&format!("e{i}"), Sector::History, "user", 10))
+            .collect();
+        app.ledger = Some(LedgerView::new(
+            "s1".into(),
+            ContextLedgerResult {
+                entries,
+                ..Default::default()
+            },
+        ));
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.ledger.as_ref().unwrap().cursor, 10);
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.ledger.as_ref().unwrap().cursor, 0);
+        app.ledger = None;
+
+        // Cross-session approval inbox.
+        app.inbox = Some(InboxView {
+            items: (0..15)
+                .map(|i| InboxItem {
+                    session_id: format!("s{i}"),
+                    session_name: format!("s{i}"),
+                    tool: "run_command".into(),
+                    summary: format!("item {i}"),
+                    kind: PendingKind::Tool,
+                })
+                .collect(),
+            cursor: 0,
+        });
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.inbox.as_ref().unwrap().cursor, 10);
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.inbox.as_ref().unwrap().cursor, 0);
+        app.inbox = None;
+
+        // Background process output.
+        let mut processes = ProcessView::new("s1".into());
+        processes.processes = (0..15)
+            .map(|i| ProcessInfo {
+                id: format!("p{i}"),
+                session_id: "s1".into(),
+                command: format!("cmd {i}"),
+                cwd: "/tmp".into(),
+                pid: i as u32,
+                status: ProcessStatus::Running,
+                exit_code: None,
+                started_ms: 0,
+                ended_ms: None,
+                bytes: 0,
+                truncated: false,
+                log: String::new(),
+            })
+            .collect();
+        processes.scroll = 100;
+        app.process_view = Some(processes);
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.process_view.as_ref().unwrap().scroll, 80);
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.process_view.as_ref().unwrap().scroll, 100);
+        app.process_view = None;
+
+        // Read-only timeline.
+        app.timeline = Some(
+            (0..15)
+                .map(|seq| eix_core::TimelineItem {
+                    seq,
+                    ts: 0,
+                    kind: "user".into(),
+                    preview: format!("event {seq}"),
+                })
+                .collect(),
+        );
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.timeline_scroll, 10);
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.timeline_scroll, 0);
+        app.timeline = None;
+
+        // `/btw` side-question overlay.
+        app.btw = Some(BtwView {
+            session_id: "s1".into(),
+            btw_id: "b1".into(),
+            question: "why?".into(),
+            text: "answer".into(),
+            error: None,
+            done: true,
+            scroll: 0,
+        });
+        app.handle_key(control('f'), &tx);
+        assert_eq!(app.btw.as_ref().unwrap().scroll, 8);
+        app.handle_key(control('b'), &tx);
+        assert_eq!(app.btw.as_ref().unwrap().scroll, 0);
+
+        // Diff review.
+        let mut diff_app = app_with_hunks(
+            (0..20)
+                .map(|i| hunk(i, "@@ -1 +1 @@", &["@@ -1 +1 @@", "-a", "+A"]))
+                .collect(),
+        );
+        diff_app.handle_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE), &tx);
+        assert!(diff_app.diff_view.is_some());
+        diff_app.handle_key(control('f'), &tx);
+        assert_eq!(diff_app.diff_view.as_ref().unwrap().scroll, 10);
+        diff_app.handle_key(control('b'), &tx);
+        assert_eq!(diff_app.diff_view.as_ref().unwrap().scroll, 0);
     }
 
     #[test]

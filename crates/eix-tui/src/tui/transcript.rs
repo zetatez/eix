@@ -501,15 +501,28 @@ fn italic_dim(theme: Theme) -> Style {
         .add_modifier(Modifier::ITALIC)
 }
 
-/// A user turn as ordinary Markdown text, using the same left gutter as agent
-/// output rather than a right-aligned bubble.
+/// Prefix spaces so a line ends at the right edge. The padding stays in the
+/// spans so mouse selection and search use the same coordinates as the screen.
+fn right_align(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let padding = width.saturating_sub(line.width());
+    if padding > 0 {
+        line.spans.insert(0, Span::raw(" ".repeat(padding)));
+    }
+    line
+}
+
+/// A user turn: plain Markdown aligned to the right edge, opposite the
+/// left-aligned agent output. No role prefix or bubble is added.
 fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usize, theme: Theme) {
     for path in images {
         out.push(
-            Line::from(Span::styled(
-                format!("  [image] {path}"),
-                Style::default().fg(theme.comment.unwrap_or(MUTED)),
-            )),
+            right_align(
+                Line::from(Span::styled(
+                    format!("  [image] {path}"),
+                    Style::default().fg(theme.comment.unwrap_or(MUTED)),
+                )),
+                width,
+            ),
             None,
         );
     }
@@ -519,7 +532,7 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
         return;
     }
     for line in markdown::render(text, width.max(1), theme) {
-        out.push(line, None);
+        out.push(right_align(line, width), None);
     }
     out.blank();
 }
@@ -724,7 +737,10 @@ fn queued_prompt(out: &mut Transcript, text: &str, width: usize, theme: Theme) {
             Span::raw(" ".repeat(prefix_width))
         };
         out.push(
-            Line::from(vec![lead, Span::styled(segment, dim(theme))]),
+            right_align(
+                Line::from(vec![lead, Span::styled(segment, dim(theme))]),
+                width,
+            ),
             None,
         );
     }
