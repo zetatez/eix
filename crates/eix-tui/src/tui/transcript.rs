@@ -113,10 +113,11 @@ pub fn render(
     folds: &HashMap<FoldId, bool>,
     width: usize,
     theme: Theme,
+    tick: u64,
 ) -> Transcript {
     let tail_width = width.saturating_sub(2).max(1);
     let mut out = render_history(events, folds, width, theme);
-    append_tail(&mut out, live, queued, folds, tail_width, theme);
+    append_tail(&mut out, live, queued, folds, tail_width, theme, tick);
     out
 }
 
@@ -142,13 +143,14 @@ pub fn render_tail(
     folds: &HashMap<FoldId, bool>,
     width: usize,
     theme: Theme,
+    tick: u64,
 ) -> Transcript {
     let width = width.saturating_sub(2).max(1);
     let mut out = Transcript {
         lines: Vec::new(),
         slots: Vec::new(),
     };
-    append_tail(&mut out, live, queued, folds, width, theme);
+    append_tail(&mut out, live, queued, folds, width, theme, tick);
     out
 }
 
@@ -199,6 +201,18 @@ fn render_blocks(
     out
 }
 
+/// One dot phase every other 200ms tick, so the placeholder cycles `.`, `..`,
+/// `...` at a readable pace instead of flickering on every redraw.
+const WAITING_DOT_TICKS: u64 = 2;
+
+fn waiting_dots(tick: u64) -> &'static str {
+    match (tick / WAITING_DOT_TICKS) % 3 {
+        0 => ".",
+        1 => "..",
+        _ => "...",
+    }
+}
+
 fn append_tail(
     out: &mut Transcript,
     live: Option<Live<'_>>,
@@ -206,6 +220,7 @@ fn append_tail(
     folds: &HashMap<FoldId, bool>,
     width: usize,
     theme: Theme,
+    tick: u64,
 ) {
     if let Some(live) = live {
         if !live.reasoning.is_empty() {
@@ -214,7 +229,7 @@ fn append_tail(
         if !live.text.is_empty() {
             assistant_message(out, live.text, false, width, theme);
         } else if live.reasoning.is_empty() {
-            assistant_message(out, "…", false, width, theme);
+            assistant_message(out, waiting_dots(tick), false, width, theme);
         }
     }
     if !queued.is_empty() {

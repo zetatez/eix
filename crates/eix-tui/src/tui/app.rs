@@ -6317,7 +6317,14 @@ already exists, update it in place rather than rewriting it from scratch.";
                 reasoning: &stream.reasoning,
                 text: &stream.text,
             });
-            transcript::render_tail(live, &queued, &view.folds, inner_width.max(1), theme)
+            transcript::render_tail(
+                live,
+                &queued,
+                &view.folds,
+                inner_width.max(1),
+                theme,
+                self.tick,
+            )
         };
         let history_len = self.views[index]
             .history_cache
@@ -10596,7 +10603,7 @@ mod tests {
             .collect()
     }
 
-    fn render_transcript(view: &SessionView, width: usize) -> String {
+    fn render_transcript_at(view: &SessionView, width: usize, tick: u64) -> String {
         let live = view.stream.as_ref().map(|stream| transcript::Live {
             reasoning: &stream.reasoning,
             text: &stream.text,
@@ -10608,12 +10615,17 @@ mod tests {
             &view.folds,
             width,
             Theme::default(),
+            tick,
         )
         .lines
         .iter()
         .map(line_text)
         .collect::<Vec<_>>()
         .join("\n")
+    }
+
+    fn render_transcript(view: &SessionView, width: usize) -> String {
+        render_transcript_at(view, width, 0)
     }
 
     #[test]
@@ -11088,6 +11100,47 @@ mod tests {
         let rendered = render_transcript(&view, 40);
         assert!(rendered.contains("Thinking…"));
         assert!(rendered.contains("thinking out loud"));
+    }
+
+    #[test]
+    fn waiting_placeholder_cycles_dots_and_yields_to_streamed_text() {
+        let session = Session::new("s1", "chat", "/tmp");
+        let mut view = SessionView::new(session, Vec::new());
+        view.stream = Some(StreamState {
+            turn_id: "t1".into(),
+            text: String::new(),
+            reasoning: String::new(),
+        });
+
+        for (tick, dots) in [(0, "."), (1, "."), (2, ".."), (4, "..."), (6, ".")] {
+            let rendered = render_transcript_at(&view, 40, tick);
+            assert!(
+                rendered.lines().any(|line| line.trim() == dots),
+                "tick {tick}: {rendered}"
+            );
+        }
+
+        view.stream.as_mut().unwrap().text = "answer".into();
+        let rendered = render_transcript_at(&view, 40, 4);
+        assert!(rendered.contains("answer"), "{rendered}");
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| matches!(line.trim(), "." | ".." | "...")),
+            "{rendered}"
+        );
+
+        let stream = view.stream.as_mut().unwrap();
+        stream.text.clear();
+        stream.reasoning = "thinking".into();
+        let rendered = render_transcript_at(&view, 40, 4);
+        assert!(rendered.contains("Thinking…"), "{rendered}");
+        assert!(
+            !rendered
+                .lines()
+                .any(|line| matches!(line.trim(), "." | ".." | "...")),
+            "{rendered}"
+        );
     }
 
     #[test]
