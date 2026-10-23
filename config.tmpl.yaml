@@ -1,0 +1,301 @@
+# ============================================================================
+# eix config template (YAML reference)
+# ============================================================================
+# eix loads TOML. Convert this file before use.
+# Global: ~/.config/eix/config.toml
+# Project: <ancestor>/.eix/config.toml (nearest wins; arrays replace)
+# Placeholders: {env:NAME}, {file:path}
+# Keep secrets in environment variables, not in this file.
+# ============================================================================
+
+
+# OpenAI-compatible endpoint. Change these three values for another provider;
+# common provider endpoints are listed below.
+provider:
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  api_key_env: "OPENAI_API_KEY"
+  # Optional: api_key, timeout_secs=300, retry_attempts=5, retry_base_ms=500, retry_max_secs=30, context_tokens, system_prompt.
+
+
+# Optional: additional OpenAI-compatible providers and pinned models.
+# OpenAI is the default [provider] above. /model fetches each provider's
+# GET /models; selection ids are `<provider>/<api-model>`.
+# providers:
+#   # OpenAI is already the default. Uncomment to also expose it as
+#   # `openai/<model>` while another provider is the default.
+#   openai:
+#     base_url: "https://api.openai.com/v1"
+#     api_key_env: "OPENAI_API_KEY"
+#   deepseek:
+#     base_url: "https://api.deepseek.com"
+#     api_key_env: "DEEPSEEK_API_KEY"
+#   opencode:
+#     base_url: "https://opencode.ai/zen/v1"
+#     api_key_env: "OPENCODE_API_KEY"
+#   groq:
+#     base_url: "https://api.groq.com/openai/v1"
+#     api_key_env: "GROQ_API_KEY"
+#   gemini:
+#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+#     api_key_env: "GEMINI_API_KEY"
+#   anthropic:
+#     base_url: "https://api.anthropic.com/v1/"  # OpenAI compatibility layer
+#     api_key_env: "ANTHROPIC_API_KEY"
+#   xai:
+#     base_url: "https://api.x.ai/v1"
+#     api_key_env: "XAI_API_KEY"
+#   ollama:
+#     base_url: "http://localhost:11434/v1"  # no key
+# models:
+#   - id: "openrouter/gpt-5"
+#     provider: "openrouter"
+#     model: "openai/gpt-5"
+#     variants: ["low", "medium", "high"]
+
+
+# Tool approval and safety. Defaults are shown; uncomment to change.
+tools:
+  approval: "ask"  # ask | auto
+  # rules:
+  #   - tool: "run_command"
+  #     command: ["cargo", "test"]
+  #     action: "sandbox"
+  #   - tool: "run_command"
+  #     command_regex: '^rm '
+  #     action: "deny"
+  #   - tool: "write_file"
+  #     path: "src/**"
+  #     action: "ask"
+  # external_directory: ["/tmp/shared", "~/.cache/tool/**"]
+  # network_allow: ["docs.rs", "*.github.com"]
+  # Other defaults: max_output_bytes=20000, command_timeout_secs=60,
+  # sandbox=auto, sandbox_network=false,
+  # sandbox_read_paths=[~/.cargo, ~/.rustup, ~/.cache, ~/.npm],
+  # sandbox_writable_roots=[], snapshots=true.
+
+
+# Optional: notify on approval/input/error.
+# notifications:
+#   bell: false
+#   command: 'notify-send eix "$EIX_SESSION_NAME: $EIX_STATUS"'
+#   cooldown_secs: 10
+
+
+# Context budget and compaction. Defaults are shown.
+# context:
+#   budget_tokens: 32000
+#   auto_compact: true
+#   auto_compact_threshold: 0.8
+#   auto_compact_keep_turns: 2
+#   tool_output_tokens: 4000
+#   max_tool_schema_tokens: 12000
+#   instructions_files: ["AGENTS.md"]
+#   workspace_summary: true
+
+
+# Compatibility with other agent harnesses. All switches are OFF by default;
+# native .eix / ~/.config/eix resources are always loaded.
+#
+# Set one to true to load that harness's global and project resources:
+#   claude_code: ~/.claude + .claude  (skills, commands, agents, CLAUDE.md)
+#   opencode:    ~/.config/opencode + .opencode (skills, commands, agents, AGENTS.md)
+#   codex_cli:   $CODEX_HOME + .codex (skills, prompts, AGENTS.md)
+#   gemini_cli:  ~/.gemini + .gemini (skills, TOML commands, agents, GEMINI.md)
+#   pi:          $PI_CODING_AGENT_DIR + .pi (skills, prompts, AGENTS.md/CLAUDE.md)
+#
+# Paseo skills live under ~/.claude/skills, so enable claude_code for those.
+# OpenCode commands such as fix.bug live under ~/.config/opencode/commands,
+# so enable opencode for those.
+#
+# Project .eix/config.toml may only turn these switches OFF; it cannot enable
+# another agent's resources.
+compations:
+  claude_code: false
+  opencode: false
+  codex_cli: false
+  gemini_cli: false
+  pi: false
+
+
+# Optional: remote TCP/HTTP attach. token is required when enabled.
+# server:
+#   tcp: "127.0.0.1:7420"
+#   http: "127.0.0.1:7421"
+#   token: "{env:EIX_REMOTE_TOKEN}"
+
+
+# Common MCP servers. They start lazily and require Node.js/npx.
+mcp:
+  servers:
+    context7:
+      command: "npx"
+      args: ["-y", "@upstash/context7-mcp"]
+    sequential-thinking:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    memory:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-memory"]
+      env:
+        MEMORY_FILE_PATH: "{env:HOME}/.config/eix/memory.json"
+
+    # Optional browser automation; run `npx playwright install chromium` first.
+    # playwright:
+    #   command: "npx"
+    #   args: ["-y", "@playwright/mcp@latest"]
+
+    # Use allowed_tools / denied_tools to narrow tools if needed.
+
+
+# Image defaults: 4 per prompt, 8 MiB each, 30-day retention, 2 GiB store.
+# images:
+#   max_prompt_images: 4
+#   max_image_bytes: 8388608
+#   retention_days: 30
+#   max_store_bytes: 2147483648
+
+
+# Diagnostics after writes. Servers start lazily; install only what you use.
+# npm i -g bash-language-server pyright typescript typescript-language-server
+# npm i -g vscode-langservers-extracted yaml-language-server
+# go install golang.org/x/tools/gopls@latest
+# go install github.com/sqls-server/sqls@latest
+# rustup component add rust-analyzer
+# cargo install taplo-cli
+# clangd, lua-language-server, marksman: install via your package manager
+lsp:
+  servers:
+    bash:
+      command: "bash-language-server"
+      args: ["start"]
+      extensions: ["sh", "bash"]
+    cpp:
+      command: "clangd"
+      extensions: ["c", "h", "cc", "cpp", "cxx", "hpp"]
+    css:
+      command: "vscode-css-language-server"
+      args: ["--stdio"]
+      extensions: ["css", "scss", "less"]
+    go:
+      command: "gopls"
+      extensions: ["go"]
+    html:
+      command: "vscode-html-language-server"
+      args: ["--stdio"]
+      extensions: ["html", "htm"]
+      language_id: "html"
+    json:
+      command: "vscode-json-language-server"
+      args: ["--stdio"]
+      extensions: ["json", "jsonc"]
+    lua:
+      command: "lua-language-server"
+      extensions: ["lua"]
+    markdown:
+      command: "marksman"
+      args: ["server"]
+      extensions: ["md"]
+    python:
+      command: "pyright-langserver"
+      args: ["--stdio"]
+      extensions: ["py"]
+    rust:
+      command: "rust-analyzer"
+      extensions: ["rs"]
+    sql:
+      command: "sqls"
+      extensions: ["sql"]
+    toml:
+      command: "taplo"
+      args: ["lsp", "stdio"]
+      extensions: ["toml"]
+    typescript:
+      command: "typescript-language-server"
+      args: ["--stdio"]
+      extensions: ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"]
+    yaml:
+      command: "yaml-language-server"
+      args: ["--stdio"]
+      extensions: ["yaml", "yml"]
+      language_id: "yaml"
+
+    # Other common servers (uncomment as needed):
+    # java:   { command: "jdtls", extensions: ["java"] }
+    # kotlin: { command: "kotlin-language-server", extensions: ["kt", "kts"], language_id: "kotlin" }
+    # csharp: { command: "csharp-ls", extensions: ["cs"], language_id: "csharp" }
+    # php:    { command: "intelephense", args: ["--stdio"], extensions: ["php"] }
+    # ruby:   { command: "solargraph", args: ["stdio"], extensions: ["rb"] }
+    # zig:    { command: "zls", extensions: ["zig"] }
+    # nix:    { command: "nil", extensions: ["nix"] }
+    # terraform: { command: "terraform-ls", args: ["serve"], extensions: ["tf"], language_id: "terraform" }
+    # vue:    { command: "vue-language-server", args: ["--stdio"], extensions: ["vue"] }
+    # svelte: { command: "svelteserver", args: ["--stdio"], extensions: ["svelte"] }
+
+
+# Optional: post-write formatters. eix appends the file path to `command`.
+# Entries are tried in order; the first matching extension wins.
+formatter:
+  - command: "rustfmt --edition 2021"
+    extensions: ["rs"]
+  - command: "gofmt -w"
+    extensions: ["go"]
+  - command: "ruff format"
+    extensions: ["py"]
+  - command: "sqlfluff format --dialect ansi"
+    extensions: ["sql"]
+  - command: "prettier --write"
+    extensions: ["json"]
+  - command: "prettier --write"
+    extensions: ["yaml", "yml"]
+  - command: "taplo fmt"
+    extensions: ["toml"]
+  - command: "shfmt -w"
+    extensions: ["sh", "bash"]
+  - command: "clang-format -i"
+    extensions: ["c", "h", "cc", "cpp", "hpp"]
+  - command: "prettier --write"
+    extensions: ["js", "jsx", "ts", "tsx", "css"]
+  - command: "prettier --write"
+    extensions: ["md"]
+  - command: "prettier --write"
+    extensions: ["json", "yaml", "yml", "md"]
+
+
+# Optional: TUI palette. Available presets:
+#   github-dark, github-light, gruvbox-dark, solarized-dark, solarized-light, nord, dracula, catppuccin-mocha
+theme:
+  preset: "github-dark"
+
+
+# Optional: transcript key overrides. Defaults are built in; `keys` only
+# overrides them. Leader = Space.
+#   quit            Z / Ctrl-C / Ctrl-D
+#   help            ? / F1
+#   new_session     Space n / Space N
+#   new_worktree    Space W
+#   sessions        Space s / Ctrl-G
+#   new_pane        Space o
+#   palette         Ctrl-P / Space a
+#   model           Ctrl-/
+#   worktrees       Space w
+#   branches        Space b
+#   ledger          Space C
+#   processes       Space p
+#   inbox           Space R
+#   search          # / Space h
+#   fork            Space F
+#   attention       Space A
+#   cancel          Space x
+#   next_session    Shift+. / >
+#   prev_session    Shift+, / <
+#   scroll_down     j / Down / PgDn
+#   scroll_up       k / Up / PgUp / Ctrl-U
+#   timeline        /timeline
+#   todos           /todos
+#   undo            /undo
+#   redo            /redo
+# Prompt normal mode keeps vim keys; overlay keys are in README.
+# Override with a modified/named/punctuation key; bare letters are ignored.
+# Examples: sessions: "C-t" · new_session: "C-n" · help: "F2"
+keys: {}
