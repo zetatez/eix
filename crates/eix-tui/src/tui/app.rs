@@ -7597,16 +7597,22 @@ already exists, update it in place rather than rewriting it from scratch.";
             name
         );
         let border_color = if focused {
-            composer_border(theme)
+            // The active pane needs to read as the input target at a glance;
+            // the muted border used for inactive panes is too subtle once
+            // several sessions are tiled together.
+            composer_accent(theme)
         } else if attention {
             composer_warn(theme)
         } else {
             Color::Rgb(48, 52, 62)
         };
         let mut border_style = Style::default().fg(border_color);
-        let mut title_style = Style::default()
-            .fg(border_color)
-            .add_modifier(Modifier::DIM);
+        let mut title_style = Style::default().fg(border_color);
+        if focused {
+            title_style = title_style.add_modifier(Modifier::BOLD);
+        } else {
+            title_style = title_style.add_modifier(Modifier::DIM);
+        }
         let mut block = Block::default().borders(borders).title(title);
         if let Some(background) = theme.background {
             border_style = border_style.bg(background);
@@ -11711,6 +11717,29 @@ mod tests {
     }
 
     #[test]
+    fn focused_pane_border_uses_the_accent_color() {
+        let mut app = app_with_panes(&["a", "b"]);
+        app.focused = 0;
+        let backend = ratatui::backend::TestBackend::new(80, 20);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let left = app.pane_areas[0];
+        let right = app.pane_areas[1];
+
+        assert_eq!(
+            buffer[(left.x, left.y + 2)].fg,
+            composer_accent(app.theme),
+            "focused pane border should be brighter"
+        );
+        assert_eq!(
+            buffer[(right.x + right.width - 1, right.y + 2)].fg,
+            Color::Rgb(48, 52, 62),
+            "inactive pane border should stay muted"
+        );
+    }
+
+    #[test]
     fn pane_layouts_stay_inside_the_area() {
         let area = Rect::new(0, 0, 100, 40);
         for count in 1..=6 {
@@ -12065,10 +12094,17 @@ mod tests {
         ];
         let mut view = SessionView::new(session, events);
 
-        // Finished calls collapse to a single summary line with a status.
+        // Finished calls collapse to a summary line with the status directly
+        // below it, not right-aligned at the end of the summary.
         let collapsed = render_transcript(&view, 60);
-        assert!(collapsed.contains("write out.txt (+5 bytes)"));
-        assert!(collapsed.contains("ok"));
+        let lines: Vec<&str> = collapsed.lines().collect();
+        let summary_line = lines
+            .iter()
+            .position(|line| line.contains("write out.txt (+5 bytes)"))
+            .expect("summary line");
+        assert!(!lines[summary_line].contains("ok"), "{collapsed}");
+        assert_eq!(lines[summary_line + 1].trim(), "ok", "{collapsed}");
+        assert!(lines[summary_line + 1].starts_with("      "), "{collapsed}");
         assert!(!collapsed.contains("wrote 5 bytes to out.txt"));
 
         // Expanding the block reveals the written body and the result without
@@ -12156,10 +12192,20 @@ mod tests {
         let expanded = render_transcript(&view, 60);
         let lines: Vec<&str> = expanded.lines().collect();
 
-        // The first header line keeps the status and is no longer elided.
+        // The command is no longer elided and its status sits on the line
+        // below the wrapped command instead of at the right edge.
         assert!(lines[0].contains("$ echo"), "{expanded}");
-        assert!(lines[0].contains("ok"), "{expanded}");
+        assert!(!lines[0].contains("ok"), "{expanded}");
         assert!(!expanded.contains('…'), "{expanded}");
+        let status_line = lines
+            .iter()
+            .position(|line| line.trim() == "ok")
+            .expect("status line");
+        assert!(status_line > 0, "{expanded}");
+        assert!(
+            lines[status_line - 1].starts_with("      ") && lines[status_line - 1].contains('x'),
+            "{expanded}"
+        );
         // The command wraps onto continuation lines aligned under the summary.
         assert!(
             lines
@@ -12207,8 +12253,8 @@ mod tests {
         let lines: Vec<&str> = rendered.lines().collect();
         let user = lines.iter().find(|line| line.contains("hi there")).unwrap();
         assert!(
-            user.starts_with(' ') && user.ends_with("hi there"),
-            "user turn should be right-aligned: {user:?}"
+            user.starts_with(' ') && user.contains("│ hi there │"),
+            "user turn should be a right-aligned bubble: {user:?}"
         );
         assert!(lines.iter().any(|line| line.contains("▾ Thinking")));
         // Stored thinking is expanded by default.
@@ -12219,7 +12265,7 @@ mod tests {
     }
 
     #[test]
-    fn user_messages_render_as_plain_text() {
+    fn user_messages_render_in_a_bubble() {
         let session = Session::new("s1", "chat", "/tmp");
         let events = vec![SessionEvent::new(
             "s1",
@@ -12230,12 +12276,16 @@ mod tests {
         let view = SessionView::new(session, events);
         let rendered = render_transcript(&view, 40);
         let lines: Vec<&str> = rendered.lines().collect();
-        assert_eq!(lines.len(), 1, "{rendered}");
-        assert!(lines[0].ends_with("hi there"), "{rendered:?}");
-        assert!(lines[0].starts_with(' '), "{rendered:?}");
-        assert_eq!(UnicodeWidthStr::width(lines[0]), 38, "{rendered:?}");
-        assert!(!rendered.contains('╭'), "{rendered}");
-        assert!(!rendered.contains('│'), "{rendered}");
+        assert_eq!(lines.len(), 3, "{rendered}");
+        assert!(rendered.contains("╭"), "{rendered}");
+        assert!(rendered.contains("│ hi there │"), "{rendered}");
+        assert!(rendered.contains("╰"), "{rendered}");
+        assert!(
+            lines.iter().all(|line| UnicodeWidthStr::width(*line) == 38),
+            "{rendered:?}"
+        );
+        assert!(!rendered.contains("you>"), "{rendered}");
+        assert!(!rendered.contains("eix>"), "{rendered}");
     }
 
     #[test]
@@ -12336,7 +12386,7 @@ mod tests {
             text_line(agent)
         );
 
-        let rendered = render_text(&mut app, 40, 12);
+        let rendered = render_text(&mut app, 40, 20);
         let user_x = rendered
             .lines()
             .find(|line| line.contains("question"))

@@ -255,6 +255,7 @@ session 执行 shell；`:r!<cmd>`（也接受 `:r !<cmd>`）把命令输出插�
 自动拉起 daemon；没有 session 时自动创建一个。（stdout 被管道时 `eix` 会退回 `eix chat`。）pane 自动平铺
 （1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+ 个近似网格），每个 pane
 独立显示一个 session 的转录、滚动位置和流式输出；相邻 pane 共用一条边框线。
+当前聚焦 pane 的边框使用主题 accent 色并加粗标题，后台 pane 保持低对比灰（attention 仍用警示色）。
 底部输入条只作用于当前聚焦 pane。
 
 用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、
@@ -275,13 +276,13 @@ session 请用 `Alt-7`。在转录区或输入框 normal 模式下，1 秒内连
 `cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数、pane/队列/attention 计数在空间允许时
 出现在中部或右侧；后台提醒会临时占用中间区域。
 
-转录区按对话渲染：用户消息右对齐，agent 输出左对齐（保留 2 空格缩进）；都使用普通文本、不加角色前缀，也不使用气泡；agent 的
+转录区按对话渲染：用户消息右对齐并包在圆角气泡框中，agent 输出左对齐（保留 2 空格缩进）；消息正文仍使用普通文本、不加角色前缀；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
-显示为一行状态徽标（状态点、命令/路径摘要、右侧 `ok` / `running` / `needs approval`），
+显示为摘要行（状态点、命令/路径摘要），下一行紧跟状态（`ok` / `running` / `needs approval` 等），
 展开后用四空格左缩进直接显示参数、side-by-side diff 和输出；diff 左侧是改动前、右侧是改动后，
 代码按文件扩展名做语法高亮，窄 pane 自动回退到 unified 视图。命令/路径已在摘要里，不再重复
 `input` / `output` 标签。两类模块都支持鼠标点击折叠；`Thinking` 默认
-展开（包括已结束的 turn），工具块在流式中展开、结束后收起为一行摘要。等待发送的 prompt 会以
+展开（包括已结束的 turn），工具块在流式中展开、结束后收起为摘要行和状态行。等待发送的 prompt 会以
 `⏳ queued` 行显示在转录末尾。
 
 agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删除线、行内代码与围栏代码块、

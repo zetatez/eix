@@ -1,10 +1,11 @@
 //! Chat-style transcript rendering.
 //!
-//! The transcript is a conversation, not a log: user turns hug the right edge,
-//! agent output sits on the left. The agent's chain of thought and every tool
-//! invocation render as one-line headers that expand into their details, and
-//! the same line map powers click-to-fold. Blocks still streaming live under a
-//! synthetic [`FoldId::Live`] key so they collapse once the turn is stored.
+//! The transcript is a conversation, not a log: user turns sit on the right in
+//! a rounded bubble, while agent output stays on the left. The agent's chain
+//! of thought and every tool invocation render as compact headers that expand
+//! into their details, and the same line map powers click-to-fold. Blocks still
+//! streaming live under a synthetic [`FoldId::Live`] key so they collapse once
+//! the turn is stored.
 
 use std::collections::HashMap;
 
@@ -129,8 +130,8 @@ pub fn render_history(
     width: usize,
     theme: Theme,
 ) -> Transcript {
-    // Keep a two-cell gutter on the right so tool statuses and queued prompts
-    // never touch the pane border.
+    // Keep a two-cell gutter on the right so queued prompts never touch the
+    // pane border.
     let width = width.saturating_sub(2).max(1);
     render_blocks(collect(events), folds, width, theme)
 }
@@ -511,29 +512,117 @@ fn right_align(mut line: Line<'static>, width: usize) -> Line<'static> {
     line
 }
 
-/// A user turn: plain Markdown aligned to the right edge, opposite the
-/// left-aligned agent output. No role prefix or bubble is added.
-fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usize, theme: Theme) {
-    for path in images {
-        out.push(
-            right_align(
-                Line::from(Span::styled(
-                    format!("  [image] {path}"),
-                    Style::default().fg(theme.comment.unwrap_or(MUTED)),
-                )),
-                width,
-            ),
-            None,
-        );
+/// Horizontal padding inside the bubble's left/right borders.
+const BUBBLE_PAD: usize = 1;
+
+/// Longest content line that still leaves room for both borders and the
+/// inner horizontal padding.
+fn bubble_content_limit(width: usize) -> usize {
+    let available = width.saturating_sub(2 * (BUBBLE_PAD + 1)).max(1);
+    let preferred = (width * 3 / 4).max(8);
+    preferred.min(available).max(1)
+}
+
+fn with_panel(style: Style, panel: Option<Color>) -> Style {
+    match panel {
+        Some(panel) => Style::default().bg(panel).patch(style),
+        None => style,
     }
-    let text = text.trim_end();
-    if text.is_empty() {
+}
+
+fn bubble_border_style(theme: Theme) -> Style {
+    with_panel(
+        Style::default().fg(theme.function.unwrap_or(ACCENT)),
+        theme.panel,
+    )
+}
+
+/// Draw a right-aligned rounded bubble around the rendered content. Padding
+/// and borders are normal spans, so click selection, search, and horizontal
+/// positioning all see exactly what is drawn.
+fn push_bubble(out: &mut Transcript, mut content: Vec<Line<'static>>, width: usize, theme: Theme) {
+    while content.first().is_some_and(|line| line.width() == 0) {
+        content.remove(0);
+    }
+    while content.last().is_some_and(|line| line.width() == 0) {
+        content.pop();
+    }
+    if content.is_empty() {
         out.blank();
         return;
     }
-    for line in markdown::render(text, width.max(1), theme) {
-        out.push(right_align(line, width), None);
+
+    let content_width = content.iter().map(Line::width).max().unwrap_or(0).max(1);
+    let box_width = content_width + 2 * (BUBBLE_PAD + 1);
+    let body_pad = width.saturating_sub(box_width);
+
+    let border = bubble_border_style(theme);
+    let panel = with_panel(Style::default(), theme.panel);
+
+    let mut top = Vec::new();
+    if body_pad > 0 {
+        top.push(Span::raw(" ".repeat(body_pad)));
     }
+    top.push(Span::styled(
+        format!("╭{}╮", "─".repeat(content_width + 2 * BUBBLE_PAD)),
+        border,
+    ));
+    out.push(Line::from(top), None);
+
+    for line in content {
+        let line_width = line.width();
+        let mut spans = Vec::with_capacity(line.spans.len() + 3);
+        if body_pad > 0 {
+            spans.push(Span::raw(" ".repeat(body_pad)));
+        }
+        spans.push(Span::styled("│", border));
+        spans.push(Span::styled(" ".repeat(BUBBLE_PAD), panel));
+        for mut span in line.spans {
+            span.style = with_panel(span.style, theme.panel);
+            spans.push(span);
+        }
+        if line_width < content_width {
+            spans.push(Span::styled(" ".repeat(content_width - line_width), panel));
+        }
+        spans.push(Span::styled(" ".repeat(BUBBLE_PAD), panel));
+        spans.push(Span::styled("│", border));
+        out.push(Line::from(spans), None);
+    }
+
+    let mut bottom = Vec::new();
+    if body_pad > 0 {
+        bottom.push(Span::raw(" ".repeat(body_pad)));
+    }
+    bottom.push(Span::styled(
+        format!("╰{}╯", "─".repeat(content_width + 2 * BUBBLE_PAD)),
+        border,
+    ));
+    out.push(Line::from(bottom), None);
+}
+
+/// A user turn: Markdown wrapped in a right-aligned chat bubble, opposite the
+/// left-aligned agent output.
+fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usize, theme: Theme) {
+    let content_width = bubble_content_limit(width);
+    let mut content = Vec::new();
+    for path in images {
+        content.push(Line::from(Span::styled(
+            format!("[image] {path}"),
+            Style::default().fg(theme.comment.unwrap_or(MUTED)),
+        )));
+    }
+    let text = text.trim_end();
+    if !text.is_empty() {
+        // The bubble supplies its own horizontal padding, so render without
+        // the transcript's usual two-cell left gutter.
+        content.extend(markdown::render_with_indent(
+            text,
+            content_width.max(1),
+            theme,
+            "",
+        ));
+    }
+    push_bubble(out, content, width, theme);
     out.blank();
 }
 
@@ -623,9 +712,10 @@ fn thinking(
     out.blank();
 }
 
-/// A tool invocation: a compact status line that expands into args, approval
-/// diff and output. The summary already carries the command/path, so the body
-/// stays quiet: four spaces, no `input`/`output` labels.
+/// A tool invocation: a compact summary with the status on the following line,
+/// expanding into args, approval diff and output. The summary already carries
+/// the command/path, so the body stays quiet: four spaces, no `input`/`output`
+/// labels.
 fn tool_block(
     out: &mut Transcript,
     block: &ToolBlock,
@@ -642,10 +732,9 @@ fn tool_block(
 
     let color = status_color(block, theme);
     let status = status_label(block);
-    let status_width = UnicodeWidthStr::width(status);
     let prefix_width = 6; // "  ▾ ● "
     let summary = tool_summary(block);
-    let room = width.saturating_sub(prefix_width + status_width + 1).max(8);
+    let room = width.saturating_sub(prefix_width + 1).max(8);
     // Expanded shell calls wrap the command instead of truncating it and then
     // repeating the full command in the body.
     let summary_lines = if open && is_command_tool(&block.tool) {
@@ -673,14 +762,18 @@ fn tool_block(
             spans.push(Span::raw(" ".repeat(prefix_width)));
         }
         spans.push(Span::styled(summary.clone(), summary_style));
-        if first {
-            let used = prefix_width + UnicodeWidthStr::width(summary.as_str()) + status_width;
-            let pad = width.saturating_sub(used).max(1);
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.push(Span::styled(status, Style::default().fg(color)));
-        }
         out.push(Line::from(spans), Some(fold));
     }
+
+    // Keep statuses under the command instead of right-aligning them: user
+    // turns also live on the right, so a second right edge looks noisy.
+    out.push(
+        Line::from(vec![
+            Span::raw(" ".repeat(prefix_width)),
+            Span::styled(status, Style::default().fg(color)),
+        ]),
+        Some(fold),
+    );
 
     if open {
         // `push_*` subtracts `BODY_INDENT` itself, so pass the full line width.

@@ -29,7 +29,12 @@ pub fn render(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
     render_with_indent(text, width, theme, "  ")
 }
 
-fn render_with_indent(text: &str, width: usize, theme: Theme, indent: &str) -> Vec<Line<'static>> {
+pub(crate) fn render_with_indent(
+    text: &str,
+    width: usize,
+    theme: Theme,
+    indent: &str,
+) -> Vec<Line<'static>> {
     let mut renderer = Renderer::new(width, theme, indent);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH

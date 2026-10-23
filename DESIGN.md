@@ -246,7 +246,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   cwd（`~` 缩写）和 git 分支；最近状态、worktree/图片数、pane 位置和队列/attention 信息在空间
   允许时出现在中部或右侧，变窄时优先保留 cwd/branch。
 - 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i` 或 `<Space>i` 聚焦输入并进入 insert；
-  在转录区或输入框 normal 模式按 `Enter` 把当前 pane 提升到第一位并保持聚焦。
+  在转录区或输入框 normal 模式按 `Enter` 把当前 pane 提升到第一位并保持聚焦。聚焦 pane 的边框
+  使用主题 accent 色、标题加粗；非聚焦 pane 保持低对比灰，attention 仍用警示色。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
 - 输入条默认显示 3 行内容（加边框共 5 行；短终端优先让给转录区），长草稿会向上生长到
@@ -345,11 +346,11 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 **转录区**
 
-转录按对话渲染：用户消息右对齐，agent 输出左对齐并保留 2 空格缩进；都使用普通文本，
-不使用气泡，也不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
+转录按对话渲染：用户消息右对齐并包在圆角气泡框中，agent 输出左对齐并保留 2 空格缩进；
+消息正文使用普通文本，不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
 以 `Thinking` 模块流式展开，turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
-call/approval/patch/result 事件，一行显示状态圆点、命令或路径摘要与右侧状态
-（`ok` / `running` / `needs approval`），展开后用四空格左缩进直接显示参数、输出和 diff；
+call/approval/patch/result 事件，摘要行显示状态圆点、命令或路径摘要，下一行显示状态
+（`ok` / `running` / `needs approval` 等），展开后用四空格左缩进直接显示参数、输出和 diff；
 diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syntect 做语法高亮，窄 pane 回退
 unified。命令与路径已由折叠摘要给出，不再重复 `input` / `output` 标签；摘要因宽度截断时，
 展开后会在正文补回完整命令。
