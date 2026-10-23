@@ -227,6 +227,14 @@ struct TextSelection {
     moved: bool,
 }
 
+/// Short-lived top-right confirmation after a mouse selection was copied.
+struct CopyToast {
+    text: String,
+    until: Instant,
+}
+
+const COPY_TOAST_DISPLAY: Duration = Duration::from_secs(2);
+
 /// Parsed and wrapped history for one pane. Only the live turn is re-rendered
 /// on each frame; stored events stay here until the log, width, theme or fold
 /// state changes.
@@ -988,6 +996,8 @@ pub struct App {
     /// Text selected with the mouse, waiting for the event loop to copy it to
     /// the system clipboard.
     pending_clipboard: Option<String>,
+    /// Top-right confirmation shown briefly after copying a selection.
+    copy_toast: Option<CopyToast>,
     /// Older-history request picked up by the event loop after drawing.
     pending_history: Option<(String, u64)>,
     /// Pane rectangles from the last draw, used to pick a focus direction.
@@ -1108,6 +1118,7 @@ impl App {
             inflight_images: Vec::new(),
             pending_leader: false,
             pending_clipboard: None,
+            copy_toast: None,
             pending_history: None,
             pane_areas: Vec::new(),
             approvals: HashMap::new(),
@@ -1529,7 +1540,10 @@ impl App {
                     self.views[index].folds.insert(fold.id, !fold.open);
                     self.views[index].selection = None;
                 } else if let Some(text) = copied {
-                    self.status = format!("copied {} chars", text.chars().count());
+                    self.copy_toast = Some(CopyToast {
+                        text: format!("Copied {} chars", text.chars().count()),
+                        until: Instant::now() + COPY_TOAST_DISPLAY,
+                    });
                     // Seed the prompt's unnamed register too: normal-mode `p`
                     // can then paste the same text even if the native
                     // clipboard helper is unavailable.
@@ -6090,6 +6104,45 @@ already exists, update it in place rather than rewriting it from scratch.";
         if self.error.is_some() {
             self.draw_error_dialog(frame, area);
         }
+
+        if self
+            .copy_toast
+            .as_ref()
+            .is_some_and(|toast| toast.until <= Instant::now())
+        {
+            self.copy_toast = None;
+        }
+        self.draw_copy_toast(frame, area);
+    }
+
+    /// A small confirmation in the top-right corner. It intentionally floats
+    /// above panes and dialogs so copy feedback is visible without moving the
+    /// eye to the status bar.
+    fn draw_copy_toast(&self, frame: &mut Frame, area: Rect) {
+        let Some(toast) = &self.copy_toast else {
+            return;
+        };
+        let text = format!(" {} ", toast.text);
+        let width = (text.width() as u16).min(area.width.saturating_sub(2));
+        if width == 0 || area.height < 2 {
+            return;
+        }
+        let rect = Rect {
+            x: area.x + area.width.saturating_sub(width + 1),
+            y: area.y + 1,
+            width,
+            height: 1,
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(text).alignment(Alignment::Right).style(
+                Style::default()
+                    .fg(COMPOSER_BADGE_TEXT)
+                    .bg(COMPOSER_SUCCESS)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rect,
+        );
     }
 
     /// Glyph for the prompt header. Idle and running are icon-only so the
@@ -11126,8 +11179,16 @@ mod tests {
         app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 1));
 
         assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
-        assert!(app.status.contains("copied 5 chars"));
+        assert_eq!(
+            app.copy_toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("Copied 5 chars")
+        );
         assert!(app.views[0].selection.is_some());
+
+        let rendered = render_text(&mut app, 40, 12);
+        let top_right = rendered.lines().nth(1).unwrap_or_default();
+        let column = top_right.find("Copied 5 chars").unwrap_or_default();
+        assert!(column > 20, "{rendered}");
 
         // The copied text also seeds the prompt register, so normal-mode `p`
         // pastes it even without a native clipboard helper.

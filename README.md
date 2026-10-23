@@ -249,7 +249,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 
 | 键 | 行为 |
 | --- | --- |
-| 鼠标左键 / 滚轮 | 聚焦 pane；点击 `Thinking` / 工具块折叠或展开；拖拽选择转录文本并在松开时自动复制；滚轮滚动转录 |
+| 鼠标左键 / 滚轮 | 聚焦 pane；点击 `Thinking` / 工具块折叠或展开；拖拽选择转录文本并在松开时自动复制，右上角短暂显示 `Copied N chars`；滚轮滚动转录 |
 | `i` / `Enter` / `<Space>i` | 聚焦输入框（进入 insert 模式） |
 | `Esc` / `Esc Esc` | 单次 `Esc` 回到 normal 模式并**保持输入框焦点**（不计数）；normal 模式下 500ms 内连按两次：有 turn 在跑时中断它，否则回到转录区 |
 | `Enter` | 发送到聚焦 pane（仅 insert 模式）；turn 还在跑时自动排队，结束后按顺序发出 |
@@ -999,7 +999,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve[--hunks] / deny / answer / doctor）
 - [x] TUI v1（多 pane 自动平铺、焦点切换、转录、session 栏、fuzzy picker、多行输入、流式跟随）
 - [x] 转录 Markdown 渲染（强调、代码、列表、引用、表格、链接、图片占位、Unicode 行内公式与 2D 块级公式）
-- [x] 转录鼠标选择 + 松开自动复制（native clipboard helper，失败时 OSC 52）
+- [x] 转录鼠标选择 + 松开自动复制（native clipboard helper，失败时 OSC 52；右上角短暂确认）
 - [x] 工具调用 + 审批门禁（read_file / list_dir / write_file / run_command、workspace 沙箱、审批卡片）
 - [x] 写入前 Vim 风格 side-by-side diff 预览（左旧右新、语法高亮、窄宽回退 unified；TUI 卡片、`d` 全屏审阅、`eix chat` / `eix log`）
 - [x] stale-write 冲突检测（stage 后文件被外部修改 → `patch_conflict`，不会覆盖）
