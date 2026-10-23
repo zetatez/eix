@@ -4819,7 +4819,8 @@ impl Daemon {
         plan: Option<&tools::WritePlan>,
     ) -> Result<Option<String>> {
         let is_mcp = tool.starts_with(crate::mcp::PREFIX);
-        if !(risk.mutates_workspace() || is_mcp) || !self.config.load().tools.snapshots {
+        let mcp_mutating = is_mcp && risk.categories.contains(&eix_core::RiskCategory::McpWrite);
+        if !(risk.mutates_workspace() || mcp_mutating) || !self.config.load().tools.snapshots {
             return Ok(None);
         }
         let cwd = self.require_session(session_id)?.cwd;

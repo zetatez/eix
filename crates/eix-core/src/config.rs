@@ -422,7 +422,9 @@ pub struct ToolsConfig {
     /// Absolute paths (or `~`-prefixed) that file tools may touch outside the
     /// session workspace. A plain path allows its whole subtree.
     pub external_directory: Vec<String>,
-    /// Domains (or `*.example.com`) that `webfetch` may access without asking.
+    /// Optional allowlist for read-only network tools. Empty means `webfetch`
+    /// and `websearch` are allowed; a non-empty list restricts them to the
+    /// matching hosts.
     pub network_allow: Vec<String>,
 }
 

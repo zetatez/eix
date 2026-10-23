@@ -132,6 +132,12 @@ pub fn assess_tool(
                     ),
                 );
                 risk.hard_deny = true;
+            } else if config.tools.network_allow.is_empty() {
+                risk.add(
+                    RiskCategory::Network,
+                    RiskLevel::Low,
+                    format!("read-only network fetch: {}", redact_url(url)),
+                );
             } else if config.tools.network_host_allowed(url) {
                 risk.add(
                     RiskCategory::Network,
@@ -142,7 +148,10 @@ pub fn assess_tool(
                 risk.add(
                     RiskCategory::Network,
                     RiskLevel::High,
-                    format!("fetches a URL from the network: {}", redact_url(url)),
+                    format!(
+                        "fetch is not on the configured network allowlist: {}",
+                        redact_url(url)
+                    ),
                 );
             }
             risk
@@ -160,6 +169,12 @@ pub fn assess_tool(
                     "search query contains a withheld secret placeholder".to_string(),
                 );
                 risk.hard_deny = true;
+            } else if config.tools.network_allow.is_empty() {
+                risk.add(
+                    RiskCategory::Network,
+                    RiskLevel::Low,
+                    "read-only web search".to_string(),
+                );
             } else if config.tools.network_host_allowed("https://duckduckgo.com/") {
                 risk.add(
                     RiskCategory::Network,
@@ -170,7 +185,7 @@ pub fn assess_tool(
                 risk.add(
                     RiskCategory::Network,
                     RiskLevel::High,
-                    "sends the search query to a remote search engine".to_string(),
+                    "websearch is not on the configured network allowlist".to_string(),
                 );
             }
             risk
@@ -198,6 +213,12 @@ pub fn assess_tool(
                     RiskLevel::Low,
                     "reads an MCP resource".to_string(),
                 );
+            } else if mcp_known && mcp_read_only_tool(tool) {
+                risk.add(
+                    RiskCategory::Read,
+                    RiskLevel::Low,
+                    "calls a read-only MCP tool".to_string(),
+                );
             } else {
                 risk.add(
                     RiskCategory::McpWrite,
@@ -221,6 +242,46 @@ pub fn assess_tool(
             risk
         }
     }
+}
+
+/// MCP tools whose names describe a read-only lookup. Unknown or unregistered
+/// tools are never auto-approved: the server must have advertised the tool
+/// first, and only common `get_*` / `list_*` style names qualify.
+fn mcp_read_only_tool(tool: &str) -> bool {
+    let Some((_, name)) = tool.rsplit_once("__") else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "get"
+            | "list"
+            | "read"
+            | "search"
+            | "find"
+            | "query"
+            | "fetch"
+            | "lookup"
+            | "describe"
+            | "show"
+            | "status"
+            | "info"
+    ) || [
+        "get_",
+        "list_",
+        "read_",
+        "search_",
+        "find_",
+        "query_",
+        "fetch_",
+        "lookup_",
+        "describe_",
+        "show_",
+        "status_",
+        "info_",
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// Decide what to do with a tool call. `session_rules` are the in-memory
@@ -687,7 +748,7 @@ mod tests {
     }
 
     #[test]
-    fn network_tools_ask_by_default_and_honour_the_allowlist() {
+    fn network_tools_allow_read_only_requests_and_honour_an_opt_in_allowlist() {
         let mut config = config();
         let decision = decide(
             "webfetch",
@@ -698,7 +759,8 @@ mod tests {
             &[],
             false,
         );
-        assert_eq!(decision.action, PermissionAction::Ask);
+        assert_eq!(decision.action, PermissionAction::Allow);
+        assert_eq!(decision.risk.level, RiskLevel::Low);
         assert!(decision.risk.categories.contains(&RiskCategory::Network));
         assert!(!decision.risk.reasons.join(" ").contains("token=secret"));
         assert!(redact_url("https://example.com/docs?token=secret")
@@ -708,8 +770,10 @@ mod tests {
             "https://…@example.com/docs?…"
         );
 
+        // Populating network_allow opts into an allowlist instead of allowing
+        // every GET-style fetch.
         config.tools.network_allow = vec!["example.com".to_string()];
-        let decision = decide(
+        let allowed = decide(
             "webfetch",
             &json!({"url": "https://example.com/docs"}),
             cwd(),
@@ -718,8 +782,20 @@ mod tests {
             &[],
             false,
         );
-        assert_eq!(decision.action, PermissionAction::Allow);
-        assert_eq!(decision.risk.level, RiskLevel::Low);
+        assert_eq!(allowed.action, PermissionAction::Allow);
+        assert_eq!(allowed.risk.level, RiskLevel::Low);
+
+        let blocked = decide(
+            "webfetch",
+            &json!({"url": "https://other.example/docs"}),
+            cwd(),
+            &config,
+            PermissionLevel::WorkspaceWrite,
+            &[],
+            false,
+        );
+        assert_eq!(blocked.action, PermissionAction::Ask);
+        assert_eq!(blocked.risk.level, RiskLevel::High);
     }
 
     #[test]
@@ -737,6 +813,47 @@ mod tests {
         assert_eq!(decision.action, PermissionAction::Deny, "{decision:?}");
         assert!(decision.risk.categories.contains(&RiskCategory::McpWrite));
         assert!(decision.reason.contains("read-only"));
+
+        let unregistered = decide(
+            "mcp__server__get_everything",
+            &json!({}),
+            cwd(),
+            &config,
+            PermissionLevel::WorkspaceWrite,
+            &[],
+            false,
+        );
+        assert_eq!(unregistered.action, PermissionAction::Ask);
+        assert!(unregistered
+            .risk
+            .categories
+            .contains(&RiskCategory::McpWrite));
+    }
+
+    #[test]
+    fn registered_read_only_mcp_tools_do_not_ask() {
+        let config = config();
+        for tool in [
+            "mcp__server__get_item",
+            "mcp__server__list_items",
+            "mcp__server__search",
+        ] {
+            let decision = decide(
+                tool,
+                &json!({}),
+                cwd(),
+                &config,
+                PermissionLevel::ReadOnly,
+                &[],
+                true,
+            );
+            assert_eq!(
+                decision.action,
+                PermissionAction::Allow,
+                "{tool}: {decision:?}"
+            );
+            assert!(decision.risk.categories.contains(&RiskCategory::Read));
+        }
     }
 
     #[test]

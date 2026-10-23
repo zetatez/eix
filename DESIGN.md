@@ -510,9 +510,10 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 `Session` 只存在内存，`User` 追加到用户配置。每次决策写 `permission_evaluated` 审计事件
 （action、risk、categories、reasons、rule、rule_source、sandbox），网络 URL query 脱敏。
 
-`webfetch` / `websearch` 归入 network 风险：默认 ask，`network_allow` 命中才 allow。
-secret 占位符只对本地文件工具还原；shell、网络和 MCP 参数中的占位符会触发 `secret-exfil`
-硬拒绝。
+`webfetch` / `websearch` 归入 network 风险，但属于只读 GET：默认 allow；配置非空
+`network_allow` 后只 allow 命中域名。已注册的 MCP `get_*` / `list_*` / `read_*` / `search_*`
+类工具也按只读放行，其余 MCP 工具仍 ask。secret 占位符只对本地文件工具还原；shell、
+网络和 MCP 参数中的占位符会触发 `secret-exfil` 硬拒绝。
 
 ## 10. Context ledger
 
@@ -606,13 +607,13 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 ## 14. 安全
 
-- 工具沙箱：bubblewrap。工作区 rw，`/tmp` tmpfs，home 只读（缓存目录按需 rw），网络开关。
+- 工具沙箱：bubblewrap。工作区 rw，`/tmp` tmpfs，不挂载整个 home，缓存目录按需只读挂载，网络开关。
 - 环境变量白名单；密钥不进入 daemon 日志。
 - 发往 provider 的消息在 `Provider::stream_chat` 边界做可逆脱敏：密码、API key、token、
   Bearer、URL 凭据、PEM 私钥和敏感赋值替换为 per-provider salt 哈希出的占位符；模型返回的
   tool-call 参数和文本在本地执行/持久化前还原。映射不离开进程，事件日志和 TUI 保留原文。
   图片不做文本脱敏。
-- 网络/破坏性命令默认需要审批；只读 shell 命令的风险分类见 §9.1。
+- Web GET 默认放行；被 allowlist 限制的网络请求和破坏性命令按风险审批；只读 shell 命令的风险分类见 §9.1。
 - 配置文件与日志权限收紧；不把 API key 写进项目目录。
 
 ## 15. 风险

@@ -423,8 +423,9 @@ server 进程，下一条写入重新启动。
 
 `[mcp.servers.<name>]` 配置的 stdio server 会在首次 turn 时懒启动、握手，并读取
 `tools/list`、`resources/list`、`prompts/list`（后两者由 server 能力决定）。工具以
-`mcp__<server>__<tool>` 暴露，**始终需要审批**（`auto` / `full` 策略除外），执行前会捕获
-一次工作区树快照。`read-only` session 和 sub-agent 看不到 MCP 工具。
+`mcp__<server>__<tool>` 暴露。已注册的只读类工具（如 `get_*`、`list_*`、`read_*`、
+`search_*`）默认放行；其余 MCP 工具仍需要审批，执行前会捕获一次工作区树快照。
+`read-only` session 和 sub-agent 看不到 MCP 工具。
 
 资源与 prompt 通过四个只读 meta-tool 暴露，不需要审批：
 
@@ -506,7 +507,7 @@ insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`
 `$EDITOR`，保存后通过 `patch.revise` 更新 diff 再审批；`o` 打开工作区里的真实文件；
 `r` 输入拒绝理由，随 `approval.respond` 一起发给模型；卡片标题会标出
 `[LOW]` / `[MEDIUM]` / `[HIGH]` / `[CRITICAL]` 及命中的规则和沙箱状态。只读命令不会打断
-turn；写入、网络和未知命令按风险弹审批，`HIGH`/`CRITICAL` 不提供 `Always`。session 栏显示 `⚠`；也可以从命令行用
+turn；写入、未命中 allowlist 的网络请求和未知命令按风险弹审批，`HIGH`/`CRITICAL` 不提供 `Always`。session 栏显示 `⚠`；也可以从命令行用
 `eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk，
 `eix deny --reason "..."` 会记录理由）。模型调用 `ask_user` 时 pane 底部出现同样的选项
 卡片：选项同样按 Markdown checkbox 渲染，`Ctrl-J`/`Ctrl-K`（或 `j/k`）移动、`Enter` 确认、
@@ -588,8 +589,8 @@ daemon 目前向模型暴露这些工具：
 | `todo` | 整表替换当前 session 的任务列表（pending / in_progress / completed / cancelled） | 自动放行 |
 | `memory` | 读写当前 workspace 的跨 session 记忆（`add` / `replace` / `clear`） | 自动放行（只改 daemon 数据目录） |
 | `lsp_diagnostics` | 查询某个文件的语言服务器 diagnostics（未配置对应扩展时返回 no-op） | 自动放行 |
-| `webfetch` | 抓取 http(s) URL 并转成纯文本（HTML 去标签，约 100 KB 上限） | 默认询问；`network_allow` 命中时放行 |
-| `websearch` | DuckDuckGo HTML 搜索，返回标题和链接（无需 API key） | 默认询问 |
+| `webfetch` | 抓取 http(s) URL 并转成纯文本（HTML 去标签，约 100 KB 上限） | 默认放行（只读 GET）；配置 `network_allow` 后只放行命中域名 |
+| `websearch` | DuckDuckGo HTML 搜索，返回标题和链接（无需 API key） | 默认放行；配置 `network_allow` 时需包含 `duckduckgo.com` |
 | `write_file` | stage 到 shadow workspace，审批后写入 cwd 内文件（自动建父目录） | stage + 审批落盘 |
 | `edit` | 精确字符串替换（默认要求唯一匹配，`replaceAll` 可全部替换），同样走 stage | stage + 审批落盘 |
 | `patch` | 多文件 `*** Begin Patch` / Add / Update / Delete，先全量校验再写入 | 需要审批 |
@@ -635,7 +636,7 @@ sandbox_read_paths = ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]  # 只读�
 sandbox_writable_roots = []  # workspace 之外额外可写目录
 snapshots = true          # false 时跳过执行前快照（大仓库可关）
 external_directory = ["/tmp/eix-shared", "~/.cache/eix/**"]  # 允许文件工具访问 workspace 之外
-network_allow = ["docs.rs", "*.github.com"]  # webfetch/websearch 的域名 allowlist
+network_allow = ["docs.rs", "*.github.com"]  # 可选：配置后 webfetch/websearch 只放行命中域名
 ```
 
 显式规则按“具体度”选择，`deny` 全局优先，不会被 `auto` / `full` 绕过：
@@ -685,8 +686,8 @@ action = "allow"
   `CRITICAL` 不提供 Always，服务端也会拒绝把它升级成持久规则。
 - 每次工具决策都会写入 `permission_evaluated` 审计事件（action、风险等级、分类、命中规则
   及来源、沙箱状态）；自动批准的写入仍会快照，`patch_applied` message 会带命中的规则 id。
-- `webfetch` / `websearch` 属于 network 风险：默认询问，命中 `network_allow` 才放行；URL
-  query 在展示和日志中脱敏。网络工具不会收到还原后的 secret。
+- `webfetch` / `websearch` 是只读 GET 类网络工具：默认放行；配置非空 `network_allow`
+  后只放行命中域名。URL query 在展示和日志中脱敏，网络工具不会收到还原后的 secret。
 
 `run_command` 在沙箱模式下用 bubblewrap 隔离：系统目录只读，`/tmp` 是私有 tmpfs，
 session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只读挂载，整个 `$HOME`
