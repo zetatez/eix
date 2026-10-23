@@ -171,9 +171,9 @@ fn builtin_commands() -> Vec<CommandSpec> {
 
 /// Merge built-ins with user commands. A custom command with the same name
 /// replaces the built-in entry rather than creating a duplicate.
-fn merge_commands(cwd: &std::path::Path) -> Vec<CommandSpec> {
+fn merge_commands(cwd: &std::path::Path, compat: &eix_core::CompatConfig) -> Vec<CommandSpec> {
     let mut commands = builtin_commands();
-    let custom: Vec<_> = eix_core::load_commands(cwd);
+    let custom: Vec<_> = eix_core::load_commands(cwd, compat);
     for command in custom {
         let spec = CommandSpec {
             name: command.name.clone(),
@@ -193,16 +193,15 @@ fn merge_commands(cwd: &std::path::Path) -> Vec<CommandSpec> {
 }
 
 /// Prompt height: at least [`super::editor::PROMPT_ROWS`] content rows plus the
-/// two borders and one footer row. Long drafts grow the box up to eight total
-/// rows before the editor starts scrolling, and short terminals always keep
-/// transcript rows.
+/// two borders. Long drafts grow the box up to twelve total rows before the
+/// editor starts scrolling, and short terminals always keep transcript rows.
 fn prompt_input_height(area_height: u16, area_width: u16, input: &Editor) -> u16 {
-    // Five editor rows + two borders + the footer = eight rows total.
-    const PROMPT_MAX_ROWS: usize = 5;
+    // Ten editor rows + two borders = twelve rows total.
+    const PROMPT_MAX_ROWS: usize = 10;
     let inner_width = area_width.saturating_sub(4).max(1) as usize;
     let rows = input.layout(inner_width, 1).segments.len();
     let visible = rows.clamp(super::editor::PROMPT_ROWS as usize, PROMPT_MAX_ROWS) as u16;
-    (visible + 3).min(area_height.saturating_sub(5).max(4))
+    (visible + 2).min(area_height.saturating_sub(5).max(4))
 }
 
 // Keep the prompt readable without a separate panel: its chrome paints over
@@ -515,7 +514,7 @@ enum PickerKind {
     Branches,
     /// Open the focused session's context ledger.
     Context,
-    /// Client-side command palette (`:`).
+    /// Client-side command palette (`Ctrl-P`).
     Commands,
     /// Pin the focused session to a configured model.
     Models,
@@ -1080,6 +1079,8 @@ pub struct App {
     command_cursor: usize,
     /// Built-in and user-defined Markdown commands, in menu order.
     commands: Vec<CommandSpec>,
+    /// Opt-in resources from other agent harnesses.
+    compat: eix_core::CompatConfig,
     /// `/` command menu was dismissed with Esc for the current draft.
     command_dismissed: bool,
     /// Streaming `/btw` side answer, shown above the prompt.
@@ -1088,6 +1089,8 @@ pub struct App {
 
 impl App {
     pub fn new(initial_session: Option<String>) -> Self {
+        let launch_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let compat = eix_core::CompatConfig::default();
         Self {
             should_quit: false,
             exit_message: None,
@@ -1159,12 +1162,24 @@ impl App {
             queued_inflight: None,
             submitting_session: None,
             command_cursor: 0,
-            commands: merge_commands(
-                &std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-            ),
+            commands: merge_commands(&launch_cwd, &compat),
+            compat,
             command_dismissed: false,
             btw: None,
         }
+    }
+
+    /// Apply the daemon config's compatibility switches and reload commands
+    /// from all enabled harness sources.
+    pub fn set_compat(&mut self, compat: eix_core::CompatConfig) {
+        self.compat = compat;
+        let cwd = self
+            .focused_view()
+            .map(|view| view.session.cwd.clone())
+            .unwrap_or_else(|| {
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+            });
+        self.commands = merge_commands(&cwd, &self.compat);
     }
 
     /// True when no full-screen overlay owns the keyboard, so a prompt request
@@ -2824,21 +2839,16 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            // In the prompt Ctrl-C is the vim "interrupt": leave insert /
-            // visual mode (or blur on a second press) instead of quitting while
-            // the user is typing. Everywhere else it stays the global quit.
-            let prompt_open = self.focus == Focus::Input
-                && self.overlay_closed()
-                && !self.help
-                && self.reason_prompt.is_none();
-            if prompt_open {
-                let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE);
-                self.handle_input_key(esc, tx);
-            } else {
-                self.sync_draft(tx);
-                self.should_quit = true;
-            }
+        // Ctrl-C / Ctrl-D quit the TUI from every mode, including insert and
+        // any open overlay. Save the draft first so quitting never loses it.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
+                key.code,
+                KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('d') | KeyCode::Char('D')
+            )
+        {
+            self.sync_draft(tx);
+            self.should_quit = true;
             return;
         }
         // Errors float above everything else and keep the keyboard until
@@ -3000,9 +3010,24 @@ impl App {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
         {
             if let KeyCode::Char(ch @ '1'..='9') = key.code {
-                self.focus_tab(ch as usize - '1' as usize);
-                return;
+                // Ctrl-7 is the legacy encoding of Ctrl-/ and belongs to the
+                // model picker below, not the tab strip.
+                if ch != '7' {
+                    self.focus_tab(ch as usize - '1' as usize);
+                    return;
+                }
             }
+        }
+
+        // Global model picker: Ctrl-/ (terminals encode it as '/', '_', or Ctrl-7).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(
+                key.code,
+                KeyCode::Char('/') | KeyCode::Char('_') | KeyCode::Char('7')
+            )
+        {
+            self.open_picker(PickerKind::Models, tx);
+            return;
         }
 
         // Global reasoning shortcut: cycle low → medium → high → none → low.
@@ -3057,8 +3082,8 @@ impl App {
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
-                KeyCode::Char('d') => {
-                    self.scroll_focused(10);
+                KeyCode::Char('p') | KeyCode::Char('P') => {
+                    self.open_picker(PickerKind::Commands, tx);
                     return true;
                 }
                 KeyCode::Char('u') => {
@@ -3480,6 +3505,11 @@ impl App {
             self.handle_diff_key(key, tx);
             return;
         }
+        // Direct test callers may reach the transcript handler without going
+        // through `handle_key`; keep card navigation working there too.
+        if self.handle_card_key(key, tx) {
+            return;
+        }
         if self.handle_shared_normal_key(key, tx) {
             return;
         }
@@ -3487,14 +3517,10 @@ impl App {
             self.open_picker(PickerKind::Sessions, tx);
             return;
         }
-        // Direct test callers may reach the transcript handler without going
-        // through `handle_key`; keep card navigation working there too.
-        if self.handle_card_key(key, tx) {
-            return;
-        }
         // Pane actions are leader-only. Single letters are reserved for
         // navigation (j/k, g/G) and the prompt's own vim editing; the only
-        // direct shortcuts left are shifted punctuation (`:`/`?`/`#`/`<`/`>`).
+        // direct shortcuts left are shifted punctuation (`?`/`#`/`<`/`>`)
+        // plus Ctrl-P for the palette in the shared handler above.
         match key.code {
             // Shift+Z is the vim-adjacent quit key in normal mode.
             KeyCode::Char('Z')
@@ -3504,7 +3530,6 @@ impl App {
             {
                 self.run_action("quit", tx)
             }
-            KeyCode::Char(':') => self.open_picker(PickerKind::Commands, tx),
             KeyCode::Char('<') => self.cycle_pane(-1),
             KeyCode::Char('>') => self.cycle_pane(1),
             // `i` is the one bare letter that stays: focusing the prompt is
@@ -3542,6 +3567,7 @@ impl App {
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
             KeyAction::NewPane => self.open_picker(PickerKind::NewPane, tx),
             KeyAction::Palette => self.open_picker(PickerKind::Commands, tx),
+            KeyAction::Models => self.open_picker(PickerKind::Models, tx),
             KeyAction::Worktrees => self.open_picker(PickerKind::Worktrees, tx),
             KeyAction::Branches => self.open_picker(PickerKind::Branches, tx),
             KeyAction::Ledger => self.open_ledger(tx),
@@ -4242,7 +4268,7 @@ impl App {
                         .focused_view()
                         .map(|view| view.session.cwd.clone())
                         .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    if let Some(skill) = eix_core::find_skill(&cwd, &value) {
+                    if let Some(skill) = eix_core::find_skill(&cwd, &value, &self.compat) {
                         self.picker = None;
                         self.input.set_text(&skill.body);
                         self.focus = Focus::Input;
@@ -4313,7 +4339,7 @@ impl App {
                 .focused_view()
                 .map(|view| view.session.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            picker.items = skill_picker_items(&eix_core::load_skills(&cwd));
+            picker.items = skill_picker_items(&eix_core::load_skills(&cwd, &self.compat));
             self.status = format!("{} skill(s)", picker.items.len());
         } else if kind == PickerKind::Mcp {
             picker.loading = true;
@@ -4414,12 +4440,8 @@ impl App {
         view.session.agent = next.clone();
         let _ = tx.send(Command::SetAgent {
             session_id,
-            agent: next.clone(),
+            agent: next,
         });
-        self.status = match next.as_deref() {
-            Some("plan") => "Plan".into(),
-            _ => "Build".into(),
-        };
     }
 
     fn filtered_sessions(&self) -> Vec<usize> {
@@ -4899,7 +4921,7 @@ impl App {
                         .split_once(char::is_whitespace)
                         .map(|(name, rest)| (name, rest.trim()))
                         .unwrap_or((args, ""));
-                    if let Some(skill) = eix_core::find_skill(&cwd, name) {
+                    if let Some(skill) = eix_core::find_skill(&cwd, name, &self.compat) {
                         self.input
                             .set_text(&eix_core::expand_command(&skill.body, arguments));
                         self.focus = Focus::Input;
@@ -4941,7 +4963,7 @@ impl App {
                     .unwrap_or_else(|| {
                         std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
                     });
-                self.commands = merge_commands(&cwd);
+                self.commands = merge_commands(&cwd, &self.compat);
                 self.status = format!(
                     "{} commands ({} user-defined)",
                     self.commands.len(),
@@ -6157,143 +6179,6 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
-    /// Session banner rendered inside the prompt's bottom-left: agent mode,
-    /// status, model, provider and reasoning variant. The old `eix` brand chip
-    /// and footer statusline are intentionally gone so the line stays quiet.
-    fn header_spans(&self) -> Vec<Span<'static>> {
-        let session = self
-            .focused_view()
-            .map(|view| &view.session)
-            .or_else(|| self.sessions.get(self.selected));
-        let panel = composer_background(self.theme);
-        let muted = composer_muted(self.theme);
-        let accent = composer_accent(self.theme);
-        let warn = composer_warn(self.theme);
-        let plan = session.is_some_and(|session| session.agent.as_deref() == Some("plan"));
-        let mode = if plan { "Plan" } else { "Build" };
-        let mode_color = if plan { warn } else { accent };
-        let mut spans = vec![
-            // Keep Build/Plan the same cell width so the status and model do
-            // not shift when the mode changes.
-            Span::styled(
-                format!(" {mode:<5}"),
-                Style::default()
-                    .fg(mode_color)
-                    .bg(panel)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" · ", Style::default().fg(muted).bg(panel)),
-        ];
-        if let Some(session) = session {
-            let (status, status_color) = if self.connected {
-                (
-                    self.status_glyph(session.status),
-                    composer_status_color(session.status, self.theme),
-                )
-            } else {
-                ("offline".to_string(), composer_danger(self.theme))
-            };
-            spans.push(Span::styled(
-                status,
-                Style::default().fg(status_color).bg(panel),
-            ));
-            let (model, provider, variant) = self.model_header_parts();
-            spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
-            spans.push(Span::styled(model, Style::default().fg(accent).bg(panel)));
-            spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
-            spans.push(Span::styled(provider, Style::default().fg(muted).bg(panel)));
-            if let Some(variant) = variant {
-                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
-                spans.push(Span::styled(variant, Style::default().fg(warn).bg(panel)));
-            }
-            let queued = self.queue_len(&session.id);
-            if queued > 0 {
-                spans.push(Span::styled(
-                    format!("  ⏳{queued}"),
-                    Style::default().fg(warn).bg(panel),
-                ));
-            }
-        } else if self.connected {
-            spans.push(Span::styled(
-                "no session",
-                Style::default().fg(muted).bg(panel),
-            ));
-        } else {
-            spans.push(Span::styled(
-                "connecting…",
-                Style::default().fg(muted).bg(panel),
-            ));
-        }
-        let attention = self.attention_count();
-        if attention > 0 {
-            spans.push(Span::styled(
-                format!("  ⚠{attention}"),
-                Style::default()
-                    .fg(warn)
-                    .bg(panel)
-                    .add_modifier(Modifier::BOLD),
-            ));
-        }
-        spans.push(Span::styled(" ", Style::default().bg(panel)));
-        spans
-    }
-
-    /// Right-aligned half of the prompt banner.
-    fn header_meta_spans(&self) -> Vec<Span<'static>> {
-        let session = self
-            .focused_view()
-            .map(|view| &view.session)
-            .or_else(|| self.sessions.get(self.selected));
-        let panel = composer_background(self.theme);
-        let muted = composer_muted(self.theme);
-        let accent = composer_accent(self.theme);
-        let warn = composer_warn(self.theme);
-        let mut spans = Vec::new();
-        if let Some(session) = session {
-            spans.push(Span::styled(
-                format!(" {} ", compact_path(&session.cwd.display().to_string())),
-                Style::default().fg(muted).bg(panel),
-            ));
-            if self.git_cwd.as_ref() == Some(&session.cwd) {
-                if let Some(branch) = &self.git_branch {
-                    spans.push(Span::styled(
-                        format!("{branch} "),
-                        Style::default().fg(accent).bg(panel),
-                    ));
-                }
-            }
-            if let Some(worktree) = &session.worktree {
-                let name = worktree
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "worktree".into());
-                spans.push(Span::styled(
-                    format!("wt:{name} "),
-                    Style::default().fg(warn).bg(panel),
-                ));
-            }
-        }
-        if !self.pending_images.is_empty() {
-            if !spans.is_empty() {
-                spans.push(Span::styled(" ", Style::default().bg(panel)));
-            }
-            spans.push(Span::styled(
-                format!(" {} img ", self.pending_images.len()),
-                Style::default().fg(warn).bg(panel),
-            ));
-        }
-        spans
-    }
-
-    fn header_meta_line(&self) -> Option<Line<'static>> {
-        let spans = self.header_meta_spans();
-        if spans.is_empty() {
-            None
-        } else {
-            Some(Line::from(spans))
-        }
-    }
-
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         // Sessions live in the floating picker (`p` / `<Space>s`), not in a
         // permanent sidebar: panes get the whole body.
@@ -6403,7 +6288,9 @@ already exists, update it in place rather than rewriting it from scratch.";
                 || self.inputs.contains_key(&session_id));
         let theme = self.theme;
         let borders = if self.layout == PaneLayout::Tabby {
-            Borders::ALL
+            let mut borders = Borders::ALL;
+            borders.remove(Borders::BOTTOM);
+            borders
         } else {
             pane_borders(&self.pane_areas, index)
         };
@@ -6597,7 +6484,9 @@ already exists, update it in place rather than rewriting it from scratch.";
             ));
         }
         let background = self.theme.background;
-        let block = Block::default().borders(Borders::ALL).title(" transcript ");
+        let mut borders = Borders::ALL;
+        borders.remove(Borders::BOTTOM);
+        let block = Block::default().borders(borders).title(" transcript ");
         let block = if let Some(background) = background {
             block.style(Style::default().bg(background))
         } else {
@@ -6620,11 +6509,10 @@ already exists, update it in place rather than rewriting it from scratch.";
             Color::Rgb(46, 50, 60)
         };
 
-        // The top border carries workspace metadata; deny reasons temporarily
-        // replace it. The session banner (mode, status, model, provider and
-        // reasoning variant) lives inside the box at the bottom-left.
+        // Deny reasons temporarily replace the top border. Mode, session and
+        // workspace context live in the statusline below the prompt.
         let title_width = area.width.saturating_sub(2) as usize;
-        let (top_left, top_right) = if let Some(prompt) = &self.reason_prompt {
+        let top_left = if let Some(prompt) = &self.reason_prompt {
             let line = Line::from(vec![
                 Span::styled(
                     " deny reason: ",
@@ -6642,12 +6530,12 @@ already exists, update it in place rather than rewriting it from scratch.";
                     Style::default().fg(composer_muted(self.theme)).bg(panel),
                 ),
             ]);
-            (truncate_line(line, title_width), None)
+            truncate_line(line, title_width)
         } else {
-            fit_title(Line::default(), self.header_meta_line(), title_width)
+            Line::default()
         };
 
-        let mut block = Block::default()
+        let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color).bg(panel))
@@ -6655,15 +6543,11 @@ already exists, update it in place rather than rewriting it from scratch.";
             .title_style(Style::default().bg(panel))
             .padding(Padding::new(1, 1, 0, 0))
             .title_top(top_left);
-        if let Some(title) = top_right {
-            block = block.title_top(title.right_aligned());
-        }
 
         // One cell of left padding keeps the text close to the border; one
-        // cell on the right mirrors it. The last inner row is reserved for the
-        // session banner, so it never covers the draft or the cursor.
+        // cell on the right mirrors it.
         let inner_width = area.width.saturating_sub(4).max(1) as usize;
-        let inner_height = area.height.saturating_sub(3).max(1) as usize;
+        let inner_height = area.height.saturating_sub(2).max(1) as usize;
         let layout = self.input.layout(inner_width, inner_height);
         let lines: Vec<Line> = layout
             .segments
@@ -6676,21 +6560,6 @@ already exists, update it in place rather than rewriting it from scratch.";
             .block(block)
             .style(Style::default().fg(text).bg(panel));
         frame.render_widget(paragraph, area);
-
-        let footer_width = area.width.saturating_sub(4) as usize;
-        if self.reason_prompt.is_none() && footer_width > 0 && area.height >= 3 {
-            let footer_area = Rect::new(
-                area.x.saturating_add(2),
-                area.y + area.height.saturating_sub(2),
-                footer_width as u16,
-                1,
-            );
-            let footer = truncate_line(Line::from(self.header_spans()), footer_width);
-            frame.render_widget(
-                Paragraph::new(footer).style(Style::default().bg(panel)),
-                footer_area,
-            );
-        }
 
         // The error dialog covers the prompt; don't leave a blinking input
         // cursor on top of it.
@@ -6705,29 +6574,112 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
-    /// Vim-style statusline: mode on the left, then the focused session and
-    /// the latest app status; the right side carries model and queue counters.
+    fn status_session(&self) -> Option<&Session> {
+        self.focused_view()
+            .map(|view| &view.session)
+            .or_else(|| self.sessions.get(self.selected))
+    }
+
+    /// Primary statusline: Vim mode, agent mode, execution status,
+    /// model/provider and reasoning variant. The workspace (cwd + branch) is
+    /// right-aligned.
     fn status_bar_left(&self) -> Line<'static> {
         let theme = self.theme;
         let panel = composer_background(theme);
         let muted = composer_muted(theme);
-        let text = composer_text(theme);
+        let accent = composer_accent(theme);
+        let warn = composer_warn(theme);
         let active = self.focus == Focus::Input;
-        let mode = if active {
+        let input_mode = if active {
             self.input.mode()
         } else {
             Mode::Normal
         };
+        let session = self.status_session();
+        let plan = session.is_some_and(|session| session.agent.as_deref() == Some("plan"));
+        let agent_mode = if plan { "Plan" } else { "Build" };
+        let agent_color = if plan { warn } else { accent };
         let mut spans = vec![
             Span::styled(
-                format!(" {} ", mode.short_label()),
-                composer_mode_style(mode, active, theme),
+                format!(" {} ", input_mode.short_label()),
+                composer_mode_style(input_mode, active, theme),
             ),
-            Span::styled(" ", Style::default().bg(panel)),
+            Span::styled("· ", Style::default().fg(muted).bg(panel)),
+            // Keep Build/Plan the same cell width so the status does not shift
+            // when the mode changes.
+            Span::styled(
+                format!("{agent_mode:<5}"),
+                Style::default()
+                    .fg(agent_color)
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · ", Style::default().fg(muted).bg(panel)),
         ];
-        if let Some(view) = self.focused_view() {
+        if let Some(session) = session {
+            let (status, status_color) = if self.connected {
+                (
+                    self.status_glyph(session.status),
+                    composer_status_color(session.status, theme),
+                )
+            } else {
+                ("offline".to_string(), composer_danger(theme))
+            };
             spans.push(Span::styled(
-                view.session.name.clone(),
+                status,
+                Style::default().fg(status_color).bg(panel),
+            ));
+
+            let (model, provider, variant) = self.model_header_parts();
+            let model = short_model(&model);
+            if model != "-" && !model.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                spans.push(Span::styled(
+                    model.to_string(),
+                    Style::default().fg(muted).bg(panel),
+                ));
+                if !provider.is_empty() {
+                    spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                    spans.push(Span::styled(
+                        provider,
+                        Style::default()
+                            .fg(muted)
+                            .bg(panel)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
+                if let Some(variant) = variant {
+                    spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                    spans.push(Span::styled(variant, Style::default().fg(warn).bg(panel)));
+                }
+            }
+        } else if self.connected {
+            spans.push(Span::styled(
+                "no session",
+                Style::default().fg(muted).bg(panel),
+            ));
+        } else {
+            spans.push(Span::styled(
+                "connecting…",
+                Style::default().fg(muted).bg(panel),
+            ));
+        }
+        spans.push(Span::styled(" ", Style::default().bg(panel)));
+        Line::from(spans)
+    }
+
+    /// Secondary statusline context: session name, latest status, worktree and
+    /// pending image count. It is dropped first when the bar gets narrow.
+    fn status_bar_middle(&self) -> Option<Line<'static>> {
+        let theme = self.theme;
+        let panel = composer_background(theme);
+        let muted = composer_muted(theme);
+        let text = composer_text(theme);
+        let warn = composer_warn(theme);
+        let mut spans = Vec::new();
+        if let Some(session) = self.status_session() {
+            spans.push(Span::styled(
+                session.name.clone(),
                 Style::default()
                     .fg(text)
                     .bg(panel)
@@ -6735,7 +6687,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             ));
             spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
             let status = if self.status.is_empty() {
-                view.session.status.as_str()
+                session.status.as_str()
             } else {
                 self.status.as_str()
             };
@@ -6743,20 +6695,61 @@ already exists, update it in place rather than rewriting it from scratch.";
                 status.to_string(),
                 Style::default().fg(muted).bg(panel),
             ));
-        } else {
+            if let Some(worktree) = &session.worktree {
+                let name = worktree
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "worktree".into());
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                spans.push(Span::styled(
+                    format!("wt:{name}"),
+                    Style::default().fg(warn).bg(panel),
+                ));
+            }
+        }
+        if !self.pending_images.is_empty() {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+            }
             spans.push(Span::styled(
-                "no session",
-                Style::default().fg(muted).bg(panel),
+                format!("{} img", self.pending_images.len()),
+                Style::default().fg(warn).bg(panel),
             ));
         }
-        Line::from(spans)
+        if spans.is_empty() {
+            None
+        } else {
+            spans.insert(0, Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+            Some(Line::from(spans))
+        }
+    }
+
+    /// Workspace context kept against the right edge: cwd and git branch.
+    fn status_bar_workspace(&self) -> Option<Line<'static>> {
+        let panel = composer_background(self.theme);
+        let muted = composer_muted(self.theme);
+        let accent = composer_accent(self.theme);
+        let session = self.status_session()?;
+        let mut spans = vec![Span::styled(
+            compact_path(&session.cwd.display().to_string()),
+            Style::default().fg(muted).bg(panel),
+        )];
+        if self.git_cwd.as_ref() == Some(&session.cwd) {
+            if let Some(branch) = &self.git_branch {
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                spans.push(Span::styled(
+                    branch.clone(),
+                    Style::default().fg(accent).bg(panel),
+                ));
+            }
+        }
+        Some(Line::from(spans))
     }
 
     fn status_bar_right(&self) -> Line<'static> {
         let theme = self.theme;
         let panel = composer_background(theme);
         let muted = composer_muted(theme);
-        let accent = composer_accent(theme);
         let warn = composer_warn(theme);
         let mut spans = Vec::new();
         let push = |spans: &mut Vec<Span<'static>>, text: String, color: Color| {
@@ -6765,12 +6758,6 @@ already exists, update it in place rather than rewriting it from scratch.";
             }
             spans.push(Span::styled(text, Style::default().fg(color).bg(panel)));
         };
-        if self.focused_view().is_some() {
-            let model = short_model(self.model());
-            if model != "-" {
-                push(&mut spans, model.to_string(), accent);
-            }
-        }
         if self.views.len() > 1 {
             push(
                 &mut spans,
@@ -6818,17 +6805,74 @@ already exists, update it in place rather than rewriting it from scratch.";
         let panel = composer_background(self.theme);
         let background = Style::default().bg(panel);
         let left = self.status_bar_left();
-        let right = self.status_bar_right();
+        let middle = self.status_bar_middle();
+        let counters = self.status_bar_right();
+        let workspace = self.status_bar_workspace();
         let alert = self.status_bar_alert();
-        let right_width = (right.width() as u16).min(area.width);
-        let left_width = (left.width() as u16).min(area.width.saturating_sub(right_width));
+
+        let counters_width = counters.width();
+        let workspace_width = workspace.as_ref().map_or(0, |line| line.width());
+        let workspace_with_padding = if workspace_width > 0 {
+            workspace_width + 1
+        } else {
+            0
+        };
+        let combined_right_width = if counters_width > 0 && workspace_width > 0 {
+            counters_width + workspace_width + 3
+        } else if workspace_width > 0 {
+            workspace_with_padding
+        } else {
+            counters_width
+        };
+
+        // Keep cwd/branch visible when the left side grows; the counters are
+        // dropped before the workspace on narrow terminals.
+        let left_width = left
+            .width()
+            .min((area.width as usize).saturating_sub(workspace_with_padding))
+            as u16;
+        let right_available = area.width as usize - left_width as usize;
+        let combined_fits = combined_right_width <= right_available;
+        let right_width = if combined_fits {
+            combined_right_width
+        } else {
+            workspace_with_padding.min(right_available)
+        } as u16;
+        let middle_width = area
+            .width
+            .saturating_sub(left_width)
+            .saturating_sub(right_width);
+
+        let mut right_spans = Vec::new();
+        if combined_fits {
+            right_spans.extend(counters.spans);
+            if let Some(workspace) = workspace {
+                if right_spans.is_empty() {
+                    right_spans.push(Span::styled(" ", background));
+                } else {
+                    right_spans.push(Span::styled(
+                        " · ",
+                        Style::default().fg(composer_muted(self.theme)).bg(panel),
+                    ));
+                }
+                right_spans.extend(workspace.spans);
+            }
+        } else if let Some(workspace) = workspace {
+            right_spans.push(Span::styled(" ", background));
+            right_spans.extend(workspace.spans);
+        }
+        let right = truncate_line(Line::from(right_spans), right_width as usize);
+
         let chunks = Layout::horizontal([
             Constraint::Length(left_width),
             Constraint::Min(0),
             Constraint::Length(right_width),
         ])
         .split(area);
-        frame.render_widget(Paragraph::new(left).style(background), chunks[0]);
+        if left_width > 0 {
+            let left = truncate_line(left, left_width as usize);
+            frame.render_widget(Paragraph::new(left).style(background), chunks[0]);
+        }
         if let Some(alert) = alert {
             frame.render_widget(
                 Paragraph::new(alert)
@@ -6836,6 +6880,11 @@ already exists, update it in place rather than rewriting it from scratch.";
                     .style(background),
                 chunks[1],
             );
+        } else if middle_width > 0 {
+            if let Some(middle) = middle {
+                let middle = truncate_line(middle, middle_width as usize);
+                frame.render_widget(Paragraph::new(middle).style(background), chunks[1]);
+            }
         }
         if right_width > 0 {
             frame.render_widget(
@@ -8001,7 +8050,7 @@ fn skill_picker_items(skills: &[eix_core::Skill]) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Rows for the `:` command palette. `value` is dispatched by
+/// Rows for the `Ctrl-P` command palette. `value` is dispatched by
 /// [`App::run_action`]; the label and help are only for display.
 fn command_items() -> Vec<PickerItem> {
     const COMMANDS: &[(&str, &str, &str)] = &[
@@ -8527,7 +8576,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Ctrl-1 … Ctrl-9",
-                description: "focus the Nth open session / tabby tab (needs CSI-u keyboard support)",
+                description: "focus the Nth open session / tabby tab (Ctrl-7 opens the model picker on some terminals)",
             },
             HelpEntry {
                 key: "Alt-1 … Alt-9",
@@ -8550,7 +8599,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "normal mode: move between lines in the draft",
             },
             HelpEntry {
-                key: ":",
+                key: "Ctrl-P",
                 description: "command palette (prompt normal mode and transcript)",
             },
             HelpEntry {
@@ -8560,6 +8609,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "Ctrl-T",
                 description: "cycle reasoning (default medium): low / medium / high / none",
+            },
+            HelpEntry {
+                key: "Ctrl-/",
+                description: "open the searchable model picker",
             },
             HelpEntry {
                 key: "Space o",
@@ -8650,8 +8703,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "open this help (F1 anywhere)",
             },
             HelpEntry {
-                key: "Z / Ctrl-C",
-                description: "quit in normal mode (Ctrl-C interrupts instead while the prompt is focused)",
+                key: "Z / Ctrl-C / Ctrl-D",
+                description: "quit from any mode (draft is saved first)",
             },
             HelpEntry {
                 key: "help search",
@@ -9004,31 +9057,30 @@ fn ledger_hint_line(ledger: &LedgerView) -> Line<'static> {
 /// Tile `count` panes inside `area`. One pane is fullscreen, two split
 /// vertically, three use a tall left pane plus two stacked on the right, and
 /// everything else uses a near-square grid.
-/// Adjacent panes share one line: the left pane owns the right border, the
-/// top pane owns the top border. This halves the gap between neighbouring
-/// panes while keeping every title on a top border.
+/// Adjacent panes share one line: the left pane owns the right border, and
+/// each pane's top border separates it from the pane above. The prompt's top
+/// border closes the transcript, so panes never draw their own bottom edge;
+/// this keeps the conversation and input box one line apart instead of two.
 fn pane_borders(areas: &[Rect], index: usize) -> Borders {
     let Some(rect) = areas.get(index).copied() else {
-        return Borders::ALL;
+        let mut borders = Borders::ALL;
+        borders.remove(Borders::BOTTOM);
+        return borders;
     };
     let overlaps = |a_start: u16, a_len: u16, b_start: u16, b_len: u16| {
         a_start < b_start.saturating_add(b_len) && b_start < a_start.saturating_add(a_len)
     };
 
     let mut borders = Borders::ALL;
+    borders.remove(Borders::BOTTOM);
     for (other_index, other) in areas.iter().enumerate() {
         if other_index == index {
             continue;
         }
         let left_neighbour = other.x.saturating_add(other.width) == rect.x
             && overlaps(other.y, other.height, rect.y, rect.height);
-        let bottom_neighbour = other.y == rect.y.saturating_add(rect.height)
-            && overlaps(other.x, other.width, rect.x, rect.width);
         if left_neighbour {
             borders.remove(Borders::LEFT);
-        }
-        if bottom_neighbour {
-            borders.remove(Borders::BOTTOM);
         }
     }
     borders
@@ -9824,23 +9876,6 @@ fn composer_mode_style(mode: Mode, focused: bool, theme: Theme) -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
-/// Keep a left/right pair of border titles from colliding. The right title is
-/// dropped first; the left one is clipped only when it cannot fit by itself.
-fn fit_title(
-    left: Line<'static>,
-    right: Option<Line<'static>>,
-    width: usize,
-) -> (Line<'static>, Option<Line<'static>>) {
-    let width = width.max(1);
-    let right = right.filter(|right| left.width() + right.width() + 2 <= width);
-    let left = if left.width() > width {
-        truncate_line(left, width)
-    } else {
-        left
-    };
-    (left, right)
-}
-
 fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
     if width == 0 {
         return Line::default();
@@ -10243,6 +10278,7 @@ mod tests {
 
         let stacked = vec![Rect::new(0, 0, 20, 10), Rect::new(0, 10, 20, 10)];
         assert!(!pane_borders(&stacked, 0).contains(Borders::BOTTOM));
+        assert!(!pane_borders(&stacked, 1).contains(Borders::BOTTOM));
         assert!(pane_borders(&stacked, 1).contains(Borders::TOP));
     }
 
@@ -10527,24 +10563,19 @@ mod tests {
         // The active tab is bracketed; inactive tabs are not separate panes.
         assert!(rendered.contains("[2 session b]"), "{rendered}");
 
-        // Tabs sit directly above the prompt box; the session banner now lives
-        // on the last inner row, just above the bottom border.
+        // Tabs sit directly above the prompt box; the session banner lives in
+        // the statusline on the final row.
         let lines: Vec<&str> = rendered.lines().collect();
         let tab_row = lines
             .iter()
             .position(|line| line.contains("[2 session b]"))
             .expect("tab strip");
-        let build_row = lines
-            .iter()
-            .position(|line| line.contains("Build ·"))
-            .expect("prompt header");
         let prompt_top = tab_row + 1;
         assert!(lines[prompt_top].contains('╭'), "{rendered}");
-        let prompt_bottom = lines
-            .iter()
-            .rposition(|line| line.contains('╰'))
-            .expect("prompt bottom");
-        assert_eq!(build_row + 1, prompt_bottom, "{rendered}");
+        assert!(
+            lines.last().is_some_and(|line| line.contains("Build ·")),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -12261,14 +12292,14 @@ mod tests {
     #[test]
     fn prompt_height_grows_for_long_drafts() {
         let mut input = Editor::new();
-        // Short drafts keep the minimum 3 editor rows + 2 borders + 1 footer.
-        assert_eq!(prompt_input_height(40, 80, &input), 6);
-        assert_eq!(prompt_input_height(100, 80, &input), 6);
+        // Short drafts keep the minimum 3 editor rows + 2 borders.
+        assert_eq!(prompt_input_height(40, 80, &input), 5);
+        assert_eq!(prompt_input_height(100, 80, &input), 5);
 
         // A long command grows the box so wrapped rows stay visible, but the
-        // cap is 8 rows total and short terminals still win.
+        // cap is 12 rows total and short terminals still win.
         input.set_text(&"x".repeat(1_000));
-        assert_eq!(prompt_input_height(40, 80, &input), 8);
+        assert_eq!(prompt_input_height(40, 80, &input), 12);
         assert_eq!(prompt_input_height(12, 80, &input), 7);
         assert_eq!(prompt_input_height(8, 80, &input), 4);
     }
@@ -12295,7 +12326,7 @@ mod tests {
     }
 
     #[test]
-    fn colon_in_prompt_normal_mode_opens_the_palette() {
+    fn ctrl_p_in_prompt_normal_mode_opens_the_palette() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.focus_input();
@@ -12305,44 +12336,49 @@ mod tests {
         assert!(app.picker.is_none());
         assert_eq!(app.input.text(), ":");
 
-        // In normal mode `:` opens the interactive command palette instead of
-        // editing the draft, matching the transcript binding.
+        // In normal mode Ctrl-P opens the interactive command palette instead
+        // of editing the draft, matching the transcript binding.
         app.input.clear();
         app.input.enter_normal();
-        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert!(matches!(
             app.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Commands)
         ));
+
+        // The old bare-colon binding no longer opens the palette.
+        app.picker = None;
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
     }
 
     #[test]
-    fn ctrl_c_interrupts_insert_mode_without_quitting() {
+    fn ctrl_c_and_ctrl_d_quit_from_any_mode() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(None);
-        app.focus_input();
-        assert_eq!(app.input.mode(), Mode::Insert);
+        for key in ['c', 'd'] {
+            let mut app = App::new(None);
+            app.focus_input();
+            assert_eq!(app.input.mode(), Mode::Insert);
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                &tx,
+            );
+            assert!(app.should_quit, "Ctrl-{key} should quit from insert mode");
 
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &tx,
-        );
-        assert!(!app.should_quit);
-        assert!(matches!(app.focus, Focus::Input));
-        assert_eq!(app.input.mode(), Mode::Normal);
-    }
-
-    #[test]
-    fn ctrl_c_still_quits_outside_the_prompt() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(None);
-        app.focus = Focus::Transcript;
-
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
-            &tx,
-        );
-        assert!(app.should_quit);
+            let mut app = App::new(None);
+            app.focus = Focus::Transcript;
+            app.handle_key(
+                KeyEvent::new(KeyCode::Char(key), KeyModifiers::CONTROL),
+                &tx,
+            );
+            assert!(
+                app.should_quit,
+                "Ctrl-{key} should quit from the transcript"
+            );
+        }
     }
 
     #[test]
@@ -12435,9 +12471,12 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
         assert!(app.process_view.is_some());
 
-        // Shift+`:` stays available as the command palette shortcut.
+        // Ctrl-P opens the command palette from the transcript.
         app.process_view = None;
-        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::SHIFT), &tx);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+            &tx,
+        );
         assert!(matches!(
             app.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Commands)
@@ -12612,7 +12651,6 @@ mod tests {
             vec![KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)],
             vec![KeyEvent::new(KeyCode::Char('#'), KeyModifiers::SHIFT)],
             vec![KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)],
-            vec![KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL)],
             vec![
                 KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE),
                 KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL),
@@ -12729,9 +12767,10 @@ mod tests {
     }
 
     #[test]
-    fn prompt_header_keeps_build_and_plan_aligned() {
-        fn header(app: &App) -> String {
-            app.header_spans()
+    fn status_bar_keeps_build_and_plan_aligned() {
+        fn left(app: &App) -> String {
+            app.status_bar_left()
+                .spans
                 .iter()
                 .map(|span| span.content.as_ref())
                 .collect()
@@ -12757,23 +12796,21 @@ mod tests {
             context_tokens: None,
         });
 
-        let build = header(&app);
+        let build = left(&app);
         assert_eq!(
             build,
-            " Build · ○ · deepseek/deepseek-v4.1-flash · llmgate · high "
+            " I · Build · ○ · deepseek-v4.1-flash · llmgate · high "
         );
-        assert!(!build.contains("eix"));
 
         app.views[0].session.agent = Some("plan".into());
-        let plan = header(&app);
+        let plan = left(&app);
         assert_eq!(
             plan,
-            " Plan  · ○ · deepseek/deepseek-v4.1-flash · llmgate · high "
+            " I · Plan  · ○ · deepseek-v4.1-flash · llmgate · high "
         );
-        // Padding Plan to Build's width keeps the status and model in place.
+        // Padding Plan to Build's width keeps the status in place.
         assert_eq!(build.len(), plan.len());
         assert_eq!(build.find('○'), plan.find('○'));
-        assert_eq!(build.find("deepseek"), plan.find("deepseek"));
     }
 
     #[test]
@@ -12790,7 +12827,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_header_shows_git_branch_and_worktree() {
+    fn status_bar_shows_git_branch_and_worktree() {
         let mut app = App::new(None);
         let cwd = std::path::PathBuf::from("/tmp/eix-repo");
         let mut session = Session::new("s1", "one", cwd.clone());
@@ -12801,22 +12838,22 @@ mod tests {
         app.git_branch = Some("eix/feat".into());
         app.git_checked = Some(Instant::now());
 
-        let text: String = app
-            .header_meta_spans()
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("eix/feat"), "{text}");
-        assert!(text.contains("wt:feat"), "{text}");
+        let workspace = app.status_bar_workspace().expect("workspace");
+        let workspace = line_text(&workspace);
+        assert!(workspace.contains("eix-repo"), "{workspace}");
+        assert!(workspace.contains("eix/feat"), "{workspace}");
+        let middle = app.status_bar_middle().expect("middle");
+        let middle = line_text(&middle);
+        assert!(middle.contains("wt:feat"), "{middle}");
 
         // A cached branch for another cwd must not leak into this session.
         app.git_cwd = Some(std::path::PathBuf::from("/tmp/other"));
-        let text: String = app
-            .header_meta_spans()
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(!text.contains("eix/feat"), "{text}");
+        let workspace = app.status_bar_workspace().expect("workspace");
+        let workspace = line_text(&workspace);
+        assert!(!workspace.contains("eix/feat"), "{workspace}");
+        let middle = app.status_bar_middle().expect("middle");
+        let middle = line_text(&middle);
+        assert!(middle.contains("wt:feat"), "{middle}");
     }
 
     #[test]
@@ -12829,11 +12866,13 @@ mod tests {
         ));
         app.focused = 0;
         app.focus_input();
+        app.status = "ready".into();
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
         assert_eq!(app.views[0].session.agent.as_deref(), Some("plan"));
-        assert_eq!(app.status, "Plan");
+        // Build/Plan lives in the status bar, not in the transient app status.
+        assert_eq!(app.status, "ready");
         match rx.try_recv().expect("set plan agent") {
             Command::SetAgent { session_id, agent } => {
                 assert_eq!(session_id, "s1");
@@ -12844,7 +12883,7 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
         assert_eq!(app.views[0].session.agent, None);
-        assert_eq!(app.status, "Build");
+        assert_eq!(app.status, "ready");
         match rx.try_recv().expect("set build agent") {
             Command::SetAgent { session_id, agent } => {
                 assert_eq!(session_id, "s1");
@@ -13583,6 +13622,46 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_slash_opens_the_model_picker_from_both_focus_modes() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let mut transcript = App::new(None);
+        transcript.focus = Focus::Transcript;
+        transcript.handle_key(
+            KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(matches!(
+            transcript.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Models)
+        ));
+        assert!(transcript.picker.as_ref().unwrap().loading);
+
+        let mut prompt = App::new(None);
+        prompt.focus_input();
+        prompt.handle_key(
+            KeyEvent::new(KeyCode::Char('_'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(matches!(
+            prompt.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Models)
+        ));
+        assert!(prompt.picker.as_ref().unwrap().loading);
+
+        let mut legacy = App::new(None);
+        legacy.focus = Focus::Transcript;
+        legacy.handle_key(
+            KeyEvent::new(KeyCode::Char('7'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(matches!(
+            legacy.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Models)
+        ));
+    }
+
+    #[test]
     fn slash_quit_on_the_last_pane_quits_after_saving() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
@@ -13867,7 +13946,7 @@ mod tests {
     }
 
     #[test]
-    fn prompt_footer_stays_below_the_draft_inside_the_box() {
+    fn prompt_border_stays_below_the_draft_inside_the_box() {
         let mut app = App::new(None);
         let mut session = Session::new("s1", "one", "/tmp");
         session.model = Some("llmgate/deepseek/deepseek-v4.1-flash#high".into());
@@ -13875,6 +13954,8 @@ mod tests {
         app.focused = 0;
         app.focus = Focus::Input;
         app.connected = true;
+        app.git_cwd = Some(std::path::PathBuf::from("/tmp"));
+        app.git_branch = Some("main".into());
         app.models.push(ModelInfo {
             id: "llmgate/deepseek/deepseek-v4.1-flash".into(),
             api_model: Some("deepseek/deepseek-v4.1-flash".into()),
@@ -13894,20 +13975,46 @@ mod tests {
             .iter()
             .position(|line| line.contains("hello footer"))
             .expect("draft");
-        let footer_row = lines
-            .iter()
-            .position(|line| line.contains("Build ·"))
-            .expect("session banner");
-        assert!(
-            lines[footer_row].contains("deepseek/deepseek-v4.1-flash · llmgate · high"),
-            "{rendered}"
-        );
-        assert!(text_row < footer_row, "{rendered}");
         let bottom_row = lines
             .iter()
             .rposition(|line| line.contains('╰'))
             .expect("prompt bottom");
-        assert_eq!(footer_row + 1, bottom_row, "{rendered}");
+        assert!(!lines[bottom_row - 1].contains("Build"), "{rendered}");
+        assert!(!lines[bottom_row - 1].contains("deepseek"), "{rendered}");
+        let status_row = lines.last().expect("status bar");
+        assert!(status_row.contains(" I · Build ·"), "{rendered}");
+        assert!(status_row.contains("deepseek-v4.1-flash"), "{rendered}");
+        assert!(status_row.contains("llmgate"), "{rendered}");
+        assert!(status_row.contains("· high"), "{rendered}");
+        assert!(status_row.contains("· main"), "{rendered}");
+        let top_row = lines
+            .iter()
+            .position(|line| line.contains('╭'))
+            .expect("prompt top border");
+        assert!(!lines[top_row].contains("main"), "{rendered}");
+        assert!(
+            !lines[top_row.saturating_sub(1)].contains('└'),
+            "the transcript should not add a second border above the prompt:\n{rendered}"
+        );
+        assert!(text_row < bottom_row, "{rendered}");
+    }
+
+    #[test]
+    fn status_bar_keeps_workspace_metadata_when_narrow() {
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "one", "/tmp");
+        session.model = Some("provider/a-very-long-model-name#high".into());
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.connected = true;
+        app.git_cwd = Some(std::path::PathBuf::from("/tmp"));
+        app.git_branch = Some("main".into());
+
+        let rendered = render_text(&mut app, 40, 20);
+        let bar = rendered.lines().last().expect("status bar");
+        assert!(bar.contains("/tmp · main"), "{bar}");
+        assert!(bar.contains("Build ·"), "{bar}");
+        assert!(UnicodeWidthStr::width(bar) <= 40, "{bar}");
     }
 
     #[test]
@@ -13962,10 +14069,7 @@ mod tests {
         app.connected = true;
 
         let empty = render_text(&mut app, 80, 20);
-        assert!(
-            empty.contains("Build · ⠋ · openai/gpt-5 · openai · medium"),
-            "{empty}"
-        );
+        assert!(empty.contains("Build · ⠋"), "{empty}");
         assert!(!empty.contains("eixd"), "no footer brand: {empty}");
         assert!(!empty.contains("/cmds"), "no footer hints: {empty}");
         assert!(empty.contains("1● prompt polish"), "{empty}");
@@ -13980,7 +14084,25 @@ mod tests {
         assert!(!empty.contains("❯"), "{empty}");
         assert!(empty.contains(" I "), "{empty}");
         assert!(!empty.contains("INSERT"), "{empty}");
-        assert!(empty.contains("~/git/eix"), "{empty}");
+        let lines: Vec<&str> = empty.lines().collect();
+        let top_border = lines
+            .iter()
+            .position(|line| line.contains('╭'))
+            .expect("prompt top border");
+        let prompt_bottom = lines
+            .iter()
+            .rposition(|line| line.contains('╰'))
+            .expect("prompt bottom");
+        let status_bar = lines.last().expect("status bar");
+        assert!(!lines[top_border].contains("~/git/eix"), "{empty}");
+        assert!(!lines[prompt_bottom - 1].contains(" I "), "{empty}");
+        assert!(!lines[prompt_bottom - 1].contains("Build"), "{empty}");
+        assert!(status_bar.contains(" I · Build ·"), "{empty}");
+        assert!(status_bar.contains("~/git/eix"), "{empty}");
+        assert!(!lines[prompt_bottom - 1].contains("gpt-5"), "{empty}");
+        assert!(status_bar.contains("gpt-5"), "{empty}");
+        assert!(status_bar.contains("openai"), "{empty}");
+        assert!(status_bar.contains("medium"), "{empty}");
         assert!(!empty.contains("Message eix…"), "{empty}");
         assert!(!empty.contains("C-j newline"), "{empty}");
         assert!(!empty.contains("Esc normal"), "{empty}");
@@ -13993,7 +14115,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_mode_session_and_latest_status() {
+    fn status_bar_shows_session_and_latest_status() {
         let mut app = App::new(None);
         let mut session = Session::new("s1", "status test", "/tmp");
         session.model = Some("openai/gpt-5".into());
@@ -14004,17 +14126,35 @@ mod tests {
         app.status = "retrying 2/5".into();
 
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().nth(19).expect("status bar row");
-        assert!(bar.contains(" I "), "{bar}");
+        let bar = text.lines().last().expect("status bar row");
+        assert!(bar.contains("Build ·"), "{bar}");
         assert!(bar.contains("status test"), "{bar}");
         assert!(bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");
+        // The primary group is ordered Vim mode → agent mode → status → model
+        // → provider → reasoning, and cwd stays pinned to the right edge.
+        assert!(bar.trim_start().starts_with("I · Build ·"), "{bar}");
+        let vim_mode = bar.find('I').unwrap();
+        let build = bar.find("Build").unwrap();
+        let status = bar.find('○').unwrap();
+        let model = bar.find("gpt-5").unwrap();
+        let provider = bar.find("openai").unwrap();
+        let reasoning = bar.find("medium").unwrap();
+        assert!(
+            vim_mode < build
+                && build < status
+                && status < model
+                && model < provider
+                && provider < reasoning,
+            "{bar}"
+        );
+        assert!(bar.trim_end().ends_with("/tmp"), "{bar}");
 
-        // The statusline follows the active context, not the editor buffer.
+        // The mode badge follows the active context, not the editor buffer.
         app.focus = Focus::Transcript;
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().nth(19).expect("status bar row");
-        assert!(bar.contains(" N "), "{bar}");
+        let bar = text.lines().last().expect("status bar row");
+        assert!(bar.trim_start().starts_with("N · Build ·"), "{text}");
     }
 
     #[test]
@@ -14031,18 +14171,22 @@ mod tests {
         app.alert_at = Some(Instant::now());
 
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().nth(19).expect("status bar row");
+        let bar = text.lines().last().expect("status bar row");
         let alert = bar
             .find("worker · awaiting approval")
             .expect("center alert");
-        assert!(alert > bar.find("retrying").unwrap(), "{bar}");
-        assert!(bar.contains("gpt-5"), "{bar}");
+        assert!(alert > bar.find("Build").unwrap(), "{bar}");
+        assert!(alert < bar.find("/tmp").unwrap(), "{bar}");
+        assert!(!bar.contains("retrying 2/5"), "{bar}");
 
-        // The alert is transient, so stale attention text does not stick.
+        // The alert temporarily replaces the secondary metadata; once it
+        // expires the session status and model context come back.
         app.alert_at = Some(Instant::now() - ALERT_DISPLAY);
         let text = render_text(&mut app, 80, 20);
-        let bar = text.lines().nth(19).expect("status bar row");
+        let bar = text.lines().last().expect("status bar row");
         assert!(!bar.contains("worker · awaiting approval"), "{bar}");
+        assert!(bar.contains("retrying 2/5"), "{bar}");
+        assert!(bar.contains("gpt-5"), "{bar}");
     }
 
     #[test]

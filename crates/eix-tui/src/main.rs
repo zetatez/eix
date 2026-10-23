@@ -1768,6 +1768,30 @@ async fn doctor(cli: &Cli) -> Result<()> {
                     "blocked"
                 }
             );
+            let mut compat = Vec::new();
+            if config.compations.claude_code {
+                compat.push("claude");
+            }
+            if config.compations.opencode {
+                compat.push("opencode");
+            }
+            if config.compations.codex_cli {
+                compat.push("codex");
+            }
+            if config.compations.gemini_cli {
+                compat.push("gemini");
+            }
+            if config.compations.pi {
+                compat.push("pi");
+            }
+            println!(
+                "compations {}",
+                if compat.is_empty() {
+                    "off (native .eix only)".to_string()
+                } else {
+                    compat.join(", ")
+                }
+            );
             let agents = std::env::current_dir()
                 .ok()
                 .map(|cwd| cwd.join("AGENTS.md"))

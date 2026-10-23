@@ -75,6 +75,14 @@ auto_compact_threshold = 0.8   # 占 budget_tokens 的比例 (0, 1]
 auto_compact_keep_turns = 2    # 最近 N 个 user turn 原样保留
 tool_output_tokens = 4000      # 单条工具结果进入 provider 上下文的 token 上限
 
+# 其他 agent 的资源兼容（默认全关；.eix 自己的目录始终加载）
+[compations]
+claude_code = false            # ~/.claude + 项目 .claude：skills / commands / agents / CLAUDE.md
+opencode = false               # ~/.config/opencode + 项目 .opencode：skills / commands / agents / AGENTS.md
+codex_cli = false              # $CODEX_HOME + 项目 .codex：skills / prompts / AGENTS.md
+gemini_cli = false             # ~/.gemini + 项目 .gemini：skills / commands(.toml) / agents / GEMINI.md
+pi = false                     # $PI_CODING_AGENT_DIR + 项目 .pi：skills / prompts / AGENTS.md / CLAUDE.md
+
 # 额外 provider（可选）。/model 会自动请求每个 provider 的 GET /models，
 # 选择 id 为 "<provider>/<api-model-id>"；模型 id 里的 "/" 会保留。
 # [provider] 的自动项使用 "default/<api-model-id>"，默认模型仍排在第一位。
@@ -118,10 +126,18 @@ args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
 # max_store_bytes = 2147483648
 
 # 写入后的格式化（可选；写入成功后执行，失败只附注不撤销文件）
-[formatter]
+# 按顺序匹配 extensions，第一条命中的规则执行。
+[[formatter]]
 command = "rustfmt --edition 2021"
 extensions = ["rs"]
-timeout_secs = 30
+
+[[formatter]]
+command = "gofmt -w"
+extensions = ["go"]
+
+[[formatter]]
+command = "prettier --write"
+extensions = ["json", "yaml", "yml", "md"]
 
 # TUI 调色板（可选；颜色名 / #rrggbb / 0-255 ANSI 索引）
 # 不设置 preset 时使用终端背景；输入框不再额外填充背景，跟随主题 background/终端。
@@ -153,6 +169,7 @@ extensions = ["py"]
 # new_session = "C-n"
 # help = "F2"
 # palette = "C-p"
+# model = "C-/"
 # quit = "C-q"
 ```
 
@@ -202,10 +219,12 @@ ask 写入、以及 `run_command` 的写操作仍在审批处阻塞（shell 无�
 只读的命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮、`a` 跳转提示，
 并在底部状态栏中间显示提醒（不弹桌面通知）；外部通知命令（dwm/tmux）已接入
-（见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：顶部左侧显示
-`Build · ○ deepseek-v4-flash`（当前模式 · 状态图标 + 模型，Plan 为黄色），右侧对齐 cwd、git 分支和工作树；
-正文左侧留 1 格内边距，底边保持普通边框；输入框下方是一行 statusline，左侧显示 `N` / `I` / `V` / `VL`
-模式徽标、session 名和最近状态，中间显示后台 attention 提醒（约 8 秒），右侧显示模型、pane 位置、排队数和 attention。
+（见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：
+默认 3 行内容 + 上下边框（共 5 行，长草稿最多 10 行内容 / 12 行总高）；正文左侧留 1 格内边距，
+底边保持普通边框；输入框下方是一行 statusline，左侧依次显示
+`N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning`，右侧靠右显示
+`cwd（~ 缩写） · git 分支`；session 名、最近状态、worktree/图片数以及 pane/队列/attention 计数在空间
+允许时显示在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用中间区域（约 8 秒）。
 
 ## TUI（v1）
 
@@ -220,17 +239,20 @@ ask 写入、以及 `run_command` 的写操作仍在审批处阻塞（shell 无�
 底部输入条只作用于当前聚焦 pane。
 
 用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、
-`tabby`（输入框 Build 行上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
+`tabby`（输入框上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个**活跃队列**：pane 1 是当前工作槽位；turn 完成或
 session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；
 给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。
 `Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session；在 `tabby` 布局下就是切换到第 N 个 tab
 （输入框内也可用）。终端需要支持 kitty 键盘协议才能完整区分这些组合键；不支持时可用
-`Alt-1` … `Alt-9`。
+`Alt-1` … `Alt-9`。`Ctrl-7` 在部分终端等价于 `Ctrl-/`，会打开模型 picker；第 7 个
+session 请用 `Alt-7`。
 
 历史 session 不再占用左侧栏：按 `<Space>s` 打开浮动 picker，输入即模糊搜索，`Enter` 选择、
-`Esc` 关闭。输入框标题行直接显示 Build/Plan、session 状态和模型，cwd 右对齐并以 `~` 缩写，
-模型省略 provider 前缀；输入框下方保留一行 statusline 展示模式、session、最近状态、居中提醒和队列信息。
+`Esc` 关闭。输入框只保留正文和边框；下方 statusline 左侧按
+`N/I/V/VL · Build/Plan · 状态 · 模型 · provider · reasoning` 排列，右侧靠右显示
+`cwd（~ 缩写） · git 分支`；session 名、最近状态、worktree/图片数、pane/队列/attention 计数
+在空间允许时出现在中部或右侧；后台提醒会临时占用中间区域。
 
 转录区按对话渲染：用户消息和 agent 输出都使用普通文本（左侧 2 空格缩进，不加角色前缀），不再使用气泡；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
@@ -259,15 +281,16 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `Tab` | normal 模式与转录区：在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
 | `<Space>s` / `Ctrl-G` | session picker：切换聚焦 pane 的 session（`Ctrl-G` 输入框内外都可用） |
 | `Ctrl-T` | 快速轮换推理强度：low → medium → high → 空 → low（默认 medium，输入框内外都可用） |
+| `Ctrl-/` | 打开可搜索的模型 picker：输入筛选、`Enter` 切换、`Esc` 关闭（输入框内外都可用；部分终端为 `Ctrl-_` / `Ctrl-7`） |
 | `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane） |
-| `:` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
+| `Ctrl-P` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
 | `<Space>w` | worktree picker：选中后把路径插入聚焦 pane 的输入框 |
 | `<Space>b` | branch picker：选中后把分支名插入输入框 |
 | `@`（输入框内） | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发） |
 | `<Space>A` | 跳到下一个需要 attention 的 pane（审批/错误） |
 | `Shift+,` / `Shift+.` | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式） |
 | `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
-| `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用） |
+| `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用；`Ctrl-7` 可能用于模型 picker） |
 | `Alt-1` … `Alt-9` | 同上；用于终端无法区分 `Ctrl-1…9` 的情况 |
 | `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；有待审批时卡片上的 `n` 仍是 deny |
 | `<Space>W` | 新建 session，同时在 `.worktrees/<name>` 建 git worktree |
@@ -287,7 +310,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `j` / `k` / `PgUp` / `PgDn` | 转录区聚焦时滚动；输入框 normal 模式下 `j`/`k` 是草稿内行移动，`Ctrl-J`/`Ctrl-K` 浏览已提交的 prompt 历史 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
 | `?` / `F1` | 帮助（F1 任意位置可用）；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭 |
-| `Z` / `Ctrl-C` | 退出（normal 模式下的 `Shift+Z`；输入框内 `Ctrl-C` 是 vim 中断：回到 normal / 离开 insert，不会退出） |
+| `Z` / `Ctrl-C` / `Ctrl-D` | 退出 eix TUI（任意模式；退出前会保存当前草稿） |
 
 ### prompt 命令
 
@@ -334,17 +357,45 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
+### 其他 agent 兼容
+
+默认只读取 eix 自己的 `.eix` / `~/.config/eix`。需要复用其他 agent 的资源时，在
+`[compations]` 中逐项打开：
+
+| 开关 | 读取内容 |
+|---|---|
+| `claude_code` | `~/.claude` 与项目 `.claude` 下的 skills、commands、agents，以及 `CLAUDE.md` |
+| `opencode` | `~/.config/opencode` 与项目 `.opencode` 下的 skills、commands、agents，以及 `AGENTS.md` |
+| `codex_cli` | `$CODEX_HOME`（默认 `~/.codex`）与项目 `.codex` 下的 skills、prompts，以及 `AGENTS.md` |
+| `gemini_cli` | `~/.gemini` 与项目 `.gemini` 下的 skills、commands（TOML）、agents，以及 `GEMINI.md`；也读 `.agents/skills` |
+| `pi` | `$PI_CODING_AGENT_DIR`（默认 `~/.pi/agent`）与项目 `.pi` 下的 skills、prompts，以及 `AGENTS.md` / `CLAUDE.md`；也读 `.agents/skills` |
+
+- 同一目录下原生 `.eix` 资源优先；更靠近 cwd 的项目层覆盖外层。
+- 项目 `.eix/config.toml` 只能关闭兼容开关，不能开启；尝试开启会被忽略并写入 `security_warnings`。
+- 只读取资源文件，不导入其他 agent 的 permissions、hooks、settings、provider 或 MCP 配置。
+- Gemini 的 `{{args}}` 会转换成 eix 的 `$ARGUMENTS`；其他 agent 的命名占位符只保证原样保留。
+- 兼容 agent 定义时只读取 Markdown 正文和 eix 支持的 frontmatter；Claude/Gemini 的工具列表不会被解释成 eix 权限。
+
 ### Skills
 
-支持以下位置（越靠近项目越优先，同目录下 `.eix` > `.opencode` > `.claude`）：
+原生和兼容来源如下（越靠近项目越优先；同一目录下 `.eix` > `.opencode` > `.claude`）：
 
 ```text
-~/.config/eix/skills/<name>/SKILL.md
-~/.config/opencode/skills/<name>/SKILL.md
-~/.claude/skills/<name>/SKILL.md
-<project>/.eix/skills/<name>/SKILL.md
-<project>/.opencode/skills/<name>.md
+~/.config/eix/skills/<name>/SKILL.md          # 始终加载
+<project>/.eix/skills/<name>/SKILL.md         # 始终加载
+
+~/.claude/skills/<name>/SKILL.md              # claude_code
 <project>/.claude/skills/<name>/SKILL.md
+~/.config/opencode/skills/<name>/SKILL.md     # opencode
+<project>/.opencode/skills/<name>.md
+$CODEX_HOME/skills/**/SKILL.md                 # codex_cli
+<project>/.codex/skills/**/SKILL.md
+~/.gemini/skills/**/SKILL.md                   # gemini_cli
+<project>/.gemini/skills/**/SKILL.md
+~/.pi/agent/skills/**/SKILL.md                 # pi
+<project>/.pi/skills/**/SKILL.md
+~/.agents/skills/**/SKILL.md                   # gemini_cli 或 pi
+<project>/.agents/skills/**/SKILL.md
 ```
 
 frontmatter 支持 `name`、`description`、`allowed-tools`；正文是完整指令，可使用
@@ -360,18 +411,33 @@ frontmatter 支持 `name`、`description`、`allowed-tools`；正文是完整指
 
 ### 自定义命令与 agent
 
-Markdown 文件放在以下目录（越靠近项目越优先）：
+原生命令与 agent 始终加载；外部来源由 `[compations]` 控制：
 
 ```text
 ~/.config/eix/cmds/*.md              # 全局命令
 ~/.config/eix/commands/*.md          # 旧路径，仍兼容
-~/.config/opencode/commands/*.md     # OpenCode 兼容
 <project>/.eix/cmds/*.md             # 项目命令（可嵌套，team/name.md → /team/name）
 <project>/.eix/commands/*.md         # 旧路径，仍兼容
+
+~/.config/opencode/commands/*.md     # opencode
+~/.claude/commands/*.md              # claude_code
+$CODEX_HOME/prompts/*.md             # codex_cli
+~/.gemini/commands/**/*.toml         # gemini_cli（{{args}} → $ARGUMENTS）
+$PI_CODING_AGENT_DIR/prompts/*.md     # pi
 <project>/.opencode/commands/*.md
+<project>/.claude/commands/*.md
+<project>/.codex/prompts/*.md
+<project>/.gemini/commands/**/*.toml
+<project>/.pi/prompts/*.md
 
 ~/.config/eix/agents/*.md            # 全局 agent
 <project>/.eix/agents/*.md           # 项目 agent
+~/.claude/agents/*.md                # claude_code
+<project>/.claude/agents/*.md
+~/.config/opencode/agents/*.md       # opencode
+<project>/.opencode/agents/*.md
+~/.gemini/agents/*.md                # gemini_cli
+<project>/.gemini/agents/*.md
 ```
 
 命令本质上就是提示词模板：`~/.config/eix/cmds/review.md` 会出现在 `/` 命令菜单里，输入
@@ -446,16 +512,16 @@ resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server �
 在 turn 运行时会被拒绝，先 `Esc Esc` 中断（或按 `<Space>x`）再执行。
 
 **转录区不响应裸字母快捷键**：动作一律走 `<Space>` leader（见下），但 `i` 仍用于聚焦
-输入框并进入 insert 模式；`j`/`k` 等导航键和 `:`/`?` 等标点键也保留。输入框聚焦时（normal 模式）单字母是 vim 命令，TUI 动作同样用
+输入框并进入 insert 模式；`j`/`k` 等导航键和 `?`/`#` 等标点键也保留。输入框聚焦时（normal 模式）单字母是 vim 命令，TUI 动作同样用
 leader；`?`、`#`、翻页/滚动和 `[keys]` 绑定也与转录区一致，只有输入框自己的
 vim 编辑键（如 `j`/`k` 行移动、`Tab` 切换 Build/Plan）保留编辑器语义。
 转录区动作可以通过 `[keys]` 覆盖，但裸字母会被忽略，请用 `C-`/`A-` 修饰键或
 命名键，例如 `sessions = "C-t"`、`new_session = "C-n"`、`help = "F2"`。可用动作：`quit`、`help`、`new_session`、
-`new_worktree`、`sessions`、`new_pane`、`palette`、`worktrees`、`branches`、`ledger`、
-`processes`、`inbox`、`search`、`fork`、`attention`、`cancel`、`next_session`、
+`new_worktree`、`sessions`、`new_pane`、`palette`、`model`、`worktrees`、`branches`、
+`ledger`、`processes`、`inbox`、`search`、`fork`、`attention`、`cancel`、`next_session`、
 `prev_session`、`scroll_down`、`scroll_up`、`timeline`、`todos`、`undo`、`redo`。
 键写法支持 `Space`、`Tab`、`BackTab`、`Enter`、`Esc`、方向键、`PageUp/PageDown`、
-`F1`..`F12` 以及 `C-` / `S-` / `A-` 修饰符；裸字母会被忽略，标点键（如 `:`、`?`）可用。
+`F1`..`F12` 以及 `C-` / `S-` / `A-` 修饰符；裸字母会被忽略，标点键（如 `?`、`#`）可用。
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
 所有 picker 共用同一个 overlay：上方输入框做模糊过滤，左侧是候选列表，右侧是预览
@@ -466,7 +532,11 @@ branches / context 由 daemon 的 `picker.query` 提供，其余（sessions、�
 常驻，只通过这个浮动 picker 打开（`<Space>s`）。
 
 输入框是自研的 Vim 风格编辑器（不再内嵌 Neovim 进程，输入零往返延迟）。外框使用透明背景的
-圆角边框，跟随主题的 `background`（未设置时用终端背景），顶部显示 `Build · ○ deepseek-v4-flash`（idle 为静态圆点，running 为动画 spinner），右侧对齐 cwd、git 分支/工作树和图片数；底边保持普通边框，输入框下方一行 statusline 显示彩色单字母模式徽标、session 名和最近状态，中间显示后台 attention 提醒（约 8 秒），右侧显示模型、pane 位置、排队数和 attention；
+圆角边框，跟随主题的 `background`（未设置时用终端背景），默认 3 行内容 + 上下边框（共 5 行，
+长草稿最多 10 行内容 / 12 行总高）；底边保持普通边框，输入框下方一行 statusline 左侧按
+`N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
+`cwd（~ 缩写） · git 分支`；session 名、最近状态、worktree/图片数以及 pane/排队/attention 计数
+在空间允许时显示在中部或右侧；后台 attention 提醒会临时占用中间区域（约 8 秒）；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
@@ -488,14 +558,14 @@ picker、`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 
 `<Space>p` 进程、`<Space>R` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
 `<Space>F` fork、`<Space>x` 取消、`<Space>A` attention、`<Space>i` 聚焦输入框、
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>a` 或
-`<Space>:` 命令面板。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
+`Ctrl-P` 命令面板。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
 除此之外，裸字母 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
 insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
 和 `@`（文件 picker）。所有 picker / 历史搜索都支持 `Ctrl-J`/`Ctrl-K` 或
 `Ctrl-N`/`Ctrl-P`（以及 `↑`/`↓`）上下选择。normal 模式下 `Esc Esc` 先中断运行中的 turn；
 空闲时回到转录区。
-输入框最少 6 行内容（加边框；终端过矮时优先让给转录区），长草稿最多向上生长到 12 行，
-再在框内滚动；normal 模式不会让输入框折叠。
+输入框默认 3 行内容（加边框共 5 行；终端过矮时优先让给转录区），长草稿最多向上生长到
+10 行内容（总 12 行），再在框内滚动；normal 模式不会让输入框折叠。
 低/中风险的 `write_file` / `edit` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现
 选项卡片；高风险/forced ask 写入直接弹出审批卡片，不进入 stage。卡片选项为
 （`Apply change` / `Review hunks` / `Open file` / `Edit staged content` / `Reject` /
@@ -573,7 +643,7 @@ git 会拒绝，需显式加 `--force`。删除后 session 的 `cwd` 回到主�
 - `Enter` 只在 insert 模式提交；`Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 换行
 - `@`（行首或空白后）打开 workspace 文件 picker，选中后插入 `@相对路径`；其余位置插入字面 `@`
 - 草稿镜像到 `draft.set`，切换 session 时回填；提交失败会把 draft 放回输入框
-- 输入框最少 6 行内容高（加边框），长草稿最多增长到 12 行后在框内滚动，normal 模式也不会收缩
+- 输入框默认 3 行内容（加边框共 5 行），长草稿最多增长到 10 行内容（总 12 行）后在框内滚动，normal 模式也不会收缩
 - 转录区使用固定配色（不再从编辑器 colorscheme 采样）
 
 `eix doctor` 的 `input` 一行显示 `native (built-in Vim editor)`。
@@ -1032,8 +1102,8 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 自动压缩（超过 `auto_compact_threshold` 时总结旧 turn，保留最近 N 轮；`context_compacted` 事件）
 - [x] 配置分层 + 占位符 + 热重载 + `cli.json`（全局 → 祖先 `.eix/config.toml`、`{env:}` / `{file:}`、mtime 轮询 + `/reload`、项目默认 model/agent/permission）
 - [x] session 管理（undo/redo、export/import、delete、archive、timeline、队列 `rm`/`move`；CLI `eix undo/redo/export/import/delete/archive/timeline`）
-- [x] Skills（`.eix` / `.opencode` / `.claude` 的全局与项目 skills、system prompt 摘要 + `use_skill {name, arguments}`、`$ARGUMENTS` / `$1..$9`、`allowed-tools` 单 turn 限制、带预览的 `/skills` picker）
-- [x] 写入后 formatter（`[formatter]` command/extensions/timeout；直接写入与 staged apply 都生效）
+- [x] Skills（原生 `.eix` + 可配置 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 兼容、system prompt 摘要 + `use_skill {name, arguments}`、`$ARGUMENTS` / `$1..$9`、`allowed-tools` 单 turn 限制、带预览的 `/skills` picker）
+- [x] 写入后 formatter（`[[formatter]]` command/extensions/timeout；按顺序首个匹配；直接写入与 staged apply 都生效）
 - [x] `todo` 任务列表 + `webfetch` / `websearch` 网络工具
 - [x] 可配置 TUI 调色板（`[theme]`，颜色名 / hex / ANSI 索引）
 - [x] HTTP API（`[server] http`；`/health`、`/stats`、POST `/rpc`、SSE `/events` + `session_id` 过滤，Bearer token、CORS/OPTIONS；`eix-sdk` 类型化 Rust client）
@@ -1042,9 +1112,9 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] LSP diagnostics（`[lsp.servers.*]`、懒启动 stdio client、写入后附诊断、`lsp_diagnostics`、`lsp.workspace` 全工作区扫描 RPC）
 - [x] prompt `!<cmd>` 直接执行 shell（sandbox + snapshot + 只读拒绝，保留 tool 事件）
 - [x] 独立 Neovim 前端交互：`<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`
-- [x] 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider）、两次 `Esc` 回转录区、长草稿自动增高（上限 12 行）
+- [x] 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider）、两次 `Esc` 回转录区、长草稿自动增高（默认 3 行，总高上限 12 行）
 - [x] 草稿镜像（编辑器变更同步到 `draft.set`，切 session 时从 daemon 回填）
-- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / worktrees / branches / context，`p`/`o`/`:`/`w`/`b`/`@` 入口；独立前端 `:Eix pick [KIND]`）
+- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / worktrees / branches / context，`p`/`o`/`Ctrl-P`/`w`/`b`/`@` 入口；独立前端 `:Eix pick [KIND]`）
 - [x] 工具补齐：`grep` / `glob` / `edit` / `patch`，`read_file` 行号 + `offset`/`limit` 分页（只读工具自动放行）
 - [x] 自定义 Markdown 命令（`~/.config/eix/cmds`、项目 `.eix/cmds`，兼容旧 `commands` 目录；`/name` 快速调用、`$ARGUMENTS` / `$1..$9`、frontmatter `description`/`agent`/`model`）
 - [x] 自定义 Markdown agent（`~/.config/eix/agents`、项目 `.eix/agents`；`mode`/`model`/`permission`，`/agents` 选择 primary、`spawn_agent agent:` 选择 subagent）

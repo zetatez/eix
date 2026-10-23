@@ -6,6 +6,7 @@
 
 pub mod agents;
 pub mod commands;
+pub mod compat;
 pub mod config;
 pub mod context;
 pub mod event;
@@ -24,11 +25,12 @@ pub mod skills;
 pub use agents::{find_agent, load_agents, AgentMode, AgentSpec};
 pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
-    load_cli_config, models_endpoint, theme_preset, ApprovalMode, CliConfig, Config, ConfigError,
-    ContextConfig, FormatterConfig, ImagesConfig, LspConfig, LspServerConfig, McpConfig,
-    McpServerConfig, ModelConfig, ModelInfo, ModelRoute, NamedProviderConfig, NotificationsConfig,
-    PermissionAction, PermissionRule, ProviderConfig, ProviderSource, RuleSource, SandboxMode,
-    ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, THEME_PRESETS,
+    load_cli_config, models_endpoint, theme_preset, ApprovalMode, CliConfig, CompatConfig, Config,
+    ConfigError, ContextConfig, FormatterConfig, FormattersConfig, ImagesConfig, LspConfig,
+    LspServerConfig, McpConfig, McpServerConfig, ModelConfig, ModelInfo, ModelRoute,
+    NamedProviderConfig, NotificationsConfig, PermissionAction, PermissionRule, ProviderConfig,
+    ProviderSource, RuleSource, SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolsConfig,
+    THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{

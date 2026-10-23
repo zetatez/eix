@@ -957,7 +957,7 @@ pub async fn execute_with_cancel(
         "list_dir" => list_dir(args, cwd, config).await,
         "grep" => grep(args, cwd, config).await,
         "glob" => glob_files(args, cwd, config),
-        "use_skill" => use_skill(args, cwd),
+        "use_skill" => use_skill(args, cwd, config),
         "webfetch" => webfetch(args).await,
         "websearch" => websearch(args).await,
         "todo" => Err(anyhow::anyhow!("todo is handled by the daemon")),
@@ -990,10 +990,7 @@ pub async fn execute_with_cancel(
 /// Run the configured formatter on a file that was just written. Returns an
 /// optional note for the tool output; failures never undo the write.
 pub async fn format_file(config: &Config, cwd: &Path, path: &Path) -> Option<String> {
-    let formatter = &config.formatter;
-    if !formatter.applies_to(path) {
-        return None;
-    }
+    let formatter = config.formatter.matching(path)?;
     let command = formatter.command.as_deref()?.trim();
     let mut process = tokio::process::Command::new("sh");
     process
@@ -1176,13 +1173,13 @@ async fn websearch(args: &Value) -> Result<String> {
     Ok(cap_output(out, 20_000))
 }
 
-fn use_skill(args: &Value, cwd: &Path) -> Result<String> {
+fn use_skill(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
     let name = required_string(args, "name")?;
     let arguments = args
         .get("arguments")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    match eix_core::find_skill(cwd, name) {
+    match eix_core::find_skill(cwd, name, &config.compations) {
         Some(skill) => {
             let body = eix_core::expand_command(&skill.body, arguments);
             let restriction = if skill.allowed_tools.is_empty() {
@@ -1196,7 +1193,7 @@ fn use_skill(args: &Value, cwd: &Path) -> Result<String> {
             Ok(format!("# skill: {}\n{restriction}\n{body}", skill.name))
         }
         None => {
-            let names: Vec<String> = eix_core::load_skills(cwd)
+            let names: Vec<String> = eix_core::load_skills(cwd, &config.compations)
                 .into_iter()
                 .map(|skill| skill.name)
                 .collect();
@@ -2045,6 +2042,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eix_core::FormatterConfig;
     use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -2102,9 +2100,15 @@ mod tests {
     #[tokio::test]
     async fn formatter_runs_after_a_direct_write_and_respects_extensions() {
         let cwd = temp_cwd("formatter");
-        let mut config = Config::default();
-        config.formatter.command = Some("sed -i 's/hello/HELLO/'".into());
-        config.formatter.extensions = vec!["txt".into()];
+        let config = Config {
+            formatter: FormatterConfig {
+                command: Some("sed -i 's/hello/HELLO/'".into()),
+                extensions: vec!["txt".into()],
+                timeout_secs: 30,
+            }
+            .into(),
+            ..Config::default()
+        };
         let outcome = execute(
             "write_file",
             &json!({"path": "note.txt", "content": "hello"}),
@@ -2130,6 +2134,60 @@ mod tests {
             std::fs::read_to_string(cwd.join("note.md")).unwrap(),
             "hello"
         );
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[tokio::test]
+    async fn formatter_uses_the_first_matching_entry() {
+        let cwd = temp_cwd("formatter-order");
+        let config = Config {
+            formatter: vec![
+                FormatterConfig {
+                    command: Some("sed -i 's/hello/FIRST/'".into()),
+                    extensions: vec!["txt".into()],
+                    timeout_secs: 30,
+                },
+                FormatterConfig {
+                    command: Some("sed -i 's/hello/SECOND/'".into()),
+                    extensions: vec!["txt".into()],
+                    timeout_secs: 30,
+                },
+                FormatterConfig {
+                    command: Some("sed -i 's/world/WORLD/'".into()),
+                    extensions: vec!["md".into()],
+                    timeout_secs: 30,
+                },
+            ]
+            .into(),
+            ..Config::default()
+        };
+
+        let outcome = execute(
+            "write_file",
+            &json!({"path": "note.txt", "content": "hello"}),
+            &cwd,
+            &config,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.output);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
+            "FIRST"
+        );
+
+        let outcome = execute(
+            "write_file",
+            &json!({"path": "note.md", "content": "world"}),
+            &cwd,
+            &config,
+        )
+        .await;
+        assert!(outcome.ok, "{}", outcome.output);
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("note.md")).unwrap(),
+            "WORLD"
+        );
+
         let _ = std::fs::remove_dir_all(&cwd);
     }
 

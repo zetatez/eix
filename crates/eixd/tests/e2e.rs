@@ -1035,7 +1035,7 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
         .await?;
     assert_eq!(code, "invalid_params");
 
-    let commands = eix_core::load_commands(&dir);
+    let commands = eix_core::load_commands(&dir, &eix_core::CompatConfig::default());
     let review = commands
         .iter()
         .find(|command| command.name == "review")
@@ -4512,6 +4512,7 @@ async fn skills_are_listed_in_the_prompt_and_loadable_with_use_skill() -> anyhow
     config.provider.timeout_secs = 30;
     config.context.instructions_files = Vec::new();
     config.context.workspace_summary = false;
+    config.compations.claude_code = true;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));

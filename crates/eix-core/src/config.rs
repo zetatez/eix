@@ -42,6 +42,9 @@ pub struct Config {
     pub tools: ToolsConfig,
     pub notifications: NotificationsConfig,
     pub context: ContextConfig,
+    /// Opt-in discovery of skills, commands, and agents written for other
+    /// agent harnesses. Native `.eix` sources are always loaded.
+    pub compations: CompatConfig,
     pub server: ServerConfig,
     /// Additional OpenAI-compatible models. The default `[provider]` entry is
     /// always available and appears first in `/model`.
@@ -55,8 +58,9 @@ pub struct Config {
     pub images: ImagesConfig,
     /// Language servers used for diagnostics after edits.
     pub lsp: LspConfig,
-    /// Optional post-write formatter.
-    pub formatter: FormatterConfig,
+    /// Optional post-write formatters. Entries are tried in order and the
+    /// first matching extension wins.
+    pub formatter: FormattersConfig,
     /// Optional TUI palette overrides. Empty values keep the built-in colors.
     pub theme: ThemeConfig,
     /// Transcript-mode key overrides (`action = "C-x"`). Empty keeps defaults.
@@ -74,6 +78,36 @@ pub struct Config {
     /// Security relaxations that were refused from project layers.
     #[serde(skip)]
     pub security_warnings: Vec<String>,
+}
+
+/// Per-harness compatibility switches. All are off by default so another
+/// agent's global skills/commands do not silently enter eix.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompatConfig {
+    /// Claude Code: `~/.claude` and project `.claude` skills/commands/agents.
+    pub claude_code: bool,
+    /// OpenCode: `~/.config/opencode` and project `.opencode` skills/commands/agents.
+    pub opencode: bool,
+    /// Codex CLI: `$CODEX_HOME` and project `.codex` skills, plus prompts.
+    pub codex_cli: bool,
+    /// Gemini CLI: `~/.gemini` and project `.gemini` skills, TOML commands, agents.
+    pub gemini_cli: bool,
+    /// Pi: `$PI_CODING_AGENT_DIR` / `.pi` skills and prompts, plus `.agents`.
+    pub pi: bool,
+}
+
+impl CompatConfig {
+    /// Every supported compatibility source (useful for tests and imports).
+    pub fn all() -> Self {
+        Self {
+            claude_code: true,
+            opencode: true,
+            codex_cli: true,
+            gemini_cli: true,
+            pi: true,
+        }
+    }
 }
 
 /// Optional TCP listener for remote attach. Off by default: the Unix socket is
@@ -746,6 +780,51 @@ impl FormatterConfig {
     }
 }
 
+/// One or more post-write formatters.
+///
+/// Accepts either a single `[formatter]` table (legacy) or an ordered array of
+/// `[[formatter]]` tables. The first entry whose extensions match a file wins.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(transparent)]
+pub struct FormattersConfig(pub Vec<FormatterConfig>);
+
+impl FormattersConfig {
+    pub fn matching(&self, path: &Path) -> Option<&FormatterConfig> {
+        self.0.iter().find(|formatter| formatter.applies_to(path))
+    }
+}
+
+impl From<FormatterConfig> for FormattersConfig {
+    fn from(formatter: FormatterConfig) -> Self {
+        Self(vec![formatter])
+    }
+}
+
+impl From<Vec<FormatterConfig>> for FormattersConfig {
+    fn from(formatters: Vec<FormatterConfig>) -> Self {
+        Self(formatters)
+    }
+}
+
+impl<'de> Deserialize<'de> for FormattersConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum OneOrMany {
+            One(FormatterConfig),
+            Many(Vec<FormatterConfig>),
+        }
+
+        Ok(match OneOrMany::deserialize(deserializer)? {
+            OneOrMany::One(formatter) => Self(vec![formatter]),
+            OneOrMany::Many(formatters) => Self(formatters),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ContextConfig {
@@ -1350,20 +1429,21 @@ impl Config {
                 "tools.command_timeout_secs must be > 0".into(),
             ));
         }
-        if self
-            .formatter
-            .command
-            .as_deref()
-            .is_some_and(|command| command.trim().is_empty())
-        {
-            return Err(ConfigError::Invalid(
-                "formatter.command must not be empty".into(),
-            ));
-        }
-        if self.formatter.timeout_secs == 0 {
-            return Err(ConfigError::Invalid(
-                "formatter.timeout_secs must be > 0".into(),
-            ));
+        for (index, formatter) in self.formatter.0.iter().enumerate() {
+            if formatter
+                .command
+                .as_deref()
+                .is_some_and(|command| command.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "formatter[{index}].command must not be empty"
+                )));
+            }
+            if formatter.timeout_secs == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "formatter[{index}].timeout_secs must be > 0"
+                )));
+            }
         }
         if let Some(preset) = self.theme.preset.as_deref() {
             if theme_preset(preset).is_none() {
@@ -1939,44 +2019,59 @@ fn take_tools_array(layer: &mut toml::Value, key: &str) -> Option<Vec<toml::Valu
 }
 
 fn sanitize_project_layer(layer: &mut toml::Value, warnings: &mut Vec<String>) {
-    let Some(tools) = layer.get_mut("tools").and_then(toml::Value::as_table_mut) else {
-        return;
-    };
-    if let Some(other) = tools.get("approval").and_then(toml::Value::as_str) {
-        if other != "ask" {
-            let other = other.to_string();
-            tools.remove("approval");
-            warnings.push(format!(
-                "project config cannot set tools.approval = {other:?}; ignored"
-            ));
+    if let Some(tools) = layer.get_mut("tools").and_then(toml::Value::as_table_mut) {
+        if let Some(other) = tools.get("approval").and_then(toml::Value::as_str) {
+            if other != "ask" {
+                let other = other.to_string();
+                tools.remove("approval");
+                warnings.push(format!(
+                    "project config cannot set tools.approval = {other:?}; ignored"
+                ));
+            }
+        }
+        if let Some(other) = tools.get("sandbox").and_then(toml::Value::as_str) {
+            if other != "required" {
+                let other = other.to_string();
+                tools.remove("sandbox");
+                warnings.push(format!(
+                    "project config cannot set tools.sandbox = {other:?}; ignored"
+                ));
+            }
+        }
+        if tools.get("sandbox_network").and_then(toml::Value::as_bool) == Some(true) {
+            tools.insert("sandbox_network".into(), toml::Value::Boolean(false));
+            warnings.push("project config cannot enable sandbox_network; forced false".into());
+        }
+        for key in [
+            "sandbox_read_paths",
+            "sandbox_writable_roots",
+            "external_directory",
+            "network_allow",
+        ] {
+            if tools.remove(key).is_some() {
+                warnings.push(format!("project config cannot add tools.{key}; ignored"));
+            }
+        }
+        if tools.get("snapshots").and_then(toml::Value::as_bool) == Some(false) {
+            tools.remove("snapshots");
+            warnings.push("project config cannot disable snapshots; ignored".into());
         }
     }
-    if let Some(other) = tools.get("sandbox").and_then(toml::Value::as_str) {
-        if other != "required" {
-            let other = other.to_string();
-            tools.remove("sandbox");
-            warnings.push(format!(
-                "project config cannot set tools.sandbox = {other:?}; ignored"
-            ));
+
+    // Enabling compatibility loads user-global skills/commands from another
+    // agent. A project may turn a switch off, but never on.
+    if let Some(compat) = layer
+        .get_mut("compations")
+        .and_then(toml::Value::as_table_mut)
+    {
+        for key in ["claude_code", "opencode", "codex_cli", "gemini_cli", "pi"] {
+            if compat.get(key).and_then(toml::Value::as_bool) == Some(true) {
+                compat.insert(key.into(), toml::Value::Boolean(false));
+                warnings.push(format!(
+                    "project config cannot enable compations.{key}; forced false"
+                ));
+            }
         }
-    }
-    if tools.get("sandbox_network").and_then(toml::Value::as_bool) == Some(true) {
-        tools.insert("sandbox_network".into(), toml::Value::Boolean(false));
-        warnings.push("project config cannot enable sandbox_network; forced false".into());
-    }
-    for key in [
-        "sandbox_read_paths",
-        "sandbox_writable_roots",
-        "external_directory",
-        "network_allow",
-    ] {
-        if tools.remove(key).is_some() {
-            warnings.push(format!("project config cannot add tools.{key}; ignored"));
-        }
-    }
-    if tools.get("snapshots").and_then(toml::Value::as_bool) == Some(false) {
-        tools.remove("snapshots");
-        warnings.push("project config cannot disable snapshots; ignored".into());
     }
 }
 
@@ -2214,6 +2309,35 @@ mod tests {
             config.chat_endpoint(),
             "http://localhost:1234/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn formatter_accepts_single_table_and_array() {
+        let single: Config = toml::from_str(
+            r#"
+[formatter]
+command = "rustfmt --edition 2021"
+extensions = ["rs"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(single.formatter.0.len(), 1);
+        assert_eq!(single.formatter.0[0].extensions, vec!["rs"]);
+
+        let many: Config = toml::from_str(
+            r#"
+[[formatter]]
+command = "rustfmt --edition 2021"
+extensions = ["rs"]
+
+[[formatter]]
+command = "gofmt -w"
+extensions = ["go"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(many.formatter.0.len(), 2);
+        assert_eq!(many.formatter.0[1].command.as_deref(), Some("gofmt -w"));
     }
 
     #[test]
@@ -2611,6 +2735,13 @@ external_directory = ["/"]
 network_allow = ["*"]
 snapshots = false
 
+[compations]
+claude_code = true
+opencode = true
+codex_cli = true
+gemini_cli = true
+pi = true
+
 [[tools.rules]]
 id = "repo-allow"
 tool = "write_file"
@@ -2642,6 +2773,11 @@ action = "allow"
         assert!(config.tools.external_directory.is_empty());
         assert!(config.tools.network_allow.is_empty());
         assert!(config.tools.snapshots);
+        assert!(!config.compations.claude_code);
+        assert!(!config.compations.opencode);
+        assert!(!config.compations.codex_cli);
+        assert!(!config.compations.gemini_cli);
+        assert!(!config.compations.pi);
         assert!(
             config
                 .tools
@@ -2660,6 +2796,11 @@ action = "allow"
             "network_allow",
             "snapshots",
             "allow",
+            "compations.claude_code",
+            "compations.opencode",
+            "compations.codex_cli",
+            "compations.gemini_cli",
+            "compations.pi",
         ] {
             assert!(
                 config
@@ -2672,6 +2813,35 @@ action = "allow"
         }
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn compat_switches_default_off_and_parse() {
+        let default = Config::default();
+        assert!(!default.compations.claude_code);
+        assert!(!default.compations.opencode);
+        assert!(!default.compations.codex_cli);
+        assert!(!default.compations.gemini_cli);
+        assert!(!default.compations.pi);
+
+        let config: Config = toml::from_str(
+            r#"
+[compations]
+claude_code = true
+opencode = true
+codex_cli = true
+gemini_cli = true
+pi = true
+"#,
+        )
+        .unwrap();
+        assert!(
+            config.compations.claude_code
+                && config.compations.opencode
+                && config.compations.codex_cli
+                && config.compations.gemini_cli
+                && config.compations.pi
+        );
     }
 
     #[test]

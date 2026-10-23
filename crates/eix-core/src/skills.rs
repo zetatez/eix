@@ -21,6 +21,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::commands::{first_line, split_frontmatter};
+use crate::config::CompatConfig;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Skill {
@@ -35,34 +36,17 @@ pub struct Skill {
 }
 
 /// Skills visible from `cwd`, sorted by name.
-pub fn load_skills(cwd: &Path) -> Vec<Skill> {
-    // Lowest priority first: later inserts replace an earlier skill with the
-    // same name. Native eix directories win over compatible formats, and
-    // project directories win over global ones.
-    let mut sources: Vec<PathBuf> = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        sources.push(home.join(".claude/skills"));
-    }
-    sources.push(crate::config::config_home().join("opencode/skills"));
-    sources.push(crate::config::skills_dir());
-    let mut ancestors: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        sources.push(ancestor.join(".claude/skills"));
-        sources.push(ancestor.join(".opencode/skills"));
-        sources.push(ancestor.join(".eix/skills"));
-    }
-
+pub fn load_skills(cwd: &Path, compat: &CompatConfig) -> Vec<Skill> {
     let mut by_name: BTreeMap<String, Skill> = BTreeMap::new();
-    for source in sources {
+    for source in crate::compat::skill_sources(cwd, compat) {
         collect_from(&source, &mut by_name);
     }
     by_name.into_values().collect()
 }
 
 /// Find one skill by its exact name.
-pub fn find_skill(cwd: &Path, name: &str) -> Option<Skill> {
-    load_skills(cwd)
+pub fn find_skill(cwd: &Path, name: &str, compat: &CompatConfig) -> Option<Skill> {
+    load_skills(cwd, compat)
         .into_iter()
         .find(|skill| skill.name == name)
 }
@@ -124,72 +108,78 @@ fn collect_from(dir: &Path, out: &mut BTreeMap<String, Skill>) {
         let Ok(kind) = entry.file_type() else {
             continue;
         };
-        let skill_path = if kind.is_dir() {
+        if kind.is_dir() {
             let candidate = path.join("SKILL.md");
-            if !candidate.is_file() {
-                continue;
+            if candidate.is_file() {
+                insert_skill(&candidate, out);
+            } else {
+                // Pi and Codex support nested skill directories (for example
+                // `skills/group/name/SKILL.md`) and recursively scan them.
+                collect_from(&path, out);
             }
-            candidate
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
-            path
-        } else {
-            continue;
-        };
-        let Ok(text) = std::fs::read_to_string(&skill_path) else {
-            continue;
-        };
-        let (meta, body) = split_frontmatter(&text);
-        let body = body.trim().to_string();
-        if body.is_empty() {
             continue;
         }
-        let fallback = skill_path
-            .parent()
-            .and_then(Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| {
-                skill_path
-                    .file_stem()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_default()
-            });
-        let name = meta
-            .get("name")
-            .cloned()
-            .filter(|name| !name.is_empty())
-            .unwrap_or(fallback);
-        if name.is_empty() {
-            continue;
+        if path.extension().and_then(|ext| ext.to_str()) == Some("md") {
+            insert_skill(&path, out);
         }
-        let description = meta
-            .get("description")
-            .cloned()
-            .filter(|description| !description.is_empty())
-            .unwrap_or_else(|| first_line(&body));
-        let allowed_tools = meta
-            .get("allowed-tools")
-            .or_else(|| meta.get("allowed_tools"))
-            .map(|list| {
-                list.trim_matches(|ch| ch == '[' || ch == ']')
-                    .split([',', ' ', '\t'])
-                    .map(str::trim)
-                    .filter(|tool| !tool.is_empty())
-                    .map(normalize_tool_name)
-                    .collect()
-            })
-            .unwrap_or_default();
-        out.insert(
-            name.clone(),
-            Skill {
-                name,
-                description,
-                body,
-                allowed_tools,
-                source: skill_path,
-            },
-        );
     }
+}
+
+fn insert_skill(skill_path: &Path, out: &mut BTreeMap<String, Skill>) {
+    let Ok(text) = std::fs::read_to_string(skill_path) else {
+        return;
+    };
+    let (meta, body) = split_frontmatter(&text);
+    let body = body.trim().to_string();
+    if body.is_empty() {
+        return;
+    }
+    let fallback = skill_path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| {
+            skill_path
+                .file_stem()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    let name = meta
+        .get("name")
+        .cloned()
+        .filter(|name| !name.is_empty())
+        .unwrap_or(fallback);
+    if name.is_empty() {
+        return;
+    }
+    let description = meta
+        .get("description")
+        .cloned()
+        .filter(|description| !description.is_empty())
+        .unwrap_or_else(|| first_line(&body));
+    let allowed_tools = meta
+        .get("allowed-tools")
+        .or_else(|| meta.get("allowed_tools"))
+        .map(|list| {
+            list.trim_matches(|ch| ch == '[' || ch == ']')
+                .split([',', ' ', '\t'])
+                .map(str::trim)
+                .filter(|tool| !tool.is_empty())
+                .map(normalize_tool_name)
+                .collect()
+        })
+        .unwrap_or_default();
+    out.insert(
+        name.clone(),
+        Skill {
+            name,
+            description,
+            body,
+            allowed_tools,
+            source: skill_path.to_path_buf(),
+        },
+    );
 }
 
 #[cfg(test)]
@@ -230,24 +220,42 @@ mod tests {
             "---\nallowed-tools: [Read, Grep]\n---\nAudit it.\n",
         )
         .unwrap();
+        std::fs::create_dir_all(project.join(".pi/skills/tools/lint")).unwrap();
+        std::fs::write(
+            project.join(".pi/skills/tools/lint/SKILL.md"),
+            "---\ndescription: nested Pi skill\n---\nLint carefully.\n",
+        )
+        .unwrap();
         std::fs::write(
             project.join(".claude/skills/review.md"),
             "---\nname: review\ndescription: claude review\n---\nClaude body\n",
         )
         .unwrap();
 
-        let skills = load_skills(&project);
-        // Global sources (~/.config, ~/.claude) may contribute real skills on
-        // the test machine; only the project entries are asserted.
+        // Claude compatibility is opt-in.
+        assert!(!load_skills(&project, &CompatConfig::default())
+            .iter()
+            .any(|skill| skill.name == "audit"));
+
+        let compat = CompatConfig {
+            claude_code: true,
+            pi: true,
+            ..Default::default()
+        };
+        let skills = load_skills(&project, &compat);
+        // Global sources may contribute real skills on the test machine; only
+        // the project entries are asserted.
         assert!(skills.len() >= 3);
-        let review = find_skill(&project, "review").expect("review");
+        let review = find_skill(&project, "review", &compat).expect("review");
         assert_eq!(review.description, "inner review");
         assert_eq!(review.body, "Inner body");
         assert!(review.source.ends_with(".eix/skills/review.md"));
-        let deploy = find_skill(&project, "deploy").expect("deploy");
+        let deploy = find_skill(&project, "deploy", &compat).expect("deploy");
         assert_eq!(deploy.description, "Ship it.");
-        let audit = find_skill(&project, "audit").expect("audit");
+        let audit = find_skill(&project, "audit", &compat).expect("audit");
         assert_eq!(audit.allowed_tools, vec!["read_file", "grep"]);
+        let lint = find_skill(&project, "lint", &compat).expect("nested Pi skill");
+        assert_eq!(lint.description, "nested Pi skill");
         let prompt = available_prompt(&skills);
         assert!(prompt.contains("<name>review</name>"));
         assert!(prompt.contains("use_skill"));

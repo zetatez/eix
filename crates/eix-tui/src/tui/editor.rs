@@ -589,11 +589,6 @@ impl Editor {
 
     fn normal_char(&mut self, c: char) -> Outcome {
         match c {
-            // Vim's ex `:` opens the TUI command palette, from the prompt's
-            // normal mode as well as from the transcript.
-            ':' if self.op.is_none() && self.count.is_none() => {
-                return Outcome::Action("commands");
-            }
             '<' if self.op.is_none() && self.count.is_none() => {
                 return Outcome::Action("pane-prev");
             }
@@ -1862,7 +1857,7 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'x' => "cancel",
         'i' => "input",
         'A' => "attention",
-        'a' | ':' => "commands",
+        'a' => "commands",
         _ => return None,
     })
 }
@@ -1914,19 +1909,13 @@ mod tests {
     }
 
     #[test]
-    fn colon_opens_the_command_palette_from_normal_mode() {
+    fn colon_no_longer_opens_the_command_palette() {
         let mut editor = editor_with("draft");
-        assert_eq!(
-            key(&mut editor, KeyCode::Char(':')),
-            Outcome::Action("commands")
-        );
+        assert_eq!(key(&mut editor, KeyCode::Char(':')), Outcome::Ignored);
 
         let mut editor = editor_with("draft");
         assert_eq!(key(&mut editor, KeyCode::Char(' ')), Outcome::Ignored);
-        assert_eq!(
-            key(&mut editor, KeyCode::Char(':')),
-            Outcome::Action("commands")
-        );
+        assert_eq!(key(&mut editor, KeyCode::Char(':')), Outcome::Ignored);
     }
 
     #[test]

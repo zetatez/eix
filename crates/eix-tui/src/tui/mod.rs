@@ -59,6 +59,7 @@ pub async fn run(
     let mut app = App::new(initial_session);
     app.bell = bell;
     let loaded = eix_core::Config::load(config.as_deref()).unwrap_or_default();
+    app.set_compat(loaded.compations.clone());
     app.theme = Theme::from_config(&loaded.theme);
     app.theme_config = loaded.theme.clone();
     app.keybinds = Keybinds::from_config(&loaded.keys);

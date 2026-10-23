@@ -814,8 +814,9 @@ impl Daemon {
                     .unwrap_or_else(|_| {
                         std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                     });
+                let config = self.config.load();
                 Ok(serde_json::to_value(AgentListResult {
-                    agents: eix_core::load_agents(&cwd),
+                    agents: eix_core::load_agents(&cwd, &config.compations),
                 })?)
             }
             "mcp.list" => {
@@ -1452,7 +1453,8 @@ impl Daemon {
         let Some(name) = session.agent.as_deref() else {
             return base;
         };
-        let Some(agent) = eix_core::find_agent(&session.cwd, name) else {
+        let config = self.config.load();
+        let Some(agent) = eix_core::find_agent(&session.cwd, name, &config.compations) else {
             return base;
         };
         match agent.permission {
@@ -1484,7 +1486,8 @@ impl Daemon {
             .map(|agent| agent.trim().to_string())
             .filter(|agent| !agent.is_empty());
         if let Some(name) = &agent {
-            let Some(spec) = eix_core::find_agent(&session.cwd, name) else {
+            let config = self.config.load();
+            let Some(spec) = eix_core::find_agent(&session.cwd, name, &config.compations) else {
                 return Err(rpc("invalid_params", format!("unknown agent {name:?}")));
             };
             if !spec.mode.can_primary() {
@@ -2910,7 +2913,8 @@ impl Daemon {
             .filter(|agent| !agent.is_empty());
         let agent = match requested_agent {
             Some(name) => {
-                let Some(spec) = eix_core::find_agent(&parent.cwd, name) else {
+                let config = self.config.load();
+                let Some(spec) = eix_core::find_agent(&parent.cwd, name, &config.compations) else {
                     bail!("unknown sub-agent {name:?}");
                 };
                 if !spec.mode.can_subagent() {
@@ -3535,7 +3539,7 @@ impl Daemon {
             db_bytes: store.db_bytes,
             blob_count,
             blob_bytes,
-            skills: eix_core::load_skills(&config.load_cwd).len(),
+            skills: eix_core::load_skills(&config.load_cwd, &config.compations).len(),
             mcp_servers: config.mcp.servers.len(),
             default_model: config.provider.model.clone(),
         })
@@ -4791,7 +4795,8 @@ impl Daemon {
         let Ok(session) = self.require_session(session_id) else {
             return;
         };
-        let Some(skill) = eix_core::find_skill(&session.cwd, name) else {
+        let config = self.config.load();
+        let Some(skill) = eix_core::find_skill(&session.cwd, name, &config.compations) else {
             return;
         };
         if skill.allowed_tools.is_empty() {
@@ -5872,7 +5877,7 @@ fn system_prompt(config: &Config, session: &Session, permission: PermissionLevel
             session.cwd.display()
         )
     };
-    let agents = eix_core::load_agents(&session.cwd);
+    let agents = eix_core::load_agents(&session.cwd, &config.compations);
     if let Some(name) = session.agent.as_deref() {
         if let Some(agent) = agents.iter().find(|agent| agent.name == name) {
             let instructions = agent.prompt.trim();
@@ -5895,7 +5900,7 @@ fn system_prompt(config: &Config, session: &Session, permission: PermissionLevel
             prompt.push('.');
         }
     }
-    let skills = eix_core::load_skills(&session.cwd);
+    let skills = eix_core::load_skills(&session.cwd, &config.compations);
     prompt.push_str(&eix_core::available_skills_prompt(&skills));
     prompt
 }

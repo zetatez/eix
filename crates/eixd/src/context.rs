@@ -1114,13 +1114,30 @@ async fn load_instructions(config: &Config, cwd: &Path) -> Vec<(String, String)>
             }
         }
     }
+    for (path, label) in eix_core::compat::global_instruction_sources(&config.compations) {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        if let Ok(text) = tokio::fs::read_to_string(&path).await {
+            if !text.trim().is_empty() {
+                out.push((label, cap_instruction(text)));
+            }
+        }
+    }
+
+    let mut names = config.context.instructions_files.clone();
+    for name in eix_core::compat::project_instruction_names(&config.compations) {
+        if !names.iter().any(|existing| existing == name) {
+            names.push(name.to_string());
+        }
+    }
 
     // Codex-style instruction hierarchy: load AGENTS.md from the repository
     // root down to the session cwd. More specific files come later, so they can
     // refine (or override) the outer instructions. Outside a repository only
     // the cwd is considered, avoiding unrelated files from `$HOME`.
     for dir in instruction_dirs(cwd) {
-        for name in &config.context.instructions_files {
+        for name in &names {
             let path = dir.join(name);
             if !seen.insert(path.clone()) {
                 continue;
@@ -1607,6 +1624,40 @@ mod tests {
         let entries = ledger.info().entries;
         assert!(entries.iter().find(|e| e.id == "e2").unwrap().dropped);
         assert!(entries.iter().find(|e| e.id == "e1").unwrap().pinned);
+    }
+
+    #[tokio::test]
+    async fn compat_instruction_files_are_opt_in() {
+        let dir = std::env::temp_dir().join(format!(
+            "eix-context-compat-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "Claude rules").unwrap();
+        std::fs::write(dir.join("GEMINI.md"), "Gemini rules").unwrap();
+
+        let mut config = Config::default();
+        let base = load_instructions(&config, &dir).await;
+        assert!(!base.iter().any(|(label, _)| label == "CLAUDE.md"));
+        assert!(!base.iter().any(|(label, _)| label == "GEMINI.md"));
+
+        config.compations.claude_code = true;
+        let claude = load_instructions(&config, &dir).await;
+        assert!(claude
+            .iter()
+            .any(|(label, text)| label == "CLAUDE.md" && text == "Claude rules"));
+
+        config.compations.gemini_cli = true;
+        let both = load_instructions(&config, &dir).await;
+        assert!(both
+            .iter()
+            .any(|(label, text)| label == "GEMINI.md" && text == "Gemini rules"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

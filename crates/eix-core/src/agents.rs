@@ -18,6 +18,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::config::CompatConfig;
 use crate::session::PermissionLevel;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,31 +115,21 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
 
 /// Every agent visible from `cwd`. Project agents override global agents with
 /// the same name, and user agents override built-ins.
-pub fn load_agents(cwd: &Path) -> Vec<AgentSpec> {
+pub fn load_agents(cwd: &Path, compat: &CompatConfig) -> Vec<AgentSpec> {
     let mut by_name: BTreeMap<String, AgentSpec> = builtin_agents()
         .into_iter()
         .map(|agent| (agent.name.clone(), agent))
         .collect();
 
-    let mut sources: Vec<PathBuf> = Vec::new();
-    sources.push(crate::config::config_home().join("opencode/agents"));
-    sources.push(crate::config::config_dir().join("agents"));
-    let mut ancestors: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        sources.push(ancestor.join(".eix/agents"));
-        sources.push(ancestor.join(".opencode/agents"));
-    }
-
-    for source in sources {
+    for source in crate::compat::agent_sources(cwd, compat) {
         collect_from(&source, &source, &mut by_name);
     }
     by_name.into_values().collect()
 }
 
 /// Look up one agent by name, reloading from disk so edits apply immediately.
-pub fn find_agent(cwd: &Path, name: &str) -> Option<AgentSpec> {
-    load_agents(cwd)
+pub fn find_agent(cwd: &Path, name: &str, compat: &CompatConfig) -> Option<AgentSpec> {
+    load_agents(cwd, compat)
         .into_iter()
         .find(|agent| agent.name == name)
 }
@@ -274,6 +265,28 @@ mod tests {
     }
 
     #[test]
+    fn loads_compatible_agent_definitions() {
+        let cwd = temp_dir("compat");
+        for (dir, name) in [
+            (".claude/agents", "claude"),
+            (".opencode/agents", "opencode"),
+            (".gemini/agents", "gemini"),
+        ] {
+            std::fs::create_dir_all(cwd.join(dir)).unwrap();
+            std::fs::write(
+                cwd.join(dir).join(format!("{name}.md")),
+                format!("---\ndescription: {name} agent\n---\n{name} prompt\n"),
+            )
+            .unwrap();
+        }
+        let agents = load_agents(&cwd, &CompatConfig::all());
+        for name in ["claude", "opencode", "gemini"] {
+            assert!(agents.iter().any(|agent| agent.name == name), "{name}");
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
     fn loads_custom_agents_and_overrides_builtins() {
         let cwd = temp_dir("load");
         std::fs::write(
@@ -287,7 +300,7 @@ mod tests {
         )
         .unwrap();
 
-        let agents = load_agents(&cwd);
+        let agents = load_agents(&cwd, &CompatConfig::default());
         let reviewer = agents
             .iter()
             .find(|agent| agent.name == "reviewer")

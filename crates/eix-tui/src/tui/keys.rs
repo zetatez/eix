@@ -16,6 +16,7 @@ pub enum KeyAction {
     Sessions,
     NewPane,
     Palette,
+    Models,
     Worktrees,
     Branches,
     Ledger,
@@ -46,6 +47,7 @@ impl KeyAction {
                 "sessions" => Self::Sessions,
                 "new_pane" => Self::NewPane,
                 "palette" => Self::Palette,
+                "model" | "models" => Self::Models,
                 "worktrees" => Self::Worktrees,
                 "branches" => Self::Branches,
                 "ledger" | "context" => Self::Ledger,
@@ -210,6 +212,10 @@ mod tests {
             parse_key("F1"),
             Some(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE))
         );
+        assert_eq!(
+            parse_key("C-/"),
+            Some(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL))
+        );
         assert_eq!(parse_key("not-a-key"), None);
     }
 
@@ -232,6 +238,17 @@ mod tests {
         assert_eq!(
             binds.action(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::SHIFT)),
             Some(KeyAction::Help)
+        );
+    }
+
+    #[test]
+    fn model_binding_accepts_ctrl_slash() {
+        let mut map = BTreeMap::new();
+        map.insert("model".to_string(), "C-/".to_string());
+        let binds = Keybinds::from_config(&map);
+        assert_eq!(
+            binds.action(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::CONTROL)),
+            Some(KeyAction::Models)
         );
     }
 

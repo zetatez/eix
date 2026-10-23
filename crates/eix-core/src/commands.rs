@@ -20,6 +20,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::compat::CommandFormat;
+use crate::config::CompatConfig;
+
 /// A command discovered on disk. `name` uses `/` separators for nested files.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CustomCommand {
@@ -33,11 +36,12 @@ pub struct CustomCommand {
 
 /// Load every command visible from `cwd`. Nearer project sources override
 /// global and ancestor sources with the same name.
-pub fn load_commands(cwd: &Path) -> Vec<CustomCommand> {
+pub fn load_commands(cwd: &Path, compat: &CompatConfig) -> Vec<CustomCommand> {
     load_commands_with_roots(
         cwd,
         &crate::config::config_home(),
         &crate::config::config_dir(),
+        compat,
     )
 }
 
@@ -45,30 +49,21 @@ fn load_commands_with_roots(
     cwd: &Path,
     config_home: &Path,
     config_dir: &Path,
+    compat: &CompatConfig,
 ) -> Vec<CustomCommand> {
-    let mut sources: Vec<PathBuf> = Vec::new();
-    sources.push(config_home.join("opencode/commands"));
-    // Legacy global directory, then the current `cmds/` directory so a file in
-    // either place is picked up and `cmds/` wins when both define a name.
-    sources.push(config_dir.join("commands"));
-    sources.push(config_dir.join("cmds"));
-
-    let mut ancestors: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
-    ancestors.reverse();
-    for ancestor in ancestors {
-        sources.push(ancestor.join(".eix/commands"));
-        sources.push(ancestor.join(".opencode/commands"));
-        sources.push(ancestor.join(".eix/cmds"));
+    let mut commands: BTreeMap<String, CustomCommand> = BTreeMap::new();
+    for (source, format) in crate::compat::command_sources(cwd, compat, config_home, config_dir) {
+        collect_from(&source, &source, &mut commands, format);
     }
-
-    let mut by_name: BTreeMap<String, CustomCommand> = BTreeMap::new();
-    for source in sources {
-        collect_from(&source, &source, &mut by_name);
-    }
-    by_name.into_values().collect()
+    commands.into_values().collect()
 }
 
-fn collect_from(source: &Path, dir: &Path, out: &mut BTreeMap<String, CustomCommand>) {
+fn collect_from(
+    source: &Path,
+    dir: &Path,
+    out: &mut BTreeMap<String, CustomCommand>,
+    format: CommandFormat,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -80,46 +75,92 @@ fn collect_from(source: &Path, dir: &Path, out: &mut BTreeMap<String, CustomComm
             continue;
         };
         if kind.is_dir() {
-            collect_from(source, &path, out);
+            collect_from(source, &path, out, format);
             continue;
         }
-        if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+        let Some(relative) = path.strip_prefix(source).ok() else {
             continue;
+        };
+        match format {
+            CommandFormat::Markdown => {
+                if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                    continue;
+                }
+                let Some(name) = command_name(relative, "md") else {
+                    continue;
+                };
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let (meta, body) = split_frontmatter(&text);
+                let template = body.trim().to_string();
+                if template.is_empty() {
+                    continue;
+                }
+                let description = meta
+                    .get("description")
+                    .cloned()
+                    .filter(|description| !description.is_empty())
+                    .unwrap_or_else(|| first_line(&template));
+                out.insert(
+                    name.clone(),
+                    CustomCommand {
+                        name,
+                        description,
+                        template,
+                        agent: meta.get("agent").cloned().filter(|value| !value.is_empty()),
+                        model: meta.get("model").cloned().filter(|value| !value.is_empty()),
+                        source: path,
+                    },
+                );
+            }
+            CommandFormat::GeminiToml => {
+                if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+                    continue;
+                }
+                let Some(name) = command_name(relative, "toml") else {
+                    continue;
+                };
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let Ok(value) = toml::from_str::<toml::Value>(&text) else {
+                    continue;
+                };
+                let Some(table) = value.as_table() else {
+                    continue;
+                };
+                let Some(prompt) = table.get("prompt").and_then(toml::Value::as_str) else {
+                    continue;
+                };
+                let template = prompt.replace("{{args}}", "$ARGUMENTS").trim().to_string();
+                if template.is_empty() {
+                    continue;
+                }
+                let description = table
+                    .get("description")
+                    .and_then(toml::Value::as_str)
+                    .map(str::trim)
+                    .filter(|description| !description.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| first_line(&template));
+                out.insert(
+                    name.clone(),
+                    CustomCommand {
+                        name,
+                        description,
+                        template,
+                        agent: None,
+                        model: None,
+                        source: path,
+                    },
+                );
+            }
         }
-        let Ok(relative) = path.strip_prefix(source) else {
-            continue;
-        };
-        let Some(name) = command_name(relative) else {
-            continue;
-        };
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let (meta, body) = split_frontmatter(&text);
-        let template = body.trim().to_string();
-        if template.is_empty() {
-            continue;
-        }
-        let description = meta
-            .get("description")
-            .cloned()
-            .filter(|description| !description.is_empty())
-            .unwrap_or_else(|| first_line(&template));
-        out.insert(
-            name.clone(),
-            CustomCommand {
-                name,
-                description,
-                template,
-                agent: meta.get("agent").cloned().filter(|value| !value.is_empty()),
-                model: meta.get("model").cloned().filter(|value| !value.is_empty()),
-                source: path,
-            },
-        );
     }
 }
 
-fn command_name(relative: &Path) -> Option<String> {
+fn command_name(relative: &Path, extension: &str) -> Option<String> {
     let mut parts = Vec::new();
     for component in relative.components() {
         let part = component.as_os_str().to_string_lossy();
@@ -129,7 +170,8 @@ fn command_name(relative: &Path) -> Option<String> {
         parts.push(part.to_string());
     }
     let last = parts.last_mut()?;
-    let stem = last.strip_suffix(".md")?.to_string();
+    let suffix = format!(".{extension}");
+    let stem = last.strip_suffix(&suffix)?.to_string();
     if stem.is_empty() {
         return None;
     }
@@ -266,7 +308,7 @@ mod tests {
         .unwrap();
         std::fs::write(cwd.join(".eix/cmds/team/check.md"), "Check $1 and $2.\n").unwrap();
 
-        let commands = load_commands(&cwd);
+        let commands = load_commands(&cwd, &CompatConfig::default());
         let review = commands
             .iter()
             .find(|command| command.name == "review")
@@ -291,7 +333,8 @@ mod tests {
         let cwd = config_home.join("project");
         std::fs::create_dir_all(&cwd).unwrap();
 
-        let commands = load_commands_with_roots(&cwd, &config_home, &config_dir);
+        let commands =
+            load_commands_with_roots(&cwd, &config_home, &config_dir, &CompatConfig::default());
         let global = commands
             .iter()
             .find(|command| command.name == "global")
@@ -299,6 +342,44 @@ mod tests {
         assert_eq!(global.template, "cmds template");
         assert!(commands.iter().any(|command| command.name == "review"));
         let _ = std::fs::remove_dir_all(&config_home);
+    }
+
+    #[test]
+    fn loads_compatible_agent_commands() {
+        let cwd = temp_dir("compat");
+        std::fs::create_dir_all(cwd.join(".claude/commands")).unwrap();
+        std::fs::write(
+            cwd.join(".claude/commands/claude.md"),
+            "Claude $ARGUMENTS\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(cwd.join(".opencode/commands")).unwrap();
+        std::fs::write(cwd.join(".opencode/commands/opencode.md"), "OpenCode $1\n").unwrap();
+        std::fs::create_dir_all(cwd.join(".codex/prompts")).unwrap();
+        std::fs::write(cwd.join(".codex/prompts/codex.md"), "Codex $ARGUMENTS\n").unwrap();
+        std::fs::create_dir_all(cwd.join(".gemini/commands")).unwrap();
+        std::fs::write(
+            cwd.join(".gemini/commands/gemini.toml"),
+            "description = \"Gemini command\"\nprompt = \"Gemini {{args}}\"\n",
+        )
+        .unwrap();
+        std::fs::create_dir_all(cwd.join(".pi/prompts")).unwrap();
+        std::fs::write(cwd.join(".pi/prompts/pi.md"), "Pi $1\n").unwrap();
+
+        let commands = load_commands(&cwd, &CompatConfig::all());
+        for name in ["claude", "opencode", "codex", "gemini", "pi"] {
+            assert!(
+                commands.iter().any(|command| command.name == name),
+                "{name}"
+            );
+        }
+        let gemini = commands
+            .iter()
+            .find(|command| command.name == "gemini")
+            .unwrap();
+        assert_eq!(gemini.description, "Gemini command");
+        assert_eq!(gemini.template, "Gemini $ARGUMENTS");
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[test]
