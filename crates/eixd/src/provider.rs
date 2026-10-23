@@ -51,6 +51,26 @@ impl RetryClass {
     pub fn is_retryable(self) -> bool {
         matches!(self, Self::Transient | Self::RateLimited)
     }
+
+    /// Stable label used in retry notifications and logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Transient => "transient",
+            Self::RateLimited => "rate_limited",
+            Self::Quota => "quota",
+            Self::ContextLength => "context_length",
+            Self::Fatal => "fatal",
+        }
+    }
+
+    /// Rate limits need a more patient floor than a dropped connection when
+    /// the provider did not send `Retry-After`.
+    pub fn backoff_floor(self) -> Duration {
+        match self {
+            Self::RateLimited => Duration::from_millis(500),
+            _ => Duration::ZERO,
+        }
+    }
 }
 
 impl ProviderError {
@@ -65,7 +85,7 @@ impl ProviderError {
                 if looks_like_quota(&body) || *status == 402 {
                     return RetryClass::Quota;
                 }
-                if looks_like_context_length(&body) {
+                if *status == 413 || looks_like_context_length(&body) {
                     return RetryClass::ContextLength;
                 }
                 if *status == 429 {
@@ -168,7 +188,9 @@ impl Provider {
             completion.text = redactor.restore(&completion.text);
             completion.reasoning = redactor.restore(&completion.reasoning);
             for call in &mut completion.tool_calls {
-                call.function.arguments = redactor.restore_json(&call.function.arguments);
+                if restore_tool_arguments(&call.function.name) {
+                    call.function.arguments = redactor.restore_json(&call.function.arguments);
+                }
             }
         }
         result
@@ -712,6 +734,28 @@ async fn wait_for_cancel(cancel: &AtomicBool) {
     }
 }
 
+/// Secret placeholders are restored only for local tools. Network, shell and
+/// MCP tool arguments keep the placeholder (or fail closed in the daemon), so a
+/// model cannot turn a redacted transcript value back into a live credential in
+/// an outbound request.
+fn restore_tool_arguments(tool: &str) -> bool {
+    matches!(
+        tool,
+        "read_file"
+            | "list_dir"
+            | "grep"
+            | "glob"
+            | "lsp_diagnostics"
+            | "write_file"
+            | "edit"
+            | "patch"
+            | "todo"
+            | "memory"
+            | "ask_user"
+            | "use_skill"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -868,6 +912,25 @@ mod tests {
             assert_eq!(err.retry_class(), RetryClass::ContextLength, "{body}");
             assert!(!err.retry_class().is_retryable());
         }
+
+        // A generic 413 is also recoverable by compacting the prompt.
+        let payload = ProviderError::Api {
+            status: 413,
+            body: "request entity too large".into(),
+            retry_after_secs: None,
+        };
+        assert_eq!(payload.retry_class(), RetryClass::ContextLength);
+    }
+
+    #[test]
+    fn retry_classes_expose_labels_and_backoff_floors() {
+        assert_eq!(RetryClass::Transient.label(), "transient");
+        assert_eq!(RetryClass::RateLimited.label(), "rate_limited");
+        assert_eq!(
+            RetryClass::RateLimited.backoff_floor(),
+            Duration::from_millis(500)
+        );
+        assert_eq!(RetryClass::Transient.backoff_floor(), Duration::ZERO);
     }
 
     #[test]
@@ -898,5 +961,22 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after-ms", "1500".parse().unwrap());
         assert_eq!(parse_retry_after(&headers), Some(2));
+    }
+
+    #[test]
+    fn secrets_are_only_restored_for_local_tool_arguments() {
+        for tool in ["read_file", "write_file", "edit", "patch", "grep"] {
+            assert!(restore_tool_arguments(tool), "{tool}");
+        }
+        for tool in [
+            "run_command",
+            "start_command",
+            "webfetch",
+            "websearch",
+            "spawn_agent",
+            "mcp__github__create_issue",
+        ] {
+            assert!(!restore_tool_arguments(tool), "{tool}");
+        }
     }
 }

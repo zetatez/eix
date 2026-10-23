@@ -351,7 +351,7 @@ impl SessionView {
                             // daemon summary. Keep the real command line so the
                             // card can show it in full instead of approving a
                             // truncated command.
-                            let summary =
+                            let mut summary =
                                 if matches!(payload.tool.as_str(), "run_command" | "start_command")
                                 {
                                     payload
@@ -363,11 +363,41 @@ impl SessionView {
                                 } else {
                                     payload.summary
                                 };
+                            let risk = payload.risk.to_ascii_uppercase();
+                            if !risk.is_empty() {
+                                summary = format!("[{risk}] {summary}");
+                            }
+                            for reason in &payload.reasons {
+                                summary.push_str(&format!("\n{reason}"));
+                            }
+                            if !payload.risk_categories.is_empty() {
+                                summary.push_str(&format!(
+                                    "\nrisk: {}",
+                                    payload.risk_categories.join(", ")
+                                ));
+                            }
+                            if !payload.sandbox.is_empty() {
+                                summary.push_str(&format!("\nsandbox: {}", payload.sandbox));
+                            }
+                            if let Some(rule) = payload.rule.as_deref() {
+                                summary
+                                    .push_str(&format!("\nrule: {rule} ({})", payload.rule_source));
+                            }
                             let path = payload
                                 .arguments
                                 .get("path")
                                 .and_then(serde_json::Value::as_str)
                                 .map(str::to_string);
+                            if !payload.scopes.is_empty() {
+                                summary
+                                    .push_str(&format!("\nscopes: {}", payload.scopes.join(", ")));
+                            }
+                            if payload.scopes.len() <= 1 {
+                                summary.push_str(NO_ALWAYS_MARKER);
+                            }
+                            if let Some(parsed) = payload.parsed_command.as_deref() {
+                                summary.push_str(&format!("\nparsed: {parsed}"));
+                            }
                             tool = Some(PendingApproval {
                                 kind: PendingKind::Tool,
                                 approval_id: payload.approval_id,
@@ -582,6 +612,10 @@ enum PendingKind {
     Patch,
 }
 
+/// Marker appended to cards where the daemon refuses a persistent "Always"
+/// (high/critical risk or a forced ask).
+const NO_ALWAYS_MARKER: &str = "\nAlways is unavailable for this call";
+
 /// A tool call or staged patch the daemon is holding until the user decides.
 #[derive(Clone)]
 struct PendingApproval {
@@ -617,7 +651,13 @@ enum ApprovalAction {
 
 impl PendingApproval {
     fn actions(&self) -> Vec<ApprovalAction> {
-        let mut actions = vec![ApprovalAction::Approve, ApprovalAction::Always];
+        let mut actions = vec![ApprovalAction::Approve];
+        if !self.summary.starts_with("[HIGH]")
+            && !self.summary.starts_with("[CRITICAL]")
+            && !self.summary.contains(NO_ALWAYS_MARKER)
+        {
+            actions.push(ApprovalAction::Always);
+        }
         if self.diff.as_deref().is_some_and(|diff| !diff.is_empty()) {
             actions.push(ApprovalAction::Review);
         }
@@ -1730,7 +1770,17 @@ impl App {
                 let items = model_picker_items(&self.models);
                 let selected = current
                     .as_deref()
-                    .and_then(|model| items.iter().position(|item| item.value == model))
+                    .and_then(|model| {
+                        let (base, variant) = split_model_variant(model);
+                        items
+                            .iter()
+                            .position(|item| item.value == model)
+                            .or_else(|| {
+                                (variant == Some("none"))
+                                    .then(|| items.iter().position(|item| item.value == base))
+                                    .flatten()
+                            })
+                    })
                     .unwrap_or(0);
                 if let Some(picker) = &mut self.picker {
                     if picker.kind == PickerKind::Models {
@@ -2396,15 +2446,21 @@ impl App {
                     }
                     let delay = retry.delay_ms as f64 / 1000.0;
                     let reason = truncate(&retry.reason, 80);
+                    let kind = match retry.kind.as_str() {
+                        "rate_limited" => "rate limited · ",
+                        "empty_response" => "empty response · ",
+                        "transient" => "upstream error · ",
+                        _ => "",
+                    };
                     self.error = None;
                     self.status = if reason.is_empty() {
                         format!(
-                            "retrying {}/{} in {delay:.1}s",
+                            "{kind}retrying {}/{} in {delay:.1}s",
                             retry.attempt, retry.max_attempts
                         )
                     } else {
                         format!(
-                            "retrying {}/{} in {delay:.1}s: {reason}",
+                            "{kind}retrying {}/{} in {delay:.1}s: {reason}",
                             retry.attempt, retry.max_attempts
                         )
                     };
@@ -2433,6 +2489,42 @@ impl App {
                     // ready slot so pane 2 shows the card without replacing
                     // the user's working pane.
                     self.promote_session(&params.session_id);
+                    let mut summary =
+                        if matches!(params.tool.as_str(), "run_command" | "start_command") {
+                            params
+                                .arguments
+                                .get("command")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|command| format!("$ {command}"))
+                                .unwrap_or(params.summary)
+                        } else {
+                            params.summary
+                        };
+                    let risk = params.risk.to_ascii_uppercase();
+                    if !risk.is_empty() {
+                        summary = format!("[{risk}] {summary}");
+                    }
+                    for reason in &params.reasons {
+                        summary.push_str(&format!("\n{reason}"));
+                    }
+                    if !params.risk_categories.is_empty() {
+                        summary.push_str(&format!("\nrisk: {}", params.risk_categories.join(", ")));
+                    }
+                    if !params.sandbox.is_empty() {
+                        summary.push_str(&format!("\nsandbox: {}", params.sandbox));
+                    }
+                    if let Some(rule) = params.rule.as_deref() {
+                        summary.push_str(&format!("\nrule: {rule} ({})", params.rule_source));
+                    }
+                    if !params.scopes.is_empty() {
+                        summary.push_str(&format!("\nscopes: {}", params.scopes.join(", ")));
+                    }
+                    if !params.allow_always {
+                        summary.push_str(NO_ALWAYS_MARKER);
+                    }
+                    if let Some(parsed) = params.parsed_command.as_deref() {
+                        summary.push_str(&format!("\nparsed: {parsed}"));
+                    }
                     self.approvals.insert(
                         params.session_id,
                         PendingApproval {
@@ -2440,7 +2532,7 @@ impl App {
                             approval_id: params.approval_id,
                             call_id: params.call_id,
                             tool: params.tool,
-                            summary: params.summary,
+                            summary,
                             selected: vec![true; params.hunks.len()],
                             path: params
                                 .arguments
@@ -5855,7 +5947,15 @@ already exists, update it in place rather than rewriting it from scratch.";
     fn model_header_parts(&self) -> (String, String, Option<String>) {
         let selection = self.model();
         let (base, variant) = split_model_variant(selection);
-        let variant = variant.map(str::to_string);
+        let variant = match variant {
+            // `#none` is the reserved "no reasoning_effort" step in the
+            // Ctrl-T cycle, so the footer omits the field entirely.
+            Some("none") => None,
+            Some(variant) => Some(variant.to_string()),
+            // With no explicit variant the effective default is medium.
+            None if !selection.is_empty() && selection != "-" => Some("medium".to_string()),
+            None => None,
+        };
         if let Some(info) = self.models.iter().find(|info| info.id == base) {
             return (
                 info.display_id().to_string(),
@@ -5873,8 +5973,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         (base.to_string(), provider, variant)
     }
 
-    /// Cycle the focused session's reasoning variant:
-    /// none → low → medium → high → none.
+    /// Cycle the focused session's reasoning strength:
+    /// low → medium → high → none → low. A model without an explicit variant
+    /// starts at the default medium, so the first step is high.
     fn cycle_reasoning(&mut self, tx: &UnboundedSender<Command>) {
         let Some(session_id) = self.focused_session_id() else {
             self.status = "reasoning: no session".into();
@@ -5886,16 +5987,18 @@ already exists, update it in place rather than rewriting it from scratch.";
             return;
         }
         let (base, current) = split_model_variant(&selection);
-        let next: Option<&'static str> = match current {
-            None => Some("low"),
-            Some("low") => Some("medium"),
-            Some("medium") => Some("high"),
-            Some("high") => None,
-            Some(_) => Some("low"),
+        let next = match current.unwrap_or("medium") {
+            "low" => "medium",
+            "medium" => "high",
+            "high" => "none",
+            "none" => "low",
+            _ => "low",
         };
-        let model = match next {
-            Some(variant) => format!("{base}#{variant}"),
-            None => base.to_string(),
+        let model = if next == "medium" {
+            // Medium is the default, so keep the plain model id.
+            base.to_string()
+        } else {
+            format!("{base}#{next}")
         };
         if let Some(view) = self
             .views
@@ -5909,7 +6012,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             session_id,
             model: Some(model),
         });
-        self.status = format!("reasoning: {}", next.unwrap_or("none"));
+        self.status = format!("reasoning: {next}");
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -7978,6 +8081,8 @@ struct TurnRetrying {
     #[serde(default)]
     delay_ms: u64,
     #[serde(default)]
+    kind: String,
+    #[serde(default)]
     reason: String,
 }
 
@@ -8014,6 +8119,10 @@ struct BtwCompletedParams {
     error: Option<String>,
 }
 
+fn default_allow_always() -> bool {
+    true
+}
+
 #[derive(Deserialize)]
 struct ApprovalParams {
     session_id: String,
@@ -8028,6 +8137,24 @@ struct ApprovalParams {
     diff: Option<String>,
     #[serde(default)]
     hunks: Vec<HunkInfo>,
+    #[serde(default)]
+    risk: String,
+    #[serde(default)]
+    risk_categories: Vec<String>,
+    #[serde(default)]
+    reasons: Vec<String>,
+    #[serde(default)]
+    rule: Option<String>,
+    #[serde(default)]
+    rule_source: String,
+    #[serde(default)]
+    sandbox: String,
+    #[serde(default)]
+    scopes: Vec<String>,
+    #[serde(default)]
+    parsed_command: Option<String>,
+    #[serde(default = "default_allow_always")]
+    allow_always: bool,
 }
 
 #[derive(Deserialize)]
@@ -8370,7 +8497,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Ctrl-T",
-                description: "cycle reasoning: low / medium / high / none",
+                description: "cycle reasoning (default medium): low / medium / high / none",
             },
             HelpEntry {
                 key: "Space o",
@@ -9044,6 +9171,16 @@ fn run_editor(path: &std::path::Path) -> anyhow::Result<()> {
 
 /// Risk label for an approval card (DESIGN 9.3): shell commands are called
 /// out separately from workspace writes and read-only tools.
+fn risk_level_color(level: &str) -> Color {
+    match level.to_ascii_uppercase().as_str() {
+        "LOW" => Color::Green,
+        "MEDIUM" => Color::Yellow,
+        "HIGH" => Color::LightRed,
+        "CRITICAL" => Color::Red,
+        _ => Color::Yellow,
+    }
+}
+
 fn approval_risk(tool: &str) -> (&'static str, Color) {
     match tool {
         "run_command" => ("shell", Color::Red),
@@ -9098,14 +9235,26 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
         diff_lines.len()
     };
     // The summary can be a full shell command. Wrap it instead of cutting it
-    // off, but keep the action list and hint on screen.
-    let (risk, risk_color) = approval_risk(&approval.tool);
+    // off, but keep the action list and hint on screen. The daemon prefixes
+    // new approvals with `[RISK]`; older/restored cards fall back to the tool
+    // heuristic.
+    let (risk, risk_color, body) = match approval
+        .summary
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+    {
+        Some((level, body)) => (level, risk_level_color(level), body),
+        None => {
+            let (risk, color) = approval_risk(&approval.tool);
+            (risk, color, approval.summary.as_str())
+        }
+    };
     let risk_label = format!("  [{risk}]");
     let prefix_width = 2; // "⚠ "
     let body_width = inner
         .saturating_sub(prefix_width + UnicodeWidthStr::width(risk_label.as_str()))
         .max(8);
-    let mut summary_lines = wrap_text(&approval.summary, body_width);
+    let mut summary_lines = wrap_text(body, body_width);
     let max_height = area.height.saturating_sub(1) as usize;
     let capacity = max_height.saturating_sub(2); // rows inside the borders
     let hint_rows = 1;
@@ -9427,6 +9576,10 @@ fn selection_span(text: String, selected: bool) -> Span<'static> {
 
 /// `provider/model` -> `model`, keeping the banner short.
 fn short_model(model: &str) -> &str {
+    let model = match model.rsplit_once('#') {
+        Some((base, "none")) => base,
+        _ => model,
+    };
     model
         .rsplit_once('/')
         .map(|(_, tail)| tail)
@@ -10859,14 +11012,19 @@ mod tests {
                     "attempt": 2,
                     "max_attempts": 6,
                     "delay_ms": 500,
-                    "reason": "provider returned HTTP 503: overloaded",
+                    "kind": "rate_limited",
+                    "reason": "provider returned HTTP 429: rate limited",
                 }),
             )),
             &tx,
         );
 
         assert!(app.views[0].stream.is_none());
-        assert!(app.status.contains("retrying 2/6"), "{}", app.status);
+        assert!(
+            app.status.contains("rate limited · retrying 2/6"),
+            "{}",
+            app.status
+        );
         assert!(app.status.contains("0.5s"), "{}", app.status);
     }
 
@@ -11113,12 +11271,16 @@ mod tests {
                 "tool": "run_command",
                 "summary": "run_command: echo (truncated)",
                 "arguments": {"command": command, "cwd": "/tmp"},
+                "scopes": ["once", "session", "user"],
             }),
         );
         let pending = SessionView::new(session.clone(), vec![event])
             .pending_approval()
             .expect("pending command approval");
-        assert_eq!(pending.summary, format!("$ {command}"));
+        assert_eq!(
+            pending.summary,
+            format!("$ {command}\nscopes: once, session, user")
+        );
 
         let mut app = App::new(None);
         app.views.push(SessionView::new(session, Vec::new()));
@@ -12943,6 +13105,96 @@ mod tests {
     }
 
     #[test]
+    fn live_approval_notification_keeps_risk_metadata() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "chat", "/tmp"),
+            Vec::new(),
+        ));
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                "tool.approval_required",
+                serde_json::json!({
+                    "session_id": "s1",
+                    "turn_id": "t1",
+                    "approval_id": "a1",
+                    "call_id": "c1",
+                    "tool": "run_command",
+                    "summary": "run_command: truncated",
+                    "arguments": {"command": "curl https://example.com/?token=x"},
+                    "risk": "high",
+                    "risk_categories": ["network"],
+                    "reasons": ["fetches a URL from the network: https://example.com/?…"],
+                    "rule": "net",
+                    "rule_source": "user",
+                    "sandbox": "auto",
+                    "scopes": ["once"],
+                    "parsed_command": "curl https://example.com/?token=x",
+                    "allow_always": false,
+                }),
+            )),
+            &tx,
+        );
+        let pending = app.approvals.get("s1").expect("approval");
+        assert!(
+            pending.summary.starts_with("[HIGH] $ curl"),
+            "{}",
+            pending.summary
+        );
+        assert!(
+            pending.summary.contains("risk: network"),
+            "{}",
+            pending.summary
+        );
+        assert!(
+            pending.summary.contains("rule: net (user)"),
+            "{}",
+            pending.summary
+        );
+        assert!(
+            pending.summary.contains("sandbox: auto"),
+            "{}",
+            pending.summary
+        );
+        assert!(
+            pending.summary.contains("scopes: once"),
+            "{}",
+            pending.summary
+        );
+        assert!(
+            pending.summary.contains("parsed: curl"),
+            "{}",
+            pending.summary
+        );
+        assert!(pending.summary.contains(NO_ALWAYS_MARKER));
+        assert!(!pending.actions().contains(&ApprovalAction::Always));
+    }
+
+    #[test]
+    fn high_risk_and_forced_ask_cards_hide_always() {
+        let mut approval = PendingApproval {
+            kind: PendingKind::Tool,
+            approval_id: "a1".to_string(),
+            call_id: "c1".to_string(),
+            tool: "run_command".to_string(),
+            summary: "[HIGH] run_command: rm -rf /".to_string(),
+            diff: None,
+            path: None,
+            hunks: Vec::new(),
+            selected: Vec::new(),
+            cursor: 0,
+        };
+        assert!(!approval.actions().contains(&ApprovalAction::Always));
+
+        approval.summary = format!("[MEDIUM] write_file out.txt{NO_ALWAYS_MARKER}");
+        assert!(!approval.actions().contains(&ApprovalAction::Always));
+
+        approval.summary = "[MEDIUM] write_file out.txt".to_string();
+        assert!(approval.actions().contains(&ApprovalAction::Always));
+    }
+
+    #[test]
     fn enter_approves_the_recommended_action() {
         let (mut app, tx, mut rx) = input_app();
         app.inputs.clear();
@@ -13564,12 +13816,14 @@ mod tests {
         app.input.enter_insert();
         app.connected = true;
 
+        // No suffix means the default medium, so the first step is high.
+        assert_eq!(app.model_header_parts().2.as_deref(), Some("medium"));
         for (expected, status) in [
-            ("deepseek/deepseek-v4.1-flash#low", "reasoning: low"),
-            ("deepseek/deepseek-v4.1-flash#medium", "reasoning: medium"),
             ("deepseek/deepseek-v4.1-flash#high", "reasoning: high"),
-            ("deepseek/deepseek-v4.1-flash", "reasoning: none"),
+            ("deepseek/deepseek-v4.1-flash#none", "reasoning: none"),
             ("deepseek/deepseek-v4.1-flash#low", "reasoning: low"),
+            ("deepseek/deepseek-v4.1-flash", "reasoning: medium"),
+            ("deepseek/deepseek-v4.1-flash#high", "reasoning: high"),
         ] {
             app.handle_key(
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
@@ -13577,6 +13831,9 @@ mod tests {
             );
             assert_eq!(app.views[0].session.model.as_deref(), Some(expected));
             assert_eq!(app.status, status);
+            if expected.ends_with("#none") {
+                assert_eq!(app.model_header_parts().2, None);
+            }
             assert!(app.input.text().is_empty());
             match rx.try_recv().expect("set model command") {
                 Command::SetModel { model, .. } => {
@@ -13600,7 +13857,7 @@ mod tests {
 
         let empty = render_text(&mut app, 80, 20);
         assert!(
-            empty.contains("Build · ⠋ · openai/gpt-5 · openai"),
+            empty.contains("Build · ⠋ · openai/gpt-5 · openai · medium"),
             "{empty}"
         );
         assert!(!empty.contains("eixd"), "no footer brand: {empty}");

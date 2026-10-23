@@ -404,8 +404,25 @@ pub struct RenameParams {
 pub enum ApprovalDecision {
     Approve,
     Deny,
-    /// Approve this call and matching calls for the rest of the session.
+    /// Approve this call and remember a matching rule. `scope` selects where
+    /// the rule is stored.
     Always,
+}
+
+/// How long an "Always" choice lasts.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalScope {
+    /// Do not remember anything.
+    Once,
+    /// Keep the rule in memory for this session (default).
+    #[default]
+    Session,
+    /// Request project scope. Project config may only tighten permissions, so
+    /// an `allow` rule is kept for the current session instead of persisted.
+    Project,
+    /// Append a rule to the user's global config.
+    User,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -419,6 +436,9 @@ pub struct ApprovalRespondParams {
     /// means the whole change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hunks: Option<Vec<usize>>,
+    /// Where an `Always` decision is remembered. Ignored for other decisions.
+    #[serde(default)]
+    pub scope: ApprovalScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

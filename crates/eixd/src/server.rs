@@ -20,8 +20,8 @@ use base64::Engine as _;
 use eix_core::{
     now_ms, payload, AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams,
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
-    AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult, ChatMessage,
-    Config, ContextClearParams, ContextClearedPayload, ContextCompactParams,
+    ApprovalScope, AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult,
+    ChatMessage, Config, ContextClearParams, ContextClearedPayload, ContextCompactParams,
     ContextCompactedPayload, ContextDropParams, ContextDropPayload, ContextLedgerParams,
     ContextPinParams, ContextPinPayload, CreateSessionParams, DraftParams, DraftResult,
     ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
@@ -29,16 +29,16 @@ use eix_core::{
     InputResult, LspWorkspaceParams, McpListResult, McpServerInfo, ModelListResult, Notification,
     PatchApplyParams, PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams,
     PatchResult, PatchResultPayload, PatchReviseParams, PermissionAction, PermissionLevel,
-    PermissionParams, PermissionPayload, PickerItem, PickerParams, PickerResult, ProcessKillParams,
-    ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams, RenameParams, Request,
-    Response, RewindParams, RewindResult, SearchParams, SearchResult, ServerMessage, Session,
-    SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
-    SessionId, SessionImportParams, SessionList, SessionModelParams, SessionOrigin, SessionRef,
-    SessionResult, SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
-    StatusChangedPayload, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
-    TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition, ToolPolicy,
-    ToolResultPayload, UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult,
-    PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    PermissionParams, PermissionPayload, PermissionRule, PickerItem, PickerParams, PickerResult,
+    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
+    RenameParams, Request, Response, RewindParams, RewindResult, RuleSource, SearchParams,
+    SearchResult, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
+    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
+    SessionList, SessionModelParams, SessionOrigin, SessionRef, SessionResult, SessionStatus,
+    ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult, StatusChangedPayload,
+    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult,
+    ToolCall, ToolCallPayload, ToolDefinition, ToolResultPayload, UserMessagePayload,
+    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -49,6 +49,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::context::{estimate_request_tokens, estimate_tool_schema_tokens, Ledger, StaticContext};
+use crate::permissions::{decide as permission_decide, PermissionDecision};
 use crate::process::ProcessRegistry;
 use crate::provider::{Provider, ProviderError, RetryClass};
 use crate::snapshot::{Scope, Snapshotter};
@@ -320,7 +321,7 @@ pub(crate) struct Daemon {
     /// Tool calls blocked on a user decision, keyed by session.
     approvals: Mutex<HashMap<SessionId, PendingApproval>>,
     /// Session-scoped rules created by "Always allow" on the approval card.
-    always: Mutex<HashMap<SessionId, Vec<eix_core::AutoApproveRule>>>,
+    always: Mutex<HashMap<SessionId, Vec<PermissionRule>>>,
     /// `ask_user` questions blocked on an answer, keyed by session.
     inputs: Mutex<HashMap<SessionId, PendingInput>>,
     /// In-flight `/btw` side questions, keyed by session (for cancellation).
@@ -354,6 +355,8 @@ struct PendingApproval {
     tool: String,
     summary: String,
     created_ms: i64,
+    /// High/critical risk calls cannot become unlimited "Always" rules.
+    allow_always: bool,
     responder: oneshot::Sender<ApprovalReply>,
 }
 
@@ -373,6 +376,8 @@ struct ApprovalReply {
     plan: Option<tools::WritePlan>,
     /// Hunk indices the user selected; `None` means the whole change.
     hunks: Option<Vec<usize>>,
+    /// Where an "Always" decision is remembered.
+    scope: ApprovalScope,
 }
 
 impl Daemon {
@@ -622,17 +627,26 @@ impl Daemon {
                     return Err(rpc("invalid", "shell command is empty"));
                 }
                 let session = self.require_session(&params.session_id)?;
-                let read_only_command = tools::is_read_only_command(command);
-                if self.session_permission(&session) == PermissionLevel::ReadOnly
-                    && !read_only_command
-                {
-                    return Err(rpc(
-                        "permission",
-                        "read-only sessions cannot run mutating shell commands",
-                    ));
-                }
                 let cwd = session.cwd.clone();
+                let permission = self.session_permission(&session);
+                let decision = {
+                    let config = self.config.load();
+                    permission_decide(
+                        "run_command",
+                        &json!({ "command": command }),
+                        &cwd,
+                        &config,
+                        permission,
+                        &[],
+                        false,
+                    )
+                };
                 let call_id = format!("shell-{}", Uuid::new_v4());
+                self.record_permission(&params.session_id, &call_id, "run_command", &decision)?;
+                if decision.action == PermissionAction::Deny {
+                    return Err(rpc("permission", decision.reason));
+                }
+                let mutating = decision.risk.mutates_workspace();
                 let arguments = json!({ "command": command });
                 let call = ToolCall {
                     id: call_id.clone(),
@@ -652,7 +666,7 @@ impl Daemon {
                     }),
                 )?;
                 self.emit_event(&event);
-                if self.config.load().tools.snapshots && !read_only_command {
+                if self.config.load().tools.snapshots && mutating {
                     let result = self
                         .snapshots
                         .capture_tree(&params.session_id, "run_command", &call_id, &cwd)
@@ -1145,6 +1159,7 @@ impl Daemon {
                         reason: Some("turn cancelled".to_string()),
                         plan: None,
                         hunks: None,
+                        scope: ApprovalScope::Once,
                     });
                 }
                 // Drop a pending question; the waiting `ask_user` sees a closed
@@ -1175,6 +1190,7 @@ impl Daemon {
                         ApprovalDecision::Approve,
                         params.hunks,
                         None,
+                        ApprovalScope::Once,
                     )
                     .await?;
                 Ok(serde_json::to_value(result)?)
@@ -1265,6 +1281,7 @@ impl Daemon {
                         ApprovalDecision::Deny,
                         None,
                         params.reason,
+                        ApprovalScope::Once,
                     )
                     .await?;
                 Ok(serde_json::to_value(result)?)
@@ -1336,6 +1353,7 @@ impl Daemon {
             decision,
             reason,
             hunks,
+            scope,
         } = params;
         {
             let mut approvals = self.approvals.lock().await;
@@ -1345,18 +1363,24 @@ impl Daemon {
                     approvals.insert(session_id, pending);
                     return Ok(ApprovalResult { accepted: false });
                 }
+                let decision = if decision == ApprovalDecision::Always && !pending.allow_always {
+                    ApprovalDecision::Approve
+                } else {
+                    decision
+                };
                 let _ = pending.responder.send(ApprovalReply {
                     decision,
                     reason,
                     plan: None,
                     hunks,
+                    scope,
                 });
                 return Ok(ApprovalResult { accepted: true });
             }
         }
         // No blocking tool call: the id must belong to a staged patch.
         let result = self
-            .decide_patch(&session_id, &approval_id, decision, hunks, reason)
+            .decide_patch(&session_id, &approval_id, decision, hunks, reason, scope)
             .await?;
         Ok(ApprovalResult {
             accepted: result.accepted,
@@ -2187,10 +2211,10 @@ impl Daemon {
             .require_session(&session_id)
             .map(|session| session.origin == SessionOrigin::Agent)
             .unwrap_or(true);
-        let mut definitions = if read_only {
+        let mut definitions = if read_only || sub_agent {
             tools::definitions()
                 .into_iter()
-                .filter(|tool| !tools::requires_approval(&tool.function.name))
+                .filter(|tool| !tools::hard_mutating(&tool.function.name))
                 .collect::<Vec<_>>()
         } else {
             tools::definitions()
@@ -2393,7 +2417,7 @@ impl Daemon {
                     self.observe_prompt_usage(&model, estimated_prompt, completion.usage.as_ref());
                 }
 
-                let (reason, delay) = match outcome {
+                let (reason, delay, kind) = match outcome {
                     Ok(completion)
                         if completion.tool_calls.is_empty()
                             && completion.text.trim().is_empty()
@@ -2402,7 +2426,14 @@ impl Daemon {
                     {
                         (
                             "model returned an empty response".to_string(),
-                            retry_delay(retry_base, retry_max, attempt + 1, None),
+                            retry_delay_for_class(
+                                retry_base,
+                                retry_max,
+                                attempt + 1,
+                                None,
+                                RetryClass::Transient,
+                            ),
+                            "empty_response",
                         )
                     }
                     Ok(completion) => break completion,
@@ -2470,9 +2501,15 @@ impl Daemon {
                         continue;
                     }
                     Err(err) if err.retry_class().is_retryable() && attempt < max_retries => {
-                        let delay =
-                            retry_delay(retry_base, retry_max, attempt + 1, err.retry_after());
-                        (err.to_string(), delay)
+                        let class = err.retry_class();
+                        let delay = retry_delay_for_class(
+                            retry_base,
+                            retry_max,
+                            attempt + 1,
+                            err.retry_after(),
+                            class,
+                        );
+                        (err.to_string(), delay, class.label())
                     }
                     Err(err) => {
                         if attempt > 0 {
@@ -2496,7 +2533,7 @@ impl Daemon {
                 }
                 let reason = truncate_ui(&redact(&reason), 240);
                 eprintln!(
-                    "eixd: turn {turn_id} retry {attempt}/{max_retries} in {}ms: {reason}",
+                    "eixd: turn {turn_id} retry {attempt}/{max_retries} ({kind}) in {}ms: {reason}",
                     delay.as_millis()
                 );
                 self.emit_value(
@@ -2507,6 +2544,7 @@ impl Daemon {
                         "attempt": attempt + 1,
                         "max_attempts": max_retries.saturating_add(1),
                         "delay_ms": delay.as_millis() as u64,
+                        "kind": kind,
                         "reason": reason,
                     }),
                 );
@@ -3063,8 +3101,6 @@ impl Daemon {
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
         }
-        let needs_approval = tools::requires_approval_for(tool, &args) || mcp_known;
-
         // A loaded skill may restrict the tools available for the rest of the
         // turn. `use_skill` itself is always allowed so another skill can be
         // loaded (their allow-lists are unioned).
@@ -3080,8 +3116,54 @@ impl Daemon {
         // refused here so a child can never change the shared workspace.
         let session = self.require_session(session_id)?;
         let permission = self.session_permission(&session);
-        if session.origin == SessionOrigin::Agent && needs_approval {
-            let output = "sub-agents are read-only; mutating tools are not available".to_string();
+        let session_rules = self
+            .always
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let decision = {
+            let config = self.config.load();
+            permission_decide(
+                tool,
+                &args,
+                &session.cwd,
+                &config,
+                permission,
+                &session_rules,
+                mcp_known,
+            )
+        };
+        self.record_permission(session_id, &call.id, tool, &decision)?;
+        // A deny is global and absolute: it must run before the special-case
+        // handlers below (todo/memory/ask_user/lsp), which otherwise bypass
+        // the approval gate.
+        if decision.action == PermissionAction::Deny {
+            let output = decision.reason.clone();
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            self.emit_value(
+                "tool.completed",
+                json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "call_id": call.id,
+                    "tool": tool,
+                    "ok": false,
+                    "denied": true,
+                    "duration_ms": 0,
+                }),
+            );
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        }
+        if session.origin == SessionOrigin::Agent && decision.action != PermissionAction::Allow {
+            let output = if decision.action == PermissionAction::Deny {
+                format!("sub-agents are read-only; {}", decision.reason)
+            } else {
+                "sub-agents are read-only; mutating or interactive tools are not available"
+                    .to_string()
+            };
             self.record_tool_result(session_id, call, false, true, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
@@ -3188,40 +3270,15 @@ impl Daemon {
             return Ok(());
         }
 
-        // The session-level level can only narrow what the global policy
-        // allows. `read-only` sessions never stage, ask, or auto-run a write.
-        if permission == PermissionLevel::ReadOnly && needs_approval {
-            let output = "session permission is read-only; mutating tools are disabled".to_string();
-            self.record_tool_result(session_id, call, false, true, &output, 0)?;
-            messages.push(ChatMessage::tool(call.id.clone(), output));
-            return Ok(());
-        }
-
-        // Ordered permission rules, then session-scoped "Always allow" rules.
-        // A deny always wins, even under `auto` / `full`.
-        let action = self.permission_action(session_id, tool, &args).await;
-        if action == PermissionAction::Deny {
-            let output = "permission rules deny this tool call".to_string();
-            self.record_tool_result(session_id, call, false, true, &output, 0)?;
-            messages.push(ChatMessage::tool(call.id.clone(), output));
-            return Ok(());
-        }
-        // Rules only relax the default `ask` policy. `auto` needs no help,
-        // `read-only` must stay a hard cap, and `full` sessions already skip
-        // the approval prompt.
-        let auto_approve = self.config.load().tools.policy == ToolPolicy::Ask
-            && permission != PermissionLevel::Full
-            && action == PermissionAction::Allow;
-
-        // Staged writes: under `ask` (the default) a `write_file` proposal goes
-        // into the session's shadow workspace and returns at once. The user
-        // applies or rejects it later with `patch.apply` / `patch.reject`.
-        // Reads and later writes see the staged contents. `full` sessions and
-        // auto-approved calls skip the review step and write directly.
-        if matches!(tool, "write_file" | "edit")
-            && self.config.load().tools.policy == ToolPolicy::Ask
-            && permission != PermissionLevel::Full
-            && !auto_approve
+        // Low/medium writes under an `ask` decision go into the shadow
+        // workspace and return immediately. The user applies or rejects them
+        // later. High/critical writes and forced asks block on an approval card
+        // so their risk metadata is visible and `Always` can be withheld.
+        // Explicit `allow` rules and `approval = "auto"` write directly.
+        if decision.action == PermissionAction::Ask
+            && !decision.force_ask
+            && decision.risk.level <= eix_core::RiskLevel::Medium
+            && matches!(tool, "write_file" | "edit")
         {
             return self
                 .stage_write(session_id, turn_id, call, &args, messages)
@@ -3231,34 +3288,23 @@ impl Daemon {
         let mut denial: Option<String> = None;
         let mut plan: Option<tools::WritePlan> = None;
         let mut selected_hunks: Option<Vec<usize>> = None;
-        if needs_approval {
-            match self.config.load().tools.policy {
-                ToolPolicy::Auto => {}
-                ToolPolicy::ReadOnly => {
-                    denial =
-                        Some("tool policy is read-only; mutating tools are disabled".to_string())
-                }
-                ToolPolicy::Ask if permission == PermissionLevel::Full => {}
-                ToolPolicy::Ask if auto_approve => {}
-                ToolPolicy::Ask => {
-                    // `write_file` returned above; only blocking tools land here.
-                    let reply = self
-                        .wait_for_approval(session_id, turn_id, call, tool, &args, cancel)
-                        .await?;
-                    selected_hunks = reply.hunks;
-                    plan = reply.plan;
-                    if reply.decision == ApprovalDecision::Always {
-                        self.remember_always(session_id, tool, &args).await;
-                    }
-                    if reply.decision == ApprovalDecision::Deny {
-                        denial = Some(reply.reason.unwrap_or_else(|| "denied by user".to_string()));
-                    } else if let Some(plan) = &plan {
-                        // The user reviewed a diff; do not overwrite a file that
-                        // changed in the meantime.
-                        if let Err(err) = plan.verify_unchanged().await {
-                            denial = Some(format!("{err:#}"));
-                        }
-                    }
+        if decision.action == PermissionAction::Ask {
+            let reply = self
+                .wait_for_approval(session_id, turn_id, call, &args, &decision, cancel)
+                .await?;
+            selected_hunks = reply.hunks;
+            plan = reply.plan;
+            if reply.decision == ApprovalDecision::Always {
+                self.remember_always(session_id, tool, &args, reply.scope)
+                    .await;
+            }
+            if reply.decision == ApprovalDecision::Deny {
+                denial = Some(reply.reason.unwrap_or_else(|| "denied by user".to_string()));
+            } else if let Some(plan) = &plan {
+                // The user reviewed a diff; do not overwrite a file that
+                // changed in the meantime.
+                if let Err(err) = plan.verify_unchanged().await {
+                    denial = Some(format!("{err:#}"));
                 }
             }
         }
@@ -3267,7 +3313,7 @@ impl Daemon {
         let snapshot_warning = if denied {
             None
         } else {
-            self.capture_snapshot(session_id, tool, call, &args, plan.as_ref())
+            self.capture_snapshot(session_id, tool, call, &args, &decision.risk, plan.as_ref())
                 .await?
         };
         let (ok, mut output, duration_ms) = match denial {
@@ -3326,16 +3372,8 @@ impl Daemon {
             output.push_str(&self.lsp_notes(&config, &session.cwd, &paths).await);
         }
         if ok && matches!(tool, "write_file" | "edit") {
-            // Direct writes bypass the review step: `auto`, `full`, or a
-            // matching `[[tools.auto_approve]]` rule.
-            let reason = if auto_approve {
-                "auto-approval rule"
-            } else if permission == PermissionLevel::Full {
-                "session permission full"
-            } else {
-                "tool policy auto"
-            };
-            self.record_auto_patch(session_id, call, &args, reason)?;
+            let reason = decision.reason.clone();
+            self.record_auto_patch(session_id, call, &args, &reason)?;
         }
 
         self.record_tool_result(session_id, call, ok, denied, &output, duration_ms)?;
@@ -3588,10 +3626,10 @@ impl Daemon {
     fn standard_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
         let read_only = self.session_permission(session) == PermissionLevel::ReadOnly;
         let sub_agent = session.origin == SessionOrigin::Agent;
-        let mut definitions = if read_only {
+        let mut definitions = if read_only || sub_agent {
             tools::definitions()
                 .into_iter()
-                .filter(|tool| !tools::requires_approval(&tool.function.name))
+                .filter(|tool| !tools::hard_mutating(&tool.function.name))
                 .collect::<Vec<_>>()
         } else {
             tools::definitions()
@@ -4058,8 +4096,8 @@ impl Daemon {
         self.notify_attention(session, SessionStatus::AwaitingApproval);
     }
 
-    /// Record a write that was committed to disk without review (`auto`
-    /// policy, `full` permission, or an `auto_approve` rule).
+    /// Record a write that was committed to disk without a review prompt
+    /// (`approval = "auto"` or an explicit `allow` rule).
     fn record_auto_patch(
         &self,
         session_id: &str,
@@ -4205,6 +4243,7 @@ impl Daemon {
         decision: ApprovalDecision,
         hunks: Option<Vec<usize>>,
         reason: Option<String>,
+        scope: ApprovalScope,
     ) -> Result<PatchResult> {
         let patch = if patch_id.is_empty() {
             self.staging.oldest(session_id)
@@ -4233,6 +4272,7 @@ impl Daemon {
                 session_id,
                 &patch.tool,
                 &json!({"path": patch.label.clone()}),
+                scope,
             )
             .await;
         }
@@ -4520,57 +4560,153 @@ impl Daemon {
         }
     }
 
-    /// Ordered config rules, plus this session's "Always allow" rules. A deny
-    /// in the config always wins so a session cannot widen a hard guardrail.
-    async fn permission_action(
+    fn sandbox_status(&self, decision: &PermissionDecision) -> &'static str {
+        if decision.action == PermissionAction::Sandbox {
+            return "sandbox";
+        }
+        match self.config.load().tools.sandbox {
+            eix_core::SandboxMode::Off => "off",
+            eix_core::SandboxMode::Auto | eix_core::SandboxMode::Required
+                if !eix_core::sandbox::bwrap_available() =>
+            {
+                "unavailable"
+            }
+            eix_core::SandboxMode::Auto => "auto",
+            eix_core::SandboxMode::Required => "required",
+        }
+    }
+
+    fn record_permission(
+        &self,
+        session_id: &str,
+        call_id: &str,
+        tool: &str,
+        decision: &PermissionDecision,
+    ) -> Result<()> {
+        let sandbox = self.sandbox_status(decision);
+        let event = self.store.append_event(
+            session_id,
+            EventKind::PermissionEvaluated,
+            payload(&eix_core::PermissionEvaluatedPayload {
+                call_id: call_id.to_string(),
+                tool: tool.to_string(),
+                action: decision.action.as_str().to_string(),
+                risk: decision.risk.level.as_str().to_string(),
+                risk_categories: decision
+                    .risk
+                    .categories
+                    .iter()
+                    .map(|category| category.as_str().to_string())
+                    .collect(),
+                reasons: decision.risk.reasons.clone(),
+                rule: decision.rule_id().map(str::to_string),
+                rule_source: decision.rule_source().as_str().to_string(),
+                sandbox: sandbox.to_string(),
+                parsed_command: decision.risk.parsed_command(),
+            }),
+        )?;
+        self.emit_event(&event);
+        Ok(())
+    }
+
+    /// Turn an approved "Always" into a narrow rule. Session scope is kept in
+    /// memory; user scope also persists it, while project scope cannot widen
+    /// permissions and therefore stays session-local.
+    async fn remember_always(
         &self,
         session_id: &str,
         tool: &str,
         args: &Value,
-    ) -> PermissionAction {
-        let configured = self.config.load().tools.permission_for(tool, args);
-        if configured == PermissionAction::Deny {
-            return configured;
+        scope: ApprovalScope,
+    ) {
+        if scope == ApprovalScope::Once {
+            return;
         }
-        let allowed = self
-            .always
-            .lock()
-            .await
-            .get(session_id)
-            .is_some_and(|rules| rules.iter().any(|rule| rule.matches(tool, args)));
-        if allowed {
-            PermissionAction::Allow
-        } else {
-            configured
+        let rule = build_always_rule(tool, args, RuleSource::Session);
+        // The current session always gets the narrow in-memory rule so the
+        // next call is not delayed by a config reload. User scope additionally
+        // persists it; project scope cannot grant `allow` (project config may
+        // only tighten), so it stays session-local.
+        if scope == ApprovalScope::User {
+            let cwd = match self.require_session(session_id) {
+                Ok(session) => session.cwd,
+                Err(_) => {
+                    self.always
+                        .lock()
+                        .await
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .push(rule);
+                    return;
+                }
+            };
+            if let Err(err) = self.append_rule(scope, &rule, &cwd) {
+                eprintln!(
+                    "eixd: could not persist permission rule: {}",
+                    redact(&format!("{err:#}"))
+                );
+            }
+        } else if scope == ApprovalScope::Project {
+            eprintln!("eixd: project scope cannot grant allow; keeping rule for this session");
         }
-    }
-
-    /// Turn an approved "Always" into a narrow session rule: a path for file
-    /// tools, an exact command for shells, otherwise the exact arguments.
-    async fn remember_always(&self, session_id: &str, tool: &str, args: &Value) {
-        let path = args
-            .get("path")
-            .and_then(Value::as_str)
-            .filter(|path| Path::new(path).is_relative())
-            .map(str::to_string);
-        let command = args.get("command").and_then(Value::as_str);
-        let signature = match (&path, command) {
-            (None, None) => serde_json::to_string(args).ok(),
-            _ => None,
-        };
-        let rule = eix_core::AutoApproveRule {
-            tool: tool.to_string(),
-            path,
-            command_regex: command.map(|command| format!("^{}$", regex::escape(command))),
-            signature,
-            ..Default::default()
-        };
         self.always
             .lock()
             .await
             .entry(session_id.to_string())
             .or_default()
             .push(rule);
+    }
+
+    fn append_rule(&self, scope: ApprovalScope, rule: &PermissionRule, cwd: &Path) -> Result<()> {
+        let path = match scope {
+            ApprovalScope::User => eix_core::config::default_config_path(),
+            ApprovalScope::Once | ApprovalScope::Session | ApprovalScope::Project => {
+                let _ = cwd;
+                return Ok(());
+            }
+        };
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let mut text = String::new();
+        if path.exists() {
+            text = fs::read_to_string(&path)
+                .with_context(|| format!("cannot read {}", path.display()))?;
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+        }
+        text.push_str("\n[[tools.rules]]\n");
+        text.push_str(&format!("id = {}\n", toml_string(&rule.id)));
+        text.push_str(&format!("tool = {}\n", toml_string(&rule.tool)));
+        if let Some(path) = rule.path.as_deref() {
+            text.push_str(&format!("path = {}\n", toml_string(path)));
+        }
+        if let Some(command) = rule.command.as_ref() {
+            text.push_str("command = [");
+            text.push_str(
+                &command
+                    .iter()
+                    .map(|token| toml_string(token))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            );
+            text.push_str("]\n");
+        }
+        if let Some(signature) = rule.signature.as_deref() {
+            text.push_str(&format!("signature = {}\n", toml_string(signature)));
+        }
+        text.push_str(&format!("action = {}\n", toml_string(rule.action.as_str())));
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        use std::io::Write as _;
+        let mut file = options
+            .open(&path)
+            .with_context(|| format!("cannot open {}", path.display()))?;
+        file.write_all(text.as_bytes())
+            .with_context(|| format!("cannot append {}", path.display()))?;
+        Ok(())
     }
 
     /// Run an MCP tool and cap its output like any other tool result.
@@ -4679,12 +4815,11 @@ impl Daemon {
         tool: &str,
         call: &ToolCall,
         args: &Value,
+        risk: &eix_core::RiskAssessment,
         plan: Option<&tools::WritePlan>,
     ) -> Result<Option<String>> {
         let is_mcp = tool.starts_with(crate::mcp::PREFIX);
-        if !(tools::requires_approval_for(tool, args) || is_mcp)
-            || !self.config.load().tools.snapshots
-        {
+        if !(risk.mutates_workspace() || is_mcp) || !self.config.load().tools.snapshots {
             return Ok(None);
         }
         let cwd = self.require_session(session_id)?.cwd;
@@ -4966,16 +5101,18 @@ impl Daemon {
         session_id: &str,
         turn_id: &str,
         call: &ToolCall,
-        tool: &str,
         args: &Value,
+        decision: &PermissionDecision,
         cancel: &AtomicBool,
     ) -> Result<ApprovalReply> {
+        let tool = call.function.name.as_str();
         if cancel.load(Ordering::SeqCst) {
             return Ok(ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("turn cancelled".to_string()),
                 plan: None,
                 hunks: None,
+                scope: ApprovalScope::Once,
             });
         }
 
@@ -5001,6 +5138,8 @@ impl Daemon {
             .map(|plan| plan.hunk_infos())
             .unwrap_or_default();
         let (responder, receiver) = oneshot::channel();
+        let allow_always =
+            decision.risk.level <= eix_core::RiskLevel::Medium && !decision.force_ask;
         self.approvals.lock().await.insert(
             session_id.to_string(),
             PendingApproval {
@@ -5008,10 +5147,27 @@ impl Daemon {
                 tool: tool.to_string(),
                 summary: summary.clone(),
                 created_ms: now_ms(),
+                allow_always,
                 responder,
             },
         );
 
+        let risk_categories: Vec<String> = decision
+            .risk
+            .categories
+            .iter()
+            .map(|category| category.as_str().to_string())
+            .collect();
+        let scopes = if allow_always {
+            vec![
+                "once".to_string(),
+                "session".to_string(),
+                "user".to_string(),
+            ]
+        } else {
+            vec!["once".to_string()]
+        };
+        let sandbox = self.sandbox_status(decision);
         let event = self.store.append_event(
             session_id,
             EventKind::ApprovalRequired,
@@ -5023,6 +5179,14 @@ impl Daemon {
                 arguments: args.clone(),
                 diff: diff.clone(),
                 hunks: hunks.clone(),
+                risk: decision.risk.level.as_str().to_string(),
+                risk_categories: risk_categories.clone(),
+                reasons: decision.risk.reasons.clone(),
+                rule: decision.rule_id().map(str::to_string),
+                rule_source: decision.rule_source().as_str().to_string(),
+                sandbox: sandbox.to_string(),
+                parsed_command: decision.risk.parsed_command(),
+                scopes,
             }),
         )?;
         self.emit_event(&event);
@@ -5038,6 +5202,14 @@ impl Daemon {
                 "arguments": args,
                 "diff": diff,
                 "hunks": hunks,
+                "risk": decision.risk.level.as_str(),
+                "risk_categories": risk_categories,
+                "reasons": decision.risk.reasons,
+                "rule": decision.rule_id(),
+                "rule_source": decision.rule_source().as_str(),
+                "sandbox": sandbox,
+                "parsed_command": decision.risk.parsed_command(),
+                "allow_always": allow_always,
             }),
         );
         self.transition(session_id, SessionStatus::AwaitingApproval)?;
@@ -5048,12 +5220,14 @@ impl Daemon {
                 reason: Some("approval channel closed".to_string()),
                 plan: None,
                 hunks: None,
+                scope: ApprovalScope::Once,
             }),
             _ = wait_for_cancel(cancel) => ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("turn cancelled".to_string()),
                 plan: None,
                 hunks: None,
+                scope: ApprovalScope::Once,
             },
         };
         reply.plan = plan;
@@ -5146,6 +5320,32 @@ fn retry_delay(
     }
     let factor = 1u32 << attempt.saturating_sub(1).min(20);
     base.saturating_mul(factor).min(max)
+}
+
+/// Class-aware backoff. `Retry-After` wins when present; otherwise rate
+/// limits use a one-second floor and transient failures get jitter so a fleet
+/// of agents does not retry in lockstep.
+fn retry_delay_for_class(
+    base: Duration,
+    max: Duration,
+    attempt: u32,
+    retry_after: Option<Duration>,
+    class: RetryClass,
+) -> Duration {
+    if retry_after.is_some() {
+        return retry_delay(base, max, attempt, retry_after);
+    }
+    let base = base.max(class.backoff_floor());
+    jitter(retry_delay(base, max, attempt, None)).min(max)
+}
+
+/// Add up to 25% jitter. UUID v4 is already part of the daemon and gives us a
+/// cheap source of entropy without another dependency.
+fn jitter(delay: Duration) -> Duration {
+    let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    let span = (millis / 4).max(1);
+    let offset = (uuid::Uuid::new_v4().as_u128() as u64) % span;
+    delay.saturating_add(Duration::from_millis(offset))
 }
 
 /// Blend a new provider observation into the current estimate scale. The
@@ -5592,6 +5792,47 @@ fn written_paths(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Vec<P
         .unwrap_or_default()
 }
 
+fn build_always_rule(tool: &str, args: &Value, source: RuleSource) -> PermissionRule {
+    let path = args
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .map(str::to_string);
+    let command = args.get("command").and_then(Value::as_str);
+    let (command, signature) = match command {
+        Some(command) => {
+            let analysis = eix_core::risk::analyze_command(command);
+            if analysis.dynamic || analysis.segments.len() != 1 {
+                (None, serde_json::to_string(args).ok())
+            } else {
+                (Some(analysis.segments[0].argv.clone()), None)
+            }
+        }
+        None => (
+            None,
+            if path.is_none() {
+                serde_json::to_string(args).ok()
+            } else {
+                None
+            },
+        ),
+    };
+    PermissionRule {
+        id: format!("always-{tool}-{}", now_ms()),
+        tool: tool.to_string(),
+        path,
+        command,
+        signature,
+        action: PermissionAction::Allow,
+        source,
+        ..PermissionRule::default()
+    }
+}
+
+fn toml_string(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_default()
+}
+
 fn auto_name(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
     let mut name: String = first.chars().take(48).collect();
@@ -5747,6 +5988,51 @@ mod tests {
         );
         assert_eq!(
             retry_delay(base, max, 1, Some(Duration::from_secs(60))),
+            max
+        );
+    }
+
+    #[test]
+    fn retry_delay_applies_class_specific_backoff() {
+        let base = Duration::from_millis(100);
+        let max = Duration::from_secs(60);
+
+        // Transient failures start at the configured base with up to 25%
+        // jitter.
+        let transient = retry_delay_for_class(base, max, 1, None, RetryClass::Transient);
+        assert!(transient >= base, "{transient:?}");
+        assert!(transient <= Duration::from_millis(125), "{transient:?}");
+
+        // Rate limits without Retry-After use a 500ms floor.
+        let rate_limited = retry_delay_for_class(base, max, 1, None, RetryClass::RateLimited);
+        assert!(
+            rate_limited >= Duration::from_millis(500),
+            "{rate_limited:?}"
+        );
+        assert!(
+            rate_limited <= Duration::from_millis(625),
+            "{rate_limited:?}"
+        );
+
+        // Retry-After is authoritative and capped by retry_max_secs.
+        assert_eq!(
+            retry_delay_for_class(
+                base,
+                max,
+                1,
+                Some(Duration::from_secs(7)),
+                RetryClass::RateLimited,
+            ),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            retry_delay_for_class(
+                base,
+                max,
+                1,
+                Some(Duration::from_secs(90)),
+                RetryClass::RateLimited,
+            ),
             max
         );
     }

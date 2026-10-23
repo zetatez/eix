@@ -37,6 +37,8 @@ pub enum EventKind {
     ContextCleared,
     /// A session's permission level changed (including temporary escalation).
     Permission,
+    /// Audit record for a tool permission decision.
+    PermissionEvaluated,
     Error,
 }
 
@@ -63,6 +65,7 @@ impl EventKind {
             Self::ContextDropped => "context_dropped",
             Self::ContextCleared => "context_cleared",
             Self::Permission => "permission",
+            Self::PermissionEvaluated => "permission_evaluated",
             Self::Error => "error",
         }
     }
@@ -98,6 +101,7 @@ impl std::str::FromStr for EventKind {
             "context_dropped" => Self::ContextDropped,
             "context_cleared" => Self::ContextCleared,
             "permission" => Self::Permission,
+            "permission_evaluated" => Self::PermissionEvaluated,
             "error" => Self::Error,
             _ => return Err(()),
         })
@@ -282,6 +286,47 @@ pub struct ApprovalRequiredPayload {
     /// Per-hunk preview for file-writing tools, used for hunk-level approval.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub hunks: Vec<HunkInfo>,
+    /// `low`, `medium`, `high` or `critical`.
+    #[serde(default)]
+    pub risk: String,
+    /// Machine tags such as `exec-sandboxed`, `network`, `write-local`.
+    #[serde(default)]
+    pub risk_categories: Vec<String>,
+    /// Why the risk analyser / rule produced this decision.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// Matching rule id, when an explicit rule caused the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// `builtin`, `user`, `project` or `session`.
+    #[serde(default)]
+    pub rule_source: String,
+    /// `sandbox`, `direct` or `unavailable`.
+    #[serde(default)]
+    pub sandbox: String,
+    /// Shell segments as parsed by the risk analyser (wrappers preserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parsed_command: Option<String>,
+    /// Scopes the UI may offer for an "Always" choice.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// Audit record for one permission decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionEvaluatedPayload {
+    pub call_id: String,
+    pub tool: String,
+    pub action: String,
+    pub risk: String,
+    pub risk_categories: Vec<String>,
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    pub rule_source: String,
+    pub sandbox: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parsed_command: Option<String>,
 }
 
 /// Metadata for a pre-execution snapshot. The bytes live in
@@ -414,6 +459,9 @@ mod tests {
             EventKind::ContextCompacted,
             EventKind::ContextPinned,
             EventKind::ContextDropped,
+            EventKind::ContextCleared,
+            EventKind::Permission,
+            EventKind::PermissionEvaluated,
             EventKind::Error,
         ];
         for kind in all {

@@ -53,9 +53,9 @@ base_url = "https://api.openai.com/v1"
 model = "gpt-4o-mini"
 api_key_env = "OPENAI_API_KEY"
 timeout_secs = 300
-retry_attempts = 5            # 首次失败后的自动重试次数；0 关闭
-retry_base_ms = 500           # 指数退避起点
-retry_max_secs = 30           # 单次等待上限（也限制 Retry-After）
+retry_attempts = 8            # 首次失败后的自动重试次数；0 关闭
+retry_base_ms = 250           # 抖动指数退避起点
+retry_max_secs = 60           # 单次等待上限（也限制 Retry-After）
 # system_prompt = "..."
 
 [notifications]
@@ -193,9 +193,10 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `
 `context.updated`、`context.compacted`、`session.attention`、`turn.completed` 等。
 `eix-core/src/protocol.rs` 是唯一契约来源。
 
-当前限制：`write_file` 在 `ask` 策略下先 stage 到 shadow workspace、不阻塞 turn，读取
-（以及后续写入）看到的是“真实工作区 + staged”合并视图；`run_command` 的写操作仍在审批处
-阻塞（shell 无法 stage），白名单内的只读命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
+当前限制：低/中风险的 `write_file` / `edit` 在 `ask` 策略下先 stage 到 shadow workspace、
+不阻塞 turn，读取（以及后续写入）看到的是“真实工作区 + staged”合并视图；高风险/forced
+ask 写入、以及 `run_command` 的写操作仍在审批处阻塞（shell 无法 stage），风险分析判定为
+只读的命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮、`a` 跳转提示，
 并在底部状态栏中间显示提醒（不弹桌面通知）；外部通知命令（dwm/tmux）已接入
 （见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：顶部左侧显示
@@ -320,7 +321,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `/image <path>` | 把图片挂到下一条 prompt（png / jpg / gif / webp，最多 4 张、每张 8 MB）；不带参数时显示已挂图片，`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI |
 
 在 prompt 里以 `!` 开头（例如 `!cargo test`）会直接在当前 session 的 cwd 里执行 shell：走同样的沙箱；
-写命令先抓 tree snapshot，只读 session 只允许白名单内的只读命令。命令和输出以 tool 卡片的形式留在转录里。
+写命令先抓 tree snapshot，只读 session 只允许风险分析判为只读的命令。命令和输出以 tool 卡片的形式留在转录里。
 | `/timeline [n]` | 只读浮层：最近 n 条 user / assistant / tool 事件（`j/k` 滚动，`Esc` 关闭） |
 | `/archive` | 归档当前 session（从 picker/列表隐藏，事件保留） |
 | `/delete` | 删除当前 session；需要连续执行两次确认 |
@@ -491,7 +492,8 @@ insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`
 空闲时回到转录区。
 输入框最少 6 行内容（加边框；终端过矮时优先让给转录区），长草稿最多向上生长到 12 行，
 再在框内滚动；normal 模式不会让输入框折叠。
-`write_file` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现选项卡片
+低/中风险的 `write_file` / `edit` 在 `ask` 策略下先 stage（不阻塞 turn），pane 底部出现
+选项卡片；高风险/forced ask 写入直接弹出审批卡片，不进入 stage。卡片选项为
 （`Apply change` / `Review hunks` / `Open file` / `Edit staged content` / `Reject` /
 `Reject with reason…`，第一个是推荐项）并显示 side-by-side diff（宽 pane 左旧右新、语法高亮，
 窄 pane 回退 unified；最多 8 行，超出标 `… diff truncated`）。卡片本身是交互式 picker：
@@ -503,8 +505,8 @@ insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`
 未勾选任何 hunk 时 `y` 会提示先选择。`e` 把 staged 内容写进临时文件交给
 `$EDITOR`，保存后通过 `patch.revise` 更新 diff 再审批；`o` 打开工作区里的真实文件；
 `r` 输入拒绝理由，随 `approval.respond` 一起发给模型；卡片标题会标出
-`[shell]` / `[workspace-write]` / `[agent]` / `[read]` 风险级别。写操作的 `run_command`
-仍走阻塞式审批卡片，白名单内的只读命令不会打断 turn。session 栏显示 `⚠`；也可以从命令行用
+`[LOW]` / `[MEDIUM]` / `[HIGH]` / `[CRITICAL]` 及命中的规则和沙箱状态。只读命令不会打断
+turn；写入、网络和未知命令按风险弹审批，`HIGH`/`CRITICAL` 不提供 `Always`。session 栏显示 `⚠`；也可以从命令行用
 `eix approve` / `eix deny` 处理（`eix approve --hunks 0,2` 只应用选中的 hunk，
 `eix deny --reason "..."` 会记录理由）。模型调用 `ask_user` 时 pane 底部出现同样的选项
 卡片：选项同样按 Markdown checkbox 渲染，`Ctrl-J`/`Ctrl-K`（或 `j/k`）移动、`Enter` 确认、
@@ -514,9 +516,11 @@ pending 审批/补丁或进入 `error` 时会标 `!`、边框和侧栏变黄/红
 按 `<Space>A` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的卡片，输入框
 里的未发送文字也会通过 daemon 草稿恢复。
 
-每个 session 有独立的权限级别：`workspace-write`（默认，受全局 `[tools] policy` 的
-approval 约束）、`read-only`（不向模型暴露写工具，运行时也拒绝写）和 `full`（跳过审批，
-路径仍限制在 workspace）。创建时用 `eix new --permission read-only`，运行时用
+每个 session 有独立的权限上限：`workspace-write`（默认，由 `[tools] approval` 和规则决定
+是否询问）、`read-only`（隐藏 `write_file` / `edit` / `patch` / `start_command`，运行时拒绝
+所有写入和危险执行；保留 `run_command` 以便 `git status` 等只读检查）和 `full`（解除能力上限，
+但仍然执行 `deny`、硬安全拦截和审批规则；只有 `approval = "auto"` 才会自动放行默认 ask）。
+创建时用 `eix new --permission read-only`，运行时用
 `eix permission LEVEL [--session ID]` 切换；加 `--temporary` 只改内存并在事件日志留下
 `permission` 记录，daemon 重启后回到持久值。TUI pane 标题和 `eix ls` 会显示非默认级别，
 nvim 里可用 `:Eix permission [LEVEL]`。
@@ -584,34 +588,37 @@ daemon 目前向模型暴露这些工具：
 | `todo` | 整表替换当前 session 的任务列表（pending / in_progress / completed / cancelled） | 自动放行 |
 | `memory` | 读写当前 workspace 的跨 session 记忆（`add` / `replace` / `clear`） | 自动放行（只改 daemon 数据目录） |
 | `lsp_diagnostics` | 查询某个文件的语言服务器 diagnostics（未配置对应扩展时返回 no-op） | 自动放行 |
-| `webfetch` | 抓取 http(s) URL 并转成纯文本（HTML 去标签，约 100 KB 上限） | 自动放行 |
-| `websearch` | DuckDuckGo HTML 搜索，返回标题和链接（无需 API key） | 自动放行 |
+| `webfetch` | 抓取 http(s) URL 并转成纯文本（HTML 去标签，约 100 KB 上限） | 默认询问；`network_allow` 命中时放行 |
+| `websearch` | DuckDuckGo HTML 搜索，返回标题和链接（无需 API key） | 默认询问 |
 | `write_file` | stage 到 shadow workspace，审批后写入 cwd 内文件（自动建父目录） | stage + 审批落盘 |
 | `edit` | 精确字符串替换（默认要求唯一匹配，`replaceAll` 可全部替换），同样走 stage | stage + 审批落盘 |
 | `patch` | 多文件 `*** Begin Patch` / Add / Update / Delete，先全量校验再写入 | 需要审批 |
-| `run_command` | 在 cwd 内用 `sh -c` 执行命令，带超时；默认套 bubblewrap 沙箱 | 只读命令自动放行，其余需要审批 |
-| `start_command` | 在沙箱里启动后台进程并立即返回 id，日志落盘 | 需要审批 |
+| `run_command` | 在 cwd 内用 `sh -c` 执行命令，带超时；命令可分析时默认沙箱 | 只读命令放行；构建在沙箱内放行；未知/破坏性命令询问或拒绝 |
+| `start_command` | 在沙箱里启动后台进程并立即返回 id，日志落盘 | 按风险分析；无法沙箱时询问 |
 | `process_output` | 读取后台进程的尾部输出（只读） | 自动放行 |
 | `spawn_agent` | 起一个只读子 agent 并发处理独立问题，可用 `agent` 指定自定义 agent | 自动放行（子 agent 只读） |
 | `ask_user` | 让用户从 2-6 个选项中选择 | 交互，不修改文件 |
-| `mcp__*` | MCP server 暴露的工具 | 需要审批 |
+| `mcp__*` | MCP server 暴露的工具 | 默认询问；读取型 resource/prompt 放行 |
 
 所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出先按
 `max_output_bytes` 截断，进入 provider 上下文时再按 `context.tool_output_tokens` 做 head/tail
 省略，完整输出仍保留在事件日志。同一批次全是只读工具（`read_file` / `list_dir` / `grep` /
 `glob` / `webfetch` / `websearch`）时并发执行，结果按调用顺序回填。
 
-`run_command` 的只读判定是保守白名单：`grep` / `rg` / `fd` / `find` / `cat` / `head` /
-`tail` / `wc` / `ls` / `stat` / `diff` 等只读命令，以及由它们组成的 `|`、`&&`、`;` 管道，
-不会弹出审批卡片，也不触发执行前快照。重定向、后台运行、命令替换、子 shell、`find -exec` /
-`-delete`、`rg --pre`、`fd -x` 等可能执行任意命令或写文件的形式仍然需要审批；不在白名单里的
-命令（包括 `git`、`sed`、`awk`、构建工具和脚本解释器）也保持审批。
+`run_command` 使用统一风险分析：shell tokenizer 会拆出每个命令段、重定向、`sudo`/`env`
+等包装器、嵌套 `sh -c` 和命令替换。`git status`、`cat`、`grep`、`ls` 等只读命令直接放行；
+`cargo test` / `npm test` 等构建命令默认在沙箱内执行；`rm`、写入重定向、未知程序、脚本
+解释器、`find -exec`、网络命令等按风险询问。`rm -rf /`、块设备 `dd`、`mkfs`、关机、
+fork bomb、私钥读取以及把 secret 占位符送进网络/命令/MCP 调用会硬拒绝，`auto` / `full`
+和任何 `allow` 规则都不能绕过。`git push --force` 视为高风险，默认询问。
 
 隐私边界：daemon 在把消息发给 provider 之前，会把密码、`sk-…` / Stripe / GitHub / Slack
 等 token、Bearer、URL 凭据、PEM 私钥和 `password=` / `api_key:` 等赋值替换成带随机 salt 的
-占位符。模型返回的工具参数和文本中的占位符会在本地执行/写回前还原，因此模型拿不到原文，而
-`write_file` / `run_command` 仍使用真实值。占位符映射只在当前 provider 进程内保存；本地事件
-日志和 TUI 仍显示原文，方便审阅。图片内容不做文本脱敏，敏感截图不要上传。
+占位符。占位符只在本地文件工具（`read_file` / `grep` / `write_file` / `edit` / `patch` 等）
+的参数和最终文本里还原；`run_command`、`start_command`、`webfetch`、`websearch` 和 MCP
+参数不会还原，一旦出现占位符会被判定为 `secret-exfil` 并硬拒绝。URL 在审批卡片和审计事件里
+只保留 `?…` 之前的部分。占位符映射只在当前 provider 进程内保存；本地事件日志和 TUI 仍显示
+原文，方便审阅。图片内容不做文本脱敏，敏感截图不要上传。
 
 `write_file` 会先生成 unified diff 和逐 hunk 预览，TUI 审批卡片、
 `eix chat` 和 `eix log` 都会显示；在 TUI 里用 `d` 全屏审阅可以按 hunk 选择应用，命令行用
@@ -619,75 +626,81 @@ daemon 目前向模型暴露这些工具：
 
 ```toml
 [tools]
-policy = "ask"            # ask（默认）/ auto / read_only
+approval = "ask"          # ask（默认）/ auto；只影响默认 ask，不绕过规则或硬拒绝
 max_output_bytes = 20000
 command_timeout_secs = 60
-sandbox = "auto"          # auto（默认，有 bwrap 就用）/ bwrap / off
-sandbox_network = true    # false 时加 --unshare-net
-sandbox_read_home = true  # false 时 $HOME 完全隐藏
+sandbox = "auto"          # auto（默认，可用则隔离）/ required（不可用就询问）/ off
+sandbox_network = false   # false 时加 --unshare-net
+sandbox_read_paths = ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]  # 只读挂载，不再挂整个 $HOME
+sandbox_writable_roots = []  # workspace 之外额外可写目录
 snapshots = true          # false 时跳过执行前快照（大仓库可关）
 external_directory = ["/tmp/eix-shared", "~/.cache/eix/**"]  # 允许文件工具访问 workspace 之外
+network_allow = ["docs.rs", "*.github.com"]  # webfetch/websearch 的域名 allowlist
 ```
 
-有序权限规则（第一条匹配生效，`deny` 始终优先，不会被 `auto` / `full` 绕过）：
+显式规则按“具体度”选择，`deny` 全局优先，不会被 `auto` / `full` 绕过：
 
 ```toml
-[[tools.permissions]]
+[[tools.rules]]
+id = "block-rm"
 tool = "run_command"
 command_regex = "^rm "
 action = "deny"
 
-[[tools.permissions]]
+[[tools.rules]]
+id = "cargo-sandbox"
 tool = "run_command"
-command_prefix = "cargo "
-action = "allow"
+command = ["cargo", "test"]  # argv token 前缀，不是整条 shell 字符串
+action = "sandbox"
 
-[[tools.permissions]]
+[[tools.rules]]
+id = "review-src"
 tool = "write_file"
 path = "src/**"
-action = "ask"             # 落到普通审批卡片
+action = "ask"
+
+[[tools.rules]]
+id = "docs-allow"
+tool = "webfetch"
+path = "https://docs.rs/**"
+action = "allow"
 ```
 
-兼容写法：`[[tools.auto_approve]]` 等价于追加的 `allow` 规则（只放宽 `ask`）。
+- 规则字段是 AND 关系；`tool = "*"` 可匹配任意工具。`path` 对文件工具是 workspace 相对
+  glob，对 `webfetch` 是 URL；`command` 是 argv token 前缀。`deny` 只要**任一** shell
+  段命中就拒绝（`echo hi && rm -rf build` 会命中 `command = ["rm"]`）；`allow` / `ask` /
+  `sandbox` 要求**每个** shell 段都满足，所以 `cargo test && rm -rf /` 不会命中
+  `command = ["cargo", "test"]`。带重定向的 shell 命令不会命中非 deny 的 `command` 前缀规则，
+  避免 `echo hi` 的 allow 覆盖 `echo hi > /etc/passwd`。`signature` 匹配规范化后的完整参数。
+  `command_regex` 用于复杂表达式，但更适合 `deny` 而不是 `allow`。
+- `allow` 只放行风险分析本来会 ask 的调用；硬拒绝和命令中的危险段仍然优先。`sandbox` 表示
+  必须在沙箱内执行，bwrap 不可用时转为 `ask` 且 `auto` 不会绕过。`action = "deny"` 最先
+  扫描所有来源，哪怕更具体的规则是 `allow`。
+- 规则来源优先级为 `session > user > project > builtin`；具体度相同时越靠近当前 session 的
+  来源胜出。项目 `.eix/config.toml` 只能收紧：`approval = "auto"`、`sandbox = "off"`、
+  `sandbox_network = true`、`external_directory`、`network_allow`、额外 sandbox 路径会被忽略，
+  `allow` 规则会降级为 `ask`，并写入 `security_warnings`（`eix doctor` 可见）。
+- 审批卡片上的 `a`（`Always allow`）只在中低风险出现：session scope 只存在内存，user scope
+  追加到用户配置；文件工具按路径、shell 按单段 argv 前缀、其它工具按精确参数收窄。`HIGH` /
+  `CRITICAL` 不提供 Always，服务端也会拒绝把它升级成持久规则。
+- 每次工具决策都会写入 `permission_evaluated` 审计事件（action、风险等级、分类、命中规则
+  及来源、沙箱状态）；自动批准的写入仍会快照，`patch_applied` message 会带命中的规则 id。
+- `webfetch` / `websearch` 属于 network 风险：默认询问，命中 `network_allow` 才放行；URL
+  query 在展示和日志中脱敏。网络工具不会收到还原后的 secret。
 
-```toml
-[[tools.auto_approve]]
-tool = "run_command"
-command_prefix = "cargo test"
+`run_command` 在沙箱模式下用 bubblewrap 隔离：系统目录只读，`/tmp` 是私有 tmpfs，
+session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只读挂载，整个 `$HOME`
+不再默认暴露。网络默认关闭；`sandbox_writable_roots` 可额外开放工作区外目录。
+`bwrap` 未安装时 `sandbox = "auto"` 会把需要沙箱的命令降级为强制审批，`required` 直接
+阻断，`off` 完全关闭沙箱。`eix doctor` 会显示 approval、规则数量、网络和 bwrap 状态。
 
-[[tools.auto_approve]]
-tool = "run_command"
-command_regex = "^cargo (check|clippy)\\b"
-
-[[tools.auto_approve]]
-tool = "write_file"
-path = "tests/**"         # workspace 相对路径；* 不跨目录，** 跨目录
-```
-
-- 规则里的字段是 AND 关系；只写 `tool` 表示该工具的所有调用都放行，`tool = "*"` 匹配
-  任何需要审批的工具。`path` 先做词法归一化，绝对路径或 `..` 逃出 workspace 的路径
-  不会匹配（`tests/../src/main.rs` 不会命中 `tests/**`）——除非命中
-  `external_directory`。
-- `command_prefix` 是整条 `sh -c` 字符串的前缀，`cargo test && rm ...` 也会命中；需要
-  更严格时用 `command_regex`（例如 `^cargo test( |$)`）。
-- 审批卡片上的 `a`（`Always allow`）为当前 session 追加一条窄规则：文件工具按路径、
-  shell 按精确命令、其它工具按精确参数。只在内存里生效，daemon 重启或换 session 后失效；
-  配置文件里的 `deny` 仍然优先。
-- 自动批准的调用仍会做执行前快照；`write_file` 记录为 `patch_applied`，message 是
-  `auto-approval rule`。
-
-`run_command` 在 `auto`/`bwrap` 下用 bubblewrap 隔离：宿主目录只读挂载，只有 session
-workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具链缓存、git 配置可读但
-不可写），设为 `false` 则 `$HOME` 指向沙箱内的 `/tmp`。默认保留网络。
-`bwrap` 未安装时 `auto` 退回直接执行，`bwrap` 模式会拒绝执行；`off` 完全关闭沙箱。
-`eix doctor` 会显示当前模式和 bwrap 是否可用。
-
-`auto` 会跳过审批直接执行写操作（危险，显式选择才生效）；`read_only` 直接拒绝写工具
-并把原因回传给模型。一次 turn 最多 64 轮工具往返。
+`approval = "auto"` 只自动放行风险分析给出的默认 `ask`，不会绕过硬拒绝、`deny` 规则、
+只读上限或“必须沙箱”的失败路径。一次 turn 最多 64 轮工具往返。
 
 ### Shadow workspace（staged 写入）
 
-`ask` 策略下，`write_file` 不再阻塞 turn，而是先把提案 stage 起来：
+`ask` 策略下，低/中风险的 `write_file` / `edit` 不再阻塞 turn，而是先把提案 stage
+起来；高风险、critical 或显式 `ask` 规则的写入仍会弹出带完整风险信息的审批卡片：
 
 1. **propose**：`write_file` 读取基准内容（磁盘或更新的 staged 内容）、生成 diff/hunk，
    返回 `staged <path> as patch <id>; the file is not written yet`，并发出
@@ -731,14 +744,19 @@ workspace 可写，`/tmp` 是私有 tmpfs；`$HOME` 默认只读挂载（工具�
 
 | 类型 | 例子 | 行为 |
 | --- | --- | --- |
-| 瞬时故障 | 连接重置/DNS/超时、HTTP 408/409/425、5xx、流被截断 | 指数退避重试 |
-| 限流 | HTTP 429、`overloaded` / `try again` | 重试；有 `Retry-After` 时优先按它等待 |
-| 空响应 | 模型只返回空内容或空 reasoning | 视为瞬时故障重试 |
+| 瞬时故障 | 连接重置/DNS/超时、HTTP 408/409/425、5xx、流被截断 | 抖动指数退避重试 |
+| 限流 | HTTP 429、`overloaded` / `try again` | 有 `Retry-After` 时按它等待；否则至少 500ms 起步，再抖动指数退避 |
+| 空响应 | 模型只返回空内容或空 reasoning | 视为瞬时故障重试，并在通知里标记 `empty_response` |
+| 上下文超限 | HTTP 413、`context_length_exceeded`、`prompt is too long` | 先强制压缩上下文，再从压缩后的上下文重试 |
 | 套餐/余额 | `insufficient_quota`、402、billing/credit 类错误 | 不重试，直接报错并保留草稿 |
 | 鉴权/配置 | 400/401/403/404/422、无效 key、错误的 base URL | 不重试 |
 
-- `retry_attempts` 是首次请求之外的额外次数；等待从 `retry_base_ms` 开始按 1s → 2s → 4s
-  增长，单次不超过 `retry_max_secs`。
+- `retry_attempts` 是首次请求之外的额外次数，默认 8 次；瞬时故障从 `retry_base_ms`
+  开始按 1x → 2x → 4x 增长（默认 250ms → 500ms → 1s → 2s …），加入最多 25% 抖动，
+  单次不超过 `retry_max_secs`（默认 60s）。早期重试更密，后期等待更长，兼顾快速恢复和
+  避免持续打满上游。
+- `turn.retrying` 会带 `kind`（`transient` / `rate_limited` / `empty_response`），
+  TUI 状态栏会显示“upstream error”“rate limited”或“empty response”。
 - 重试发生在当前工具轮次内部，不会把整轮对话重新跑一遍；已经进入上下文的事件不变。
 - 如果失败前已经向 TUI 流式输出了部分文本，daemon 会先发 `message.reset` 清掉这部分，
   再发 `turn.retrying` 显示“第几次重试/等待多久”；重试成功后不会重复显示旧内容。
@@ -1005,8 +1023,8 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）与 provider 上下行可逆脱敏
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
 - [x] 按 session 权限级别（`read-only` / `workspace-write` / `full`；`session.permission` 支持临时升级并记录事件）
-- [x] 自动批准规则（`[[tools.auto_approve]]`：工具名 + 路径 glob + 命令前缀/正则；只放宽 `ask`）
-- [x] 有序权限规则 + `Allow always` + `external_directory`（`[[tools.permissions]]` 首条匹配、deny 强制优先、审批卡片 `a` 记住当前 session、workspace 外白名单）
+- [x] 显式权限规则（`[[tools.rules]]`：工具名 + 路径 glob + argv 前缀 / 正则 / signature；deny 全局优先、按具体度选择、项目配置只能收紧）
+- [x] 统一风险分析与审计（只读命令分析、硬 deny、network/secret 保护、`permission_evaluated` 事件、审批 scope / risk UX、`external_directory`）
 - [x] 自动压缩（超过 `auto_compact_threshold` 时总结旧 turn，保留最近 N 轮；`context_compacted` 事件）
 - [x] 配置分层 + 占位符 + 热重载 + `cli.json`（全局 → 祖先 `.eix/config.toml`、`{env:}` / `{file:}`、mtime 轮询 + `/reload`、项目默认 model/agent/permission）
 - [x] session 管理（undo/redo、export/import、delete、archive、timeline、队列 `rm`/`move`；CLI `eix undo/redo/export/import/delete/archive/timeline`）

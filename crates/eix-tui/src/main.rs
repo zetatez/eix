@@ -1759,9 +1759,14 @@ async fn doctor(cli: &Cli) -> Result<()> {
                 }
             );
             println!(
-                "policy   {} · {} auto-approve rule(s)",
-                config.tools.policy.as_str(),
-                config.tools.auto_approve.len()
+                "approval {} · {} rule(s) · network {}",
+                config.tools.approval.as_str(),
+                config.tools.rules.len(),
+                if config.tools.sandbox_network {
+                    "allowed"
+                } else {
+                    "blocked"
+                }
             );
             let agents = std::env::current_dir()
                 .ok()
@@ -2226,6 +2231,24 @@ fn render_events(events: &[Event]) {
                         "ctx> {} {}",
                         if payload.dropped { "drop" } else { "restore" },
                         payload.entry
+                    );
+                }
+            }
+            EventKind::PermissionEvaluated => {
+                if let Ok(payload) = serde_json::from_value::<eix_core::PermissionEvaluatedPayload>(
+                    event.payload.clone(),
+                ) {
+                    println!(
+                        "perm> {} {} · risk {} · {}{}",
+                        payload.tool,
+                        payload.action,
+                        payload.risk,
+                        payload.rule_source,
+                        payload
+                            .rule
+                            .as_deref()
+                            .map(|rule| format!(" · rule {rule}"))
+                            .unwrap_or_default()
                     );
                 }
             }

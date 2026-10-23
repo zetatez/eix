@@ -43,18 +43,17 @@ fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
-/// Arguments for `bwrap` that expose the system read-only, `workspace` (and its
-/// contents) read-write, and start in `chdir`. The workspace keeps its host path
-/// so `cwd` values and tool output stay meaningful.
+/// Arguments for `bwrap` that expose the system read-only, `workspace` (and
+/// its extra writable roots) read-write, and start in `chdir`.
 ///
-/// `home` is mounted read-only when given, so toolchain caches and `git` config
-/// stay readable without letting a command write there; when it is `None`,
-/// `$HOME` is redirected to the sandbox's scratch `/tmp`.
+/// `read_paths` are mounted read-only individually (toolchain caches by
+/// default). The whole home directory is deliberately not mounted.
 pub fn bwrap_args(
     workspace: &Path,
     chdir: &Path,
     network: bool,
-    home: Option<&Path>,
+    read_paths: &[PathBuf],
+    writable_roots: &[PathBuf],
 ) -> Vec<OsString> {
     let mut args: Vec<OsString> = [
         "--die-with-parent",
@@ -78,17 +77,27 @@ pub fn bwrap_args(
         args.push((*path).into());
         args.push((*path).into());
     }
-    if let Some(home) = home {
-        args.push("--ro-bind-try".into());
-        args.push(home.as_os_str().to_owned());
-        args.push(home.as_os_str().to_owned());
+    let home = home_dir();
+    for path in read_paths {
+        if path.exists() {
+            args.push("--ro-bind-try".into());
+            args.push(path.as_os_str().to_owned());
+            args.push(path.as_os_str().to_owned());
+        }
     }
     if !network {
         args.push("--unshare-net".into());
     }
 
-    // The workspace bind comes last so it stays writable even when it sits
-    // inside the read-only home directory.
+    // Extra writable roots are bound before the workspace. The workspace bind
+    // comes last so it stays writable even when it sits under a read-only path.
+    for path in writable_roots {
+        if path.exists() {
+            args.push("--bind".into());
+            args.push(path.as_os_str().to_owned());
+            args.push(path.as_os_str().to_owned());
+        }
+    }
     args.push("--bind".into());
     args.push(workspace.as_os_str().to_owned());
     args.push(workspace.as_os_str().to_owned());
@@ -97,7 +106,18 @@ pub fn bwrap_args(
     args.push("--setenv".into());
     args.push("TMPDIR".into());
     args.push("/tmp".into());
-    if home.is_none() {
+    // Keep the real HOME when any read cache lives below it so cargo/rustup
+    // find their caches; otherwise point HOME at the sandbox scratch dir.
+    let has_home_read_path = home.as_ref().is_some_and(|home| {
+        read_paths
+            .iter()
+            .any(|path| path == home || path.starts_with(home))
+    });
+    if let Some(home) = home.as_ref().filter(|_| has_home_read_path) {
+        args.push("--setenv".into());
+        args.push("HOME".into());
+        args.push(home.as_os_str().to_owned());
+    } else {
         args.push("--setenv".into());
         args.push("HOME".into());
         args.push("/tmp".into());
@@ -116,15 +136,22 @@ mod tests {
     }
 
     #[test]
-    fn binds_the_workspace_writable_and_the_system_read_only() {
+    fn binds_the_workspace_writable_and_caches_read_only() {
+        let workspace = Path::new("/home/me/project");
+        let cache = PathBuf::from("/tmp/eix-sandbox-cache-test");
+        let _ = std::fs::create_dir_all(&cache);
         let args = text(&bwrap_args(
-            Path::new("/home/me/project"),
-            Path::new("/home/me/project/src"),
+            workspace,
+            workspace,
             true,
-            Some(Path::new("/home/me")),
+            std::slice::from_ref(&cache),
+            &[],
         ));
-        let workspace = args.iter().filter(|arg| *arg == "/home/me/project").count();
-        assert_eq!(workspace, 2, "{args:?}");
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--bind", "/home/me/project"]),
+            "{args:?}"
+        );
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["--ro-bind-try", "/usr"]),
@@ -132,28 +159,33 @@ mod tests {
         );
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["--ro-bind-try", "/home/me"]),
+                .any(|pair| pair == ["--ro-bind-try", "/tmp/eix-sandbox-cache-test"]),
             "{args:?}"
         );
         assert!(
+            !args
+                .windows(2)
+                .any(|pair| pair == ["--ro-bind-try", "/home/me"]),
+            "the whole home directory must not be mounted: {args:?}"
+        );
+        assert!(
             args.windows(2)
-                .any(|pair| pair == ["--chdir", "/home/me/project/src"]),
+                .any(|pair| pair == ["--chdir", "/home/me/project"]),
             "{args:?}"
         );
-        // The workspace bind must follow the read-only home bind.
-        let home = args.iter().position(|arg| arg == "/home/me").unwrap();
-        let bind = args
-            .windows(2)
-            .position(|pair| pair == ["--bind", "/home/me/project"])
-            .unwrap();
-        assert!(bind > home, "{args:?}");
         assert!(!args.iter().any(|arg| arg == "--unshare-net"), "{args:?}");
         assert!(args.iter().any(|arg| arg == "--die-with-parent"));
     }
 
     #[test]
-    fn hides_home_behind_a_scratch_directory_when_disabled() {
-        let args = text(&bwrap_args(Path::new("/w"), Path::new("/w"), true, None));
+    fn hides_home_behind_a_scratch_directory_when_no_cache_is_mounted() {
+        let args = text(&bwrap_args(
+            Path::new("/w"),
+            Path::new("/w"),
+            true,
+            &[],
+            &[],
+        ));
         let ro_binds = args.iter().filter(|arg| *arg == "--ro-bind-try").count();
         assert_eq!(ro_binds, READ_ONLY_PATHS.len(), "{args:?}");
         assert!(
@@ -164,7 +196,31 @@ mod tests {
 
     #[test]
     fn can_keep_the_network_private() {
-        let args = text(&bwrap_args(Path::new("/w"), Path::new("/w"), false, None));
+        let args = text(&bwrap_args(
+            Path::new("/w"),
+            Path::new("/w"),
+            false,
+            &[],
+            &[],
+        ));
         assert!(args.iter().any(|arg| arg == "--unshare-net"), "{args:?}");
+    }
+
+    #[test]
+    fn extra_writable_roots_are_bound() {
+        let _ = std::fs::create_dir_all("/tmp/eix-sandbox-test-root");
+        let root = PathBuf::from("/tmp/eix-sandbox-test-root");
+        let args = text(&bwrap_args(
+            Path::new("/w"),
+            Path::new("/w"),
+            true,
+            &[],
+            std::slice::from_ref(&root),
+        ));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--bind", "/tmp/eix-sandbox-test-root"]),
+            "{args:?}"
+        );
     }
 }

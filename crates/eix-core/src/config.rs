@@ -71,6 +71,9 @@ pub struct Config {
     /// The daemon watches their mtimes for hot reload.
     #[serde(skip)]
     pub watch_paths: Vec<PathBuf>,
+    /// Security relaxations that were refused from project layers.
+    #[serde(skip)]
+    pub security_warnings: Vec<String>,
 }
 
 /// Optional TCP listener for remote attach. Off by default: the Unix socket is
@@ -112,38 +115,36 @@ impl Default for NotificationsConfig {
     }
 }
 
-/// What the daemon does when a mutating tool is requested.
+/// The default approval behavior. Rules are explicit intent and override this
+/// mode; the mode only decides what happens to *unruled* `ask` calls.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ToolPolicy {
-    /// Ask the user for every mutating tool call (default).
+pub enum ApprovalMode {
+    /// Ask for every unruled call whose risk default is `ask` (default).
     #[default]
     Ask,
-    /// Run mutating tools without asking (dangerous; opt in explicitly).
+    /// Run unruled `ask` calls without prompting. Hard denies still win.
     Auto,
-    /// Read-only: refuse mutating tools without asking.
-    ReadOnly,
 }
 
-impl ToolPolicy {
+impl ApprovalMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Ask => "ask",
             Self::Auto => "auto",
-            Self::ReadOnly => "read-only",
         }
     }
 }
 
-/// How `run_command` is isolated from the host filesystem.
+/// How `run_command` / `start_command` are isolated from the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
-    /// Use bubblewrap when it is installed, otherwise run directly.
+    /// Use bubblewrap when it is available, otherwise run directly.
     #[default]
     Auto,
-    /// Require bubblewrap; fail the command when it is missing.
-    Bwrap,
+    /// Require bubblewrap; fail rather than run outside the sandbox.
+    Required,
     /// Run without a sandbox.
     Off,
 }
@@ -152,59 +153,117 @@ impl SandboxMode {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Auto => "auto",
-            Self::Bwrap => "bwrap",
+            Self::Required => "required",
             Self::Off => "off",
         }
     }
 }
 
-/// One `[[tools.auto_approve]]` rule. Rules only relax the `ask` policy: the
-/// global `read-only` policy and a session's `read-only` level still win, and
-/// `full` sessions never consult them.
-///
-/// All constraints that are present must match (logical AND). A rule with only
-/// `tool` matches every call of that tool, including `"*"` for any mutating
-/// tool.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AutoApproveRule {
-    /// Tool name (`write_file`, `run_command`, `start_command`, ...) or `"*"`.
-    pub tool: String,
-    /// Workspace-relative glob matched against the `path` argument. `*` stops
-    /// at `/`, `**` crosses directories, `?` matches one character.
-    pub path: Option<String>,
-    /// Prefix of the `command` argument (after leading whitespace).
-    pub command_prefix: Option<String>,
-    /// Regular expression matched against the whole `command` argument.
-    pub command_regex: Option<String>,
-    /// Exact JSON arguments signature. Used by session-scoped "Always allow"
-    /// rules for tools without a path/command.
-    pub signature: Option<String>,
+/// What a permission rule says about a matching call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PermissionAction {
+    Allow,
+    #[default]
+    Ask,
+    Deny,
+    /// Allow only when a sandbox is active; fall back to `ask` otherwise.
+    Sandbox,
 }
 
-impl AutoApproveRule {
+impl PermissionAction {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Allow => "allow",
+            Self::Ask => "ask",
+            Self::Deny => "deny",
+            Self::Sandbox => "sandbox",
+        }
+    }
+}
+
+/// Where a rule came from. `Builtin` is reserved for risk defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RuleSource {
+    Builtin,
+    #[default]
+    User,
+    Project,
+    Session,
+}
+
+impl RuleSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Builtin => "builtin",
+            Self::User => "user",
+            Self::Project => "project",
+            Self::Session => "session",
+        }
+    }
+}
+
+/// A permission rule. All present constraints must match.
+///
+/// `command` is an argv token prefix. A command with multiple shell segments
+/// (for example `cargo test && rm -rf x`) only matches when *every* segment
+/// starts with the prefix; this prevents raw-string prefix bypasses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PermissionRule {
+    /// Stable identifier used in approval payloads and audit logs.
+    pub id: String,
+    /// Tool name (`write_file`, `run_command`, `mcp__*`, ...) or `"*"`.
+    pub tool: String,
+    /// Workspace-relative glob matched against the `path` argument.
+    pub path: Option<String>,
+    /// Argv token prefix, e.g. `["git", "status"]`.
+    pub command: Option<Vec<String>>,
+    /// Escape hatch for unusual cases. Prefer `command` for shell rules.
+    pub command_regex: Option<String>,
+    /// Exact JSON arguments signature. Used by "Always" rules for tools
+    /// without a path or command.
+    pub signature: Option<String>,
+    #[serde(default)]
+    pub action: PermissionAction,
+    /// Set by the config loader; never trusted from TOML.
+    #[serde(skip)]
+    pub source: RuleSource,
+}
+
+impl PermissionRule {
     /// True when this rule covers `tool` with the given call arguments.
     pub fn matches(&self, tool: &str, args: &Value) -> bool {
         if self.tool != "*" && self.tool != tool {
             return false;
         }
         if let Some(glob) = self.path.as_deref() {
-            let Some(path) = args
-                .get("path")
-                .and_then(Value::as_str)
-                .and_then(normalize_workspace_path)
-            else {
-                return false;
-            };
-            if !glob_match(glob, &path) {
-                return false;
+            if tool == "webfetch" {
+                let Some(url) = args.get("url").and_then(Value::as_str) else {
+                    return false;
+                };
+                if !glob_match(glob, url) {
+                    return false;
+                }
+            } else {
+                let Some(path) = args
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .and_then(normalize_workspace_path)
+                else {
+                    return false;
+                };
+                if !glob_match(glob, &path) {
+                    return false;
+                }
             }
         }
-        if let Some(prefix) = self.command_prefix.as_deref() {
+        if let Some(prefix) = self.command.as_deref() {
             let Some(command) = args.get("command").and_then(Value::as_str) else {
                 return false;
             };
-            if !command.trim_start().starts_with(prefix) {
+            if !command_starts_with(command, prefix, self.action == PermissionAction::Deny) {
                 return false;
             }
         }
@@ -226,43 +285,41 @@ impl AutoApproveRule {
         }
         true
     }
+
+    /// More constraints means a more specific rule wins when several match.
+    pub fn specificity(&self) -> usize {
+        usize::from(self.tool != "*")
+            + usize::from(self.path.is_some())
+            + usize::from(self.command.is_some())
+            + usize::from(self.command_regex.is_some())
+            + usize::from(self.signature.is_some())
+    }
 }
 
-/// What an ordered `[[permissions]]` rule decides. `ask` falls through to the
-/// normal approval card; rules are evaluated top-down and the first match wins.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PermissionAction {
-    Allow,
-    #[default]
-    Ask,
-    Deny,
-}
-
-/// One ordered permission rule. Matching fields work exactly like
-/// [`AutoApproveRule`]: every constraint that is present must match.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct PermissionRule {
-    /// Tool name (`write_file`, `run_command`, `mcp__*`, ...) or `"*"`.
-    pub tool: String,
-    pub path: Option<String>,
-    pub command_prefix: Option<String>,
-    pub command_regex: Option<String>,
-    #[serde(default)]
-    pub action: PermissionAction,
-}
-
-impl PermissionRule {
-    pub fn matches(&self, tool: &str, args: &Value) -> bool {
-        AutoApproveRule {
-            tool: self.tool.clone(),
-            path: self.path.clone(),
-            command_prefix: self.command_prefix.clone(),
-            command_regex: self.command_regex.clone(),
-            signature: None,
-        }
-        .matches(tool, args)
+fn command_starts_with(command: &str, prefix: &[String], any_segment: bool) -> bool {
+    let analysis = crate::risk::analyze_command(command);
+    if analysis.segments.is_empty() {
+        return false;
+    }
+    if analysis.dynamic && !any_segment {
+        return false;
+    }
+    // A prefix rule must not silently cover output redirections: allowing
+    // `echo hi` must not allow `echo hi > /etc/passwd`.
+    if !any_segment && !analysis.redirections.is_empty() {
+        return false;
+    }
+    let matches_prefix = |segment: &crate::risk::CommandSegment| {
+        prefix.len() <= segment.argv.len()
+            && prefix
+                .iter()
+                .zip(segment.argv.iter())
+                .all(|(expected, actual)| expected == actual)
+    };
+    if any_segment {
+        analysis.segments.iter().any(matches_prefix)
+    } else {
+        analysis.segments.iter().all(matches_prefix)
     }
 }
 
@@ -341,53 +398,35 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
-    pub policy: ToolPolicy,
+    /// What to do with unruled `ask` calls.
+    pub approval: ApprovalMode,
     /// Tool output is truncated to this many bytes before it enters the log.
     pub max_output_bytes: usize,
     /// Wall-clock limit for `run_command`.
     pub command_timeout_secs: u64,
-    /// Filesystem isolation for `run_command`.
+    /// Filesystem isolation for `run_command` / `start_command`.
     pub sandbox: SandboxMode,
     /// Allow network access inside the sandbox.
     pub sandbox_network: bool,
-    /// Mount the home directory read-only so toolchain caches stay usable.
-    pub sandbox_read_home: bool,
+    /// Paths mounted read-only in the sandbox. `~` is expanded. The whole
+    /// home directory is not mounted by default; list toolchain caches here.
+    pub sandbox_read_paths: Vec<String>,
+    /// Extra paths mounted writable in the sandbox. Relative paths resolve
+    /// against the session workspace. The workspace itself is always writable.
+    pub sandbox_writable_roots: Vec<String>,
     /// Copy what a mutating tool can change before it runs.
     pub snapshots: bool,
-    /// Rules that skip the approval prompt for matching mutating tool calls.
-    pub auto_approve: Vec<AutoApproveRule>,
-    /// Ordered allow/ask/deny rules. The first match wins, before
-    /// `auto_approve` (which is treated as an appended `allow` rule).
-    pub permissions: Vec<PermissionRule>,
+    /// Explicit permission rules. All matching rules are considered; `deny`
+    /// wins, then the most specific `ask`/`allow`/`sandbox` rule.
+    pub rules: Vec<PermissionRule>,
     /// Absolute paths (or `~`-prefixed) that file tools may touch outside the
     /// session workspace. A plain path allows its whole subtree.
     pub external_directory: Vec<String>,
+    /// Domains (or `*.example.com`) that `webfetch` may access without asking.
+    pub network_allow: Vec<String>,
 }
 
 impl ToolsConfig {
-    /// First rule that covers this call, if any. Only meaningful under the
-    /// `ask` policy; callers must still enforce `read-only` and sub-agent
-    /// restrictions before consulting it.
-    pub fn auto_approval(&self, tool: &str, args: &Value) -> Option<&AutoApproveRule> {
-        self.auto_approve
-            .iter()
-            .find(|rule| rule.matches(tool, args))
-    }
-
-    /// Ordered permission decision. `[[permissions]]` entries are checked in
-    /// order; legacy `[[tools.auto_approve]]` entries then act as `allow`.
-    pub fn permission_for(&self, tool: &str, args: &Value) -> PermissionAction {
-        for rule in &self.permissions {
-            if rule.matches(tool, args) {
-                return rule.action;
-            }
-        }
-        if self.auto_approval(tool, args).is_some() {
-            return PermissionAction::Allow;
-        }
-        PermissionAction::Ask
-    }
-
     /// Whether `path` is covered by `tools.external_directory`.
     pub fn external_path_allowed(&self, path: &Path) -> bool {
         let path = path.to_string_lossy().replace('\\', "/");
@@ -401,6 +440,48 @@ impl ToolsConfig {
             }
         })
     }
+
+    /// Whether `url`'s host is in `network_allow`.
+    pub fn network_host_allowed(&self, url: &str) -> bool {
+        let Some(host) = url_host(url) else {
+            return false;
+        };
+        let host = host.to_ascii_lowercase();
+        self.network_allow.iter().any(|pattern| {
+            let pattern = pattern.trim().trim_end_matches('.').to_ascii_lowercase();
+            if let Some(suffix) = pattern.strip_prefix("*.") {
+                host == suffix || host.ends_with(&format!(".{suffix}"))
+            } else {
+                host == pattern
+            }
+        })
+    }
+
+    /// All rules that match a call, in config order.
+    pub fn matching_rules<'a>(&'a self, tool: &str, args: &Value) -> Vec<&'a PermissionRule> {
+        self.rules
+            .iter()
+            .filter(|rule| rule.matches(tool, args))
+            .collect()
+    }
+}
+
+fn url_host(url: &str) -> Option<&str> {
+    let rest = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let authority = rest.split(['/', '?', '#']).next()?;
+    let host = authority.rsplit('@').next()?.split(':').next()?;
+    (!host.is_empty()).then_some(host)
+}
+
+fn split_env_list(value: &str) -> Vec<String> {
+    value
+        .split([',', ':'])
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
 }
 
 fn expand_tilde(pattern: &str) -> String {
@@ -418,16 +499,22 @@ fn expand_tilde(pattern: &str) -> String {
 impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
-            policy: ToolPolicy::Ask,
+            approval: ApprovalMode::Ask,
             max_output_bytes: 20_000,
             command_timeout_secs: 60,
             sandbox: SandboxMode::Auto,
-            sandbox_network: true,
-            sandbox_read_home: true,
+            sandbox_network: false,
+            sandbox_read_paths: vec![
+                "~/.cargo".to_string(),
+                "~/.rustup".to_string(),
+                "~/.cache".to_string(),
+                "~/.npm".to_string(),
+            ],
+            sandbox_writable_roots: Vec::new(),
             snapshots: true,
-            auto_approve: Vec::new(),
-            permissions: Vec::new(),
+            rules: Vec::new(),
             external_directory: Vec::new(),
+            network_allow: Vec::new(),
         }
     }
 }
@@ -735,7 +822,8 @@ pub struct ProviderConfig {
     /// upstream 5xx, rate limits, malformed/empty responses). `0` disables
     /// automatic retries.
     pub retry_attempts: u32,
-    /// Base delay for exponential backoff between retries.
+    /// Base delay for jittered exponential backoff between retries. Rate
+    /// limits without `Retry-After` use a one-second floor.
     pub retry_base_ms: u64,
     /// Upper bound for a single retry delay. A provider's `Retry-After` header
     /// is also capped by this value.
@@ -753,9 +841,9 @@ impl Default for ProviderConfig {
             api_key_env: "OPENAI_API_KEY".to_string(),
             timeout_secs: 300,
             context_tokens: None,
-            retry_attempts: 5,
-            retry_base_ms: 500,
-            retry_max_secs: 30,
+            retry_attempts: 8,
+            retry_base_ms: 250,
+            retry_max_secs: 60,
             system_prompt: None,
         }
     }
@@ -1046,6 +1134,8 @@ impl Config {
         let mut explicit_path = None;
         let mut watch_paths = Vec::new();
         let mut merged = toml::Value::Table(toml::map::Map::new());
+        let mut rules = Vec::new();
+        let mut security_warnings = Vec::new();
 
         // `--config` and EIX_CONFIG are authoritative; do not mix project
         // layers into a deliberately reproducible configuration.
@@ -1057,20 +1147,32 @@ impl Config {
             explicit_path = Some(path.clone());
             watch_paths.push(path.clone());
             if path.exists() {
-                merge_toml(&mut merged, read_layer(&path)?);
+                let mut layer = read_layer(&path)?;
+                collect_rules(&mut layer, RuleSource::User, &path, &mut rules)?;
+                merge_toml(&mut merged, layer);
             }
         } else {
             let global = default_config_path();
             watch_paths.push(global.clone());
             if global.exists() {
-                merge_toml(&mut merged, read_layer(&global)?);
+                let mut layer = read_layer(&global)?;
+                collect_rules(&mut layer, RuleSource::User, &global, &mut rules)?;
+                merge_toml(&mut merged, layer);
             }
             let mut dirs: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
             dirs.reverse();
             for dir in dirs {
                 let candidate = dir.join(".eix").join("config.toml");
                 if candidate.exists() {
-                    merge_toml(&mut merged, read_layer(&candidate)?);
+                    let mut layer = read_layer(&candidate)?;
+                    sanitize_project_layer(&mut layer, &mut security_warnings);
+                    collect_project_rules(
+                        &mut layer,
+                        &candidate,
+                        &mut rules,
+                        &mut security_warnings,
+                    )?;
+                    merge_toml(&mut merged, layer);
                 }
                 watch_paths.push(candidate);
             }
@@ -1080,9 +1182,11 @@ impl Config {
             path: explicit_path.clone().unwrap_or_else(default_config_path),
             source,
         })?;
+        config.tools.rules = rules;
         config.explicit_path = explicit_path;
         config.load_cwd = cwd.to_path_buf();
         config.watch_paths = watch_paths;
+        config.security_warnings = security_warnings;
         config.apply_env();
         config.validate()?;
         Ok(config)
@@ -1121,11 +1225,10 @@ impl Config {
         if let Some(value) = env_var("EIX_RETRY_MAX_SECS").and_then(|v| v.parse().ok()) {
             self.provider.retry_max_secs = value;
         }
-        if let Some(value) = env_var("EIX_TOOL_POLICY") {
+        if let Some(value) = env_var("EIX_TOOL_APPROVAL") {
             match value.as_str() {
-                "ask" => self.tools.policy = ToolPolicy::Ask,
-                "auto" => self.tools.policy = ToolPolicy::Auto,
-                "read-only" | "readonly" => self.tools.policy = ToolPolicy::ReadOnly,
+                "ask" => self.tools.approval = ApprovalMode::Ask,
+                "auto" => self.tools.approval = ApprovalMode::Auto,
                 _ => {}
             }
         }
@@ -1138,7 +1241,7 @@ impl Config {
         if let Some(value) = env_var("EIX_TOOL_SANDBOX") {
             match value.as_str() {
                 "auto" => self.tools.sandbox = SandboxMode::Auto,
-                "bwrap" => self.tools.sandbox = SandboxMode::Bwrap,
+                "required" => self.tools.sandbox = SandboxMode::Required,
                 "off" => self.tools.sandbox = SandboxMode::Off,
                 _ => {}
             }
@@ -1146,8 +1249,14 @@ impl Config {
         if let Some(value) = env_var("EIX_TOOL_SANDBOX_NETWORK") {
             self.tools.sandbox_network = matches!(value.as_str(), "1" | "true" | "yes" | "on");
         }
-        if let Some(value) = env_var("EIX_TOOL_SANDBOX_READ_HOME") {
-            self.tools.sandbox_read_home = matches!(value.as_str(), "1" | "true" | "yes" | "on");
+        if let Some(value) = env_var("EIX_TOOL_SANDBOX_READ_PATHS") {
+            self.tools.sandbox_read_paths = split_env_list(&value);
+        }
+        if let Some(value) = env_var("EIX_TOOL_SANDBOX_WRITABLE_ROOTS") {
+            self.tools.sandbox_writable_roots = split_env_list(&value);
+        }
+        if let Some(value) = env_var("EIX_TOOL_NETWORK_ALLOW") {
+            self.tools.network_allow = split_env_list(&value);
         }
         if let Some(value) = env_var("EIX_TOOL_SNAPSHOTS") {
             self.tools.snapshots = matches!(value.as_str(), "1" | "true" | "yes" | "on");
@@ -1264,10 +1373,10 @@ impl Config {
                 )));
             }
         }
-        for (index, rule) in self.tools.auto_approve.iter().enumerate() {
+        for (index, rule) in self.tools.rules.iter().enumerate() {
             if rule.tool.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "tools.auto_approve[{index}].tool is required (use \"*\" to match any tool)"
+                    "tools.rules[{index}].tool is required (use \"*\" to match any tool)"
                 )));
             }
             if rule
@@ -1276,54 +1385,20 @@ impl Config {
                 .is_some_and(|path| path.trim().is_empty())
             {
                 return Err(ConfigError::Invalid(format!(
-                    "tools.auto_approve[{index}].path is empty"
+                    "tools.rules[{index}].path is empty"
                 )));
             }
-            if rule
-                .command_prefix
-                .as_deref()
-                .is_some_and(|prefix| prefix.is_empty())
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "tools.auto_approve[{index}].command_prefix is empty"
-                )));
+            if let Some(command) = rule.command.as_ref() {
+                if command.is_empty() || command.iter().any(|token| token.is_empty()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "tools.rules[{index}].command must be a non-empty argv prefix"
+                    )));
+                }
             }
             if let Some(pattern) = rule.command_regex.as_deref() {
                 Regex::new(pattern).map_err(|err| {
                     ConfigError::Invalid(format!(
-                        "tools.auto_approve[{index}].command_regex is not a valid regex: {err}"
-                    ))
-                })?;
-            }
-        }
-        for (index, rule) in self.tools.permissions.iter().enumerate() {
-            if rule.tool.trim().is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "tools.permissions[{index}].tool is required (use \"*\" to match any tool)"
-                )));
-            }
-            if rule
-                .path
-                .as_deref()
-                .is_some_and(|path| path.trim().is_empty())
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "tools.permissions[{index}].path is empty"
-                )));
-            }
-            if rule
-                .command_prefix
-                .as_deref()
-                .is_some_and(|prefix| prefix.is_empty())
-            {
-                return Err(ConfigError::Invalid(format!(
-                    "tools.permissions[{index}].command_prefix is empty"
-                )));
-            }
-            if let Some(pattern) = rule.command_regex.as_deref() {
-                Regex::new(pattern).map_err(|err| {
-                    ConfigError::Invalid(format!(
-                        "tools.permissions[{index}].command_regex is not a valid regex: {err}"
+                        "tools.rules[{index}].command_regex is not a valid regex: {err}"
                     ))
                 })?;
             }
@@ -1728,13 +1803,22 @@ impl Config {
             },
         };
 
+        // Reasoning defaults to medium. The TUI uses the reserved `#none`
+        // variant to mean "do not send reasoning_effort at all", which keeps
+        // the empty Ctrl-T step distinct from the default.
+        let reasoning_effort = match variant {
+            Some(variant) if variant.eq_ignore_ascii_case("none") => None,
+            Some(variant) => Some(variant),
+            None => Some("medium".to_string()),
+        };
+
         ModelRoute {
             model: api_model,
             endpoint: chat_endpoint(&base_url),
             api_key,
             // Most OpenAI-compatible servers accept this for reasoning models;
             // it is ignored by the others.
-            reasoning_effort: variant,
+            reasoning_effort,
             input_cost,
             output_cost,
             context_tokens,
@@ -1793,6 +1877,107 @@ fn env_var(name: &str) -> Option<String> {
 }
 
 /// Read one TOML layer after expanding `{env:NAME}` / `{file:path}`.
+fn collect_rules(
+    layer: &mut toml::Value,
+    source: RuleSource,
+    path: &Path,
+    out: &mut Vec<PermissionRule>,
+) -> Result<(), ConfigError> {
+    let Some(rules) = take_tools_array(layer, "rules") else {
+        return Ok(());
+    };
+    for value in rules {
+        let mut rule: PermissionRule = value.try_into().map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        rule.source = source;
+        out.push(rule);
+    }
+    Ok(())
+}
+
+/// Project layers may only tighten policy. `allow` rules are downgraded to
+/// `ask`; `sandbox`/`ask`/`deny` are portable because they cannot expand the
+/// user's authority beyond what the risk engine already permits.
+fn collect_project_rules(
+    layer: &mut toml::Value,
+    path: &Path,
+    out: &mut Vec<PermissionRule>,
+    warnings: &mut Vec<String>,
+) -> Result<(), ConfigError> {
+    let Some(rules) = take_tools_array(layer, "rules") else {
+        return Ok(());
+    };
+    for value in rules {
+        let mut rule: PermissionRule = value.try_into().map_err(|source| ConfigError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        if rule.action == PermissionAction::Allow {
+            warnings.push(format!(
+                "{}: rules[{}].action = \"allow\" is not allowed in project config; downgraded to ask",
+                path.display(),
+                if rule.id.is_empty() { "?" } else { &rule.id }
+            ));
+            rule.action = PermissionAction::Ask;
+        }
+        rule.source = RuleSource::Project;
+        out.push(rule);
+    }
+    Ok(())
+}
+
+fn take_tools_array(layer: &mut toml::Value, key: &str) -> Option<Vec<toml::Value>> {
+    layer
+        .get_mut("tools")
+        .and_then(toml::Value::as_table_mut)
+        .and_then(|tools| tools.remove(key))
+        .and_then(|value| value.as_array().cloned())
+}
+
+fn sanitize_project_layer(layer: &mut toml::Value, warnings: &mut Vec<String>) {
+    let Some(tools) = layer.get_mut("tools").and_then(toml::Value::as_table_mut) else {
+        return;
+    };
+    if let Some(other) = tools.get("approval").and_then(toml::Value::as_str) {
+        if other != "ask" {
+            let other = other.to_string();
+            tools.remove("approval");
+            warnings.push(format!(
+                "project config cannot set tools.approval = {other:?}; ignored"
+            ));
+        }
+    }
+    if let Some(other) = tools.get("sandbox").and_then(toml::Value::as_str) {
+        if other != "required" {
+            let other = other.to_string();
+            tools.remove("sandbox");
+            warnings.push(format!(
+                "project config cannot set tools.sandbox = {other:?}; ignored"
+            ));
+        }
+    }
+    if tools.get("sandbox_network").and_then(toml::Value::as_bool) == Some(true) {
+        tools.insert("sandbox_network".into(), toml::Value::Boolean(false));
+        warnings.push("project config cannot enable sandbox_network; forced false".into());
+    }
+    for key in [
+        "sandbox_read_paths",
+        "sandbox_writable_roots",
+        "external_directory",
+        "network_allow",
+    ] {
+        if tools.remove(key).is_some() {
+            warnings.push(format!("project config cannot add tools.{key}; ignored"));
+        }
+    }
+    if tools.get("snapshots").and_then(toml::Value::as_bool) == Some(false) {
+        tools.remove("snapshots");
+        warnings.push("project config cannot disable snapshots; ignored".into());
+    }
+}
+
 fn read_layer(path: &Path) -> Result<toml::Value, ConfigError> {
     let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
         path: path.to_path_buf(),
@@ -2155,6 +2340,13 @@ base_url = "http://127.0.0.1:11434/v1"
         assert_eq!(route.api_key.as_deref(), Some("router-key"));
         assert_eq!(route.reasoning_effort.as_deref(), Some("high"));
 
+        // Unspecified reasoning defaults to medium; the reserved `#none`
+        // selection omits reasoning_effort entirely.
+        let default_effort = config.route("openrouter/openai/gpt-5");
+        assert_eq!(default_effort.reasoning_effort.as_deref(), Some("medium"));
+        let no_effort = config.route("openrouter/openai/gpt-5#none");
+        assert_eq!(no_effort.reasoning_effort, None);
+
         let local = config.route("local/llama3");
         assert_eq!(local.model, "llama3");
         assert_eq!(local.endpoint, "http://127.0.0.1:11434/v1/chat/completions");
@@ -2277,66 +2469,65 @@ base_url = "http://127.0.0.1:11434/v1"
     }
 
     #[test]
-    fn ordered_permission_rules_first_match_wins() {
+    fn permission_rules_match_and_report_specificity() {
         let parsed: Config = toml::from_str(
             r#"
-[[tools.permissions]]
+[[tools.rules]]
+id = "allow-cargo-test"
 tool = "run_command"
-command_prefix = "cargo "
+command = ["cargo", "test"]
 action = "allow"
 
-[[tools.permissions]]
+[[tools.rules]]
+id = "deny-rm"
 tool = "run_command"
 command_regex = "^rm "
 action = "deny"
 
-[[tools.permissions]]
+[[tools.rules]]
+id = "ask-src"
 tool = "write_file"
 path = "src/**"
 action = "ask"
 "#,
         )
-        .expect("parse permissions");
-        parsed.validate().expect("valid permissions");
+        .expect("parse rules");
+        parsed.validate().expect("valid rules");
 
+        let cargo = parsed
+            .tools
+            .matching_rules("run_command", &json!({"command": "cargo test --workspace"}));
+        assert_eq!(cargo.len(), 1);
+        assert_eq!(cargo[0].action, PermissionAction::Allow);
+        assert_eq!(cargo[0].specificity(), 2);
+
+        let rm = parsed
+            .tools
+            .matching_rules("run_command", &json!({"command": "rm -rf /"}));
         assert_eq!(
-            parsed
-                .tools
-                .permission_for("run_command", &json!({"command": "cargo test"})),
-            PermissionAction::Allow
+            rm.first().map(|rule| rule.action),
+            Some(PermissionAction::Deny)
         );
+
+        let write = parsed
+            .tools
+            .matching_rules("write_file", &json!({"path": "src/lib.rs"}));
         assert_eq!(
-            parsed
-                .tools
-                .permission_for("run_command", &json!({"command": "rm -rf /"})),
-            PermissionAction::Deny
+            write.first().map(|rule| rule.action),
+            Some(PermissionAction::Ask)
         );
-        assert_eq!(
-            parsed
-                .tools
-                .permission_for("write_file", &json!({"path": "src/lib.rs"})),
-            PermissionAction::Ask
-        );
-        // No rule matches: the default is still a prompt.
-        assert_eq!(
-            parsed
-                .tools
-                .permission_for("write_file", &json!({"path": "docs/readme.md"})),
-            PermissionAction::Ask
-        );
-        // Legacy auto_approve entries behave as appended allow rules.
-        let mut legacy = Config::default();
-        legacy.tools.auto_approve.push(AutoApproveRule {
-            tool: "write_file".into(),
-            path: Some("docs/**".into()),
-            ..AutoApproveRule::default()
-        });
-        assert_eq!(
-            legacy
-                .tools
-                .permission_for("write_file", &json!({"path": "docs/a.md"})),
-            PermissionAction::Allow
-        );
+
+        assert!(parsed
+            .tools
+            .matching_rules("write_file", &json!({"path": "docs/readme.md"}))
+            .is_empty());
+
+        // A multi-segment command cannot satisfy a prefix rule for only one
+        // segment. This is the `cargo test && rm -rf /` bypass guard.
+        assert!(parsed
+            .tools
+            .matching_rules("run_command", &json!({"command": "cargo test && rm -rf /"}))
+            .is_empty());
     }
 
     #[test]
@@ -2398,6 +2589,86 @@ action = "ask"
         assert!(config
             .watch_paths
             .contains(&nested.join(".eix/config.toml")));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn project_config_cannot_loosen_permissions() {
+        let root = config_temp_dir("project-tighten");
+        std::fs::create_dir_all(root.join(".eix")).unwrap();
+        std::fs::write(
+            root.join(".eix/config.toml"),
+            r#"
+[tools]
+approval = "auto"
+sandbox = "off"
+sandbox_network = true
+sandbox_read_paths = ["/"]
+sandbox_writable_roots = ["/"]
+external_directory = ["/"]
+network_allow = ["*"]
+snapshots = false
+
+[[tools.rules]]
+id = "repo-allow"
+tool = "write_file"
+action = "allow"
+
+[[tools.rules]]
+id = "repo-shell"
+tool = "run_command"
+command = ["true"]
+action = "allow"
+"#,
+        )
+        .unwrap();
+
+        let config = Config::load_for(None, &root).expect("project config");
+        assert_eq!(config.tools.approval, ApprovalMode::Ask);
+        assert_eq!(config.tools.sandbox, SandboxMode::Auto);
+        assert!(!config.tools.sandbox_network);
+        assert!(!config
+            .tools
+            .sandbox_read_paths
+            .iter()
+            .any(|path| path == "/"));
+        assert!(!config
+            .tools
+            .sandbox_writable_roots
+            .iter()
+            .any(|path| path == "/"));
+        assert!(config.tools.external_directory.is_empty());
+        assert!(config.tools.network_allow.is_empty());
+        assert!(config.tools.snapshots);
+        assert!(
+            config
+                .tools
+                .rules
+                .iter()
+                .all(|rule| rule.source == RuleSource::Project
+                    && rule.action == PermissionAction::Ask)
+        );
+        for expected in [
+            "approval",
+            "sandbox",
+            "sandbox_network",
+            "sandbox_read_paths",
+            "sandbox_writable_roots",
+            "external_directory",
+            "network_allow",
+            "snapshots",
+            "allow",
+        ] {
+            assert!(
+                config
+                    .security_warnings
+                    .iter()
+                    .any(|warning| warning.contains(expected)),
+                "missing warning for {expected}: {:?}",
+                config.security_warnings
+            );
+        }
+
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2519,17 +2790,35 @@ action = "ask"
     fn tools_sandbox_defaults_and_parses() {
         let default = Config::default();
         assert_eq!(default.tools.sandbox, SandboxMode::Auto);
-        assert!(default.tools.sandbox_network);
-        assert!(default.tools.sandbox_read_home);
+        assert!(!default.tools.sandbox_network);
+        assert!(default
+            .tools
+            .sandbox_read_paths
+            .iter()
+            .any(|path| path == "~/.cargo"));
         assert!(default.tools.snapshots);
+        assert_eq!(default.tools.approval, ApprovalMode::Ask);
 
         let parsed: Config = toml::from_str(
-            "[tools]\nsandbox = \"off\"\nsandbox_network = false\nsandbox_read_home = false\nsnapshots = false\n",
+            r#"
+[tools]
+approval = "auto"
+sandbox = "required"
+sandbox_network = true
+sandbox_read_paths = ["~/.cargo"]
+sandbox_writable_roots = ["target"]
+network_allow = ["example.com"]
+snapshots = false
+"#,
         )
         .expect("tools config");
-        assert_eq!(parsed.tools.sandbox, SandboxMode::Off);
-        assert!(!parsed.tools.sandbox_network);
-        assert!(!parsed.tools.sandbox_read_home);
+        assert_eq!(parsed.tools.approval, ApprovalMode::Auto);
+        assert_eq!(parsed.tools.sandbox, SandboxMode::Required);
+        assert!(parsed.tools.sandbox_network);
+        assert_eq!(parsed.tools.sandbox_read_paths, vec!["~/.cargo"]);
+        assert_eq!(parsed.tools.sandbox_writable_roots, vec!["target"]);
+        assert!(parsed.tools.network_host_allowed("https://example.com/x"));
+        assert!(!parsed.tools.network_host_allowed("https://evil.test/x"));
         assert!(!parsed.tools.snapshots);
     }
 
@@ -2553,75 +2842,115 @@ action = "ask"
     }
 
     #[test]
-    fn auto_approve_rules_parse_and_match() {
+    fn rules_parse_and_match() {
         let parsed: Config = toml::from_str(
             r#"
             [tools]
-            policy = "ask"
+            approval = "ask"
 
-            [[tools.auto_approve]]
+            [[tools.rules]]
+            id = "cargo-test"
             tool = "run_command"
-            command_prefix = "cargo test"
+            command = ["cargo", "test"]
+            action = "allow"
 
-            [[tools.auto_approve]]
+            [[tools.rules]]
+            id = "tests-writes"
             tool = "write_file"
             path = "tests/**"
+            action = "ask"
 
-            [[tools.auto_approve]]
+            [[tools.rules]]
+            id = "cargo-check"
             tool = "run_command"
             command_regex = "^cargo (check|clippy)\\b"
+            action = "ask"
             "#,
         )
-        .expect("auto approve config");
-        assert_eq!(parsed.tools.auto_approve.len(), 3);
+        .expect("rules config");
+        assert_eq!(parsed.tools.rules.len(), 3);
         parsed.validate().expect("rules are valid");
 
         let command = json!({"command": "cargo test --workspace"});
+        assert_eq!(
+            parsed
+                .tools
+                .matching_rules("run_command", &command)
+                .first()
+                .map(|rule| rule.id.as_str()),
+            Some("cargo-test")
+        );
         assert!(parsed
             .tools
-            .auto_approval("run_command", &command)
-            .is_some());
-        assert!(parsed
-            .tools
-            .auto_approval("start_command", &command)
-            .is_none());
+            .matching_rules("start_command", &command)
+            .is_empty());
 
         let write = json!({"path": "./tests/unit/a.rs", "content": "x"});
-        assert!(parsed.tools.auto_approval("write_file", &write).is_some());
+        assert_eq!(parsed.tools.matching_rules("write_file", &write).len(), 1);
         let escape = json!({"path": "tests/../src/main.rs", "content": "x"});
-        assert!(parsed.tools.auto_approval("write_file", &escape).is_none());
-        let outside = json!({"path": "src/main.rs", "content": "x"});
-        assert!(parsed.tools.auto_approval("write_file", &outside).is_none());
-        // A missing `path` argument cannot satisfy a path rule.
         assert!(parsed
             .tools
-            .auto_approval("write_file", &json!({}))
-            .is_none());
+            .matching_rules("write_file", &escape)
+            .is_empty());
+        let outside = json!({"path": "src/main.rs", "content": "x"});
+        assert!(parsed
+            .tools
+            .matching_rules("write_file", &outside)
+            .is_empty());
+        assert!(parsed
+            .tools
+            .matching_rules("write_file", &json!({}))
+            .is_empty());
 
         let check = json!({"command": "cargo clippy --workspace"});
-        assert!(parsed.tools.auto_approval("run_command", &check).is_some());
+        assert!(parsed.tools.matching_rules("run_command", &check).len() == 1);
         assert!(parsed
             .tools
-            .auto_approval("run_command", &json!({"command": "cargo run"}))
-            .is_none());
+            .matching_rules("run_command", &json!({"command": "cargo run"}))
+            .is_empty());
     }
 
     #[test]
-    fn auto_approve_rejects_invalid_rules() {
-        let invalid: Config = toml::from_str(
-            "[[tools.auto_approve]]\ntool = \"run_command\"\ncommand_regex = \"(\"\n",
+    fn webfetch_path_rules_match_urls() {
+        let parsed: Config = toml::from_str(
+            r#"
+[[tools.rules]]
+id = "docs"
+tool = "webfetch"
+path = "https://docs.rs/**"
+action = "allow"
+"#,
         )
-        .expect("parse first");
+        .expect("parse");
+        assert_eq!(
+            parsed
+                .tools
+                .matching_rules(
+                    "webfetch",
+                    &json!({"url": "https://docs.rs/serde/latest/serde/"})
+                )
+                .len(),
+            1
+        );
+        assert!(parsed
+            .tools
+            .matching_rules("webfetch", &json!({"url": "https://evil.example/docs.rs"}))
+            .is_empty());
+    }
+
+    #[test]
+    fn rules_reject_invalid_values() {
+        let invalid: Config =
+            toml::from_str("[[tools.rules]]\ntool = \"run_command\"\ncommand_regex = \"(\"\n")
+                .expect("parse first");
         assert!(invalid.validate().is_err());
 
-        let empty: Config =
-            toml::from_str("[[tools.auto_approve]]\ntool = \"\"\n").expect("parse first");
+        let empty: Config = toml::from_str("[[tools.rules]]\ntool = \"\"\n").expect("parse first");
         assert!(empty.validate().is_err());
 
-        let prefix: Config = toml::from_str(
-            "[[tools.auto_approve]]\ntool = \"run_command\"\ncommand_prefix = \"\"\n",
-        )
-        .expect("parse first");
+        let prefix: Config =
+            toml::from_str("[[tools.rules]]\ntool = \"run_command\"\ncommand = []\n")
+                .expect("parse first");
         assert!(prefix.validate().is_err());
     }
 
@@ -2696,12 +3025,13 @@ help = "F2"
     }
 
     #[test]
-    fn wildcard_rule_matches_any_mutating_tool() {
-        let rule = AutoApproveRule {
+    fn wildcard_rule_matches_any_tool() {
+        let rule = PermissionRule {
             tool: "*".to_string(),
-            ..AutoApproveRule::default()
+            ..PermissionRule::default()
         };
         assert!(rule.matches("write_file", &json!({"path": "a"})));
         assert!(rule.matches("run_command", &json!({"command": "ls"})));
+        assert_eq!(rule.specificity(), 0);
     }
 }

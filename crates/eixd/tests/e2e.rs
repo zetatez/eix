@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
     AttachResult, Config, EventKind, EventsResult, HelloResult, ModelConfig, NamedProviderConfig,
-    PermissionLevel, Request, Response, SearchResult, ServerMessage, SessionResult, SubmitResult,
-    PROTOCOL_VERSION,
+    PermissionAction, PermissionLevel, PermissionRule, Request, Response, SearchResult,
+    ServerMessage, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -209,6 +209,7 @@ async fn daemon_retries_transient_provider_failures() -> anyhow::Result<()> {
                 assert_eq!(notification.params["session_id"], session_id);
                 assert_eq!(notification.params["turn_id"], submitted.turn_id);
                 assert!(notification.params["attempt"].as_u64().unwrap() >= 2);
+                assert_eq!(notification.params["kind"], "transient");
                 retries += 1;
             }
             "turn.completed"
@@ -225,6 +226,78 @@ async fn daemon_retries_transient_provider_failures() -> anyhow::Result<()> {
     assert_eq!(text, "recovered");
     assert!(completed["error"].is_null());
     assert_eq!(bodies.lock().await.len(), 3);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_honours_rate_limit_retry_after() -> anyhow::Result<()> {
+    let dir = temp_dir("retry-rate-limit");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(rate_limit_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.provider.base_url = format!("http://{addr}/v1");
+    config.provider.model = "mock-model".to_string();
+    config.provider.api_key = None;
+    config.provider.timeout_secs = 30;
+    config.provider.retry_attempts = 2;
+    config.provider.retry_base_ms = 500;
+    config.provider.retry_max_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let data_dir = dir.join("data");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir));
+
+    let mut client = connect(&socket).await?;
+    let _: HelloResult = client.request("hello", Value::Null).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "rate-limit", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "hello"}),
+        )
+        .await?;
+
+    let mut text = String::new();
+    let mut retries = 0;
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "message.delta" => text.push_str(notification.params["delta"].as_str().unwrap()),
+            "turn.retrying" => {
+                assert_eq!(notification.params["kind"], "rate_limited");
+                assert!(
+                    notification.params["delay_ms"].as_u64().unwrap() >= 900,
+                    "Retry-After should be honoured: {}",
+                    notification.params["delay_ms"]
+                );
+                retries += 1;
+            }
+            "turn.completed"
+                if notification.params["session_id"] == session_id.as_str()
+                    && notification.params["turn_id"] == submitted.turn_id.as_str() =>
+            {
+                break notification.params.clone();
+            }
+            _ => {}
+        }
+    };
+
+    assert_eq!(retries, 1);
+    assert_eq!(text, "recovered");
+    assert!(completed["error"].is_null());
+    assert_eq!(bodies.lock().await.len(), 2);
 
     daemon.abort();
     mock.abort();
@@ -1512,7 +1585,9 @@ async fn read_only_session_refuses_writes_and_permission_is_logged() -> anyhow::
         result.payload
     );
     assert!(!dir.join("out.txt").exists());
-    // The provider never got a mutating tool in its advertised list.
+    // The provider never got a directly mutating tool in its advertised
+    // list. `run_command` stays visible so harmless commands like `git
+    // status` work; the permission engine rejects anything that writes.
     let first: Value = serde_json::from_str(&bodies.lock().await[0])?;
     assert!(
         first["tools"]
@@ -1520,11 +1595,17 @@ async fn read_only_session_refuses_writes_and_permission_is_logged() -> anyhow::
             .is_some_and(|tools| tools.iter().all(|tool| {
                 !matches!(
                     tool["function"]["name"].as_str(),
-                    Some("write_file" | "run_command" | "start_command")
+                    Some("write_file" | "edit" | "patch" | "start_command")
                 )
             })),
         "read-only tools were: {}",
         first["tools"]
+    );
+    assert!(
+        first["tools"].as_array().is_some_and(|tools| tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "run_command")),
+        "run_command should remain available for read-only inspection"
     );
 
     // Persisted change: row + permission event.
@@ -1884,8 +1965,8 @@ async fn read_only_commands_run_without_approval_and_secrets_stay_local() -> any
 }
 
 #[tokio::test]
-async fn auto_approve_rule_skips_the_prompt() -> anyhow::Result<()> {
-    let dir = temp_dir("auto-approve");
+async fn permission_rule_skips_the_prompt() -> anyhow::Result<()> {
+    let dir = temp_dir("allow-rule");
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("src/keep.txt"), "before")?;
 
@@ -1900,9 +1981,10 @@ async fn auto_approve_rule_skips_the_prompt() -> anyhow::Result<()> {
     config.provider.api_key = None;
     config.provider.timeout_secs = 30;
     config.tools.sandbox = eix_core::SandboxMode::Off;
-    config.tools.auto_approve = vec![eix_core::AutoApproveRule {
+    config.tools.rules = vec![PermissionRule {
         tool: "run_command".to_string(),
-        command_prefix: Some("printf".to_string()),
+        command: Some(vec!["sed".to_string()]),
+        action: PermissionAction::Allow,
         ..Default::default()
     }];
 
@@ -1962,8 +2044,8 @@ async fn auto_approve_rule_skips_the_prompt() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn auto_approve_rule_cannot_bypass_a_read_only_session() -> anyhow::Result<()> {
-    let dir = temp_dir("auto-approve-readonly");
+async fn permission_rule_cannot_bypass_a_read_only_session() -> anyhow::Result<()> {
+    let dir = temp_dir("allow-rule-readonly");
     std::fs::create_dir_all(dir.join("src"))?;
     std::fs::write(dir.join("src/keep.txt"), "before")?;
 
@@ -1979,8 +2061,9 @@ async fn auto_approve_rule_cannot_bypass_a_read_only_session() -> anyhow::Result
     config.provider.timeout_secs = 30;
     config.tools.sandbox = eix_core::SandboxMode::Off;
     // A catch-all rule must still lose to the session's read-only level.
-    config.tools.auto_approve = vec![eix_core::AutoApproveRule {
+    config.tools.rules = vec![PermissionRule {
         tool: "*".to_string(),
+        action: PermissionAction::Allow,
         ..Default::default()
     }];
 
@@ -2422,7 +2505,7 @@ async fn background_process_streams_output_and_can_be_killed() -> anyhow::Result
     config.provider.model = "mock-model".to_string();
     config.provider.api_key = None;
     config.provider.timeout_secs = 30;
-    config.tools.policy = eix_core::ToolPolicy::Auto;
+    config.tools.approval = eix_core::ApprovalMode::Auto;
     config.tools.sandbox = eix_core::SandboxMode::Off;
 
     let socket = dir.join("eix.sock");
@@ -2823,7 +2906,7 @@ async fn rewind_restores_the_workspace_before_a_write() -> anyhow::Result<()> {
     config.provider.timeout_secs = 30;
     // Execute the write immediately so the snapshot and the write land in one
     // turn; `ask` would stage it and defer the snapshot until apply.
-    config.tools.policy = eix_core::ToolPolicy::Auto;
+    config.tools.approval = eix_core::ApprovalMode::Auto;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -4096,6 +4179,44 @@ async fn flaky_provider(listener: TcpListener, failures: usize, bodies: Arc<Mute
                     r#"{"error":{"message":"temporarily overloaded"}}"#,
                 )
                 .await;
+                return;
+            }
+            let events = concat!(
+                "data: {\"model\":\"mock-retry\",\"choices\":[{\"delta\":{\"content\":\"recovered\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            write_sse(&mut socket, events).await;
+        });
+    }
+}
+
+async fn rate_limit_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    let first = Arc::new(Mutex::new(true));
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        let first = Arc::clone(&first);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            bodies.lock().await.push(body);
+            let first = {
+                let mut first = first.lock().await;
+                let value = *first;
+                *first = false;
+                value
+            };
+            if first {
+                let body = r#"{"error":{"message":"rate limit exceeded"}}"#;
+                let response = format!(
+                    "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 1\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.flush().await;
                 return;
             }
             let events = concat!(
@@ -5486,7 +5607,34 @@ async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::R
         .filter(|event| event.kind == EventKind::PatchApplied)
         .collect();
     assert_eq!(applied.len(), 2, "both writes were applied");
-    assert_eq!(applied[1].payload["message"], "auto-approval rule");
+    assert!(
+        applied[1].payload["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("rule")),
+        "write was not marked as rule-approved: {}",
+        applied[1].payload
+    );
+    let audits: Vec<_> = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::PermissionEvaluated)
+        .collect();
+    assert!(
+        audits.iter().any(|event| event.payload["action"] == "ask"),
+        "missing ask audit: {audits:?}"
+    );
+    let allowed = audits
+        .iter()
+        .find(|event| event.payload["action"] == "allow")
+        .expect("session rule should produce an allow audit");
+    assert_eq!(allowed.payload["rule_source"], "session");
+    assert!(
+        allowed.payload["rule"]
+            .as_str()
+            .is_some_and(|rule| rule.starts_with("always-write_file-")),
+        "unexpected rule audit: {}",
+        allowed.payload
+    );
 
     daemon.abort();
     mock.abort();
@@ -5774,7 +5922,8 @@ async fn command_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>
                 });
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else {
-                let arguments = json!({"command": "printf after > src/keep.txt"}).to_string();
+                let arguments =
+                    json!({"command": "sed -i 's/before/after/' src/keep.txt"}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{

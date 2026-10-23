@@ -14,7 +14,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use eix_core::commands::tokenize;
 use eix_core::{sandbox, Config, HunkInfo, SandboxMode, ToolDefinition};
 use regex::{Regex, RegexBuilder};
 use serde_json::{json, Value};
@@ -42,8 +41,6 @@ struct ToolSpec {
     subagent_allowed: bool,
     /// Safe to run concurrently with other read-only tools in one batch.
     parallel_safe: bool,
-    /// Requires the normal approval gate under the default `ask` policy.
-    requires_approval: bool,
 }
 
 const TOOL_SPECS: &[ToolSpec] = &[
@@ -51,133 +48,111 @@ const TOOL_SPECS: &[ToolSpec] = &[
         name: "read_file",
         subagent_allowed: true,
         parallel_safe: true,
-        requires_approval: false,
     },
     ToolSpec {
         name: "use_skill",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "todo",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "memory",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "webfetch",
         subagent_allowed: true,
         parallel_safe: true,
-        requires_approval: false,
     },
     ToolSpec {
         name: "websearch",
         subagent_allowed: true,
         parallel_safe: true,
-        requires_approval: false,
     },
     ToolSpec {
         name: "list_dir",
         subagent_allowed: true,
         parallel_safe: true,
-        requires_approval: false,
     },
     ToolSpec {
         name: "grep",
         subagent_allowed: true,
         parallel_safe: true,
-        requires_approval: false,
     },
     ToolSpec {
         name: "glob",
         subagent_allowed: true,
         parallel_safe: true,
-        requires_approval: false,
     },
     ToolSpec {
         name: "lsp_diagnostics",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "write_file",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: true,
     },
     ToolSpec {
         name: "edit",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: true,
     },
     ToolSpec {
         name: "patch",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: true,
     },
     ToolSpec {
         name: "run_command",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: true,
     },
     ToolSpec {
         name: "start_command",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: true,
     },
     ToolSpec {
         name: "process_output",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "spawn_agent",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "ask_user",
         subagent_allowed: false,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "mcp_list_resources",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "mcp_read_resource",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "mcp_list_prompts",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
     ToolSpec {
         name: "mcp_get_prompt",
         subagent_allowed: true,
         parallel_safe: false,
-        requires_approval: false,
     },
 ];
 
@@ -500,232 +475,12 @@ pub fn parallel_safe(tool: &str) -> bool {
     spec(tool).is_some_and(|spec| spec.parallel_safe)
 }
 
-/// Mutating tools need an approval decision under the default `ask` policy.
-pub fn requires_approval(tool: &str) -> bool {
-    spec(tool).is_some_and(|spec| spec.requires_approval)
+/// Tools that always mutate and are therefore hidden from read-only sessions.
+/// `run_command` is deliberately not here: read-only shell commands such as
+/// `git status` are useful, and the permission engine rejects mutating ones.
+pub fn hard_mutating(tool: &str) -> bool {
+    matches!(tool, "write_file" | "edit" | "patch" | "start_command")
 }
-
-/// Whether this specific call needs approval. `run_command` is the exception:
-/// recognized lookup commands (`grep`, `rg`, `fd`, `find`, `cat`, ...) only
-/// read, so they bypass the approval card and the read-only session cap.
-pub fn requires_approval_for(tool: &str, args: &Value) -> bool {
-    if tool == "run_command" {
-        return !is_read_only_command_args(args);
-    }
-    requires_approval(tool)
-}
-
-pub fn is_read_only_command_args(args: &Value) -> bool {
-    args.get("command")
-        .and_then(Value::as_str)
-        .map(is_read_only_command)
-        .unwrap_or(false)
-}
-
-/// Conservative shell classifier for read-only commands.
-///
-/// This is intentionally an allow-list, not a deny-list. Anything that could
-/// write, spawn an arbitrary command, redirect output, or change shell state
-/// keeps the normal approval path. Pipelines and `&&`/`;` chains are allowed
-/// only when every segment is itself a recognized read-only command.
-pub fn is_read_only_command(command: &str) -> bool {
-    let command = command.trim();
-    if command.is_empty() {
-        return false;
-    }
-    let Some(segments) = split_shell_segments(command) else {
-        return false;
-    };
-    !segments.is_empty() && segments.iter().all(|segment| is_read_only_segment(segment))
-}
-
-fn split_shell_segments(command: &str) -> Option<Vec<&str>> {
-    let chars: Vec<(usize, char)> = command.char_indices().collect();
-    let mut segments = Vec::new();
-    let mut quote: Option<char> = None;
-    let mut start = 0usize;
-    let mut i = 0usize;
-    while i < chars.len() {
-        let (idx, ch) = chars[i];
-        if let Some(open) = quote {
-            // Double quotes still expand `$` and backticks. Single quotes are
-            // literal, so only the opening/closing quote matters there.
-            if open == '"' && matches!(ch, '\\' | '$' | '`') {
-                return None;
-            }
-            if ch == open {
-                quote = None;
-            }
-            i += 1;
-            continue;
-        }
-        match ch {
-            '\'' | '"' => {
-                quote = Some(ch);
-                i += 1;
-            }
-            '\\' | '$' | '`' | '\n' | '\r' | '(' | ')' | '<' | '>' | '{' | '}' => return None,
-            '&' => {
-                if chars.get(i + 1).map(|(_, next)| *next) != Some('&') {
-                    return None;
-                }
-                if !push_segment(command, start, idx, &mut segments) {
-                    return None;
-                }
-                i += 2;
-                start = chars.get(i).map(|(next, _)| *next).unwrap_or(command.len());
-            }
-            '|' => {
-                let doubled = chars.get(i + 1).map(|(_, next)| *next) == Some('|');
-                if !push_segment(command, start, idx, &mut segments) {
-                    return None;
-                }
-                i += if doubled { 2 } else { 1 };
-                start = chars.get(i).map(|(next, _)| *next).unwrap_or(command.len());
-            }
-            ';' => {
-                if !push_segment(command, start, idx, &mut segments) {
-                    return None;
-                }
-                i += 1;
-                start = chars.get(i).map(|(next, _)| *next).unwrap_or(command.len());
-            }
-            _ => i += 1,
-        }
-    }
-    if quote.is_some() || !push_segment(command, start, command.len(), &mut segments) {
-        return None;
-    }
-    Some(segments)
-}
-
-fn push_segment<'a>(command: &'a str, start: usize, end: usize, out: &mut Vec<&'a str>) -> bool {
-    let segment = command[start..end].trim();
-    if segment.is_empty() {
-        return false;
-    }
-    out.push(segment);
-    true
-}
-
-fn is_read_only_segment(segment: &str) -> bool {
-    let tokens = tokenize(segment);
-    let Some(command) = tokens.first() else {
-        return false;
-    };
-    // `./cat` or `/bin/cat` could point at a workspace binary. Only trust the
-    // commands the user actually has on PATH.
-    if command.contains('/') {
-        return false;
-    }
-    match command.as_str() {
-        "find" => !tokens.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "-exec" | "-execdir" | "-ok" | "-okdir" | "-delete" | "-fls"
-            ) || arg.starts_with("-fprint")
-                || arg.starts_with("-fprintf")
-        }),
-        "rg" => !tokens.iter().any(|arg| {
-            arg == "--pre"
-                || arg.starts_with("--pre=")
-                || arg == "--hostname-bin"
-                || arg.starts_with("--hostname-bin=")
-        }),
-        "fd" | "fdfind" => !tokens.iter().any(|arg| {
-            arg.starts_with("-x")
-                || arg.starts_with("-X")
-                || arg == "--exec"
-                || arg == "--exec-batch"
-                || arg.starts_with("--exec=")
-                || arg.starts_with("--exec-batch=")
-        }),
-        "sort" => !tokens.iter().any(|arg| {
-            arg == "-o"
-                || (arg.starts_with("-o") && !arg.starts_with("--"))
-                || arg == "--output"
-                || arg.starts_with("--output=")
-                || arg == "--compress-program"
-                || arg.starts_with("--compress-program=")
-                || arg == "-T"
-                || (arg.starts_with("-T") && !arg.starts_with("--"))
-                || arg == "--temporary-directory"
-                || arg.starts_with("--temporary-directory=")
-        }),
-        "tree" => !tokens
-            .iter()
-            .any(|arg| arg == "-o" || arg.starts_with("-o") || arg.starts_with("--output")),
-        "ss" => !tokens
-            .iter()
-            .any(|arg| arg.starts_with("-K") || arg == "--kill" || arg.starts_with("--kill=")),
-        other => READ_ONLY_COMMANDS.contains(&other),
-    }
-}
-
-/// Commands that only read files or process input and write to stdout. All of
-/// them are used with shell redirection disabled by `split_shell_segments`.
-const READ_ONLY_COMMANDS: &[&str] = &[
-    "basename",
-    "b2sum",
-    "cat",
-    "cksum",
-    "cmp",
-    "comm",
-    "column",
-    "cut",
-    "df",
-    "diff",
-    "dirname",
-    "du",
-    "echo",
-    "false",
-    "fd",
-    "fdfind",
-    "find",
-    "free",
-    "grep",
-    "head",
-    "id",
-    "join",
-    "jq",
-    "locate",
-    "ls",
-    "lsof",
-    "md5sum",
-    "netstat",
-    "nl",
-    "od",
-    "paste",
-    "pgrep",
-    "printenv",
-    "printf",
-    "ps",
-    "pwd",
-    "readlink",
-    "realpath",
-    "rg",
-    "sha1sum",
-    "sha256sum",
-    "sha512sum",
-    "sort",
-    "ss",
-    "stat",
-    "strings",
-    "tac",
-    "tail",
-    "tr",
-    "tree",
-    "true",
-    "type",
-    "uniq",
-    "uname",
-    "uptime",
-    "wc",
-    "whereis",
-    "which",
-    "whoami",
-    "xxd",
-];
 
 /// One-line description shown in the approval card / notification.
 pub fn summarize(tool: &str, args: &Value) -> String {
@@ -2013,6 +1768,24 @@ impl CommandPlan {
     }
 }
 
+fn expand_sandbox_path(value: &str, workspace: &Path) -> PathBuf {
+    let trimmed = value.trim();
+    if trimmed == "~" {
+        return sandbox::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    }
+    if let Some(rest) = trimmed.strip_prefix("~/") {
+        if let Some(home) = sandbox::home_dir() {
+            return home.join(rest);
+        }
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    }
+}
+
 /// Resolve a shell command into a concrete (possibly sandboxed) invocation.
 pub fn command_plan(
     command: &str,
@@ -2027,9 +1800,9 @@ pub fn command_plan(
     let command_cwd = command_cwd.canonicalize().unwrap_or(command_cwd);
     let sandboxed = match config.tools.sandbox {
         SandboxMode::Off => false,
-        SandboxMode::Bwrap => {
+        SandboxMode::Required => {
             if !sandbox::bwrap_available() {
-                bail!("tools.sandbox = \"bwrap\" but bwrap is not installed");
+                bail!("tools.sandbox = \"required\" but bwrap is not installed");
             }
             true
         }
@@ -2041,16 +1814,25 @@ pub fn command_plan(
         let workspace = session_cwd
             .canonicalize()
             .unwrap_or_else(|_| session_cwd.to_path_buf());
-        let home = if config.tools.sandbox_read_home {
-            sandbox::home_dir()
-        } else {
-            None
-        };
+        let read_paths: Vec<PathBuf> = config
+            .tools
+            .sandbox_read_paths
+            .iter()
+            .map(|path| expand_sandbox_path(path, &workspace))
+            .collect();
+        let writable_roots: Vec<PathBuf> = config
+            .tools
+            .sandbox_writable_roots
+            .iter()
+            .map(|path| expand_sandbox_path(path, &workspace))
+            .filter(|path| path != &workspace)
+            .collect();
         args.extend(sandbox::bwrap_args(
             &workspace,
             &command_cwd,
             config.tools.sandbox_network,
-            home.as_deref(),
+            &read_paths,
+            &writable_roots,
         ));
         args.push("sh".into());
     }
@@ -2645,12 +2427,12 @@ mod tests {
                 spec.name
             );
             assert!(
-                !(spec.subagent_allowed && spec.requires_approval),
+                !(spec.subagent_allowed && hard_mutating(spec.name)),
                 "{} would let a read-only sub-agent mutate the workspace",
                 spec.name
             );
             assert!(
-                !(spec.parallel_safe && spec.requires_approval),
+                !(spec.parallel_safe && hard_mutating(spec.name)),
                 "{} cannot be both mutating and parallel-safe",
                 spec.name
             );
@@ -2662,7 +2444,6 @@ mod tests {
         }
         for spec in TOOL_SPECS {
             assert_eq!(parallel_safe(spec.name), spec.parallel_safe);
-            assert_eq!(requires_approval(spec.name), spec.requires_approval);
         }
     }
 
@@ -2709,70 +2490,14 @@ mod tests {
             "read_file src/a.rs"
         );
         assert!(summarize("run_command", &json!({"command": "ls"})).starts_with("run_command:"));
-        assert!(requires_approval("write_file"));
-        assert!(requires_approval("edit"));
-        assert!(requires_approval("patch"));
-        assert!(!requires_approval("read_file"));
-        assert!(!requires_approval("grep"));
-        assert!(!requires_approval("glob"));
         assert!(is_known("ask_user"));
         assert!(is_known("grep"));
-        assert!(!requires_approval("ask_user"));
-    }
-
-    #[test]
-    fn read_only_commands_bypass_approval_but_writes_do_not() {
-        for command in [
-            "cat Cargo.toml",
-            "rg -n secret src",
-            "grep -R token .",
-            "fd '\\.rs$'",
-            "find . -name '*.rs'",
-            "cat file | head -20",
-            "rg foo src && wc -l src/lib.rs",
-        ] {
-            assert!(is_read_only_command(command), "{command}");
-            assert!(
-                !requires_approval_for("run_command", &json!({"command": command})),
-                "{command}"
-            );
-        }
-
-        for command in [
-            "rm -rf /",
-            "cat file > out.txt",
-            "cat file >> out.txt",
-            "cat $(rm -rf /)",
-            "cat `rm -rf /`",
-            "cat file && rm file",
-            "cat file; rm file",
-            "find . -delete",
-            "find . -exec rm {} +",
-            "find . -fprint out.txt",
-            "rg --pre ./evil foo",
-            "rg --pre=./evil foo",
-            "fd -x rm",
-            "fd -xrm",
-            "ss -Kt",
-            "fd --exec rm",
-            "fd --exec=rm",
-            "fd --exec-batch rm",
-            "fd --exec-batch=rm",
-            "sort -o out.txt input.txt",
-            "tree -o out.txt",
-            "sh -c 'cat file'",
-            // Git subcommands can invoke configured hooks/filters, so even
-            // apparently read-only ones stay behind the approval gate.
-            "git status",
-            "git checkout main",
-            "./cat file",
-        ] {
-            assert!(!is_read_only_command(command), "{command}");
-            assert!(
-                requires_approval_for("run_command", &json!({"command": command})),
-                "{command}"
-            );
-        }
+        assert!(hard_mutating("write_file"));
+        assert!(hard_mutating("edit"));
+        assert!(hard_mutating("patch"));
+        assert!(!hard_mutating("read_file"));
+        assert!(!hard_mutating("grep"));
+        assert!(!hard_mutating("glob"));
     }
 
     #[test]

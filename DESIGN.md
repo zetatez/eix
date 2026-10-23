@@ -279,7 +279,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `@` | 文件 picker（行首/空白后） |
 | `Esc` | insert/visual → normal；normal 下 500ms 内再按一次：有 turn 在跑时中断它，否则回到转录区 |
 | `Ctrl-J` / `Ctrl-K` | normal 模式下浏览已提交的 prompt 历史（newer / older） |
-| `Ctrl-T` | 任意焦点：推理强度 low → medium → high → 空 → low |
+| `Ctrl-T` | 任意焦点：推理强度 low → medium → high → 空 → low（默认 medium） |
 | `Tab` | normal 模式下切换 Build / Plan 模式（命令面板的 `Build / Plan` 同义） |
 | `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
 | `<Space>s/o/f/w/b/c/C/h/p/R/n/N/W/F/v/t/r/l/x/i/A/a/:` | TUI 动作（见 5.1）；裸字母不触发动作 |
@@ -412,9 +412,10 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 - agent 的读操作看到的是 `真实工作区 + 已 stage 改动` 的合并视图，避免"自己改了什么自己不知道"。
 - shell 命令无法 stage：写操作走审批门禁 + 执行前快照（git stash 或目录快照），风险等级单独标注。
 - 只读 shell 命令（`grep` / `rg` / `fd` / `find` / `cat` / `head` / `tail` / `wc` /
-  `ls` / `stat` / `diff` 等）走保守白名单，不弹审批、不抓快照。重定向、后台运行、
-  命令替换、子 shell、`find -exec` / `-delete`、`rg --pre`、`fd -x` 以及所有未知命令
-  仍按写操作处理，避免白名单被 shell 语法绕过。
+  `ls` / `stat` / `diff` / `git status` 等）由统一风险分析判为 `ExecSafe`，不弹审批、
+  不抓快照。重定向、后台运行、命令替换、子 shell、`find -exec` / `-delete`、
+  `rg --pre`、`fd -x` 以及所有未知命令仍按风险处理（unknown 默认 ask），避免被 shell
+  语法绕过。构建命令判为 `ExecSandboxed`，优先在沙箱内执行。
 
 ### 9.2 审批 UI
 
@@ -469,21 +470,49 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 
 ### 9.3 权限策略
 
-- 级别（已实现，按 session）：`read-only` / `workspace-write` / `full`，存于 `sessions.permission`
-  （旧库自动迁移，默认 `workspace-write`）。`session.create` 可带 `permission`；
-  `session.permission` 可在运行时切换，`temporary: true` 只存内存并在事件日志留下
-  `permission` 事件，daemon 重启后回到持久值。
-  - `read-only`：不向模型暴露写工具，运行时拒绝 `write_file` / `start_command` 和会修改文件的
-    `run_command`；白名单内的只读 shell 命令仍可执行（例如用户显式 `shell.run cat ...`）。
-  - `workspace-write`：仍受全局 `[tools] policy` 的 `ask` / `auto` 约束，路径限制在 workspace 内。
-  - `full`：跳过审批直接执行写工具（路径限制仍作为纵深防御保留）；全局 `read-only` 仍是硬上限。
-  - 子 agent 永远只读，与父 session 的级别无关。
-- 全局 `[tools] policy`（`ask` / `auto` / `read-only`）仍作为默认值与上限。
-- 自动批准规则（已实现）：`[[tools.auto_approve]]`，字段 `tool` + `path` glob +
-  `command_prefix` / `command_regex`（全部给出时是 AND）。只放宽 `ask`；全局或 session
-  的 `read-only`、子 agent 只读仍是硬上限，`full` 不经过规则。`path` 先做词法归一化，
-  绝对路径和 `..` 逃逸不会匹配；`command_prefix` 匹配整条 shell 字符串，需要更严格时用
-  `command_regex`。只读工具本来就不进审批门禁。
+权限按四层处理，层与层之间没有隐式跳过：
+
+1. **能力上限**：session 的 `read-only` / `workspace-write` / `full`，存于
+   `sessions.permission`（旧库自动迁移，默认 `workspace-write`）。`session.create` 可带
+   `permission`；`session.permission` 可在运行时切换，`temporary: true` 只存内存并在事件日志
+   留下 `permission` 事件，daemon 重启后回到持久值。子 agent 永远按只读处理。
+   - `read-only`：隐藏 `write_file` / `edit` / `patch` / `start_command`；运行时拒绝所有写入、
+     危险执行、网络 MCP 和 `ExecUnknown`。保留 `run_command`，以便 `git status` / `cat` /
+     `grep` 等只读检查；写重定向和 `rm` 仍会被拒绝。
+   - `workspace-write`：默认级别，路径限制在 workspace 内，是否询问由风险、规则和 approval
+     mode 决定。
+   - `full`：只解除能力上限；仍然执行硬拒绝、`deny` 规则、只读命令分类和沙箱要求。
+2. **风险分析**：`eix-core/src/risk.rs` 对具体调用分类：`Read` / `SecretRead` / `WriteLocal` /
+   `WriteExternal` / `ExecSafe` / `ExecUnknown` / `ExecSandboxed` / `Destructive` / `Network` /
+   `GitPublish` / `GitRewrite` / `McpWrite` / `Privilege` / `SecretExfil`，并给出 low/medium/
+   high/critical。shell tokenizer 拆 segment、重定向、wrapper 和嵌套 shell；只读路径、secret
+   路径、构建命令、网络命令和 Git 写操作分别归类。不可恢复的灾难命令（`rm -rf /`、块设备
+   `dd`、`mkfs`、关机、fork bomb）、私钥读取、网络/命令/MCP 中的 secret 占位符进入
+   `hard_deny`。
+3. **规则**：`[[tools.rules]]`，字段 `id` / `tool` / `path` / `command` / `command_regex` /
+   `signature` / `action = allow|ask|deny|sandbox`。`deny` 先全局扫描，任意来源的 deny 都
+   胜出；其余规则按具体度选择，平局按 `Session > User > Project > Builtin`。`command` 是
+   argv token 前缀；`deny` 在任一 shell segment 命中时生效（`echo hi && rm -rf build` 命中
+   `command = ["rm"]`），非 deny 规则要求所有 segment 都满足，且带重定向的命令不会命中
+   `command` 前缀，避免 `cargo test && rm` 或 `echo hi > /etc/passwd` 被 allow。
+4. **approval / sandbox**：`[tools] approval = "ask" | "auto"` 只决定默认 ask 是否自动放行；
+   `auto` 不绕过硬拒绝、显式 deny、能力上限或“需要沙箱但沙箱不可用”。`sandbox = "auto" |
+   "required" | "off"` 只决定在哪执行：构建命令默认 sandbox；bwrap 不可用时 auto 降级为
+   强制审批，required 直接阻断。
+
+项目层 `.eix/config.toml` 只能收紧：`approval = "auto"`、`sandbox = "off"`、
+`sandbox_network = true`、`external_directory`、`network_allow`、额外 sandbox 只读/可写路径
+会被忽略；项目 `allow` 规则降级为 `ask`；`snapshots = false` 被忽略。所有拒绝都写入
+`Config::security_warnings`。
+
+审批卡片显示风险等级、原因、解析后的命令、命中规则及来源、沙箱状态和可用 scope。
+`HIGH` / `CRITICAL` 不提供 `Always`，服务端也会拒绝将其升级为持久规则；`Once` 不记忆，
+`Session` 只存在内存，`User` 追加到用户配置。每次决策写 `permission_evaluated` 审计事件
+（action、risk、categories、reasons、rule、rule_source、sandbox），网络 URL query 脱敏。
+
+`webfetch` / `websearch` 归入 network 风险：默认 ask，`network_allow` 命中才 allow。
+secret 占位符只对本地文件工具还原；shell、网络和 MCP 参数中的占位符会触发 `secret-exfil`
+硬拒绝。
 
 ## 10. Context ledger
 
@@ -505,7 +534,10 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 - `tools` / `history` 超预算时保留最新 4 条；若总预算仍超，emergency trim 只保护当前 user
   消息和最新工具结果，避免一轮大输出让后续请求永久失败。
 - 压缩是**显式事件**：历史里出现 `compacted 12 messages → summary`，可展开查看原文。
-- 自动压缩在每个工具批次后也会检查；provider 报 context-length 时强制压缩并重试。
+- 自动压缩在每个工具批次后也会检查；provider 报 context-length / 413 时强制压缩并重试。
+- provider 重试按错误类型分派：瞬时故障使用抖动指数退避（默认 8 次、250ms 起）；429 优先
+  `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
+  `kind`，TUI 用简短标签显示原因。
 - 删除/pin 是 session 级策略，可保存为项目默认。
 
 ## 11. 事件与协议（草案）
@@ -580,7 +612,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
   Bearer、URL 凭据、PEM 私钥和敏感赋值替换为 per-provider salt 哈希出的占位符；模型返回的
   tool-call 参数和文本在本地执行/持久化前还原。映射不离开进程，事件日志和 TUI 保留原文。
   图片不做文本脱敏。
-- 网络/破坏性命令默认需要审批；只读 shell 命令的白名单见 §9.1。
+- 网络/破坏性命令默认需要审批；只读 shell 命令的风险分类见 §9.1。
 - 配置文件与日志权限收紧；不把 API key 写进项目目录。
 
 ## 15. 风险
@@ -660,24 +692,26 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 事件并广播 `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
 > 选中的 hunk）。
-> 策略：`[tools] policy = ask|auto|read_only`（默认 ask）。`write_file` 在 stage 时生成
-> unified diff 和逐 hunk 预览并随 `patch_proposed` 事件广播，TUI 卡片与 `d` 全屏审阅
-> 将 unified diff 转成左旧右新的 side-by-side 视图（syntax highlight，窄宽回退 unified），
-> CLI 保留 unified 输出。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
+> 策略：`[tools] approval = ask|auto`（默认 ask）加 `[[tools.rules]]`；低/中风险 `write_file` /
+> `edit` 在 stage 时生成 unified diff 和逐 hunk 预览并随 `patch_proposed` 事件广播，TUI 卡片与
+> `d` 全屏审阅将 unified diff 转成左旧右新的 side-by-side 视图（syntax highlight，窄宽回退
+> unified），CLI 保留 unified 输出。高风险/forced ask 写入不 stage，直接弹出带风险元数据的审批
+> 卡片。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
 > 全不选、`y` 只应用选中的 hunk（全选时整文件），`n` 拒绝；`patch.apply` / `approval.respond`
 > 接受可选 `hunks` 索引列表。应用时用基准内容拼出结果再落盘，并重新校验文件内容：
 > stage 后被外部修改则记 conflict、不覆盖。
-> `run_command` 默认用 bubblewrap 隔离（`[tools] sandbox = auto|bwrap|off`，`sandbox_network`
-> 控制是否 `--unshare-net`，`sandbox_read_home` 决定 `$HOME` 只读挂载还是隐藏）：宿主只读、
-> 仅 session workspace 可写、`/tmp` 为私有 tmpfs；bwrap 缺失时 `auto` 退回直接执行，
-> `bwrap` 模式则拒绝执行。
+> `run_command` 默认用 bubblewrap 隔离（`[tools] sandbox = auto|required|off`，
+> `sandbox_network` 控制是否 `--unshare-net`，`sandbox_read_paths` 逐个只读挂载工具链缓存，
+> `sandbox_writable_roots` 额外开放目录）：系统只读、仅 session workspace 可写、`/tmp`
+> 为私有 tmpfs，默认不挂载整个 `$HOME`。bwrap 缺失时 `auto` 把需要沙箱的命令降级为强制
+> 审批，`required` 直接阻断。
 > 执行前快照已落地：`write_file` 复制目标文件（含“原本不存在”这一事实），`run_command`
 > 复制整个 workspace；排除 `.git` / `target` / `node_modules` / `.venv` / `dist` 等派生目录，
 > 单文件 8 MB、总量 200 MB、条目 5 万上限，跳过数与失败都记入 `snapshot` 事件（失败时工具
 > 输出也带一行说明），每个 session 保留 20 份。`Snapshotter::restore` 已实现并有测试覆盖，
 > 供 Phase 3 的 rewind 调用；事件日志只存索引，快照字节在 `<data>/snapshots/<session>/<id>/`。
 > `[tools] snapshots = false`（`EIX_TOOL_SNAPSHOTS=0`）可在大仓库里关闭。
-> Staged shadow workspace 已落地：`ask` 策略下 `write_file` 先把提案写入
+> Staged shadow workspace 已落地：`ask` 策略下低/中风险 `write_file` / `edit` 先把提案写入
 > `<data>/staging/<session>/<patch_id>.json` 并立即返回 `staged ...`，turn 不阻塞；
 > `read_file` / `list_dir` 看到“真实工作区 + staged”合并视图，同一文件再次写入以最新
 > staged 内容为基准，可以叠加。`patch.proposed|applied|rejected|conflict` 事件与同名通知
@@ -796,7 +830,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 的 `/models`，选择 id 为 `<provider>/<api-model-id>`（`[provider]` 的自动项用 `default/`
 > 前缀）。`[[models]]` 仍可手动固定模型、补充成本/上下文/variants，或用 `provider` 复用命名
 > endpoint。`Config::route` 解析 provider 前缀和 `id#variant`，变体作为 `reasoning_effort`
-> 发送。`model.list` / `session.model` / `/model` picker（含变体行）已接入；`turn.completed`
+> 发送；未指定变体时默认 `medium`，保留值 `#none` 表示不发送。`model.list` / `session.model` /
+> `/model` picker（含变体行）已接入；`turn.completed`
 > 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
 >
 > MCP：`eixd/src/mcp.rs` 实现 stdio JSON-RPC 客户端，`[mcp.servers.<name>]` 懒启动并缓存进程。

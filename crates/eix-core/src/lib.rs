@@ -15,6 +15,7 @@ pub mod picker;
 pub mod process;
 pub mod protocol;
 pub mod redact;
+pub mod risk;
 pub mod sandbox;
 pub mod search;
 pub mod session;
@@ -23,20 +24,20 @@ pub mod skills;
 pub use agents::{find_agent, load_agents, AgentMode, AgentSpec};
 pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
-    load_cli_config, models_endpoint, theme_preset, AutoApproveRule, CliConfig, Config,
-    ConfigError, ContextConfig, FormatterConfig, ImagesConfig, LspConfig, LspServerConfig,
-    McpConfig, McpServerConfig, ModelConfig, ModelInfo, ModelRoute, NamedProviderConfig,
-    NotificationsConfig, PermissionAction, PermissionRule, ProviderConfig, ProviderSource,
-    SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolPolicy, ToolsConfig, THEME_PRESETS,
+    load_cli_config, models_endpoint, theme_preset, ApprovalMode, CliConfig, Config, ConfigError,
+    ContextConfig, FormatterConfig, ImagesConfig, LspConfig, LspServerConfig, McpConfig,
+    McpServerConfig, ModelConfig, ModelInfo, ModelRoute, NamedProviderConfig, NotificationsConfig,
+    PermissionAction, PermissionRule, ProviderConfig, ProviderSource, RuleSource, SandboxMode,
+    ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ContextClearedPayload,
     ContextCompactedPayload, ContextDropPayload, ContextPinPayload, ErrorPayload, Event, EventKind,
     HunkInfo, ImageAttachment, InputAnsweredPayload, InputOption, InputRequiredPayload,
-    PatchProposedPayload, PatchResultPayload, PermissionPayload, ProcessExitedPayload,
-    ProcessStartedPayload, SnapshotPayload, StatusChangedPayload, ToolCallPayload,
-    ToolResultPayload, UserMessagePayload,
+    PatchProposedPayload, PatchResultPayload, PermissionEvaluatedPayload, PermissionPayload,
+    ProcessExitedPayload, ProcessStartedPayload, SnapshotPayload, StatusChangedPayload,
+    ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 pub use message::{
     ChatMessage, FunctionCall, FunctionDefinition, ImagePart, Role, ToolCall, ToolDefinition, Usage,
@@ -48,8 +49,8 @@ pub use picker::{
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{
     AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams, ApprovalListResult,
-    ApprovalRespondParams, ApprovalResult, AttachParams, AttachResult, AuthParams, AuthResult,
-    BtwParams, BtwResult, CancelResult, ContextClearParams, ContextCompactParams,
+    ApprovalRespondParams, ApprovalResult, ApprovalScope, AttachParams, AttachResult, AuthParams,
+    AuthResult, BtwParams, BtwResult, CancelResult, ContextClearParams, ContextCompactParams,
     ContextDropParams, ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams,
     DraftResult, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult, InputRespondParams,
     InputResult, LspDiagnosticInfo, LspWorkspaceParams, LspWorkspaceResult, McpListResult,
@@ -61,6 +62,10 @@ pub use protocol::{
     SessionRef, SessionResult, ShellRunParams, ShellRunResult, StatsResult, SubmitParams,
     SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, TodoItem,
     TodoList, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+};
+pub use risk::{
+    analyze_command, assess_command, assess_read_path, assess_write_path, path_is_private_key,
+    path_is_secret, CommandAnalysis, CommandSegment, RiskAssessment, RiskCategory, RiskLevel,
 };
 pub use search::{SearchHit, SearchParams, SearchResult};
 pub use session::{PermissionLevel, Session, SessionId, SessionOrigin, SessionStatus};

@@ -434,6 +434,13 @@ fn is_placeholder(value: &str) -> bool {
     value.starts_with(PLACEHOLDER_PREFIX) && value.ends_with("}}")
 }
 
+/// True when `value` contains one of this process's redaction placeholders.
+pub fn contains_placeholder(value: &str) -> bool {
+    value
+        .find(PLACEHOLDER_PREFIX)
+        .is_some_and(|start| value[start..].contains("}}"))
+}
+
 /// Replace `needle` only when it is a standalone token. Scrubbing a known
 /// password as a substring would corrupt ordinary identifiers that merely
 /// contain it, so boundaries must not be alphanumeric, `_` or `-`.

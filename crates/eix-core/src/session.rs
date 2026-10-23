@@ -113,21 +113,21 @@ impl std::str::FromStr for SessionOrigin {
 
 /// What a session is allowed to do to the workspace.
 ///
-/// This is a per-session safety boundary on top of the global `[tools] policy`:
-/// the global policy can still be stricter (e.g. `read-only` always wins), but
-/// it can never widen a session's level.
+/// This is the per-session capability ceiling. Risk rules and the approval
+/// mode decide what happens below it; none of them can widen this level.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum PermissionLevel {
-    /// Mutating tools are refused; reads are always allowed.
+    /// Mutating tools are refused; safe reads and read-only shell commands are
+    /// allowed.
     #[serde(rename = "read-only")]
     ReadOnly,
-    /// The default: mutating tools are gated by `[tools] policy` and paths stay
-    /// inside the session workspace.
+    /// The default: risk rules and `[tools] approval` decide whether a call is
+    /// allowed, sandboxed or asked about; paths stay inside the workspace.
     #[default]
     #[serde(rename = "workspace-write")]
     WorkspaceWrite,
-    /// Mutating tools run without asking (the workspace path check remains as
-    /// defense in depth). Intended for trusted, disposable sessions.
+    /// Removes the capability ceiling only. Hard denials, explicit rules and
+    /// approval mode still apply; the workspace path check remains.
     #[serde(rename = "full")]
     Full,
 }
