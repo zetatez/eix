@@ -47,26 +47,26 @@ pub use message::{
 };
 pub use picker::{
     is_data_kind, PickerItem, PickerParams, PickerPreviewParams, PickerPreviewResult, PickerResult,
-    DATA_KINDS, KIND_BRANCHES, KIND_CONTEXT, KIND_FILES, KIND_SESSION_PREVIEW, KIND_WORKTREES,
+    DATA_KINDS, KIND_BRANCHES, KIND_FILES, KIND_SESSION_PREVIEW, KIND_WORKTREES,
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{
     AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams, ApprovalListResult,
     ApprovalRespondParams, ApprovalResult, ApprovalScope, AttachParams, AttachResult, AuthParams,
     AuthResult, BtwParams, BtwResult, CancelResult, ContextClearParams, ContextCompactParams,
-    ContextDropParams, ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams,
-    DraftResult, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult, InputRespondParams,
-    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
-    LspDiagnosticInfo, LspWorkspaceParams, LspWorkspaceResult, McpListResult, McpServerInfo,
-    ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
-    PatchRejectParams, PatchResult, PatchReviseParams, PermissionParams, ProcessKillParams,
-    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
-    RewindResult, ServerMessage, SessionAgentParams, SessionArchiveParams, SessionCdParams,
-    SessionExport, SessionExportResult, SessionImportParams, SessionList, SessionModelParams,
-    SessionReadyParams, SessionRef, SessionResult, ShellRunParams, ShellRunResult, StatsResult,
-    SubagentConcurrencyParams, SubagentConcurrencyResult, SubmitParams, SubmitResult,
-    SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, TodoItem, TodoList,
-    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    CreateSessionParams, DraftParams, DraftResult, Endpoint, EventsParams, EventsResult,
+    ForkParams, HelloResult, InputRespondParams, InputResult, IntegrationContinueParams,
+    IntegrationListParams, IntegrationListResult, LspDiagnosticInfo, LspWorkspaceParams,
+    LspWorkspaceResult, McpListResult, McpServerInfo, ModelListResult, Notification,
+    PatchApplyParams, PatchGetParams, PatchGetResult, PatchRejectParams, PatchResult,
+    PatchReviseParams, PermissionParams, ProcessKillParams, ProcessListParams, ProcessOutputParams,
+    RenameParams, Request, Response, RewindParams, RewindResult, ServerMessage, SessionAgentParams,
+    SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult, SessionImportParams,
+    SessionList, SessionModelParams, SessionReadyParams, SessionRef, SessionResult, ShellRunParams,
+    ShellRunResult, StatsResult, SubagentConcurrencyParams, SubagentConcurrencyResult,
+    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult,
+    TodoItem, TodoList, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SESSION_EXPORT_VERSION,
 };
 pub use risk::{
     analyze_command, assess_command, assess_read_path, assess_write_path, path_is_private_key,

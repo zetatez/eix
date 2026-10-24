@@ -8,10 +8,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use eix_core::{
-    ApprovalDecision, ApprovalResult, AttachResult, CancelResult, ContextLedgerResult, Endpoint,
-    EventsResult, HelloResult, InputResult, IntegrationListResult, IntegrationState, Notification,
-    ProcessKillResult, ProcessList, ProcessOutput, RewindResult, SearchResult, Session,
-    SessionList, SessionResult, SubmitResult,
+    ApprovalDecision, ApprovalResult, AttachResult, CancelResult, Endpoint, EventsResult,
+    HelloResult, InputResult, IntegrationListResult, IntegrationState, Notification,
+    ProcessKillResult, ProcessList, ProcessOutput, SearchResult, Session, SessionList,
+    SessionResult, SubmitResult,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -160,13 +160,6 @@ pub enum Command {
         input_id: String,
         option_index: usize,
     },
-    ContextLedger {
-        session_id: String,
-    },
-    ContextOp {
-        session_id: String,
-        op: ContextOp,
-    },
     ProcessList {
         session_id: String,
     },
@@ -179,12 +172,6 @@ pub enum Command {
     Fork {
         session_id: String,
         /// Copy history before this sequence; `None` copies everything.
-        at_seq: Option<u64>,
-        name: Option<String>,
-    },
-    Rewind {
-        session_id: String,
-        /// Restore the workspace to just before this sequence.
         at_seq: Option<u64>,
         name: Option<String>,
     },
@@ -225,13 +212,6 @@ pub enum Command {
     },
 }
 
-/// Ledger edits map one-to-one onto `context.*` requests.
-pub enum ContextOp {
-    Drop { entry: String, dropped: bool },
-    Pin { entry: String, pinned: bool },
-    Compact { from_seq: u64, to_seq: u64 },
-}
-
 impl Command {
     fn label(&self) -> &'static str {
         match self {
@@ -266,12 +246,10 @@ impl Command {
             Self::Cancel(_) => "cancel",
             Self::Approval { .. } => "approval",
             Self::Input { .. } => "answer",
-            Self::ContextLedger { .. } | Self::ContextOp { .. } => "context",
             Self::ProcessList { .. } => "processes",
             Self::ProcessOutput { .. } => "process output",
             Self::ProcessKill { .. } => "kill process",
             Self::Fork { .. } => "fork",
-            Self::Rewind { .. } => "rewind",
             Self::Search { .. } => "search",
             Self::PickerData { .. } => "picker",
             Self::PickerPreview { .. } => "picker preview",
@@ -321,10 +299,6 @@ pub enum Event {
     InputResponded {
         accepted: bool,
     },
-    Ledger {
-        session_id: String,
-        result: ContextLedgerResult,
-    },
     Processes {
         session_id: String,
         result: ProcessList,
@@ -337,7 +311,6 @@ pub enum Event {
         killed: bool,
     },
     Forked(Session),
-    Rewound(Box<RewindResult>),
     Search(SearchResult),
     PickerData {
         kind: String,
@@ -856,42 +829,6 @@ async fn dispatch(
                 },
             )
         }
-        Command::ContextLedger { session_id } => {
-            let value = requester
-                .request("context.ledger", json!({ "session_id": session_id }))
-                .await?;
-            send(
-                events,
-                Event::Ledger {
-                    session_id,
-                    result: decode(value)?,
-                },
-            )
-        }
-        Command::ContextOp { session_id, op } => {
-            let (method, params) = match op {
-                ContextOp::Drop { entry, dropped } => (
-                    "context.drop",
-                    json!({ "session_id": session_id, "entry": entry, "dropped": dropped }),
-                ),
-                ContextOp::Pin { entry, pinned } => (
-                    "context.pin",
-                    json!({ "session_id": session_id, "entry": entry, "pinned": pinned }),
-                ),
-                ContextOp::Compact { from_seq, to_seq } => (
-                    "context.compact",
-                    json!({ "session_id": session_id, "from_seq": from_seq, "to_seq": to_seq }),
-                ),
-            };
-            let value = requester.request(method, params).await?;
-            send(
-                events,
-                Event::Ledger {
-                    session_id,
-                    result: decode(value)?,
-                },
-            )
-        }
         Command::ProcessList { session_id } => {
             let value = requester
                 .request("process.list", json!({ "session_id": session_id }))
@@ -941,20 +878,6 @@ async fn dispatch(
                 .await?;
             let result: SessionResult = decode(value)?;
             send(events, Event::Forked(result.session))
-        }
-        Command::Rewind {
-            session_id,
-            at_seq,
-            name,
-        } => {
-            let value = requester
-                .request(
-                    "session.rewind",
-                    json!({ "session_id": session_id, "at_seq": at_seq, "name": name }),
-                )
-                .await?;
-            let result: RewindResult = decode(value)?;
-            send(events, Event::Rewound(Box::new(result)))
         }
         Command::Search {
             query,

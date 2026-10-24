@@ -22,26 +22,24 @@ use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
     ApprovalScope, AttachParams, AttachResult, AuthParams, AutoReady, BtwParams, BtwResult,
     CancelResult, ChatMessage, Config, ContextClearParams, ContextClearedPayload,
-    ContextCompactParams, ContextCompactedPayload, ContextDropParams, ContextDropPayload,
-    ContextLedgerParams, ContextPinParams, ContextPinPayload, CreateSessionParams, DraftParams,
-    DraftResult, ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams,
-    FunctionCall, HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload,
-    InputRespondParams, InputResult, IntegrationContinueParams, IntegrationListParams,
-    IntegrationListResult, IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult,
-    McpServerInfo, ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
+    ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DraftParams, DraftResult,
+    ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
+    HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams,
+    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
+    IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo,
+    ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
     PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
     PermissionAction, PermissionLevel, PermissionParams, PermissionPayload, PermissionRule,
-    PickerItem, PickerParams, PickerPreviewParams, PickerPreviewResult, PickerResult,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    RenameParams, Request, Response, RewindParams, RewindResult, RuleSource, SearchParams,
-    SearchResult, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
-    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
-    SessionList, SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef, SessionResult,
-    SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
-    StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
-    SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
-    ToolResultPayload, UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult,
-    PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    PickerParams, PickerPreviewParams, PickerPreviewResult, ProcessKillParams, ProcessKillResult,
+    ProcessList, ProcessListParams, ProcessOutputParams, RenameParams, Request, Response,
+    RewindParams, RewindResult, RuleSource, SearchParams, SearchResult, ServerMessage, Session,
+    SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
+    SessionId, SessionImportParams, SessionList, SessionModelParams, SessionOrigin,
+    SessionReadyParams, SessionRef, SessionResult, SessionStatus, ShellRunParams, ShellRunResult,
+    SnapshotPayload, StatsResult, StatusChangedPayload, SubagentConcurrencyParams, SubmitParams,
+    SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, ToolCall,
+    ToolCallPayload, ToolDefinition, ToolResultPayload, UserMessagePayload, WorktreeRemoveParams,
+    WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -564,6 +562,25 @@ impl Daemon {
         crate::worktree::resolve_base(repo, &configured).await
     }
 
+    /// Base for a new session: the branch checked out in the directory where
+    /// the user started it. Explicit `[worktree] base` / per-repo `base`
+    /// settings still win; `auto` now means "this branch", not "main/master".
+    async fn base_for_session(&self, dir: &Path, repo: &Path) -> Result<String> {
+        let config = self.config.load_full();
+        let configured = config
+            .integration
+            .repo_base(repo)
+            .unwrap_or(&config.worktree.base)
+            .to_string();
+        let configured = configured.trim();
+        if configured.is_empty() || configured == "auto" {
+            if let Some(branch) = crate::worktree::branch(dir).await {
+                return Ok(branch);
+            }
+        }
+        crate::worktree::resolve_base(repo, configured).await
+    }
+
     /// Name a worktree from the user's task text. The model call is on the
     /// first prompt's critical path, so provider failure falls back to an
     /// ASCII task slug rather than blocking the turn.
@@ -638,7 +655,17 @@ impl Daemon {
             let Some(repo) = crate::worktree::main_repo(&session.cwd).await else {
                 return Ok(session);
             };
-            let base = self.base_for_repo(&repo).await?;
+            // Recorded when the session was created, before the user could
+            // switch branches. Legacy rows have no stored base, so resolve it
+            // at first prompt.
+            let base = match self
+                .store
+                .get_integration(&session.id)?
+                .and_then(|state| state.base_branch)
+            {
+                Some(base) => base,
+                None => self.base_for_session(&session.cwd, &repo).await?,
+            };
             let name = self.generate_worktree_name(&session, text).await;
             let created =
                 crate::worktree::create_from_base(&session.cwd, &name, Some(&base)).await?;
@@ -935,6 +962,21 @@ impl Daemon {
             },
         };
         state.base_branch = Some(base.clone());
+        // The base branch is the branch the user was on when the session was
+        // created. It may live in a linked worktree rather than the main one;
+        // find that checkout before syncing/merging.
+        let base_worktree = match crate::worktree::worktree_for_branch(&repo, &base).await {
+            Some(path) => path,
+            None => {
+                return self.retry_integration(
+                    &session,
+                    state,
+                    format!(
+                        "base branch {base} is not checked out in any worktree; check it out before ready"
+                    ),
+                );
+            }
+        };
         state.status = IntegrationStatus::Syncing;
         state.stage = Some("base".into());
         state.updated_at = now_ms();
@@ -946,7 +988,7 @@ impl Daemon {
         );
 
         let (base_head, sync_commands) = if config.integration.repo_pull_base(&repo) {
-            match crate::worktree::sync_base(&repo, &base).await {
+            match crate::worktree::sync_base(&base_worktree, &base).await {
                 Ok(run) => (run.head, run.commands),
                 Err(err) => {
                     let detail = format!("base sync: {err:#}");
@@ -959,7 +1001,7 @@ impl Daemon {
                 }
             }
         } else {
-            match crate::worktree::require_base(&repo, &base).await {
+            match crate::worktree::require_base(&base_worktree, &base).await {
                 Ok(head) => (head, Vec::new()),
                 Err(err) => {
                     return self.retry_integration(&session, state, format!("base head: {err:#}"));
@@ -1162,7 +1204,7 @@ impl Daemon {
                 .await;
         }
 
-        let current_base = match crate::worktree::require_base(&repo, &base).await {
+        let current_base = match crate::worktree::require_base(&base_worktree, &base).await {
             Ok(head) => head,
             Err(err) => {
                 return self.retry_integration(&session, state, format!("base head: {err:#}"));
@@ -1197,7 +1239,7 @@ impl Daemon {
             IntegrationStatus::Merging,
             format!("integration merging · {branch} → {base}"),
         );
-        let merge_log = match crate::worktree::merge_ff(&repo, &branch).await {
+        let merge_log = match crate::worktree::merge_ff(&base_worktree, &branch).await {
             Ok(log) => log,
             Err(err) => {
                 return self
@@ -1210,7 +1252,7 @@ impl Daemon {
                     .await;
             }
         };
-        let merged_commit = crate::worktree::head(&repo).await.ok();
+        let merged_commit = crate::worktree::head(&base_worktree).await.ok();
         state.status = IntegrationStatus::Merged;
         state.stage = None;
         state.error = None;
@@ -1242,7 +1284,7 @@ impl Daemon {
             }),
         );
         if config.integration.push {
-            match crate::worktree::push_base(&repo, &base).await {
+            match crate::worktree::push_base(&base_worktree, &base).await {
                 Ok(log) => self.note_integration(
                     &session.id,
                     IntegrationStatus::Merged,
@@ -2252,7 +2294,19 @@ impl Daemon {
                         .await
                         .or_else(|| Some(source.cwd.clone()))
                         .unwrap_or_else(|| source.cwd.clone());
-                    let base = self.base_for_repo(&repo).await?;
+                    // A fork of a worktree session should branch from that
+                    // session's base branch, not from its temporary `eix/...`
+                    // branch. A shared source has no temporary branch, so use
+                    // the branch the user is on.
+                    let stored_base = self
+                        .store
+                        .get_integration(&source.id)?
+                        .and_then(|state| state.base_branch);
+                    let base = match stored_base {
+                        Some(base) => base,
+                        None if source.has_worktree() => self.base_for_repo(&repo).await?,
+                        None => self.base_for_session(&source.cwd, &repo).await?,
+                    };
                     let created =
                         crate::worktree::create_from_base(&source.cwd, &name, Some(&base)).await?;
                     base_branch = Some(base);
@@ -2367,19 +2421,6 @@ impl Daemon {
                 };
                 Ok(serde_json::to_value(EventsResult { events, has_more })?)
             }
-            "context.ledger" => {
-                let params: ContextLedgerParams = parse_params(request.params.clone())?;
-                let ledger = self.build_ledger(&params.session_id).await?;
-                Ok(serde_json::to_value(ledger.info())?)
-            }
-            "context.drop" => {
-                let params: ContextDropParams = parse_params(request.params.clone())?;
-                Ok(serde_json::to_value(self.context_drop(params).await?)?)
-            }
-            "context.pin" => {
-                let params: ContextPinParams = parse_params(request.params.clone())?;
-                Ok(serde_json::to_value(self.context_pin(params).await?)?)
-            }
             "context.compact" => {
                 let params: ContextCompactParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(self.context_compact(params).await?)?)
@@ -2436,12 +2477,7 @@ impl Daemon {
                         crate::picker::branches(&session.cwd, params.query.as_deref(), params.limit)
                             .await
                     }
-                    // `KIND_CONTEXT` is the only kind that needs the ledger, so
-                    // it is built here; the rest are pure workspace providers.
-                    _ => {
-                        let ledger = self.build_ledger(session_id).await?;
-                        picker_context_items(ledger.info(), params.query.as_deref(), params.limit)
-                    }
+                    _ => unreachable!("validated data kind"),
                 };
                 Ok(serde_json::to_value(result)?)
             }
@@ -2859,25 +2895,33 @@ impl Daemon {
             session.agent = Some(agent);
         }
         let worktree_mode = params.worktree;
+        let disabled = match worktree_mode {
+            Some(false) => true,
+            None => !self.config.load().worktree.auto,
+            Some(true) => false,
+        };
         let mut base_branch = None;
         if worktree_mode == Some(true) {
             let repo = crate::worktree::main_repo(&session.cwd)
                 .await
                 .or_else(|| Some(session.cwd.clone()))
                 .unwrap_or_else(|| session.cwd.clone());
-            let base = self.base_for_repo(&repo).await?;
+            let base = self.base_for_session(&session.cwd, &repo).await?;
             let created =
                 crate::worktree::create_from_base(&session.cwd, &session.name, Some(&base)).await?;
             session.cwd = created.path.clone();
             session.worktree = Some(created.path);
             base_branch = Some(base);
+        } else if !disabled {
+            // Lazy worktrees are created on the first prompt, but the base
+            // branch must be the one the user was on when the session was
+            // created. Failure here is deferred: the first prompt will retry
+            // and report a useful error.
+            if let Some(repo) = crate::worktree::main_repo(&session.cwd).await {
+                base_branch = self.base_for_session(&session.cwd, &repo).await.ok();
+            }
         }
         self.store.create_session(&session)?;
-        let disabled = match worktree_mode {
-            Some(false) => true,
-            None => !self.config.load().worktree.auto,
-            Some(true) => false,
-        };
         let integration =
             self.store
                 .ensure_integration(&session.id, base_branch.as_deref(), disabled)?;
@@ -5340,66 +5384,6 @@ impl Daemon {
         );
     }
 
-    async fn context_drop(
-        &self,
-        params: ContextDropParams,
-    ) -> Result<eix_core::ContextLedgerResult> {
-        let ledger = self.build_ledger(&params.session_id).await?;
-        if !ledger.has_entry(&params.entry) {
-            return Err(rpc(
-                "not_found",
-                format!("unknown context entry {:?}", params.entry),
-            ));
-        }
-        if !ledger.is_editable(&params.entry) {
-            return Err(rpc(
-                "invalid_params",
-                format!("context entry {:?} cannot be edited", params.entry),
-            ));
-        }
-        let dropped = params.dropped.unwrap_or(true);
-        let event = self.store.append_event(
-            &params.session_id,
-            EventKind::ContextDropped,
-            payload(&ContextDropPayload {
-                entry: params.entry,
-                dropped,
-            }),
-        )?;
-        self.emit_event(&event);
-        let ledger = self.build_ledger(&params.session_id).await?;
-        self.emit_context(&params.session_id, &ledger);
-        Ok(ledger.info())
-    }
-
-    async fn context_pin(&self, params: ContextPinParams) -> Result<eix_core::ContextLedgerResult> {
-        let ledger = self.build_ledger(&params.session_id).await?;
-        if !ledger.has_entry(&params.entry) {
-            return Err(rpc(
-                "not_found",
-                format!("unknown context entry {:?}", params.entry),
-            ));
-        }
-        if !ledger.is_editable(&params.entry) {
-            return Err(rpc(
-                "invalid_params",
-                format!("context entry {:?} cannot be pinned", params.entry),
-            ));
-        }
-        let event = self.store.append_event(
-            &params.session_id,
-            EventKind::ContextPinned,
-            payload(&ContextPinPayload {
-                entry: params.entry,
-                pinned: params.pinned,
-            }),
-        )?;
-        self.emit_event(&event);
-        let ledger = self.build_ledger(&params.session_id).await?;
-        self.emit_context(&params.session_id, &ledger);
-        Ok(ledger.info())
-    }
-
     async fn context_compact(
         &self,
         params: ContextCompactParams,
@@ -5454,6 +5438,7 @@ impl Daemon {
                 messages,
                 tokens,
                 summary,
+                rolling: false,
             }),
         )?;
         self.emit_event(&event);
@@ -5475,14 +5460,18 @@ impl Daemon {
     /// Ask the model to summarize the conversation so far. Used by `/compact`;
     /// the result replaces the history in the provider request.
     async fn generate_summary(&self, session_id: &str, ledger: &Ledger) -> Result<String> {
-        self.summarize_messages(session_id, ledger.messages()).await
+        self.summarize_messages(session_id, ledger.messages(), None)
+            .await
     }
 
-    /// Summarize only the messages that are about to leave the context.
+    /// Summarize only the messages that are about to leave the context. When
+    /// `previous` is present, produce a rolling handoff that also retains the
+    /// earlier summary's decisions and task state.
     async fn summarize_messages(
         &self,
         session_id: &str,
         mut messages: Vec<ChatMessage>,
+        previous: Option<&str>,
     ) -> Result<String> {
         let todos = self
             .todos
@@ -5510,16 +5499,27 @@ impl Daemon {
             system.push_str(&todo_context(&todos));
         }
         messages.insert(0, ChatMessage::system(system));
+        if let Some(previous) = previous.map(str::trim).filter(|text| !text.is_empty()) {
+            messages.insert(
+                1,
+                ChatMessage::system(format!(
+                    "Previous rolling summary. Update it with the new conversation; keep still-valid \
+                     goals, decisions, file paths and next steps, and remove stale details:\n\n{}",
+                    cap_text(previous, 12_000)
+                )),
+            );
+        }
         messages.push(ChatMessage::user(
             "Summarize the conversation so far for a fresh context window. Write the compacted \
              summary now. Return only the summary.",
         ));
+        let config = self.config.load();
         let model = self
             .require_session(session_id)?
             .model
-            .unwrap_or_else(|| self.config.load().default_model().to_string());
+            .unwrap_or_else(|| config.default_model().to_string());
         let cancel = AtomicBool::new(false);
-        let route = self.config.load().route(&model);
+        let route = config.route(&model);
         let provider = self.provider.load_full();
         let completion = provider
             .stream_chat(&messages, &route, &[], &cancel, |_| {})
@@ -5587,8 +5587,13 @@ impl Daemon {
         if messages == 0 {
             return (ledger, false);
         }
+        let previous_summary = ledger.latest_summary();
         let summary = match self
-            .summarize_messages(session_id, ledger.messages_in_range(from_seq, to_seq))
+            .summarize_messages(
+                session_id,
+                ledger.messages_in_range(from_seq, to_seq),
+                previous_summary.as_deref(),
+            )
             .await
         {
             Ok(summary) => summary,
@@ -5606,6 +5611,7 @@ impl Daemon {
                 messages,
                 tokens,
                 summary,
+                rolling: true,
             }),
         ) {
             Ok(event) => event,
@@ -7077,62 +7083,6 @@ fn notification_session_id(notification: &Notification) -> Option<SessionId> {
 
 fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T> {
     serde_json::from_value(params).map_err(|err| rpc("invalid_params", err.to_string()))
-}
-
-/// Turn a context ledger into picker rows. The ledger entry id is the value so
-/// a frontend can target `context.drop` / `context.pin` directly.
-fn picker_context_items(
-    ledger: eix_core::ContextLedgerResult,
-    query: Option<&str>,
-    limit: Option<u32>,
-) -> PickerResult {
-    let needle = query
-        .map(str::trim)
-        .filter(|query| !query.is_empty())
-        .map(str::to_lowercase);
-    let limit = limit.unwrap_or(500).clamp(1, 5_000) as usize;
-    let mut items = Vec::new();
-    for entry in ledger.entries {
-        let label = format!("{} · {}", entry.sector.as_str(), entry.preview);
-        if let Some(needle) = &needle {
-            let haystack =
-                format!("{} {} {} {}", entry.id, label, entry.kind, entry.detail).to_lowercase();
-            if !haystack.contains(needle) {
-                continue;
-            }
-        }
-        let mut flags = Vec::new();
-        if entry.pinned {
-            flags.push("pinned");
-        }
-        if entry.dropped {
-            flags.push("dropped");
-        }
-        if entry.compacted {
-            flags.push("compacted");
-        }
-        if entry.auto {
-            flags.push("auto");
-        }
-        let detail = if flags.is_empty() {
-            format!("{} tok", entry.tokens)
-        } else {
-            format!("{} tok · {}", entry.tokens, flags.join(" "))
-        };
-        items.push(
-            PickerItem::new(entry.id)
-                .with_label(label)
-                .with_detail(detail)
-                .with_preview(entry.detail),
-        );
-        if items.len() >= limit {
-            break;
-        }
-    }
-    PickerResult {
-        kind: eix_core::KIND_CONTEXT.to_string(),
-        items,
-    }
 }
 
 #[derive(Debug, thiserror::Error)]

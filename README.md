@@ -225,7 +225,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `
 当前限制：`workspace-write` 默认自动应用工作区内的低/中风险 `write_file` / `edit`，同时
 保留执行前快照和自动补丁记录；把 `[tools] auto_apply_workspace_edits = false` 可恢复逐次
 stage 到 shadow workspace 的审核模式。高风险/forced ask 写入、外部路径、secret 路径以及
-`run_command` 的写操作仍在审批处阻塞（shell 无法 stage），风险分析判定为只读的命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
+`run_command` 的写操作仍在审批处阻塞（shell 无法 stage），风险分析判定为只读的命令直接执行。bubblewrap 沙箱已接入；自动上下文管理与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮、`a` 跳转提示，
 并在底部状态栏中间显示提醒（不弹桌面通知）；外部通知命令（dwm/tmux）已接入
 （见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：
@@ -305,7 +305,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `Ctrl-/` | 打开可搜索的模型 picker：输入筛选、`Enter` 切换、`Esc` 关闭（输入框内外都可用；部分终端为 `Ctrl-_` / `Ctrl-7`） |
 | `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane），右侧实时预览最近对话 |
 | `<Space>f` | 文件 picker：搜索 workspace 文件，右侧实时预览文件内容，选中后插入 `@相对路径` |
-| `Ctrl-P` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / ledger / search / processes / approvals / new / fork / cancel / help / quit） |
+| `Ctrl-P` | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / search / processes / approvals / new / fork / cancel / help / quit） |
 | `<Space>w` | worktree picker：选中后把路径插入聚焦 pane 的输入框 |
 | `<Space>b` | branch picker：选中后把分支名插入输入框 |
 | `@`（输入框内） | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发） |
@@ -329,7 +329,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `<Space>F` | fork 当前 session；在 git 仓库里自动建 worktree，仓库外共享工作区 |
 | `:history` / `Ctrl-P` | 打开跨 session 聊天记录搜索：输入 query 回车搜索，`↑/↓` 选择，再回车打开对应 session |
 | `<Space>x` | 取消聚焦 pane 的 turn |
-| `j` / `k` / `PgUp` / `PgDn` / `Ctrl-B` / `Ctrl-F` | 转录区聚焦时滚动，`Ctrl-B`/`Ctrl-F` 快速向上/向下翻页；输入框 normal 模式以及帮助、选择器、历史搜索、ledger、inbox、进程、diff、timeline、btw 等浮层也支持 `Ctrl-B`/`Ctrl-F` 快速翻页；输入框 normal 模式下 `j`/`k` 是草稿内行移动，`Ctrl-J`/`Ctrl-K` 浏览已提交的 prompt 历史 |
+| `j` / `k` / `PgUp` / `PgDn` / `Ctrl-B` / `Ctrl-F` | 转录区聚焦时滚动，`Ctrl-B`/`Ctrl-F` 快速向上/向下翻页；输入框 normal 模式以及帮助、选择器、历史搜索、inbox、进程、diff、timeline、btw 等浮层也支持 `Ctrl-B`/`Ctrl-F` 快速翻页；输入框 normal 模式下 `j`/`k` 是草稿内行移动，`Ctrl-J`/`Ctrl-K` 浏览已提交的 prompt 历史 |
 | `g` / `G` | 顶部 / 跟随末尾（聚焦 pane） |
 | `F1` / `/help` | 帮助（F1 任意位置可用）；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭；`/`、`?`、`#` 在 normal 模式打开命令行 |
 | `Z` / `Ctrl-C` / `Ctrl-D` | 退出 eix TUI（任意模式；退出前会保存当前草稿） |
@@ -546,7 +546,7 @@ vim 编辑键（如 `j`/`k` 行移动、`Tab` 切换 Build/Plan）保留编辑�
 转录区动作可以通过 `[keys]` 覆盖，但裸字母会被忽略，请用 `C-`/`A-` 修饰键或
 命名键，例如 `sessions = "C-t"`、`new_session = "C-n"`、`help = "F2"`。可用动作：`quit`、`help`、`new_session`、
 `new_worktree`、`sessions`、`new_pane`、`palette`、`model`、`worktrees`、`branches`、
-`ledger`、`processes`、`inbox`、`search`、`fork`、`attention`、`cancel`、`next_session`、
+`processes`、`inbox`、`search`、`fork`、`attention`、`cancel`、`next_session`、
 `prev_session`、`scroll_down`、`scroll_up`、`timeline`、`todos`、`undo`、`redo`。
 键写法支持 `Space`、`Tab`、`BackTab`、`Enter`、`Esc`、方向键、`PageUp/PageDown`、
 `F1`..`F12` 以及 `C-` / `S-` / `A-` 修饰符；裸字母会被忽略，标点键（如 `?`、`#`）可用。
@@ -584,7 +584,7 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：
 `<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
 （`<Space>c` 关闭当前 pane）、`<Space>f` 文件、
-`<Space>w`/`b` worktree/分支、`<Space>C` ledger、`<Space>h` 历史、
+`<Space>w`/`b` worktree/分支、`<Space>h` 历史、
 `<Space>p` 进程、`<Space>R` 审批、`<Space>N` 新建、`<Space>W` 新建 worktree、
 `<Space>F` fork、`<Space>x` 取消、`<Space>A` attention、`<Space>i` 聚焦输入框、
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>a` 或
@@ -667,22 +667,32 @@ git 会拒绝，需显式加 `--force`。删除后 session 的 `cwd` 回到主�
 
 在 git 仓库里，新建 session 默认**延迟到第一条 prompt** 才建 worktree：daemon 让模型
 根据任务内容总结一个英文 kebab-case 短名（例如 `fix-login-redirect`），再创建
-`.worktrees/<slug>` 和分支 `eix/<slug>`。这样不会先出现一个无意义的 `session` 目录；
-模型不可用时退化为 ASCII 词或 `task-<timestamp>`。创建时会把 `.worktrees/` 追加到
-`.git/info/exclude`（只影响本仓库，不改工作区文件），因此主 worktree 不会被 worktree
-目录弄脏。`eix new --shared` 或 TUI `/new-shared` 显式共享工作区。
+`.worktrees/<slug>` 和分支 `eix/<slug>`。worktree 的基线是**用户创建 session 时所在的
+分支**（例如当前在 `feature/login`，就从 `feature/login` 拉出 `eix/<slug>`），而不是
+固定从 `master` 拉。这样可以在同一个 feature 分支上并发多个 session；每个 session 最终
+合并回这个 feature 分支，feature → master 的合并由用户自己控制。`worktree.base` /
+`[integration.repos."..."].base` 显式配置时仍以配置为准；`auto` 表示使用 session 创建时
+的当前分支。这样不会先出现一个无意义的 `session` 目录；模型不可用时退化为 ASCII 词或
+`task-<timestamp>`。创建时会把 `.worktrees/` 追加到 `.git/info/exclude`（只影响本仓库，
+不改工作区文件），因此主 worktree 不会被 worktree 目录弄脏。`eix new --shared` 或 TUI
+`/new-shared` 显式共享工作区。
 
 agent 完成工作并跑过测试后调用 `ready` 工具（无需审批）或运行 `eix ready`（TUI `/ready`）。
 daemon 的串行队列随后：
 
-1. 在干净的主 worktree 上 `git fetch` + `git pull --ff-only` 基分支（`worktree.base=auto`
-   时解析 `origin/HEAD` → `main`/`master`）；
+1. 找到基分支所在的干净 worktree（可能是主 worktree，也可能是用户自己开的 linked
+   worktree），在上面 `git fetch` + `git pull --ff-only`；本地 feature 分支没有 upstream
+   时不会强行 pull；
 2. 把 session 分支 rebase 到基分支；
 3. 在 worktree 里运行测试命令（`integration.test=auto` 时识别 Cargo / npm / Go /
    Python / Make；也支持 `go/`、`rust/` 这类子目录项目，优先选 session 当前目录所属的
    项目；多个候选且无法判断时需要在 `[integration.repos."..."]` 里显式配置。没有测试
    命令时不会合并）；
-4. 确认基分支 SHA 未变化后 `git merge --ff-only`。
+4. 确认基分支 SHA 未变化后 `git merge --ff-only`，只更新这个基分支，不会自动碰
+   `master`。
+
+同一个 feature 分支上的多个 session 会串行合并：后合并的 session 会先 rebase 到已经
+包含前一个 session 的 feature 分支，再 ff 合并。
 
 失败不会让 session 永久 blocked：瞬时错误用 `retrying` + 指数退避；确定性失败（无测试
 命令、rebase 冲突、测试失败、dirty base、merge 失败）会把错误注入原 session 作为修复
@@ -704,7 +714,7 @@ rebase 也会先备份并清理再重试。
 ```toml
 [worktree]
 auto = true
-base = "auto"
+base = "auto"          # auto = 创建 session 时的当前分支；显式分支名则强制使用
 
 [integration]
 enabled = true
@@ -944,7 +954,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
   0 skipped`），记录文件数、字节数和跳过数；抓取失败也会记 `ok = false`，并在工具输出里
   附一行 `[snapshot failed: ...]`。每个 session 保留最近 20 份，更早的自动清理。
 - 快照字节只存在 `snapshots/` 目录，事件日志只做索引。`Snapshotter::restore` 已接进
-  `session.rewind`：`eix rewind` / TUI ledger 的 `w` 会按 `seq >= at` 倒序恢复快照并返回
+  `session.rewind`：`eix rewind` 会按 `seq >= at` 倒序恢复快照并返回
   新 session。回滚是尽力而为的，恢复失败、缺失文件、被 prune 的旧快照都会在结果的
   `warnings` 里列出，`restored = false` 表示工作区没有完全回到切点。
 - 大仓库可以设 `[tools] snapshots = false` 关掉；关闭后不再
@@ -975,7 +985,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 - 取消（`Esc` / `eix cancel`）会立即打断退避等待；重试耗尽后才把 session 标为 error。
 - `/btw` 和自动摘要目前不参与这套 turn 级重试。
 
-### Context ledger
+### 自动上下文管理
 
 上下文由 daemon 自动维护，不需要用户手动管理。每次请求都会从事件日志重建上下文，并按 sector 记账：
 
@@ -1005,7 +1015,8 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
   `auto_compact_threshold`（默认 0.8），daemon 先把最旧的 turn 总结掉。保留窗口优先使用
   `auto_compact_keep_tokens`（默认约 8000 tokens），并至少保留
   `auto_compact_keep_turns`（默认 2）个 user turn，裁剪点落在 user turn 边界，避免拆散
-  tool call 和结果。压缩只由上下文压力触发，不按轮数定期执行。
+  tool call 和结果。压缩只由上下文压力触发，不按轮数定期执行。自动压缩使用滚动摘要：
+  新摘要会带上一次摘要继续更新，旧摘要不再重复发送；摘要使用当前 session 模型。
   摘要使用固定结构（目标/约束、决策和被否方案、文件与改动、命令和错误、任务状态、未决问题），
   并带上当前 todo；更新时优先保留任务状态、决策和下一步，而不是复述对话。摘要失败只记录日志，
   不会阻塞本轮，事件同样是 `context_compacted`。
@@ -1154,15 +1165,15 @@ eix nvim [--session ID]      # 也可用 EIX_NVIM 覆盖 nvim 可执行文件
 | 命令 | 作用 |
 | --- | --- |
 | `:Eix attach [ID\|name]` | attach（省略则第一个 session，没有就新建） |
-| `:Eix list` / `:Eix pick [KIND]` | 列出 session / picker（`KIND` 省略为 session；可选 `files`/`worktrees`/`branches`/`context`，选中后把值插入光标处，`context` 在分屏显示条目详情） |
+| `:Eix list` / `:Eix pick [KIND]` | 列出 session / picker（`KIND` 省略为 session；可选 `files`/`worktrees`/`branches`，选中后把值插入光标处） |
 | `:Eix new [NAME] [worktree]` | 新建 session（可选独立 worktree） |
 | `:Eix send TEXT` / `:Eix prompt` | 发送 prompt；`prompt` 开一个输入分屏，`<CR>` 发送、`@` 文件 picker |
 | `:Eix fork [SEQ]` / `:Eix rewind [SEQ]` | 分叉 / 回滚并切到新 session |
 | `:Eix stop` | 取消当前 turn |
-| `:Eix ps` / `:Eix ledger` | 后台进程 / context ledger |
+| `:Eix ps` | 后台进程 |
 | `:Eix permission [LEVEL]` / `:Eix doctor` | 权限级别 / 连接与版本诊断 |
 | `<C-g>` / `<C-g><C-g>` | session picker / 回到上一个 session |
-| `<leader>a` | 动作 palette（picker / list / new / worktree / file / branch / context / prompt / stop / fork / rewind / ps / ledger / permission / doctor） |
+| `<leader>a` | 动作 palette（picker / list / new / worktree / file / branch / prompt / stop / fork / rewind / ps / permission / doctor） |
 
 每个 Neovim 进程是一个独立 client，共享同一个 daemon；daemon 会串行化同一 session 的
 turn，第二个 prompt 在忙时会被拒绝。attach 后前端会发 `session.subscribe`，只接收当前
@@ -1222,7 +1233,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 执行前快照（write_file 单文件 / run_command 整个 workspace，`snapshot` 事件，保留 20 份）
 - [x] 自动上下文管理（sector 预算 / token 记账、AGENTS.md + workspace 注入、自动 drop / pin / compact）
 - [x] process view（daemon 托管后台进程、`start_command` / `process_output`、流式输出与日志、TUI `P`、`eix ps/tail/kill`）
-- [x] fork / rewind（按消息裁剪历史复制到新 session；`eix rewind` / ledger `w` 还会按快照倒序回滚工作区，并报告无法恢复的改动）
+- [x] fork / rewind（按消息裁剪历史复制到新 session；`eix rewind` 还会按快照倒序回滚工作区，并报告无法恢复的改动）
 - [x] git worktree（新 session 首条 prompt 自动建英文名 `.worktrees/<slug>`、`--shared`、`eix worktree list|remove`）
 - [x] 集成队列（`ready` 工具 / `eix ready`、rebase → 测试 → base ff merge、冲突/测试失败注入修复、退避重试与 `eix integrate`）
 - [x] 子 agent（`spawn_agent`、只读工具集、并发批次、深度上限 1、独立事件日志）

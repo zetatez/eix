@@ -40,6 +40,27 @@ pub async fn repo_root(dir: &Path) -> Option<PathBuf> {
     (!path.is_empty()).then(|| PathBuf::from(path))
 }
 
+/// Find the worktree that currently has `branch` checked out. Integration
+/// must run in that worktree, not necessarily the main one, because git
+/// refuses to update a branch from a different checkout.
+pub async fn worktree_for_branch(dir: &Path, branch: &str) -> Option<PathBuf> {
+    let output = git_stdout(dir, &["worktree", "list", "--porcelain"]).await?;
+    let wanted = format!("refs/heads/{branch}");
+    let mut current: Option<PathBuf> = None;
+    for line in output.lines() {
+        if let Some(path) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(path));
+        } else if let Some(name) = line.strip_prefix("branch ") {
+            if name.trim() == wanted {
+                return current.map(|path| path.canonicalize().unwrap_or(path));
+            }
+        } else if line.trim().is_empty() {
+            current = None;
+        }
+    }
+    None
+}
+
 /// Main repository for a (possibly linked) worktree. `--git-common-dir`
 /// points at `<main>/.git`; its parent is the main work tree.
 pub async fn main_repo(dir: &Path) -> Option<PathBuf> {
@@ -128,8 +149,10 @@ pub async fn create_from_base(dir: &Path, name: &str, base: Option<&str>) -> Res
     })
 }
 
-/// Resolve the base branch. `auto` prefers the remote HEAD name, then the
-/// conventional `main` / `master`, then the repository's current branch.
+/// Resolve a fallback base branch. Session creation passes the branch checked
+/// out in the starting directory first; this `auto` path is for detached HEADs
+/// and legacy sessions. It prefers the remote HEAD name, then `main` /
+/// `master`, then the repository's current branch.
 pub async fn resolve_base(repo: &Path, configured: &str) -> Result<String> {
     let configured = configured.trim();
     if !configured.is_empty() && configured != "auto" {
@@ -842,7 +865,7 @@ fn slug(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{in_rebase, is_clean, rebase_has_work, recover_rebase, slug};
+    use super::{in_rebase, is_clean, rebase_has_work, recover_rebase, slug, worktree_for_branch};
     use std::path::Path;
 
     #[test]
@@ -851,6 +874,56 @@ mod tests {
         assert_eq!(slug("Feature/Login"), "feature-login");
         assert_eq!(slug("../../etc"), "etc");
         assert_eq!(slug("中文"), "session");
+    }
+
+    #[tokio::test]
+    async fn finds_the_worktree_that_has_a_branch_checked_out() -> anyhow::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "eix-worktree-branch-{}-{stamp}",
+            std::process::id()
+        ));
+        let linked = root.with_extension("feature");
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&linked);
+        std::fs::create_dir_all(&root)?;
+
+        assert!(git(&root, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(root.join("file.txt"), "base\n")?;
+        assert!(git(&root, &["add", "file.txt"]).status.success());
+        assert!(git(&root, &["commit", "-q", "-m", "base"]).status.success());
+        let add = git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "feature",
+                linked.to_str().expect("linked path"),
+            ],
+        );
+        assert!(
+            add.status.success(),
+            "git worktree add: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let main = worktree_for_branch(&root, "main")
+            .await
+            .expect("main worktree");
+        assert_eq!(main, root.canonicalize()?);
+        let feature = worktree_for_branch(&root, "feature")
+            .await
+            .expect("feature worktree");
+        assert_eq!(feature, linked.canonicalize()?);
+        assert!(worktree_for_branch(&root, "missing").await.is_none());
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&linked);
+        Ok(())
     }
 
     fn git(dir: &Path, args: &[&str]) -> std::process::Output {

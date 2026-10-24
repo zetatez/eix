@@ -90,11 +90,12 @@ tools:
 # Session worktrees and the integration queue.
 #   New sessions in a git repo get a worktree lazily on the first prompt, named
 #   with an English slug generated from the task. `--shared` opts out.
-#   After the agent runs `eix ready` (or the session idles), the daemon pulls
-#   the base branch, rebases, runs the test command, then fast-forwards base.
+#   Worktrees start from the branch checked out when the session is created;
+#   after `eix ready` (or idle) the daemon rebases onto that branch, runs the
+#   test command, then fast-forwards it. Feature -> main stays user-controlled.
 worktree:
   auto: true          # false disables lazy worktrees for new sessions
-  base: "auto"        # local branch; auto = origin/HEAD, main/master, current
+  base: "auto"        # auto = branch at session creation; or a branch name
 
 integration:
   enabled: true

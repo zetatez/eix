@@ -569,7 +569,6 @@ open_palette = function()
     { label = "pick a file (insert path)", run = function() pick_insert("files", "eix files") end },
     { label = "pick a worktree (insert path)", run = function() pick_insert("worktrees", "eix worktrees") end },
     { label = "pick a branch (insert name)", run = function() pick_insert("branches", "eix branches") end },
-    { label = "browse context entries", run = function() vim.cmd("Eix pick context") end },
     { label = "send a prompt", run = open_prompt },
     { label = "stop the running turn", run = function()
         if require_session() then
@@ -579,7 +578,6 @@ open_palette = function()
     { label = "fork this session", run = function() vim.cmd("Eix fork") end },
     { label = "rewind this session", run = function() vim.cmd("Eix rewind") end },
     { label = "background processes", run = function() vim.cmd("Eix ps") end },
-    { label = "context ledger", run = function() vim.cmd("Eix ledger") end },
     { label = "permission…", run = function() vim.cmd("Eix permission") end },
     { label = "doctor", run = function() vim.cmd("Eix doctor") end },
   }
@@ -679,34 +677,6 @@ vim.api.nvim_create_user_command("Eix", function(opts)
         vim.api.nvim_win_set_buf(0, buf)
       end)
     end)
-  elseif sub == "ledger" then
-    if require_session() then
-      request("context.ledger", { session_id = state.session.id }, function(result, err)
-        if err then
-          notify("ledger: " .. tostring(err.message), vim.log.levels.ERROR)
-          return
-        end
-        vim.schedule(function()
-          local lines = {
-            string.format("## context · %d / %d tokens", result.total_tokens, result.budget_tokens),
-          }
-          for _, entry in ipairs(result.entries) do
-            table.insert(lines, string.format(
-              "%s %-4s %-22s %d tok",
-              entry.id,
-              entry.sector,
-              entry.label,
-              entry.tokens
-            ))
-          end
-          local buf = vim.api.nvim_create_buf(false, true)
-          vim.bo[buf].buftype = "nofile"
-          vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-          vim.cmd("botright 12split")
-          vim.api.nvim_win_set_buf(0, buf)
-        end)
-      end)
-    end
   elseif sub == "pick" then
     local kind = args[2] or "sessions"
     if kind == "sessions" or kind == "" then
@@ -717,15 +687,8 @@ vim.api.nvim_create_user_command("Eix", function(opts)
       pick_insert("worktrees", "eix worktrees")
     elseif kind == "branches" then
       pick_insert("branches", "eix branches")
-    elseif kind == "context" then
-      pick_data("context", "eix context", function(item)
-        show_scratch(
-          string.format("## context · %s", item.value),
-          vim.split(item.preview or item.label or item.value, "\n", { plain = true })
-        )
-      end)
     else
-      notify("unknown picker kind: " .. kind .. " (sessions|files|worktrees|branches|context)")
+      notify("unknown picker kind: " .. kind .. " (sessions|files|worktrees|branches)")
     end
   elseif sub == "doctor" then
     local endpoint = state.socket

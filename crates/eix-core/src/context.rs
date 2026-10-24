@@ -101,7 +101,7 @@ pub struct ContextEntryInfo {
     /// policy event.
     #[serde(default)]
     pub auto: bool,
-    /// Whether `context.drop` / `context.pin` can target this entry.
+    /// Whether automatic trimming may target this entry.
     #[serde(default)]
     pub editable: bool,
 }

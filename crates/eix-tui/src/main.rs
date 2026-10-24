@@ -17,13 +17,12 @@ use eix_core::sandbox as core_sandbox;
 use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload,
     AttachResult, CancelResult, Config, ContextCompactedPayload, ContextDropPayload,
-    ContextLedgerResult, ContextPinPayload, Endpoint, Event, EventKind, HelloResult,
-    InputAnsweredPayload, InputRequiredPayload, InputResult, IntegrationListResult,
-    IntegrationState, PatchProposedPayload, PatchResultPayload, PermissionPayload,
-    ProcessExitedPayload, ProcessKillResult, ProcessList, ProcessOutput, ProcessStartedPayload,
-    RewindResult, SearchResult, Sector, Session, SessionList, SessionResult, SessionStatus,
-    SnapshotPayload, SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
-    WorktreeRemoveResult,
+    ContextPinPayload, Endpoint, Event, EventKind, HelloResult, InputAnsweredPayload,
+    InputRequiredPayload, InputResult, IntegrationListResult, IntegrationState,
+    PatchProposedPayload, PatchResultPayload, PermissionPayload, ProcessExitedPayload,
+    ProcessKillResult, ProcessList, ProcessOutput, ProcessStartedPayload, RewindResult,
+    SearchResult, Session, SessionList, SessionResult, SessionStatus, SnapshotPayload,
+    SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -84,7 +83,6 @@ async fn main() -> Result<()> {
         Command::Approvals { json } => approvals(&cli, json).await,
         Command::Status { json } => status(&cli, json).await,
         Command::Pick { query, limit, json } => pick(&cli, query, limit, json).await,
-        Command::Context(args) => context(&cli, args).await,
         Command::Search {
             query,
             session,
@@ -196,7 +194,6 @@ enum Command {
         limit: Option<usize>,
         json: bool,
     },
-    Context(ContextArgs),
     Search {
         query: String,
         session: Option<String>,
@@ -275,18 +272,6 @@ enum WorktreeCmd {
         session: Option<String>,
         force: bool,
     },
-}
-
-#[derive(Clone, Default)]
-struct ContextArgs {
-    session: Option<String>,
-    drop: Option<String>,
-    undrop: Option<String>,
-    pin: Option<String>,
-    unpin: Option<String>,
-    /// `FROM:TO` or `FROM..TO`; inclusive source event sequences.
-    compact: Option<String>,
-    summary: Option<String>,
 }
 
 impl Cli {
@@ -521,43 +506,6 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
                 .transpose()?;
             let json = take_switch(&mut args, "--json");
             Ok(Command::Pick { query, limit, json })
-        }
-        "context" | "ctx" | "ledger" => {
-            let session = take_flag(&mut args, "--session")?;
-            let drop = take_flag(&mut args, "--drop")?;
-            let undrop = take_flag(&mut args, "--undrop")?;
-            let pin = take_flag(&mut args, "--pin")?;
-            let unpin = take_flag(&mut args, "--unpin")?;
-            let compact = take_flag(&mut args, "--compact")?;
-            let summary = take_flag(&mut args, "--summary")?;
-            let session = session.or_else(|| args.first().cloned());
-            let edits = [
-                drop.is_some(),
-                undrop.is_some(),
-                pin.is_some(),
-                unpin.is_some(),
-                compact.is_some(),
-            ]
-            .into_iter()
-            .filter(|active| *active)
-            .count();
-            if edits > 1 {
-                bail!(
-                    "eix context takes at most one of --drop, --undrop, --pin, --unpin, --compact"
-                );
-            }
-            if summary.is_some() && compact.is_none() {
-                bail!("--summary is only meaningful with --compact");
-            }
-            Ok(Command::Context(ContextArgs {
-                session,
-                drop,
-                undrop,
-                pin,
-                unpin,
-                compact,
-                summary,
-            }))
         }
         "search" | "find" => {
             let session = take_flag(&mut args, "--session")?;
@@ -1202,72 +1150,6 @@ fn pick_matches(query: &str, session: &Session) -> bool {
         .all(|needle| chars.any(|ch| ch == needle))
 }
 
-async fn context(cli: &Cli, args: ContextArgs) -> Result<()> {
-    let mut client = cli.connect().await?;
-    let session = resolve_session(&mut client, args.session.as_deref(), false).await?;
-    let result: ContextLedgerResult = if let Some(entry) = args.drop {
-        request_ledger(
-            &mut client,
-            "context.drop",
-            json!({"session_id": session.id, "entry": entry, "dropped": true}),
-        )
-        .await?
-    } else if let Some(entry) = args.undrop {
-        request_ledger(
-            &mut client,
-            "context.drop",
-            json!({"session_id": session.id, "entry": entry, "dropped": false}),
-        )
-        .await?
-    } else if let Some(entry) = args.pin {
-        request_ledger(
-            &mut client,
-            "context.pin",
-            json!({"session_id": session.id, "entry": entry, "pinned": true}),
-        )
-        .await?
-    } else if let Some(entry) = args.unpin {
-        request_ledger(
-            &mut client,
-            "context.pin",
-            json!({"session_id": session.id, "entry": entry, "pinned": false}),
-        )
-        .await?
-    } else if let Some(range) = args.compact {
-        let (from, to) = parse_range(&range)?;
-        request_ledger(
-            &mut client,
-            "context.compact",
-            json!({
-                "session_id": session.id,
-                "from_seq": from,
-                "to_seq": to,
-                "summary": args.summary,
-            }),
-        )
-        .await?
-    } else {
-        request_ledger(
-            &mut client,
-            "context.ledger",
-            json!({"session_id": session.id}),
-        )
-        .await?
-    };
-    render_ledger(&session, &result);
-    Ok(())
-}
-
-async fn request_ledger(
-    client: &mut Client,
-    method: &str,
-    params: Value,
-) -> Result<ContextLedgerResult> {
-    Ok(serde_json::from_value(
-        client.request(method, params).await?,
-    )?)
-}
-
 /// Full-text search over user and assistant messages in every session.
 async fn search(
     cli: &Cli,
@@ -1774,77 +1656,6 @@ async fn kill(cli: &Cli, process: &str) -> Result<()> {
         println!("process {process} is not running");
     }
     Ok(())
-}
-
-fn render_ledger(session: &Session, result: &ContextLedgerResult) {
-    let remaining = result.budget_tokens.saturating_sub(result.total_tokens);
-    println!(
-        "context · {} · {} / {} tokens ({} left)",
-        session.name, result.total_tokens, result.budget_tokens, remaining
-    );
-    if result.trimmed > 0 {
-        println!(
-            "  {} entries auto-trimmed to fit the budget",
-            result.trimmed
-        );
-    }
-    if result.entries.is_empty() {
-        println!("  (empty)");
-        return;
-    }
-    for sector in Sector::ALL {
-        let entries: Vec<_> = result
-            .entries
-            .iter()
-            .filter(|entry| entry.sector == sector)
-            .collect();
-        if entries.is_empty() {
-            continue;
-        }
-        let usage = result
-            .sectors
-            .iter()
-            .find(|usage| usage.sector == sector)
-            .map(|usage| (usage.tokens, usage.budget_tokens))
-            .unwrap_or((0, 0));
-        println!("\n{}  ({} / {} tokens)", sector.as_str(), usage.0, usage.1);
-        for entry in entries {
-            let mut flags = Vec::new();
-            if entry.pinned {
-                flags.push("pin");
-            }
-            if entry.dropped {
-                flags.push(if entry.auto { "cut" } else { "off" });
-            }
-            if entry.compacted {
-                flags.push("sum");
-            }
-            let flag = format!("{:<7}", flags.join(","));
-            println!(
-                "  {:<18} {:>6}t  {} {}",
-                entry.id, entry.tokens, flag, entry.preview
-            );
-        }
-    }
-}
-
-fn parse_range(value: &str) -> Result<(u64, u64)> {
-    let (from, to) = value
-        .split_once(':')
-        .or_else(|| value.split_once(".."))
-        .ok_or_else(|| anyhow::anyhow!("--compact expects FROM:TO, e.g. 3:9"))?;
-    let from: u64 = from
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid start sequence in {value:?}"))?;
-    let to: u64 = to
-        .trim()
-        .parse()
-        .with_context(|| format!("invalid end sequence in {value:?}"))?;
-    if from == 0 || to < from {
-        bail!("--compact needs 0 < FROM <= TO");
-    }
-    Ok((from, to))
 }
 
 async fn daemon(cli: &Cli) -> Result<()> {
@@ -2686,8 +2497,6 @@ EXAMPLES:
     EIX_MODEL=qwen2.5-coder eix chat
     eix new --name auth --cwd ~/src/app --worktree
     eix permission read-only --session 4f2a9c11
-    eix context
-    eix context --compact 3:9 --summary 'we settled on a SQLite event log'
     eix ps
     eix tail 4f2a9c11
     eix fork --at 12

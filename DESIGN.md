@@ -33,7 +33,7 @@
 | leader | `<Space>`（输入框 normal / 转录区） | 单字母全部留给 vim；转录区动作也必须经过 leader | insert 下不可用，用 `<C-g>` 补充 |
 | 转录 | ratatui 自绘 + 对话式布局 + 可折叠块 | 流式 reasoning/工具/审批卡片可见，性能可控 | 需维护一套只读导航键位 |
 | 审批 | propose → stage → apply | hunk 级审批才有意义；可回滚 | 需虚拟工作区/补丁暂存 |
-| 上下文 | 可见且可编辑的 context ledger | 既是 UX 也是回答质量 | 中等额外工作量 |
+| 上下文 | 内部自动管理的 context ledger | 不需要用户维护 | 中等额外工作量 |
 
 ## 3. 架构
 
@@ -88,7 +88,7 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `○`，run
 - TUI / `chat` / `send` 未指定 session 时，按启动目录选择最近更新的 user session attach；
   当前目录没有 session 则新建。其他只读 CLI 命令找不到当前目录 session 时回退到最近 session。
 - 同一 session 可被多 client 观察，但**只有一个输入所有者（controller）**。
-- 所有者断开 → 自动转移给最早的 watcher；显式抢占用 `<leader>a C`（claim，避免与 context ledger 的 `<leader>a c` 冲突）。
+- 所有者断开 → 自动转移给最早的 watcher；显式抢占用 `<leader>a C`（claim）。
 - draft 由 daemon 持有，client 的 nvim 只是视图；所有权切换时重新加载 draft。
 - 新建 session 在首次输入前只是空壳：TUI 退出时对本次创建的空 session 调用
   `session.delete_if_empty`，daemon 用单条 SQL 原子检查“无事件、无草稿、无 worktree”后删除，
@@ -111,14 +111,16 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `○`，run
   以及 eix 之外的改动都无法察觉，`warnings` 里逐条说明，绝不假装成功。
 - busy 的 session 拒绝 rewind（`session_busy`）。
 - 已实现（2026-10-18）：`session.fork` 仅复制历史，`session.rewind` 组合 fork + 快照回滚；
-  TUI ledger `w`、CLI `eix rewind [--session ID] [--at SEQ] [--name NAME]` 走 rewind，`F` / `f` 仍是纯 fork。
+  CLI `eix rewind [--session ID] [--at SEQ] [--name NAME]` 走 rewind，`F` / `f` 仍是纯 fork。
   fork 在 git 仓库里默认同时起 worktree，避免共享 cwd 的并发冲突（见下）。
 
 ### 4.6 worktree
 
 - 默认绑定 cwd；在 git 仓库里新建 session 默认延迟到首条 prompt 自动创建 `.worktrees/<slug>`。
-  名称由模型根据任务总结成英文 kebab-case；模型失败时用 ASCII 词或 `task-<timestamp>`。
-  `eix new --shared` / `/new-shared` 显式共享工作区；`--worktree` 立即创建。
+  worktree 从**创建 session 时 cwd 所在的分支**拉出，而不是固定从 `master`；`worktree.base`
+  或 per-repo `base` 显式设置时覆盖。名称由模型根据任务总结成英文 kebab-case；模型失败时用
+  ASCII 词或 `task-<timestamp>`。`eix new --shared` / `/new-shared` 显式共享工作区；
+  `--worktree` 立即创建。
 - repo 内 fork 默认给新分支建 worktree；`eix fork --shared` / `session.fork worktree=false` 显式共享源工作区。
 - worktree 与 session 生命周期解耦：session 归档不自动删除 worktree，需显式确认。
 - 已实现（2026-10-18）：`eixd/src/worktree.rs` shell out 给 git，`git worktree add -b eix/<slug> .worktrees/<slug>`；
@@ -142,11 +144,15 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `○`，run
   turn 结束。
   `auto_ready = idle` 时 daemon 扫描空闲 session：无 turn/审批/输入、草稿为空、
   至少一条 user message、worktree 干净，且 `idle_secs` 内无更新。
-- 单个 daemon worker 串行处理队列：主 worktree 干净时 `fetch` + `pull --ff-only`，把 session
-  分支 rebase 到基分支，运行 `integration.test`（`auto` 识别 Cargo/npm/Go/Python/Make；
-  也支持子目录项目，优先 session cwd 所属项目，多候选不猜；没有测试命令则拒绝合并），
-  确认基分支 SHA 未变化后 `merge --ff-only`。`push=false` 默认只更新本地基分支，worktree
-  在合并后保留。
+- 单个 daemon worker 串行处理队列：基分支是 session 创建时所在的分支；用
+  `git worktree list --porcelain` 找到该分支实际 checkout 的 worktree（可能是主 worktree，
+  也可能是用户自己的 linked worktree），在它干净时 `fetch` + `pull --ff-only`（本地 feature
+  无 upstream 时跳过 pull），把 session 分支 rebase 到基分支，运行 `integration.test`
+  （`auto` 识别 Cargo/npm/Go/Python/Make；也支持子目录项目，优先 session cwd 所属项目，
+  多候选不猜；没有测试命令则拒绝合并），确认基分支 SHA 未变化后在**这个基 worktree** 里
+  `merge --ff-only`。`push=false` 默认只更新本地基分支，不会自动合并 master；feature →
+  master 由用户自己控制。worktree 在合并后保留。同一 feature 上的多个 session 串行合并，
+  后合并者会 rebase 到包含前者的新 feature HEAD。
 - 队列里程碑写为 `integration` 事件（queued / syncing / rebasing / testing / merging /
   merged / retrying / repairing），包含实际执行的 git / 测试命令和输出尾部；transcript
   和 `eix log` 可见，不进入 provider 的 chat context。
@@ -181,7 +187,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   系统剪贴板（鼠标选中的转录文本可直接粘贴），且外部粘贴不覆盖内部寄存器。
 - `<Space>` 是 leader（输入框 normal 与转录区共用同一映射）：`n` 新建 session 并开新 pane、
   `o` 打开 session picker（已有 session 放进新 pane）、`c` 关闭 pane、`f` 文件、
-  `w` worktree、`b` 分支、`C` ledger、`h` 历史、`p` 进程、`r` 审批、
+  `w` worktree、`b` 分支、`h` 历史、`p` 进程、`r` 审批、
   `N` 新建、`W` 新建 worktree、`F` fork、`x` 取消、`A` attention、`i` 聚焦输入框、
   `a`/`Ctrl-P` 命令面板。单字母基本留给 vim；转录区裸字母不触发动作，仅保留
   `i`（聚焦输入框）、`Z`（退出）、`j/k`/`g/G` 等导航、`/`/`?`/`#` 当前对话搜索和 `Ctrl-P`；布局动作
@@ -253,7 +259,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - `:Eix` 命令：`attach [ID|name]` / `list` / `pick [KIND]`（`KIND` = `sessions`(默认)/`files`/`worktrees`/
   `branches`/`context`；选中 files/branches/worktree 插入光标处，context 在分屏显示条目详情）/
   `new [NAME] [worktree]` / `send TEXT` / `prompt`（输入分屏，`<CR>` 发送、`@` 文件 picker）/
-  `fork [SEQ]` / `rewind [SEQ]` / `stop` / `ps` / `ledger` / `permission [LEVEL]` / `doctor`。
+  `fork [SEQ]` / `rewind [SEQ]` / `stop` / `ps` / `permission [LEVEL]` / `doctor`。
   eix buffer 里 `<C-g>` 打开 session picker，`<C-g><C-g>` 回到上一个 session；`<leader>a` palette
   也含 file / worktree / branch / context 入口。
 - 连接和请求都由插件内的 libuv 处理；注意 **libuv 回调是 fast context**，`vim.env` / `vim.fn.*` /
@@ -321,7 +327,6 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<leader>a a` | attention 队列（下一个待审批/待输入） |
 | `<leader>a p` | 命令面板（搜一切动作） |
 | `<leader>a d` | diff 审阅 |
-| `<leader>a c` | context ledger |
 | `<leader>a e` | 用真 nvim 编辑当前 draft |
 | `<leader>a x` | 取消当前生成 |
 | `<leader>a r` | 审批收件箱（跨 session） |
@@ -369,7 +374,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/queue [clear]` | 查看/清空本 session 的待发送队列 |
 | `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
 | `/files` / `/worktrees` / `/branches` | picker；选中后插入路径 / worktree / 分支名 |
-| `/context` / `/ledger` / `/history` | context picker / 完整 ledger / 历史搜索 |
+| `/history` | 历史搜索 |
 | `/processes` / `/approvals` / `/attention` | 进程 / 审批收件箱 / 下一个 attention |
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
 | `/cancel` / `/toggle-agent` | 取消运行 / 切换 Build·Plan |
@@ -452,10 +457,10 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     `Ctrl-P`（commands，命令面板；转录区与输入框 normal 模式都可用）、
     `<Space>w`（worktrees）、`<Space>b`（branches）、prompt 内 `@`（files）、`Eix pick` 经独立前端选择。
   - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`worktrees`
-    （`git worktree list --porcelain`）、`branches`（`git branch`）、`context`（session ledger 条目，
+    （`git worktree list --porcelain`）、`branches`（`git branch`）；
     值为 entry id）。默认 500、上限 5000；跳过 `.git` / `target` 等派生目录。
   - 动作：files → 在 prompt 光标处插入 `@path`；worktrees/branches → 插入对应值；sessions → 切换/新 pane；
-    context → 打开 ledger；commands → 执行（session / files / worktrees / branches / ledger / search /
+    commands → 执行（session / files / worktrees / branches / search /
     processes / approvals / new / fork / cancel / help / quit）。
   - 独立 nvim 前端：`:Eix pick [sessions|files|worktrees|branches|context]`（`sessions` 为默认），
     文件/分支/worktree 选中后插入光标处，context 选中后在 scratch 分屏显示条目详情。
@@ -610,9 +615,9 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 类工具也按只读放行，其余 MCP 工具仍 ask。secret 占位符只对本地文件工具还原；shell、
 网络和 MCP 参数中的占位符会触发 `secret-exfil` 硬拒绝。
 
-## 10. Context ledger
+## 10. 自动上下文管理
 
-`<leader>a c` 打开全屏 ledger，按 sector 分组：
+context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界面；它按 sector 分组：
 
 | sector | 内容 | 预算 |
 |---|---|---|
@@ -623,8 +628,7 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 | tools | 工具输出（可截断/引用 blob） | 10% |
 | memory | 跨 session 记忆 + 当前任务列表 | 5% |
 
-- 操作：`dd` 删除、`p` pin、`o` 展开、`s` 压缩、`/` 搜索、`y` 复制、`<CR>` 打开来源。
-- 每条显示 token 成本；底部显示总预算与剩余。
+- 条目的 token 成本只用于内部预算和自动裁剪。
 - 工具结果先按 `tools.max_output_bytes` 截断，再按 `context.tool_output_tokens` 对 provider
   视图做 head/tail 省略；完整输出保留在事件日志。
 - `tools` / `history` 超预算时保留最新 4 条；若总预算仍超，emergency trim 只保护当前 user
@@ -633,7 +637,8 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 - 自动压缩在每个工具批次后也会检查；provider 报 context-length / 413 时强制压缩并重试。
   压缩只由上下文压力触发，不按轮数定期执行。保留窗口优先按
   `auto_compact_keep_tokens`（默认 8000）计算，`auto_compact_keep_turns` 只作为最少轮数
-  下限；裁剪点只落在 user turn 边界。
+  下限；裁剪点只落在 user turn 边界。自动压缩是滚动摘要：新摘要会带上旧摘要继续更新，
+  旧摘要不再重复发送；摘要使用当前 session 模型。
 - provider 重试按错误类型分派：瞬时故障使用抖动指数退避（默认 8 次、250ms 起）；429 优先
   `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
   `kind`，TUI 用简短标签显示原因。
@@ -665,7 +670,7 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 - `prompt.submit|cancel|queue`
 - `approval.respond|list`、`input.respond`、`patch.apply|reject|get|revise`
 - `draft.get|set`（按 session 的未发送输入；空文本删除）
-- `context.drop|pin|compact`
+- `context.compact|clear`（自动压缩与 `/compact` / `/clear` 内部使用）
 - `process.list|output|kill`
 - `search.query`（跨 session 全文搜索；`session_id` 可限定范围）
 - `picker.query {kind, session_id?, query?, limit?}`（provider：`files` / `worktrees` / `branches` / `context`；
@@ -775,8 +780,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 独立前端补上 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick [KIND]` 与 `:Eix doctor`。
 > 统一 picker（2026-10-18）：TUI 用单一 overlay 承载 sessions / files / worktrees / branches /
 > context / commands，左侧列表右侧预览；`Ctrl-G`/`<Space>o`/`Ctrl-P`/`<Space>w`/`<Space>b`/`@` 为入口，files 插入 `@path`，
-> worktrees/branches 插入值，context 打开 ledger，commands 直接执行。daemon `picker.query` 新增
-> `worktrees`（porcelain）、`branches`（`git branch`）、`context`（ledger 条目）三个 provider；
+> worktrees/branches 插入值，commands 直接执行。daemon `picker.query` 新增
+> `worktrees`（porcelain）、`branches`（`git branch`）两个 provider；
 > 独立前端 `:Eix pick files|worktrees|branches|context` 用 `vim.ui.select` 选择。
 > 输入焦点（2026-10-18）：`Esc` 只在 insert/visual 下回到 normal 并保留焦点，500ms 内
 > 再按一次才回到转录；`<CR>` 只在 insert 提交；`<C-g>` 在任意模式打开 picker；
@@ -788,7 +793,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 **Phase 2**
 
-- 工具执行、staging、审批、diff hunk、沙箱、context ledger、process view。
+- 工具执行、staging、审批、diff hunk、沙箱、自动上下文管理、process view。
 
 > 实现快照（2026-10-18，进行中）：工具调用与审批门禁已落地。daemon 暴露
 > `read_file` / `list_dir`（只读，自动放行）和 `write_file` / `run_command`（需审批），
@@ -829,18 +834,16 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 丢弃；落盘前重新校验基准，stage 后被外部修改则记 `patch_conflict` 且不覆盖。单文件快照
 > 改为应用补丁时抓取。pending 补丁跨 daemon 重启恢复；TUI 卡片、attention、`eix approve` /
 > `eix deny`、`eix log` 均已支持补丁。`run_command` 无法 stage，仍在审批处阻塞。
-> Context ledger 已落地：`eixd/src/context.rs` 从事件日志重建 provider 上下文并按 sector
+> Context ledger 是内部机制：`eixd/src/context.rs` 从事件日志重建 provider 上下文并按 sector
 > 记账（system 5% / instructions 5% / workspace 15% / history 60% / tools 10% / memory 5%），
-> `context.ledger|drop|pin|compact` 请求与 `context.updated|compacted` 通知已接入；
+> 不向普通用户暴露 ledger 或手动 drop / pin 命令。
 > `AGENTS.md`（仓库根 → cwd 与 config 目录）注入 `instructions` sector，workspace summary 注入顶层
-> 文件树与 git branch/status。drop / pin / compact 落成事件
-> （`context_dropped|pinned|compacted`），重启后重放一致；`tools` / `history` 超预算时从最旧
-> 未 pin 条目自动裁剪（保留最新 4 条，必要时 emergency trim 到最新一条），system / instructions /
-> workspace / memory 不自动裁剪。`memory` 工具把 workspace 记忆写入 `<data>/memory/<hash>.md`，
-> 每次重建上下文都注入 `memory` sector；当前 todo 也作为固定任务状态注入。自动压缩在 turn
-> 开始和每个工具批次后运行；provider 返回 context-length 错误时强制压缩并重试。只读工具批次
-> 并发执行，结果保持调用顺序。TUI `c` 打开全屏 ledger（`o` 展开、`p` pin、`d` drop、`m` 标记、
-> `s` 压缩范围），CLI 为 `eix context [--drop|--undrop|--pin|--unpin|--compact]`。
+> 文件树与 git branch/status。上下文压缩落成 `context_compacted` 事件，重启后重放一致；
+> `tools` / `history` 超预算时从最旧条目自动裁剪（保留最新 4 条，必要时 emergency trim 到最新
+> 一条），system / instructions / workspace / memory 不自动裁剪。`memory` 工具把 workspace
+> 记忆写入 `<data>/memory/<hash>.md`，每次重建上下文都注入 `memory` sector；当前 todo 也作为
+> 固定任务状态注入。自动压缩在 turn 开始和每个工具批次后运行；provider 返回 context-length
+> 错误时强制压缩并重试。只读工具批次并发执行，结果保持调用顺序。
 > Process view 已落地：新增 `start_command {command, cwd?}`（与 `run_command` 共用
 > `command_plan`，同一沙箱与审批门禁）在 daemon 内启动后台进程并立即返回 id，以及只读的
 > `process_output {process_id?, max_bytes?}`（缺省取本 session 最新进程）。进程归属 daemon、
@@ -861,17 +864,17 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 > Fork / rewind 已落地（2026-10-18）：`session.fork {session_id, at_seq?, name?}` 把源
 > session 的 `seq < at_seq`（`None` 表示全部）事件复制到新 session，序号原样保留，因此
-> ledger 重建结果与源前缀一致；新 session 为 `idle`，复制 `cwd` / 模型 pin，并记录
+> 上下文重建结果与源前缀一致；新 session 为 `idle`，复制 `cwd` / 模型 pin，并记录
 > `parent_id` + `forked_from_seq`（独占切点）。默认命名去掉已有的数值 `~N` 后取
 > `name~2`、`name~3`…；`sessions` 表用 `PRAGMA table_info` 做幂等加列迁移。原 session
-> 完全不变。TUI `F` 在末尾 fork，ledger 里 `f` 在选中消息之前 fork（`seq_of` 非空时）；
+> 完全不变。TUI `F` 在末尾 fork，CLI `eix fork --at` 可在选中消息之前 fork；
 > 新 session 自动在新 pane attach。CLI 为 `eix fork [--session ID] [--at SEQ] [--name NAME]`。
 > **真正的 rewind**：`session.rewind {session_id, at_seq?, name?}` 先 fork，再把
 > `seq >= at_seq` 的快照按 seq 倒序（最新先撤）交给 `Snapshotter::restore`；busy session
 > 直接拒绝。返回 `RewindResult { restored, snapshots, files_restored, files_removed,
 > files_missing, warnings }`，`restored = failed_restores == 0 && files_missing == 0`；
 > 没有快照 / 快照关闭 / 被 prune / 恢复失败 / 文件缺失都会进 `warnings`，并提示“eix 之外的
-> 改动无法察觉”。TUI ledger `w` 和 CLI `eix rewind` 走这条路径，纯 fork 仍标 `files unchanged`。
+> 改动无法察觉”。CLI `eix rewind` 走这条路径，纯 fork 仍标 `files unchanged`。
 >
 > Worktree 已落地（2026-10-18，2026-10-24 扩展）：`session.create` / `session.fork` 接受
 > `worktree: bool?`。`create` 的 `None` 现在表示“首条 prompt 时自动建英文名 worktree”，
@@ -895,7 +898,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 >
 > 独立 nvim 前端已落地（2026-10-18）：`eix nvim [--session ID]` 把内嵌 Lua 插件写到
 > `<data>/eix-nvim.lua`，用 `EIX_NVIM_SOCKET` / `EIX_NVIM_TCP` / `EIX_NVIM_TOKEN` 连 daemon，
-> 转录渲染进 `eix://<id8>` scratch buffer；`:Eix attach|list|new|send|prompt|fork|rewind|stop|ps|ledger`
+> 转录渲染进 `eix://<id8>` scratch buffer；`:Eix attach|list|new|send|prompt|fork|rewind|stop|ps`
 > 覆盖主要操作。插件里所有 buffer API 都经 `vim.schedule`（libuv callback 是 fast context），
 > 环境值在加载时缓存。headless e2e 在 `nvim --headless -u NONE` 下验证 prompt/回答出现在
 > buffer；`#[tokio::test]` 的 current-thread runtime 需要 `spawn_blocking` 跑子进程。

@@ -625,27 +625,6 @@ pub struct EventsParams {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextLedgerParams {
-    pub session_id: SessionId,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextDropParams {
-    pub session_id: SessionId,
-    pub entry: String,
-    /// `None` means drop; `Some(false)` restores the entry.
-    #[serde(default)]
-    pub dropped: Option<bool>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ContextPinParams {
-    pub session_id: SessionId,
-    pub entry: String,
-    pub pinned: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextCompactParams {
     pub session_id: SessionId,
     /// Inclusive range of source event sequence numbers. Both `None` means

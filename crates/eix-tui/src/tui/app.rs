@@ -11,11 +11,11 @@ use crossterm::event::{
 };
 use eix_core::{
     theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
-    ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
-    InputAnsweredPayload, InputOption, InputRequiredPayload, IntegrationState, IntegrationStatus,
-    ModelInfo, PatchProposedPayload, PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo,
-    ProcessList, ProcessOutput, ProcessStatus, RewindResult, SearchHit, Sector, Session,
-    SessionStatus, SubmitResult, TodoItem, ToolResultPayload, UserMessagePayload, THEME_PRESETS,
+    Event as SessionEvent, EventKind, HelloResult, HunkInfo, InputAnsweredPayload, InputOption,
+    InputRequiredPayload, IntegrationState, IntegrationStatus, ModelInfo, PatchProposedPayload,
+    PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo, ProcessList, ProcessOutput,
+    ProcessStatus, SearchHit, Session, SessionStatus, SubmitResult, TodoItem, ToolResultPayload,
+    UserMessagePayload, THEME_PRESETS,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -30,7 +30,7 @@ use serde_json::Value;
 use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::controller::{Command, ContextOp, Event};
+use super::controller::{Command, Event};
 use super::editor::{leader_action, Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
 use super::theme::Theme;
@@ -1007,46 +1007,6 @@ struct DiffView {
     width: usize,
 }
 
-/// Full-screen context ledger, opened with `C` from the transcript.
-struct LedgerView {
-    session_id: String,
-    result: ContextLedgerResult,
-    cursor: usize,
-    scroll: usize,
-    /// Entries whose detail is expanded.
-    expanded: HashSet<String>,
-    /// Source seq of the first entry in a pending compaction range.
-    mark: Option<u64>,
-}
-
-impl LedgerView {
-    fn new(session_id: String, result: ContextLedgerResult) -> Self {
-        Self {
-            session_id,
-            result,
-            cursor: 0,
-            scroll: 0,
-            expanded: HashSet::new(),
-            mark: None,
-        }
-    }
-
-    fn entry(&self) -> Option<&ContextEntryInfo> {
-        self.result.entries.get(self.cursor)
-    }
-
-    fn set_result(&mut self, result: ContextLedgerResult) {
-        self.result = result;
-        self.cursor = self.cursor.min(self.result.entries.len().saturating_sub(1));
-    }
-
-    /// Event entries are named `e<seq>`; synthesized entries are not
-    /// compactable.
-    fn seq_of(entry: &ContextEntryInfo) -> Option<u64> {
-        entry.id.strip_prefix('e')?.parse().ok()
-    }
-}
-
 /// Full-screen background process list, opened with `P` from the transcript.
 struct ProcessView {
     session_id: String,
@@ -1284,8 +1244,6 @@ pub struct App {
     inputs: HashMap<String, PendingInput>,
     /// Full-screen diff review, when open.
     diff_view: Option<DiffView>,
-    /// Full-screen context ledger, when open.
-    ledger: Option<LedgerView>,
     /// Full-screen background process list, when open.
     process_view: Option<ProcessView>,
     /// Full-screen history search, when open.
@@ -1430,7 +1388,6 @@ impl App {
             approvals: HashMap::new(),
             inputs: HashMap::new(),
             diff_view: None,
-            ledger: None,
             process_view: None,
             search_view: None,
             transcript_search: None,
@@ -1499,7 +1456,6 @@ impl App {
     fn overlay_closed(&self) -> bool {
         self.picker.is_none()
             && self.diff_view.is_none()
-            && self.ledger.is_none()
             && self.process_view.is_none()
             && self.search_view.is_none()
             && self.inbox.is_none()
@@ -2249,44 +2205,6 @@ impl App {
                 };
                 let _ = tx.send(Command::Attach(id));
             }
-            Event::Rewound(result) => {
-                let RewindResult {
-                    session,
-                    restored,
-                    snapshots,
-                    files_restored,
-                    files_removed,
-                    files_missing,
-                    warnings,
-                } = *result;
-                let id = session.id.clone();
-                let name = session.name.clone();
-                self.upsert_session(session, true);
-                self.selected = self
-                    .sessions
-                    .iter()
-                    .position(|session| session.id == id)
-                    .unwrap_or(0);
-                self.pending_attach = Some(PendingAttach {
-                    session_id: id.clone(),
-                    slot: AttachSlot::New,
-                });
-                self.error = None;
-                let mut status = format!(
-                    "rewound {name} · {snapshots} snapshot(s) · {files_restored} restored, {files_removed} removed"
-                );
-                if files_missing > 0 {
-                    status.push_str(&format!(", {files_missing} missing"));
-                }
-                if !restored {
-                    status.push_str(" · INCOMPLETE");
-                }
-                if let Some(warning) = warnings.first() {
-                    status.push_str(&format!(" · {warning}"));
-                }
-                self.status = status;
-                let _ = tx.send(Command::Attach(id));
-            }
             Event::Search(result) => {
                 let Some(view) = &mut self.search_view else {
                     return;
@@ -2645,17 +2563,6 @@ impl App {
                         self.focused_view().map(|view| view.session.id.clone())
                     {
                         self.reload_input(&session_id);
-                    }
-                }
-            }
-            Event::Ledger { session_id, result } => {
-                if let Some(ledger) = &mut self.ledger {
-                    if ledger.session_id == session_id {
-                        ledger.set_result(result);
-                        self.status = format!(
-                            "context: {} / {} tokens",
-                            ledger.result.total_tokens, ledger.result.budget_tokens
-                        );
                     }
                 }
             }
@@ -3397,17 +3304,6 @@ impl App {
                     self.promote_session(&done.session_id);
                 }
             }
-            "context.updated" => {
-                if let Ok(params) =
-                    serde_json::from_value::<ContextUpdatedParams>(notification.params)
-                {
-                    if let Some(ledger) = &mut self.ledger {
-                        if ledger.session_id == params.session_id {
-                            ledger.set_result(params.ledger);
-                        }
-                    }
-                }
-            }
             "process.started" => {
                 if let Ok(info) = serde_json::from_value::<ProcessInfo>(notification.params) {
                     if self
@@ -3701,11 +3597,6 @@ impl App {
 
         if self.search_view.is_some() {
             self.handle_search_key(key, tx);
-            return;
-        }
-
-        if self.ledger.is_some() {
-            self.handle_ledger_key(key, tx);
             return;
         }
 
@@ -4789,7 +4680,6 @@ impl App {
             KeyAction::Models => self.open_picker(PickerKind::Models, tx),
             KeyAction::Worktrees => self.open_picker(PickerKind::Worktrees, tx),
             KeyAction::Branches => self.open_picker(PickerKind::Branches, tx),
-            KeyAction::Ledger => self.open_ledger(tx),
             KeyAction::Processes => self.open_processes(tx),
             KeyAction::Inbox => self.open_inbox(),
             KeyAction::Search => self.open_history_search(),
@@ -4822,156 +4712,6 @@ impl App {
                     self.status = if redo { "redoing…" } else { "undoing…" }.into();
                 }
             }
-        }
-    }
-
-    fn open_ledger(&mut self, tx: &UnboundedSender<Command>) {
-        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
-            self.status = "no session to inspect".into();
-            return;
-        };
-        self.ledger = Some(LedgerView::new(
-            session_id.clone(),
-            ContextLedgerResult::default(),
-        ));
-        self.status = "context ledger: loading…".into();
-        let _ = tx.send(Command::ContextLedger { session_id });
-    }
-
-    fn handle_ledger_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Char('q')) {
-            self.ledger = None;
-            self.status = "context ledger closed".into();
-            return;
-        }
-        let key = next_prev_key(key);
-        let Some(ledger) = &mut self.ledger else {
-            return;
-        };
-        let len = ledger.result.entries.len();
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if ledger.cursor + 1 < len {
-                    ledger.cursor += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                ledger.cursor = ledger.cursor.saturating_sub(1);
-            }
-            KeyCode::PageDown => {
-                ledger.cursor = (ledger.cursor + 10).min(len.saturating_sub(1));
-            }
-            KeyCode::PageUp => {
-                ledger.cursor = ledger.cursor.saturating_sub(10);
-            }
-            KeyCode::Char('b') | KeyCode::Char('B')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                ledger.cursor = ledger.cursor.saturating_sub(10);
-            }
-            KeyCode::Char('f') | KeyCode::Char('F')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                ledger.cursor = (ledger.cursor + 10).min(len.saturating_sub(1));
-            }
-            KeyCode::Char('g') => ledger.cursor = 0,
-            KeyCode::Char('G') => ledger.cursor = len.saturating_sub(1),
-            KeyCode::Char('o') | KeyCode::Enter => {
-                if let Some(entry) = ledger.entry() {
-                    let id = entry.id.clone();
-                    if !ledger.expanded.remove(&id) {
-                        ledger.expanded.insert(id);
-                    }
-                }
-            }
-            KeyCode::Char('p') => {
-                let Some(entry) = ledger.entry() else { return };
-                if !entry.editable {
-                    self.status = "this entry cannot be pinned".into();
-                    return;
-                }
-                let op = ContextOp::Pin {
-                    entry: entry.id.clone(),
-                    pinned: !entry.pinned,
-                };
-                let session_id = ledger.session_id.clone();
-                let _ = tx.send(Command::ContextOp { session_id, op });
-            }
-            KeyCode::Char('d') => {
-                let Some(entry) = ledger.entry() else { return };
-                if !entry.editable {
-                    self.status = "this entry cannot be dropped".into();
-                    return;
-                }
-                let op = ContextOp::Drop {
-                    entry: entry.id.clone(),
-                    dropped: !entry.dropped,
-                };
-                let session_id = ledger.session_id.clone();
-                let _ = tx.send(Command::ContextOp { session_id, op });
-            }
-            KeyCode::Char('m') => {
-                let Some(entry) = ledger.entry() else { return };
-                let Some(seq) = LedgerView::seq_of(entry) else {
-                    self.status = "only message entries can be marked".into();
-                    return;
-                };
-                if ledger.mark == Some(seq) {
-                    ledger.mark = None;
-                    self.status = "mark cleared".into();
-                } else {
-                    ledger.mark = Some(seq);
-                    self.status = format!("marked e{seq}; move and press s to compact the range");
-                }
-            }
-            KeyCode::Char('s') => {
-                let Some(entry) = ledger.entry() else { return };
-                let Some(seq) = LedgerView::seq_of(entry) else {
-                    self.status = "only message entries can be compacted".into();
-                    return;
-                };
-                let (from, to) = match ledger.mark {
-                    Some(mark) if mark != seq => (mark.min(seq), mark.max(seq)),
-                    _ => (seq, seq),
-                };
-                let op = ContextOp::Compact {
-                    from_seq: from,
-                    to_seq: to,
-                };
-                let session_id = ledger.session_id.clone();
-                ledger.mark = None;
-                let _ = tx.send(Command::ContextOp { session_id, op });
-                self.status = format!("compacting {from}..={to}…");
-            }
-            KeyCode::Char('f') => {
-                let Some(entry) = ledger.entry() else { return };
-                let Some(seq) = LedgerView::seq_of(entry) else {
-                    self.status = "only message entries can be forked".into();
-                    return;
-                };
-                let session_id = ledger.session_id.clone();
-                let _ = tx.send(Command::Fork {
-                    session_id,
-                    at_seq: Some(seq),
-                    name: None,
-                });
-                self.status = format!("forking before e{seq} · files unchanged");
-            }
-            KeyCode::Char('w') => {
-                let Some(entry) = ledger.entry() else { return };
-                let Some(seq) = LedgerView::seq_of(entry) else {
-                    self.status = "only message entries can be rewound".into();
-                    return;
-                };
-                let session_id = ledger.session_id.clone();
-                let _ = tx.send(Command::Rewind {
-                    session_id,
-                    at_seq: Some(seq),
-                    name: None,
-                });
-                self.status = format!("rewinding before e{seq} · restoring the workspace…");
-            }
-            _ => {}
         }
     }
 
@@ -7566,9 +7306,6 @@ already exists, update it in place rather than rewriting it from scratch.";
         if self.diff_view.is_some() {
             self.draw_diff_view(frame, area);
         }
-        if self.ledger.is_some() {
-            self.draw_ledger(frame, area);
-        }
         if self.process_view.is_some() {
             self.draw_processes(frame, area);
         }
@@ -8918,69 +8655,6 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
     }
 
-    fn draw_ledger(&mut self, frame: &mut Frame, area: Rect) {
-        let dialog_bg = dialog_background(self.theme);
-        let Some(ledger) = &mut self.ledger else {
-            return;
-        };
-        let rect = centered(
-            area,
-            area.width.saturating_sub(4),
-            area.height.saturating_sub(4),
-        );
-        frame.render_widget(Clear, rect);
-        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
-        let inner_width = rect.width.saturating_sub(2) as usize;
-        let inner_height = rect.height.saturating_sub(2) as usize;
-        // Two header rows (totals + per-sector budgets) and one hint row.
-        let list_height = inner_height.saturating_sub(3).max(1);
-
-        let mut lines: Vec<Line> = Vec::new();
-        let mut starts = Vec::with_capacity(ledger.result.entries.len());
-        for (index, entry) in ledger.result.entries.iter().enumerate() {
-            starts.push(lines.len());
-            lines.push(ledger_entry_line(
-                entry,
-                index == ledger.cursor,
-                inner_width,
-            ));
-            if ledger.expanded.contains(&entry.id) {
-                for detail in entry.detail.lines().take(8) {
-                    lines.push(Line::from(Span::styled(
-                        truncate(&format!("      {detail}"), inner_width),
-                        Style::default().fg(Color::DarkGray),
-                    )));
-                }
-            }
-        }
-
-        let cursor_line = starts.get(ledger.cursor).copied().unwrap_or(0);
-        let max_scroll = lines.len().saturating_sub(list_height);
-        if cursor_line < ledger.scroll {
-            ledger.scroll = cursor_line;
-        } else if cursor_line >= ledger.scroll + list_height {
-            ledger.scroll = cursor_line + 1 - list_height;
-        }
-        ledger.scroll = ledger.scroll.min(max_scroll);
-
-        let mut body: Vec<Line> = Vec::with_capacity(list_height + 3);
-        body.push(ledger_totals_line(&ledger.result));
-        body.push(ledger_sectors_line(&ledger.result, inner_width));
-        body.extend(lines.into_iter().skip(ledger.scroll).take(list_height));
-        body.push(ledger_hint_line(ledger));
-
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
-            .title(" context ledger ");
-        frame.render_widget(
-            Paragraph::new(body)
-                .block(block)
-                .style(Style::default().bg(dialog_bg)),
-            rect,
-        );
-    }
-
     fn draw_inbox(&mut self, frame: &mut Frame, area: Rect) {
         let dialog_bg = dialog_background(self.theme);
         let Some(inbox) = &self.inbox else {
@@ -10107,12 +9781,6 @@ struct AttentionParams {
 }
 
 #[derive(Deserialize)]
-struct ContextUpdatedParams {
-    session_id: String,
-    ledger: ContextLedgerResult,
-}
-
-#[derive(Deserialize)]
 struct ProcessChunkParams {
     session_id: String,
     process_id: String,
@@ -10529,10 +10197,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 key: "ask_user",
                 description: "approval/question cards use - [ ] / - [x] rows; the first option is recommended.",
             },
-            HelpEntry {
-                key: "ledger",
-                description: "advisory: system and instruction entries are never trimmed automatically",
-            },
         ],
     },
 ];
@@ -10730,17 +10394,6 @@ fn draw_timeline(
     frame.render_widget(paragraph, rect);
 }
 
-fn sector_tag(sector: Sector) -> &'static str {
-    match sector {
-        Sector::System => "SYS ",
-        Sector::Instructions => "INS ",
-        Sector::Workspace => "WS  ",
-        Sector::History => "HIS ",
-        Sector::Tools => "TOOL",
-        Sector::Memory => "MEM ",
-    }
-}
-
 fn process_line(process: &ProcessInfo, selected: bool, width: usize) -> Line<'static> {
     let marker = if selected { "▸" } else { " " };
     let (tag, color) = match process.status {
@@ -10767,97 +10420,6 @@ fn process_line(process: &ProcessInfo, selected: bool, width: usize) -> Line<'st
         Style::default().fg(color)
     };
     Line::from(Span::styled(truncate(&text, width), style))
-}
-
-fn ledger_entry_line(entry: &ContextEntryInfo, selected: bool, width: usize) -> Line<'static> {
-    let marker = if selected { "▸" } else { " " };
-    let flag = if entry.dropped {
-        if entry.auto {
-            "cut"
-        } else {
-            "off"
-        }
-    } else if entry.compacted {
-        "sum"
-    } else if entry.pinned {
-        "pin"
-    } else {
-        "   "
-    };
-    let text = format!(
-        "{marker} {flag} {} {:>6}t  {}",
-        sector_tag(entry.sector),
-        entry.tokens,
-        entry.preview
-    );
-    let style = if selected {
-        Style::default()
-            .bg(Color::DarkGray)
-            .add_modifier(Modifier::BOLD)
-    } else if entry.dropped || entry.compacted {
-        Style::default().fg(Color::DarkGray)
-    } else if entry.pinned {
-        Style::default().fg(Color::Yellow)
-    } else {
-        Style::default()
-    };
-    Line::from(Span::styled(truncate(&text, width), style))
-}
-
-fn ledger_totals_line(result: &ContextLedgerResult) -> Line<'static> {
-    let remaining = result.budget_tokens.saturating_sub(result.total_tokens);
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} / {} tokens", result.total_tokens, result.budget_tokens),
-            Style::default().add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!("  ({remaining} left)"),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ];
-    if result.trimmed > 0 {
-        spans.push(Span::styled(
-            format!("  · {} auto-trimmed", result.trimmed),
-            Style::default().fg(Color::Yellow),
-        ));
-    }
-    Line::from(spans)
-}
-
-fn ledger_sectors_line(result: &ContextLedgerResult, width: usize) -> Line<'static> {
-    let parts: Vec<String> = result
-        .sectors
-        .iter()
-        .filter(|sector| sector.entries > 0)
-        .map(|sector| {
-            format!(
-                "{} {}/{}t",
-                sector_tag(sector.sector).trim(),
-                sector.tokens,
-                sector.budget_tokens
-            )
-        })
-        .collect();
-    let text = if parts.is_empty() {
-        " (nothing in context yet)".to_string()
-    } else {
-        format!(" {}", parts.join("  ·  "))
-    };
-    Line::from(Span::styled(
-        truncate(&text, width),
-        Style::default().fg(Color::DarkGray),
-    ))
-}
-
-fn ledger_hint_line(ledger: &LedgerView) -> Line<'static> {
-    let text = match ledger.mark {
-        Some(mark) => format!(" mark e{mark} · s compact range · m clear · Esc close "),
-        None => {
-            " j/k move · o expand · p pin · d drop · m mark · s compact · Esc close ".to_string()
-        }
-    };
-    Line::from(Span::styled(text, Style::default().fg(Color::DarkGray)))
 }
 
 /// Tile `count` panes inside `area`. One pane is fullscreen, two split
@@ -13881,89 +13443,6 @@ mod tests {
         assert!(app.status.contains("no diff"));
     }
 
-    fn ledger_entry(id: &str, sector: Sector, kind: &str, tokens: usize) -> ContextEntryInfo {
-        ContextEntryInfo {
-            id: id.into(),
-            sector,
-            kind: kind.into(),
-            tokens,
-            chars: 0,
-            preview: format!("{kind} preview"),
-            detail: format!("{kind} detail"),
-            pinned: false,
-            dropped: false,
-            compacted: false,
-            auto: false,
-            editable: true,
-        }
-    }
-
-    #[test]
-    fn ledger_view_tracks_the_cursor_and_parses_seqs() {
-        let result = ContextLedgerResult {
-            entries: vec![
-                ledger_entry("system", Sector::System, "system", 10),
-                ledger_entry("e12", Sector::History, "user", 40),
-            ],
-            sectors: Vec::new(),
-            total_tokens: 50,
-            budget_tokens: 100,
-            trimmed: 0,
-        };
-        let mut view = LedgerView::new("s1".into(), result);
-        assert_eq!(view.entry().map(|entry| entry.id.as_str()), Some("system"));
-        assert!(LedgerView::seq_of(view.entry().unwrap()).is_none());
-        view.cursor = 1;
-        assert_eq!(LedgerView::seq_of(view.entry().unwrap()), Some(12));
-
-        // A refresh never moves the cursor past the end.
-        view.set_result(ContextLedgerResult {
-            entries: vec![ledger_entry("system", Sector::System, "system", 10)],
-            ..Default::default()
-        });
-        assert_eq!(view.cursor, 0);
-    }
-
-    #[test]
-    fn ledger_lines_mark_dropped_and_pinned_entries() {
-        let mut entry = ledger_entry("e1", Sector::History, "user", 40);
-        entry.pinned = true;
-        let text: String = ledger_entry_line(&entry, false, 80)
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("pin"));
-        assert!(text.contains("HIS"));
-
-        entry.pinned = false;
-        entry.dropped = true;
-        entry.auto = true;
-        let text: String = ledger_entry_line(&entry, true, 80)
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect();
-        assert!(text.contains("cut"));
-        assert!(text.starts_with('▸'));
-    }
-
-    #[test]
-    fn internal_ledger_view_sends_a_request_and_closes_with_esc() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(None);
-        app.views.push(SessionView::new(
-            Session::new("s1", "one", "/tmp"),
-            Vec::new(),
-        ));
-        app.open_ledger(&tx);
-        assert!(app.ledger.is_some());
-        assert!(rx.try_recv().is_ok());
-
-        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
-        assert!(app.ledger.is_none());
-    }
-
     fn process_info(id: &str, status: ProcessStatus) -> ProcessInfo {
         ProcessInfo {
             id: id.into(),
@@ -14069,49 +13548,6 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
         assert!(app.process_view.is_none());
         assert!(!app.should_quit, "q closes the overlay, not the app");
-    }
-
-    #[test]
-    fn fork_key_copies_everything_and_ledger_f_forks_before_the_entry() {
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = App::new(None);
-        app.views.push(SessionView::new(
-            Session::new("s1", "one", "/tmp"),
-            Vec::new(),
-        ));
-
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('F'), KeyModifiers::NONE), &tx);
-        match rx.try_recv().expect("fork command") {
-            Command::Fork {
-                session_id,
-                at_seq,
-                name,
-            } => {
-                assert_eq!(session_id, "s1");
-                assert_eq!(at_seq, None);
-                assert!(name.is_none());
-            }
-            _ => panic!("expected a fork command"),
-        }
-
-        // The ledger's `f` forks strictly before the selected message.
-        let mut result = ContextLedgerResult {
-            entries: vec![
-                ledger_entry("system", Sector::System, "system", 10),
-                ledger_entry("e12", Sector::History, "user", 40),
-            ],
-            ..Default::default()
-        };
-        result.entries[0].id = "system".into();
-        let mut ledger = LedgerView::new("s1".into(), result);
-        ledger.cursor = 1;
-        app.ledger = Some(ledger);
-        app.handle_key(KeyEvent::new(KeyCode::Char('f'), KeyModifiers::NONE), &tx);
-        match rx.try_recv().expect("ledger fork command") {
-            Command::Fork { at_seq, .. } => assert_eq!(at_seq, Some(12)),
-            _ => panic!("expected a fork command"),
-        }
     }
 
     #[test]
@@ -15314,7 +14750,6 @@ mod tests {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
             assert!(app.picker.is_none(), "bare {ch} opened a picker");
             assert!(app.process_view.is_none(), "bare {ch} opened processes");
-            assert!(app.ledger.is_none(), "bare {ch} opened the ledger");
             assert!(!app.should_quit, "bare {ch} quit the app");
         }
         assert!(!app.creating, "bare n created a session");
@@ -15467,10 +14902,6 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &tx);
 
         assert_eq!(app.views.len(), 1);
-        assert!(
-            app.ledger.is_none(),
-            "leader c closes the pane instead of opening the ledger"
-        );
     }
 
     #[test]
@@ -15497,7 +14928,6 @@ mod tests {
         struct Snapshot {
             help: bool,
             search: bool,
-            ledger: bool,
             processes: bool,
             picker: Option<u8>,
             panes: usize,
@@ -15510,7 +14940,6 @@ mod tests {
             Snapshot {
                 help: app.help,
                 search: app.search_view.is_some(),
-                ledger: app.ledger.is_some(),
                 processes: app.process_view.is_some(),
                 picker: app.picker.as_ref().map(|picker| picker.kind as u8),
                 panes: app.views.len(),
@@ -15644,23 +15073,6 @@ mod tests {
         app.handle_key(control('b'), &tx);
         assert_eq!(app.search_view.as_ref().unwrap().cursor, 0);
         app.search_view = None;
-
-        // Context ledger entries.
-        let entries = (0..15)
-            .map(|i| ledger_entry(&format!("e{i}"), Sector::History, "user", 10))
-            .collect();
-        app.ledger = Some(LedgerView::new(
-            "s1".into(),
-            ContextLedgerResult {
-                entries,
-                ..Default::default()
-            },
-        ));
-        app.handle_key(control('f'), &tx);
-        assert_eq!(app.ledger.as_ref().unwrap().cursor, 10);
-        app.handle_key(control('b'), &tx);
-        assert_eq!(app.ledger.as_ref().unwrap().cursor, 0);
-        app.ledger = None;
 
         // Cross-session approval inbox.
         app.inbox = Some(InboxView {

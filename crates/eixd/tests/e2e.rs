@@ -578,210 +578,6 @@ async fn daemon_does_not_retry_an_exhausted_quota() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn context_ledger_reports_sectors_and_honours_policies() -> anyhow::Result<()> {
-    let dir = temp_dir("context");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("AGENTS.md"), "Always answer in lowercase.\n")?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
-
-    let mut config = Config::default();
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let data_dir = dir.join("data");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data_dir.clone()));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "ctx", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "first question"}),
-        )
-        .await?;
-    wait_turn(&mut client).await?;
-
-    let ledger: eix_core::ContextLedgerResult = client
-        .request("context.ledger", json!({"session_id": session_id}))
-        .await?;
-    assert!(ledger.total_tokens > 0);
-    assert_eq!(ledger.budget_tokens, 32_000);
-    let instructions = ledger
-        .entries
-        .iter()
-        .find(|entry| entry.id == "instructions:AGENTS.md")
-        .expect("AGENTS.md in the ledger");
-    assert!(instructions.detail.contains("Always answer in lowercase"));
-    assert_eq!(instructions.sector, eix_core::Sector::Instructions);
-    assert!(ledger.entries.iter().any(|entry| entry.id == "workspace"));
-    assert!(ledger
-        .sectors
-        .iter()
-        .find(|sector| sector.sector == eix_core::Sector::History)
-        .is_some_and(|sector| sector.entries == 2));
-
-    // The first request carries the system prompt, the instructions and the
-    // workspace summary.
-    let first: Value = serde_json::from_str(&bodies.lock().await[0])?;
-    let first_text = first["messages"].to_string();
-    assert!(first_text.contains("Always answer in lowercase"));
-    assert!(first_text.contains("workspace:"));
-    assert!(first_text.contains("first question"));
-
-    let user = ledger
-        .entries
-        .iter()
-        .find(|entry| entry.kind == "user")
-        .expect("user entry")
-        .clone();
-    let assistant = ledger
-        .entries
-        .iter()
-        .find(|entry| entry.kind == "assistant")
-        .expect("assistant entry")
-        .clone();
-    assert!(user.id.starts_with('e'));
-    assert!(assistant.id.starts_with('e'));
-
-    let pinned: eix_core::ContextLedgerResult = client
-        .request(
-            "context.pin",
-            json!({"session_id": session_id, "entry": user.id, "pinned": true}),
-        )
-        .await?;
-    assert!(
-        pinned
-            .entries
-            .iter()
-            .find(|entry| entry.id == user.id)
-            .unwrap()
-            .pinned
-    );
-
-    let dropped: eix_core::ContextLedgerResult = client
-        .request(
-            "context.drop",
-            json!({"session_id": session_id, "entry": assistant.id}),
-        )
-        .await?;
-    assert!(
-        dropped
-            .entries
-            .iter()
-            .find(|entry| entry.id == assistant.id)
-            .unwrap()
-            .dropped
-    );
-
-    // System entries are not user-editable.
-    let refused = client
-        .request_error(
-            "context.drop",
-            json!({"session_id": session_id, "entry": "system"}),
-        )
-        .await?;
-    assert_eq!(refused, "invalid_params");
-
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "second question"}),
-        )
-        .await?;
-    wait_turn(&mut client).await?;
-
-    let second: Value = serde_json::from_str(&bodies.lock().await[1])?;
-    let second_text = second["messages"].to_string();
-    assert!(second_text.contains("Always answer in lowercase"));
-    assert!(second_text.contains("first question"));
-    assert!(
-        !second_text.contains("Hello from mock"),
-        "a dropped assistant message must not be sent: {second_text}"
-    );
-
-    // Compaction replaces the first exchange with one summary.
-    let from = seq_of(&user.id)?;
-    let to = seq_of(&assistant.id)?;
-    let compacted: eix_core::ContextLedgerResult = client
-        .request(
-            "context.compact",
-            json!({
-                "session_id": session_id,
-                "from_seq": from,
-                "to_seq": to,
-                "summary": "we exchanged greetings",
-            }),
-        )
-        .await?;
-    assert!(compacted
-        .entries
-        .iter()
-        .any(|entry| entry.id == format!("c{from}-{to}")));
-    assert!(
-        compacted
-            .entries
-            .iter()
-            .find(|entry| entry.id == user.id)
-            .unwrap()
-            .compacted
-    );
-
-    let overlap = client
-        .request_error(
-            "context.compact",
-            json!({"session_id": session_id, "from_seq": from, "to_seq": from + 1}),
-        )
-        .await?;
-    assert_eq!(overlap, "invalid_params");
-
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "third question"}),
-        )
-        .await?;
-    wait_turn(&mut client).await?;
-    let third: Value = serde_json::from_str(&bodies.lock().await[2])?;
-    let third_text = third["messages"].to_string();
-    assert!(third_text.contains("we exchanged greetings"));
-    assert!(third_text.contains("[compacted 2 messages"));
-    assert!(!third_text.contains("first question"));
-    assert!(third_text.contains("second question"));
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    assert!(attached
-        .events
-        .iter()
-        .any(|event| event.kind == EventKind::ContextPinned));
-    assert!(attached
-        .events
-        .iter()
-        .any(|event| event.kind == EventKind::ContextDropped));
-    assert!(attached
-        .events
-        .iter()
-        .any(|event| event.kind == EventKind::ContextCompacted));
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
     let dir = temp_dir("clear");
     std::fs::create_dir_all(&dir)?;
@@ -1391,13 +1187,6 @@ async fn wait_turn(client: &mut TestClient) -> anyhow::Result<String> {
             _ => {}
         }
     }
-}
-
-fn seq_of(id: &str) -> anyhow::Result<u64> {
-    Ok(id
-        .strip_prefix('e')
-        .ok_or_else(|| anyhow::anyhow!("not an event entry: {id}"))?
-        .parse()?)
 }
 
 #[tokio::test]
@@ -3135,6 +2924,17 @@ fn git(dir: &Path, args: &[&str]) -> std::process::Output {
         .expect("run git")
 }
 
+fn git_stdout(dir: &Path, args: &[&str]) -> String {
+    let output = git(dir, args);
+    assert!(
+        output.status.success(),
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 #[tokio::test]
 async fn worktree_sessions_are_created_forked_and_removed() -> anyhow::Result<()> {
     let dir = temp_dir("worktree");
@@ -3441,6 +3241,202 @@ async fn ready_recovers_a_stale_rebase_and_records_a_backup() -> anyhow::Result<
         notes.iter().any(|note| note.contains("backup:")),
         "missing recovery backup: {notes:?}"
     );
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_merges_into_the_branch_the_session_started_from() -> anyhow::Result<()> {
+    let root = temp_dir("integration-feature-base");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(dir.join("README.md"), "base\n")?;
+    assert!(git(&dir, &["add", "README.md"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+    assert!(git(&dir, &["checkout", "-q", "-b", "feature"])
+        .status
+        .success());
+    std::fs::write(dir.join("feature-base.txt"), "feature\n")?;
+    assert!(git(&dir, &["add", "feature-base.txt"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "feature base"])
+        .status
+        .success());
+
+    let main_before = git_stdout(&dir, &["rev-parse", "main"]);
+    let feature_before = git_stdout(&dir, &["rev-parse", "feature"]);
+    let repo = dir.canonicalize()?;
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "auto".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.test = "true".into();
+    config.integration.timeout_secs = 30;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "feature-work", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree");
+    assert_eq!(
+        git_stdout(&worktree, &["rev-parse", "HEAD"]),
+        feature_before,
+        "worktree should start from the current feature branch"
+    );
+
+    let list: eix_core::IntegrationListResult = client
+        .request("integration.list", json!({"session_id": session.id}))
+        .await?;
+    let state = list.integrations.first().expect("integration state");
+    assert_eq!(state.base_branch.as_deref(), Some("feature"));
+
+    std::fs::write(worktree.join("session.txt"), "session\n")?;
+    let ready: eix_core::IntegrationState = client
+        .request("session.ready", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(ready.status, eix_core::IntegrationStatus::Ready);
+
+    let mut merged = false;
+    for _ in 0..40 {
+        let list: eix_core::IntegrationListResult = client
+            .request("integration.list", json!({"session_id": session.id}))
+            .await?;
+        let state = list.integrations.first().expect("integration state");
+        if state.status == eix_core::IntegrationStatus::Merged {
+            merged = true;
+            break;
+        }
+        if state.status == eix_core::IntegrationStatus::Retrying {
+            anyhow::bail!("integration retried: {:?}", state.error);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(merged, "integration did not merge");
+
+    let session_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(git_stdout(&repo, &["rev-parse", "feature"]), session_head);
+    assert_eq!(git_stdout(&repo, &["rev-parse", "main"]), main_before);
+    assert_ne!(git_stdout(&repo, &["rev-parse", "feature"]), feature_before);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("session.txt"))?,
+        "session\n"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("feature-base.txt"))?,
+        "feature\n"
+    );
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_merges_into_a_linked_starting_worktree() -> anyhow::Result<()> {
+    let root = temp_dir("integration-linked-base");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(dir.join("README.md"), "base\n")?;
+    assert!(git(&dir, &["add", "README.md"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+
+    let feature = root.join("feature-wt");
+    let add = git(
+        &dir,
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "feature",
+            feature.to_str().expect("feature path"),
+        ],
+    );
+    assert!(
+        add.status.success(),
+        "git worktree add: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    std::fs::write(feature.join("feature-base.txt"), "feature\n")?;
+    assert!(git(&feature, &["add", "feature-base.txt"]).status.success());
+    assert!(git(&feature, &["commit", "-q", "-m", "feature base"])
+        .status
+        .success());
+
+    let main_before = git_stdout(&dir, &["rev-parse", "main"]);
+    let repo = dir.canonicalize()?;
+    let feature = feature.canonicalize()?;
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "auto".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.test = "true".into();
+    config.integration.timeout_secs = 30;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "linked-work", "cwd": feature, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree");
+    let list: eix_core::IntegrationListResult = client
+        .request("integration.list", json!({"session_id": session.id}))
+        .await?;
+    let state = list.integrations.first().expect("integration state");
+    assert_eq!(state.base_branch.as_deref(), Some("feature"));
+
+    std::fs::write(worktree.join("session.txt"), "session\n")?;
+    let ready: eix_core::IntegrationState = client
+        .request("session.ready", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(ready.status, eix_core::IntegrationStatus::Ready);
+
+    let mut merged = false;
+    for _ in 0..40 {
+        let list: eix_core::IntegrationListResult = client
+            .request("integration.list", json!({"session_id": session.id}))
+            .await?;
+        let state = list.integrations.first().expect("integration state");
+        if state.status == eix_core::IntegrationStatus::Merged {
+            merged = true;
+            break;
+        }
+        if state.status == eix_core::IntegrationStatus::Retrying {
+            anyhow::bail!("integration retried: {:?}", state.error);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(merged, "integration did not merge");
+
+    let session_head = git_stdout(&worktree, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        git_stdout(&feature, &["rev-parse", "feature"]),
+        session_head
+    );
+    assert_eq!(git_stdout(&repo, &["rev-parse", "main"]), main_before);
+    assert_eq!(
+        std::fs::read_to_string(feature.join("session.txt"))?,
+        "session\n"
+    );
+    assert!(!repo.join("session.txt").exists());
 
     daemon.abort();
     let _ = tokio::fs::remove_dir_all(&root).await;
@@ -3865,6 +3861,88 @@ async fn first_prompt_creates_an_english_named_worktree() -> anyhow::Result<()> 
         Some("hello-from-mock")
     );
     assert!(worktree.is_dir());
+
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn lazy_worktree_uses_the_branch_from_session_creation() -> anyhow::Result<()> {
+    let root = temp_dir("auto-worktree-branch");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(dir.join(".gitignore"), ".worktrees/\n")?;
+    assert!(git(&dir, &["add", ".gitignore"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+    assert!(git(&dir, &["checkout", "-q", "-b", "feature"])
+        .status
+        .success());
+    std::fs::write(dir.join("feature.txt"), "feature\n")?;
+    assert!(git(&dir, &["add", "feature.txt"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "feature"])
+        .status
+        .success());
+    let feature_head = git_stdout(&dir, &["rev-parse", "HEAD"]);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.worktree.base = "auto".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "auto-branch", "cwd": dir}))
+        .await?;
+    assert!(!created.session.has_worktree());
+    let list: eix_core::IntegrationListResult = client
+        .request(
+            "integration.list",
+            json!({"session_id": created.session.id}),
+        )
+        .await?;
+    let state = list.integrations.first().expect("integration state");
+    assert_eq!(state.base_branch.as_deref(), Some("feature"));
+
+    // Switch the starting checkout away before the lazy worktree is created.
+    // The stored branch from session creation must still win.
+    assert!(git(&dir, &["checkout", "-q", "main"]).status.success());
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "fix the login bug"}),
+        )
+        .await?;
+    let updated: SessionResult = client
+        .request("session.get", json!({"session_id": created.session.id}))
+        .await?;
+    let worktree = updated.session.worktree.clone().expect("auto worktree");
+    assert_eq!(git_stdout(&worktree, &["rev-parse", "HEAD"]), feature_head);
+    assert_eq!(
+        std::fs::read_to_string(worktree.join("feature.txt"))?,
+        "feature\n"
+    );
 
     loop {
         let notification = client.next_notification().await?;
@@ -4735,43 +4813,6 @@ async fn picker_query_lists_git_worktrees_and_branches() -> anyhow::Result<()> {
     assert_eq!(branches.kind, eix_core::KIND_BRANCHES);
     assert_eq!(branches.items.len(), 1);
     assert_eq!(branches.items[0].value, "feature");
-
-    daemon.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn picker_query_lists_context_entries() -> anyhow::Result<()> {
-    let dir = temp_dir("picker-context");
-    std::fs::create_dir_all(&dir)?;
-    let config = Config::default();
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "context", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-
-    let result: eix_core::PickerResult = client
-        .request(
-            "picker.query",
-            json!({"kind": "context", "session_id": session_id}),
-        )
-        .await?;
-    assert_eq!(result.kind, eix_core::KIND_CONTEXT);
-    assert!(
-        result.items.iter().any(|item| item.value == "system"),
-        "system entry missing: {result:?}"
-    );
-    assert!(
-        result.items.iter().any(|item| item.value == "workspace"),
-        "workspace entry missing: {result:?}"
-    );
-    // Rows carry the ledger detail so the picker can preview them.
-    assert!(result.items.iter().all(|item| item.preview.is_some()));
 
     daemon.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;

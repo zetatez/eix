@@ -401,6 +401,11 @@ pub struct ContextCompactedPayload {
     pub messages: usize,
     pub tokens: usize,
     pub summary: String,
+    /// Automatic compactions include the previous summary and supersede older
+    /// summary entries in the provider context. Manual compactions leave this
+    /// false so unrelated summaries remain visible.
+    #[serde(default)]
+    pub rolling: bool,
 }
 
 /// Everything with `seq <=` this event's sequence is excluded from provider

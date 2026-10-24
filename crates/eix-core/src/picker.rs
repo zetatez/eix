@@ -21,13 +21,11 @@ pub const KIND_FILES: &str = "files";
 pub const KIND_WORKTREES: &str = "worktrees";
 /// Provider name for git branches of the session's repository.
 pub const KIND_BRANCHES: &str = "branches";
-/// Provider name for the session's context-ledger entries.
-pub const KIND_CONTEXT: &str = "context";
 /// Preview provider name for a session's recent conversation.
 pub const KIND_SESSION_PREVIEW: &str = "sessions";
 
 /// Every provider the daemon answers for `picker.query`.
-pub const DATA_KINDS: [&str; 4] = [KIND_FILES, KIND_WORKTREES, KIND_BRANCHES, KIND_CONTEXT];
+pub const DATA_KINDS: [&str; 3] = [KIND_FILES, KIND_WORKTREES, KIND_BRANCHES];
 
 /// True when `kind` is a daemon-backed provider.
 pub fn is_data_kind(kind: &str) -> bool {

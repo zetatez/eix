@@ -87,6 +87,7 @@ struct Compaction {
     messages: usize,
     tokens: usize,
     summary: String,
+    rolling: bool,
 }
 
 #[derive(Default)]
@@ -144,6 +145,7 @@ impl Policy {
                             messages: value.messages,
                             tokens: value.tokens,
                             summary: value.summary,
+                            rolling: value.rolling,
                         });
                     }
                 }
@@ -348,6 +350,22 @@ impl Ledger {
             compactions: policy.compactions,
             result,
         }
+    }
+
+    /// Active compaction summaries, used as the starting point for the next
+    /// rolling summary. Older rolling summaries are already suppressed, so
+    /// this is normally one summary; a later manual compaction can add another.
+    pub fn latest_summary(&self) -> Option<String> {
+        let text = self
+            .entries
+            .iter()
+            .filter(|entry| entry.summary && !entry.info.dropped && !entry.info.compacted)
+            .flat_map(|entry| entry.messages.iter())
+            .map(|message| message.content.trim())
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        (!text.is_empty()).then_some(text)
     }
 
     /// Provider messages for everything still in the context.
@@ -875,6 +893,19 @@ fn apply_compactions(entries: Vec<Entry>, compactions: &[Compaction]) -> Vec<Ent
     if compactions.is_empty() {
         return entries;
     }
+    // A rolling auto-compaction includes the previous summary, so older
+    // summaries would be duplicate context. Keep only the newest rolling one.
+    let latest_rolling = compactions
+        .iter()
+        .rposition(|compaction| compaction.rolling);
+    let superseded: HashSet<(u64, u64)> = latest_rolling
+        .map(|index| {
+            compactions[..index]
+                .iter()
+                .map(|compaction| (compaction.from_seq, compaction.to_seq))
+                .collect()
+        })
+        .unwrap_or_default();
     let mut emitted: HashSet<(u64, u64)> = HashSet::new();
     let mut out = Vec::with_capacity(entries.len());
     for mut entry in entries {
@@ -888,7 +919,8 @@ fn apply_compactions(entries: Vec<Entry>, compactions: &[Compaction]) -> Vec<Ent
             .cloned();
         if let Some(compaction) = covered {
             entry.info.compacted = true;
-            if emitted.insert((compaction.from_seq, compaction.to_seq)) {
+            let key = (compaction.from_seq, compaction.to_seq);
+            if !superseded.contains(&key) && emitted.insert(key) {
                 out.push(summary_entry(&compaction));
             }
             // Keep the original for the expand view; `messages()` skips it.
@@ -898,7 +930,8 @@ fn apply_compactions(entries: Vec<Entry>, compactions: &[Compaction]) -> Vec<Ent
         out.push(entry);
     }
     for compaction in compactions {
-        if emitted.insert((compaction.from_seq, compaction.to_seq)) {
+        let key = (compaction.from_seq, compaction.to_seq);
+        if !superseded.contains(&key) && emitted.insert(key) {
             out.push(summary_entry(compaction));
         }
     }
@@ -1728,6 +1761,7 @@ mod tests {
                     messages: 1,
                     tokens: 1,
                     summary: "two".into(),
+                    rolling: false,
                 }),
             ),
         ];
@@ -1752,6 +1786,7 @@ mod tests {
                     messages: 2,
                     tokens: 10,
                     summary: "they greeted each other".into(),
+                    rolling: false,
                 }),
             ),
         ];
@@ -1766,6 +1801,52 @@ mod tests {
         let entries = ledger.info().entries;
         assert!(entries.iter().find(|e| e.id == "e1").unwrap().compacted);
         assert!(entries.iter().any(|e| e.id == "c1-2"));
+        assert!(ledger.overlaps_compaction(2, 3));
+    }
+
+    #[test]
+    fn rolling_compaction_supersedes_older_summaries() {
+        let events = vec![
+            user(1, "one"),
+            assistant(2, "two"),
+            user(3, "three"),
+            assistant(4, "four"),
+            user(5, "five"),
+            assistant(6, "six"),
+            event(
+                7,
+                EventKind::ContextCompacted,
+                payload(&ContextCompactedPayload {
+                    from_seq: 1,
+                    to_seq: 2,
+                    messages: 2,
+                    tokens: 10,
+                    summary: "old summary".into(),
+                    rolling: true,
+                }),
+            ),
+            event(
+                8,
+                EventKind::ContextCompacted,
+                payload(&ContextCompactedPayload {
+                    from_seq: 3,
+                    to_seq: 4,
+                    messages: 2,
+                    tokens: 10,
+                    summary: "new rolling summary".into(),
+                    rolling: true,
+                }),
+            ),
+        ];
+        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 100_000);
+        let messages = ledger.messages();
+        assert!(!messages.iter().any(|m| m.content.contains("old summary")));
+        assert!(messages
+            .iter()
+            .any(|m| m.content.contains("new rolling summary")));
+        assert!(ledger
+            .latest_summary()
+            .is_some_and(|summary| summary.contains("new rolling summary")));
         assert!(ledger.overlaps_compaction(2, 3));
     }
 
@@ -2024,6 +2105,7 @@ mod tests {
                 messages: 4,
                 tokens: 10,
                 summary: "earlier talk".into(),
+                rolling: false,
             }),
         ));
         events.push(user(10, "five"));

@@ -171,8 +171,10 @@ pub struct WorktreeConfig {
     /// Create an isolated worktree for every new user/fork session in a git
     /// repository. Explicit `--shared` sessions opt out.
     pub auto: bool,
-    /// Local base branch. `auto` resolves `origin/HEAD`, then `main` /
-    /// `master`, then the repository's current branch.
+    /// Local base branch. `auto` uses the branch checked out in the session's
+    /// starting directory; detached HEADs fall back to `origin/HEAD`, then
+    /// `main` / `master`, then the repository's current branch. An explicit
+    /// branch name overrides the session's current branch.
     pub base: String,
 }
 
