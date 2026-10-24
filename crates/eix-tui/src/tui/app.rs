@@ -19,7 +19,6 @@ use eix_core::{
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::symbols::border::Set as BorderSet;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
@@ -57,7 +56,7 @@ const CMDLINE_HISTORY_LIMIT: usize = 100;
 /// Picker value for "no preset" (keep the terminal/default palette).
 const THEME_DEFAULT_VALUE: &str = "@default";
 
-/// Running sessions use a short animated glyph; idle sessions show `○`.
+/// Running sessions use a short animated glyph; completed/idle sessions show `⠶`.
 const RUNNING_SPINNER: [&str; 8] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧"];
 
 /// Re-read the focused session's git branch at this interval.
@@ -230,19 +229,6 @@ const COMPOSER_WARN: Color = Color::Rgb(229, 192, 123);
 const COMPOSER_DANGER: Color = Color::Rgb(231, 130, 132);
 const COMPOSER_BADGE_TEXT: Color = Color::Rgb(20, 22, 28);
 const COMPOSER_SELECTION: Color = Color::Rgb(54, 60, 76);
-
-/// Dashed single-cell focus ring. Sparse cells keep the outline visually light
-/// while the focused color can stay bright.
-const PANE_FOCUS_BORDER: BorderSet = BorderSet {
-    top_left: "╭",
-    top_right: "╮",
-    bottom_left: "╰",
-    bottom_right: "╯",
-    vertical_left: "╎",
-    vertical_right: "╎",
-    horizontal_top: "╌",
-    horizontal_bottom: "╌",
-};
 
 /// A mouse text selection in transcript-line/cell coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -4400,15 +4386,18 @@ impl App {
         match base {
             "q" => {
                 self.handle_command_text("/close", tx, false);
+                self.input.enter_normal();
             }
             "qa" | "qall" | "quitall" => {
                 self.handle_command_text("/quit", tx, false);
             }
             "w" => {
                 self.save_draft_now(tx);
+                self.input.enter_normal();
             }
             "wq" | "x" => {
                 self.handle_command_text("/close", tx, false);
+                self.input.enter_normal();
             }
             _ => {
                 let line = if args.is_empty() {
@@ -7363,13 +7352,15 @@ already exists, update it in place rather than rewriting it from scratch.";
         );
     }
 
-    /// Small pane-title marker. Idle/running use dots instead of circles so the
-    /// title stays compact; attention states keep their distinct symbols.
-    fn pane_status_marker(status: SessionStatus) -> &'static str {
+    /// Compact status icon shared by the pane title and the prompt header.
+    /// Running sessions animate; idle sessions use a small static dot.
+    fn status_icon(&self, status: SessionStatus) -> String {
         match status {
-            SessionStatus::Idle => "·",
-            SessionStatus::Running => "•",
-            _ => status.symbol(),
+            SessionStatus::Idle => "⠶".to_string(),
+            SessionStatus::Running => {
+                RUNNING_SPINNER[(self.tick as usize) % RUNNING_SPINNER.len()].to_string()
+            }
+            _ => status.symbol().to_string(),
         }
     }
 
@@ -7377,10 +7368,7 @@ already exists, update it in place rather than rewriting it from scratch.";
     /// header stays compact; other states keep their symbol and label.
     fn status_glyph(&self, status: SessionStatus) -> String {
         match status {
-            SessionStatus::Idle => status.symbol().to_string(),
-            SessionStatus::Running => {
-                RUNNING_SPINNER[(self.tick as usize) % RUNNING_SPINNER.len()].to_string()
-            }
+            SessionStatus::Idle | SessionStatus::Running => self.status_icon(status),
             _ => format!("{} {}", status.symbol(), status.as_str()),
         }
     }
@@ -7691,7 +7679,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         let title = format!(
             " {} {}{marker} {}{permission} ",
             index + 1,
-            Self::pane_status_marker(view.session.status),
+            self.status_icon(view.session.status),
             name
         );
         let border_color = if focused {
@@ -7712,9 +7700,6 @@ already exists, update it in place rather than rewriting it from scratch.";
             title_style = title_style.add_modifier(Modifier::DIM);
         }
         let mut block = Block::default().borders(borders).title(title);
-        if focused {
-            block = block.border_set(PANE_FOCUS_BORDER);
-        }
         if let Some(background) = theme.background {
             border_style = border_style.bg(background);
             title_style = title_style.bg(background);
@@ -11730,8 +11715,8 @@ mod tests {
         );
         assert_eq!(
             focused.symbol(),
-            "╎",
-            "focused pane border should use the lighter dashed line"
+            "│",
+            "focused pane border should stay solid and use the brighter color"
         );
         assert_eq!(
             inactive.fg,
@@ -14660,6 +14645,32 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
         assert_eq!(view_order(&app), vec!["s2"]);
+        assert_eq!(app.input.mode(), Mode::Normal);
+        let mut saved = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::DraftSet { session_id, text } = command {
+                if session_id == "s1" {
+                    saved = Some(text);
+                }
+            }
+        }
+        assert_eq!(saved.as_deref(), Some("keep me"));
+    }
+
+    #[test]
+    fn command_line_w_saves_and_returns_to_normal_mode() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.focus_input();
+        app.input.set_text("keep me");
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        type_text(&mut app, &tx, "w");
+        app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+        assert_eq!(app.input.mode(), Mode::Normal);
+        assert_eq!(app.input.text(), "keep me");
         let mut saved = None;
         while let Ok(command) = rx.try_recv() {
             if let Command::DraftSet { session_id, text } = command {
@@ -15483,24 +15494,24 @@ mod tests {
         let build = left(&app);
         assert_eq!(
             build,
-            " I · Build · ○ · deepseek-v4.1-flash · llmgate · high"
+            " I · Build · ⠶ · deepseek-v4.1-flash · llmgate · high"
         );
 
         app.views[0].session.agent = Some("plan".into());
         let plan = left(&app);
         assert_eq!(
             plan,
-            " I · Plan  · ○ · deepseek-v4.1-flash · llmgate · high"
+            " I · Plan  · ⠶ · deepseek-v4.1-flash · llmgate · high"
         );
         // Padding Plan to Build's width keeps the status in place.
         assert_eq!(build.len(), plan.len());
-        assert_eq!(build.find('○'), plan.find('○'));
+        assert_eq!(build.find('·'), plan.find('·'));
     }
 
     #[test]
     fn prompt_header_uses_icon_for_idle_and_animated_running() {
         let mut app = App::new(None);
-        assert_eq!(app.status_glyph(SessionStatus::Idle), "○");
+        assert_eq!(app.status_glyph(SessionStatus::Idle), "⠶");
         assert_eq!(app.status_glyph(SessionStatus::Running), "⠋");
         app.tick = 1;
         assert_eq!(app.status_glyph(SessionStatus::Running), "⠙");
@@ -16962,7 +16973,7 @@ mod tests {
         assert!(empty.contains("Build · ⠋"), "{empty}");
         assert!(!empty.contains("eixd"), "no footer brand: {empty}");
         assert!(!empty.contains("/cmds"), "no footer hints: {empty}");
-        assert!(empty.contains("1 • prompt polish"), "{empty}");
+        assert!(empty.contains("1 ⠋ prompt polish"), "{empty}");
         assert!(
             empty.contains('╭'),
             "the composer keeps its border: {empty}"
@@ -17046,7 +17057,7 @@ mod tests {
         assert!(bar.trim_start().starts_with("I · Build ·"), "{bar}");
         let vim_mode = bar.find('I').unwrap();
         let build = bar.find("Build").unwrap();
-        let status = bar.find('○').unwrap();
+        let status = bar.find("Build · ").unwrap() + "Build · ".len();
         let model = bar.find("gpt-5").unwrap();
         let provider = bar.find("openai").unwrap();
         let reasoning = bar.find("medium").unwrap();
