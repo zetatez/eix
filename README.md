@@ -255,7 +255,7 @@ session 执行 shell；`:r!<cmd>`（也接受 `:r !<cmd>`）把命令输出插�
 自动拉起 daemon；没有 session 时自动创建一个。（stdout 被管道时 `eix` 会退回 `eix chat`。）pane 自动平铺
 （1 个全屏、2 个左右分屏、3 个左侧大 pane + 右侧两个、4+ 个近似网格），每个 pane
 独立显示一个 session 的转录、滚动位置和流式输出；相邻 pane 共用一条边框线。
-当前聚焦 pane 的边框使用主题 accent 色并加粗标题，后台 pane 保持低对比灰（attention 仍用警示色）。
+当前聚焦 pane 使用更亮的单格虚线边框并加粗标题，后台 pane 保持低对比实线灰（attention 仍用警示色）。
 底部输入条只作用于当前聚焦 pane。
 
 用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、

@@ -246,8 +246,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   cwd（`~` 缩写）和 git 分支；最近状态、worktree/图片数、pane 位置和队列/attention 信息在空间
   允许时出现在中部或右侧，变窄时优先保留 cwd/branch。
 - 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i` 或 `<Space>i` 聚焦输入并进入 insert；
-  在转录区或输入框 normal 模式按 `Enter` 把当前 pane 提升到第一位并保持聚焦。聚焦 pane 的边框
-  使用主题 accent 色、标题加粗；非聚焦 pane 保持低对比灰，attention 仍用警示色。
+  在转录区或输入框 normal 模式按 `Enter` 把当前 pane 提升到第一位并保持聚焦。聚焦 pane 使用
+  更亮的单格虚线边框、标题加粗；非聚焦 pane 保持低对比实线灰，attention 仍用警示色。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
 - 输入条默认显示 3 行内容（加边框共 5 行；短终端优先让给转录区），长草稿会向上生长到

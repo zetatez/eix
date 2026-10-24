@@ -9,50 +9,59 @@
 # ============================================================================
 
 
-# OpenAI-compatible endpoint. Change these three values for another provider;
-# common provider endpoints are listed below.
-provider:
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4o-mini"
-  api_key_env: "OPENAI_API_KEY"
-  # Optional: api_key, timeout_secs=300, retry_attempts=5, retry_base_ms=500, retry_max_secs=30, context_tokens, system_prompt.
+# OpenAI-compatible providers. Exactly one entry must set default = true; its
+# table key is the model prefix. The default provider's model is the fallback
+# used when a session has no explicit model. Common endpoints are listed below.
+providers:
+  llmgate:
+    default: true
+    base_url: "http://127.0.0.1:3210/v1"
+    model: "deepseek/deepseek-v4.1-flash"
+    api_key: ""
 
+  # openai:
+  #   default: true
+  #   name: "OpenAI"                 # optional display name
+  #   base_url: "https://api.openai.com/v1"
+  #   model: "gpt-4o-mini"
+  #   api_key_env: "OPENAI_API_KEY"
+  # deepseek:
+  #   base_url: "https://api.deepseek.com"
+  #   api_key_env: "DEEPSEEK_API_KEY"
+  # opencode:
+  #   base_url: "https://opencode.ai/zen/v1"
+  #   api_key_env: "OPENCODE_API_KEY"
+  # groq:
+  #   base_url: "https://api.groq.com/openai/v1"
+  #   api_key_env: "GROQ_API_KEY"
+  # gemini:
+  #   base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  #   api_key_env: "GEMINI_API_KEY"
+  # anthropic:
+  #   base_url: "https://api.anthropic.com/v1/"  # OpenAI compatibility layer
+  #   api_key_env: "ANTHROPIC_API_KEY"
+  # xai:
+  #   base_url: "https://api.x.ai/v1"
+  #   api_key_env: "XAI_API_KEY"
+  # ollama:
+  #   base_url: "http://localhost:11434/v1"  # no key
 
-# Optional: additional OpenAI-compatible providers and pinned models.
-# OpenAI is the default [provider] above. /model fetches each provider's
-# GET /models; selection ids are `<provider>/<api-model>`.
-# providers:
-#   # OpenAI is already the default. Uncomment to also expose it as
-#   # `openai/<model>` while another provider is the default.
-#   openai:
-#     base_url: "https://api.openai.com/v1"
-#     api_key_env: "OPENAI_API_KEY"
-#   deepseek:
-#     base_url: "https://api.deepseek.com"
-#     api_key_env: "DEEPSEEK_API_KEY"
-#   opencode:
-#     base_url: "https://opencode.ai/zen/v1"
-#     api_key_env: "OPENCODE_API_KEY"
-#   groq:
-#     base_url: "https://api.groq.com/openai/v1"
-#     api_key_env: "GROQ_API_KEY"
-#   gemini:
-#     base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
-#     api_key_env: "GEMINI_API_KEY"
-#   anthropic:
-#     base_url: "https://api.anthropic.com/v1/"  # OpenAI compatibility layer
-#     api_key_env: "ANTHROPIC_API_KEY"
-#   xai:
-#     base_url: "https://api.x.ai/v1"
-#     api_key_env: "XAI_API_KEY"
-#   ollama:
-#     base_url: "http://localhost:11434/v1"  # no key
+# Global provider runtime knobs (timeout, retries, default context window and
+# system prompt). These are not per-provider settings.
+provider_runtime:
+  timeout_secs: 300
+  retry_attempts: 8
+  retry_base_ms: 250
+  retry_max_secs: 60
+  # context_tokens: 128000
+  # system_prompt: "You are eix..."
+
+# Optional pinned models. `provider` references a providers key.
 # models:
 #   - id: "openrouter/gpt-5"
 #     provider: "openrouter"
 #     model: "openai/gpt-5"
 #     variants: ["low", "medium", "high"]
-
 
 # Tool approval and safety. Defaults are shown; uncomment to change.
 tools:

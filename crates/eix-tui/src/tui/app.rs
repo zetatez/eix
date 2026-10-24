@@ -19,6 +19,7 @@ use eix_core::{
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border::Set as BorderSet;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
@@ -217,11 +218,25 @@ const COMPOSER_TEXT: Color = Color::Rgb(220, 223, 228);
 const COMPOSER_MUTED: Color = Color::Rgb(110, 116, 129);
 const COMPOSER_BORDER: Color = Color::Rgb(74, 88, 120);
 const COMPOSER_ACCENT: Color = Color::Rgb(122, 162, 247);
+const COMPOSER_FOCUS: Color = Color::Rgb(154, 202, 255);
 const COMPOSER_SUCCESS: Color = Color::Rgb(126, 199, 149);
 const COMPOSER_WARN: Color = Color::Rgb(229, 192, 123);
 const COMPOSER_DANGER: Color = Color::Rgb(231, 130, 132);
 const COMPOSER_BADGE_TEXT: Color = Color::Rgb(20, 22, 28);
 const COMPOSER_SELECTION: Color = Color::Rgb(54, 60, 76);
+
+/// Dashed single-cell focus ring. Sparse cells keep the outline visually light
+/// while the focused color can stay bright.
+const PANE_FOCUS_BORDER: BorderSet = BorderSet {
+    top_left: "╭",
+    top_right: "╮",
+    bottom_left: "╰",
+    bottom_right: "╯",
+    vertical_left: "╎",
+    vertical_right: "╎",
+    horizontal_top: "╌",
+    horizontal_bottom: "╌",
+};
 
 /// A mouse text selection in transcript-line/cell coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -7600,7 +7615,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             // The active pane needs to read as the input target at a glance;
             // the muted border used for inactive panes is too subtle once
             // several sessions are tiled together.
-            composer_accent(theme)
+            composer_focus(theme)
         } else if attention {
             composer_warn(theme)
         } else {
@@ -7614,6 +7629,9 @@ already exists, update it in place rather than rewriting it from scratch.";
             title_style = title_style.add_modifier(Modifier::DIM);
         }
         let mut block = Block::default().borders(borders).title(title);
+        if focused {
+            block = block.border_set(PANE_FOCUS_BORDER);
+        }
         if let Some(background) = theme.background {
             border_style = border_style.bg(background);
             title_style = title_style.bg(background);
@@ -8714,11 +8732,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         let Some(view) = &mut self.process_view else {
             return;
         };
-        let rect = centered(
-            area,
-            area.width.saturating_sub(4),
-            area.height.saturating_sub(4),
-        );
+        // Process inspection is an overlay like the pickers, not a full-screen
+        // mode; keep the same inset instead of covering the terminal.
+        let rect = search_dialog_rect(area);
         frame.render_widget(Clear, rect);
         frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
         let inner_height = rect.height.saturating_sub(2) as usize;
@@ -11245,6 +11261,10 @@ fn composer_accent(theme: Theme) -> Color {
     theme.function.unwrap_or(COMPOSER_ACCENT)
 }
 
+fn composer_focus(theme: Theme) -> Color {
+    theme.function.unwrap_or(COMPOSER_FOCUS)
+}
+
 fn composer_warn(theme: Theme) -> Color {
     theme.string.unwrap_or(COMPOSER_WARN)
 }
@@ -11726,17 +11746,25 @@ mod tests {
         let buffer = terminal.backend().buffer();
         let left = app.pane_areas[0];
         let right = app.pane_areas[1];
+        let focused = &buffer[(left.x, left.y + 2)];
+        let inactive = &buffer[(right.x + right.width - 1, right.y + 2)];
 
         assert_eq!(
-            buffer[(left.x, left.y + 2)].fg,
-            composer_accent(app.theme),
+            focused.fg,
+            composer_focus(app.theme),
             "focused pane border should be brighter"
         );
         assert_eq!(
-            buffer[(right.x + right.width - 1, right.y + 2)].fg,
+            focused.symbol(),
+            "╎",
+            "focused pane border should use the lighter dashed line"
+        );
+        assert_eq!(
+            inactive.fg,
             Color::Rgb(48, 52, 62),
             "inactive pane border should stay muted"
         );
+        assert_eq!(inactive.symbol(), "│");
     }
 
     #[test]
@@ -13454,6 +13482,25 @@ mod tests {
         });
         view.mark_exited("aaaaaaaa-1", ProcessStatus::Killed, None);
         assert_eq!(view.selected().unwrap().status, ProcessStatus::Killed);
+    }
+
+    #[test]
+    fn process_dialog_uses_the_shared_overlay_size() {
+        let mut app = app_with_panes(&["s1"]);
+        app.process_view = Some(ProcessView::new("s1".into()));
+        let text = render_text(&mut app, 80, 24);
+        let area = Rect::new(0, 0, 80, 24);
+        let rect = search_dialog_rect(area);
+        let top = text
+            .lines()
+            .nth(rect.y as usize)
+            .expect("process dialog top border");
+        assert_eq!(
+            top.chars().position(|ch| ch == '┌'),
+            Some(rect.x as usize),
+            "{text}"
+        );
+        assert!(top.contains("processes · s1"), "{text}");
     }
 
     #[test]
