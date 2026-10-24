@@ -3794,12 +3794,13 @@ impl Daemon {
         {
             Some(outcome) => outcome,
             None => {
-                tools::execute_with_cancel(
+                tools::execute_in(
                     tool,
                     &args,
                     &session.cwd,
                     &self.config.load(),
                     Some(cancel),
+                    session.worktree.as_deref(),
                 )
                 .await
             }
@@ -4389,12 +4390,13 @@ impl Daemon {
                         {
                             Some(outcome) => outcome,
                             None => {
-                                tools::execute_with_cancel(
+                                tools::execute_in(
                                     tool,
                                     &args,
                                     &session.cwd,
                                     &self.config.load(),
                                     Some(cancel),
+                                    session.worktree.as_deref(),
                                 )
                                 .await
                             }
@@ -5522,7 +5524,13 @@ impl Daemon {
             }
         };
         let cwd = args.get("cwd").and_then(Value::as_str);
-        let plan = match tools::command_plan(command, cwd, &session.cwd, &self.config.load()) {
+        let plan = match tools::command_plan(
+            command,
+            cwd,
+            &session.cwd,
+            session.worktree.as_deref(),
+            &self.config.load(),
+        ) {
             Ok(plan) => plan,
             Err(err) => {
                 return tools::ToolOutcome {

@@ -960,6 +960,19 @@ pub async fn execute_with_cancel(
     config: &Config,
     cancel: Option<&AtomicBool>,
 ) -> ToolOutcome {
+    execute_in(tool, args, cwd, config, cancel, None).await
+}
+
+/// Execute a tool with an explicit sandbox workspace root. Worktree sessions
+/// pass the worktree root so a cwd inside `go/` can still see `.git`.
+pub async fn execute_in(
+    tool: &str,
+    args: &Value,
+    cwd: &Path,
+    config: &Config,
+    cancel: Option<&AtomicBool>,
+    sandbox_root: Option<&Path>,
+) -> ToolOutcome {
     let started = Instant::now();
     let result = match tool {
         "read_file" => read_file(args, cwd, config).await,
@@ -973,7 +986,7 @@ pub async fn execute_with_cancel(
         "write_file" => write_file(args, cwd, config).await,
         "edit" => edit(args, cwd, config).await,
         "patch" => patch(args, cwd, config).await,
-        "run_command" => run_command(args, cwd, config, cancel).await,
+        "run_command" => run_command(args, cwd, config, cancel, sandbox_root).await,
         "start_command" | "process_output" => {
             Err(anyhow::anyhow!("{tool} is handled by the daemon"))
         }
@@ -1792,11 +1805,26 @@ fn expand_sandbox_path(value: &str, workspace: &Path) -> PathBuf {
     }
 }
 
+/// The real git metadata directory for a linked worktree. Normal repositories
+/// have `.git/`, which is already covered by the workspace bind.
+fn worktree_git_dir(workspace: &Path) -> Option<PathBuf> {
+    let pointer = std::fs::read_to_string(workspace.join(".git")).ok()?;
+    let raw = pointer.trim().strip_prefix("gitdir:")?.trim();
+    let path = Path::new(raw);
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        workspace.join(path)
+    };
+    path.canonicalize().ok().filter(|path| path.is_dir())
+}
+
 /// Resolve a shell command into a concrete (possibly sandboxed) invocation.
 pub fn command_plan(
     command: &str,
     cwd_arg: Option<&str>,
     session_cwd: &Path,
+    sandbox_root: Option<&Path>,
     config: &Config,
 ) -> Result<CommandPlan> {
     let command_cwd = match cwd_arg {
@@ -1817,22 +1845,34 @@ pub fn command_plan(
 
     let mut args: Vec<std::ffi::OsString> = Vec::new();
     if sandboxed {
-        let workspace = session_cwd
+        // A worktree session may keep its cwd in a subdirectory. Mount the
+        // worktree root, not just that subdirectory, so `.git` and git commit
+        // operations remain usable inside the sandbox.
+        let workspace = sandbox_root
+            .unwrap_or(session_cwd)
             .canonicalize()
-            .unwrap_or_else(|_| session_cwd.to_path_buf());
+            .unwrap_or_else(|_| sandbox_root.unwrap_or(session_cwd).to_path_buf());
         let read_paths: Vec<PathBuf> = config
             .tools
             .sandbox_read_paths
             .iter()
             .map(|path| expand_sandbox_path(path, &workspace))
             .collect();
-        let writable_roots: Vec<PathBuf> = config
+        let mut writable_roots: Vec<PathBuf> = config
             .tools
             .sandbox_writable_roots
             .iter()
             .map(|path| expand_sandbox_path(path, &workspace))
             .filter(|path| path != &workspace)
             .collect();
+        // Linked worktrees keep `.git` outside the worktree as a `gitdir:`
+        // pointer. Bind that metadata directory too; otherwise every git
+        // command inside the sandbox fails with "not a valid repository".
+        if let Some(git_dir) = worktree_git_dir(&workspace) {
+            if git_dir != workspace && !writable_roots.contains(&git_dir) {
+                writable_roots.push(git_dir);
+            }
+        }
         args.extend(sandbox::bwrap_args(
             &workspace,
             &command_cwd,
@@ -1860,9 +1900,16 @@ async fn run_command(
     cwd: &Path,
     config: &Config,
     cancel: Option<&AtomicBool>,
+    sandbox_root: Option<&Path>,
 ) -> Result<String> {
     let command = required_string(args, "command")?;
-    let plan = command_plan(command, optional_string(args, "cwd"), cwd, config)?;
+    let plan = command_plan(
+        command,
+        optional_string(args, "cwd"),
+        cwd,
+        sandbox_root,
+        config,
+    )?;
     let command_cwd = plan.cwd.clone();
     let child = plan
         .command()
@@ -2476,6 +2523,126 @@ mod tests {
         assert!(out.ok, "{}", out.output);
         assert_eq!(out.output, "x");
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn linked_worktree_git_metadata_is_mounted() {
+        if !sandbox::bwrap_available() {
+            return;
+        }
+        let base = temp_cwd("worktree-git");
+        let root = base.join("worktree");
+        let sub = root.join("go");
+        let git_dir = base.join("repo/.git/worktrees/example");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::create_dir_all(&git_dir).unwrap();
+        std::fs::write(
+            root.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            worktree_git_dir(&root),
+            Some(git_dir.canonicalize().unwrap())
+        );
+        let plan = command_plan(
+            "git status --short",
+            None,
+            &sub,
+            Some(&root),
+            &Config::default(),
+        )
+        .unwrap();
+        let args: Vec<String> = plan
+            .args
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--bind", root.to_str().unwrap()]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--bind", git_dir.to_str().unwrap()]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--chdir", sub.to_str().unwrap()]),
+            "{args:?}"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[tokio::test]
+    async fn sandbox_git_works_in_a_linked_worktree_subdirectory() {
+        if !sandbox::bwrap_available()
+            || std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .is_err()
+        {
+            return;
+        }
+        let base = temp_cwd("sandbox-git-worktree");
+        let repo = base.join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(repo.join("README"), "x").unwrap();
+        git(&["add", "README"]);
+        git(&[
+            "-c",
+            "user.name=eix",
+            "-c",
+            "user.email=eix@example.invalid",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+        let worktree = base.join("worktree");
+        git(&[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "sandbox-test",
+            worktree.to_str().unwrap(),
+        ]);
+        let sub = worktree.join("go");
+        std::fs::create_dir_all(&sub).unwrap();
+
+        let out = execute_in(
+            "run_command",
+            &json!({"command": "git status --short"}),
+            &sub,
+            &Config::default(),
+            None,
+            Some(&worktree),
+        )
+        .await;
+        assert!(out.ok, "{}", out.output);
+        assert!(
+            !out.output.contains("not a valid repository"),
+            "{}",
+            out.output
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

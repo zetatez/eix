@@ -570,7 +570,8 @@ mod tests {
         }
 
         async fn start(&self, session: &str, command: &str) -> ProcessInfo {
-            let plan = command_plan(command, None, &std::env::temp_dir(), &self.config).unwrap();
+            let plan =
+                command_plan(command, None, &std::env::temp_dir(), None, &self.config).unwrap();
             self.registry
                 .start(session, command, plan)
                 .await
