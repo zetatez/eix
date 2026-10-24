@@ -20,19 +20,19 @@ use base64::Engine as _;
 use eix_core::{
     now_ms, payload, AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams,
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
-    ApprovalScope, AttachParams, AttachResult, AuthParams, AutoReady, BtwParams, BtwResult,
-    CancelResult, ChatMessage, Config, ContextClearParams, ContextClearedPayload,
-    ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DraftParams, DraftResult,
-    ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
-    HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams,
-    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
-    IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo,
-    ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
-    PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
-    PermissionAction, PermissionLevel, PermissionParams, PermissionPayload, PermissionRule,
-    PickerParams, PickerPreviewParams, PickerPreviewResult, ProcessKillParams, ProcessKillResult,
-    ProcessList, ProcessListParams, ProcessOutputParams, RenameParams, Request, Response,
-    RewindParams, RewindResult, RuleSource, SearchParams, SearchResult, ServerMessage, Session,
+    ApprovalScope, AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult,
+    ChatMessage, Config, ContextClearParams, ContextClearedPayload, ContextCompactParams,
+    ContextCompactedPayload, CreateSessionParams, DraftParams, DraftResult, ErrorPayload, Event,
+    EventKind, EventsParams, EventsResult, ForkParams, FunctionCall, HelloResult,
+    InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams, InputResult,
+    IntegrationContinueParams, IntegrationListParams, IntegrationListResult, IntegrationState,
+    IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo, ModelListResult,
+    Notification, PatchApplyParams, PatchGetParams, PatchGetResult, PatchProposedPayload,
+    PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams, PermissionAction,
+    PermissionLevel, PermissionParams, PermissionPayload, PermissionRule, PickerParams,
+    PickerPreviewParams, PickerPreviewResult, ProcessKillParams, ProcessKillResult, ProcessList,
+    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
+    RewindResult, RuleSource, SearchParams, SearchResult, ServerMessage, Session,
     SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
     SessionId, SessionImportParams, SessionList, SessionModelParams, SessionOrigin,
     SessionReadyParams, SessionRef, SessionResult, SessionStatus, ShellRunParams, ShellRunResult,
@@ -1591,7 +1591,7 @@ impl Daemon {
     /// few seconds keeps the daemon simple and restart-safe.
     async fn auto_ready_idle(&self) -> Result<()> {
         let config = self.config.load_full();
-        if config.integration.auto_ready != AutoReady::Idle {
+        if !config.integration.auto_ready {
             return Ok(());
         }
         let idle_ms = (config.integration.idle_secs.max(1) as i64) * 1_000;
@@ -2186,6 +2186,7 @@ impl Daemon {
                 let events = self.store.events(&params.session_id)?;
                 let mut items: Vec<TimelineItem> = events
                     .into_iter()
+                    .filter(|event| event.kind == EventKind::UserMessage)
                     .filter_map(|event| {
                         let preview = timeline_preview(event.kind, &event.payload)?;
                         Some(TimelineItem {
@@ -2199,6 +2200,8 @@ impl Daemon {
                 if items.len() > limit {
                     items.drain(0..items.len() - limit);
                 }
+                // Newest user input first; `limit` still keeps the newest rows.
+                items.reverse();
                 Ok(serde_json::to_value(TimelineResult { items })?)
             }
             "session.create" => {

@@ -1410,13 +1410,7 @@ async fn timeline(
     }
     for item in result.items {
         let preview = item.preview.replace('\n', " ");
-        println!(
-            "e{:<4} {}  {:<17} {}",
-            item.seq,
-            format_ts(item.ts),
-            item.kind,
-            preview
-        );
+        println!("{}  {}", format_ts(item.ts), preview);
     }
     Ok(())
 }

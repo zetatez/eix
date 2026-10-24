@@ -99,7 +99,7 @@ worktree:
 
 integration:
   enabled: true
-  auto_ready: "idle"  # manual | idle
+  auto_ready: false  # true scans idle sessions; false keeps /ready user-triggered
   idle_secs: 300
   auto_commit: true   # commit dirty worktrees before queuing
   test: "auto"        # Cargo / npm / Go / Python / Make detection, or a command

@@ -192,23 +192,15 @@ impl Default for WorktreeConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AutoReady {
-    /// Only an explicit `eix ready` starts integration.
-    Manual,
-    /// After a successful turn and an idle period, mark the session ready.
-    #[default]
-    Idle,
-}
-
 /// Daemon-side integration queue. One session branch is rebased onto the base
 /// branch, tested, then fast-forwarded into the base worktree.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IntegrationConfig {
     pub enabled: bool,
-    pub auto_ready: AutoReady,
+    /// Automatically mark idle sessions ready. Off by default; `/ready` is
+    /// user-triggered.
+    pub auto_ready: bool,
     /// Seconds of no activity before an idle session is marked ready.
     pub idle_secs: u64,
     /// Commit dirty worktree changes when readiness is requested. Enabled by
@@ -240,7 +232,7 @@ impl Default for IntegrationConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            auto_ready: AutoReady::Idle,
+            auto_ready: false,
             idle_secs: 300,
             auto_commit: true,
             test: "auto".into(),
@@ -1690,9 +1682,9 @@ impl Config {
             ));
         }
         if self.integration.enabled {
-            if self.integration.idle_secs == 0 && self.integration.auto_ready == AutoReady::Idle {
+            if self.integration.idle_secs == 0 && self.integration.auto_ready {
                 return Err(ConfigError::Invalid(
-                    "integration.idle_secs must be > 0 when auto_ready = \"idle\"".into(),
+                    "integration.idle_secs must be > 0 when auto_ready = true".into(),
                 ));
             }
             if self.integration.timeout_secs == 0 {
@@ -3418,6 +3410,8 @@ pi = true
         assert_eq!(default.tools.max_tool_rounds, 64);
         assert_eq!(default.tools.max_parallel_subagents, 4);
         assert!(default.integration.auto_commit);
+        assert!(!default.integration.auto_ready);
+        assert!(default.worktree.auto);
 
         let parsed: Config = toml::from_str(
             r#"

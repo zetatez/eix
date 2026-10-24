@@ -126,6 +126,8 @@ impl Subagent {
 pub struct Transcript {
     pub lines: Vec<Line<'static>>,
     pub slots: Vec<Option<Fold>>,
+    /// Stored user-message sequence -> first rendered line.
+    pub user_lines: Vec<(u64, usize)>,
 }
 
 /// Fold target for a line: which block, and whether it is currently open.
@@ -164,6 +166,7 @@ enum PatchOutcome {
 /// Intermediate representation, built in one pass before rendering.
 enum Block {
     User {
+        seq: u64,
         text: String,
         images: Vec<String>,
     },
@@ -235,6 +238,7 @@ pub fn render_tail(
     let mut out = Transcript {
         lines: Vec::new(),
         slots: Vec::new(),
+        user_lines: Vec::new(),
     };
     append_tail(&mut out, live, queued, folds, width, theme, tick);
     out
@@ -250,10 +254,15 @@ fn render_blocks(
     let mut out = Transcript {
         lines: Vec::new(),
         slots: Vec::new(),
+        user_lines: Vec::new(),
     };
     for block in blocks {
         match block {
-            Block::User { text, images } => user_message(&mut out, &text, &images, width, theme),
+            Block::User { seq, text, images } => {
+                let line = out.lines.len();
+                user_message(&mut out, &text, &images, width, theme);
+                out.user_lines.push((seq, line));
+            }
             Block::Assistant {
                 seq,
                 text,
@@ -353,6 +362,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                     serde_json::from_value::<UserMessagePayload>(event.payload.clone())
                 {
                     blocks.push(Block::User {
+                        seq: event.seq,
                         text: payload.text,
                         images: payload.images.into_iter().map(|image| image.path).collect(),
                     });

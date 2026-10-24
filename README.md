@@ -247,15 +247,14 @@ session 执行 shell；`:r!<cmd>`（也接受 `:r !<cmd>`）把命令输出插�
 当前聚焦 pane 使用更亮的单格虚线边框并加粗标题，后台 pane 保持低对比实线灰（attention 仍用警示色）。
 底部输入条只作用于当前聚焦 pane。
 
-用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大；
-pane 不超过 5 个时全部显示，超过时只显示队首 + 最近 4 个，其余隐藏，用 `Ctrl-N` 切换时
-窗口会跟随焦点滑动；终端矮时压缩为标题行/单行内容，不退回 tabby）、
+用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、第一个 pane 更大；
+pane 不超过 5 个时全部显示，超过时只显示第一个 pane + 后续 4 个，其余隐藏，用 `Ctrl-1…9`
+或前后移动切换时窗口会跟随焦点滑动；终端矮时压缩为标题行/单行内容，不退回 tabby）、
 `tabby`（输入框上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
-（含默认 grid）间循环。所有布局共享同一个**活跃队列**：pane 1 是当前工作槽位；turn 完成或
-session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；
-给它发送任务后移到队尾，第二个位置的 session 会补到 pane 1。点击或切换到某个 pane 后，
-在转录区或输入框 normal 模式按 `Enter` 可把它手动提升到第一位，并继续保持焦点。
-`Ctrl-1` … `Ctrl-9` 直接聚焦第 N 个已打开 session；在 `tabby` 布局下就是切换到第 N 个 tab
+（含默认 grid）间循环。所有布局共享同一个稳定的 session 顺序：pane 按打开顺序排列，发送任务、
+turn 完成或等待审批/输入都不会移动它。session 视作双向链表，`Shift+,` / `Shift+.` 或 1 秒内
+连续按两次 `Ctrl-W` 在前后节点间移动；`Ctrl-1` … `Ctrl-9` 直接跳到对应 session，顺序保持不变。
+在 `tabby` 布局下就是切换到第 N 个 tab
 （输入框内也可用）。终端需要支持 kitty 键盘协议才能完整区分这些组合键；不支持时可用
 `Alt-1` … `Alt-9`。`Ctrl-7` 在部分终端等价于 `Ctrl-/`，会打开模型 picker；第 7 个
 session 请用 `Alt-7`。在转录区或输入框 normal 模式下，1 秒内连续按两次 `Ctrl-W` 会聚焦
@@ -290,7 +289,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `:`（normal 模式） | 激活 statusline 下方的常驻命令行；按 `Tab` 才显示匹配命令列表并补全首个命令，普通输入不弹窗；菜单中 `Ctrl-J`/`Ctrl-K`、`Ctrl-N`/`Ctrl-P` 上下选择，`Enter` 执行选中项；菜单打开时 `Esc` 先收起菜单并保留输入，再按一次退出命令行回到 normal，`↑`/`↓` 历史；支持所有 `/命令` 名以及 `:q` / `:qa` / `:w` / `:wq` / `:x`；`:!cmd` 直接执行 shell，`:r!cmd` 把输出插入输入框 |
 | `/` / `?` / `#`（normal 模式） | 打开带对应前缀的命令行：`/xxx` 在当前 session 对话中向后搜索，`?xxx` / `#xxx` 向后搜索；`n` / `N` 跳到下一个/上一个匹配，`Esc` 清除高亮 |
 | `F1` / `/help` | 打开可搜索的帮助/按键参考；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭 |
-| `Enter` | insert 模式：发送到聚焦 pane（turn 还在跑时自动排队，结束后按顺序发出）；转录区或输入框 normal 模式：把当前聚焦 pane 提升到第一位并保持聚焦 |
+| `Enter` | insert 模式：发送到聚焦 pane（turn 还在跑时自动排队，结束后按顺序发出） |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
@@ -574,7 +573,7 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
   越过最新一条会恢复当前草稿。`j`、`k`、`3j`、`dj`、方向键是草稿内的行移动
 - 模式切换：输入框 normal 模式与转录区都可用 `Tab` 在 Build / Plan 之间切换；Plan 只读，Build 可执行工具
 - `Enter` 在 insert 模式提交；turn 运行中提交的内容自动排队（`/queue` 查看，`Esc Esc` 中断当前 turn）。
-  转录区或输入框 normal 模式按 `Enter` 会把当前聚焦 pane 提升到第一位
+  normal 模式不改变 pane 顺序；切换 session 用 `Ctrl-1` … `Ctrl-9` 或前后移动
 
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：
 `<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
@@ -713,7 +712,7 @@ worktree:
 
 integration:
   enabled: true
-  auto_ready: idle       # manual | idle
+  auto_ready: false      # true scans idle sessions; false keeps /ready user-triggered
   idle_secs: 300
   auto_commit: true      # ready 时自动提交 worktree 改动；false 则要求先手动提交
   test: auto

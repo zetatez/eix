@@ -42,8 +42,10 @@ enum Focus {
     Input,
 }
 
-/// Two `Esc` presses within this window leave the prompt for the transcript.
-const ESC_WINDOW: Duration = Duration::from_millis(500);
+/// Two `Esc` presses within this window interrupt the focused turn (or leave
+/// the prompt for the transcript when idle). Keep it forgiving: three presses
+/// (insert → normal → interrupt) can take a moment.
+const ESC_WINDOW: Duration = Duration::from_millis(1000);
 
 /// Two `Ctrl-W` presses within this window focus the next pane.
 const CTRL_W_WINDOW: Duration = Duration::from_millis(1000);
@@ -150,8 +152,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("reload", "", "re-read the daemon config files"),
         builtin(
             "timeline",
-            "[n]",
-            "show recent turns, answers and tool calls",
+            "",
+            "search this session's user input history and jump",
         ),
         builtin("archive", "", "hide this session from the picker"),
         builtin("delete", "", "delete this session (run twice to confirm)"),
@@ -302,6 +304,8 @@ struct SessionView {
     /// Plain text for every transcript line from the last draw, used when a
     /// mouse selection is copied.
     text_lines: Vec<String>,
+    /// Stored user-message sequence -> first rendered line, for `/timeline`.
+    user_lines: Vec<(u64, usize)>,
     /// Active mouse selection, if any.
     selection: Option<TextSelection>,
 }
@@ -325,6 +329,7 @@ impl SessionView {
             folds: HashMap::new(),
             slots: Vec::new(),
             text_lines: Vec::new(),
+            user_lines: Vec::new(),
             selection: None,
         }
     }
@@ -342,7 +347,11 @@ impl SessionView {
         if !stale {
             return;
         }
-        let transcript::Transcript { lines, slots } = transcript::render_history_with_subagents(
+        let transcript::Transcript {
+            lines,
+            slots,
+            user_lines,
+        } = transcript::render_history_with_subagents(
             &self.events,
             &self.folds,
             width,
@@ -351,6 +360,7 @@ impl SessionView {
         );
         self.slots = slots;
         self.text_lines = lines.iter().map(text_line).collect();
+        self.user_lines = user_lines;
         self.history_cache = Some(HistoryCache {
             width,
             theme,
@@ -627,6 +637,8 @@ enum PickerKind {
     Subagents,
     /// Choose the focused session's permission level.
     Permissions,
+    /// Search this session's user-message history and jump to it.
+    Timeline,
     /// Browse installed skills, with a body preview.
     Skills,
     /// Preview and apply a color preset.
@@ -651,6 +663,7 @@ impl PickerKind {
             | Self::Agents
             | Self::Subagents
             | Self::Permissions
+            | Self::Timeline
             | Self::Skills
             | Self::Themes
             | Self::Mcp
@@ -679,6 +692,7 @@ impl PickerKind {
             Self::Agents => "agents — choose the primary agent",
             Self::Subagents => "subagents — parallel limit",
             Self::Permissions => "permission — choose session access",
+            Self::Timeline => "timeline — user input history",
             Self::Skills => "skills — preview and insert",
             Self::Themes => "colorschemes — live preview",
             Self::Mcp => "mcp — servers and tools",
@@ -698,6 +712,7 @@ impl PickerKind {
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k · Esc close",
             Self::Subagents => "Enter apply · ↑/↓ or C-j/C-k · Esc close",
             Self::Permissions => "type to search · Enter apply · Esc close",
+            Self::Timeline => "type to search · C-j/C-k or C-n/C-p · Enter jump · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
             Self::Mcp => "Enter close · ↑/↓ or C-j/C-k select · Esc close",
@@ -1139,7 +1154,7 @@ impl SearchView {
     }
 }
 
-/// Horizontal layout keeps the head pane plus this many recent panes visible.
+/// Horizontal layout keeps the first pane plus this many following panes visible.
 const HORIZONTAL_TAIL_PANES: usize = 4;
 
 /// How open sessions are arranged in the body.
@@ -1147,19 +1162,13 @@ const HORIZONTAL_TAIL_PANES: usize = 4;
 enum PaneLayout {
     /// The original automatic tiling.
     Grid,
-    /// One column of panes; the queue head gets most of the height and the
-    /// recent panes below compact when the terminal is short.
+    /// One column of panes; the first pane gets most of the height and the
+    /// following panes compact when the terminal is short.
     Horizontal,
     /// A session tab bar with only the active session below it.
     Tabby,
     /// A tab bar plus a spiral tiling that gives the active pane the most space.
     Fibonacci,
-}
-
-enum FocusAfterMove {
-    Follow,
-    KeepSlot,
-    KeepSession,
 }
 
 impl PaneLayout {
@@ -1193,11 +1202,13 @@ pub struct App {
     models: Vec<ModelInfo>,
     sessions: Vec<Session>,
     selected: usize,
-    /// Open panes, in layout order.
+    /// Open panes in a stable order. Focus moves to the previous/next pane or
+    /// jumps directly to a session, but sessions never change panes on their
+    /// own.
     views: Vec<SessionView>,
     /// Index into `views` of the focused pane.
     focused: usize,
-    /// Session pane arrangement. The queue order is always `views` order.
+    /// Session pane arrangement. Session order is always `views` order.
     layout: PaneLayout,
     pending_attach: Option<PendingAttach>,
     initial_session: Option<String>,
@@ -2766,7 +2777,6 @@ impl App {
             view.folds.remove(&FoldId::Live);
             view.follow = true;
         }
-        self.demote_session(&submitted.session.id);
         self.error = None;
         self.status = "running".into();
     }
@@ -2824,25 +2834,11 @@ impl App {
             "session.updated" => {
                 if let Ok(session) = serde_json::from_value::<Session>(notification.params) {
                     let id = session.id.clone();
-                    let new_status = session.status;
                     let index = self.views.iter().position(|view| view.session.id == id);
-                    let previous = index.map(|index| self.views[index].session.status);
                     if let Some(index) = index {
                         self.views[index].session = session.clone();
                         if index != self.focused && self.pane_needs_attention(index) {
                             self.status = format!("{} needs attention", session.name);
-                        }
-                    }
-                    // The daemon reports idle / awaiting_input / awaiting_approval
-                    // as separate status updates; promote on the transition so a
-                    // finished background session slides into pane 2. Resuming
-                    // from a card (approval / answer) is work again, so demote it.
-                    let ready = !new_status.is_busy() || new_status.needs_attention();
-                    if previous.is_some_and(|status| status != new_status) {
-                        if new_status == SessionStatus::Running {
-                            self.demote_session(&id);
-                        } else if ready {
-                            self.promote_session(&id);
                         }
                     }
                     self.upsert_session(session, false);
@@ -2882,9 +2878,6 @@ impl App {
                         if self.bell {
                             self.ring = true;
                         }
-                    }
-                    if params.status.needs_attention() {
-                        self.promote_session(&params.session_id);
                     }
                 }
             }
@@ -3110,10 +3103,6 @@ impl App {
                         self.focus = Focus::Transcript;
                     }
                     self.status = format!("approval needed: {}", params.summary);
-                    // A blocked session is ready for the user: put it in the
-                    // ready slot so pane 2 shows the card without replacing
-                    // the user's working pane.
-                    self.promote_session(&params.session_id);
                     let mut summary =
                         if matches!(params.tool.as_str(), "run_command" | "start_command") {
                             params
@@ -3185,7 +3174,6 @@ impl App {
                         self.focus = Focus::Transcript;
                     }
                     self.status = format!("question: {}", truncate(&params.question, 60));
-                    self.promote_session(&params.session_id);
                     self.inputs.insert(
                         params.session_id,
                         PendingInput {
@@ -3303,9 +3291,6 @@ impl App {
                         self.status = turn_summary(&done);
                         self.clear_pending_draft(&done.session_id);
                     }
-                    // Completed, cancelled and failed turns all hand control
-                    // back to the user; move this session to the ready slot.
-                    self.promote_session(&done.session_id);
                 }
             }
             "process.started" => {
@@ -3655,6 +3640,15 @@ impl App {
             return;
         }
 
+        // Ctrl-H opens this session's user-input timeline. Some terminals
+        // report Ctrl-H as a control-modified Backspace.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace)
+        {
+            self.open_picker(PickerKind::Timeline, tx);
+            return;
+        }
+
         // Global reasoning shortcut: cycle low → medium → high → none → low.
         // Updating the session locally first keeps rapid presses advancing
         // even before the daemon round-trip lands.
@@ -3722,16 +3716,6 @@ impl App {
                 self.run_key_action(action, tx);
                 return true;
             }
-        }
-        // In transcript and prompt normal mode, Enter makes the focused pane
-        // the first one. Insert mode keeps using Enter to submit.
-        if key.code == KeyCode::Enter
-            && key.modifiers.is_empty()
-            && self.focused_approval().is_none()
-            && self.focused_input().is_none()
-        {
-            self.promote_focused_pane();
-            return true;
         }
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {
@@ -4076,6 +4060,7 @@ impl App {
 
     fn close_cmdline(&mut self) {
         self.cmdline = None;
+        self.esc_at = None;
         self.cmdline_menu_armed = false;
         self.cmdline_menu_prefix = None;
         self.cmdline_menu_cursor = None;
@@ -4629,6 +4614,24 @@ impl App {
             self.status = "search cleared".into();
             return;
         }
+        if key.code == KeyCode::Esc {
+            // The transcript is also a valid start point: after `:` closes
+            // (which may have been opened from here), two Esc presses should
+            // interrupt the focused turn just like they do in the prompt.
+            let now = Instant::now();
+            let double = self
+                .esc_at
+                .is_some_and(|last| now.duration_since(last) < ESC_WINDOW);
+            if double {
+                self.esc_at = None;
+                if self.focused_session_busy() {
+                    self.cancel(tx);
+                }
+            } else {
+                self.esc_at = Some(now);
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
             self.open_picker(PickerKind::Sessions, tx);
             return;
@@ -4697,15 +4700,7 @@ impl App {
             KeyAction::PrevSession => self.cycle_session(-1, tx),
             KeyAction::ScrollDown => self.scroll_focused(1),
             KeyAction::ScrollUp => self.scroll_focused(-1),
-            KeyAction::Timeline => {
-                if let Some(session_id) = self.focused_session_id() {
-                    let _ = tx.send(Command::TimelineData {
-                        session_id,
-                        limit: None,
-                    });
-                    self.status = "timeline: loading…".into();
-                }
-            }
+            KeyAction::Timeline => self.open_picker(PickerKind::Timeline, tx),
             KeyAction::Todos => {
                 if let Some(session_id) = self.focused_session_id() {
                     let _ = tx.send(Command::ListTodos { session_id });
@@ -4738,6 +4733,25 @@ impl App {
             Some(seq) => format!("forking before e{seq}…"),
             None => "forking…".into(),
         };
+    }
+
+    fn jump_to_user_seq(&mut self, seq: u64) {
+        let Some(view) = self.focused_view_mut() else {
+            self.status = "attach a session first".into();
+            return;
+        };
+        let Some(line) = view
+            .user_lines
+            .iter()
+            .find(|(message_seq, _)| *message_seq == seq)
+            .map(|(_, line)| *line)
+        else {
+            self.status = format!("e{seq} is not loaded in this pane");
+            return;
+        };
+        view.follow = false;
+        view.scroll = line.saturating_sub(2);
+        self.status = format!("jumped to e{seq}");
     }
 
     fn open_processes(&mut self, tx: &UnboundedSender<Command>) {
@@ -5289,6 +5303,14 @@ impl App {
                     self.command_permission(&value, tx);
                 }
             }
+            PickerKind::Timeline => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    if let Ok(seq) = value.parse::<u64>() {
+                        self.jump_to_user_seq(seq);
+                    }
+                }
+            }
             PickerKind::Skills => {
                 if let Some(value) = value {
                     let cwd = self
@@ -5384,6 +5406,13 @@ impl App {
                 .position(|item| item.value == current.as_str())
                 .unwrap_or(0);
             self.status = format!("permission: {}", current.as_str());
+        } else if kind == PickerKind::Timeline {
+            let Some(view) = self.focused_view() else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            picker.items = timeline_picker_items(&view.events);
+            self.status = format!("timeline: {} user message(s)", picker.items.len());
         } else if kind == PickerKind::Skills {
             let cwd = self
                 .focused_view()
@@ -5588,7 +5617,6 @@ impl App {
             self.last_saved_draft.clear();
             self.reset_history();
             self.error = None;
-            self.demote_session(&session_id);
             let _ = tx.send(Command::RunShell {
                 session_id: session_id.clone(),
                 command: command.to_string(),
@@ -5649,9 +5677,6 @@ impl App {
     /// Park a prompt until its session goes idle. The prompt box is cleared so
     /// the user can keep typing the next one.
     fn enqueue(&mut self, session_id: String, text: &str, tx: &UnboundedSender<Command>) {
-        // Queued work still counts as work for this session: move it off the
-        // head so another ready session can be handled first.
-        self.demote_session(&session_id);
         let queue = self.queues.entry(session_id.clone()).or_default();
         queue.push_back(text.to_string());
         let pending = queue.len();
@@ -5947,21 +5972,7 @@ impl App {
                 true
             }
             "timeline" => {
-                let limit = if args.is_empty() {
-                    None
-                } else {
-                    match args.parse::<usize>() {
-                        Ok(limit) => Some(limit),
-                        Err(_) => {
-                            self.error = Some("usage: /timeline [count]".into());
-                            return true;
-                        }
-                    }
-                };
-                if let Some(session_id) = self.focused_session_id() {
-                    let _ = tx.send(Command::TimelineData { session_id, limit });
-                    self.status = "timeline: loading…".into();
-                }
+                self.open_picker(PickerKind::Timeline, tx);
                 true
             }
             "archive" => {
@@ -6938,8 +6949,8 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.status = format!("layout: {}", layout.label());
     }
 
-    /// Focus the Nth session by queue position (`Ctrl-1` is the head). In
-    /// tabby layout the focused session is also the active tab.
+    /// Focus the Nth open session (`Ctrl-1` is the first pane). In tabby
+    /// layout the focused session is also the active tab.
     fn focus_tab(&mut self, index: usize) {
         if index >= self.views.len() {
             self.status = format!("session {} is not open", index + 1);
@@ -6948,88 +6959,13 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.focus_pane(index);
     }
 
-    /// Where focus should land after a queue reorder.
-    fn move_view(&mut self, from: usize, to: usize, focus_after: FocusAfterMove) {
-        if from >= self.views.len() {
-            return;
-        }
-        let to = to.min(self.views.len().saturating_sub(1));
-        if from == to {
-            return;
-        }
-        let focused_id = self
-            .views
-            .get(self.focused)
-            .map(|view| view.session.id.clone());
-        let view = self.views.remove(from);
-        self.views.insert(to, view);
-        self.focused = match focus_after {
-            FocusAfterMove::Follow => to,
-            FocusAfterMove::KeepSlot => self.focused.min(self.views.len() - 1),
-            // A background completion should not swap the session under a
-            // prompt the user is actively editing.
-            FocusAfterMove::KeepSession => focused_id
-                .and_then(|id| self.views.iter().position(|view| view.session.id == id))
-                .unwrap_or_else(|| self.focused.min(self.views.len() - 1)),
-        };
-        self.sync_selected_to_focus();
-    }
-
-    /// Move the focused pane to the first slot and keep focus on it.
-    fn promote_focused_pane(&mut self) {
-        let unit = if self.layout == PaneLayout::Tabby {
-            "tab"
-        } else {
-            "pane"
-        };
-        let Some(name) = self.focused_view().map(|view| view.session.name.clone()) else {
-            return;
-        };
-        if self.focused == 0 {
-            self.status = format!("already the first {unit}");
-            return;
-        }
-        self.move_view(self.focused, 0, FocusAfterMove::Follow);
-        self.status = format!("promoted {name} · {unit} 1/{}", self.views.len());
-    }
-
-    /// A session that finished a turn (or is waiting for the user) moves to
-    /// the second slot, leaving pane 1 as the user's working slot.
-    fn promote_session(&mut self, session_id: &str) {
+    /// Jump focus to an open session without changing the pane order.
+    fn jump_to_session(&mut self, session_id: &str) -> bool {
         let Some(index) = self.open_session(session_id) else {
-            return;
+            return false;
         };
-        let focus_after = if index == self.focused {
-            // The user was watching this session; follow it to the ready
-            // slot.
-            FocusAfterMove::Follow
-        } else if self.focused == 0 {
-            // Pane 1 is the working slot: let the newly ready session slide
-            // into pane 2 without replacing the user's pane.
-            FocusAfterMove::KeepSlot
-        } else {
-            FocusAfterMove::KeepSession
-        };
-        self.move_view(index, 1, focus_after);
-    }
-
-    /// Sending work moves that session to the queue tail so the user can stay
-    /// on the first slot and pick up whatever becomes ready next.
-    fn demote_session(&mut self, session_id: &str) {
-        let Some(index) = self.open_session(session_id) else {
-            return;
-        };
-        let Some(last) = self.views.len().checked_sub(1) else {
-            return;
-        };
-        let focus_after = if index == self.focused {
-            // Keep the slot, not the session: the next queued session should
-            // be waiting in the same place.
-            FocusAfterMove::KeepSlot
-        } else {
-            FocusAfterMove::KeepSession
-        };
-        self.move_view(index, last, focus_after);
+        self.focus_pane(index);
+        true
     }
 
     fn cycle_pane(&mut self, delta: isize) {
@@ -7068,8 +7004,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
         self.selected = index.min(self.sessions.len() - 1);
         let id = self.sessions[self.selected].id.clone();
-        if let Some(open) = self.open_session(&id) {
-            self.focused = open;
+        if self.jump_to_session(&id) {
             self.focus = Focus::Input;
             self.status = "focused open pane".into();
             return;
@@ -7458,9 +7393,9 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.layout
     }
 
-    /// Horizontal layout shows the queue head plus the four most recent panes
-    /// after it. If focus moved into a hidden pane, slide the tail window so
-    /// the focused pane stays visible.
+    /// Horizontal layout shows the first pane plus the next four panes after
+    /// it. If focus moved into a hidden pane, slide the tail window so the
+    /// focused pane stays visible.
     fn horizontal_visible_indices(&self) -> Vec<usize> {
         let len = self.views.len();
         if len <= HORIZONTAL_TAIL_PANES + 1 {
@@ -7557,6 +7492,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         let transcript::Transcript {
             lines: tail_lines,
             slots: tail_slots,
+            user_lines: _,
         } = {
             let view = &self.views[index];
             let live = view.stream.as_ref().map(|stream| transcript::Live {
@@ -9341,6 +9277,47 @@ fn permission_picker_items(current: PermissionLevel) -> Vec<PickerItem> {
     .collect()
 }
 
+fn timeline_timestamp(ts: i64) -> String {
+    chrono::DateTime::from_timestamp_millis(ts)
+        .map(|dt| {
+            dt.with_timezone(&chrono::Local)
+                .format("%m-%d %H:%M")
+                .to_string()
+        })
+        .unwrap_or_else(|| "—".to_string())
+}
+
+/// Rows for `/timeline`: only this session's user messages, newest first.
+/// The full text is used for fuzzy search and the right-side preview.
+fn timeline_picker_items(events: &[SessionEvent]) -> Vec<PickerItem> {
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.kind == EventKind::UserMessage)
+        .filter_map(|event| {
+            let payload =
+                serde_json::from_value::<UserMessagePayload>(event.payload.clone()).ok()?;
+            let text = payload.text.trim();
+            let preview = if text.is_empty() {
+                "[image]".to_string()
+            } else {
+                text.chars().take(4_000).collect()
+            };
+            let first = preview.lines().next().unwrap_or("[image]");
+            Some(
+                PickerItem::new(event.seq.to_string())
+                    .with_label(format!(
+                        "{}  {}",
+                        timeline_timestamp(event.ts),
+                        truncate(first, 64)
+                    ))
+                    .with_detail(preview.clone())
+                    .with_preview(preview),
+            )
+        })
+        .collect()
+}
+
 /// Rows for the interactive `/colorscheme` picker. The first row clears the preset;
 /// the rest are the built-in palettes in `THEME_PRESETS` order.
 fn theme_picker_items() -> Vec<PickerItem> {
@@ -9995,7 +9972,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/timeline",
-                description: "recent turns, answers and tool calls (j/k scroll)",
+                description: "search this session's user inputs; Enter jumps to the message",
             },
             HelpEntry {
                 key: "/archive · /delete",
@@ -10064,7 +10041,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Enter",
-                description: "normal modes: promote the focused pane to first; insert: send (queued while busy)",
+                description: "insert: send (queued while busy)",
             },
             HelpEntry {
                 key: "Ctrl-J",
@@ -10111,8 +10088,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "focus the Nth open session / tabby tab without Ctrl-digit support",
             },
             HelpEntry {
-                key: "active queue",
-                description: "finished or waiting sessions move to pane 2; sending work moves them to the tail",
+                key: "session order",
+                description: "panes keep their order; Ctrl-1…9 jumps directly, Shift+,/. or Ctrl-W Ctrl-W moves prev/next",
             },
             HelpEntry {
                 key: "Space N/W/F",
@@ -10133,6 +10110,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "Ctrl-G",
                 description: "session picker (switch the focused pane's session)",
+            },
+            HelpEntry {
+                key: "Ctrl-H",
+                description: "search this session's user-input history and jump",
             },
             HelpEntry {
                 key: "Ctrl-T",
@@ -10513,7 +10494,7 @@ fn layout_pane_rects(layout: PaneLayout, area: Rect, count: usize) -> Vec<Rect> 
     }
 }
 
-/// One column, with the head of the queue taking over half the height.
+/// One column, with the first pane taking over half the height.
 fn horizontal_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
     match count {
         0 => Vec::new(),
@@ -10521,17 +10502,17 @@ fn horizontal_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
         _ => {
             let rest = count - 1;
             let height = area.height as usize;
-            // Keep the head at its normal 55% share regardless of how many
-            // panes are open. The recent panes below split the remainder and
+            // Keep the first pane at its normal 55% share regardless of how
+            // many panes are open. The panes below split the remainder and
             // compact to title-only rows when space is short.
             let first = if height >= count * 2 {
                 (height * 55 / 100).max(1).min(height.saturating_sub(rest))
             } else if height >= count {
-                // Too short for a 55% head; distribute evenly and give the
-                // remainder to the head.
+                // Too short for a 55% first pane; distribute evenly and give
+                // the remainder to the first pane.
                 height / count + height % count
             } else {
-                // More panes than rows: show the head and whatever fits.
+                // More panes than rows: show the first pane and whatever fits.
                 height
             };
             let mut constraints = Vec::with_capacity(count);
@@ -10543,7 +10524,7 @@ fn horizontal_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
 }
 
 /// Spiral tiling: each pane takes a slice of the remaining rectangle. Cuts
-/// cycle left, top, right, bottom, so the queue head gets the largest,
+/// cycle left, top, right, bottom, so the first pane gets the largest,
 /// full-height pane and the rest spiral inward.
 fn fibonacci_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
     if count == 0 {
@@ -11695,6 +11676,91 @@ mod tests {
     }
 
     #[test]
+    fn timeline_picker_lists_only_user_inputs_and_jumps() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let events = vec![
+            SessionEvent::new(
+                "s1",
+                1,
+                EventKind::UserMessage,
+                serde_json::json!({"text": "first request"}),
+            ),
+            SessionEvent::new(
+                "s1",
+                2,
+                EventKind::AssistantMessage,
+                serde_json::json!({"text": "first answer"}),
+            ),
+            SessionEvent::new(
+                "s1",
+                3,
+                EventKind::UserMessage,
+                serde_json::json!({"text": "second request"}),
+            ),
+        ];
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "timeline", "/tmp"),
+            events,
+        ));
+        app.focused = 0;
+        let _ = render_text(&mut app, 80, 20);
+        let line = app.views[0]
+            .user_lines
+            .iter()
+            .find(|(seq, _)| *seq == 3)
+            .map(|(_, line)| *line)
+            .expect("user line");
+
+        app.open_picker(PickerKind::Timeline, &tx);
+        let picker = app.picker.as_ref().expect("timeline picker");
+        assert_eq!(picker.kind, PickerKind::Timeline);
+        let values: Vec<&str> = picker
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect();
+        assert_eq!(values, ["3", "1"]);
+        assert_eq!(picker.selected, 0);
+        assert!(picker.items[0].label.contains(':'));
+        assert!(picker.items[0]
+            .preview
+            .as_deref()
+            .is_some_and(|preview| preview.contains("second request")));
+
+        app.picker_enter(PickerKind::Timeline, &tx);
+        assert!(app.picker.is_none());
+        assert!(!app.views[0].follow);
+        assert_eq!(app.views[0].scroll, line.saturating_sub(2));
+        assert!(app.status.contains("jumped to e3"));
+    }
+
+    #[test]
+    fn ctrl_h_opens_the_timeline_picker() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::UserMessage,
+            serde_json::json!({"text": "hello"}),
+        )];
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "timeline", "/tmp"),
+            events,
+        ));
+        app.focused = 0;
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        let picker = app.picker.as_ref().expect("timeline picker");
+        assert_eq!(picker.kind, PickerKind::Timeline);
+        assert_eq!(picker.items.len(), 1);
+    }
+
+    #[test]
     fn split_panes_render_both_titles() {
         let mut app = App::new(None);
         app.views.push(SessionView::new(
@@ -11768,7 +11834,7 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_layout_gives_the_head_most_height() {
+    fn horizontal_layout_gives_the_first_pane_most_height() {
         let area = Rect::new(0, 0, 100, 40);
         let rects = layout_pane_rects(PaneLayout::Horizontal, area, 5);
         assert_eq!(rects.len(), 5);
@@ -11818,7 +11884,7 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_layout_shows_head_plus_four_recent_panes() {
+    fn horizontal_layout_shows_head_plus_four_following_panes() {
         let mut app = app_with_panes(&["a", "b", "c", "d", "e", "f", "g", "h"]);
         app.layout = PaneLayout::Horizontal;
         let rendered = render_text(&mut app, 80, 30);
@@ -11840,7 +11906,7 @@ mod tests {
             5
         );
 
-        // The head keeps the same height as it has with only five panes.
+        // The first pane keeps the same height as with only five panes.
         let mut five = app_with_panes(&["a", "b", "c", "d", "e"]);
         five.layout = PaneLayout::Horizontal;
         render_text(&mut five, 80, 30);
@@ -11854,7 +11920,7 @@ mod tests {
         app.focused = 7;
         let rendered = render_text(&mut app, 80, 30);
 
-        // Head plus the four most recent panes ending at the focused one.
+        // Head plus the four following panes ending at the focused one.
         for id in ["a", "e", "f", "g", "h"] {
             assert!(
                 rendered.contains(&format!("session {id}")),
@@ -11872,7 +11938,7 @@ mod tests {
     }
 
     #[test]
-    fn fibonacci_layout_spirals_from_the_head() {
+    fn fibonacci_layout_spirals_from_the_first_pane() {
         let area = Rect::new(0, 0, 100, 40);
         for count in 1..=7 {
             let rects = layout_pane_rects(PaneLayout::Fibonacci, area, count);
@@ -11922,26 +11988,32 @@ mod tests {
     }
 
     #[test]
-    fn active_queue_promotes_ready_to_the_second_slot_and_demotes_sent_sessions() {
+    fn sending_and_status_changes_keep_the_session_order() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = app_with_panes(&["a", "b", "c"]);
         app.focused = 0;
 
-        // A finished background session moves to pane 2, so pane 1 keeps the
-        // user's working session.
-        app.promote_session("c");
-        assert_eq!(view_order(&app), vec!["a", "c", "b"]);
-        assert_eq!(app.focused, 0);
-        assert_eq!(app.views[app.focused].session.id, "a");
-
-        // Sending a session moves it behind everything else.
-        app.demote_session("c");
+        let submitted = SubmitResult {
+            session: app.views[2].session.clone(),
+            turn_id: "turn-c".into(),
+        };
+        app.submitted(submitted);
         assert_eq!(view_order(&app), vec!["a", "b", "c"]);
         assert_eq!(app.focused, 0);
-        assert_eq!(app.views[app.focused].session.id, "a");
+        assert_eq!(app.focused_session_id().as_deref(), Some("a"));
+
+        let mut idle = app.views[2].session.clone();
+        idle.status = SessionStatus::Idle;
+        app.notification(
+            eix_core::Notification::new("session.updated", serde_json::to_value(idle).unwrap()),
+            &tx,
+        );
+        assert_eq!(view_order(&app), vec!["a", "b", "c"]);
+        assert_eq!(app.focused, 0);
     }
 
     #[test]
-    fn ready_session_does_not_replace_the_focused_draft() {
+    fn session_updates_do_not_replace_the_focused_draft() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = app_with_panes(&["a", "b"]);
         app.focused = 0;
@@ -11949,7 +12021,13 @@ mod tests {
         app.input_session = Some("a".to_string());
         app.input.set_text("draft for a");
 
-        app.promote_session("b");
+        let mut ready = app.views[1].session.clone();
+        ready.status = SessionStatus::AwaitingApproval;
+        app.notification(
+            eix_core::Notification::new("session.updated", serde_json::to_value(ready).unwrap()),
+            &tx,
+        );
+        assert_eq!(view_order(&app), vec!["a", "b"]);
         assert_eq!(app.focused_session_id().as_deref(), Some("a"));
         assert_eq!(app.input.text(), "draft for a");
 
@@ -11960,45 +12038,24 @@ mod tests {
     }
 
     #[test]
-    fn session_status_transitions_follow_the_active_queue() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        let mut app = app_with_panes(&["a", "b", "c"]);
+    fn jumping_to_a_session_keeps_the_linked_order() {
+        let mut app = app_with_panes(&["a", "b", "c", "d"]);
         app.focused = 0;
-        app.views[0].session.status = SessionStatus::Idle;
 
-        let mut running = app.views[0].session.clone();
-        running.status = SessionStatus::Running;
-        app.notification(
-            eix_core::Notification::new("session.updated", serde_json::to_value(running).unwrap()),
-            &tx,
-        );
-        assert_eq!(view_order(&app), vec!["b", "c", "a"]);
-        assert_eq!(app.focused, 0);
+        assert!(app.jump_to_session("c"));
+        assert_eq!(app.focused, 2);
+        assert_eq!(app.focused_session_id().as_deref(), Some("c"));
+        assert_eq!(view_order(&app), vec!["a", "b", "c", "d"]);
 
-        let mut idle = app.views[2].session.clone();
-        idle.status = SessionStatus::Idle;
-        app.notification(
-            eix_core::Notification::new("session.updated", serde_json::to_value(idle).unwrap()),
-            &tx,
-        );
-        assert_eq!(view_order(&app), vec!["b", "a", "c"]);
-        assert_eq!(app.focused, 0);
-    }
+        app.cycle_pane(1);
+        assert_eq!(app.focused_session_id().as_deref(), Some("d"));
+        app.cycle_pane(1);
+        assert_eq!(app.focused_session_id().as_deref(), Some("a"));
+        app.cycle_pane(-1);
+        assert_eq!(app.focused_session_id().as_deref(), Some("d"));
+        assert_eq!(view_order(&app), vec!["a", "b", "c", "d"]);
 
-    #[test]
-    fn background_promotion_does_not_steal_focus_from_a_working_pane() {
-        let mut app = app_with_panes(&["a", "b", "c"]);
-        app.focused = 1;
-        app.promote_session("c");
-        assert_eq!(view_order(&app), vec!["a", "c", "b"]);
-        assert_eq!(app.views[app.focused].session.id, "b");
-
-        let mut app = app_with_panes(&["a", "b", "c"]);
-        app.focused = 2;
-        app.promote_session("c");
-        assert_eq!(view_order(&app), vec!["a", "c", "b"]);
-        assert_eq!(app.focused, 1);
-        assert_eq!(app.views[app.focused].session.id, "c");
+        assert!(!app.jump_to_session("missing"));
     }
 
     #[test]
@@ -12082,7 +12139,7 @@ mod tests {
             let rendered = render_text(&mut app, 80, 30);
             assert!(
                 rendered.contains("session a"),
-                "{layout:?} lost the queue head:\n{rendered}"
+                "{layout:?} lost the first pane:\n{rendered}"
             );
         }
     }
@@ -13140,8 +13197,7 @@ mod tests {
             )),
             &tx,
         );
-        // The active queue moves a waiting session to pane 2, leaving the
-        // focused working pane in place.
+        // Attention is marked in place; the pane order does not change.
         assert_eq!(app.views[0].session.id, "s1");
         assert_eq!(app.views[1].session.id, "s2");
         assert_eq!(app.views[1].session.status, SessionStatus::AwaitingApproval);
@@ -14368,6 +14424,52 @@ mod tests {
     }
 
     #[test]
+    fn double_escape_after_insert_cancels_a_busy_session() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "one", "/tmp");
+        session.status = SessionStatus::Running;
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.enter_insert();
+
+        // One Esc leaves insert mode; the next two within the window cancel.
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert_eq!(app.input.mode(), Mode::Normal);
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("cancel command") {
+            Command::Cancel(session_id) => assert_eq!(session_id, "s1"),
+            _ => panic!("expected a cancel command"),
+        }
+    }
+
+    #[test]
+    fn double_escape_in_transcript_and_after_cmdline_cancels() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "one", "/tmp");
+        session.status = SessionStatus::Running;
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(':'), KeyModifiers::NONE), &tx);
+        assert!(app.cmdline.is_some());
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        assert!(app.cmdline.is_none());
+        assert!(matches!(app.focus, Focus::Transcript));
+
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+        match rx.try_recv().expect("cancel command") {
+            Command::Cancel(session_id) => assert_eq!(session_id, "s1"),
+            _ => panic!("expected a cancel command"),
+        }
+    }
+
+    #[test]
     fn ctrl_p_in_prompt_normal_mode_opens_the_palette() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
@@ -15394,7 +15496,7 @@ mod tests {
     }
 
     #[test]
-    fn enter_promotes_the_focused_pane_to_first() {
+    fn normal_mode_enter_keeps_the_session_order() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         for focus in [Focus::Transcript, Focus::Input] {
             let mut app = app_with_panes(&["a", "b", "c"]);
@@ -15407,19 +15509,13 @@ mod tests {
             }
 
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-            assert_eq!(view_order(&app), vec!["c", "a", "b"]);
-            assert_eq!(app.focused, 0);
+            assert_eq!(view_order(&app), vec!["a", "b", "c"]);
+            assert_eq!(app.focused, 2);
             assert_eq!(app.focused_session_id().as_deref(), Some("c"));
-            assert_eq!(app.status, "promoted session c · pane 1/3");
-            assert!(
-                app.focus == focus,
-                "Enter changed the input/transcript focus"
-            );
-
-            // Pressing Enter on the first pane is a no-op.
-            app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-            assert_eq!(view_order(&app), vec!["c", "a", "b"]);
-            assert_eq!(app.status, "already the first pane");
+            assert!(app.focus == focus, "Enter changed the focus");
+            if focus == Focus::Input {
+                assert_eq!(app.input.mode(), Mode::Normal);
+            }
         }
     }
 

@@ -142,8 +142,9 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `○`，run
   暂存修改时则返回明确错误，要求先 `rebase --continue` 或 `rebase --abort`，避免误丢
   正在解决的冲突。agent turn 内也可以用无审批的 `ready` 工具提前置为 ready，队列会等
   turn 结束。
-  `auto_ready = idle` 时 daemon 扫描空闲 session：无 turn/审批/输入、草稿为空、
-  至少一条 user message、worktree 干净，且 `idle_secs` 内无更新。
+  默认 `auto_ready = false`，`/ready` 只由用户触发；显式设为 `true` 时才扫描空闲
+  session（无 turn/审批/输入、草稿为空、至少一条 user message、worktree 干净，且
+  `idle_secs` 内无更新）。
 - 单个 daemon worker 串行处理队列：基分支是 session 创建时所在的分支；用
   `git worktree list --porcelain` 找到该分支实际 checkout 的 worktree（可能是主 worktree，
   也可能是用户自己的 linked worktree），在它干净时 `fetch` + `pull --ff-only`（本地 feature
@@ -202,7 +203,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   选择只读 Plan；输入框下方 statusline 左侧显示 `Build` / `Plan`。本地立即更新以支持连续切换，
   daemon 的 session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
-- `Enter` 在 insert 提交；转录区和输入框 normal 模式都把当前聚焦 pane 提升到第一位。
+- `Enter` 在 insert 提交；normal 模式不改变 pane 顺序。
 - `@`（insert，行首/空白后）打开文件 picker；`Ctrl-G` 在任意模式打开 session picker。
 - picker / 历史搜索：`Ctrl-J`/`Ctrl-K`（或 `↑`/`↓`）上下选择。
 - 不再有 `[input] backend` / `minimal` 配置，也没有 nvim 回退路径。
@@ -272,25 +273,23 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 ## 6. 布局与焦点
 
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
-- 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首固定占 55% 高度；pane 超过 5 个
-  时只渲染队首 + 最近 4 个，其余隐藏，焦点移入隐藏 pane 时窗口滑动；空间不足时压缩为
+- 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，第一个 pane 固定占 55% 高度；pane 超过 5 个
+  时只渲染第一个 pane + 后续 4 个，其余隐藏，焦点移入隐藏 pane 时窗口滑动；空间不足时压缩为
   标题行/单行内容，不退回 tabby）、`tabby`（输入框
   上方显示 tab，只渲染当前 session）、`fibonacci`（左/上/右/下循环切分的螺旋分屏，不显示 tab）。用 leader
   `<Space>v/t/r` 切换，`<Space>l` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session，
   在 `tabby` 下即切换到第 N 个 tab。TUI 启动时请求 kitty 键盘协议（CSI-u），否则传统终端
   会把 `Ctrl-2`/`Ctrl-3` 等编码成 NUL/Esc；不支持该协议时用 `Alt-1` … `Alt-9`。
-- 活跃队列：`views` 顺序即队列顺序，位置 0 是 pane 1，也是当前工作槽位。turn 完成、等待
-  审批/输入时把对应 session 移到第二个位置（position 1，即 pane 2），避免替换 pane 1 正在
-  编辑的内容；提交流程（包括排队和 `!` shell）把它移到队尾。重排时保持聚焦槽位，因此发送后
-  第二个位置的 session 会补到 pane 1；若被移动的正是聚焦 session，promotion 会跟随到
-  第二个位置，demotion 则留在原槽位等待下一个 session。手动操作时，在转录区或输入框
-  normal 模式按 `Enter` 会把当前聚焦 pane 移到位置 0（pane 1）并保持焦点。
+- session 顺序：`views` 是稳定顺序（可视为双向链表），pane 打开后保持位置。发送任务、turn
+  完成、等待审批/输入都不会移动 session；焦点只改变当前节点，不改变 `views` 顺序。用
+  `Shift+,` / `Shift+.`（`<` / `>`）或 1 秒内连续两次 `Ctrl-W` 在前后节点间移动，
+  `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。
 - 不再有独立顶部 header 行，输入框也不再有底部信息行；输入框下方保留一行 statusline，
   左侧按 `N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
-  cwd（`~` 缩写）和 git 分支；最近状态、worktree/图片数、pane 位置和队列/attention 信息在空间
-  允许时出现在中部或右侧，变窄时优先保留 cwd/branch。
+  cwd（`~` 缩写）和 git 分支；最近状态、worktree/图片数、pane 位置、prompt 队列和 attention
+  信息在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。
 - 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i` 或 `<Space>i` 聚焦输入并进入 insert；
-  在转录区或输入框 normal 模式按 `Enter` 把当前 pane 提升到第一位并保持聚焦。聚焦 pane 使用
+  `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。聚焦 pane 使用
   更亮的单格虚线边框、标题加粗；非聚焦 pane 保持低对比实线灰，attention 仍用警示色。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
@@ -339,7 +338,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 | 键 | 行为 |
 |---|---|
-| `<CR>` | insert 提交（turn 运行中进入 session 队列）；normal 模式提升当前 pane 到第一位 |
+| `<CR>` | insert 提交（turn 运行中进入 prompt 队列）；normal 模式不改变 pane 顺序 |
 | `/命令` | 整条消息作为 prompt 命令处理，不发给模型（见下表） |
 | `<C-j>` / `<C-Enter>` / `<S-Enter>` | 换行（仅 insert） |
 | `@` | 文件 picker（行首/空白后） |
@@ -421,7 +420,7 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 | `/`、`n/N` | 搜索 |
 | `za`、`zR/zM` | 折叠当前/全部 |
 | `Tab` | 切换 Build / Plan 模式 |
-| `<CR>` | 把当前聚焦 pane 提升到第一位并保持聚焦 |
+| `<CR>` | 提交输入（insert 模式） |
 | `y` / `Y` / `v` | 复制当前块 / 整条消息 / 可视选择 |
 | `gf` / `gx` | 打开路径 / URL |
 | `i` | 聚焦输入（insert） |

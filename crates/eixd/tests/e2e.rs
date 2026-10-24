@@ -3066,7 +3066,7 @@ async fn integration_rebases_tests_and_fast_forwards_the_base_branch() -> anyhow
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "main".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = true;
     config.integration.test = "echo unit-tests-passed".into();
     config.integration.timeout_secs = 30;
@@ -3178,7 +3178,7 @@ async fn ready_recovers_a_stale_rebase_and_records_a_backup() -> anyhow::Result<
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "main".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = false;
     config.integration.conflict_repair = false;
     config.integration.pause_after = 1;
@@ -3272,7 +3272,7 @@ async fn integration_merges_into_the_branch_the_session_started_from() -> anyhow
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "auto".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = false;
     config.integration.test = "true".into();
     config.integration.timeout_secs = 30;
@@ -3381,7 +3381,7 @@ async fn integration_merges_into_a_linked_starting_worktree() -> anyhow::Result<
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "auto".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = false;
     config.integration.test = "true".into();
     config.integration.timeout_secs = 30;
@@ -3461,7 +3461,7 @@ async fn integration_missing_test_command_hands_off_to_the_agent() -> anyhow::Re
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "main".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = false;
     config.integration.test = "auto".into();
     config.integration.conflict_repair = true;
@@ -3571,7 +3571,7 @@ async fn integration_pending_repair_resumes_when_idle() -> anyhow::Result<()> {
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "main".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = false;
     config.integration.test = "auto".into();
     config.integration.conflict_repair = true;
@@ -3659,7 +3659,7 @@ async fn integration_failure_retries_and_continue_requeues() -> anyhow::Result<(
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "main".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = false;
     config.integration.test = "false".into();
     config.integration.timeout_secs = 30;
@@ -3753,7 +3753,7 @@ async fn integration_conflict_retries_when_repair_is_disabled() -> anyhow::Resul
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "main".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     config.integration.pull_base = false;
     config.integration.test = "true".into();
     config.integration.conflict_repair = false;
@@ -3837,7 +3837,7 @@ async fn first_prompt_creates_an_english_named_worktree() -> anyhow::Result<()> 
     config.default_provider_mut().api_key = None;
     config.provider_runtime.timeout_secs = 30;
     config.worktree.base = "main".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     let socket = root.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
 
@@ -3907,7 +3907,7 @@ async fn lazy_worktree_uses_the_branch_from_session_creation() -> anyhow::Result
     config.default_provider_mut().api_key = None;
     config.provider_runtime.timeout_secs = 30;
     config.worktree.base = "auto".into();
-    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.auto_ready = false;
     let socket = root.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
 
@@ -5900,7 +5900,7 @@ async fn sessions_can_be_exported_imported_archived_and_deleted() -> anyhow::Res
     assert!(timeline
         .items
         .iter()
-        .any(|item| item.kind == "assistant_message" && item.preview.contains("Hello")));
+        .all(|item| item.kind == "user_message"));
 
     let exported: eix_core::SessionExportResult = client
         .request("session.export", json!({"session_id": original_id}))
