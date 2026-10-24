@@ -19,6 +19,7 @@ use eix_core::{
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
+use ratatui::symbols::border::Set as BorderSet;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Clear, List, ListItem, ListState, Padding, Paragraph, Wrap,
@@ -229,6 +230,19 @@ const COMPOSER_WARN: Color = Color::Rgb(229, 192, 123);
 const COMPOSER_DANGER: Color = Color::Rgb(231, 130, 132);
 const COMPOSER_BADGE_TEXT: Color = Color::Rgb(20, 22, 28);
 const COMPOSER_SELECTION: Color = Color::Rgb(54, 60, 76);
+
+/// Fine dashed focus ring. Quadruple-dash box drawing keeps the focused pane
+/// visible without the heavier look of the normal solid border.
+const PANE_FOCUS_BORDER: BorderSet = BorderSet {
+    top_left: "╭",
+    top_right: "╮",
+    bottom_left: "╰",
+    bottom_right: "╯",
+    vertical_left: "┊",
+    vertical_right: "┊",
+    horizontal_top: "┈",
+    horizontal_bottom: "┈",
+};
 
 /// A mouse text selection in transcript-line/cell coordinates.
 #[derive(Clone, Copy, Debug)]
@@ -7700,6 +7714,9 @@ already exists, update it in place rather than rewriting it from scratch.";
             title_style = title_style.add_modifier(Modifier::DIM);
         }
         let mut block = Block::default().borders(borders).title(title);
+        if focused {
+            block = block.border_set(PANE_FOCUS_BORDER);
+        }
         if let Some(background) = theme.background {
             border_style = border_style.bg(background);
             title_style = title_style.bg(background);
@@ -11715,8 +11732,8 @@ mod tests {
         );
         assert_eq!(
             focused.symbol(),
-            "│",
-            "focused pane border should stay solid and use the brighter color"
+            "┊",
+            "focused pane border should use the fine dashed line"
         );
         assert_eq!(
             inactive.fg,
