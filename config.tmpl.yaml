@@ -79,7 +79,7 @@ tools:
   # external_directory: ["/tmp/shared", "~/.cache/tool/**"]
   # network_allow: ["docs.rs", "*.github.com"]
   # Other defaults: max_output_bytes=20000, command_timeout_secs=60,
-  # sandbox=auto, sandbox_network=false,
+  # max_tool_rounds=64, sandbox=auto, sandbox_network=false,
   # sandbox_read_paths=[~/.cargo, ~/.rustup, ~/.cache, ~/.npm],
   # sandbox_writable_roots=[], snapshots=true.
 

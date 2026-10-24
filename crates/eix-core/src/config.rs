@@ -604,6 +604,10 @@ pub struct ToolsConfig {
     pub max_output_bytes: usize,
     /// Wall-clock limit for `run_command`.
     pub command_timeout_secs: u64,
+    /// Hard cap on provider <-> tool round trips for one turn. The last few
+    /// rounds include a "summarize now" reminder, and the final round is sent
+    /// without tool definitions so the model must produce an answer.
+    pub max_tool_rounds: usize,
     /// Filesystem isolation for `run_command` / `start_command`.
     pub sandbox: SandboxMode,
     /// Allow network access inside the sandbox.
@@ -704,6 +708,7 @@ impl Default for ToolsConfig {
             approval: ApprovalMode::Ask,
             max_output_bytes: 20_000,
             command_timeout_secs: 60,
+            max_tool_rounds: 64,
             sandbox: SandboxMode::Auto,
             sandbox_network: false,
             sandbox_read_paths: vec![
@@ -1583,6 +1588,9 @@ impl Config {
         if let Some(value) = env_var("EIX_TOOL_TIMEOUT_SECS").and_then(|v| v.parse().ok()) {
             self.tools.command_timeout_secs = value;
         }
+        if let Some(value) = env_var("EIX_TOOL_MAX_ROUNDS").and_then(|v| v.parse().ok()) {
+            self.tools.max_tool_rounds = value;
+        }
         if let Some(value) = env_var("EIX_TOOL_SANDBOX") {
             match value.as_str() {
                 "auto" => self.tools.sandbox = SandboxMode::Auto,
@@ -1726,6 +1734,11 @@ impl Config {
         if self.tools.command_timeout_secs == 0 {
             return Err(ConfigError::Invalid(
                 "tools.command_timeout_secs must be > 0".into(),
+            ));
+        }
+        if self.tools.max_tool_rounds == 0 {
+            return Err(ConfigError::Invalid(
+                "tools.max_tool_rounds must be > 0".into(),
             ));
         }
         if self.integration.enabled {
@@ -3410,11 +3423,13 @@ pi = true
             .any(|path| path == "~/.cargo"));
         assert!(default.tools.snapshots);
         assert_eq!(default.tools.approval, ApprovalMode::Ask);
+        assert_eq!(default.tools.max_tool_rounds, 64);
 
         let parsed: Config = toml::from_str(
             r#"
 [tools]
 approval = "auto"
+max_tool_rounds = 96
 sandbox = "required"
 sandbox_network = true
 sandbox_read_paths = ["~/.cargo"]
@@ -3425,6 +3440,7 @@ snapshots = false
         )
         .expect("tools config");
         assert_eq!(parsed.tools.approval, ApprovalMode::Auto);
+        assert_eq!(parsed.tools.max_tool_rounds, 96);
         assert_eq!(parsed.tools.sandbox, SandboxMode::Required);
         assert!(parsed.tools.sandbox_network);
         assert_eq!(parsed.tools.sandbox_read_paths, vec!["~/.cargo"]);
@@ -3432,6 +3448,13 @@ snapshots = false
         assert!(parsed.tools.network_host_allowed("https://example.com/x"));
         assert!(!parsed.tools.network_host_allowed("https://evil.test/x"));
         assert!(!parsed.tools.snapshots);
+    }
+
+    #[test]
+    fn tool_round_budget_must_be_positive() {
+        let mut config = Config::default();
+        config.tools.max_tool_rounds = 0;
+        assert!(config.validate().is_err());
     }
 
     #[test]

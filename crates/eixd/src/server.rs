@@ -3268,6 +3268,7 @@ impl Daemon {
         let mut messages = ledger.messages();
         self.emit_context(session_id, &ledger);
         let tools = allowed_tools;
+        let max_tool_rounds = config.tools.max_tool_rounds.max(1);
         let route = config.route(&model);
         let (max_retries, retry_base, retry_max) = (
             config.provider_runtime.retry_attempts,
@@ -3279,7 +3280,7 @@ impl Daemon {
         let mut auto_compactions = 0u32;
         let mut context_recoveries = 0u32;
 
-        for round in 0..=tools::MAX_TOOL_ROUNDS {
+        for round in 0..=max_tool_rounds {
             if cancel.load(Ordering::SeqCst) {
                 self.finish_cancelled(session_id, turn_id, "", "", &model)?;
                 return Ok(());
@@ -3320,6 +3321,15 @@ impl Daemon {
                 self.emit_context(session_id, &refreshed);
             }
 
+            // Approaching the budget, tell the model to stop exploring and
+            // answer. The final round omits tool definitions entirely, so the
+            // model cannot spend the whole budget and then fail without a
+            // synthesis.
+            if let Some(warning) = tool_round_warning(round, max_tool_rounds) {
+                messages.push(ChatMessage::system(warning));
+            }
+            let request_tools = tools_for_round(round, max_tool_rounds, tools);
+
             let provider = self.provider.load_full();
             let mut attempt = 0u32;
             let completion = loop {
@@ -3328,14 +3338,10 @@ impl Daemon {
                 let tid = turn_id.to_string();
                 let mut streamed = String::new();
                 let mut streamed_reasoning = String::new();
-                let estimated_prompt = estimate_request_tokens(&messages, tools);
+                let estimated_prompt = estimate_request_tokens(&messages, request_tools);
                 let outcome = provider
-                    .stream_chat(
-                        &messages,
-                        &route,
-                        tools,
-                        cancel.as_ref(),
-                        |delta| match delta {
+                    .stream_chat(&messages, &route, request_tools, cancel.as_ref(), |delta| {
+                        match delta {
                             crate::provider::StreamDelta::Content(text) => {
                                 streamed.push_str(text);
                                 let _ = bus.send(Notification::new(
@@ -3358,8 +3364,8 @@ impl Daemon {
                                     }),
                                 ));
                             }
-                        },
-                    )
+                        }
+                    })
                     .await;
 
                 if cancel.load(Ordering::SeqCst) {
@@ -3591,10 +3597,10 @@ impl Daemon {
                 return Ok(());
             }
 
-            if round == tools::MAX_TOOL_ROUNDS {
+            if round == max_tool_rounds {
                 bail!(
-                    "tool loop exceeded {} rounds without a final answer",
-                    tools::MAX_TOOL_ROUNDS
+                    "tool loop exceeded {} rounds without a final answer; raise [tools] max_tool_rounds or EIX_TOOL_MAX_ROUNDS if this task legitimately needs more",
+                    max_tool_rounds
                 );
             }
         }
@@ -6356,6 +6362,33 @@ async fn sleep_cancellable(delay: Duration, cancel: &AtomicBool) -> bool {
     }
 }
 
+const TOOL_ROUND_WARNING: usize = 8;
+
+/// A system reminder injected near the end of the tool budget. It is not
+/// persisted: the next round rebuilds messages from the event log, so the
+/// reminder is added again only while it still applies.
+fn tool_round_warning(round: usize, max_rounds: usize) -> Option<String> {
+    let remaining = max_rounds.saturating_sub(round);
+    (remaining <= TOOL_ROUND_WARNING).then(|| {
+        format!(
+            "Tool budget: {round}/{max_rounds} rounds used, {remaining} left. \
+             Stop calling tools and provide your best final answer now. \
+             If something is incomplete or unverified, say so explicitly \
+             instead of starting more exploration."
+        )
+    })
+}
+
+/// The final round deliberately hides tool definitions. At that point the
+/// alternative is a hard failure with no answer, so force a synthesis.
+fn tools_for_round(round: usize, max_rounds: usize, tools: &[ToolDefinition]) -> &[ToolDefinition] {
+    if round >= max_rounds {
+        &[]
+    } else {
+        tools
+    }
+}
+
 fn truncate_ui(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -7106,6 +7139,22 @@ mod tests {
         assert!(SessionStatus::Running.is_busy());
         assert!(SessionStatus::AwaitingApproval.is_busy());
         assert!(!SessionStatus::Error.is_busy());
+    }
+
+    #[test]
+    fn tool_round_budget_warns_and_forces_the_final_answer() {
+        let tools = vec![ToolDefinition::function(
+            "read_file",
+            "read a file",
+            json!({ "type": "object" }),
+        )];
+        assert!(tool_round_warning(0, 64).is_none());
+        assert!(tool_round_warning(55, 64).is_none());
+        assert!(tool_round_warning(56, 64).is_some());
+        assert!(tool_round_warning(64, 64).is_some());
+
+        assert_eq!(tools_for_round(63, 64, &tools).len(), 1);
+        assert!(tools_for_round(64, 64, &tools).is_empty());
     }
 
     #[test]
