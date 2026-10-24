@@ -590,6 +590,62 @@ mod tests {
     }
 
     #[test]
+    fn common_read_only_shell_pipelines_do_not_ask() {
+        let config = config();
+        for command in [
+            "cd /tmp/eix-perm && cat Cargo.toml | head -20",
+            "cd /tmp/eix-perm && grep -rn TODO crates --include=*.rs | head -20",
+            "cd /tmp/eix-perm && sed -n '1,80p' crates/eix-core/src/risk.rs",
+            "cd /tmp/eix-perm && awk 'END{print NR}' crates/eix-core/src/risk.rs",
+            "cd /tmp/eix-perm && git status --short",
+            "find . -name '*.rs' | xargs wc -l | sort -n | tail -1",
+            "env FOO=1 timeout 5 ls crates",
+        ] {
+            let decision = decide(
+                "run_command",
+                &json!({"command": command}),
+                Path::new("/tmp/eix-perm"),
+                &config,
+                PermissionLevel::WorkspaceWrite,
+                &[],
+                false,
+            );
+            assert_eq!(
+                decision.action,
+                PermissionAction::Allow,
+                "{command}: {decision:?}"
+            );
+            assert!(!decision.risk.hard_deny, "{command}: {decision:?}");
+        }
+    }
+
+    #[test]
+    fn read_only_classifier_still_gates_mutating_shell_commands() {
+        let config = config();
+        for command in [
+            "sed -i 's/x/y/' file",
+            "awk 'BEGIN{system(\"rm -rf /\")}'",
+            "find . -name '*.rs' | xargs sort -o out",
+            "cd /tmp && cat passwd",
+        ] {
+            let decision = decide(
+                "run_command",
+                &json!({"command": command}),
+                Path::new("/tmp/eix-perm"),
+                &config,
+                PermissionLevel::WorkspaceWrite,
+                &[],
+                false,
+            );
+            assert_ne!(
+                decision.action,
+                PermissionAction::Allow,
+                "{command}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
     fn full_does_not_bypass_hard_deny_or_rules() {
         let mut config = config();
         config.tools.rules = vec![PermissionRule {

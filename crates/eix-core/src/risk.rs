@@ -453,6 +453,35 @@ fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
             }
             "env" => {
                 wrappers.push(base);
+                if argv[1..].iter().any(|arg| {
+                    arg == "-C"
+                        || arg == "--chdir"
+                        || arg.starts_with("--chdir=")
+                        || (arg.starts_with("-C") && arg.len() > 2)
+                }) {
+                    // `env -C` changes the working directory before running
+                    // the inner command, so relative read paths would be
+                    // checked against the wrong directory.
+                    analysis.dynamic = true;
+                    analysis
+                        .reasons
+                        .push("env changes the working directory".to_string());
+                }
+                if argv[1..].iter().any(|arg| {
+                    arg == "-S"
+                        || arg == "--split-string"
+                        || arg.starts_with("--split-string=")
+                        || (arg.starts_with("-S") && arg.len() > 2)
+                }) {
+                    // Splitting a command string is shell-like and can hide
+                    // additional arguments. Treat it as dynamic instead of
+                    // falling through to a bare `env` (which prints secrets).
+                    analysis.dynamic = true;
+                    analysis
+                        .reasons
+                        .push("env splits a command string".to_string());
+                    return;
+                }
                 argv = skip_env(&argv[1..]);
             }
             "command" | "builtin" | "nohup" | "time" | "busybox" | "toybox" => {
@@ -476,12 +505,50 @@ fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
                 argv = rest;
             }
             "xargs" => {
-                analysis.dynamic = true;
-                analysis
-                    .reasons
-                    .push("xargs may execute arbitrary commands".to_string());
                 wrappers.push(base);
-                argv = skip_options(&argv[1..], &["-I", "-n", "-P", "-d", "-E", "-s"]);
+                let reads_arg_file = argv[1..].iter().any(|arg| {
+                    arg == "-a"
+                        || arg == "--arg-file"
+                        || arg.starts_with("--arg-file=")
+                        || (arg.starts_with("-a") && arg.len() > 2)
+                });
+                argv = skip_options(
+                    &argv[1..],
+                    &[
+                        "-I",
+                        "-n",
+                        "-P",
+                        "-d",
+                        "-E",
+                        "-s",
+                        "-L",
+                        "-a",
+                        "--max-args",
+                        "--max-procs",
+                        "--delimiter",
+                        "--eof",
+                        "--max-chars",
+                        "--max-lines",
+                        "--arg-file",
+                    ],
+                );
+                // `xargs` is only a wrapper around the inner command. If that
+                // command cannot write or execute another program, the whole
+                // pipeline is still read-only. Commands such as `git`, `sed`
+                // or `sort` stay unknown here because appended file names could
+                // be interpreted as write/exec options.
+                if reads_arg_file {
+                    analysis.dynamic = true;
+                    analysis.reasons.push(
+                        "xargs reads arguments from a file that may hold secrets".to_string(),
+                    );
+                }
+                if !xargs_inner_is_safe(&argv) {
+                    analysis.dynamic = true;
+                    analysis
+                        .reasons
+                        .push("xargs may execute a mutating command".to_string());
+                }
                 // The remaining args are the command xargs will run.
             }
             "eval" => {
@@ -493,6 +560,15 @@ fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
                 argv.clear();
             }
             "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" => {
+                if wrappers
+                    .iter()
+                    .any(|wrapper| matches!(wrapper.as_str(), "sudo" | "doas" | "nohup"))
+                {
+                    analysis.dynamic = true;
+                    analysis
+                        .reasons
+                        .push("nested shell inherits an elevation or output wrapper".to_string());
+                }
                 if let Some(pos) = argv.iter().position(|arg| arg == "-c") {
                     if let Some(script) = argv.get(pos + 1) {
                         analysis.reasons.push("nested shell command".to_string());
@@ -555,6 +631,41 @@ fn skip_options(argv: &[String], value_options: &[&str]) -> Vec<String> {
         i += if takes_value { 2 } else { 1 };
     }
     argv[i.min(argv.len())..].to_vec()
+}
+
+/// Commands that stay read-only even when `xargs` appends arbitrary file
+/// names. Deliberately excludes tools with output/exec options (`sort`,
+/// `tree`, `sed`, `awk`, `git`, ...), because a file named `-o` or `push`
+/// could otherwise turn the call into a write or publish.
+fn xargs_inner_is_safe(argv: &[String]) -> bool {
+    let Some(program) = argv.first() else {
+        return true;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    matches!(
+        program,
+        // Only commands that report names, metadata, or counts. Content
+        // readers (`cat`, `head`, `grep`, checksums, ...) stay gated because
+        // `find . | xargs cat` could expose a workspace `.env` that the
+        // literal path classifier never sees.
+        "wc" | "ls"
+            | "stat"
+            | "du"
+            | "df"
+            | "basename"
+            | "dirname"
+            | "realpath"
+            | "readlink"
+            | "which"
+            | "whereis"
+            | "pwd"
+            | "echo"
+            | "printf"
+            | "true"
+            | "false"
+            | "test"
+            | "["
+    )
 }
 
 fn skip_env(argv: &[String]) -> Vec<String> {
@@ -683,11 +794,26 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
         return;
     };
     let args = &segment.argv[1..];
-    if !segment.wrappers.is_empty() {
+    // Only elevation wrappers are privileged. `env`, `timeout`, `xargs`,
+    // `nice`, `command` and similar wrappers are judged by the command they
+    // actually run; treating every wrapper as privilege made `timeout 5 ls`
+    // and `find ... | xargs wc -l` ask for approval.
+    if segment
+        .wrappers
+        .iter()
+        .any(|wrapper| matches!(wrapper.as_str(), "sudo" | "doas"))
+    {
         risk.add(
             RiskCategory::Privilege,
             RiskLevel::High,
             format!("wrapped command: {}", segment.wrappers.join(" ")),
+        );
+    }
+    if segment.wrappers.iter().any(|wrapper| wrapper == "nohup") {
+        risk.add(
+            RiskCategory::WriteLocal,
+            RiskLevel::Medium,
+            "nohup may write nohup.out".to_string(),
         );
     }
     match program {
@@ -859,13 +985,21 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
             if args.iter().any(|arg| {
                 matches!(
                     arg.as_str(),
-                    "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir"
-                )
+                    "-delete"
+                        | "-exec"
+                        | "-execdir"
+                        | "-ok"
+                        | "-okdir"
+                        | "-files0-from"
+                        | "--files0-from"
+                ) || arg.starts_with("-files0-from=")
+                    || arg.starts_with("--files0-from=")
             }) {
                 risk.add(
                     RiskCategory::ExecUnknown,
                     RiskLevel::High,
-                    "find can execute commands or delete files".to_string(),
+                    "find can execute commands, delete files, or read an uninspected path list"
+                        .to_string(),
                 );
             } else {
                 risk.add(
@@ -874,15 +1008,33 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
                     "find reads directory entries".to_string(),
                 );
             }
+            classify_find_paths(args, cwd, risk);
         }
-        "rg" | "fd" | "fdfind" => {
+        "rg" => {
             if args.iter().any(|arg| {
                 arg == "--pre"
                     || arg.starts_with("--pre=")
-                    || arg.starts_with("--hostname-bin")
-                    || arg.starts_with("-x")
-                    || arg.starts_with("-X")
+                    || arg == "--hostname-bin"
+                    || arg.starts_with("--hostname-bin=")
                     || arg.starts_with("--exec")
+            }) {
+                risk.add(
+                    RiskCategory::ExecUnknown,
+                    RiskLevel::High,
+                    "rg can execute another program".to_string(),
+                );
+            } else {
+                classify_search_paths(program, args, cwd, risk);
+            }
+        }
+        "fd" | "fdfind" => {
+            if args.iter().any(|arg| {
+                arg.starts_with("-x")
+                    || arg.starts_with("-X")
+                    || arg == "--exec"
+                    || arg.starts_with("--exec=")
+                    || arg == "--exec-batch"
+                    || arg.starts_with("--exec-batch=")
             }) {
                 risk.add(
                     RiskCategory::ExecUnknown,
@@ -893,29 +1045,112 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
                 classify_read_paths(program, args, cwd, risk);
             }
         }
-        "tree" | "sort"
-            if args
-                .iter()
-                .any(|arg| arg == "-o" || arg == "--output" || arg.starts_with("--output=")) =>
+        "grep" => classify_search_paths(program, args, cwd, risk),
+        "diff" => classify_diff_paths(args, cwd, risk),
+        "jq" => classify_jq_paths(args, cwd, risk),
+        "tree"
+            if args.iter().any(|arg| {
+                arg == "-o"
+                    || arg == "--output"
+                    || arg.starts_with("--output=")
+                    || (arg.starts_with("-o") && arg.len() > 2)
+            }) =>
         {
-            risk.add(
-                RiskCategory::WriteLocal,
-                RiskLevel::Medium,
-                format!("{program} writes results to a file"),
-            );
+            classify_tree(args, cwd, risk);
+        }
+        "cd" => classify_cd(args, cwd, risk),
+        "sed" => classify_sed(args, cwd, risk),
+        "sort" => classify_sort(args, cwd, risk),
+        "xxd" => classify_xxd(args, cwd, risk),
+        "uniq" => classify_uniq(args, cwd, risk),
+        "awk" | "gawk" | "mawk" => classify_awk(program, args, cwd, risk),
+        "cat" | "head" | "tail" | "od" | "strings" | "stat" | "ls" | "tree" | "du" | "wc"
+        | "cmp" | "md5sum" | "sha1sum" | "sha256sum" | "sha512sum" | "b2sum" | "cksum" | "tr"
+        | "cut" | "paste" | "nl" | "tac" | "rev" | "fold" | "fmt" | "expand" | "unexpand"
+        | "column" | "join" | "comm" | "base64" | "base32" | "df" | "file" => {
+            if program == "file"
+                && args.iter().any(|arg| {
+                    arg == "--compile"
+                        || (arg.starts_with('-')
+                            && !arg.starts_with("--")
+                            && arg.chars().skip(1).any(|ch| ch == 'C'))
+                })
+            {
+                risk.add(
+                    RiskCategory::WriteLocal,
+                    RiskLevel::Medium,
+                    "file compiles a magic database".to_string(),
+                );
+            }
             classify_read_paths(program, args, cwd, risk);
         }
-        "cat" | "head" | "tail" | "less" | "more" | "xxd" | "od" | "strings" | "stat" | "ls"
-        | "tree" | "du" | "wc" | "diff" | "cmp" | "md5sum" | "sha1sum" | "sha256sum"
-        | "sha512sum" | "jq" | "grep" | "sort" => {
-            classify_read_paths(program, args, cwd, risk);
+        "basename" | "dirname" | "realpath" | "readlink" | "which" | "whereis" | "type"
+        | "printf" | "echo" | "pwd" | "true" | "false" | "test" | "[" | "uname" | "whoami"
+        | "id" | "groups" | "uptime" | "nproc" | "arch" | "getconf" | "locale" | "free"
+        | "lsblk" | "lscpu" | "ps" | "pgrep" | "pidof" | "lsof" | "ss" | "netstat" => {
+            if program == "ss"
+                && args.iter().any(|arg| {
+                    arg == "--kill"
+                        || arg.starts_with("--kill=")
+                        || (arg.starts_with('-')
+                            && !arg.starts_with("--")
+                            && arg.chars().skip(1).any(|ch| ch == 'K'))
+                })
+            {
+                risk.add(
+                    RiskCategory::Destructive,
+                    RiskLevel::High,
+                    "ss drops sockets".to_string(),
+                );
+            } else {
+                risk.add(
+                    RiskCategory::ExecSafe,
+                    RiskLevel::Low,
+                    format!("{program} only reports information"),
+                );
+            }
         }
-        "printf" | "echo" | "pwd" | "true" | "false" | "test" | "[" => {
-            risk.add(
-                RiskCategory::ExecSafe,
-                RiskLevel::Low,
-                format!("{program} only writes to its output stream"),
-            );
+        "date" => {
+            if args.iter().any(|arg| {
+                arg == "-s"
+                    || (arg.starts_with("-s") && arg.len() > 2)
+                    || arg == "--set"
+                    || arg.starts_with("--set=")
+            }) {
+                risk.add(
+                    RiskCategory::WriteExternal,
+                    RiskLevel::High,
+                    "date changes the system clock".to_string(),
+                );
+            } else {
+                let mut i = 0usize;
+                while i < args.len() {
+                    let arg = args[i].as_str();
+                    if arg == "-f" || arg == "--file" {
+                        if let Some(path) = args.get(i + 1) {
+                            classify_read_file("date", path, cwd, risk);
+                        }
+                        i += 2;
+                        continue;
+                    }
+                    if let Some(path) = arg.strip_prefix("--file=") {
+                        classify_read_file("date", path, cwd, risk);
+                        i += 1;
+                        continue;
+                    }
+                    if arg.starts_with("-f") && arg.len() > 2 {
+                        classify_read_file("date", &arg[2..], cwd, risk);
+                        i += 1;
+                        continue;
+                    }
+                    i += 1;
+                }
+                risk.add(
+                    RiskCategory::ExecSafe,
+                    RiskLevel::Low,
+                    "date only reports the current time".to_string(),
+                );
+            }
         }
         "tee" => {
             let targets: Vec<&str> = args
@@ -1184,26 +1419,1234 @@ fn classify_git(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
     }
 }
 
-fn classify_read_paths(program: &str, args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+fn classify_cd(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let target = args
+        .iter()
+        .find(|arg| !arg.starts_with('-') || arg.as_str() == "-")
+        .map(String::as_str)
+        .unwrap_or("~");
+    if target == "-" {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            "cd - uses an unknown previous directory".to_string(),
+        );
+        return;
+    }
+    if target.contains('$') || target.contains('`') {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            "cd target is constructed dynamically".to_string(),
+        );
+        return;
+    }
+    let target_path = match homeish_path(target) {
+        Some(path) => path,
+        None if target.starts_with('~') => {
+            risk.add(
+                RiskCategory::ExecUnknown,
+                RiskLevel::High,
+                format!("cd target cannot be resolved safely: {target}"),
+            );
+            return;
+        }
+        None => std::path::PathBuf::from(target),
+    };
+    let candidate = if target_path.is_absolute() {
+        target_path
+    } else {
+        cwd.join(target_path)
+    };
+    if path_is_outside_workspace(&candidate, cwd) {
+        // Relative paths after `cd` are still classified against the workspace
+        // root. Treating a directory change outside the workspace as safe
+        // would make `cd /etc && cat passwd` look like a workspace read.
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            format!("cd leaves the workspace: {target}"),
+        );
+    } else {
+        risk.add(
+            RiskCategory::ExecSafe,
+            RiskLevel::Low,
+            format!("cd stays inside the workspace: {target}"),
+        );
+    }
+}
+
+fn classify_xxd(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut options_done = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-" {
+                positionals.push(arg);
+                i += 1;
+                continue;
+            }
+            if arg.starts_with('-') {
+                let takes_value = matches!(arg, "-c" | "-g" | "-l" | "-n" | "-o" | "-s" | "-R");
+                i += if takes_value { 2 } else { 1 };
+                continue;
+            }
+        }
+        positionals.push(arg);
+        i += 1;
+    }
+    if let Some(input) = positionals.first().copied() {
+        if input != "-" {
+            classify_read_file("xxd", input, cwd, risk);
+        }
+    }
+    if let Some(output) = positionals.get(1).copied() {
+        if output != "-" {
+            classify_write_path(output, cwd, risk);
+        }
+    }
+    if risk.categories.is_empty() {
+        risk.add(
+            RiskCategory::ExecSafe,
+            RiskLevel::Low,
+            "xxd only writes to its output stream".to_string(),
+        );
+    }
+}
+
+fn classify_uniq(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut positionals: Vec<&str> = Vec::new();
+    let mut options_done = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-" {
+                positionals.push(arg);
+                i += 1;
+                continue;
+            }
+            if arg.starts_with('-') {
+                if matches!(
+                    arg,
+                    "-f" | "--skip-fields" | "-s" | "--skip-chars" | "-w" | "--check-chars"
+                ) {
+                    i += 2;
+                    continue;
+                }
+                i += 1;
+                continue;
+            }
+        }
+        positionals.push(arg);
+        i += 1;
+    }
+    if let Some(input) = positionals.first().copied() {
+        if input != "-" {
+            classify_read_file("uniq", input, cwd, risk);
+        }
+    }
+    if let Some(output) = positionals.get(1).copied() {
+        if output != "-" {
+            classify_write_path(output, cwd, risk);
+        }
+    }
+    if risk.categories.is_empty() {
+        risk.add(
+            RiskCategory::ExecSafe,
+            RiskLevel::Low,
+            "uniq only writes to its output stream".to_string(),
+        );
+    }
+}
+
+fn classify_tree(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut target: Option<&str> = None;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "-o" || arg == "--output" {
+            target = args.get(i + 1).map(String::as_str);
+            i += 2;
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("--output=") {
+            target = Some(path);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-o") && arg.len() > 2 {
+            target = Some(&arg[2..]);
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    if let Some(path) = target {
+        classify_write_path(path, cwd, risk);
+    } else {
+        risk.add(
+            RiskCategory::WriteLocal,
+            RiskLevel::Medium,
+            "tree writes results to a file".to_string(),
+        );
+    }
+    classify_read_paths("tree", args, cwd, risk);
+}
+
+fn classify_sort(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--compress-program" || arg.starts_with("--compress-program=") {
+            risk.add(
+                RiskCategory::ExecUnknown,
+                RiskLevel::High,
+                "sort runs an external compression program".to_string(),
+            );
+            i += if arg == "--compress-program" { 2 } else { 1 };
+            continue;
+        }
+        if arg == "--files0-from" || arg.starts_with("--files0-from=") {
+            risk.add(
+                RiskCategory::ExecUnknown,
+                RiskLevel::High,
+                "sort reads a file list that cannot be inspected".to_string(),
+            );
+            i += if arg == "--files0-from" { 2 } else { 1 };
+            continue;
+        }
+        if arg == "--random-source" {
+            if let Some(path) = args.get(i + 1) {
+                classify_read_file("sort", path, cwd, risk);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(path) = arg.strip_prefix("--random-source=") {
+            classify_read_file("sort", path, cwd, risk);
+            i += 1;
+            continue;
+        }
+        if arg == "-o" || arg == "--output" {
+            match args.get(i + 1) {
+                Some(target) => classify_write_path(target, cwd, risk),
+                None => risk.add(
+                    RiskCategory::WriteLocal,
+                    RiskLevel::Medium,
+                    "sort writes results to a file".to_string(),
+                ),
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(target) = arg.strip_prefix("--output=") {
+            classify_write_path(target, cwd, risk);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-o") && arg.len() > 2 {
+            classify_write_path(&arg[2..], cwd, risk);
+            i += 1;
+            continue;
+        }
+        if arg == "-T" || arg == "--temporary-directory" {
+            match args.get(i + 1) {
+                Some(target) => classify_write_path(target, cwd, risk),
+                None => risk.add(
+                    RiskCategory::WriteLocal,
+                    RiskLevel::Medium,
+                    "sort writes temporary files".to_string(),
+                ),
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(target) = arg.strip_prefix("--temporary-directory=") {
+            classify_write_path(target, cwd, risk);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-T") && arg.len() > 2 {
+            classify_write_path(&arg[2..], cwd, risk);
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    classify_read_paths("sort", args, cwd, risk);
+}
+
+fn classify_search_paths(program: &str, args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
     let mut paths: Vec<&str> = Vec::new();
-    let mut skip_next = false;
-    for (index, arg) in args.iter().enumerate() {
-        if skip_next {
-            skip_next = false;
+    let mut pattern_seen = false;
+    let mut files_mode = false;
+    let mut scanning_options = true;
+    // `-e` / `-f` can appear after positional arguments (GNU option
+    // permutation), so decide up front whether the first positional is a
+    // pattern or an input file. This prevents `grep /etc/passwd -e x` from
+    // being mistaken for a workspace-only search.
+    for arg in args {
+        if scanning_options && arg == "--" {
+            scanning_options = false;
+            continue;
+        }
+        if !scanning_options {
+            continue;
+        }
+        if arg == "--files" {
+            files_mode = true;
+        }
+        if matches!(arg.as_str(), "-e" | "--regexp" | "-f" | "--file")
+            || arg.starts_with("--regexp=")
+            || arg.starts_with("--file=")
+            || (arg.starts_with("-e") && arg.len() > 2)
+            || (arg.starts_with("-f") && arg.len() > 2)
+        {
+            pattern_seen = true;
+        }
+    }
+
+    let mut options_done = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-e" || arg == "--regexp" {
+                pattern_seen = true;
+                i += 2;
+                continue;
+            }
+            if arg.starts_with("--regexp=") || (arg.starts_with("-e") && arg.len() > 2) {
+                pattern_seen = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-f" || arg == "--file" {
+                pattern_seen = true;
+                if let Some(path) = args.get(i + 1) {
+                    paths.push(path);
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(path) = arg.strip_prefix("--file=") {
+                pattern_seen = true;
+                paths.push(path);
+                i += 1;
+                continue;
+            }
+            if arg.starts_with("-f") && arg.len() > 2 {
+                pattern_seen = true;
+                paths.push(&arg[2..]);
+                i += 1;
+                continue;
+            }
+            if matches!(arg, "--exclude-from" | "--include-from" | "--ignore-file") {
+                if let Some(path) = args.get(i + 1) {
+                    paths.push(path);
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(path) = arg
+                .strip_prefix("--exclude-from=")
+                .or_else(|| arg.strip_prefix("--include-from="))
+                .or_else(|| arg.strip_prefix("--ignore-file="))
+            {
+                paths.push(path);
+                i += 1;
+                continue;
+            }
+            if matches!(
+                arg,
+                "-m" | "--max-count"
+                    | "-A"
+                    | "--after-context"
+                    | "-B"
+                    | "--before-context"
+                    | "-C"
+                    | "--context"
+                    | "-g"
+                    | "--glob"
+                    | "--iglob"
+                    | "-t"
+                    | "--type"
+                    | "-T"
+                    | "--type-not"
+                    | "-j"
+                    | "--threads"
+                    | "--max-depth"
+                    | "--max-filesize"
+            ) {
+                i += 2;
+                continue;
+            }
+            if arg.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        if !pattern_seen && !files_mode {
+            pattern_seen = true;
+            i += 1;
+            continue;
+        }
+        paths.push(arg);
+        i += 1;
+    }
+    if paths.is_empty() {
+        paths.push(".");
+    }
+    for path in paths {
+        classify_read_file(program, path, cwd, risk);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JqFilterRisk {
+    Safe,
+    Environment,
+    External,
+}
+
+fn jq_ident(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+fn jq_filter_risk(script: &str) -> JqFilterRisk {
+    // String interpolation (`"\(...)"`) evaluates an expression inside the
+    // string. Treat it conservatively instead of skipping the whole literal.
+    if script.contains("\\(") {
+        if script.contains("env") || script.contains("$ENV") {
+            return JqFilterRisk::Environment;
+        }
+        return JqFilterRisk::External;
+    }
+    let chars: Vec<char> = script.chars().collect();
+    let mut i = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    let mut in_comment = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_comment {
+            if ch == '\n' {
+                in_comment = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            i += 1;
+            continue;
+        }
+        if ch == '#' {
+            in_comment = true;
+            i += 1;
+            continue;
+        }
+        if ch == '$' {
+            let start = i + 1;
+            let mut end = start;
+            while end < chars.len() && jq_ident(chars[end]) {
+                end += 1;
+            }
+            if chars[start..end].iter().collect::<String>() == "ENV" {
+                return JqFilterRisk::Environment;
+            }
+            i = end.max(i + 1);
+            continue;
+        }
+        if jq_ident(ch) {
+            let start = i;
+            let mut end = i;
+            while end < chars.len() && jq_ident(chars[end]) {
+                end += 1;
+            }
+            let token: String = chars[start..end].iter().collect();
+            let previous = start.checked_sub(1).map(|index| chars[index]);
+            match token.as_str() {
+                "env" if previous != Some('.') && previous != Some('$') => {
+                    return JqFilterRisk::Environment;
+                }
+                "import" | "include" | "module" => return JqFilterRisk::External,
+                _ => {}
+            }
+            i = end;
+            continue;
+        }
+        i += 1;
+    }
+    JqFilterRisk::Safe
+}
+
+fn classify_jq_paths(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut paths: Vec<&str> = Vec::new();
+    let mut pattern_seen = false;
+    let mut filter: Option<&str> = None;
+    let mut loads_script = false;
+    let mut files_mode = false;
+    let mut scanning_options = true;
+    for arg in args {
+        if scanning_options && arg == "--" {
+            scanning_options = false;
+            continue;
+        }
+        if !scanning_options {
+            continue;
+        }
+        if arg == "--run-tests" {
+            files_mode = true;
+        }
+        if matches!(arg.as_str(), "-f" | "--from-file")
+            || arg.starts_with("--from-file=")
+            || (arg.starts_with("-f") && arg.len() > 2)
+        {
+            pattern_seen = true;
+        }
+    }
+
+    let mut options_done = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-f" || arg == "--from-file" {
+                pattern_seen = true;
+                loads_script = true;
+                if let Some(path) = args.get(i + 1) {
+                    paths.push(path);
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(path) = arg.strip_prefix("--from-file=") {
+                pattern_seen = true;
+                loads_script = true;
+                paths.push(path);
+                i += 1;
+                continue;
+            }
+            if arg.starts_with("-f") && arg.len() > 2 {
+                pattern_seen = true;
+                loads_script = true;
+                paths.push(&arg[2..]);
+                i += 1;
+                continue;
+            }
+            if arg == "--run-tests" {
+                loads_script = true;
+                i += 1;
+                continue;
+            }
+            if matches!(arg, "--slurpfile" | "--rawfile" | "--argfile") {
+                if let Some(path) = args.get(i + 2) {
+                    paths.push(path);
+                }
+                i += 3;
+                continue;
+            }
+            if matches!(arg, "--arg" | "--argjson") {
+                i += 3;
+                continue;
+            }
+            if arg == "-L" || arg == "--library-path" {
+                if let Some(path) = args.get(i + 1) {
+                    paths.push(path);
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(path) = arg.strip_prefix("--library-path=") {
+                paths.push(path);
+                i += 1;
+                continue;
+            }
+            if arg.starts_with("-L") && arg.len() > 2 {
+                paths.push(&arg[2..]);
+                i += 1;
+                continue;
+            }
+            if arg == "--indent" {
+                i += 2;
+                continue;
+            }
+            if arg.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        if !pattern_seen && !files_mode {
+            pattern_seen = true;
+            filter = Some(arg);
+            i += 1;
+            continue;
+        }
+        paths.push(arg);
+        i += 1;
+    }
+    if loads_script {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            "jq loads a script or test file that cannot be inspected".to_string(),
+        );
+    }
+    if let Some(script) = filter {
+        match jq_filter_risk(script) {
+            JqFilterRisk::Safe => {}
+            JqFilterRisk::Environment => {
+                risk.add(
+                    RiskCategory::SecretRead,
+                    RiskLevel::Critical,
+                    "jq filter reads the process environment, which may contain credentials"
+                        .to_string(),
+                );
+                risk.hard_deny = true;
+            }
+            JqFilterRisk::External => {
+                risk.add(
+                    RiskCategory::ExecUnknown,
+                    RiskLevel::High,
+                    "jq filter imports external code that cannot be inspected".to_string(),
+                );
+            }
+        }
+    }
+    if paths.is_empty() {
+        paths.push(".");
+    }
+    for path in paths {
+        classify_read_file("jq", path, cwd, risk);
+    }
+}
+
+fn classify_diff_paths(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    if args.iter().any(|arg| arg == "--paginate" || arg == "-l") {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            "diff paginates through an external pr program".to_string(),
+        );
+    }
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if matches!(arg, "--from-file" | "--to-file" | "--exclude-from" | "-X") {
+            if let Some(path) = args.get(i + 1) {
+                classify_read_file("diff", path, cwd, risk);
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(path) = arg
+            .strip_prefix("--from-file=")
+            .or_else(|| arg.strip_prefix("--to-file="))
+            .or_else(|| arg.strip_prefix("--exclude-from="))
+        {
+            classify_read_file("diff", path, cwd, risk);
+            i += 1;
+            continue;
+        }
+        if arg.starts_with("-X") && arg.len() > 2 {
+            classify_read_file("diff", &arg[2..], cwd, risk);
+            i += 1;
+            continue;
+        }
+        i += 1;
+    }
+    classify_read_paths("diff", args, cwd, risk);
+}
+
+fn classify_find_paths(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut i = 0usize;
+    // Global options may appear before the start paths.
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if matches!(arg, "-H" | "-L" | "-P" | "--") {
+            i += 1;
+            continue;
+        }
+        if arg == "-D" || arg == "-O" {
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("-O") && arg.len() > 2 {
+            i += 1;
             continue;
         }
         if arg.starts_with('-') {
-            if matches!(
-                arg.as_str(),
-                "-o" | "--output" | "-e" | "--regexp" | "-f" | "--file" | "-m" | "--max-count"
-            ) {
-                skip_next = true;
+            break;
+        }
+        classify_read_file("find", arg, cwd, risk);
+        i += 1;
+    }
+    // Only options that name a real file are checked; expression arguments
+    // such as `-name '*.rs'` or `-path '/etc/*'` are patterns, not reads.
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if matches!(arg, "-newer" | "-anewer" | "-cnewer" | "-samefile") {
+            if let Some(path) = args.get(i + 1) {
+                classify_read_file("find", path, cwd, risk);
+            }
+            i += 2;
+            continue;
+        }
+        if matches!(arg, "-fprint" | "-fprint0" | "-fprintf" | "-fls") {
+            if let Some(path) = args.get(i + 1) {
+                classify_write_path(path, cwd, risk);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+}
+
+fn classify_sed(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut scripts: Vec<&str> = Vec::new();
+    let mut files: Vec<&str> = Vec::new();
+    let mut in_place = false;
+    let mut script_from_file = false;
+    let mut options_done = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-e" || arg == "--expression" {
+                if let Some(script) = args.get(i + 1) {
+                    scripts.push(script);
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(script) = arg.strip_prefix("--expression=") {
+                scripts.push(script);
+                i += 1;
+                continue;
+            }
+            if let Some(script) = arg.strip_prefix("-e").filter(|value| !value.is_empty()) {
+                scripts.push(script);
+                i += 1;
+                continue;
+            }
+            if arg == "-f" || arg == "--file" {
+                script_from_file = true;
+                i += 2;
+                continue;
+            }
+            if arg.starts_with("--file=") || (arg.starts_with("-f") && arg.len() > 2) {
+                script_from_file = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-i"
+                || arg.starts_with("-i")
+                || arg == "--in-place"
+                || arg.starts_with("--in-place=")
+                || (arg.starts_with('-')
+                    && !arg.starts_with("--")
+                    && arg.chars().skip(1).any(|ch| ch == 'i'))
+            {
+                in_place = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-l" || arg == "--line-length" {
+                i += 2;
+                continue;
+            }
+            if arg.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        if scripts.is_empty() && !script_from_file {
+            scripts.push(arg);
+        } else {
+            files.push(arg);
+        }
+        i += 1;
+    }
+
+    if script_from_file {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            "sed reads its script from a file that cannot be inspected".to_string(),
+        );
+    } else {
+        for script in &scripts {
+            if !sed_script_is_safe(script) {
+                risk.add(
+                    RiskCategory::ExecUnknown,
+                    RiskLevel::High,
+                    "sed script may execute commands or write files".to_string(),
+                );
+                break;
+            }
+        }
+    }
+
+    if in_place {
+        risk.add(
+            RiskCategory::WriteLocal,
+            RiskLevel::Medium,
+            "sed edits files in place".to_string(),
+        );
+    }
+    for file in files {
+        if in_place {
+            classify_write_path(file, cwd, risk);
+        } else {
+            classify_read_file("sed", file, cwd, risk);
+        }
+    }
+    if risk.categories.is_empty() {
+        risk.add(
+            RiskCategory::ExecSafe,
+            RiskLevel::Low,
+            "sed only writes to its output stream".to_string(),
+        );
+    }
+}
+
+fn sed_script_is_safe(script: &str) -> bool {
+    let chars: Vec<char> = script.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        while i < chars.len() && matches!(chars[i], ' ' | '\t' | '\r' | '\n' | ';') {
+            i += 1;
+        }
+        if i >= chars.len() {
+            break;
+        }
+        if chars[i] == '#' {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
             }
             continue;
         }
-        // grep/rg's first positional argument is the pattern, not a path.
-        if matches!(program, "grep" | "rg" | "jq") && index == 0 {
+        // Optional address, optionally a second address for a range.
+        while let Some(next) = sed_parse_address(&chars, i) {
+            i = next;
+            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == ',' {
+                i += 1;
+                while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                    i += 1;
+                }
+            } else {
+                break;
+            }
+        }
+        if i < chars.len() && chars[i] == '!' {
+            i += 1;
+            while i < chars.len() && matches!(chars[i], ' ' | '\t') {
+                i += 1;
+            }
+        }
+        let Some(&command) = chars.get(i) else {
+            break;
+        };
+        match command {
+            '#' => {
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            's' => {
+                if !sed_parse_substitute(&chars, &mut i) {
+                    return false;
+                }
+            }
+            'y' => {
+                if !sed_parse_transliterate(&chars, &mut i) {
+                    return false;
+                }
+            }
+            'a' | 'i' | 'c' => {
+                // Text runs to the end of the line; semicolons inside it are
+                // literal text, not command separators.
+                i += 1;
+                while i < chars.len() && chars[i] != '\n' {
+                    i += 1;
+                }
+            }
+            'e' | 'w' | 'W' | 'r' | 'R' => return false,
+            'p' | 'P' | 'd' | 'D' | 'n' | 'N' | 'h' | 'H' | 'g' | 'G' | 'x' | 'l' | 'L' | '='
+            | 'q' | 'Q' | 'z' | 'F' | 'v' => {
+                i += 1;
+                while i < chars.len()
+                    && (chars[i].is_ascii_digit() || matches!(chars[i], '.' | '-'))
+                {
+                    i += 1;
+                }
+            }
+            'b' | 't' | 'T' | ':' => {
+                i += 1;
+                while i < chars.len() && !matches!(chars[i], ';' | '\n') {
+                    i += 1;
+                }
+            }
+            '{' | '}' => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
+
+fn sed_parse_address(chars: &[char], i: usize) -> Option<usize> {
+    match chars.get(i)? {
+        ch if ch.is_ascii_digit() => {
+            let mut i = i;
+            while i < chars.len() && chars[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i < chars.len() && chars[i] == '~' {
+                i += 1;
+                while i < chars.len() && chars[i].is_ascii_digit() {
+                    i += 1;
+                }
+            }
+            Some(i)
+        }
+        '$' => Some(i + 1),
+        '/' => sed_parse_delimited(chars, i + 1, '/'),
+        '\\' => {
+            let delimiter = *chars.get(i + 1)?;
+            sed_parse_delimited(chars, i + 2, delimiter)
+        }
+        _ => None,
+    }
+}
+
+fn sed_parse_delimited(chars: &[char], mut i: usize, delimiter: char) -> Option<usize> {
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i += 2;
             continue;
+        }
+        if chars[i] == delimiter {
+            return Some(i + 1);
+        }
+        i += 1;
+    }
+    None
+}
+
+fn sed_parse_substitute(chars: &[char], i: &mut usize) -> bool {
+    let mut index = *i + 1;
+    let Some(&delimiter) = chars.get(index) else {
+        return false;
+    };
+    if delimiter == '\\' || delimiter == '\n' {
+        return false;
+    }
+    index += 1;
+    let Some(after_pattern) = sed_parse_delimited(chars, index, delimiter) else {
+        return false;
+    };
+    let Some(after_replacement) = sed_parse_delimited(chars, after_pattern, delimiter) else {
+        return false;
+    };
+    index = after_replacement;
+    while index < chars.len() && !matches!(chars[index], ';' | '\n' | ' ' | '\t') {
+        if matches!(chars[index], 'e' | 'E' | 'w' | 'W') {
+            return false;
+        }
+        index += 1;
+    }
+    *i = index;
+    true
+}
+
+fn sed_parse_transliterate(chars: &[char], i: &mut usize) -> bool {
+    let mut index = *i + 1;
+    let Some(&delimiter) = chars.get(index) else {
+        return false;
+    };
+    if delimiter == '\\' || delimiter == '\n' {
+        return false;
+    }
+    index += 1;
+    let Some(after_source) = sed_parse_delimited(chars, index, delimiter) else {
+        return false;
+    };
+    let Some(after_target) = sed_parse_delimited(chars, after_source, delimiter) else {
+        return false;
+    };
+    *i = after_target;
+    true
+}
+
+fn classify_awk(program: &str, args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    let mut script: Option<&str> = None;
+    let mut files: Vec<&str> = Vec::new();
+    let mut script_from_file = false;
+    let mut unsafe_option = false;
+    let mut writes_output = false;
+    let mut output_target: Option<&str> = None;
+    let mut options_done = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if matches!(arg, "-f" | "--file" | "-i" | "--include" | "-l" | "--load")
+                || arg.starts_with("--file=")
+                || arg.starts_with("--include=")
+                || arg.starts_with("--load=")
+                || ((arg.starts_with("-f") || arg.starts_with("-i") || arg.starts_with("-l"))
+                    && arg.len() > 2)
+            {
+                script_from_file = true;
+                unsafe_option = true;
+                i += if matches!(arg, "-f" | "--file" | "-i" | "--include" | "-l" | "--load") {
+                    2
+                } else {
+                    1
+                };
+                continue;
+            }
+            if matches!(arg, "-E" | "--exec")
+                || arg.starts_with("--exec=")
+                || (arg.starts_with("-E") && arg.len() > 2)
+            {
+                script_from_file = true;
+                unsafe_option = true;
+                i += if matches!(arg, "-E" | "--exec") { 2 } else { 1 };
+                continue;
+            }
+            if matches!(
+                arg,
+                "-o" | "--pretty-print" | "-p" | "--profile" | "-d" | "--dump-variables"
+            ) {
+                // gawk can write a pretty-printed program, profile, or variable
+                // dump to a default file in the current directory.
+                writes_output = true;
+                i += 1;
+                continue;
+            }
+            if let Some(path) = arg
+                .strip_prefix("--pretty-print=")
+                .or_else(|| arg.strip_prefix("--profile="))
+                .or_else(|| arg.strip_prefix("--dump-variables="))
+            {
+                writes_output = true;
+                output_target = Some(path);
+                i += 1;
+                continue;
+            }
+            if (arg.starts_with("-o") || arg.starts_with("-p") || arg.starts_with("-d"))
+                && arg.len() > 2
+            {
+                writes_output = true;
+                output_target = Some(&arg[2..]);
+                i += 1;
+                continue;
+            }
+            if matches!(arg, "-D" | "--debug")
+                || arg.starts_with("--debug=")
+                || (arg.starts_with("-D") && arg.len() > 2)
+            {
+                unsafe_option = true;
+                i += 1;
+                continue;
+            }
+            if arg == "-W" || arg.starts_with("-W") {
+                unsafe_option = true;
+                i += if arg == "-W" { 2 } else { 1 };
+                continue;
+            }
+            if arg == "-e" || arg == "--source" {
+                if let Some(value) = args.get(i + 1) {
+                    script = Some(value.as_str());
+                }
+                i += 2;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("--source=") {
+                script = Some(value);
+                i += 1;
+                continue;
+            }
+            if let Some(value) = arg.strip_prefix("-e").filter(|value| !value.is_empty()) {
+                script = Some(value);
+                i += 1;
+                continue;
+            }
+            if matches!(arg, "-F" | "--field-separator" | "-v" | "--assign") {
+                i += 2;
+                continue;
+            }
+            if arg.starts_with('-') {
+                i += 1;
+                continue;
+            }
+        }
+        if script.is_none() && !script_from_file {
+            script = Some(arg);
+        } else {
+            files.push(arg);
+        }
+        i += 1;
+    }
+
+    if script_from_file || unsafe_option {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            format!("{program} loads external code and cannot be inspected"),
+        );
+    } else if let Some(script) = script {
+        if !awk_script_is_safe(script) {
+            risk.add(
+                RiskCategory::ExecUnknown,
+                RiskLevel::High,
+                format!("{program} script may execute commands or write files"),
+            );
+        }
+    }
+    if let Some(path) = output_target {
+        classify_write_path(path, cwd, risk);
+    } else if writes_output {
+        risk.add(
+            RiskCategory::WriteLocal,
+            RiskLevel::Medium,
+            format!("{program} writes a profile or variable dump"),
+        );
+    }
+    for file in files {
+        classify_read_file(program, file, cwd, risk);
+    }
+    if risk.categories.is_empty() {
+        risk.add(
+            RiskCategory::ExecSafe,
+            RiskLevel::Low,
+            format!("{program} only writes to its output stream"),
+        );
+    }
+}
+
+fn awk_script_is_safe(script: &str) -> bool {
+    // These constructs can execute a shell, write an arbitrary file, or read a
+    // file/environment value that the path classifier never sees. Plain
+    // `print` / `printf` to stdout remains allowed.
+    ![
+        "system", "getline", "ENVIRON", "ARGV", "PROCINFO", "@", "|", ">",
+    ]
+    .iter()
+    .any(|token| script.contains(token))
+}
+
+fn path_is_outside_workspace(path: &Path, cwd: &Path) -> bool {
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let candidate = candidate
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_normalize(&candidate));
+    !candidate.starts_with(&root)
+}
+
+fn files0_from_path(args: &[String]) -> Option<&str> {
+    let mut options_done = false;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                i += 1;
+                continue;
+            }
+            if arg == "--files0-from" {
+                return args.get(i + 1).map(String::as_str);
+            }
+            if let Some(path) = arg.strip_prefix("--files0-from=") {
+                return Some(path);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn classify_read_paths(program: &str, args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
+    // Treat every non-option argument as a possible path. Option *values* are
+    // included as well: that can only add a conservative read check, while
+    // skipping them (for example `ls -m /etc`) would let a real path bypass
+    // the workspace check. Commands with a pattern argument use
+    // `classify_search_paths` instead.
+    if let Some(path) = files0_from_path(args) {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            format!("{program} reads a file list that cannot be inspected"),
+        );
+        classify_read_file(program, path, cwd, risk);
+    }
+    let mut paths: Vec<&str> = Vec::new();
+    let mut options_done = false;
+    for arg in args {
+        if !options_done {
+            if arg == "--" {
+                options_done = true;
+                continue;
+            }
+            if arg.starts_with('-') {
+                continue;
+            }
         }
         paths.push(arg);
     }
@@ -1211,33 +2654,37 @@ fn classify_read_paths(program: &str, args: &[String], cwd: &Path, risk: &mut Ri
         paths.push(".");
     }
     for path in paths {
-        if path_is_secret(path) {
-            let critical = path_is_private_key(path);
-            risk.add(
-                RiskCategory::SecretRead,
-                if critical {
-                    RiskLevel::Critical
-                } else {
-                    RiskLevel::High
-                },
-                format!("{program} reads a secret path: {path}"),
-            );
+        classify_read_file(program, path, cwd, risk);
+    }
+}
+
+fn classify_read_file(program: &str, path: &str, cwd: &Path, risk: &mut RiskAssessment) {
+    if path_is_secret(path) {
+        let critical = path_is_private_key(path);
+        risk.add(
+            RiskCategory::SecretRead,
             if critical {
-                risk.hard_deny = true;
-            }
-        } else if is_outside_workspace(path, cwd) {
-            risk.add(
-                RiskCategory::Read,
-                RiskLevel::Medium,
-                format!("{program} reads outside the workspace: {path}"),
-            );
-        } else {
-            risk.add(
-                RiskCategory::Read,
-                RiskLevel::Low,
-                format!("{program} reads a workspace path"),
-            );
+                RiskLevel::Critical
+            } else {
+                RiskLevel::High
+            },
+            format!("{program} reads a secret path: {path}"),
+        );
+        if critical {
+            risk.hard_deny = true;
         }
+    } else if is_outside_workspace(path, cwd) {
+        risk.add(
+            RiskCategory::Read,
+            RiskLevel::Medium,
+            format!("{program} reads outside the workspace: {path}"),
+        );
+    } else {
+        risk.add(
+            RiskCategory::Read,
+            RiskLevel::Low,
+            format!("{program} reads a workspace path"),
+        );
     }
 }
 
@@ -1491,6 +2938,120 @@ mod tests {
     }
 
     #[test]
+    fn common_read_only_pipelines_are_auto_allowed() {
+        for command in [
+            "cd /tmp/eix-risk-workspace && grep -rn TODO crates --include=*.rs | head -20",
+            "cd /tmp/eix-risk-workspace && sed -n '1,80p' crates/eix-core/src/risk.rs",
+            "cd /tmp/eix-risk-workspace && awk 'END{print NR}' crates/eix-core/src/risk.rs",
+            "cd /tmp/eix-risk-workspace && git log --oneline | wc -l",
+            "cd /tmp/eix-risk-workspace && git log --format= --name-only | sort | uniq -c | sort -rn | head -15",
+            "cd /tmp/eix-risk-workspace && rg -x TODO crates",
+            "cd /tmp/eix-risk-workspace && rg --files crates",
+            "cd /tmp/eix-risk-workspace && grep -eTODO crates -r",
+            "cd /tmp/eix-risk-workspace && grep TODO -e OTHER crates --include=*.rs",
+            "cd /tmp/eix-risk-workspace && jq -r '.name' Cargo.toml",
+            "cd /tmp/eix-risk-workspace && jq '.env' Cargo.toml",
+            "cd /tmp/eix-risk-workspace && xxd Cargo.toml | head -5",
+            "cd /tmp/eix-risk-workspace && uniq -c Cargo.toml | head -5",
+            "cd /tmp/eix-risk-workspace && ls -m crates",
+            "cd /tmp/eix-risk-workspace && diff -u Cargo.toml Cargo.toml",
+            "find crates -name '*.rs' -newer Cargo.toml",
+            "find crates -name '*.rs' | xargs wc -l | sort -n | tail -1",
+            "env FOO=1 timeout 5 ls crates",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert!(
+                risk.categories.contains(&RiskCategory::ExecSafe)
+                    || risk.categories.contains(&RiskCategory::Read),
+                "{command}: {risk:?}"
+            );
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn broadened_read_only_classifier_keeps_writes_and_secrets_gated() {
+        for command in [
+            "cd /tmp && cat passwd",
+            "sed -i 's/x/y/' file",
+            "sed '1w out.txt' file",
+            "sed 's/x/y/e' file",
+            "awk 'BEGIN{system(\"rm -rf /\")}'",
+            "awk 'BEGIN{print \"x\" > \"out\"}'",
+            "awk -f script.awk",
+            "awk -E script.awk",
+            "awk --exec=script.awk",
+            "awk -o out.awk 'BEGIN{print 1}'",
+            "awk -o/etc/passwd 'BEGIN{print 1}'",
+            "awk --pretty-print=.env 'BEGIN{print 1}'",
+            "awk -D 'BEGIN{print 1}'",
+            "sort --compress-program=sh file",
+            "sort -T /tmp file",
+            "sort -oout file",
+            "find . -name '*.rs' | xargs sort -o out",
+            "find . -name '*.rs' | xargs git push",
+            "find . -name '*.rs' | xargs cat",
+            "xargs -a .env echo",
+            "date --set=2020-01-01",
+            "date -f .env",
+            "ss -K",
+            "file -C -m magic",
+            "file -Cb -m magic",
+            "env -C /tmp cat passwd",
+            "grep -eTODO /etc/passwd",
+            "grep /etc/passwd -e root crates",
+            "grep -f .env crates",
+            "ls -m /etc",
+            "tree -f /etc",
+            "tree -o /etc/passwd",
+            "tree --output=.env",
+            "rg --files /etc",
+            "rg -x TODO /etc",
+            "jq -f /etc/passwd crates",
+            "jq --from-file=/etc/passwd crates",
+            "jq --rawfile env .env crates",
+            "jq --slurpfile data /etc/passwd crates",
+            "jq --run-tests /etc/passwd",
+            "jq -n env",
+            "jq -n '$ENV'",
+            "jq -f script.jq",
+            "jq --run-tests tests.jq",
+            "diff --from-file=/etc/passwd Cargo.toml",
+            "diff -X .env Cargo.toml Cargo.toml",
+            "diff --paginate Cargo.toml Cargo.toml",
+            "diff -l Cargo.toml Cargo.toml",
+            "sort --files0-from=.env",
+            "sort --random-source=.env",
+            "wc --files0-from=.env",
+            "du --files0-from /etc/passwd",
+            "xxd Cargo.toml /etc/out.hex",
+            "xxd -r Cargo.toml .env",
+            "uniq -f 2 Cargo.toml /etc/out.txt",
+            "uniq Cargo.toml .env",
+            "find /etc -name passwd",
+            "find . -newer .env",
+            "find . -files0-from .env",
+            "fd -x rm",
+            "fd --exec rm",
+            "less README.md",
+            "nohup ls",
+            "sudo ls",
+            "cat .env",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_ne!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
     fn read_like_commands_with_output_flags_are_not_auto_allowed() {
         for command in [
             "git diff --output=out.diff",
@@ -1498,6 +3059,8 @@ mod tests {
             "sort -o sorted.txt input.txt",
             "tree -o tree.txt",
             "find . -fprint found.txt",
+            "xxd Cargo.toml out.hex",
+            "uniq Cargo.toml out.txt",
         ] {
             let risk = assess_command(command, &cwd());
             assert!(
@@ -1530,7 +3093,15 @@ mod tests {
 
     #[test]
     fn printenv_and_secret_paths_are_not_auto_allowed() {
-        for command in ["printenv", "env", "cat .env", "cat ~/.ssh/id_rsa"] {
+        for command in [
+            "printenv",
+            "env",
+            "cat .env",
+            "cat ~/.ssh/id_rsa",
+            "jq -n env",
+            "jq -n '$ENV'",
+            "jq -n '\"\\(env)\"'",
+        ] {
             let risk = assess_command(command, &cwd());
             assert!(
                 risk.categories.contains(&RiskCategory::SecretRead),
@@ -1539,6 +3110,7 @@ mod tests {
             assert_ne!(risk.default_action(), PermissionAction::Allow, "{command}");
         }
         assert!(assess_command("cat ~/.ssh/id_rsa", &cwd()).hard_deny);
+        assert!(assess_command("jq -n env", &cwd()).hard_deny);
     }
 
     #[test]
@@ -1574,7 +3146,9 @@ mod tests {
             "timeout 5 rm -rf /",
             "bash -c 'rm -rf /'",
             "sudo rm -rf /",
+            "sudo sh -c 'ls'",
             "sudo --user=root rm -rf /",
+            "nohup sh -c 'ls'",
             "busybox rm -rf /",
             "timeout --signal=KILL 5 rm -rf /",
             "xargs rm",
@@ -1593,6 +3167,10 @@ mod tests {
             "{nested_write:?}"
         );
         assert_ne!(nested_write.default_action(), PermissionAction::Allow);
+
+        let split_env = assess_command("env --split-string='ls -l'", &cwd());
+        assert!(!split_env.hard_deny, "{split_env:?}");
+        assert_ne!(split_env.default_action(), PermissionAction::Allow);
     }
 
     #[test]

@@ -465,10 +465,18 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 - agent 的读操作看到的是 `真实工作区 + 已 stage 改动` 的合并视图，避免"自己改了什么自己不知道"。
 - shell 命令无法 stage：写操作走审批门禁 + 执行前快照（git stash 或目录快照），风险等级单独标注。
 - 只读 shell 命令（`grep` / `rg` / `fd` / `find` / `cat` / `head` / `tail` / `wc` /
-  `ls` / `stat` / `diff` / `git status` 等）由统一风险分析判为 `ExecSafe`，不弹审批、
-  不抓快照。重定向、后台运行、命令替换、子 shell、`find -exec` / `-delete`、
-  `rg --pre`、`fd -x` 以及所有未知命令仍按风险处理（unknown 默认 ask），避免被 shell
-  语法绕过。构建命令判为 `ExecSandboxed`，优先在沙箱内执行。
+  `ls` / `stat` / `diff` / `uniq` / `tr` / `cut` / `sed -n` / 纯 `print`/`printf` 的
+  `awk` / `git status` 等）由统一风险分析判为 `ExecSafe`，不弹审批、不抓快照。
+  工作区内的 `cd` 也直接放行；离开工作区、动态目标或 `cd -` 仍询问，避免后续相对路径
+  被误判为工作区内读取。`env` / `timeout` / `nice` / `command` 等包装器只按实际执行的
+  命令判断，只有 `sudo` / `doas` 额外计入提权；`xargs` 仅在内层是 `wc` / `ls` / `stat`
+  等只报告名称、元数据或计数的命令时放行，内容读取器和 `-a` / `--arg-file` 保持询问。
+  重定向、后台运行、命令替换、子 shell、`find -exec` / `-delete` / `-files0-from`、
+  `rg --pre`、`fd -x`、`sed -i`、`awk` 的 `system`/重定向、`date -s`、`ss -K`、
+  `sort -o` / `-T` / `--files0-from`、`diff --paginate`、`xxd` / `uniq` 的第二个文件参数、
+  `wc` / `du --files0-from` 以及所有未知命令仍按风险处理（unknown 默认 ask），避免被
+  shell 语法绕过。`jq` 读取 `env` / `$ENV` 视为 secret 读取并硬拒绝，`jq -f` /
+  `--from-file` 等外部脚本保持询问。构建命令判为 `ExecSandboxed`，优先在沙箱内执行。
 
 ### 9.2 审批 UI
 
@@ -749,8 +757,10 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `read_file` / `list_dir`（只读，自动放行）和 `write_file` / `run_command`（需审批），
 > 所有路径经 workspace 沙箱（拒绝 `..` 与 symlink 逃逸），输出按字节截断，
 > `run_command` 带超时。provider 侧支持 OpenAI `tools` / `tool_calls` 的流式增量累积，
-> 一次 turn 最多 64 轮工具往返；每轮写入 `tool_call` / `approval_required` / `tool_result`
-> 事件并广播 `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
+> 一次 turn 最多 `[tools] max_tool_rounds` 轮工具往返（默认 64）；接近上限时注入“停止探索、
+> 立即总结”的系统提示，最后一轮不再发送工具定义，强制模型给出最终回答。每轮写入
+> `tool_call` / `approval_required` / `tool_result` 事件并广播
+> `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
 > 选中的 hunk）。
 > 策略：`[tools] approval = ask|auto`（默认 ask）加 `[[tools.rules]]`；低/中风险 `write_file` /

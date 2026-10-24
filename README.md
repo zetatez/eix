@@ -189,7 +189,7 @@ extensions = ["py"]
 环境变量覆盖：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、`EIX_API_KEY_ENV`、
 `EIX_SYSTEM_PROMPT`、`EIX_TIMEOUT_SECS`、`EIX_RETRY_ATTEMPTS`、`EIX_RETRY_BASE_MS`、
 `EIX_RETRY_MAX_SECS`、`EIX_TOOL_POLICY`、`EIX_TOOL_MAX_OUTPUT`、
-`EIX_TOOL_TIMEOUT_SECS`、`EIX_TOOL_SANDBOX`、`EIX_TOOL_SANDBOX_NETWORK`、
+`EIX_TOOL_TIMEOUT_SECS`、`EIX_TOOL_MAX_ROUNDS`、`EIX_TOOL_SANDBOX`、`EIX_TOOL_SANDBOX_NETWORK`、
 `EIX_TOOL_SANDBOX_READ_HOME`、`EIX_TOOL_SNAPSHOTS`、`EIX_CONTEXT_BUDGET`、
 `EIX_CONTEXT_AUTO_COMPACT`、`EIX_CONTEXT_AUTO_COMPACT_THRESHOLD`、`EIX_CONTEXT_TOOL_OUTPUT_TOKENS`、
 `EIX_CONTEXT_WORKSPACE`、`EIX_NOTIFY_COMMAND`、`EIX_NOTIFY_COOLDOWN_SECS`、
@@ -770,11 +770,20 @@ daemon 目前向模型暴露这些工具：
 `glob` / `webfetch` / `websearch`）时并发执行，结果按调用顺序回填。
 
 `run_command` 使用统一风险分析：shell tokenizer 会拆出每个命令段、重定向、`sudo`/`env`
-等包装器、嵌套 `sh -c` 和命令替换。`git status`、`cat`、`grep`、`ls` 等只读命令直接放行；
-`cargo test` / `npm test` 等构建命令默认在沙箱内执行；`rm`、写入重定向、未知程序、脚本
-解释器、`find -exec`、网络命令等按风险询问。`rm -rf /`、块设备 `dd`、`mkfs`、关机、
-fork bomb、私钥读取以及把 secret 占位符送进网络/命令/MCP 调用会硬拒绝，`auto` / `full`
-和任何 `allow` 规则都不能绕过。`git push --force` 视为高风险，默认询问。
+等包装器、嵌套 `sh -c` 和命令替换。`git status`、`cat`、`grep`、`ls`、`sed -n`、
+纯 `print`/`printf` 的 `awk`、`uniq`、`tr`、`cut`、`sort` 等只读过滤/查询命令直接放行；
+工作区内的 `cd`（以及 `cd <workspace> && ...`）也直接放行，离开工作区的 `cd` 仍询问。
+`env` / `timeout` / `nice` / `command` 等包装器按实际执行的命令判断，只有 `sudo` / `doas`
+额外标记提权；`xargs` 仅在内层是 `wc` / `ls` / `stat` 等只报告名称、元数据或计数的命令时
+放行，`cat` / `grep` 等内容读取器和 `-a` / `--arg-file` 保持询问。`cargo test` / `npm test`
+等构建命令默认在沙箱内执行；`rm`、写入重定向、未知程序、脚本解释器、`find -exec`、
+网络命令等按风险询问。`rm -rf /`、块设备 `dd`、`mkfs`、关机、fork bomb、私钥读取以及把
+secret 占位符送进网络/命令/MCP 调用会硬拒绝，`auto` / `full` 和任何 `allow` 规则都不能绕过。
+`git push --force` 视为高风险，默认询问；`sed -i`、`awk` 的 `system`/重定向、`date -s`、
+`ss -K`、`sort -o`/`-T`/`--files0-from`、`diff --paginate`、`find -files0-from`、
+`xxd`/`uniq` 的第二个文件参数、`wc`/`du --files0-from` 等带副作用或动态文件集的选项同样
+不会自动放行。`jq` 读取 `env`/`$ENV` 会硬拒绝，`jq -f` / `--from-file` 等无法检查的外部
+脚本保持询问。
 
 隐私边界：daemon 在把消息发给 provider 之前，会把密码、`sk-…` / Stripe / GitHub / Slack
 等 token、Bearer、URL 凭据、PEM 私钥和 `password=` / `api_key:` 等赋值替换成带随机 salt 的
@@ -793,6 +802,7 @@ fork bomb、私钥读取以及把 secret 占位符送进网络/命令/MCP 调用
 approval = "ask"          # ask（默认）/ auto；只影响默认 ask，不绕过规则或硬拒绝
 max_output_bytes = 20000
 command_timeout_secs = 60
+max_tool_rounds = 64      # 单轮 turn 的 provider <-> 工具往返上限；最后几轮会提示收敛，最后一轮不再提供工具
 sandbox = "auto"          # auto（默认，可用则隔离）/ required（不可用就询问）/ off
 sandbox_network = false   # false 时加 --unshare-net
 sandbox_read_paths = ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]  # 只读挂载，不再挂整个 $HOME
