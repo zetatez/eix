@@ -945,11 +945,14 @@ impl Daemon {
                 .recover_stale_rebase(&session, &worktree, state.status)
                 .await
             {
-                return self.retry_integration(
-                    &session,
-                    state,
-                    format!("recover stale rebase: {err:#}"),
-                );
+                return self
+                    .start_repair(
+                        &session,
+                        &state,
+                        "rebase recovery failed",
+                        &format!("recover stale rebase: {err:#}"),
+                    )
+                    .await;
             }
         }
         let base = match state.base_branch.clone() {
@@ -957,7 +960,14 @@ impl Daemon {
             None => match self.base_for_repo(&repo).await {
                 Ok(base) => base,
                 Err(err) => {
-                    return self.retry_integration(&session, state, format!("{err:#}"));
+                    return self
+                        .start_repair(
+                            &session,
+                            &state,
+                            "base branch unavailable",
+                            &format!("{err:#}"),
+                        )
+                        .await;
                 }
             },
         };
@@ -968,13 +978,16 @@ impl Daemon {
         let base_worktree = match crate::worktree::worktree_for_branch(&repo, &base).await {
             Some(path) => path,
             None => {
-                return self.retry_integration(
-                    &session,
-                    state,
-                    format!(
-                        "base branch {base} is not checked out in any worktree; check it out before ready"
-                    ),
-                );
+                return self
+                    .start_repair(
+                        &session,
+                        &state,
+                        "base branch not checked out",
+                        &format!(
+                            "base branch {base} is not checked out in any worktree; check it out before ready"
+                        ),
+                    )
+                    .await;
             }
         };
         state.status = IntegrationStatus::Syncing;
@@ -1004,7 +1017,14 @@ impl Daemon {
             match crate::worktree::require_base(&base_worktree, &base).await {
                 Ok(head) => (head, Vec::new()),
                 Err(err) => {
-                    return self.retry_integration(&session, state, format!("base head: {err:#}"));
+                    return self
+                        .start_repair(
+                            &session,
+                            &state,
+                            "base branch unavailable",
+                            &format!("base head: {err:#}"),
+                        )
+                        .await;
                 }
             }
         };
@@ -1029,7 +1049,14 @@ impl Daemon {
         let rebase = match crate::worktree::rebase(&worktree, &base).await {
             Ok(output) => output,
             Err(err) => {
-                return self.retry_integration(&session, state, format!("rebase: {err:#}"));
+                return self
+                    .start_repair(
+                        &session,
+                        &state,
+                        "rebase failed",
+                        &format!("rebase: {err:#}"),
+                    )
+                    .await;
             }
         };
         if !rebase.success {
@@ -1073,11 +1100,14 @@ impl Daemon {
                     .start_repair(&session, &state, "rebase conflict", &details)
                     .await;
             }
-            return self.retry_integration(
-                &session,
-                state,
-                format!("rebase: {}", rebase.combined()),
-            );
+            return self
+                .start_repair(
+                    &session,
+                    &state,
+                    "rebase failed",
+                    &format!("rebase: {}", rebase.combined()),
+                )
+                .await;
         }
         let log = crate::worktree::CommandLog {
             command: format!("git rebase {base}"),
@@ -1207,7 +1237,14 @@ impl Daemon {
         let current_base = match crate::worktree::require_base(&base_worktree, &base).await {
             Ok(head) => head,
             Err(err) => {
-                return self.retry_integration(&session, state, format!("base head: {err:#}"));
+                return self
+                    .start_repair(
+                        &session,
+                        &state,
+                        "base branch unavailable",
+                        &format!("base head: {err:#}"),
+                    )
+                    .await;
             }
         };
         if current_base != base_head {
