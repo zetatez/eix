@@ -3265,11 +3265,9 @@ async fn integration_rebases_tests_and_fast_forwards_the_base_branch() -> anyhow
         .await?;
     let session = created.session;
     let worktree = session.worktree.clone().expect("worktree");
+    // Leave the change uncommitted: ready should commit it automatically with
+    // the default integration.auto_commit = true.
     std::fs::write(worktree.join("feature.txt"), "from worktree\n")?;
-    assert!(git(&worktree, &["add", "feature.txt"]).status.success());
-    assert!(git(&worktree, &["commit", "-q", "-m", "feature"])
-        .status
-        .success());
 
     let ready: eix_core::IntegrationState = client
         .request("session.ready", json!({"session_id": session.id}))

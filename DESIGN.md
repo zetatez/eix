@@ -133,8 +133,9 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `○`，run
 
 - session 的 `pending → ready → syncing → rebasing → testing → merging → merged` 状态存在
   `session_integrations` 表；`retrying` 带 `next_retry_at` 和指数退避，不设硬 blocked。
-- `eix ready`（`session.ready`）检查：无 turn、无 rebase、worktree 干净（或 `auto_commit`
-  自动提交）。agent turn 内也可以用无审批的 `ready` 工具提前置为 ready，队列会等 turn 结束。
+- `eix ready`（`session.ready`）检查：无 turn、无 rebase、worktree 干净；默认
+  `auto_commit = true` 会先提交 dirty worktree（设为 false 则要求先手动提交）。agent turn 内
+  也可以用无审批的 `ready` 工具提前置为 ready，队列会等 turn 结束。
   `auto_ready = idle` 时 daemon 扫描空闲 session：无 turn/审批/输入、草稿为空、
   至少一条 user message、worktree 干净，且 `idle_secs` 内无更新。
 - 单个 daemon worker 串行处理队列：主 worktree 干净时 `fetch` + `pull --ff-only`，把 session

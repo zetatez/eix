@@ -204,7 +204,8 @@ pub struct IntegrationConfig {
     pub auto_ready: AutoReady,
     /// Seconds of no activity before an idle session is marked ready.
     pub idle_secs: u64,
-    /// Commit dirty worktree changes when readiness is requested.
+    /// Commit dirty worktree changes when readiness is requested. Enabled by
+    /// default so an explicit `ready` does not fail on the agent's edits.
     pub auto_commit: bool,
     /// Test command run in the rebased worktree. `auto` detects Cargo/npm/Go/
     /// Python projects. An empty value is invalid while integration is enabled.
@@ -234,7 +235,7 @@ impl Default for IntegrationConfig {
             enabled: true,
             auto_ready: AutoReady::Idle,
             idle_secs: 300,
-            auto_commit: false,
+            auto_commit: true,
             test: "auto".into(),
             timeout_secs: 1800,
             pull_base: true,
@@ -3359,6 +3360,7 @@ pi = true
         assert!(default.tools.auto_apply_workspace_edits);
         assert_eq!(default.tools.max_tool_rounds, 64);
         assert_eq!(default.tools.max_parallel_subagents, 4);
+        assert!(default.integration.auto_commit);
 
         let parsed: Config = toml::from_str(
             r#"
