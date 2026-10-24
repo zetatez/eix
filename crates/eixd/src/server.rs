@@ -3824,7 +3824,7 @@ impl Daemon {
 
         let parent = self.require_session(parent_id)?;
         let result = self
-            .spawn_agent_inner(&parent, parent_turn, &args, parent_cancel)
+            .spawn_agent_inner(&parent, parent_turn, &call.id, &args, parent_cancel)
             .await;
         let (ok, output) = match result {
             Ok(output) => (true, output),
@@ -3852,6 +3852,7 @@ impl Daemon {
         self: &Arc<Self>,
         parent: &Session,
         parent_turn: &str,
+        parent_call_id: &str,
         args: &Value,
         parent_cancel: Arc<AtomicBool>,
     ) -> Result<String> {
@@ -3913,6 +3914,7 @@ impl Daemon {
             json!({
                 "session_id": parent.id,
                 "agent_id": child.id,
+                "call_id": parent_call_id,
                 "name": child.name,
                 "parent_turn_id": parent_turn,
             }),
@@ -3935,28 +3937,48 @@ impl Daemon {
         watcher.abort();
         self.turns.lock().await.remove(&child.id);
 
-        let text = run?;
-        let trimmed = text.trim();
-        let body = if trimmed.is_empty() {
-            "(sub-agent returned no text)".to_string()
-        } else {
-            cap_text(trimmed, self.config.load().tools.max_output_bytes)
-        };
-        self.emit_value(
-            "agent.completed",
-            json!({
-                "session_id": parent.id,
-                "agent_id": child.id,
-                "name": child.name,
-                "ok": true,
-            }),
-        );
-        Ok(format!(
-            "sub-agent {} ({}) finished:\n{}",
-            child.name,
-            short_id(&child.id),
-            body
-        ))
+        match run {
+            Ok(text) => {
+                let trimmed = text.trim();
+                let body = if trimmed.is_empty() {
+                    "(sub-agent returned no text)".to_string()
+                } else {
+                    cap_text(trimmed, self.config.load().tools.max_output_bytes)
+                };
+                self.emit_value(
+                    "agent.completed",
+                    json!({
+                        "session_id": parent.id,
+                        "agent_id": child.id,
+                        "call_id": parent_call_id,
+                        "name": child.name,
+                        "ok": true,
+                        "result": body.clone(),
+                    }),
+                );
+                Ok(format!(
+                    "sub-agent {} ({}) finished:\n{}",
+                    child.name,
+                    short_id(&child.id),
+                    body
+                ))
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                self.emit_value(
+                    "agent.completed",
+                    json!({
+                        "session_id": parent.id,
+                        "agent_id": child.id,
+                        "call_id": parent_call_id,
+                        "name": child.name,
+                        "ok": false,
+                        "error": message,
+                    }),
+                );
+                Err(err)
+            }
+        }
     }
 
     /// Run one bounded, read-only turn for a sub-agent and return its answer.
@@ -6861,30 +6883,47 @@ fn auto_name(text: &str) -> String {
     }
 }
 
-/// Session titles are identifiers, not prose: keep Unicode letters/digits,
-/// turn word boundaries into CamelCase for ASCII, and drop spaces/punctuation.
+/// Session titles are short labels: keep Unicode letters/digits, separate
+/// English words with a single space, and drop other punctuation. Chinese and
+/// other non-ASCII runs stay contiguous, so `登录 / 修复` becomes `登录修复`.
 fn sanitize_session_name(text: &str) -> String {
     const MAX: usize = 32;
     let mut out = String::new();
-    let mut boundary = true;
-    let mut count = 0usize;
-    for ch in text.chars() {
-        if ch.is_alphanumeric() {
-            if count >= MAX {
-                break;
-            }
-            if boundary && ch.is_ascii_alphabetic() {
+    let mut previous_ascii = false;
+    let mut has_word = false;
+    for word in text.split(|ch: char| !ch.is_alphanumeric()) {
+        if word.is_empty() {
+            continue;
+        }
+        let ascii = word.chars().any(|ch| ch.is_ascii_alphanumeric());
+        if has_word && (ascii || previous_ascii) {
+            out.push(' ');
+        }
+        // Normalize all-lowercase English words to title case. Preserve mixed
+        // casing such as `iOS` and acronyms such as `API`.
+        let title_case = word
+            .chars()
+            .all(|ch| !ch.is_ascii_alphabetic() || ch.is_ascii_lowercase());
+        let mut first_alpha = true;
+        for ch in word.chars() {
+            if title_case && first_alpha && ch.is_ascii_alphabetic() {
                 out.push(ch.to_ascii_uppercase());
+                first_alpha = false;
             } else {
+                if ch.is_ascii_alphabetic() {
+                    first_alpha = false;
+                }
                 out.push(ch);
             }
-            boundary = false;
-            count += 1;
-        } else {
-            boundary = true;
         }
+        previous_ascii = ascii;
+        has_word = true;
     }
-    out
+    let mut name: String = out.chars().take(MAX).collect();
+    while name.ends_with(' ') {
+        name.pop();
+    }
+    name
 }
 
 /// Models occasionally wrap the answer in prose or quotes despite the prompt.
@@ -7010,7 +7049,7 @@ impl Daemon {
         let route = config.route(&model);
         let messages = vec![
             ChatMessage::system(
-                "You name coding-agent sessions. Read the conversation and reply with only a                  short session title. Requirements: 2-6 words, at most 32 characters, use the                  user's language, no spaces, no punctuation, no quotes, no markdown. Use                  CamelCase for English words.",
+                "You name coding-agent sessions. Read the conversation and reply with only a short session title. Requirements: 2-6 words, at most 32 characters including spaces, use the user's language, separate English words with single spaces, no punctuation, no quotes, no markdown.",
             ),
             ChatMessage::user(format!(
                 "Conversation:\n\n{}\nReturn only the session title.",
@@ -7105,19 +7144,24 @@ mod tests {
     }
 
     #[test]
-    fn generated_names_have_no_spaces_or_punctuation() {
-        assert_eq!(sanitize_session_name("fix: auth_bug!"), "FixAuthBug");
+    fn generated_names_keep_spaces_between_english_words() {
+        assert_eq!(sanitize_session_name("fix: auth_bug!"), "Fix Auth Bug");
         assert_eq!(sanitize_session_name("  登录 / 修复  "), "登录修复");
-        assert_eq!(sanitize_session_name("Hello, world."), "HelloWorld");
+        assert_eq!(sanitize_session_name("Hello, world."), "Hello World");
+        assert_eq!(sanitize_session_name("Fix 登录 bug"), "Fix 登录 Bug");
+        assert_eq!(sanitize_session_name("iOS 26 build"), "iOS 26 Build");
         assert_eq!(sanitize_session_name("!!!"), "");
         assert_eq!(clean_generated_name("Session name: `FixAuth`"), "FixAuth");
         assert_eq!(
             clean_generated_name("Title: refactor cache"),
-            "RefactorCache"
+            "Refactor Cache"
         );
         let long = sanitize_session_name(&"x".repeat(80));
         assert_eq!(long.chars().count(), 32);
         assert!(long.chars().all(char::is_alphanumeric));
+        let words = sanitize_session_name(&"word ".repeat(20));
+        assert!(words.chars().count() <= 32);
+        assert!(!words.ends_with(' '));
     }
 
     #[test]

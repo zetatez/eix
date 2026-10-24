@@ -45,7 +45,7 @@ echo 'review the diff' | ./target/debug/eix send
 则新建一个。`eix log` 等只读子命令找不到当前目录 session 时仍回退到最近 session。
 
 未手动命名的 session 在前两轮对话完成后，daemon 会让模型总结这段对话并生成一个短标题；
-标题只保留 Unicode 字母/数字，最多 32 个字符，自动去掉空格和标点（英文词转 CamelCase），
+标题保留 Unicode 字母/数字和英文词之间的单个空格，最多 32 个字符（含空格），去掉其他标点；
 然后通过 `session.updated` 更新 TUI pane 标题和 tab。手动 `eix rename` / TUI 重命名会阻止
 自动覆盖；模型失败时使用首条 prompt 派生的本地标题。
 socket 在 Linux / Arch 默认 `$XDG_RUNTIME_DIR/eix.sock`；macOS 没有 XDG runtime dir，回退到

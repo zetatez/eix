@@ -42,6 +42,86 @@ pub struct Live<'a> {
     pub text: &'a str,
 }
 
+/// Runtime state of a child agent spawned by `spawn_agent`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    Failed,
+}
+
+/// A child agent associated with one `spawn_agent` tool call in its parent.
+///
+/// The child has its own session and event stream. Keeping those events here
+/// lets the parent transcript show a compact, live activity window without
+/// opening a second pane for the child.
+#[derive(Debug, Clone)]
+pub struct Subagent {
+    pub call_id: String,
+    pub name: String,
+    pub status: SubagentStatus,
+    pub events: Vec<SessionEvent>,
+    /// The child's latest assistant answer.
+    pub result: Option<String>,
+    pub error: Option<String>,
+}
+
+impl Subagent {
+    pub fn new(call_id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            call_id: call_id.into(),
+            name: name.into(),
+            status: SubagentStatus::Running,
+            events: Vec::new(),
+            result: None,
+            error: None,
+        }
+    }
+
+    /// Keep the latest assistant text as the result, and remember errors for
+    /// the completed card. Activity lines are derived from `events` at render
+    /// time so this stays cheap and replay-friendly.
+    pub fn push_event(&mut self, event: SessionEvent) {
+        match event.kind {
+            EventKind::AssistantMessage => {
+                if let Ok(payload) =
+                    serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
+                {
+                    let text = payload.text.trim();
+                    if !text.is_empty() {
+                        self.result = Some(text.to_string());
+                    }
+                }
+            }
+            EventKind::Error => {
+                if let Some(message) = event.payload.get("message").and_then(Value::as_str) {
+                    self.error = Some(message.to_string());
+                }
+            }
+            _ => {}
+        }
+        self.events.push(event);
+    }
+
+    pub fn complete(&mut self, ok: bool, result: Option<String>, error: Option<String>) {
+        self.status = if ok {
+            SubagentStatus::Completed
+        } else {
+            SubagentStatus::Failed
+        };
+        if ok {
+            // A retried turn may have left an intermediate error behind.
+            self.error = None;
+        }
+        if let Some(result) = result.filter(|text| !text.trim().is_empty()) {
+            self.result = Some(result);
+        }
+        if let Some(error) = error.filter(|text| !text.trim().is_empty()) {
+            self.error = Some(error);
+        }
+    }
+}
+
 /// One rendered line plus the block that owns it (for click-to-fold).
 pub struct Transcript {
     pub lines: Vec<Line<'static>>,
@@ -59,6 +139,7 @@ pub struct Fold {
 struct ToolBlock {
     /// `seq` of the `tool_call` event (or the first event seen for this call).
     seq: u64,
+    call_id: String,
     tool: String,
     arguments: Value,
     result: Option<ToolResultPayload>,
@@ -104,10 +185,12 @@ enum Block {
     },
 }
 
-/// Render a session's events (plus any in-flight deltas) into chat lines.
-/// Kept for tests and callers that do not cache stored history.
+/// Render a session's events (plus any in-flight deltas) together with any
+/// child-agent activity known to the UI. Test callers use the same path as the
+/// live transcript.
 #[cfg(test)]
-pub fn render(
+#[allow(clippy::too_many_arguments)]
+pub fn render_with_subagents(
     events: &[SessionEvent],
     live: Option<Live<'_>>,
     queued: &[String],
@@ -115,25 +198,27 @@ pub fn render(
     width: usize,
     theme: Theme,
     tick: u64,
+    subagents: &HashMap<String, Subagent>,
 ) -> Transcript {
     let tail_width = width.saturating_sub(2).max(1);
-    let mut out = render_history(events, folds, width, theme);
+    let mut out = render_history_with_subagents(events, folds, width, theme, subagents);
     append_tail(&mut out, live, queued, folds, tail_width, theme, tick);
     out
 }
 
 /// Render only the stored history. The UI caches this and renders the live
 /// tail separately, so streaming deltas do not reparse the whole session.
-pub fn render_history(
+pub fn render_history_with_subagents(
     events: &[SessionEvent],
     folds: &HashMap<FoldId, bool>,
     width: usize,
     theme: Theme,
+    subagents: &HashMap<String, Subagent>,
 ) -> Transcript {
     // Keep a two-cell gutter on the right so queued prompts never touch the
     // pane border.
     let width = width.saturating_sub(2).max(1);
-    render_blocks(collect(events), folds, width, theme)
+    render_blocks(collect(events), folds, width, theme, subagents)
 }
 
 /// Render the in-flight turn and queued prompts. This is cheap to call on
@@ -160,6 +245,7 @@ fn render_blocks(
     folds: &HashMap<FoldId, bool>,
     width: usize,
     theme: Theme,
+    subagents: &HashMap<String, Subagent>,
 ) -> Transcript {
     let mut out = Transcript {
         lines: Vec::new(),
@@ -189,7 +275,21 @@ fn render_blocks(
                     assistant_message(&mut out, &text, cancelled, width, theme);
                 }
             }
-            Block::Tool(block) => tool_block(&mut out, &block, width, theme, folds),
+            Block::Tool(block) => {
+                let subagent = (block.tool == "spawn_agent")
+                    .then(|| {
+                        subagents
+                            .values()
+                            .find(|subagent| subagent.call_id == block.call_id)
+                    })
+                    .flatten();
+                match subagent {
+                    Some(subagent) => {
+                        subagent_block(&mut out, &block, subagent, width, theme, folds)
+                    }
+                    None => tool_block(&mut out, &block, width, theme, folds),
+                }
+            }
             Block::Permission { text } => {
                 note(&mut out, '◆', &text, theme.function.unwrap_or(WARN), width)
             }
@@ -278,6 +378,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                     tool_index.push((payload.call_id.clone(), slot));
                     blocks.push(Block::Tool(Box::new(ToolBlock {
                         seq: event.seq,
+                        call_id: payload.call_id,
                         tool: payload.tool,
                         arguments: payload.arguments,
                         result: None,
@@ -297,10 +398,12 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                             }
                         }
                         None => {
+                            let call_id = payload.call_id.clone();
                             let arguments = payload.arguments.clone();
                             let tool = payload.tool.clone();
                             blocks.push(Block::Tool(Box::new(ToolBlock {
                                 seq: event.seq,
+                                call_id,
                                 tool,
                                 arguments,
                                 result: None,
@@ -328,6 +431,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                         }
                         None => blocks.push(Block::Tool(Box::new(ToolBlock {
                             seq: event.seq,
+                            call_id: payload.call_id,
                             tool: payload.tool,
                             arguments: Value::Null,
                             result: None,
@@ -363,6 +467,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                         }
                         None => blocks.push(Block::Tool(Box::new(ToolBlock {
                             seq: event.seq,
+                            call_id: payload.call_id,
                             tool: "write_file".into(),
                             arguments: Value::Null,
                             result: None,
@@ -388,6 +493,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                         }
                         None => blocks.push(Block::Tool(Box::new(ToolBlock {
                             seq: event.seq,
+                            call_id: payload.call_id.clone(),
                             tool: payload.tool.clone(),
                             arguments: Value::Null,
                             result: Some(payload),
@@ -815,6 +921,304 @@ fn tool_block(
         }
     }
     out.blank();
+}
+
+/// The live window stays a fixed height while the child works. It shows the
+/// newest activity at the bottom so updates replace the viewport in place
+/// instead of growing the transcript.
+const SUBAGENT_WINDOW_ROWS: usize = 5;
+/// Completed agents show only their answer; long answers are capped.
+const SUBAGENT_RESULT_ROWS: usize = 12;
+
+/// A child agent rendered in place of the parent's `spawn_agent` tool card.
+fn subagent_block(
+    out: &mut Transcript,
+    block: &ToolBlock,
+    subagent: &Subagent,
+    width: usize,
+    theme: Theme,
+    folds: &HashMap<FoldId, bool>,
+) {
+    let id = FoldId::Event(block.seq);
+    let open = folds.get(&id).copied().unwrap_or(true);
+    let fold = Fold { id, open };
+
+    let finished = subagent.status != SubagentStatus::Running || block.result.is_some();
+    let failed = subagent.status == SubagentStatus::Failed
+        || subagent.error.is_some()
+        || block.result.as_ref().is_some_and(|result| !result.ok);
+    let (label, dot, color) = if !finished {
+        ("running", "◐", accent(theme))
+    } else if failed {
+        ("failed", "✗", theme.error.unwrap_or(DANGER))
+    } else {
+        ("done", "●", theme.diff_add.unwrap_or(SUCCESS))
+    };
+
+    let name = if subagent.name.trim().is_empty() {
+        block
+            .arguments
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("agent")
+    } else {
+        subagent.name.as_str()
+    };
+    let prefix = format!("  {} {} ↳ ", if open { "▾" } else { "▸" }, dot);
+    let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+    let label_width = label.len() + 3; // " · " + label
+    let name = truncate(
+        name,
+        width.saturating_sub(prefix_width + label_width).max(4),
+    );
+    out.push(
+        Line::from(vec![
+            Span::styled(prefix, Style::default().fg(color)),
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(text_color(theme))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" · {label}"), Style::default().fg(color)),
+        ]),
+        Some(fold),
+    );
+
+    if open {
+        if finished {
+            subagent_result(out, block, subagent, width, theme, fold);
+        } else {
+            subagent_window(out, subagent, width, theme, fold);
+        }
+    }
+    out.blank();
+}
+
+/// Draw the fixed-height live viewport for a running child agent.
+fn subagent_window(
+    out: &mut Transcript,
+    subagent: &Subagent,
+    width: usize,
+    theme: Theme,
+    fold: Fold,
+) {
+    let mut rows = subagent_activity(subagent);
+    if rows.is_empty() {
+        rows.push("waiting for agent…".into());
+    }
+    if rows.len() > SUBAGENT_WINDOW_ROWS {
+        let keep = SUBAGENT_WINDOW_ROWS.saturating_sub(1);
+        rows = rows.split_off(rows.len().saturating_sub(keep));
+        rows.insert(0, "…".into());
+    }
+
+    let box_width = width.saturating_sub(BODY_INDENT.len()).max(6);
+    let inner_width = box_width.saturating_sub(4).max(1);
+    out.push(
+        Line::from(Span::styled(
+            format!("{BODY_INDENT}╭{}╮", "─".repeat(box_width.saturating_sub(2))),
+            dim(theme),
+        )),
+        Some(fold),
+    );
+    for index in 0..SUBAGENT_WINDOW_ROWS {
+        let text = rows.get(index).map(String::as_str).unwrap_or_default();
+        let text = truncate(text, inner_width);
+        let padding = inner_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
+        let style = if text.is_empty() || text == "waiting for agent…" {
+            dim(theme)
+        } else {
+            Style::default().fg(text_color(theme))
+        };
+        out.push(
+            Line::from(vec![
+                Span::raw(BODY_INDENT),
+                Span::styled("│ ", dim(theme)),
+                Span::styled(text, style),
+                Span::raw(" ".repeat(padding)),
+                Span::styled(" │", dim(theme)),
+            ]),
+            Some(fold),
+        );
+    }
+    out.push(
+        Line::from(Span::styled(
+            format!("{BODY_INDENT}╰{}╯", "─".repeat(box_width.saturating_sub(2))),
+            dim(theme),
+        )),
+        Some(fold),
+    );
+}
+
+/// After completion the child's process disappears; only its answer remains.
+fn subagent_result(
+    out: &mut Transcript,
+    block: &ToolBlock,
+    subagent: &Subagent,
+    width: usize,
+    theme: Theme,
+    fold: Fold,
+) {
+    let error = subagent
+        .error
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+        .or_else(|| {
+            block
+                .result
+                .as_ref()
+                .filter(|result| !result.ok && !result.output.trim().is_empty())
+                .map(|result| result.output.as_str())
+        });
+    let text = if let Some(error) = error {
+        error.trim()
+    } else {
+        subagent
+            .result
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .or_else(|| {
+                block
+                    .result
+                    .as_ref()
+                    .map(|result| agent_result_body(&result.output))
+                    .filter(|text| !text.is_empty())
+            })
+            .unwrap_or("(no result)")
+    };
+    let color = if error.is_some() {
+        theme.error.unwrap_or(DANGER)
+    } else {
+        text_color(theme)
+    };
+    let style = if text == "(no result)" {
+        dim(theme)
+    } else {
+        Style::default().fg(color)
+    };
+    let wrapped: Vec<String> = text
+        .lines()
+        .flat_map(|line| wrap_text(line, width.saturating_sub(BODY_INDENT.len()).max(1)))
+        .collect();
+    for segment in wrapped.iter().take(SUBAGENT_RESULT_ROWS) {
+        out.push(
+            Line::from(vec![
+                Span::raw(BODY_INDENT),
+                Span::styled(segment.clone(), style),
+            ]),
+            Some(fold),
+        );
+    }
+    if wrapped.len() > SUBAGENT_RESULT_ROWS {
+        out.push(
+            Line::from(Span::styled(format!("{BODY_INDENT}…"), dim(theme))),
+            Some(fold),
+        );
+    }
+}
+
+/// Compact activity feed for the live window. This intentionally keeps only
+/// the first line of each event so the viewport stays a fixed size.
+fn subagent_activity(subagent: &Subagent) -> Vec<String> {
+    let mut lines = Vec::new();
+    for event in &subagent.events {
+        match event.kind {
+            EventKind::UserMessage => {
+                if let Ok(payload) =
+                    serde_json::from_value::<UserMessagePayload>(event.payload.clone())
+                {
+                    let text = first_line(&payload.text);
+                    if !text.is_empty() {
+                        lines.push(format!("▶ {text}"));
+                    }
+                }
+            }
+            EventKind::AssistantMessage => {
+                if let Ok(payload) =
+                    serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
+                {
+                    if let Some(reasoning) = payload
+                        .reasoning
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        lines.push(format!("✳ {}", first_line(reasoning)));
+                    }
+                    let text = first_line(&payload.text);
+                    if !text.is_empty() {
+                        lines.push(format!("✎ {text}"));
+                    }
+                }
+            }
+            EventKind::ToolCall => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ToolCallPayload>(event.payload.clone())
+                {
+                    lines.push(format!(
+                        "⚙ {}",
+                        tool_call_summary(&payload.tool, &payload.arguments)
+                    ));
+                }
+            }
+            EventKind::ToolResult => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ToolResultPayload>(event.payload.clone())
+                {
+                    let marker = if payload.ok && !payload.denied {
+                        "✓"
+                    } else {
+                        "✗"
+                    };
+                    let output = first_line(&payload.output);
+                    if output.is_empty() {
+                        lines.push(format!("{marker} {}", payload.tool));
+                    } else {
+                        lines.push(format!("{marker} {}: {output}", payload.tool));
+                    }
+                }
+            }
+            EventKind::ApprovalRequired => {
+                if let Ok(payload) =
+                    serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
+                {
+                    lines.push(format!("⚠ approval: {}", first_line(&payload.summary)));
+                }
+            }
+            EventKind::InputRequired => {
+                if let Some(question) = event.payload.get("question").and_then(Value::as_str) {
+                    lines.push(format!("? {}", first_line(question)));
+                }
+            }
+            EventKind::Error => {
+                if let Some(message) = event.payload.get("message").and_then(Value::as_str) {
+                    lines.push(format!("! {}", first_line(message)));
+                }
+            }
+            _ => {}
+        }
+    }
+    lines
+}
+
+fn first_line(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The parent's tool result wraps the child answer with a status line. Strip
+/// that prefix when it is the fallback source for the result-only card.
+fn agent_result_body(output: &str) -> &str {
+    if let Some((_, body)) = output.split_once("finished:\n") {
+        body.trim()
+    } else {
+        output.trim()
+    }
 }
 
 /// A queued prompt waits here until the running turn finishes.

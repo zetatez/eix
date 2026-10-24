@@ -67,7 +67,7 @@
 - **事件日志**：user/assistant 消息、工具调用、补丁、审批、状态变化、压缩。
 - **工作区绑定**：cwd、可选 git worktree、branch、权限级别。
 - **运行时**：正在跑的任务、后台进程、子 agent、待审批项。
-- **元数据**：前两轮对话后由模型总结自动命名（无空格/标点、≤32 字符；手动命名优先）、标签、pin、frecency。
+- **元数据**：前两轮对话后由模型总结自动命名（保留英文词间空格、去标点、≤32 字符含空格；手动命名优先）、标签、pin、frecency。
 
 ### 4.2 状态机
 
@@ -709,8 +709,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 > 实现快照（2026-10-18）：daemon（`eixd`）、SQLite 事件日志、OpenAI 兼容流式 provider、
 > CLI（`eix chat/send/log/ls/new/rename/cancel/doctor`）和 auto-start 已落地。
-> 未命名 session 在两轮 user turn 完成后由 daemon 调模型生成短标题；标题只保留 Unicode
-> 字母/数字并截到 32 字符，空格/标点会被去掉，英文词转 CamelCase；手动重命名优先。
+> 未命名 session 在两轮 user turn 完成后由 daemon 调模型生成短标题；标题保留 Unicode
+> 字母/数字和英文词间空格，截到 32 字符（含空格），其他标点会被去掉；手动重命名优先。
 > 实际协议以 `crates/eix-core/src/protocol.rs` 为准：Phase 0 的事件通知按连接广播
 > （0600 socket 是边界），`detach` 等同于断开连接；转录渲染暂由 CLI 完成，TUI 与工具审批尚未开始。
 
@@ -956,7 +956,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 - `<leader>a` 命名空间：独立 nvim 前端已用 buffer-local 映射实现动作 palette；若你的全局映射也叫 `<leader>a`，buffer-local 会优先。
 - `@` 触发已定为「行首或空白后」，其余位置插入字面 `@`；暂不转义。
 - 是否启用鼠标。
-- session 自动命名规则（前两轮对话后总结 / 手动重命名优先；名称只保留字母数字）。
+- session 自动命名规则（前两轮对话后总结 / 手动重命名优先；名称只保留字母数字和英文词间空格）。
 - 远程 attach 的广播范围：已支持按连接 `session.subscribe` 收窄（默认仍全部）；是否把"只订阅自己打开的 session"设为默认白名单仍待定。
 
 ## 18. 命名

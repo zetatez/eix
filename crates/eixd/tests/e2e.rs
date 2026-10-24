@@ -271,7 +271,7 @@ async fn auto_names_an_unnamed_session_after_two_turns() -> anyhow::Result<()> {
         let attached: AttachResult = client
             .request("session.attach", json!({"session_id": session_id}))
             .await?;
-        if attached.session.name == "HelloFromMock" {
+        if attached.session.name == "Hello From Mock" {
             renamed = Some(attached.session);
             break;
         }
@@ -280,7 +280,10 @@ async fn auto_names_an_unnamed_session_after_two_turns() -> anyhow::Result<()> {
     let session = renamed.expect("the second turn should generate a session name");
     assert_ne!(session.name, original_name);
     assert!(
-        session.name.chars().all(char::is_alphanumeric),
+        session
+            .name
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ch == ' '),
         "{}",
         session.name
     );

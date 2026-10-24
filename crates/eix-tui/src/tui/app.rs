@@ -34,7 +34,7 @@ use super::controller::{Command, ContextOp, Event};
 use super::editor::{leader_action, Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
 use super::theme::Theme;
-use super::transcript::{self, FoldId};
+use super::transcript::{self, FoldId, Subagent, SubagentStatus};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -270,6 +270,7 @@ struct HistoryCache {
     theme: Theme,
     folds: HashMap<FoldId, bool>,
     events_rev: u64,
+    subagents_rev: u64,
     lines: Vec<Line<'static>>,
 }
 
@@ -278,6 +279,10 @@ struct SessionView {
     events: Vec<SessionEvent>,
     /// Bumped whenever `events` changes so the render cache can be reused.
     events_rev: u64,
+    /// Child agents spawned by this session, keyed by their child session id.
+    subagents: HashMap<String, Subagent>,
+    /// Bumped whenever a child agent's state changes.
+    subagents_rev: u64,
     history_cache: Option<HistoryCache>,
     /// Older stored events exist before the first loaded event.
     history_has_more: bool,
@@ -308,6 +313,8 @@ impl SessionView {
             session,
             events,
             events_rev: 0,
+            subagents: HashMap::new(),
+            subagents_rev: 0,
             history_cache: None,
             history_has_more: false,
             history_loading: false,
@@ -331,12 +338,18 @@ impl SessionView {
                 || cache.theme != theme
                 || cache.folds != self.folds
                 || cache.events_rev != self.events_rev
+                || cache.subagents_rev != self.subagents_rev
         });
         if !stale {
             return;
         }
-        let transcript::Transcript { lines, slots } =
-            transcript::render_history(&self.events, &self.folds, width, theme);
+        let transcript::Transcript { lines, slots } = transcript::render_history_with_subagents(
+            &self.events,
+            &self.folds,
+            width,
+            theme,
+            &self.subagents,
+        );
         self.slots = slots;
         self.text_lines = lines.iter().map(text_line).collect();
         self.history_cache = Some(HistoryCache {
@@ -344,8 +357,76 @@ impl SessionView {
             theme,
             folds: self.folds.clone(),
             events_rev: self.events_rev,
+            subagents_rev: self.subagents_rev,
             lines,
         });
+    }
+
+    fn upsert_subagent(&mut self, agent_id: String, call_id: String, name: String) {
+        match self.subagents.get_mut(&agent_id) {
+            Some(subagent) => {
+                if !call_id.is_empty() {
+                    subagent.call_id = call_id;
+                }
+                if !name.is_empty() {
+                    subagent.name = name;
+                }
+            }
+            None => {
+                self.subagents
+                    .insert(agent_id, Subagent::new(call_id, name));
+            }
+        }
+        self.subagents_rev = self.subagents_rev.wrapping_add(1);
+    }
+
+    fn push_subagent_event(&mut self, agent_id: &str, event: SessionEvent) -> bool {
+        let Some(subagent) = self.subagents.get_mut(agent_id) else {
+            return false;
+        };
+        subagent.push_event(event);
+        self.subagents_rev = self.subagents_rev.wrapping_add(1);
+        true
+    }
+
+    fn complete_subagent(
+        &mut self,
+        agent_id: &str,
+        call_id: &str,
+        name: &str,
+        ok: bool,
+        result: Option<String>,
+        error: Option<String>,
+    ) {
+        if !self.subagents.contains_key(agent_id) {
+            let call_id = call_id.to_string();
+            let name = name.to_string();
+            if call_id.is_empty() && name.is_empty() {
+                return;
+            }
+            self.subagents
+                .insert(agent_id.to_string(), Subagent::new(call_id, name));
+        }
+        if let Some(subagent) = self.subagents.get_mut(agent_id) {
+            subagent.complete(ok, result, error);
+            self.subagents_rev = self.subagents_rev.wrapping_add(1);
+        }
+    }
+
+    /// A parent `spawn_agent` tool result is the final fallback when the
+    /// `agent.completed` notification was missed or predates this pane.
+    fn finish_subagent_by_call(&mut self, call_id: &str, ok: bool, output: &str) {
+        let Some(subagent) = self
+            .subagents
+            .values_mut()
+            .find(|subagent| subagent.call_id == call_id)
+        else {
+            return;
+        };
+        if subagent.status == SubagentStatus::Running {
+            subagent.complete(ok, None, (!ok).then(|| output.to_string()));
+            self.subagents_rev = self.subagents_rev.wrapping_add(1);
+        }
     }
 
     /// Find the pending approval or staged patch in the replayable log. A
@@ -2888,6 +2969,22 @@ impl App {
                     // Any persisted event means the session was used, even if
                     // it is not currently open in a pane.
                     self.created_sessions.remove(&id);
+                    // Child sessions are not always open as panes. Feed their
+                    // events into the parent's subagent card even when the
+                    // child has no view of its own.
+                    if let Some(index) = self
+                        .views
+                        .iter()
+                        .position(|view| view.subagents.contains_key(&id))
+                    {
+                        self.views[index].push_subagent_event(&id, event.clone());
+                    }
+                    let spawn_result = (event.kind == EventKind::ToolResult)
+                        .then(|| {
+                            serde_json::from_value::<ToolResultPayload>(event.payload.clone()).ok()
+                        })
+                        .flatten()
+                        .filter(|payload| payload.tool == "spawn_agent");
                     let relevant = matches!(
                         event.kind,
                         EventKind::ToolResult
@@ -2928,11 +3025,53 @@ impl App {
                     }
                     view.events.push(event);
                     view.events_rev = view.events_rev.wrapping_add(1);
+                    if let Some(result) = spawn_result {
+                        view.finish_subagent_by_call(&result.call_id, result.ok, &result.output);
+                    }
                     if relevant {
                         self.reload_pending(&id);
                     }
                     if relevant_input {
                         self.reload_input(&id);
+                    }
+                }
+            }
+            "agent.spawned" => {
+                if let Ok(params) =
+                    serde_json::from_value::<AgentSpawnedParams>(notification.params)
+                {
+                    if let Some(view) = self
+                        .views
+                        .iter_mut()
+                        .find(|view| view.session.id == params.session_id)
+                    {
+                        view.upsert_subagent(params.agent_id, params.call_id, params.name.clone());
+                        self.status = format!("sub-agent {} started", params.name);
+                    }
+                }
+            }
+            "agent.completed" => {
+                if let Ok(params) =
+                    serde_json::from_value::<AgentCompletedParams>(notification.params)
+                {
+                    if let Some(view) = self
+                        .views
+                        .iter_mut()
+                        .find(|view| view.session.id == params.session_id)
+                    {
+                        view.complete_subagent(
+                            &params.agent_id,
+                            &params.call_id,
+                            &params.name,
+                            params.ok,
+                            params.result,
+                            params.error,
+                        );
+                        self.status = if params.ok {
+                            format!("sub-agent {} finished", params.name)
+                        } else {
+                            format!("sub-agent {} failed", params.name)
+                        };
                     }
                 }
             }
@@ -9836,6 +9975,32 @@ struct ToolCompleted {
 }
 
 #[derive(Deserialize)]
+struct AgentSpawnedParams {
+    session_id: String,
+    agent_id: String,
+    #[serde(default)]
+    call_id: String,
+    #[serde(default)]
+    name: String,
+}
+
+#[derive(Deserialize)]
+struct AgentCompletedParams {
+    session_id: String,
+    agent_id: String,
+    #[serde(default)]
+    call_id: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    ok: bool,
+    #[serde(default)]
+    result: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct AttentionParams {
     session_id: String,
     status: SessionStatus,
@@ -12190,7 +12355,7 @@ mod tests {
             reasoning: &stream.reasoning,
             text: &stream.text,
         });
-        transcript::render(
+        transcript::render_with_subagents(
             &view.events,
             live,
             &[],
@@ -12198,6 +12363,7 @@ mod tests {
             width,
             Theme::default(),
             tick,
+            &view.subagents,
         )
         .lines
         .iter()
@@ -12260,6 +12426,182 @@ mod tests {
         assert!(expanded.contains("hello"));
         assert!(!expanded.contains("output"), "{expanded}");
         assert!(!expanded.contains("content"), "{expanded}");
+    }
+
+    fn parent_spawn_events() -> Vec<SessionEvent> {
+        vec![SessionEvent::new(
+            "parent",
+            1,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "call-1",
+                "tool": "spawn_agent",
+                "arguments": {"name": "scout", "prompt": "inspect the parser"},
+            }),
+        )]
+    }
+
+    #[test]
+    fn subagent_card_has_a_fixed_live_window_and_folds() {
+        let session = Session::new("parent", "parent", "/tmp");
+        let mut view = SessionView::new(session, parent_spawn_events());
+        view.upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+        view.push_subagent_event(
+            "child-1",
+            SessionEvent::new(
+                "child-1",
+                1,
+                EventKind::UserMessage,
+                serde_json::json!({"text": "inspect the parser"}),
+            ),
+        );
+        view.push_subagent_event(
+            "child-1",
+            SessionEvent::new(
+                "child-1",
+                2,
+                EventKind::ToolCall,
+                serde_json::json!({
+                    "call_id": "c2",
+                    "tool": "read_file",
+                    "arguments": {"path": "src/parser.rs"},
+                }),
+            ),
+        );
+        view.push_subagent_event(
+            "child-1",
+            SessionEvent::new(
+                "child-1",
+                3,
+                EventKind::ToolResult,
+                serde_json::json!({
+                    "call_id": "c2",
+                    "tool": "read_file",
+                    "ok": true,
+                    "denied": false,
+                    "output": "fn parse() {}",
+                }),
+            ),
+        );
+
+        let rendered = render_transcript(&view, 60);
+        assert!(
+            rendered.contains("↳ parent/scout-1 · running"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("▶ inspect the parser"), "{rendered}");
+        assert!(rendered.contains("⚙ read src/parser.rs"), "{rendered}");
+        assert!(
+            rendered.contains("✓ read_file: fn parse() {}"),
+            "{rendered}"
+        );
+        // Five fixed rows between the window borders.
+        assert_eq!(rendered.matches("│ ").count(), 5, "{rendered}");
+        assert!(
+            rendered.contains('╭') && rendered.contains('╰'),
+            "{rendered}"
+        );
+
+        view.folds.insert(FoldId::Event(1), false);
+        let folded = render_transcript(&view, 60);
+        assert!(folded.contains("↳ parent/scout-1 · running"), "{folded}");
+        assert!(!folded.contains("read src/parser.rs"), "{folded}");
+        assert!(!folded.contains('╭'), "{folded}");
+    }
+
+    #[test]
+    fn completed_subagent_shows_only_its_result() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("parent", "parent", "/tmp"),
+            parent_spawn_events(),
+        ));
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                "agent.spawned",
+                serde_json::json!({
+                    "session_id": "parent",
+                    "agent_id": "child-1",
+                    "call_id": "call-1",
+                    "name": "parent/scout-1",
+                }),
+            )),
+            &tx,
+        );
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                "session.event",
+                serde_json::to_value(SessionEvent::new(
+                    "child-1",
+                    1,
+                    EventKind::ToolCall,
+                    serde_json::json!({
+                        "call_id": "c2",
+                        "tool": "read_file",
+                        "arguments": {"path": "src/parser.rs"},
+                    }),
+                ))
+                .unwrap(),
+            )),
+            &tx,
+        );
+        let running = render_transcript(&app.views[0], 60);
+        assert!(running.contains("⚙ read src/parser.rs"), "{running}");
+
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                "agent.completed",
+                serde_json::json!({
+                    "session_id": "parent",
+                    "agent_id": "child-1",
+                    "call_id": "call-1",
+                    "name": "parent/scout-1",
+                    "ok": true,
+                    "result": "the parser is fine",
+                }),
+            )),
+            &tx,
+        );
+        let done = render_transcript(&app.views[0], 60);
+        assert!(done.contains("↳ parent/scout-1 · done"), "{done}");
+        assert!(done.contains("the parser is fine"), "{done}");
+        assert!(!done.contains("read src/parser.rs"), "{done}");
+        assert!(!done.contains('╭'), "{done}");
+    }
+
+    #[test]
+    fn failed_subagent_shows_only_the_error() {
+        let session = Session::new("parent", "parent", "/tmp");
+        let mut view = SessionView::new(session, parent_spawn_events());
+        view.upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+        view.push_subagent_event(
+            "child-1",
+            SessionEvent::new(
+                "child-1",
+                1,
+                EventKind::ToolCall,
+                serde_json::json!({
+                    "call_id": "c2",
+                    "tool": "read_file",
+                    "arguments": {"path": "src/parser.rs"},
+                }),
+            ),
+        );
+        view.complete_subagent(
+            "child-1",
+            "call-1",
+            "parent/scout-1",
+            false,
+            None,
+            Some("provider exploded".into()),
+        );
+
+        let rendered = render_transcript(&view, 60);
+        assert!(rendered.contains("↳ parent/scout-1 · failed"), "{rendered}");
+        assert!(rendered.contains("provider exploded"), "{rendered}");
+        assert!(!rendered.contains("read src/parser.rs"), "{rendered}");
+        assert!(!rendered.contains('╭'), "{rendered}");
     }
 
     #[test]
