@@ -254,7 +254,9 @@ session 执行 shell；`:r!<cmd>`（也接受 `:r !<cmd>`）把命令输出插�
 当前聚焦 pane 使用更亮的单格虚线边框并加粗标题，后台 pane 保持低对比实线灰（attention 仍用警示色）。
 底部输入条只作用于当前聚焦 pane。
 
-用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大）、
+用 leader 快捷键 `<Space>v` / `<Space>t` / `<Space>r` 可切换 `horizontal`（纵向排列、队首更大；
+pane 不超过 5 个时全部显示，超过时只显示队首 + 最近 4 个，其余隐藏，用 `Ctrl-N` 切换时
+窗口会跟随焦点滑动；终端矮时压缩为标题行/单行内容，不退回 tabby）、
 `tabby`（输入框上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个**活跃队列**：pane 1 是当前工作槽位；turn 完成或
 session 等待审批/输入时，它移到第二个位置（pane 2），不会替换 pane 1 正在编辑的内容；

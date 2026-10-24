@@ -1139,12 +1139,16 @@ impl SearchView {
     }
 }
 
+/// Horizontal layout keeps the head pane plus this many recent panes visible.
+const HORIZONTAL_TAIL_PANES: usize = 4;
+
 /// How open sessions are arranged in the body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaneLayout {
     /// The original automatic tiling.
     Grid,
-    /// One column of panes; the active pane gets most of the height.
+    /// One column of panes; the queue head gets most of the height and the
+    /// recent panes below compact when the terminal is short.
     Horizontal,
     /// A session tab bar with only the active session below it.
     Tabby,
@@ -7445,19 +7449,30 @@ already exists, update it in place rather than rewriting it from scratch.";
         );
     }
 
-    /// Horizontal layout stacks every session vertically. When there are too
-    /// many sessions for the available height, drawing every pane would leave
-    /// sub-4-row rectangles that `draw_pane` skips (blank rows). Fall back to
-    /// the tabbed view for that frame; the user can still switch panes and the
-    /// layout choice is preserved for larger terminals.
-    fn effective_layout(&self, area: Rect) -> PaneLayout {
-        if self.layout == PaneLayout::Horizontal
-            && (area.height as usize) < self.views.len().max(1) * 4
-        {
-            PaneLayout::Tabby
-        } else {
-            self.layout
+    /// Resolve the layout for this frame. Horizontal layout always stays
+    /// horizontal: panes get compact title/content rows instead of silently
+    /// collapsing into tabby when the terminal is short.
+    fn effective_layout(&self, _area: Rect) -> PaneLayout {
+        self.layout
+    }
+
+    /// Horizontal layout shows the queue head plus the four most recent panes
+    /// after it. If focus moved into a hidden pane, slide the tail window so
+    /// the focused pane stays visible.
+    fn horizontal_visible_indices(&self) -> Vec<usize> {
+        let len = self.views.len();
+        if len <= HORIZONTAL_TAIL_PANES + 1 {
+            return (0..len).collect();
         }
+        let start = if self.focused > HORIZONTAL_TAIL_PANES {
+            self.focused + 1 - HORIZONTAL_TAIL_PANES
+        } else {
+            1
+        };
+        let mut indices = Vec::with_capacity(HORIZONTAL_TAIL_PANES + 1);
+        indices.push(0);
+        indices.extend(start..(start + HORIZONTAL_TAIL_PANES).min(len));
+        indices
     }
 
     fn draw_panes(&mut self, frame: &mut Frame, area: Rect) {
@@ -7477,18 +7492,26 @@ already exists, update it in place rather than rewriting it from scratch.";
             self.draw_pane(frame, area, self.focused);
             return;
         }
-        let rects = layout_pane_rects(layout, area, self.views.len());
-        self.pane_areas = rects.clone();
-        for (index, rect) in rects.into_iter().enumerate() {
-            if index >= self.views.len() {
-                break;
-            }
+        let indices: Vec<usize> = if layout == PaneLayout::Horizontal {
+            self.horizontal_visible_indices()
+        } else {
+            (0..self.views.len()).collect()
+        };
+        let rects = layout_pane_rects(layout, area, indices.len());
+        let mut areas = vec![Rect::new(0, 0, 0, 0); self.views.len()];
+        for (rect, index) in rects.iter().zip(indices.iter()) {
+            areas[*index] = *rect;
+        }
+        self.pane_areas = areas;
+        for (rect, index) in rects.into_iter().zip(indices) {
             self.draw_pane(frame, rect, index);
         }
     }
 
     fn draw_pane(&mut self, frame: &mut Frame, area: Rect, index: usize) {
-        if area.width < 4 || area.height < 4 {
+        // Horizontal layout may squeeze a pane down to a title row. Draw it
+        // rather than leaving a blank gap; only an empty slot is skipped.
+        if area.width < 4 || area.height == 0 {
             return;
         }
         let focused = index == self.focused;
@@ -10495,17 +10518,19 @@ fn horizontal_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
         1 => vec![area],
         _ => {
             let rest = count - 1;
-            // Keep the smaller panes usable (border plus one content row) and
-            // give whatever remains to the queue head, capped at 55% so it
-            // still reads as the same layout on tall terminals.
-            let min_rest = 4usize;
-            let needed = rest.saturating_mul(min_rest).saturating_add(4);
-            let first = if area.height as usize >= needed {
-                (area.height as usize * 55 / 100)
-                    .max(4)
-                    .min(area.height as usize - rest * min_rest)
+            let height = area.height as usize;
+            // Keep the head at its normal 55% share regardless of how many
+            // panes are open. The recent panes below split the remainder and
+            // compact to title-only rows when space is short.
+            let first = if height >= count * 2 {
+                (height * 55 / 100).max(1).min(height.saturating_sub(rest))
+            } else if height >= count {
+                // Too short for a 55% head; distribute evenly and give the
+                // remainder to the head.
+                height / count + height % count
             } else {
-                (area.height as usize / count).max(1)
+                // More panes than rows: show the head and whatever fits.
+                height
             };
             let mut constraints = Vec::with_capacity(count);
             constraints.push(Constraint::Length(first as u16));
@@ -11757,17 +11782,91 @@ mod tests {
     }
 
     #[test]
-    fn horizontal_layout_falls_back_to_tabs_when_panes_would_be_too_short() {
+    fn horizontal_layout_never_falls_back_to_tabs() {
         let mut app = app_with_panes(&["a", "b", "c", "d", "e"]);
         app.layout = PaneLayout::Horizontal;
         assert_eq!(
             app.effective_layout(Rect::new(0, 0, 80, 16)),
-            PaneLayout::Tabby
+            PaneLayout::Horizontal
         );
         assert_eq!(
             app.effective_layout(Rect::new(0, 0, 80, 40)),
             PaneLayout::Horizontal
         );
+    }
+
+    #[test]
+    fn horizontal_layout_keeps_every_pane_visible_when_short() {
+        for height in [12, 16, 20, 24] {
+            let mut app = app_with_panes(&["a", "b", "c", "d", "e"]);
+            app.layout = PaneLayout::Horizontal;
+            app.focused = 0;
+            let rendered = render_text(&mut app, 80, height);
+            assert!(
+                !rendered.contains("[1 session a]"),
+                "horizontal layout fell back to tabs at height {height}:\n{rendered}"
+            );
+            for id in ["a", "b", "c", "d", "e"] {
+                assert!(
+                    rendered.contains(&format!("session {id}")),
+                    "pane {id} missing at height {height}:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_layout_shows_head_plus_four_recent_panes() {
+        let mut app = app_with_panes(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        app.layout = PaneLayout::Horizontal;
+        let rendered = render_text(&mut app, 80, 30);
+        assert!(!rendered.contains("[1 session a]"), "{rendered}");
+        for id in ["a", "b", "c", "d", "e"] {
+            assert!(
+                rendered.contains(&format!("session {id}")),
+                "pane {id} should be visible:\n{rendered}"
+            );
+        }
+        for id in ["f", "g", "h"] {
+            assert!(
+                !rendered.contains(&format!("session {id}")),
+                "pane {id} should be hidden:\n{rendered}"
+            );
+        }
+        assert_eq!(
+            app.pane_areas.iter().filter(|rect| rect.height > 0).count(),
+            5
+        );
+
+        // The head keeps the same height as it has with only five panes.
+        let mut five = app_with_panes(&["a", "b", "c", "d", "e"]);
+        five.layout = PaneLayout::Horizontal;
+        render_text(&mut five, 80, 30);
+        assert_eq!(app.pane_areas[0], five.pane_areas[0]);
+    }
+
+    #[test]
+    fn horizontal_layout_slides_to_a_focused_hidden_pane() {
+        let mut app = app_with_panes(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        app.layout = PaneLayout::Horizontal;
+        app.focused = 7;
+        let rendered = render_text(&mut app, 80, 30);
+
+        // Head plus the four most recent panes ending at the focused one.
+        for id in ["a", "e", "f", "g", "h"] {
+            assert!(
+                rendered.contains(&format!("session {id}")),
+                "pane {id} should be visible:\n{rendered}"
+            );
+        }
+        for id in ["b", "c", "d"] {
+            assert!(
+                !rendered.contains(&format!("session {id}")),
+                "pane {id} should be hidden:\n{rendered}"
+            );
+        }
+        assert!(app.pane_areas[7].height > 0);
+        assert_eq!(app.pane_areas[1].height, 0);
     }
 
     #[test]

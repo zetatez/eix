@@ -272,7 +272,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 ## 6. 布局与焦点
 
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
-- 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首占 55% 高度）、`tabby`（输入框
+- 布局模式：`grid`（默认自动平铺）、`horizontal`（单列，队首固定占 55% 高度；pane 超过 5 个
+  时只渲染队首 + 最近 4 个，其余隐藏，焦点移入隐藏 pane 时窗口滑动；空间不足时压缩为
+  标题行/单行内容，不退回 tabby）、`tabby`（输入框
   上方显示 tab，只渲染当前 session）、`fibonacci`（左/上/右/下循环切分的螺旋分屏，不显示 tab）。用 leader
   `<Space>v/t/r` 切换，`<Space>l` 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session，
   在 `tabby` 下即切换到第 N 个 tab。TUI 启动时请求 kitty 键盘协议（CSI-u），否则传统终端
