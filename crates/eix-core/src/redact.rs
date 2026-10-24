@@ -8,8 +8,10 @@
 //! The patterns cover the realistic leaks: `Bearer` headers, `sk-…` API keys,
 //! URL credentials, PEM private keys, and the values of `token`, `api_key`,
 //! `password`, `secret` and `authorization` in JSON, YAML, `.env` or `KEY=value`
-//! form. Redaction is deliberately conservative: a false positive only hides a
-//! value, while a miss sends a secret to the provider.
+//! form. Redaction is deliberately conservative on real credentials. Tool
+//! results often contain source code, so common code tokens and unquoted type
+//! annotations (`token: Option<String>`) are kept readable; otherwise a type
+//! name becomes a global placeholder and corrupts every later message.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -285,6 +287,13 @@ impl SecretRedactor {
         secrets.sort_by_key(|(secret, _)| std::cmp::Reverse(secret.len()));
         let mut out = text.to_string();
         for (secret, placeholder) in secrets {
+            // A pathological credential such as `Option` must not turn every
+            // occurrence of a common code token into a placeholder. The
+            // original assignment is still redacted; only the global
+            // replacement is suppressed.
+            if is_code_like_secret(secret) {
+                continue;
+            }
             if out.contains(secret) {
                 out = replace_standalone(&out, secret, placeholder);
             }
@@ -298,20 +307,27 @@ impl SecretRedactor {
         // This catches a model copying a bare password into `write_file`
         // content without repeating the `PASSWORD=` key.
         let mut out = self.replace_known(text);
-        out = self.scrub_group(&out, &patterns.pem, true, false);
-        out = self.scrub_group(&out, &patterns.authorization, false, false);
-        out = self.scrub_group(&out, &patterns.url_credentials, false, false);
-        out = self.scrub_group(&out, &patterns.cli_secret, false, false);
-        out = self.scrub_group(&out, &patterns.quoted_assignment, false, false);
-        out = self.scrub_group(&out, &patterns.assignment, false, false);
-        out = self.scrub_group(&out, &patterns.prose_quoted, false, false);
-        out = self.scrub_group(&out, &patterns.prose_secret, false, true);
-        out = self.scrub_group(&out, &patterns.bearer, false, false);
-        out = self.scrub_group(&out, &patterns.tokens, true, false);
+        out = self.scrub_group(&out, &patterns.pem, true, false, false);
+        out = self.scrub_group(&out, &patterns.authorization, false, false, false);
+        out = self.scrub_group(&out, &patterns.url_credentials, false, false, false);
+        out = self.scrub_group(&out, &patterns.cli_secret, false, false, false);
+        out = self.scrub_group(&out, &patterns.quoted_assignment, false, false, false);
+        out = self.scrub_group(&out, &patterns.assignment, false, false, true);
+        out = self.scrub_group(&out, &patterns.prose_quoted, false, false, false);
+        out = self.scrub_group(&out, &patterns.prose_secret, false, true, false);
+        out = self.scrub_group(&out, &patterns.bearer, false, false, false);
+        out = self.scrub_group(&out, &patterns.tokens, true, false, false);
         out
     }
 
-    fn scrub_group(&mut self, text: &str, re: &Regex, whole_match: bool, prose: bool) -> String {
+    fn scrub_group(
+        &mut self,
+        text: &str,
+        re: &Regex,
+        whole_match: bool,
+        prose: bool,
+        assignment: bool,
+    ) -> String {
         let mut out = String::with_capacity(text.len());
         let mut cursor = 0;
         for captures in re.captures_iter(text) {
@@ -328,6 +344,13 @@ impl SecretRedactor {
             }
             let value = matched.as_str();
             if value.is_empty() || is_placeholder(value) {
+                continue;
+            }
+            if (assignment || prose) && is_code_like_secret(value) {
+                continue;
+            }
+            if assignment && looks_like_code_assignment(text, matched.start(), matched.end(), value)
+            {
                 continue;
             }
             if prose && is_benign_prose_value(value) {
@@ -470,6 +493,162 @@ fn replace_standalone(text: &str, needle: &str, replacement: &str) -> String {
     out
 }
 
+/// Rust type and expression fragments that look like bare assignment values.
+/// Tool results contain source code, so `token: Option<String>` must not teach
+/// the redactor that `Option` is a secret and corrupt every later message.
+fn is_code_like_secret(value: &str) -> bool {
+    matches!(
+        value,
+        "Option"
+            | "String"
+            | "Vec"
+            | "Result"
+            | "Box"
+            | "Arc"
+            | "Rc"
+            | "Cow"
+            | "bool"
+            | "str"
+            | "char"
+            | "usize"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "f32"
+            | "f64"
+            | "Self"
+            | "None"
+            | "Some"
+            | "true"
+            | "false"
+            | "HashMap"
+            | "HashSet"
+            | "BTreeMap"
+            | "BTreeSet"
+            | "PathBuf"
+            | "Path"
+            | "Duration"
+            | "Instant"
+            | "Value"
+            | "Json"
+            | "Uuid"
+    ) || value.starts_with('&')
+        || value.starts_with('*')
+        || value.starts_with('|')
+        || value.starts_with('$')
+        || value.starts_with('!')
+        || value.starts_with('[')
+        || value.starts_with('(')
+        || value.contains("::")
+}
+
+/// True when an unquoted `key: value` match is really code syntax. The
+/// assignment pattern is intentionally broad so `.env` files are covered; code
+/// type annotations need a separate guard.
+fn looks_like_code_assignment(text: &str, start: usize, end: usize, value: &str) -> bool {
+    // Punctuation immediately after the value on the same line is a strong
+    // signal for a Rust type/expression (`Option<String>`, `String,`).
+    let next = text[end..]
+        .chars()
+        .take_while(|ch| *ch != '\n' && *ch != '\r')
+        .find(|ch| !ch.is_whitespace());
+    if matches!(
+        next,
+        Some(
+            '<' | '>'
+                | '('
+                | ')'
+                | '['
+                | ']'
+                | '{'
+                | '}'
+                | ':'
+                | '&'
+                | '*'
+                | '|'
+                | '!'
+                | '?'
+                | '='
+                | '+'
+                | '\''
+        )
+    ) {
+        return true;
+    }
+    // A comma/comment marker after a type-like value is still code, but these
+    // characters also terminate ordinary config values and lists. Do not skip
+    // them blindly or `TOKEN=abc,` would leak.
+    if matches!(next, Some(',' | ';' | '#' | '.' | '/')) && is_code_like_secret(value) {
+        return true;
+    }
+
+    let line_start = text[..start].rfind('\n').map_or(0, |idx| idx + 1);
+    let prefix = &text[line_start..start];
+    const CODE_MARKERS: &[&str] = &[
+        "fn ",
+        "let ",
+        "pub ",
+        "pub(",
+        "struct ",
+        "enum ",
+        "impl ",
+        "type ",
+        "use ",
+        "const ",
+        "static ",
+        "where ",
+        "async fn ",
+        "unsafe fn ",
+        "extern ",
+        "->",
+        "::",
+        "#[",
+    ];
+    if CODE_MARKERS.iter().any(|marker| prefix.contains(marker)) {
+        return true;
+    }
+    let comment_prefix = prefix.trim_start();
+    if comment_prefix.starts_with("//") || comment_prefix.starts_with("/*") {
+        return true;
+    }
+
+    // A CamelCase identifier without digits at the end of an indented line is
+    // usually the last field of a struct (`token: SecretString` before `}`),
+    // not a secret value. Only treat it as code when the surrounding
+    // punctuation actually closes a block.
+    let indent = prefix
+        .chars()
+        .take_while(|ch| *ch == ' ' || *ch == '\t')
+        .count();
+    let closes_block = text[end..]
+        .chars()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| matches!(ch, '}' | ')' | ']' | ',' | ';'));
+    if indent > 0
+        && closes_block
+        && value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_uppercase())
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        && !value.chars().any(|ch| ch.is_ascii_digit())
+    {
+        return true;
+    }
+
+    false
+}
+
 /// "The token is invalid" is not a disclosure. Prose patterns use this small
 /// stop-list so ordinary status words do not get replaced with placeholders and
 /// confuse the model about the actual error.
@@ -514,6 +693,40 @@ fn is_benign_prose_value(value: &str) -> bool {
             | "undefined"
             | "available"
             | "unavailable"
+            | "checked"
+            | "verified"
+            | "validated"
+            | "read"
+            | "written"
+            | "loaded"
+            | "created"
+            | "deleted"
+            | "sent"
+            | "received"
+            | "used"
+            | "ignored"
+            | "skipped"
+            | "enabled"
+            | "disabled"
+            | "supported"
+            | "unsupported"
+            | "allowed"
+            | "denied"
+            | "found"
+            | "provided"
+            | "omitted"
+            | "supplied"
+            | "truncated"
+            | "retained"
+            | "stored"
+            | "passed"
+            | "failed"
+            | "ready"
+            | "pending"
+            | "running"
+            | "done"
+            | "complete"
+            | "incomplete"
     )
 }
 
@@ -867,5 +1080,66 @@ MIIEowIBAAKCAQEAsecretkeymaterial
             .and_then(|rest| rest.split("}}").next())
             .unwrap();
         assert_eq!(first_id, second_id);
+    }
+
+    #[test]
+    fn code_type_annotations_are_not_secrets() {
+        let mut redactor = SecretRedactor::new("test-salt");
+        let code = r#"pub(crate) async fn serve(daemon: Arc<Daemon>, token: Option<String>) {
+    let token: String = token.unwrap_or_default();
+    if token.is_empty() {}
+}
+struct Credentials {
+    token: SecretString
+}"#;
+        assert_eq!(redactor.redact(code), code);
+
+        let comment = "// token: SecretString";
+        assert_eq!(redactor.redact(comment), comment);
+
+        // A type name learned from one tool result must not turn into a
+        // process-wide replacement that corrupts every later Rust snippet.
+        let later = "Option, String, and SecretString are ordinary Rust types.";
+        assert_eq!(redactor.redact(later), later);
+    }
+
+    #[test]
+    fn code_tokens_are_not_globally_replaced() {
+        let mut redactor = SecretRedactor::new("test-salt");
+        let assignment = redactor.redact("password=\"Option\"");
+        assert!(!assignment.contains("\"Option\""), "{assignment}");
+
+        let later = "Option<String>";
+        assert_eq!(redactor.redact(later), later);
+    }
+
+    #[test]
+    fn code_status_prose_is_not_redacted() {
+        let mut redactor = SecretRedactor::new("test-salt");
+        for text in [
+            "the token is checked",
+            "the secret is stored",
+            "the password is validated",
+        ] {
+            assert_eq!(redactor.redact(text), text);
+        }
+    }
+
+    #[test]
+    fn config_assignments_are_still_redacted() {
+        let mut redactor = SecretRedactor::new("test-salt");
+        for (text, secret) in [
+            ("PASSWORD=hunter2", "hunter2"),
+            ("token: hunter2", "hunter2"),
+            ("token: \"hunter2\"", "hunter2"),
+            ("let password = \"hunter2\";", "hunter2"),
+            ("  password: Hunter", "Hunter"),
+            ("token: hunter2,", "hunter2"),
+            ("token: hunter2 # comment", "hunter2"),
+        ] {
+            let scrubbed = redactor.redact(text);
+            assert!(!scrubbed.contains(secret), "{text} -> {scrubbed}");
+            assert!(scrubbed.contains("{{eix_secret_"), "{text} -> {scrubbed}");
+        }
     }
 }
