@@ -414,6 +414,13 @@ pub struct SessionCdParams {
     pub path: String,
 }
 
+/// `context.clear`: make the model start from a clean context. Earlier events
+/// stay in the log (and the transcript); they are simply not sent again.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextClearParams {
+    pub session_id: SessionId,
+}
+
 /// `session.btw`: a one-off side question, answered in a throwaway context.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BtwParams {
@@ -615,6 +622,25 @@ pub struct EventsParams {
     /// Maximum number of events to return for a paged query.
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCompactParams {
+    pub session_id: SessionId,
+    /// Inclusive range of source event sequence numbers. Both `None` means
+    /// "every message currently in the context".
+    #[serde(default)]
+    pub from_seq: Option<u64>,
+    #[serde(default)]
+    pub to_seq: Option<u64>,
+    /// Replacement text. When omitted, a mechanical note is generated (or the
+    /// model writes one when `generate` is set).
+    #[serde(default)]
+    pub summary: Option<String>,
+    /// Ask the provider for a real summary of the range instead of the
+    /// mechanical placeholder. Used by the `/compact` command.
+    #[serde(default)]
+    pub generate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

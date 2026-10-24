@@ -57,6 +57,15 @@ pub enum Command {
         session_id: String,
         path: String,
     },
+    /// Drop everything before now from the model context.
+    ClearContext {
+        session_id: String,
+    },
+    /// Summarize the whole context so the next turn starts small.
+    CompactContext {
+        session_id: String,
+        notes: Option<String>,
+    },
     /// Change the session's tool permission level.
     SetPermission {
         session_id: String,
@@ -214,6 +223,8 @@ impl Command {
             Self::Create { .. } => "create",
             Self::Ready { .. } => "ready",
             Self::SetCwd { .. } => "cd",
+            Self::ClearContext { .. } => "clear",
+            Self::CompactContext { .. } => "compact",
             Self::SetPermission { .. } => "permission",
             Self::SetModel { .. } => "model",
             Self::SetAgent { .. } => "agent",
@@ -264,6 +275,14 @@ pub enum Event {
     Created(Session),
     /// A session's cwd or permission changed; the view replays it.
     Updated(Session),
+    ContextCleared {
+        session_id: String,
+    },
+    Compacted {
+        session_id: String,
+        entries: usize,
+        tokens: usize,
+    },
     BtwStarted {
         session_id: String,
         btw_id: String,
@@ -507,6 +526,36 @@ async fn dispatch(
                 .await?;
             let result: SessionResult = decode(value)?;
             send(events, Event::Updated(result.session))
+        }
+        Command::ClearContext { session_id } => {
+            let value = requester
+                .request("context.clear", json!({ "session_id": session_id }))
+                .await?;
+            let _: eix_core::ContextLedgerResult = decode(value)?;
+            send(events, Event::ContextCleared { session_id })
+        }
+        Command::CompactContext { session_id, notes } => {
+            let value = requester
+                .request(
+                    "context.compact",
+                    json!({
+                        "session_id": session_id,
+                        "summary": notes,
+                        "generate": true,
+                    }),
+                )
+                .await?;
+            let ledger: eix_core::ContextLedgerResult = decode(value)?;
+            let entries = ledger.entries.len();
+            let tokens = ledger.total_tokens;
+            send(
+                events,
+                Event::Compacted {
+                    session_id,
+                    entries,
+                    tokens,
+                },
+            )
         }
         Command::SetPermission {
             session_id,

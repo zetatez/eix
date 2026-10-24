@@ -120,6 +120,12 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("attention", "", "jump to the next pane needing attention"),
         builtin("cancel", "", "cancel the focused session's running turn"),
         builtin("toggle-agent", "", "toggle Build / Plan for this session"),
+        builtin("clear", "", "forget this conversation's context"),
+        builtin(
+            "compact",
+            "[notes]",
+            "summarize the history to free context",
+        ),
         builtin(
             "btw",
             "<question>",
@@ -2476,6 +2482,33 @@ impl App {
                     }
                 }
                 self.upsert_session(session, false);
+                self.error = None;
+            }
+            Event::ContextCleared { session_id } => {
+                if let Some(view) = self
+                    .views
+                    .iter_mut()
+                    .find(|view| view.session.id == session_id)
+                {
+                    view.stream = None;
+                }
+                self.status = "context cleared · earlier turns stay in the transcript".into();
+                self.error = None;
+            }
+            Event::Compacted {
+                session_id,
+                entries,
+                tokens,
+            } => {
+                if let Some(view) = self
+                    .views
+                    .iter_mut()
+                    .find(|view| view.session.id == session_id)
+                {
+                    view.follow = true;
+                }
+                self.status =
+                    format!("compacted · context now {tokens} tokens ({entries} entries)");
                 self.error = None;
             }
             Event::BtwStarted { session_id, btw_id } => {
@@ -5832,6 +5865,14 @@ impl App {
                 self.command_cd(args, tx);
                 true
             }
+            "clear" => {
+                self.command_clear(tx);
+                true
+            }
+            "compact" => {
+                self.command_compact(args, tx);
+                true
+            }
             "btw" => {
                 self.command_btw(args, tx);
                 true
@@ -6097,6 +6138,33 @@ impl App {
             session_id,
             path: args.to_string(),
         });
+    }
+
+    fn command_clear(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        if self.session_busy(&session_id) {
+            self.error = Some("cancel the running turn before /clear".into());
+            return;
+        }
+        self.status = "clearing context…".into();
+        let _ = tx.send(Command::ClearContext { session_id });
+    }
+
+    fn command_compact(&mut self, args: &str, tx: &UnboundedSender<Command>) {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "no session".into();
+            return;
+        };
+        if self.session_busy(&session_id) {
+            self.error = Some("cancel the running turn before /compact".into());
+            return;
+        }
+        let notes = (!args.is_empty()).then(|| args.to_string());
+        self.status = "summarizing the conversation…".into();
+        let _ = tx.send(Command::CompactContext { session_id, notes });
     }
 
     fn command_btw(&mut self, question: &str, tx: &UnboundedSender<Command>) {
@@ -7291,6 +7359,16 @@ already exists, update it in place rather than rewriting it from scratch.";
         );
     }
 
+    /// Small pane-title marker. Idle/running use dots instead of circles so the
+    /// title stays compact; attention states keep their distinct symbols.
+    fn pane_status_marker(status: SessionStatus) -> &'static str {
+        match status {
+            SessionStatus::Idle => "·",
+            SessionStatus::Running => "•",
+            _ => status.symbol(),
+        }
+    }
+
     /// Glyph for the prompt header. Idle and running are icon-only so the
     /// header stays compact; other states keep their symbol and label.
     fn status_glyph(&self, status: SessionStatus) -> String {
@@ -7306,7 +7384,10 @@ already exists, update it in place rather than rewriting it from scratch.";
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         // Sessions live in the floating picker (`Ctrl-G` / `/sessions`), not in
         // a permanent sidebar: panes get the whole body.
-        if self.views.is_empty() || self.layout != PaneLayout::Tabby || area.height <= 1 {
+        if self.views.is_empty()
+            || self.effective_layout(area) != PaneLayout::Tabby
+            || area.height <= 1
+        {
             self.draw_panes(frame, area);
             return;
         }
@@ -7364,6 +7445,21 @@ already exists, update it in place rather than rewriting it from scratch.";
         );
     }
 
+    /// Horizontal layout stacks every session vertically. When there are too
+    /// many sessions for the available height, drawing every pane would leave
+    /// sub-4-row rectangles that `draw_pane` skips (blank rows). Fall back to
+    /// the tabbed view for that frame; the user can still switch panes and the
+    /// layout choice is preserved for larger terminals.
+    fn effective_layout(&self, area: Rect) -> PaneLayout {
+        if self.layout == PaneLayout::Horizontal
+            && (area.height as usize) < self.views.len().max(1) * 4
+        {
+            PaneLayout::Tabby
+        } else {
+            self.layout
+        }
+    }
+
     fn draw_panes(&mut self, frame: &mut Frame, area: Rect) {
         if self.views.is_empty() {
             self.pane_areas.clear();
@@ -7371,7 +7467,8 @@ already exists, update it in place rather than rewriting it from scratch.";
             return;
         }
         self.focused = self.focused.min(self.views.len() - 1);
-        if self.layout == PaneLayout::Tabby {
+        let layout = self.effective_layout(area);
+        if layout == PaneLayout::Tabby {
             // Only the active tab is visible; leave zero-sized hit boxes for
             // the hidden panes so clicks cannot reach them.
             let mut areas = vec![Rect::new(0, 0, 0, 0); self.views.len()];
@@ -7380,7 +7477,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             self.draw_pane(frame, area, self.focused);
             return;
         }
-        let rects = layout_pane_rects(self.layout, area, self.views.len());
+        let rects = layout_pane_rects(layout, area, self.views.len());
         self.pane_areas = rects.clone();
         for (index, rect) in rects.into_iter().enumerate() {
             if index >= self.views.len() {
@@ -7411,7 +7508,7 @@ already exists, update it in place rather than rewriting it from scratch.";
                 || self.approvals.contains_key(&session_id)
                 || self.inputs.contains_key(&session_id));
         let theme = self.theme;
-        let borders = if self.layout == PaneLayout::Tabby {
+        let borders = if self.effective_layout(area) == PaneLayout::Tabby {
             let mut borders = Borders::ALL;
             borders.remove(Borders::BOTTOM);
             borders
@@ -7569,9 +7666,9 @@ already exists, update it in place rather than rewriting it from scratch.";
             _ => "",
         };
         let title = format!(
-            " {}{}{marker} {}{permission} ",
+            " {} {}{marker} {}{permission} ",
             index + 1,
-            view.session.status.symbol(),
+            Self::pane_status_marker(view.session.status),
             name
         );
         let border_color = if focused {
@@ -9832,6 +9929,14 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "new session · choose one for a new pane · new worktree session",
             },
             HelpEntry {
+                key: "/clear",
+                description: "forget the conversation context (transcript stays)",
+            },
+            HelpEntry {
+                key: "/compact",
+                description: "summarize the history (/compact optional notes)",
+            },
+            HelpEntry {
                 key: "/btw",
                 description: "one-off answer (/btw <question>); kept out of the conversation",
             },
@@ -11649,6 +11754,20 @@ mod tests {
         for pair in rects.windows(2) {
             assert_eq!(pair[0].y + pair[0].height, pair[1].y);
         }
+    }
+
+    #[test]
+    fn horizontal_layout_falls_back_to_tabs_when_panes_would_be_too_short() {
+        let mut app = app_with_panes(&["a", "b", "c", "d", "e"]);
+        app.layout = PaneLayout::Horizontal;
+        assert_eq!(
+            app.effective_layout(Rect::new(0, 0, 80, 16)),
+            PaneLayout::Tabby
+        );
+        assert_eq!(
+            app.effective_layout(Rect::new(0, 0, 80, 40)),
+            PaneLayout::Horizontal
+        );
     }
 
     #[test]
@@ -16394,6 +16513,18 @@ mod tests {
         app.focused = 0;
         app.focus = Focus::Input;
 
+        app.input.set_text("/clear");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.input.is_empty());
+        let mut cleared = false;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::ClearContext { session_id } = command {
+                assert_eq!(session_id, "s1");
+                cleared = true;
+            }
+        }
+        assert!(cleared);
+
         app.input.set_text("/cd /tmp");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         let mut cwd = None;
@@ -16403,6 +16534,16 @@ mod tests {
             }
         }
         assert_eq!(cwd.as_deref(), Some("/tmp"));
+
+        app.input.set_text("/compact tighten it");
+        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        let mut notes = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::CompactContext { notes: value, .. } = command {
+                notes = value;
+            }
+        }
+        assert_eq!(notes.as_deref(), Some("tighten it"));
 
         app.input.set_text("/btw why is the sky blue?");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
@@ -16440,20 +16581,17 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.focus_input();
-        app.input.set_text("/clo");
+        app.input.set_text("/cl");
         assert!(app.command_menu_open());
         let names: Vec<&str> = app
             .command_matches()
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        assert!(names.contains(&"close"), "{names:?}");
-        assert!(
-            names.iter().all(|name| name.starts_with("clo")),
-            "{names:?}"
-        );
+        assert!(names.contains(&"clear"), "{names:?}");
+        assert!(names.iter().all(|name| name.starts_with("cl")), "{names:?}");
         app.complete_command();
-        assert_eq!(app.input.text(), "/close");
+        assert_eq!(app.input.text(), "/clear");
 
         app.input.set_text("/hel");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
@@ -16725,7 +16863,7 @@ mod tests {
         assert!(empty.contains("Build · ⠋"), "{empty}");
         assert!(!empty.contains("eixd"), "no footer brand: {empty}");
         assert!(!empty.contains("/cmds"), "no footer hints: {empty}");
-        assert!(empty.contains("1● prompt polish"), "{empty}");
+        assert!(empty.contains("1 • prompt polish"), "{empty}");
         assert!(
             empty.contains('╭'),
             "the composer keeps its border: {empty}"
@@ -16760,10 +16898,10 @@ mod tests {
         assert!(!empty.contains("C-j newline"), "{empty}");
         assert!(!empty.contains("Esc normal"), "{empty}");
 
-        app.input.set_text("/clo");
+        app.input.set_text("/cl");
         let menu = render_text(&mut app, 80, 20);
         assert!(menu.contains("/ commands"), "{menu}");
-        assert!(menu.contains("❯ /close"), "{menu}");
+        assert!(menu.contains("❯ /clear"), "{menu}");
         assert!(!menu.contains("Tab complete"), "{menu}");
     }
 
