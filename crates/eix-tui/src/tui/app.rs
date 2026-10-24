@@ -120,12 +120,6 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("attention", "", "jump to the next pane needing attention"),
         builtin("cancel", "", "cancel the focused session's running turn"),
         builtin("toggle-agent", "", "toggle Build / Plan for this session"),
-        builtin("clear", "", "forget this conversation's context"),
-        builtin(
-            "compact",
-            "[notes]",
-            "summarize the history to free context",
-        ),
         builtin(
             "btw",
             "<question>",
@@ -2482,33 +2476,6 @@ impl App {
                     }
                 }
                 self.upsert_session(session, false);
-                self.error = None;
-            }
-            Event::ContextCleared { session_id } => {
-                if let Some(view) = self
-                    .views
-                    .iter_mut()
-                    .find(|view| view.session.id == session_id)
-                {
-                    view.stream = None;
-                }
-                self.status = "context cleared · earlier turns stay in the transcript".into();
-                self.error = None;
-            }
-            Event::Compacted {
-                session_id,
-                entries,
-                tokens,
-            } => {
-                if let Some(view) = self
-                    .views
-                    .iter_mut()
-                    .find(|view| view.session.id == session_id)
-                {
-                    view.follow = true;
-                }
-                self.status =
-                    format!("compacted · context now {tokens} tokens ({entries} entries)");
                 self.error = None;
             }
             Event::BtwStarted { session_id, btw_id } => {
@@ -5865,14 +5832,6 @@ impl App {
                 self.command_cd(args, tx);
                 true
             }
-            "clear" => {
-                self.command_clear(tx);
-                true
-            }
-            "compact" => {
-                self.command_compact(args, tx);
-                true
-            }
             "btw" => {
                 self.command_btw(args, tx);
                 true
@@ -6138,33 +6097,6 @@ impl App {
             session_id,
             path: args.to_string(),
         });
-    }
-
-    fn command_clear(&mut self, tx: &UnboundedSender<Command>) {
-        let Some(session_id) = self.focused_session_id() else {
-            self.status = "no session".into();
-            return;
-        };
-        if self.session_busy(&session_id) {
-            self.error = Some("cancel the running turn before /clear".into());
-            return;
-        }
-        self.status = "clearing context…".into();
-        let _ = tx.send(Command::ClearContext { session_id });
-    }
-
-    fn command_compact(&mut self, args: &str, tx: &UnboundedSender<Command>) {
-        let Some(session_id) = self.focused_session_id() else {
-            self.status = "no session".into();
-            return;
-        };
-        if self.session_busy(&session_id) {
-            self.error = Some("cancel the running turn before /compact".into());
-            return;
-        }
-        let notes = (!args.is_empty()).then(|| args.to_string());
-        self.status = "summarizing the conversation…".into();
-        let _ = tx.send(Command::CompactContext { session_id, notes });
     }
 
     fn command_btw(&mut self, question: &str, tx: &UnboundedSender<Command>) {
@@ -9658,11 +9590,7 @@ struct TurnCompleted {
     #[serde(default)]
     error: Option<String>,
     #[serde(default)]
-    usage: Option<eix_core::Usage>,
-    #[serde(default)]
     cost: Option<f64>,
-    #[serde(default)]
-    duration_ms: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -9902,14 +9830,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "/new · /new-pane · /new-worktree",
                 description: "new session · choose one for a new pane · new worktree session",
-            },
-            HelpEntry {
-                key: "/clear",
-                description: "forget the conversation context (transcript stays)",
-            },
-            HelpEntry {
-                key: "/compact",
-                description: "summarize the history (/compact optional notes)",
             },
             HelpEntry {
                 key: "/btw",
@@ -11076,25 +10996,13 @@ fn split_model_variant(selection: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// Compact usage summary for the footer: tokens, throughput and cost.
+/// Compact completion state for the footer. Token totals and throughput stay
+/// out of the status bar; usage is still recorded in the event log.
 fn turn_summary(done: &TurnCompleted) -> String {
-    let Some(usage) = &done.usage else {
-        return "idle".to_string();
-    };
-    let mut parts = vec![format!(
-        "idle · {} tok",
-        usage
-            .total_tokens
-            .max(usage.prompt_tokens.saturating_add(usage.completion_tokens),)
-    )];
-    if let Some(duration) = done.duration_ms.filter(|duration| *duration > 0) {
-        let tps = usage.completion_tokens as f64 / (duration as f64 / 1000.0);
-        parts.push(format!("{tps:.1} tok/s"));
+    match done.cost {
+        Some(cost) => format!("idle · ${cost:.4}"),
+        None => "idle".to_string(),
     }
-    if let Some(cost) = done.cost {
-        parts.push(format!("${cost:.4}"));
-    }
-    parts.join(" · ")
 }
 
 /// Current git branch for `cwd`, or a short commit hash when HEAD is detached.
@@ -16486,18 +16394,6 @@ mod tests {
         app.focused = 0;
         app.focus = Focus::Input;
 
-        app.input.set_text("/clear");
-        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-        assert!(app.input.is_empty());
-        let mut cleared = false;
-        while let Ok(command) = rx.try_recv() {
-            if let Command::ClearContext { session_id } = command {
-                assert_eq!(session_id, "s1");
-                cleared = true;
-            }
-        }
-        assert!(cleared);
-
         app.input.set_text("/cd /tmp");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         let mut cwd = None;
@@ -16507,16 +16403,6 @@ mod tests {
             }
         }
         assert_eq!(cwd.as_deref(), Some("/tmp"));
-
-        app.input.set_text("/compact tighten it");
-        app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-        let mut notes = None;
-        while let Ok(command) = rx.try_recv() {
-            if let Command::CompactContext { notes: value, .. } = command {
-                notes = value;
-            }
-        }
-        assert_eq!(notes.as_deref(), Some("tighten it"));
 
         app.input.set_text("/btw why is the sky blue?");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
@@ -16554,17 +16440,20 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.focus_input();
-        app.input.set_text("/cl");
+        app.input.set_text("/clo");
         assert!(app.command_menu_open());
         let names: Vec<&str> = app
             .command_matches()
             .iter()
             .map(|spec| spec.name.as_str())
             .collect();
-        assert!(names.contains(&"clear"), "{names:?}");
-        assert!(names.iter().all(|name| name.starts_with("cl")), "{names:?}");
+        assert!(names.contains(&"close"), "{names:?}");
+        assert!(
+            names.iter().all(|name| name.starts_with("clo")),
+            "{names:?}"
+        );
         app.complete_command();
-        assert_eq!(app.input.text(), "/clear");
+        assert_eq!(app.input.text(), "/close");
 
         app.input.set_text("/hel");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
@@ -16871,10 +16760,10 @@ mod tests {
         assert!(!empty.contains("C-j newline"), "{empty}");
         assert!(!empty.contains("Esc normal"), "{empty}");
 
-        app.input.set_text("/cl");
+        app.input.set_text("/clo");
         let menu = render_text(&mut app, 80, 20);
         assert!(menu.contains("/ commands"), "{menu}");
-        assert!(menu.contains("❯ /clear"), "{menu}");
+        assert!(menu.contains("❯ /close"), "{menu}");
         assert!(!menu.contains("Tab complete"), "{menu}");
     }
 

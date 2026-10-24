@@ -21,13 +21,12 @@ use eix_core::{
     now_ms, payload, AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams,
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
     ApprovalScope, AttachParams, AttachResult, AuthParams, AutoReady, BtwParams, BtwResult,
-    CancelResult, ChatMessage, Config, ContextClearParams, ContextClearedPayload,
-    ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DraftParams, DraftResult,
-    ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
-    HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams,
-    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
-    IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo,
-    ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
+    CancelResult, ChatMessage, Config, ContextCompactedPayload, CreateSessionParams, DraftParams,
+    DraftResult, ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams,
+    FunctionCall, HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload,
+    InputRespondParams, InputResult, IntegrationContinueParams, IntegrationListParams,
+    IntegrationListResult, IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult,
+    McpServerInfo, ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
     PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
     PermissionAction, PermissionLevel, PermissionParams, PermissionPayload, PermissionRule,
     PickerParams, PickerPreviewParams, PickerPreviewResult, ProcessKillParams, ProcessKillResult,
@@ -2420,14 +2419,6 @@ impl Daemon {
                     }
                 };
                 Ok(serde_json::to_value(EventsResult { events, has_more })?)
-            }
-            "context.compact" => {
-                let params: ContextCompactParams = parse_params(request.params.clone())?;
-                Ok(serde_json::to_value(self.context_compact(params).await?)?)
-            }
-            "context.clear" => {
-                let params: ContextClearParams = parse_params(request.params.clone())?;
-                Ok(serde_json::to_value(self.context_clear(params).await?)?)
             }
             "search.query" => {
                 let params: SearchParams = parse_params(request.params.clone())?;
@@ -5228,65 +5219,6 @@ impl Daemon {
         Ok(())
     }
 
-    /// Rebuild the context ledger for a session. Used by reads and the
-    /// `context.*` requests, where the exact turn tool list is not available.
-    async fn build_ledger(&self, session_id: &str) -> Result<Ledger> {
-        let session = self.require_session(session_id)?;
-        let tools = self.standard_tool_definitions(&session);
-        self.build_ledger_with_tools(session_id, &tools, None).await
-    }
-
-    /// The tools a normal turn would see, without starting MCP servers.
-    /// Dynamic MCP tool schemas are only known after a turn starts, so ledger
-    /// reads outside the turn use the built-in set and MCP meta-tools.
-    fn standard_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
-        let read_only = self.session_permission(session) == PermissionLevel::ReadOnly;
-        let sub_agent = session.origin == SessionOrigin::Agent;
-        let mut definitions = if read_only || sub_agent {
-            tools::definitions()
-                .into_iter()
-                .filter(|tool| !tools::hard_mutating(&tool.function.name))
-                .collect::<Vec<_>>()
-        } else {
-            tools::definitions()
-        };
-        let mcp_configured = self
-            .config
-            .load()
-            .mcp
-            .servers
-            .values()
-            .any(|server| server.enabled);
-        if !mcp_configured || read_only || sub_agent {
-            definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
-        }
-        definitions
-    }
-
-    /// Rebuild the ledger with the exact tool schemas the request will carry.
-    /// When `static_context` is supplied, instructions and the workspace
-    /// summary are reused instead of walking the repository again.
-    async fn build_ledger_with_tools(
-        &self,
-        session_id: &str,
-        tools: &[ToolDefinition],
-        static_context: Option<&StaticContext>,
-    ) -> Result<Ledger> {
-        let session = self.require_session(session_id)?;
-        let events = self.store.events_async(session_id).await?;
-        let loaded;
-        let static_context = match static_context {
-            Some(context) => context,
-            None => {
-                let config = self.config.load_full();
-                loaded = StaticContext::load(&config, &session.cwd).await;
-                &loaded
-            }
-        };
-        self.build_ledger_from_events(session_id, tools, &events, static_context)
-            .await
-    }
-
     /// Assemble the ledger from an event snapshot. The turn loop keeps this
     /// snapshot and appends only new events after each tool batch.
     async fn build_ledger_from_events(
@@ -5384,89 +5316,6 @@ impl Daemon {
         );
     }
 
-    async fn context_compact(
-        &self,
-        params: ContextCompactParams,
-    ) -> Result<eix_core::ContextLedgerResult> {
-        let session = self.require_session(&params.session_id)?;
-        if session.status.is_busy() {
-            return Err(rpc(
-                "busy",
-                "wait for the turn to finish before compacting the context",
-            ));
-        }
-        let ledger = self.build_ledger(&params.session_id).await?;
-        let (from_seq, to_seq) = match (params.from_seq, params.to_seq) {
-            (Some(from), Some(to)) => (from, to),
-            _ => ledger
-                .message_range()
-                .ok_or_else(|| rpc("invalid_params", "there is nothing to compact yet"))?,
-        };
-        if from_seq == 0 || to_seq < from_seq {
-            return Err(rpc(
-                "invalid_params",
-                "context.compact needs 0 < from_seq <= to_seq",
-            ));
-        }
-        if ledger.overlaps_compaction(from_seq, to_seq) {
-            return Err(rpc(
-                "invalid_params",
-                "compaction range overlaps an existing summary",
-            ));
-        }
-        let (messages, tokens) = ledger.range_stats(from_seq, to_seq);
-        if messages == 0 {
-            return Err(rpc("invalid_params", "no messages in the requested range"));
-        }
-        let summary = match params
-            .summary
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-        {
-            Some(text) => text,
-            None if params.generate => self.generate_summary(&params.session_id, &ledger).await?,
-            None => "(the user compacted these messages; their text remains in the event log, \
-                     not in this request)"
-                .to_string(),
-        };
-        let event = self.store.append_event(
-            &params.session_id,
-            EventKind::ContextCompacted,
-            payload(&ContextCompactedPayload {
-                from_seq,
-                to_seq,
-                messages,
-                tokens,
-                summary,
-                rolling: false,
-            }),
-        )?;
-        self.emit_event(&event);
-        self.emit_value(
-            "context.compacted",
-            json!({
-                "session_id": params.session_id,
-                "from_seq": from_seq,
-                "to_seq": to_seq,
-                "messages": messages,
-                "tokens": tokens,
-            }),
-        );
-        let ledger = self.build_ledger(&params.session_id).await?;
-        self.emit_context(&params.session_id, &ledger);
-        Ok(ledger.info())
-    }
-
-    /// Ask the model to summarize the conversation so far. Used by `/compact`;
-    /// the result replaces the history in the provider request.
-    async fn generate_summary(&self, session_id: &str, ledger: &Ledger) -> Result<String> {
-        self.summarize_messages(session_id, ledger.messages(), None)
-            .await
-    }
-
-    /// Summarize only the messages that are about to leave the context. When
-    /// `previous` is present, produce a rolling handoff that also retains the
-    /// earlier summary's decisions and task state.
     async fn summarize_messages(
         &self,
         session_id: &str,
@@ -5649,30 +5498,6 @@ impl Daemon {
                 (ledger, true)
             }
         }
-    }
-
-    /// `/clear`: draw a line in the event log before which nothing is sent to
-    /// the provider again.
-    async fn context_clear(
-        &self,
-        params: ContextClearParams,
-    ) -> Result<eix_core::ContextLedgerResult> {
-        let session = self.require_session(&params.session_id)?;
-        if session.status.is_busy() {
-            return Err(rpc(
-                "busy",
-                "cancel the running turn before clearing the context",
-            ));
-        }
-        let event = self.store.append_event(
-            &params.session_id,
-            EventKind::ContextCleared,
-            payload(&ContextClearedPayload {}),
-        )?;
-        self.emit_event(&event);
-        let ledger = self.build_ledger(&params.session_id).await?;
-        self.emit_context(&params.session_id, &ledger);
-        Ok(ledger.info())
     }
 
     fn announce_patch(&self, session: &Session) {
