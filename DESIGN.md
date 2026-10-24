@@ -469,14 +469,25 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
   `awk` / `git status` 等）由统一风险分析判为 `ExecSafe`，不弹审批、不抓快照。
   工作区内的 `cd` 也直接放行；离开工作区、动态目标或 `cd -` 仍询问，避免后续相对路径
   被误判为工作区内读取。`env` / `timeout` / `nice` / `command` 等包装器只按实际执行的
-  命令判断，只有 `sudo` / `doas` 额外计入提权；`xargs` 仅在内层是 `wc` / `ls` / `stat`
-  等只报告名称、元数据或计数的命令时放行，内容读取器和 `-a` / `--arg-file` 保持询问。
-  重定向、后台运行、命令替换、子 shell、`find -exec` / `-delete` / `-files0-from`、
-  `rg --pre`、`fd -x`、`sed -i`、`awk` 的 `system`/重定向、`date -s`、`ss -K`、
-  `sort -o` / `-T` / `--files0-from`、`diff --paginate`、`xxd` / `uniq` 的第二个文件参数、
-  `wc` / `du --files0-from` 以及所有未知命令仍按风险处理（unknown 默认 ask），避免被
-  shell 语法绕过。`jq` 读取 `env` / `$ENV` 视为 secret 读取并硬拒绝，`jq -f` /
-  `--from-file` 等外部脚本保持询问。构建命令判为 `ExecSandboxed`，优先在沙箱内执行。
+  命令判断，只有 `sudo` / `doas` 额外计入提权；`env` 设置 `PATH` / `LD_PRELOAD` /
+  `GIT_*` 等可改变命令查找、动态加载或工具配置的变量时仍视为动态环境，普通 `FOO=1`
+  不影响。`xargs` 仅在内层是 `wc` / `ls` / `stat` 等只报告名称、元数据或计数的命令时
+  放行，内容读取器和 `-a` / `--arg-file` 保持询问；例外是下一段是 `wc` 的计数管道，
+  `xargs cat` / `head` / `tail` / `grep` / `strings` / `od` 只把内容交给计数，不输出原文。
+
+  `< file` 记为输入读取，`> file` / `>> file` 才记为写入。命令替换 `$(...)` / 反引号
+  递归分析内部命令；内部安全时允许，但替换结果作为路径、脚本、`cd` 目标、`xargs`
+  内层命令，或作为非纯输出命令的普通参数（可能变成 `git` / `date` / `grep` 的选项）
+  时仍走动态目标审批。静态 `for` 循环（工作区内的字面量/通配符列表）会先展开再逐条
+  分析，`n=$(...)` 等小写局部赋值按无副作用赋值处理，`printf -v` 只信任小写局部变量
+  名；绝对外部路径、`..`、隐藏文件通配符、命令替换列表、嵌套控制流、首段无字面前缀的
+  通配符（如裸 `*.rs`）以及循环体内的未知/写入命令仍询问。重定向、
+  后台运行、子 shell、`find -exec` / `-delete` / `-files0-from`、`rg --pre`、`fd -x`、
+  `sed -i`、`awk` 的 `system`/重定向、`date -s`、`ss -K`、`sort -o` / `-T` /
+  `--files0-from`、`diff --paginate`、`xxd` / `uniq` 的第二个文件参数、`wc` / `du
+  --files0-from` 以及所有未知命令仍按风险处理（unknown 默认 ask），避免被 shell 语法
+  绕过。`jq` 读取 `env` / `$ENV` 视为 secret 读取并硬拒绝，`jq -f` / `--from-file` 等
+  外部脚本保持询问。构建命令判为 `ExecSandboxed`，优先在沙箱内执行。
 
 ### 9.2 审批 UI
 

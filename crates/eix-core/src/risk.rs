@@ -93,8 +93,11 @@ pub struct CommandAnalysis {
     /// Command substitution, subshells, eval, xargs, or another form we cannot
     /// safely prove equivalent to the visible argv.
     pub dynamic: bool,
-    /// Redirection targets (files, not file descriptors).
+    /// Output redirection targets (files, not file descriptors).
     pub redirections: Vec<String>,
+    /// Input redirection targets (`< file`, `<&0`, ...).
+    #[serde(default)]
+    pub input_redirections: Vec<String>,
     pub reasons: Vec<String>,
 }
 
@@ -210,8 +213,256 @@ impl RiskAssessment {
     }
 }
 
+const CMDSUBST_MARKER_PREFIX: &str = "__EIX_CMDSUBST_";
+const CMDSUBST_MARKER_SUFFIX: &str = "__";
+
+#[derive(Debug)]
+struct ExtractedSubstitution {
+    inner: String,
+}
+
+fn command_substitution_marker(index: usize) -> String {
+    format!("{CMDSUBST_MARKER_PREFIX}{index}{CMDSUBST_MARKER_SUFFIX}")
+}
+
+fn contains_command_substitution_marker(text: &str) -> bool {
+    text.contains(CMDSUBST_MARKER_PREFIX)
+}
+
+fn command_substitution_argument_is_safe(segment: &CommandSegment) -> bool {
+    if !segment
+        .argv
+        .iter()
+        .any(|arg| contains_command_substitution_marker(arg))
+    {
+        return true;
+    }
+    let Some(program) = segment.argv.first() else {
+        return true;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    match program {
+        // These commands only produce output or a test result; arbitrary
+        // arguments cannot write files or change shell state.
+        "echo" | "true" | "false" | ":" | "test" | "[" => true,
+        "printf" => printf_command_substitution_is_safe(segment),
+        "export" => segment.argv.iter().skip(1).all(|arg| {
+            !contains_command_substitution_marker(arg)
+                || env_assignment_name(arg).is_some_and(|name| !env_assignment_is_risky(name))
+        }),
+        _ => false,
+    }
+}
+
+fn printf_command_substitution_is_safe(segment: &CommandSegment) -> bool {
+    // A substitution can expand to several words, including options. Once a
+    // fixed format argument has ended option parsing, later substitutions are
+    // data and harmless. Before that point, a substitution could become
+    // `-vPATH` or `-v PATH`, so it must stay gated.
+    let args = &segment.argv[1..];
+    let mut options = true;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options {
+            return true;
+        }
+        if contains_command_substitution_marker(arg) {
+            return false;
+        }
+        if arg == "--" {
+            options = false;
+            i += 1;
+            continue;
+        }
+        if arg == "-v" {
+            if args
+                .get(i + 1)
+                .is_some_and(|name| contains_command_substitution_marker(name))
+            {
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("-v") && arg.len() > 2 {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        options = false;
+        i += 1;
+    }
+    true
+}
+
+/// Replace command substitutions with opaque markers and return their inner
+/// commands. The inner commands are analyzed separately so a read-only
+/// substitution such as `$(find crates | wc -l)` does not make the whole
+/// command dynamic. The marker is deliberately treated as an external path
+/// by path classifiers: output substitution can still produce an arbitrary
+/// path, so `cat $(echo /etc/passwd)` remains gated even though the inner
+/// `echo` is harmless.
+fn extract_command_substitutions(command: &str) -> (String, Vec<ExtractedSubstitution>) {
+    let chars: Vec<char> = command.chars().collect();
+    let mut output = String::new();
+    let mut substitutions = Vec::new();
+    let mut i = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    let mut word_start = true;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if single_quoted {
+            output.push(ch);
+            if ch == '\'' {
+                single_quoted = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '\\' {
+            word_start = false;
+            output.push(ch);
+            if let Some(next) = chars.get(i + 1) {
+                output.push(*next);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '\'' && !double_quoted {
+            single_quoted = true;
+            word_start = false;
+            output.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            double_quoted = !double_quoted;
+            word_start = false;
+            output.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '#' && word_start && !double_quoted {
+            while i < chars.len() && chars[i] != '\n' {
+                output.push(chars[i]);
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '$' && chars.get(i + 1) == Some(&'(') && chars.get(i + 2) != Some(&'(') {
+            if let Some(end) = find_matching_paren(&chars, i + 2) {
+                let inner: String = chars[i + 2..end].iter().collect();
+                output.push_str(&command_substitution_marker(substitutions.len()));
+                substitutions.push(ExtractedSubstitution { inner });
+                i = end + 1;
+                word_start = false;
+                continue;
+            }
+        }
+        if ch == '`' {
+            if let Some(end) = find_matching_backtick(&chars, i + 1) {
+                let inner: String = chars[i + 1..end].iter().collect();
+                output.push_str(&command_substitution_marker(substitutions.len()));
+                substitutions.push(ExtractedSubstitution { inner });
+                i = end + 1;
+                word_start = false;
+                continue;
+            }
+        }
+        word_start = ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>');
+        output.push(ch);
+        i += 1;
+    }
+
+    (output, substitutions)
+}
+
+fn find_matching_paren(chars: &[char], start: usize) -> Option<usize> {
+    let mut depth = 1usize;
+    let mut i = start;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if single_quoted {
+            if ch == '\'' {
+                single_quoted = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '\\' {
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if ch == '\'' && !double_quoted {
+            single_quoted = true;
+            i += 1;
+            continue;
+        }
+        if ch == '"' {
+            double_quoted = !double_quoted;
+            i += 1;
+            continue;
+        }
+        if ch == '`' {
+            i = find_matching_backtick(chars, i + 1)? + 1;
+            continue;
+        }
+        if ch == '(' {
+            depth += 1;
+        } else if ch == ')' {
+            depth -= 1;
+            if depth == 0 {
+                return Some(i);
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn find_matching_backtick(chars: &[char], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < chars.len() {
+        if chars[i] == '\\' {
+            i = (i + 2).min(chars.len());
+            continue;
+        }
+        if chars[i] == '`' {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
 /// Parse a shell command into normalized segments without executing a shell.
 pub fn analyze_command(command: &str) -> CommandAnalysis {
+    analyze_command_depth(command, 0)
+}
+
+fn analyze_command_depth(command: &str, depth: usize) -> CommandAnalysis {
+    if depth > 16 {
+        let mut analysis = CommandAnalysis {
+            raw: command.to_string(),
+            dynamic: true,
+            ..Default::default()
+        };
+        analysis
+            .reasons
+            .push("command substitution nesting is too deep".to_string());
+        return analysis;
+    }
+    let (rewritten, substitutions) = extract_command_substitutions(command);
     let mut analysis = CommandAnalysis {
         raw: command.to_string(),
         ..Default::default()
@@ -219,11 +470,12 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
     let mut segments: Vec<RawSegment> = Vec::new();
     let mut tokens: Vec<String> = Vec::new();
     let mut redirections: Vec<String> = Vec::new();
+    let mut input_redirections: Vec<String> = Vec::new();
     let mut current_token = String::new();
     let mut token_started = false;
     let mut quote: Option<char> = None;
     let mut escaped = false;
-    let chars: Vec<char> = command.chars().collect();
+    let chars: Vec<char> = rewritten.chars().collect();
     let mut i = 0usize;
 
     macro_rules! push_token {
@@ -237,11 +489,12 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
     macro_rules! finish_segment {
         () => {{
             push_token!();
-            if !tokens.is_empty() || !redirections.is_empty() {
+            if !tokens.is_empty() || !redirections.is_empty() || !input_redirections.is_empty() {
                 let raw = tokens.join(" ");
                 segments.push(RawSegment {
                     argv: std::mem::take(&mut tokens),
                     redirections: std::mem::take(&mut redirections),
+                    input_redirections: std::mem::take(&mut input_redirections),
                     raw,
                 });
             }
@@ -316,6 +569,13 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
             }
             '<' | '>' => {
                 push_token!();
+                let is_input = ch == '<';
+                if chars.get(i + 1) == Some(&'(') {
+                    // `<(...)` / `>(...)` execute a nested command; do not
+                    // mistake the visible text for a plain redirection.
+                    analysis.dynamic = true;
+                    analysis.reasons.push("process substitution".to_string());
+                }
                 let mut op = ch.to_string();
                 if let Some(next) = chars.get(i + 1) {
                     if matches!(next, '<' | '>' | '&' | '|') {
@@ -360,11 +620,17 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
                     i += 1;
                 }
                 // `2>&1`, `>&2`, `<<EOF` are descriptors/heredocs, not files.
+                // Plain `< file` is an input read, not a write. `<>` is
+                // read-write, so keep treating it as an output redirection.
                 if !target.is_empty()
                     && !target.chars().all(|c| c.is_ascii_digit())
                     && !op.starts_with("<<")
                 {
-                    redirections.push(target);
+                    if is_input && op == "<" {
+                        input_redirections.push(target);
+                    } else {
+                        redirections.push(target);
+                    }
                 }
                 if op.starts_with("<<") {
                     analysis.dynamic = true;
@@ -415,13 +681,39 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
     // compiler from warning about the macro's last assignment.
     let _ = token_started;
 
-    for raw in segments {
+    for (index, raw) in segments.iter().enumerate() {
         if !raw.redirections.is_empty() {
             analysis
                 .redirections
                 .extend(raw.redirections.iter().cloned());
         }
-        expand_segment(&raw, &mut analysis);
+        if !raw.input_redirections.is_empty() {
+            analysis
+                .input_redirections
+                .extend(raw.input_redirections.iter().cloned());
+        }
+        let next_program = segments
+            .get(index + 1)
+            .and_then(|next| next.argv.first())
+            .map(String::as_str);
+        expand_segment(raw, next_program, &mut analysis);
+    }
+    for substitution in substitutions {
+        let nested = analyze_command_depth(&substitution.inner, depth + 1);
+        if nested.dynamic {
+            analysis.dynamic = true;
+        }
+        analysis.reasons.extend(
+            nested
+                .reasons
+                .into_iter()
+                .filter(|reason| reason != "command contains dynamic shell syntax"),
+        );
+        analysis.segments.extend(nested.segments);
+        analysis.redirections.extend(nested.redirections);
+        analysis
+            .input_redirections
+            .extend(nested.input_redirections);
     }
     if analysis.dynamic {
         analysis
@@ -435,13 +727,27 @@ pub fn analyze_command(command: &str) -> CommandAnalysis {
 struct RawSegment {
     argv: Vec<String>,
     redirections: Vec<String>,
+    input_redirections: Vec<String>,
     raw: String,
 }
 
-fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
+fn expand_segment(raw: &RawSegment, next_program: Option<&str>, analysis: &mut CommandAnalysis) {
     let mut argv = raw.argv.clone();
     let mut wrappers = Vec::new();
+    let mut stripped_assignment = false;
     while let Some(program) = argv.first().cloned() {
+        if let Some((name, _value)) = split_shell_assignment(&program) {
+            if shell_assignment_is_safe(name) {
+                // A lowercase variable assignment is a shell-local no-op for
+                // our purposes (`n=$(find ... | wc -l)`). The assignment
+                // value's command substitution has already been analyzed.
+                // Uppercase names are not stripped: PATH, LD_PRELOAD and
+                // friends can change command lookup or inject code.
+                stripped_assignment = true;
+                argv.remove(0);
+                continue;
+            }
+        }
         let base = program.rsplit('/').next().unwrap_or(&program).to_string();
         match base.as_str() {
             "sudo" | "doas" => {
@@ -453,6 +759,30 @@ fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
             }
             "env" => {
                 wrappers.push(base);
+                if argv[1..].iter().any(|arg| {
+                    env_assignment_name(arg).is_some_and(|name| {
+                        contains_command_substitution_marker(name) || env_assignment_is_risky(name)
+                    })
+                }) {
+                    analysis.dynamic = true;
+                    analysis.reasons.push(
+                        "env sets a variable that can alter command lookup or execution"
+                            .to_string(),
+                    );
+                }
+                if argv[1..].iter().any(|arg| {
+                    arg == "-a"
+                        || arg == "--argv0"
+                        || arg.starts_with("--argv0=")
+                        || (arg.starts_with("-a") && arg.len() > 2)
+                }) {
+                    // Changing argv[0] can change dispatch (for example
+                    // busybox applets) or login-shell behavior.
+                    analysis.dynamic = true;
+                    analysis
+                        .reasons
+                        .push("env changes the inner command's argv[0]".to_string());
+                }
                 if argv[1..].iter().any(|arg| {
                     arg == "-C"
                         || arg == "--chdir"
@@ -543,7 +873,7 @@ fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
                         "xargs reads arguments from a file that may hold secrets".to_string(),
                     );
                 }
-                if !xargs_inner_is_safe(&argv) {
+                if !xargs_inner_is_safe(&argv, next_program) {
                     analysis.dynamic = true;
                     analysis
                         .reasons
@@ -584,6 +914,9 @@ fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
                         );
                         analysis.segments.extend(nested.segments);
                         analysis.redirections.extend(nested.redirections);
+                        analysis
+                            .input_redirections
+                            .extend(nested.input_redirections);
                     }
                 }
                 return;
@@ -592,7 +925,9 @@ fn expand_segment(raw: &RawSegment, analysis: &mut CommandAnalysis) {
         }
     }
     if argv.is_empty() {
-        if let Some(original) = raw.argv.first() {
+        if stripped_assignment {
+            argv.push("true".to_string());
+        } else if let Some(original) = raw.argv.first() {
             argv.push(original.rsplit('/').next().unwrap_or(original).to_string());
         }
     }
@@ -637,11 +972,126 @@ fn skip_options(argv: &[String], value_options: &[&str]) -> Vec<String> {
 /// names. Deliberately excludes tools with output/exec options (`sort`,
 /// `tree`, `sed`, `awk`, `git`, ...), because a file named `-o` or `push`
 /// could otherwise turn the call into a write or publish.
-fn xargs_inner_is_safe(argv: &[String]) -> bool {
+fn split_shell_assignment(token: &str) -> Option<(&str, &str)> {
+    let (name, value) = token.split_once('=')?;
+    if name.is_empty()
+        || !name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+        || !name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return None;
+    }
+    Some((name, value))
+}
+
+fn shell_identifier_is_safe(name: &str) -> bool {
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
+fn loop_variable_is_safe(name: &str) -> bool {
+    // Uppercase names are ordinary shell variables unless they are one of the
+    // environment/loading/config hooks below. `for I in ...` is harmless,
+    // while `for PATH in ...` or `for LD_PRELOAD in ...` can change how the
+    // body's commands are looked up or loaded.
+    name != "_" && shell_identifier_is_safe(name) && !env_assignment_is_risky(name)
+}
+
+fn shell_assignment_is_safe(name: &str) -> bool {
+    // Lowercase shell variables are ordinary script-local variables. Uppercase
+    // names include PATH, ENV, BASH_ENV, LD_PRELOAD, IFS, PS4, etc.; leaving
+    // them in argv makes the segment unrecognized instead of silently
+    // auto-allowing a command whose lookup or environment was changed.
+    name.chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+        && name
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_lowercase())
+}
+
+fn printf_sets_risky_variable(args: &[String]) -> bool {
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if arg == "--" {
+            break;
+        }
+        if arg == "-v" {
+            if let Some(name) = args.get(i + 1) {
+                if contains_command_substitution_marker(name) || !shell_assignment_is_safe(name) {
+                    return true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(name) = arg.strip_prefix("-v").filter(|name| !name.is_empty()) {
+            if contains_command_substitution_marker(name) || !shell_assignment_is_safe(name) {
+                return true;
+            }
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        // The first non-option argument is the format string. printf does not
+        // parse later arguments as options, so `printf '%s' -v PATH` only
+        // prints them.
+        break;
+    }
+    false
+}
+
+fn xargs_content_reader_args_are_safe(program: &str, args: &[String]) -> bool {
+    if program == "grep" {
+        // Unlike cat/head/tail, grep can read a pattern file. `xargs grep -f
+        // .env | wc` would still read a secret into the matcher even though
+        // only the count reaches stdout.
+        let reads_pattern_file = args.iter().any(|arg| {
+            arg == "-f"
+                || arg == "--file"
+                || arg.starts_with("--file=")
+                || arg == "--exclude-from"
+                || arg.starts_with("--exclude-from=")
+                || (arg.starts_with("-f") && arg.len() > 2)
+        });
+        if reads_pattern_file {
+            return false;
+        }
+    }
+    true
+}
+
+fn xargs_inner_is_safe(argv: &[String], next_program: Option<&str>) -> bool {
     let Some(program) = argv.first() else {
         return true;
     };
     let program = program.rsplit('/').next().unwrap_or(program);
+    let consumed_by_wc = next_program
+        .and_then(|program| program.rsplit('/').next())
+        .is_some_and(|program| program == "wc");
+    if consumed_by_wc
+        && matches!(
+            program,
+            // A content reader is safe here only because the next pipeline
+            // stage is `wc`, which emits counts rather than file contents.
+            "cat" | "head" | "tail" | "grep" | "strings" | "od"
+        )
+        && xargs_content_reader_args_are_safe(program, &argv[1..])
+    {
+        return true;
+    }
     matches!(
         program,
         // Only commands that report names, metadata, or counts. Content
@@ -668,15 +1118,117 @@ fn xargs_inner_is_safe(argv: &[String]) -> bool {
     )
 }
 
+fn env_assignment_name(arg: &str) -> Option<&str> {
+    let (name, _) = arg.split_once('=')?;
+    (!name.is_empty()).then_some(name)
+}
+
+fn env_assignment_is_risky(name: &str) -> bool {
+    // Go's build/module caches are common per-command overrides and only point
+    // at cache directories; do not force an approval for `export GOCACHE=...`.
+    if matches!(name, "GOCACHE" | "GOMODCACHE") {
+        return false;
+    }
+    // Environment variables can change command lookup, load code, or point a
+    // tool at an attacker-controlled configuration. Keep this conservative:
+    // harmless names such as FOO=1 still pass, while the well-known execution
+    // and lookup hooks below gate `env`.
+    const EXACT: &[&str] = &[
+        "PATH",
+        "IFS",
+        "ENV",
+        "BASH_ENV",
+        "SHELLOPTS",
+        "BASHOPTS",
+        "PS4",
+        "PROMPT_COMMAND",
+        "GLOBIGNORE",
+        "CDPATH",
+        "HOME",
+        "PWD",
+        "OLDPWD",
+        "TMPDIR",
+        "SHELL",
+        "PAGER",
+        "MANPAGER",
+        "EDITOR",
+        "VISUAL",
+        "BROWSER",
+        "LESS",
+        "LESSOPEN",
+        "LESSCLOSE",
+        "LESSKEY",
+        "LESSKEYIN",
+        "VIMINIT",
+        "EXINIT",
+        "GVIMINIT",
+        "TAR_OPTIONS",
+        "GZIP",
+        "BZIP2",
+        "XZ_OPT",
+        "ZIPOPT",
+        "OPENSSL_CONF",
+        "GCONV_PATH",
+        "LOCPATH",
+        "CLASSPATH",
+        "CC",
+        "CXX",
+        "CPP",
+        "LD",
+        "AR",
+        "AS",
+        "CFLAGS",
+        "CPPFLAGS",
+        "CXXFLAGS",
+        "LDFLAGS",
+        "LDLIBS",
+    ];
+    const PREFIXES: &[&str] = &[
+        "LD_",
+        "DYLD_",
+        "BASH_FUNC_",
+        "PYTHON",
+        "PERL",
+        "RUBY",
+        "NODE_",
+        "JAVA",
+        "_JAVA",
+        "JDK_",
+        "GIT_",
+        "SSH_",
+        "CARGO_",
+        "RUST",
+        "GO",
+        "GEM_",
+        "BUNDLE_",
+        "LUA_",
+        "PHP_",
+        "MAKE",
+        "MFLAGS",
+        "MAVEN",
+        "GRADLE",
+        "SBT",
+        "SCALA",
+        "LEIN_",
+        "MIX_",
+        "ERL_",
+        "DOTNET_",
+        "XDG_",
+    ];
+    EXACT.contains(&name) || PREFIXES.iter().any(|prefix| name.starts_with(prefix))
+}
+
 fn skip_env(argv: &[String]) -> Vec<String> {
+    let mut options = true;
     let mut i = 0usize;
     while i < argv.len() {
         let arg = &argv[i];
-        if arg == "--" {
+        if options && arg == "--" {
+            options = false;
             i += 1;
-            break;
+            continue;
         }
-        if arg.starts_with('-') {
+        if options && arg.starts_with('-') {
             i += if matches!(arg.as_str(), "-u" | "--unset") {
                 2
             } else {
@@ -693,8 +1245,1181 @@ fn skip_env(argv: &[String]) -> Vec<String> {
     argv[i.min(argv.len())..].to_vec()
 }
 
+#[derive(Debug)]
+struct LoopWord {
+    text: String,
+    start: usize,
+    end: usize,
+    command_start: bool,
+    quoted: bool,
+}
+
+fn loop_word_end(command: &str, offsets: &[usize], index: usize) -> usize {
+    offsets.get(index).copied().unwrap_or(command.len())
+}
+
+fn read_loop_word(
+    command: &str,
+    chars: &[char],
+    offsets: &[usize],
+    mut i: usize,
+    command_start: bool,
+) -> Option<(LoopWord, usize)> {
+    let start = loop_word_end(command, offsets, i);
+    let mut text = String::new();
+    let mut quoted = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '<' | '>' | '(' | ')' | '{' | '}') {
+            break;
+        }
+        match ch {
+            '\'' => {
+                quoted = true;
+                i += 1;
+                while i < chars.len() && chars[i] != '\'' {
+                    text.push(chars[i]);
+                    i += 1;
+                }
+                if i >= chars.len() {
+                    return None;
+                }
+                i += 1;
+            }
+            '"' => {
+                quoted = true;
+                i += 1;
+                while i < chars.len() {
+                    let inner = chars[i];
+                    if inner == '\\' {
+                        i += 1;
+                        if i >= chars.len() {
+                            return None;
+                        }
+                        text.push(chars[i]);
+                        i += 1;
+                    } else if inner == '"' {
+                        i += 1;
+                        break;
+                    } else if inner == '$' && chars.get(i + 1) == Some(&'(') {
+                        let end = find_matching_paren(chars, i + 2)?;
+                        for ch in &chars[i..=end] {
+                            text.push(*ch);
+                        }
+                        i = end + 1;
+                    } else if inner == '`' {
+                        let end = find_matching_backtick(chars, i + 1)?;
+                        for ch in &chars[i..=end] {
+                            text.push(*ch);
+                        }
+                        i = end + 1;
+                    } else {
+                        text.push(inner);
+                        i += 1;
+                    }
+                }
+            }
+            '\\' => {
+                quoted = true;
+                i += 1;
+                if i < chars.len() {
+                    text.push(chars[i]);
+                    i += 1;
+                }
+            }
+            '$' if chars.get(i + 1) == Some(&'(') => {
+                quoted = true;
+                let end = find_matching_paren(chars, i + 2)?;
+                for ch in &chars[i..=end] {
+                    text.push(*ch);
+                }
+                i = end + 1;
+            }
+            '`' => {
+                quoted = true;
+                let end = find_matching_backtick(chars, i + 1)?;
+                for ch in &chars[i..=end] {
+                    text.push(*ch);
+                }
+                i = end + 1;
+            }
+            _ => {
+                text.push(ch);
+                i += 1;
+            }
+        }
+    }
+    let end = loop_word_end(command, offsets, i);
+    Some((
+        LoopWord {
+            text,
+            start,
+            end,
+            command_start,
+            quoted,
+        },
+        i,
+    ))
+}
+
+fn lex_loop_words(command: &str) -> Option<Vec<LoopWord>> {
+    let chars: Vec<char> = command.chars().collect();
+    let offsets: Vec<usize> = command.char_indices().map(|(byte, _)| byte).collect();
+    let mut words = Vec::new();
+    let mut i = 0usize;
+    let mut command_start = true;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            if ch == '\n' {
+                command_start = true;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == ';' {
+            command_start = true;
+            i += 1;
+            continue;
+        }
+        if ch == '&' {
+            command_start = true;
+            i += if chars.get(i + 1) == Some(&'&') { 2 } else { 1 };
+            continue;
+        }
+        if ch == '|' {
+            command_start = true;
+            i += if chars.get(i + 1) == Some(&'|') { 2 } else { 1 };
+            continue;
+        }
+        if matches!(ch, '(' | ')' | '{' | '}') {
+            command_start = true;
+            i += 1;
+            continue;
+        }
+        if ch == '#' && command_start {
+            while i < chars.len() && chars[i] != '\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '<' || ch == '>' {
+            // Heredocs and process substitution hide raw shell syntax that
+            // this lightweight lexer does not model; let the dynamic path
+            // keep the loop gated.
+            if chars.get(i + 1) == Some(&ch) || chars.get(i + 1) == Some(&'(') {
+                return None;
+            }
+            i += 1;
+            while i < chars.len() && matches!(chars[i], '<' | '>' | '&' | '|') {
+                i += 1;
+            }
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            if i < chars.len() && !matches!(chars[i], ';' | '|' | '&' | '\n') {
+                let (word, next) = read_loop_word(command, &chars, &offsets, i, false)?;
+                words.push(word);
+                i = next;
+            }
+            command_start = false;
+            continue;
+        }
+        let (word, next) = read_loop_word(command, &chars, &offsets, i, command_start)?;
+        words.push(word);
+        i = next;
+        command_start = false;
+    }
+    Some(words)
+}
+
+fn is_loop_keyword(word: &LoopWord, keyword: &str) -> bool {
+    !word.quoted && word.command_start && word.text == keyword
+}
+
+fn loop_word_is_safe(word: &str, cwd: &Path) -> bool {
+    let first_component = word.split('/').next().unwrap_or(word);
+    let could_start_with_glob = first_component.starts_with('*')
+        || first_component.starts_with('?')
+        || first_component.starts_with('[');
+    !word.is_empty()
+        && !word.starts_with('-')
+        && !word.starts_with('~')
+        && !word.contains("..")
+        && !word.contains('$')
+        && !word.contains('`')
+        && !word.chars().any(|ch| {
+            ch.is_whitespace()
+                || matches!(
+                    ch,
+                    ';' | '|' | '&' | '<' | '>' | '(' | ')' | '{' | '}' | '\'' | '"' | '\\' | '#'
+                )
+        })
+        // A leading glob can expand to an argument such as `-o`, which the
+        // inner command may treat as an option. Keep a literal prefix (for
+        // example `crates/*`) so loop expansion cannot hide option injection.
+        && !could_start_with_glob
+        && word != "*"
+        && !word.split('/').any(|component| {
+            (component.starts_with('.') && component != "." && component != "./")
+                || (component.starts_with('[') && component.contains('.'))
+        })
+        && !is_outside_workspace(word, cwd)
+}
+
+fn substitute_shell_var(command: &str, variable: &str, value: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut output = String::new();
+    let mut i = 0usize;
+    let mut single_quoted = false;
+    let mut double_quoted = false;
+    while i < chars.len() {
+        let ch = chars[i];
+        if single_quoted {
+            output.push(ch);
+            if ch == '\'' {
+                single_quoted = false;
+            }
+            i += 1;
+            continue;
+        }
+        if ch == '\\' {
+            output.push(ch);
+            if let Some(next) = chars.get(i + 1) {
+                output.push(*next);
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '"' {
+            double_quoted = !double_quoted;
+            output.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '\'' && !double_quoted {
+            single_quoted = true;
+            output.push(ch);
+            i += 1;
+            continue;
+        }
+        if ch == '$' {
+            if chars.get(i + 1) == Some(&'{') {
+                if let Some(close) = chars[i + 2..].iter().position(|ch| *ch == '}') {
+                    let name: String = chars[i + 2..i + 2 + close].iter().collect();
+                    if name == variable {
+                        output.push_str(value);
+                        i += 3 + close;
+                        continue;
+                    }
+                }
+            } else {
+                let mut end = i + 1;
+                while end < chars.len() && (chars[end].is_ascii_alphanumeric() || chars[end] == '_')
+                {
+                    end += 1;
+                }
+                let name: String = chars[i + 1..end].iter().collect();
+                if name == variable {
+                    output.push_str(value);
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        output.push(ch);
+        i += 1;
+    }
+    output
+}
+
+fn skip_loop_body_start(command: &str, mut position: usize) -> usize {
+    while let Some(ch) = command[position..].chars().next() {
+        if ch.is_whitespace() || ch == ';' {
+            position += ch.len_utf8();
+        } else {
+            break;
+        }
+    }
+    position
+}
+
+const DYNAMIC_LOOP_VALUE: &str = "__EIX_DYNAMIC_LOOP_VALUE__";
+
+struct DynamicPathList {
+    /// Kept for diagnostics/tests. The value itself is not trusted for option
+    /// or path safety because command substitution word-splitting can break it
+    /// into fragments.
+    _prefix: Option<String>,
+}
+
+fn dynamic_producer(loop_word: &LoopWord, command: &str) -> Option<String> {
+    // A quoted substitution is one value, not a word list, and would make the
+    // loop body operate on a single multi-line string. Keep it on the gated
+    // path.
+    let raw = command.get(loop_word.start..loop_word.end)?;
+    if raw.starts_with('"') || raw.starts_with('\'') {
+        return None;
+    }
+    let (rewritten, substitutions) = extract_command_substitutions(&loop_word.text);
+    if substitutions.len() != 1 || rewritten != command_substitution_marker(0) {
+        return None;
+    }
+    Some(substitutions.into_iter().next()?.inner)
+}
+
+fn is_path_list_filter(segment: &CommandSegment) -> bool {
+    let Some(program) = segment.argv.first() else {
+        return false;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    let args = &segment.argv[1..];
+    match program {
+        "grep" => {
+            // A filter must consume stdin and preserve whole lines. More than
+            // one non-option argument means grep has a file operand and its
+            // output is no longer the producer's path list.
+            let mut non_options = 0usize;
+            for arg in args {
+                if arg == "--" {
+                    continue;
+                }
+                if !arg.starts_with('-') {
+                    non_options += 1;
+                }
+            }
+            non_options <= 1
+                && !args.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "-r" | "-R"
+                            | "-o"
+                            | "-l"
+                            | "-L"
+                            | "-z"
+                            | "--null-data"
+                            | "--only-matching"
+                            | "--files-with-matches"
+                            | "--files-without-match"
+                    )
+                })
+        }
+        "head" | "tail" => {
+            !args.iter().any(|arg| {
+                arg == "-c"
+                    || arg == "-z"
+                    || arg.starts_with("-c")
+                    || arg.starts_with("--bytes")
+                    || arg.starts_with("--zero-terminated")
+            }) && args.iter().all(|arg| {
+                arg.starts_with('-') || arg.chars().all(|ch| ch.is_ascii_digit() || ch == '+')
+            })
+        }
+        "sort" => args.iter().all(|arg| {
+            matches!(
+                arg.as_str(),
+                "-r" | "-n" | "-u" | "-f" | "-d" | "-g" | "-h" | "-M" | "-V" | "-b" | "-s"
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn find_path_list_prefix(args: &[String], cwd: &Path) -> Option<Option<String>> {
+    let mut index = 0usize;
+    while matches!(
+        args.get(index).map(String::as_str),
+        Some("-L" | "-H" | "-P")
+    ) {
+        index += 1;
+    }
+    let mut paths = Vec::new();
+    while let Some(arg) = args.get(index) {
+        if arg.starts_with('-') || matches!(arg.as_str(), "!" | "(" | ")") {
+            break;
+        }
+        paths.push(arg.clone());
+        index += 1;
+    }
+    if paths.is_empty() {
+        return None;
+    }
+    for path in &paths {
+        if path.is_empty()
+            || path.starts_with('-')
+            || path.starts_with('~')
+            || path.contains('$')
+            || path.contains('`')
+            || path.contains("..")
+            || path
+                .chars()
+                .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}' | ';' | '|' | '&'))
+            || is_outside_workspace(path, cwd)
+        {
+            return None;
+        }
+    }
+    // These expressions change or redirect find's output instead of emitting
+    // one path per line.
+    for arg in args.iter().skip(index) {
+        if matches!(
+            arg.as_str(),
+            "-print0"
+                | "-printf"
+                | "-fprint"
+                | "-fprint0"
+                | "-fprintf"
+                | "-fls"
+                | "-exec"
+                | "-execdir"
+                | "-ok"
+                | "-okdir"
+                | "-delete"
+        ) {
+            return None;
+        }
+    }
+    let prefix = if paths.len() == 1 {
+        let path = paths[0].trim_end_matches('/');
+        if path == "." {
+            Some("./".to_string())
+        } else if path.is_empty() {
+            None
+        } else {
+            Some(format!("{path}/"))
+        }
+    } else {
+        None
+    };
+    Some(prefix)
+}
+
+fn git_path_list_prefix(args: &[String]) -> Option<Option<String>> {
+    let subcommand = args.first()?.as_str();
+    let rest = &args[1..];
+    let has = |flag: &str| rest.iter().any(|arg| arg == flag);
+    let has_z = rest
+        .iter()
+        .any(|arg| arg == "-z" || arg == "--null" || arg == "--zero-terminated");
+    if has_z {
+        return None;
+    }
+    match subcommand {
+        "diff" => {
+            if !has("--name-only") || has("--name-status") || has("--raw") || has("--patch") {
+                return None;
+            }
+            Some(None)
+        }
+        "ls-files" => {
+            if has("--stage")
+                || rest
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "-s" | "--format" | "--debug" | "--eol"))
+            {
+                return None;
+            }
+            Some(None)
+        }
+        "ls-tree" => {
+            if !has("-r") || !has("--name-only") || has("--long") {
+                return None;
+            }
+            Some(None)
+        }
+        _ => None,
+    }
+}
+
+fn rg_path_list_prefix(args: &[String]) -> Option<Option<String>> {
+    let has_files = args.iter().any(|arg| arg == "--files");
+    let has_files_with_matches = args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-l" | "--files-with-matches" | "--files-without-match"
+        )
+    });
+    if !has_files && !has_files_with_matches {
+        return None;
+    }
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-z" | "--null"))
+    {
+        return None;
+    }
+    // Path prefixes are not trusted; the body must use its own literal
+    // relative prefix (for example `./$f`).
+    Some(None)
+}
+
+fn dynamic_path_list(risk: &RiskAssessment, cwd: &Path) -> Option<DynamicPathList> {
+    if risk.default_action() != PermissionAction::Allow {
+        return None;
+    }
+    if risk.categories.iter().any(|category| {
+        matches!(
+            category,
+            RiskCategory::SecretRead
+                | RiskCategory::WriteLocal
+                | RiskCategory::WriteExternal
+                | RiskCategory::ExecUnknown
+                | RiskCategory::Destructive
+                | RiskCategory::Network
+                | RiskCategory::GitPublish
+                | RiskCategory::GitRewrite
+                | RiskCategory::Privilege
+                | RiskCategory::SecretExfil
+        )
+    }) {
+        return None;
+    }
+    let analysis = risk.analysis.as_ref()?;
+    if !analysis
+        .redirections
+        .iter()
+        .all(|target| target == "/dev/null")
+        || !analysis.input_redirections.is_empty()
+    {
+        return None;
+    }
+    let mut segments = analysis.segments.iter();
+    let first = segments.next()?;
+    let Some(program) = first.argv.first() else {
+        return None;
+    };
+    let program = program.rsplit('/').next().unwrap_or(program);
+    let prefix = match program {
+        "find" => find_path_list_prefix(&first.argv[1..], cwd)?,
+        "git" => git_path_list_prefix(&first.argv[1..])?,
+        "rg" => rg_path_list_prefix(&first.argv[1..])?,
+        _ => return None,
+    };
+    for segment in segments {
+        if !is_path_list_filter(segment) {
+            return None;
+        }
+    }
+    Some(DynamicPathList { _prefix: prefix })
+}
+
+fn printf_sentinel_is_data(segment: &CommandSegment, needle: &str) -> bool {
+    let args = &segment.argv[1..];
+    let mut options = true;
+    let mut i = 0usize;
+    while i < args.len() {
+        let arg = args[i].as_str();
+        if !options {
+            return true;
+        }
+        if arg.contains(needle) {
+            return false;
+        }
+        if arg == "--" {
+            options = false;
+            i += 1;
+            continue;
+        }
+        if arg == "-v" {
+            if args.get(i + 1).is_some_and(|name| name.contains(needle)) {
+                return false;
+            }
+            i += 2;
+            continue;
+        }
+        if arg.starts_with("-v") && arg.len() > 2 {
+            i += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            i += 1;
+            continue;
+        }
+        options = false;
+        i += 1;
+    }
+    true
+}
+
+fn safe_output_consumer(program: &str) -> bool {
+    matches!(
+        program,
+        "cat"
+            | "head"
+            | "tail"
+            | "wc"
+            | "sort"
+            | "uniq"
+            | "grep"
+            | "cut"
+            | "tr"
+            | "nl"
+            | "tac"
+            | "rev"
+            | "fold"
+            | "fmt"
+            | "expand"
+            | "unexpand"
+            | "paste"
+            | "join"
+            | "comm"
+            | "base64"
+            | "base32"
+            | "od"
+            | "hexdump"
+            | "xxd"
+            | "strings"
+            | "column"
+    )
+}
+
+fn output_only_body_program(program: &str) -> bool {
+    matches!(
+        program,
+        "echo" | "printf" | "true" | "false" | ":" | "test" | "["
+    ) || safe_output_consumer(program)
+}
+
+fn body_is_output_only(body: &str, body_risk: &RiskAssessment, needle: &str) -> bool {
+    if body_risk.default_action() != PermissionAction::Allow {
+        return false;
+    }
+    let Some(analysis) = body_risk.analysis.as_ref() else {
+        return false;
+    };
+    if analysis
+        .redirections
+        .iter()
+        .chain(analysis.input_redirections.iter())
+        .any(|target| target.contains(needle))
+    {
+        return false;
+    }
+    // Reject an output-only loop that pipes dynamic text into an interpreter
+    // (`... | sh`). The generic analyzer treats a bare nested shell as a
+    // wrapper, so inspect the source words as well.
+    if let Some(words) = lex_loop_words(body) {
+        for word in words {
+            if !word.command_start {
+                continue;
+            }
+            let program = word.text.rsplit('/').next().unwrap_or(&word.text);
+            if !output_only_body_program(program) {
+                return false;
+            }
+        }
+    } else {
+        return false;
+    }
+    let mut saw_use = false;
+    for segment in &analysis.segments {
+        if !segment.argv.iter().any(|arg| arg.contains(needle)) {
+            continue;
+        }
+        saw_use = true;
+        let Some(program) = segment.argv.first() else {
+            return false;
+        };
+        let program = program.rsplit('/').next().unwrap_or(program);
+        match program {
+            "echo" | "true" | "false" | ":" | "test" | "[" => {}
+            "printf" => {
+                if !printf_sentinel_is_data(segment, needle) {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+    saw_use
+}
+
+fn unsafe_interpreter(program: &str) -> bool {
+    matches!(
+        program,
+        "sh" | "bash"
+            | "zsh"
+            | "dash"
+            | "ksh"
+            | "fish"
+            | "eval"
+            | "exec"
+            | "source"
+            | "."
+            | "xargs"
+    )
+}
+
+fn command_has_unsafe_interpreter(command: &str, risk: &RiskAssessment) -> bool {
+    if let Some(words) = lex_loop_words(command) {
+        for word in words {
+            if word.command_start {
+                let program = word.text.rsplit('/').next().unwrap_or(&word.text);
+                if unsafe_interpreter(program) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Some(analysis) = &risk.analysis {
+        for segment in &analysis.segments {
+            if let Some(program) = segment.argv.first() {
+                let program = program.rsplit('/').next().unwrap_or(program);
+                if unsafe_interpreter(program) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn suffix_pipeline_is_safe(command: &str, done_end: usize) -> bool {
+    let suffix = command[done_end..].trim_start();
+    if !suffix.starts_with('|') || suffix.starts_with("||") {
+        return true;
+    }
+    let chars: Vec<char> = suffix.chars().collect();
+    let mut i = 0usize;
+    let mut expect_program = true;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch.is_whitespace() {
+            i += 1;
+            continue;
+        }
+        if ch == '|' {
+            if chars.get(i + 1) == Some(&'|') {
+                return true;
+            }
+            i += if chars.get(i + 1) == Some(&'&') { 2 } else { 1 };
+            expect_program = true;
+            continue;
+        }
+        if matches!(ch, ';' | '&' | '\n') {
+            return true;
+        }
+        if !expect_program {
+            // Skip the rest of this stage, respecting quotes, so a pipe in a
+            // grep pattern does not look like a new stage.
+            let mut single = false;
+            let mut double = false;
+            let mut escaped = false;
+            while i < chars.len() {
+                let ch = chars[i];
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if single {
+                    if ch == '\'' {
+                        single = false;
+                    }
+                } else if double {
+                    if ch == '"' {
+                        double = false;
+                    }
+                } else if ch == '\'' {
+                    single = true;
+                } else if ch == '"' {
+                    double = true;
+                } else if matches!(ch, '|' | ';' | '&' | '\n') {
+                    break;
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if ch == '!' {
+            i += 1;
+            continue;
+        }
+        let mut program = String::new();
+        let mut single = false;
+        let mut double = false;
+        let mut escaped = false;
+        while i < chars.len() {
+            let ch = chars[i];
+            if escaped {
+                program.push(ch);
+                escaped = false;
+            } else if ch == '\\' && !single {
+                escaped = true;
+            } else if single {
+                if ch == '\'' {
+                    single = false;
+                } else {
+                    program.push(ch);
+                }
+            } else if double {
+                if ch == '"' {
+                    double = false;
+                } else {
+                    program.push(ch);
+                }
+            } else if ch == '\'' {
+                single = true;
+            } else if ch == '"' {
+                double = true;
+            } else if ch.is_whitespace() || matches!(ch, '|' | ';' | '&' | '\n') {
+                break;
+            } else {
+                program.push(ch);
+            }
+            i += 1;
+        }
+        if program.is_empty() {
+            return false;
+        }
+        let program = program.rsplit('/').next().unwrap_or(&program);
+        if !safe_output_consumer(program) {
+            return false;
+        }
+        expect_program = false;
+    }
+    true
+}
+
+fn quoted_literal_prefix(raw: &str, byte_start: usize) -> Option<String> {
+    let mut single = false;
+    let mut double = false;
+    let mut escaped = false;
+    let mut prefix = String::new();
+    for (offset, ch) in raw.char_indices() {
+        if offset >= byte_start {
+            break;
+        }
+        if escaped {
+            escaped = false;
+            prefix.push(ch);
+            continue;
+        }
+        if ch == '\\' && !single {
+            escaped = true;
+            continue;
+        }
+        if single {
+            if ch == '\'' {
+                single = false;
+            } else {
+                prefix.push(ch);
+            }
+            continue;
+        }
+        if ch == '\'' && !double {
+            single = true;
+            continue;
+        }
+        if ch == '"' {
+            double = !double;
+            continue;
+        }
+        prefix.push(ch);
+    }
+    double.then_some(prefix)
+}
+
+fn path_prefix_is_safe(prefix: &str) -> bool {
+    !prefix.is_empty()
+        && !prefix.starts_with('-')
+        && !prefix.starts_with('/')
+        && !prefix.starts_with('~')
+        && !prefix.contains("..")
+        && !prefix.contains('=')
+        && !prefix.contains('$')
+        && !prefix.contains('`')
+        && !prefix
+            .chars()
+            .any(|ch| matches!(ch, '*' | '?' | '[' | ']' | '{' | '}'))
+}
+
+fn loop_variable_occurrence_is_safe(
+    raw: &str,
+    offset: usize,
+    output_program: bool,
+    command_start: bool,
+) -> bool {
+    if output_program {
+        // echo/test/true/false/: only emit or test data; they cannot write,
+        // read file contents, or change shell state through an argument.
+        return true;
+    }
+    if command_start {
+        return false;
+    }
+    let Some(prefix) = quoted_literal_prefix(raw, offset) else {
+        return false;
+    };
+    path_prefix_is_safe(&prefix)
+}
+
+fn loop_variable_uses_are_safe(body: &str, variable: &str) -> bool {
+    let Some(words) = lex_loop_words(body) else {
+        return false;
+    };
+    let exact_short = format!("${variable}");
+    let exact_long = format!("${{{variable}}}");
+    let mut current_program: Option<String> = None;
+    for word in &words {
+        if word.command_start {
+            current_program = if word.text.contains('=') && !word.text.starts_with('-') {
+                None
+            } else {
+                Some(
+                    word.text
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or(&word.text)
+                        .to_string(),
+                )
+            };
+        } else if current_program.is_none() {
+            current_program = Some(
+                word.text
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&word.text)
+                    .to_string(),
+            );
+        }
+        let output_program = matches!(
+            current_program.as_deref(),
+            Some("echo" | "true" | "false" | ":" | "test" | "[")
+        );
+        let raw = &body[word.start..word.end];
+        let mut search_from = 0usize;
+        while let Some(relative) = raw[search_from..].find(&exact_short) {
+            let offset = search_from + relative;
+            // Avoid matching `$foo` when the loop variable is `f`.
+            let after = raw[offset + exact_short.len()..].chars().next();
+            if after.is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_') {
+                search_from = offset + exact_short.len();
+                continue;
+            }
+            if !loop_variable_occurrence_is_safe(raw, offset, output_program, word.command_start) {
+                return false;
+            }
+            search_from = offset + exact_short.len();
+        }
+        while let Some(relative) = raw[search_from..].find(&exact_long) {
+            let offset = search_from + relative;
+            if !loop_variable_occurrence_is_safe(raw, offset, output_program, word.command_start) {
+                return false;
+            }
+            search_from = offset + exact_long.len();
+        }
+    }
+    true
+}
+
+fn expand_dynamic_for_loop(command: &str, cwd: &Path) -> Option<String> {
+    const MAX_EXPANDED_BYTES: usize = 64 * 1024;
+
+    let words = lex_loop_words(command)?;
+    let for_index = words.iter().position(|word| is_loop_keyword(word, "for"))?;
+    let variable = words.get(for_index + 1)?;
+    if variable.quoted || !loop_variable_is_safe(&variable.text) {
+        return None;
+    }
+    let in_word = words.get(for_index + 2)?;
+    if in_word.quoted || in_word.text != "in" {
+        return None;
+    }
+    let value_word = words.get(for_index + 3)?;
+    if is_loop_keyword(value_word, "do") {
+        return None;
+    }
+    let do_word = words.get(for_index + 4)?;
+    if !is_loop_keyword(do_word, "do") {
+        return None;
+    }
+    let producer = dynamic_producer(value_word, command)?;
+    let producer_risk = assess_command(&producer, cwd);
+    if producer_risk.default_action() != PermissionAction::Allow
+        || command_has_unsafe_interpreter(&producer, &producer_risk)
+    {
+        return None;
+    }
+
+    let mut depth = 1usize;
+    let mut done_index = None;
+    for (offset, word) in words.iter().enumerate().skip(for_index + 5) {
+        if is_loop_keyword(word, "do") {
+            return None;
+        }
+        if is_loop_keyword(word, "done") {
+            depth -= 1;
+            if depth == 0 {
+                done_index = Some(offset);
+                break;
+            }
+        }
+    }
+    let done_index = done_index?;
+    if !suffix_pipeline_is_safe(command, words[done_index].end) {
+        return None;
+    }
+    let body_start = skip_loop_body_start(command, do_word.end);
+    let body_end = words[done_index].start;
+    if body_start > body_end {
+        return None;
+    }
+    let body = &command[body_start..body_end];
+    if body.trim().is_empty() {
+        let replacement = if producer.trim().is_empty() {
+            "true".to_string()
+        } else {
+            format!("{producer}\ntrue")
+        };
+        let mut expanded = String::new();
+        expanded.push_str(&command[..words[for_index].start]);
+        expanded.push_str(&replacement);
+        expanded.push_str(&command[words[done_index].end..]);
+        return (expanded != command && expanded.len() <= MAX_EXPANDED_BYTES).then_some(expanded);
+    }
+
+    let sentinel_body = substitute_shell_var(body, &variable.text, DYNAMIC_LOOP_VALUE);
+    let body_risk = assess_command(&sentinel_body, cwd);
+    if body_risk.default_action() != PermissionAction::Allow
+        || command_has_unsafe_interpreter(body, &body_risk)
+    {
+        return None;
+    }
+    let variable_is_used = sentinel_body != *body;
+    let output_only = variable_is_used && body_is_output_only(body, &body_risk, DYNAMIC_LOOP_VALUE);
+    if variable_is_used && !output_only {
+        // A path-reading body needs a producer whose output is a workspace
+        // path list. Values must also be used behind a literal relative
+        // prefix; command substitution splits on whitespace, so a value (or a
+        // fragment of one) can begin with `-` or `/`.
+        dynamic_path_list(&producer_risk, cwd)?;
+        if !loop_variable_uses_are_safe(body, &variable.text) {
+            return None;
+        }
+    }
+
+    let mut expanded = String::new();
+    expanded.push_str(&command[..words[for_index].start]);
+    if !producer.trim().is_empty() {
+        expanded.push_str(&producer);
+        expanded.push('\n');
+    }
+    expanded.push_str(&sentinel_body);
+    expanded.push_str(&command[words[done_index].end..]);
+    if expanded == command || expanded.len() > MAX_EXPANDED_BYTES {
+        return None;
+    }
+    Some(expanded)
+}
+
+/// Expand a statically bounded `for` loop into its body commands. This is not
+/// a general shell implementation: it only handles loops whose word list is
+/// literal, workspace-local, free of shell metacharacters, and whose body can
+/// be re-analyzed after substituting the loop variable. Anything else returns
+/// `None`, leaving the existing dynamic-command gate in place.
+fn expand_safe_for_loops(command: &str, cwd: &Path) -> Option<String> {
+    if let Some(expanded) = expand_dynamic_for_loop(command, cwd) {
+        return Some(expanded);
+    }
+
+    const MAX_LOOP_WORDS: usize = 256;
+    const MAX_EXPANDED_BYTES: usize = 64 * 1024;
+
+    let words = lex_loop_words(command)?;
+    let for_index = words.iter().position(|word| is_loop_keyword(word, "for"))?;
+    let variable = words.get(for_index + 1)?;
+    if variable.quoted || !loop_variable_is_safe(&variable.text) {
+        return None;
+    }
+    let in_word = words.get(for_index + 2)?;
+    if in_word.quoted || in_word.text != "in" {
+        return None;
+    }
+
+    let mut values = Vec::new();
+    let mut index = for_index + 3;
+    let mut do_index = None;
+    while index < words.len() {
+        let word = &words[index];
+        if is_loop_keyword(word, "do") {
+            do_index = Some(index);
+            break;
+        }
+        if word.command_start {
+            return None;
+        }
+        if values.len() >= MAX_LOOP_WORDS {
+            return None;
+        }
+        values.push(word.text.clone());
+        index += 1;
+    }
+    let do_index = do_index?;
+
+    let mut depth = 1usize;
+    let mut done_index = None;
+    for (offset, word) in words.iter().enumerate().skip(do_index + 1) {
+        if is_loop_keyword(word, "do") {
+            // Nested `for`/`while` bodies can shadow the outer variable. Keep
+            // them on the dynamic path rather than trying to model scoping.
+            return None;
+        } else if is_loop_keyword(word, "done") {
+            depth -= 1;
+            if depth == 0 {
+                done_index = Some(offset);
+                break;
+            }
+        }
+    }
+    let done_index = done_index?;
+    let body_start = skip_loop_body_start(command, words[do_index].end);
+    let body_end = words[done_index].start;
+    if body_start > body_end {
+        return None;
+    }
+    let body = &command[body_start..body_end];
+    if values.len().saturating_mul(body.len()) > MAX_EXPANDED_BYTES {
+        return None;
+    }
+
+    let mut replacement = String::new();
+    if values.is_empty() || body.trim().is_empty() {
+        replacement.push_str("true");
+    } else {
+        for (offset, value) in values.iter().enumerate() {
+            if !loop_word_is_safe(value, cwd) {
+                return None;
+            }
+            if offset > 0 {
+                replacement.push('\n');
+            }
+            replacement.push_str(&substitute_shell_var(body, &variable.text, value));
+        }
+    }
+
+    let mut expanded = String::new();
+    expanded.push_str(&command[..words[for_index].start]);
+    expanded.push_str(&replacement);
+    expanded.push_str(&command[words[done_index].end..]);
+    if expanded == command || expanded.len() > MAX_EXPANDED_BYTES {
+        return None;
+    }
+    if let Some(further) = expand_safe_for_loops(&expanded, cwd) {
+        Some(further)
+    } else {
+        Some(expanded)
+    }
+}
+
 /// Classify a parsed command. Paths are interpreted relative to `cwd`.
 pub fn assess_command(command: &str, cwd: &Path) -> RiskAssessment {
+    if command.contains("for") {
+        if let Some(expanded) = expand_safe_for_loops(command, cwd) {
+            return assess_command(&expanded, cwd);
+        }
+    }
     let analysis = analyze_command(command);
     let mut risk = RiskAssessment {
         analysis: Some(analysis.clone()),
@@ -741,7 +2466,21 @@ pub fn assess_command(command: &str, cwd: &Path) -> RiskAssessment {
             );
         }
     }
+    for target in &analysis.input_redirections {
+        if target == "/dev/null" {
+            continue;
+        }
+        classify_read_file("input redirection", target, cwd, &mut risk);
+    }
     for segment in &analysis.segments {
+        if !command_substitution_argument_is_safe(segment) {
+            risk.add(
+                RiskCategory::ExecUnknown,
+                RiskLevel::High,
+                "command substitution output is used as an argument whose effect cannot be proven"
+                    .to_string(),
+            );
+        }
         classify_segment(segment, cwd, &mut risk);
     }
     let network_segment = analysis.segments.iter().any(|segment| {
@@ -816,6 +2555,13 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
             "nohup may write nohup.out".to_string(),
         );
     }
+    if program == "printf" && printf_sets_risky_variable(args) {
+        risk.add(
+            RiskCategory::ExecUnknown,
+            RiskLevel::High,
+            "printf -v writes a variable that can alter later commands".to_string(),
+        );
+    }
     match program {
         "printenv" | "env" | "set" => {
             risk.add(
@@ -832,6 +2578,25 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
                 "prints the process environment, which may contain credentials".to_string(),
             );
             risk.hard_deny = true;
+        }
+        "export" => {
+            if args
+                .iter()
+                .filter_map(|arg| env_assignment_name(arg))
+                .any(env_assignment_is_risky)
+            {
+                risk.add(
+                    RiskCategory::ExecUnknown,
+                    RiskLevel::High,
+                    "export changes a variable that can alter command lookup or execution",
+                );
+            } else {
+                risk.add(
+                    RiskCategory::ExecSafe,
+                    RiskLevel::Low,
+                    "export only changes the shell environment",
+                );
+            }
         }
         "rm" => classify_rm(args, cwd, risk),
         "dd" => {
@@ -932,6 +2697,38 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
                 RiskLevel::High,
                 format!("{program} performs network I/O"),
             );
+        }
+        "gofmt" => {
+            if args.iter().any(|arg| {
+                arg == "-w" || arg == "--w" || arg.starts_with("-w=") || arg.starts_with("--w=")
+            }) {
+                risk.add(
+                    RiskCategory::WriteLocal,
+                    RiskLevel::Medium,
+                    "gofmt rewrites source files",
+                );
+            } else {
+                risk.add(
+                    RiskCategory::Read,
+                    RiskLevel::Low,
+                    "gofmt only reports formatted source",
+                );
+            }
+        }
+        "go" if args.first().map(String::as_str) == Some("env") => {
+            if args.iter().any(|arg| matches!(arg.as_str(), "-w" | "-u")) {
+                risk.add(
+                    RiskCategory::WriteLocal,
+                    RiskLevel::Medium,
+                    "go env changes the Go environment",
+                );
+            } else {
+                risk.add(
+                    RiskCategory::Read,
+                    RiskLevel::Low,
+                    "go env prints Go environment settings",
+                );
+            }
         }
         "cargo" | "rustc" | "make" | "cmake" | "ninja" | "meson" | "bazel" | "just" | "npm"
         | "pnpm" | "yarn" | "pytest" | "mvn" | "gradle" | "bundle" | "dotnet" | "go" | "swift"
@@ -1320,7 +3117,8 @@ fn classify_git(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
         matches!(
             arg.as_str(),
             "--ext-diff" | "--textconv" | "--open-files-in-pager" | "--paginate" | "--no-index"
-        )
+        ) || arg.starts_with("--open-files-in-pager=")
+            || (arg.starts_with("-O") && !arg.starts_with("--"))
     }) {
         risk.add(
             RiskCategory::ExecUnknown,
@@ -1433,7 +3231,8 @@ fn classify_cd(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
         );
         return;
     }
-    if target.contains('$') || target.contains('`') {
+    if target.contains('$') || target.contains('`') || contains_command_substitution_marker(target)
+    {
         risk.add(
             RiskCategory::ExecUnknown,
             RiskLevel::High,
@@ -1832,6 +3631,9 @@ fn jq_ident(ch: char) -> bool {
 }
 
 fn jq_filter_risk(script: &str) -> JqFilterRisk {
+    if contains_command_substitution_marker(script) {
+        return JqFilterRisk::External;
+    }
     // String interpolation (`"\(...)"`) evaluates an expression inside the
     // string. Treat it conservatively instead of skipping the whole literal.
     if script.contains("\\(") {
@@ -2252,6 +4054,9 @@ fn classify_sed(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
 }
 
 fn sed_script_is_safe(script: &str) -> bool {
+    if contains_command_substitution_marker(script) {
+        return false;
+    }
     let chars: Vec<char> = script.chars().collect();
     let mut i = 0usize;
     while i < chars.len() {
@@ -2576,6 +4381,9 @@ fn classify_awk(program: &str, args: &[String], cwd: &Path, risk: &mut RiskAsses
 }
 
 fn awk_script_is_safe(script: &str) -> bool {
+    if contains_command_substitution_marker(script) {
+        return false;
+    }
     // These constructs can execute a shell, write an arbitrary file, or read a
     // file/environment value that the path classifier never sees. Plain
     // `print` / `printf` to stdout remains allowed.
@@ -2807,7 +4615,7 @@ fn is_outside_workspace(path: &str, cwd: &Path) -> bool {
     if path.is_empty() || path == "." || path == "./" {
         return false;
     }
-    if path.starts_with('~') || path.contains('$') {
+    if path.starts_with('~') || path.contains('$') || contains_command_substitution_marker(path) {
         return true;
     }
     let candidate = Path::new(path);
@@ -2815,12 +4623,14 @@ fn is_outside_workspace(path: &str, cwd: &Path) -> bool {
         let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let candidate = candidate
             .canonicalize()
-            .unwrap_or_else(|_| candidate.to_path_buf());
+            .unwrap_or_else(|_| lexical_normalize(candidate));
         return !candidate.starts_with(&root);
     }
     let joined = cwd.join(candidate);
     let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-    let joined = joined.canonicalize().unwrap_or(joined);
+    let joined = joined
+        .canonicalize()
+        .unwrap_or_else(|_| lexical_normalize(&joined));
     !joined.starts_with(root)
 }
 
@@ -3175,7 +4985,7 @@ mod tests {
 
     #[test]
     fn build_commands_are_sandbox_only() {
-        for command in ["cargo test", "make test", "npm test"] {
+        for command in ["cargo test", "make test", "npm test", "go test ./..."] {
             let risk = assess_command(command, &cwd());
             assert_eq!(
                 risk.default_action(),
@@ -3186,8 +4996,47 @@ mod tests {
     }
 
     #[test]
+    fn go_formatters_and_env_reads_do_not_need_approval() {
+        for command in ["gofmt -l .", "gofmt -d main.go", "go env GOMODCACHE"] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+        for command in [
+            "gofmt -w main.go",
+            "gofmt -w=true main.go",
+            "go env -w GOFLAGS=-mod=mod",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Ask,
+                "{command}: {risk:?}"
+            );
+        }
+        let test_command = "cd go && export GOCACHE=/tmp/gocache \
+             GOMODCACHE=$(go env GOMODCACHE) && gofmt -l . ; go vet ./... ; \
+             go test ./... -v 2>&1 | tail -70";
+        let risk = assess_command(test_command, &cwd());
+        assert_eq!(
+            risk.default_action(),
+            PermissionAction::Sandbox,
+            "{test_command}: {risk:?}"
+        );
+    }
+
+    #[test]
     fn network_and_git_publish_need_approval() {
-        for command in ["curl https://example.com", "git push", "git push --force"] {
+        for command in [
+            "curl https://example.com",
+            "git push",
+            "git push --force",
+            "git grep -O TODO",
+            "git grep --open-files-in-pager=less TODO",
+        ] {
             let risk = assess_command(command, &cwd());
             assert_eq!(risk.default_action(), PermissionAction::Ask, "{command}");
         }
@@ -3278,5 +5127,301 @@ mod tests {
             .categories
             .contains(&RiskCategory::WriteExternal));
         assert!(assess_command("echo x > /dev/sda", &cwd()).hard_deny);
+    }
+
+    #[test]
+    fn input_redirections_are_reads_not_writes() {
+        let risk = assess_command("wc -l < DESIGN.md", &cwd());
+        assert_eq!(risk.default_action(), PermissionAction::Allow, "{risk:?}");
+        assert!(risk.categories.contains(&RiskCategory::Read));
+        assert!(!risk.categories.contains(&RiskCategory::WriteLocal));
+
+        let secret = assess_command("cat < .env", &cwd());
+        assert!(secret.categories.contains(&RiskCategory::SecretRead));
+        assert_eq!(secret.default_action(), PermissionAction::Ask);
+
+        let outside = assess_command("cat < /etc/passwd", &cwd());
+        assert!(outside.categories.contains(&RiskCategory::Read));
+        assert_eq!(outside.default_action(), PermissionAction::Ask);
+
+        let process_substitution = assess_command("diff <(cat file) other", &cwd());
+        assert_eq!(
+            process_substitution.default_action(),
+            PermissionAction::Ask,
+            "{process_substitution:?}"
+        );
+        let glob_traversal = assess_command("cat crates/*/../../../../etc/passwd", &cwd());
+        assert_eq!(
+            glob_traversal.default_action(),
+            PermissionAction::Ask,
+            "{glob_traversal:?}"
+        );
+    }
+
+    #[test]
+    fn safe_command_substitutions_are_analyzed() {
+        for command in [
+            "echo \"lines: $(wc -l < DESIGN.md)\"",
+            "printf '%s\\n' \"$(find crates -name '*.rs' | xargs cat | wc -l)\"",
+            "echo $(git status --short)",
+            "echo `wc -l < DESIGN.md`",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+        for command in ["echo hi # $(cat .env)", "echo '$(cat .env)'"] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+        for command in [
+            "echo $(cat .env)",
+            "echo \"$(cat .env)\"",
+            "echo $(find /etc -type f)",
+            "cat $(echo /etc/passwd)",
+            "echo $(rm -rf build)",
+            "sed -n \"$(cat .env)\" file",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_ne!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_substitution_cannot_inject_options() {
+        for command in [
+            "git diff $(echo --output=/tmp/out)",
+            "date $(echo -s 2020-01-01)",
+            "grep $(echo -f .env) file | wc -l",
+            "find . $(echo -exec) rm",
+            "rg $(echo --pre) TODO",
+            "printf $(echo -vPATH)",
+            "printf $(echo '-vPATH x')",
+            "printf -v n \"$(echo -vPATH)\"",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_ne!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+        let printf_data = assess_command("printf '%s\\n' \"$(wc -l < DESIGN.md)\"", &cwd());
+        assert_eq!(
+            printf_data.default_action(),
+            PermissionAction::Allow,
+            "{printf_data:?}"
+        );
+    }
+
+    #[test]
+    fn xargs_content_readers_are_allowed_only_before_wc() {
+        let counted = assess_command("find crates -name '*.rs' | xargs cat | wc -l", &cwd());
+        assert_eq!(
+            counted.default_action(),
+            PermissionAction::Allow,
+            "{counted:?}"
+        );
+        for command in [
+            "find . | xargs cat",
+            "find . | xargs cat | head",
+            "find . | xargs grep TODO",
+            "find . | xargs grep -f .env | wc -l",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Ask,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn safe_for_loops_are_unrolled() {
+        for command in [
+            "for f in crates/*/Cargo.toml; do echo \"--- $f\"; cat \"$f\"; done",
+            "for f in crates/*/Cargo.toml; do echo \"=== $f ===\"; sed -n '1,40p' $f; done",
+            "for d in crates/*/; do echo \"== $d\"; find $d -name '*.rs' | xargs wc -l | tail -1; done",
+            "for c in eix-core eixd; do n=$(find crates/$c -name '*.rs' | xargs cat | wc -l); echo \"$c: $n lines\"; done",
+            "for d in crates/*/; do printf '%-24s %6s\\n' \"$d\" \"$(find $d -name '*.rs' | xargs cat | wc -l)\"; done",
+            "for I in crates/*/; do echo \"$I\"; done",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_for_loops_with_safe_bodies_are_allowed() {
+        for command in [
+            "for f in $(echo crates/a crates/b); do echo \"$f\"; done",
+            "for f in $(date); do true; done",
+            "for f in $(git diff --name-only); do printf '%s\\n' \"$f\"; done",
+            "for f in $(find crates -name '*.rs'); do cat \"./$f\"; done",
+            "for f in $(git ls-files); do wc -l \"./$f\"; done",
+            "for f in $(rg --files crates); do grep TODO \"./$f\"; done",
+            "for f in $(find crates -name '*.rs' | sort); do echo \"$f\"; done",
+            "for f in $(git diff --name-only | grep '\\.rs$'); do echo \"$f\"; done",
+            "for f in $(find crates -name '*.rs'); do echo \"$f\" | sort; done",
+            "for f in $(find crates -name '*.rs'); do echo \"$f\"; done | sort -rn | head -15",
+            "for f in $(find crates -name '*.rs'); do cat \"./$f\" | head; done",
+            "for f in $(find crates -name '*.rs'); do echo \"$f\"; cat \"./$f\"; done",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn dynamic_for_loops_with_unsafe_details_stay_gated() {
+        for command in [
+            "for f in $(find crates -name '*.rs'); do cat \"$f\"; done",
+            "for f in $(find crates -name '*.rs'); do cat $f; done",
+            "for f in $(find crates -name '*.rs'); do cat \"/$f\"; done",
+            "for f in $(find crates -name '*.rs'); do cat \"../$f\"; done",
+            "for f in $(find crates -name '*.rs'); do cat \"-\"$f; done",
+            "for f in $(echo crates/a); do cat \"./$f\"; done",
+            "for f in $(find /etc -name '*'); do echo \"$f\"; done",
+            "for f in $(find crates -name '*.rs' -delete); do echo \"$f\"; done",
+            "for f in \"$(find crates -name '*.rs')\"; do cat \"./$f\"; done",
+            "for f in $(date); do echo \"$f\" > out; done",
+            "for f in $(date); do echo \"$f\" | sh; done",
+            "for f in $(date); do echo \"$f\"; done | sh",
+            "for f in $(date); do sh; done",
+            "for f in $(echo x | sh); do true; done",
+            "for f in $(find crates -name '*.rs'); do cat \"./$f\" | sh; done",
+            "for f in $(find crates -name '*.rs'); do echo \"$f\"; done | xargs rm",
+            "for f in $(find crates -name '*.rs'); do echo \"$f\"; cat \"$f\"; done",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_ne!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_for_loops_stay_gated() {
+        for command in [
+            "for f in /etc/*; do cat \"$f\"; done",
+            "for f in ../*; do cat \"$f\"; done",
+            "for f in -rf; do rm \"$f\"; done",
+            "for f in $(cat list); do cat \"$f\"; done",
+            "for f in .e*; do cat \"$f\"; done",
+            "for f in crates/*; do rm \"$f\"; done",
+            "for f in crates/*; do cat \"$f\" > /tmp/out; done",
+            "for f in safe; do for f in crates/*; do cat \"$f/../../../../etc/passwd\"; done; done",
+            "for opt in i; do sed -$opt 's/x/y/' file; done",
+            "for opt in o; do sort -$opt out file; done",
+            "for f in *.rs; do sort $f; done",
+            "for f in ?*; do sort $f; done",
+            "for PATH in crates/*/; do echo \"$PATH\"; done",
+            "for IFS in crates/*/; do echo \"$IFS\"; done",
+            "for LD_PRELOAD in crates/*/; do echo \"$LD_PRELOAD\"; done",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_ne!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lowercase_assignments_are_not_unknown_commands() {
+        let risk = assess_command("n=$(find crates -name '*.rs' | wc -l); echo \"$n\"", &cwd());
+        assert_eq!(risk.default_action(), PermissionAction::Allow, "{risk:?}");
+        let path = assess_command("PATH=/tmp:$PATH ls", &cwd());
+        assert_ne!(path.default_action(), PermissionAction::Allow, "{path:?}");
+    }
+
+    #[test]
+    fn env_assignments_that_can_inject_code_are_gated() {
+        for command in [
+            "env FOO=1 ls crates",
+            "env FOO=\"$(echo bar)\" ls crates",
+            "env -- FOO=1 ls crates",
+        ] {
+            let harmless = assess_command(command, &cwd());
+            assert_eq!(
+                harmless.default_action(),
+                PermissionAction::Allow,
+                "{command}: {harmless:?}"
+            );
+        }
+        for command in [
+            "env PATH=/tmp ls",
+            "env -- PATH=/tmp ls",
+            "env LD_PRELOAD=/tmp/lib.so ls",
+            "env GIT_PAGER=/tmp/pager git log",
+            "env --argv0=rm ls",
+            "env $(echo PATH)=/tmp ls",
+            "for x in ls; do env LD_PRELOAD=/tmp/lib.so $x; done",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_ne!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn printf_v_only_writes_harmless_variables() {
+        for command in [
+            "printf -v n hi",
+            "printf '%s\\n' \"$(echo hi)\"",
+            "printf -- \"$(echo hi)\"",
+            "printf -v n '%s' \"$(echo hi)\"",
+            "printf '%s %s' -v PATH",
+            "printf -v n '%s' -v PATH",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+        for command in [
+            "printf -v PATH /tmp",
+            "printf -v IFS x",
+            "printf -vPATH x",
+            "printf -v n -v PATH",
+            "printf -v n -vPATH x",
+            "printf -v \"$(echo PATH)\" /tmp",
+            "for v in PATH; do printf -v $v /tmp; done",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert_ne!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
     }
 }

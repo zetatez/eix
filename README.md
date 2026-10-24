@@ -769,16 +769,30 @@ daemon 目前向模型暴露这些工具：
 省略，完整输出仍保留在事件日志。同一批次全是只读工具（`read_file` / `list_dir` / `grep` /
 `glob` / `webfetch` / `websearch`）时并发执行，结果按调用顺序回填。
 
-`run_command` 使用统一风险分析：shell tokenizer 会拆出每个命令段、重定向、`sudo`/`env`
-等包装器、嵌套 `sh -c` 和命令替换。`git status`、`cat`、`grep`、`ls`、`sed -n`、
-纯 `print`/`printf` 的 `awk`、`uniq`、`tr`、`cut`、`sort` 等只读过滤/查询命令直接放行；
-工作区内的 `cd`（以及 `cd <workspace> && ...`）也直接放行，离开工作区的 `cd` 仍询问。
-`env` / `timeout` / `nice` / `command` 等包装器按实际执行的命令判断，只有 `sudo` / `doas`
-额外标记提权；`xargs` 仅在内层是 `wc` / `ls` / `stat` 等只报告名称、元数据或计数的命令时
-放行，`cat` / `grep` 等内容读取器和 `-a` / `--arg-file` 保持询问。`cargo test` / `npm test`
-等构建命令默认在沙箱内执行；`rm`、写入重定向、未知程序、脚本解释器、`find -exec`、
-网络命令等按风险询问。`rm -rf /`、块设备 `dd`、`mkfs`、关机、fork bomb、私钥读取以及把
-secret 占位符送进网络/命令/MCP 调用会硬拒绝，`auto` / `full` 和任何 `allow` 规则都不能绕过。
+`run_command` 使用统一风险分析：shell tokenizer 会拆出每个命令段、输入/输出重定向、
+`sudo`/`env` 等包装器、嵌套 `sh -c` 和命令替换。`git status`、`cat`、`grep`、`ls`、
+`sed -n`、纯 `print`/`printf` 的 `awk`、`uniq`、`tr`、`cut`、`sort` 等只读过滤/查询命令
+直接放行；工作区内的 `cd`（以及 `cd <workspace> && ...`）也直接放行，离开工作区的 `cd`
+仍询问。`env` / `timeout` / `nice` / `command` 等包装器按实际执行的命令判断，只有
+`sudo` / `doas` 额外标记提权；`env` 设置 `PATH`、`LD_PRELOAD`、`GIT_*` 等能改变命令
+查找/加载/配置的变量时仍询问，普通 `FOO=1` 之类不受影响。`xargs` 仅在内层是 `wc` /
+`ls` / `stat` 等只报告名称、元数据或计数的命令时放行，内容读取器和 `-a` / `--arg-file`
+保持询问，但 `find ... | xargs cat | wc -l` 这类由下一段 `wc` 消费内容的管道可以放行
+（只输出计数）。
+
+`< file` 按读取处理，不会误判成写入；`> file` / `>> file` 仍按写入审批。命令替换
+`$(...)` 和反引号会递归分析内部命令：内部只读时，`echo "$(find crates -name '*.rs' |
+wc -l)"` 可直接放行；但命令替换的结果一旦被当作路径、脚本、`cd` 目标，或作为
+非纯输出命令的普通参数（例如 `git` / `date` / `grep` 的选项），仍会询问。
+静态、工作区内的 `for` 循环（字面量或通配符列表，如
+`for f in crates/*/Cargo.toml; do ...; done`）会展开后逐条分析，`n=$(...)` 这类小写
+局部变量赋值也不会再被当成未知命令；`printf -v` 仅允许写入小写局部变量。列表含绝对
+外部路径、`..`、隐藏文件通配符、命令替换，或循环体本身是未知/写入/嵌套控制流时仍会
+询问；通配符首段需要字面前缀（`crates/*` 可以，裸 `*` / `*.rs` 会询问，避免展开成
+`-o` 之类的选项）。`cargo test` / `npm test` 等构建命令默认在沙箱内执行；`rm`、写入
+重定向、未知程序、脚本解释器、`find -exec`、网络命令等按风险询问。`rm -rf /`、块设备 `dd`、`mkfs`、关机、
+fork bomb、私钥读取以及把 secret 占位符送进网络/命令/MCP 调用会硬拒绝，`auto` / `full`
+和任何 `allow` 规则都不能绕过。
 `git push --force` 视为高风险，默认询问；`sed -i`、`awk` 的 `system`/重定向、`date -s`、
 `ss -K`、`sort -o`/`-T`/`--files0-from`、`diff --paginate`、`find -files0-from`、
 `xxd`/`uniq` 的第二个文件参数、`wc`/`du --files0-from` 等带副作用或动态文件集的选项同样

@@ -599,6 +599,11 @@ mod tests {
             "cd /tmp/eix-perm && awk 'END{print NR}' crates/eix-core/src/risk.rs",
             "cd /tmp/eix-perm && git status --short",
             "find . -name '*.rs' | xargs wc -l | sort -n | tail -1",
+            "find . -name '*.rs' | xargs cat | wc -l",
+            "echo \"lines: $(wc -l < Cargo.toml)\"",
+            "for f in crates/*/Cargo.toml; do echo \"--- $f\"; cat \"$f\"; done",
+            "for d in crates/*/; do printf '%-24s %6s\\n' \"$d\" \"$(find $d -name '*.rs' | xargs cat | wc -l)\"; done",
+            "for c in eix-core eixd; do n=$(find crates/$c -name '*.rs' | xargs cat | wc -l); echo \"$c: $n lines\"; done",
             "env FOO=1 timeout 5 ls crates",
         ] {
             let decision = decide(
