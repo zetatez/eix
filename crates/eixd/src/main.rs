@@ -67,7 +67,7 @@ OPTIONS:
     --socket <path>     Unix socket path (default: $XDG_RUNTIME_DIR/eix.sock;
                         macOS: ~/Library/Caches/eix/eix.sock)
     --data-dir <path>   state directory (default: ~/.local/share/eix)
-    --config <path>     config file (default: ~/.config/eix/config.toml)
+    --config <path>     config file (default: ~/.config/eix/config.yaml)
     -h, --help          show this help
     -V, --version       show version
 

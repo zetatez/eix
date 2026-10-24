@@ -2484,7 +2484,7 @@ OPTIONS:
     --socket <path>     daemon socket (default: $XDG_RUNTIME_DIR/eix.sock;
                         macOS: ~/Library/Caches/eix/eix.sock)
     --data-dir <path>   state directory (default: ~/.local/share/eix)
-    --config <path>     config file (default: ~/.config/eix/config.toml)
+    --config <path>     config file (default: ~/.config/eix/config.yaml)
     --tcp <host:port>   connect to a remote daemon instead of the socket
     --token <token>     remote token (or EIX_TCP / EIX_TCP_TOKEN)
 

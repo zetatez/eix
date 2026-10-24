@@ -5763,11 +5763,10 @@ async fn repeat_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Strin
 async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
     let dir = temp_dir("reload");
     std::fs::create_dir_all(&dir)?;
-    let config_path = dir.join("config.toml");
+    let config_path = dir.join("config.yaml");
     std::fs::write(
         &config_path,
-        "[providers.openai]\ndefault = true\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"first-model\"\n\
-         api_key = \"test\"\ntimeout_secs = 5\n",
+        "providers:\n  openai:\n    default: true\n    base_url: http://127.0.0.1:9/v1\n    model: first-model\n    api_key: test\n",
     )?;
 
     let mut config = Config::default();
@@ -5791,8 +5790,7 @@ async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
 
     std::fs::write(
         &config_path,
-        "[providers.openai]\ndefault = true\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"second-model\"\n\
-         api_key = \"test\"\ntimeout_secs = 5\n",
+        "providers:\n  openai:\n    default: true\n    base_url: http://127.0.0.1:9/v1\n    model: second-model\n    api_key: test\n",
     )?;
     let reloaded: Value = client.request("config.reload", Value::Null).await?;
     assert_eq!(reloaded["reloaded"], true);

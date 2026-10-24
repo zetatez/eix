@@ -22,6 +22,7 @@ ratatui = "0.29"
 crossterm = "0.28"
 rmpv = "1"
 toml = "0.8"
+serde_yaml = "0.9"
 dirs = "6"
 pulldown-cmark = { version = "0.13", default-features = false }
 syntect = { version = "5", default-features = false, features = [

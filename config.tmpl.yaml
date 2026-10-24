@@ -1,9 +1,9 @@
 # ============================================================================
 # eix config template (YAML reference)
 # ============================================================================
-# eix loads TOML. Convert this file before use.
-# Global: ~/.config/eix/config.toml
-# Project: <ancestor>/.eix/config.toml (nearest wins; arrays replace)
+# eix loads YAML.
+# Global: ~/.config/eix/config.yaml
+# Project: <ancestor>/.eix/config.yaml (nearest wins; arrays replace)
 # Placeholders: {env:NAME}, {file:path}
 # Keep secrets in environment variables, not in this file.
 # ============================================================================
@@ -151,7 +151,7 @@ integration:
 # OpenCode commands such as fix.bug live under ~/.config/opencode/commands,
 # so enable opencode for those.
 #
-# Project .eix/config.toml may only turn these switches OFF; it cannot enable
+# Project .eix/config.yaml may only turn these switches OFF; it cannot enable
 # another agent's resources.
 compations:
   claude_code: false

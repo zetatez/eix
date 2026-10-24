@@ -28,7 +28,7 @@ cargo build                          # 同时构建 eix 与 eixd
 export EIX_BASE_URL=http://localhost:11434/v1   # Ollama / vLLM / LM Studio
 export EIX_MODEL=qwen2.5-coder:7b
 export OPENAI_API_KEY=...                       # 云端 OpenAI 兼容端点
-# 或者写 ~/.config/eix/config.toml
+# 或者写 ~/.config/eix/config.yaml
 
 ./target/debug/eix                    # 默认打开全屏 TUI（无 session 时自动创建）
 ./target/debug/eix chat               # 纯命令行交互
@@ -54,153 +54,146 @@ socket 在 Linux / Arch 默认 `$XDG_RUNTIME_DIR/eix.sock`；macOS 没有 XDG ru
 
 配置：
 
-```toml
-# ~/.config/eix/config.toml
-# 所有 OpenAI 兼容 provider 放在同一张表里；恰好一个标记 default = true。
+```yaml
+# ~/.config/eix/config.yaml
+# 所有 OpenAI 兼容 provider 放在同一张表里；恰好一个标记 default: true。
 # 表名就是 /model 里的 provider 前缀，默认 provider 的名字不要求是 "default"。
-[providers.openai]
-default = true
-name = "OpenAI"               # 可选显示名
-base_url = "https://api.openai.com/v1"
-model = "gpt-4o-mini"          # 默认模型的全局 fallback
-api_key_env = "OPENAI_API_KEY"
+providers:
+  openai:
+    default: true
+    name: OpenAI                 # 可选显示名
+    base_url: https://api.openai.com/v1
+    model: gpt-4o-mini           # 默认模型的全局 fallback
+    api_key_env: OPENAI_API_KEY
+
+  # 额外 provider（可选）。/model 会自动请求每个 provider 的 GET /models。
+  openrouter:
+    name: OpenRouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+
+  local:
+    base_url: http://localhost:11434/v1
+    # api_key 或 api_key_env 可选；本地端点通常不需要。
 
 # provider 运行参数单独配置，不放在 provider 表里。
-[provider_runtime]
-timeout_secs = 300             # 单次请求/流式响应超时
-retry_attempts = 8             # 首次失败后的自动重试次数；0 关闭
-retry_base_ms = 250            # 抖动指数退避起点
-retry_max_secs = 60            # 单次等待上限（也限制 Retry-After）
-# context_tokens = 128000      # 默认模型上下文窗口
-# system_prompt = "..."
+provider_runtime:
+  timeout_secs: 300              # 单次请求/流式响应超时
+  retry_attempts: 8              # 首次失败后的自动重试次数；0 关闭
+  retry_base_ms: 250             # 抖动指数退避起点
+  retry_max_secs: 60             # 单次等待上限（也限制 Retry-After）
+  # context_tokens: 128000
+  # system_prompt: "..."
 
-# 额外 provider（可选）。/model 会自动请求每个 provider 的 GET /models，
-# 选择 id 为 "<provider>/<api-model-id>"；模型 id 里的 "/" 会保留。
-[providers.openrouter]
-name = "OpenRouter"
-base_url = "https://openrouter.ai/api/v1"
-api_key_env = "OPENROUTER_API_KEY"
+notifications:
+  # command: 'notify-send eix "$EIX_SESSION_NAME $EIX_STATUS"'
+  bell: false
+  cooldown_secs: 10
 
-[providers.local]
-base_url = "http://localhost:11434/v1"
-# api_key 或 api_key_env 可选；本地端点通常不需要。
-# provider 表名不能包含 "/"、"#" 或空白；default 标记只能出现一次。
-# 旧的单表 [provider] 会自动迁移为 [providers.default]（default = true）。
-
-[notifications]
-# command = "notify-send eix \"$EIX_SESSION_NAME $EIX_STATUS\""
-bell = false
-cooldown_secs = 10
-
-[context]
-budget_tokens = 32000          # soft ceiling for one request
-instructions_files = ["AGENTS.md"]  # repo root → cwd；也读 <config>/AGENTS.md
-workspace_summary = true       # top-level entries + git branch/status
-auto_compact = true            # 超过阈值时先总结旧历史再继续本轮
-auto_compact_threshold = 0.8   # 占 budget_tokens 的比例 (0, 1]
-auto_compact_keep_turns = 2    # 最近 N 个 user turn 原样保留
-tool_output_tokens = 4000      # 单条工具结果进入 provider 上下文的 token 上限
+context:
+  budget_tokens: 32000           # soft ceiling for one request
+  instructions_files: [AGENTS.md] # repo root → cwd；也读 <config>/AGENTS.md
+  workspace_summary: true        # top-level entries + git branch/status
+  auto_compact: true
+  auto_compact_threshold: 0.8
+  auto_compact_keep_tokens: 8000
+  auto_compact_keep_turns: 2
+  tool_output_tokens: 4000
 
 # 其他 agent 的资源兼容（默认全关；.eix 自己的目录始终加载）
-[compations]
-claude_code = false            # ~/.claude + 项目 .claude：skills / commands / agents / CLAUDE.md
-opencode = false               # ~/.config/opencode + 项目 .opencode：skills / commands / agents / AGENTS.md
-codex_cli = false              # $CODEX_HOME + 项目 .codex：skills / prompts / AGENTS.md
-gemini_cli = false             # ~/.gemini + 项目 .gemini：skills / commands(.toml) / agents / GEMINI.md
-pi = false                     # $PI_CODING_AGENT_DIR + 项目 .pi：skills / prompts / AGENTS.md / CLAUDE.md
+compations:
+  claude_code: false
+  opencode: false
+  codex_cli: false
+  gemini_cli: false
+  pi: false
 
-# 手动固定的模型（可选）。适合给模型补充成本、上下文或 variants，
-# 也可用 provider 复用 [providers.*] 的 endpoint/key。
-[[models]]
-id = "openrouter/gpt-5"        # /model 里的选择 id；API model 默认取 "/" 之后
-name = "GPT-5 via OpenRouter"
-provider = "openrouter"        # 可选；引用 [providers.openrouter]
-model = "openai/gpt-5"         # 可选；显式指定 API model id
-input_cost = 1.25              # USD / 1M tokens，用于成本统计
-output_cost = 10.0
-context_tokens = 400000
-variants = ["high", "medium", "low"]  # 可在 /model 里选 id#variant；未指定时默认 medium
+# 手动固定的模型（可选）。
+models:
+  - id: openrouter/gpt-5
+    name: GPT-5 via OpenRouter
+    provider: openrouter
+    model: openai/gpt-5
+    input_cost: 1.25
+    output_cost: 10.0
+    context_tokens: 400000
+    variants: [high, medium, low]
 
 # MCP server（stdio，可选）
-[mcp.servers.files]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
-# env = { KEY = "value" }
-# timeout_secs = 30
-# 只暴露匹配的工具；deny 优先。支持 * 和 ?（* 也匹配 /）
-# allowed_tools = ["read_*", "search"]
-# denied_tools = ["read_secret"]
+mcp:
+  servers:
+    files:
+      command: npx
+      args: [-y, "@modelcontextprotocol/server-filesystem", /tmp]
+      # env:
+      #   KEY: value
+      # timeout_secs: 30
+      # allowed_tools: ["read_*", "search"]
+      # denied_tools: ["read_secret"]
 
 # 图片附件的存储与保留（可选）
-[images]
-# max_prompt_images = 4
-# max_image_bytes = 8388608
-# retention_days = 30        # 只清理无事件引用的 blob；0 关闭按时间清理
-# max_store_bytes = 2147483648
+images:
+  # max_prompt_images: 4
+  # max_image_bytes: 8388608
+  # retention_days: 30
+  # max_store_bytes: 2147483648
 
-# 写入后的格式化（可选；写入成功后执行，失败只附注不撤销文件）
-# 按顺序匹配 extensions，第一条命中的规则执行。
-[[formatter]]
-command = "rustfmt --edition 2021"
-extensions = ["rs"]
+# 写入后的格式化（可选；按顺序匹配 extensions）
+formatter:
+  - command: rustfmt --edition 2021
+    extensions: [rs]
+  - command: gofmt -w
+    extensions: [go]
+  - command: prettier --write
+    extensions: [json, yaml, yml, md]
 
-[[formatter]]
-command = "gofmt -w"
-extensions = ["go"]
+# TUI 调色板（可选）
+theme:
+  # preset: github-dark
+  # normal: white
+  # comment: darkgray
+  # function: cyan
+  # diff_add: "#4ec9b0"
+  # diff_delete: "#f44747"
+  # panel: black
 
-[[formatter]]
-command = "prettier --write"
-extensions = ["json", "yaml", "yml", "md"]
+# 语言服务器（可选；stdio）
+lsp:
+  servers:
+    rust:
+      command: rust-analyzer
+      extensions: [rs]
+      timeout_secs: 10
+    python:
+      command: pyright-langserver
+      args: [--stdio]
+      extensions: [py]
 
-# TUI 调色板（可选；颜色名 / #rrggbb / 0-255 ANSI 索引）
-# 不设置 preset 时使用终端背景；输入框不再额外填充背景，跟随主题 background/终端。
-# 内置 preset：github-dark、github-light、gruvbox-dark、solarized-dark、
-# solarized-light、nord、dracula、catppuccin-mocha。
-[theme]
-# normal = "white"
-# comment = "darkgray"
-# function = "cyan"
-# diff_add = "#4ec9b0"
-# diff_delete = "#f44747"
-# panel = "black"
-
-# 语言服务器（可选；stdio，写入后自动收集 diagnostics）
-[lsp.servers.rust]
-command = "rust-analyzer"
-extensions = ["rs"]
-timeout_secs = 10
-
-[lsp.servers.python]
-command = "pyright-langserver"
-args = ["--stdio"]
-extensions = ["py"]
-
-# 转录区快捷键覆盖（动作 = 键；输入框保持 vim 行为，不受影响）
-# 裸字母不会被接受：请用 C-/A-、F1-F12 等命名键或标点键。
-[keys]
-# sessions = "C-t"
-# new_session = "C-n"
-# help = "F2"
-# palette = "C-p"
-# model = "C-/"
-# quit = "C-q"
+# 转录区快捷键覆盖
+keys:
+  # sessions: C-t
+  # new_session: C-n
+  # help: F2
+  # palette: C-p
+  # model: C-/
+  # quit: C-q
 ```
 
 环境变量只保留启动、连接和模型入口：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、
 `EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`、`EIX_CONFIG_DIR`、`EIX_CLI_CONFIG`、
 `EIX_TCP`、`EIX_TCP_TOKEN`、`EIX_HTTP`。工具、context、通知、provider runtime 等其余配置
-全部写入 `config.toml`，不再读取环境变量覆盖。
+全部写入 `config.yaml`，不再读取环境变量覆盖。
 
 eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `~/Library/Application Support`）：
-`config.toml`、`AGENTS.md`、`skills/`、`cmds/`、`agents/`。可用 `EIX_CONFIG_DIR` 覆盖这个目录。
+`config.yaml`、`AGENTS.md`、`skills/`、`cmds/`、`agents/`。可用 `EIX_CONFIG_DIR` 覆盖这个目录。
 
 配置分层（daemon 从启动目录向上查找）：
 
-1. `~/.config/eix/config.toml`（或 `EIX_CONFIG` / `--config`，显式路径不再合并项目层）
-2. `<祖先目录>/.eix/config.toml`，从最外层到最近层依次覆盖
+1. `~/.config/eix/config.yaml`（或 `EIX_CONFIG` / `--config`，显式路径不再合并项目层）
+2. `<祖先目录>/.eix/config.yaml`，从最外层到最近层依次覆盖
 
 表递归合并，数组整体替换。字符串里支持 `{env:NAME}` 和 `{file:path}`（相对当前配置文件），
-例如 `api_key = "{env:OPENAI_API_KEY}"`。daemon 每 2 秒检查这些文件的 mtime，变化后重新加载；
+例如 `api_key: "{env:OPENAI_API_KEY}"`。daemon 每 2 秒检查这些文件的 mtime，变化后重新加载；
 解析失败保留旧配置并通过 `config.error` 通知，TUI 里也可以 `/reload`。工具/context/MCP
 设置在下一轮生效，已有 session 的 model 与 permission 不变。
 
@@ -223,12 +216,12 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `
 `eix-core/src/protocol.rs` 是唯一契约来源。
 
 当前限制：`workspace-write` 默认自动应用工作区内的低/中风险 `write_file` / `edit`，同时
-保留执行前快照和自动补丁记录；把 `[tools] auto_apply_workspace_edits = false` 可恢复逐次
+保留执行前快照和自动补丁记录；把 `tools.auto_apply_workspace_edits: false` 可恢复逐次
 stage 到 shadow workspace 的审核模式。高风险/forced ask 写入、外部路径、secret 路径以及
 `run_command` 的写操作仍在审批处阻塞（shell 无法 stage），风险分析判定为只读的命令直接执行。bubblewrap 沙箱已接入；自动上下文管理与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮、`a` 跳转提示，
 并在底部状态栏中间显示提醒（不弹桌面通知）；外部通知命令（dwm/tmux）已接入
-（见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：
+（见 `notifications:`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：
 默认 3 行内容 + 上下边框（共 5 行，长草稿最多 10 行内容 / 12 行总高）；正文左侧留 1 格内边距，
 底边保持普通边框；输入框下方是一行 statusline，左侧依次显示
 `N/I/V/VL · Build/Plan · 状态图标 · 模型 · provider · reasoning`（命令行激活时模式徽标显示 `C`），
@@ -365,7 +358,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
 | `/history` | 打开全文历史搜索弹窗 |
 | `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
 | `/attention` / `/cancel` / `/toggle-agent` | 跳到下一个需要 attention 的 pane / 取消运行 / 切换 Build·Plan |
-| `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `[providers.*]` 自动拉取的 `/models` 和 `[[models]]`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
+| `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `providers.*` 自动拉取的 `/models` 和 `models:`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
 | `/subagents [n]` | 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 4，可选 1/2/4/8/16/32）；不带参数打开 picker（仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
@@ -390,7 +383,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
 ### 其他 agent 兼容
 
 默认只读取 eix 自己的 `.eix` / `~/.config/eix`。需要复用其他 agent 的资源时，在
-`[compations]` 中逐项打开：
+`compations:` 中逐项打开：
 
 | 开关 | 读取内容 |
 |---|---|
@@ -401,7 +394,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
 | `pi` | `$PI_CODING_AGENT_DIR`（默认 `~/.pi/agent`）与项目 `.pi` 下的 skills、prompts，以及 `AGENTS.md` / `CLAUDE.md`；也读 `.agents/skills` |
 
 - 同一目录下原生 `.eix` 资源优先；更靠近 cwd 的项目层覆盖外层。
-- 项目 `.eix/config.toml` 只能关闭兼容开关，不能开启；尝试开启会被忽略并写入 `security_warnings`。
+- 项目 `.eix/config.yaml` 只能关闭兼容开关，不能开启；尝试开启会被忽略并写入 `security_warnings`。
 - 只读取资源文件，不导入其他 agent 的 permissions、hooks、settings、provider 或 MCP 配置。
 - Gemini 的 `{{args}}` 会转换成 eix 的 `$ARGUMENTS`；其他 agent 的命名占位符只保证原样保留。
 - 兼容 agent 定义时只读取 Markdown 正文和 eix 支持的 frontmatter；Claude/Gemini 的工具列表不会被解释成 eix 权限。
@@ -441,7 +434,7 @@ frontmatter 支持 `name`、`description`、`allowed-tools`；正文是完整指
 
 ### 自定义命令与 agent
 
-原生命令与 agent 始终加载；外部来源由 `[compations]` 控制：
+原生命令与 agent 始终加载；外部来源由 `compations:` 控制：
 
 ```text
 ~/.config/eix/cmds/*.md              # 全局命令
@@ -543,7 +536,7 @@ resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server �
 
 **转录区不响应裸字母快捷键**：动作一律走 `<Space>` leader（见下），但 `i` 仍用于聚焦
 输入框并进入 insert 模式；`j`/`k` 等导航键和 `/`/`?`/`#` 等搜索入口也保留。输入框聚焦时（normal 模式）单字母是 vim 命令，TUI 动作同样用
-leader；`/`、`?`、`#` 当前对话搜索、翻页/滚动和 `[keys]` 绑定也与转录区一致，只有输入框自己的
+leader；`/`、`?`、`#` 当前对话搜索、翻页/滚动和 `keys:` 绑定也与转录区一致，只有输入框自己的
 vim 编辑键（如 `j`/`k` 行移动、`Tab` 切换 Build/Plan）保留编辑器语义。
 转录区动作可以通过 `[keys]` 覆盖，但裸字母会被忽略，请用 `C-`/`A-` 修饰键或
 命名键，例如 `sessions = "C-t"`、`new_session = "C-n"`、`help = "F2"`。可用动作：`quit`、`help`、`new_session`、
@@ -625,7 +618,7 @@ pending 审批/补丁或进入 `error` 时会标 `!`、边框和侧栏变黄/红
 按 `<Space>A` 跳到下一个；聚焦即清除标记。重新 attach 时会从事件日志恢复未完成的卡片，输入框
 里的未发送文字也会通过 daemon 草稿恢复。
 
-每个 session 有独立的权限上限：`workspace-write`（默认，由 `[tools] approval` 和规则决定
+每个 session 有独立的权限上限：`workspace-write`（默认，由 `tools.approval` 和规则决定
 是否询问）、`read-only`（隐藏 `write_file` / `edit` / `patch` / `start_command`，运行时拒绝
 所有写入和危险执行；保留 `run_command` 以便 `git status` 等只读检查）和 `full`（解除能力上限，
 但仍然执行 `deny`、硬安全拦截和审批规则；只有 `approval = "auto"` 才会自动放行默认 ask）。
@@ -713,31 +706,31 @@ daemon 重启都会先检查；需要清理时把冲突/暂存内容备份到
 误丢正在处理的冲突；用户手动 `/ready` 则始终可以恢复。`conflict_repair=false` 时，冲突
 rebase 也会先备份并清理再重试。
 
-```toml
-[worktree]
-auto = true
-base = "auto"          # auto = 创建 session 时的当前分支；显式分支名则强制使用
+```yaml
+worktree:
+  auto: true
+  base: auto             # auto = 创建 session 时的当前分支；显式分支名则强制使用
 
-[integration]
-enabled = true
-auto_ready = "idle"   # manual | idle
-idle_secs = 300
-auto_commit = true     # ready 时自动提交 worktree 改动；false 则要求先手动提交
-test = "auto"
-timeout_secs = 1800
-pull_base = true
-push = false           # 默认只合并本地基分支；需要时再推远端
-retry_max_secs = 300
-notify_after = 3
-pause_after = 0
-conflict_repair = true
-
-[integration.repos."/home/me/src/app"]
-base = "main"
-test = "cargo test --workspace"
+integration:
+  enabled: true
+  auto_ready: idle       # manual | idle
+  idle_secs: 300
+  auto_commit: true      # ready 时自动提交 worktree 改动；false 则要求先手动提交
+  test: auto
+  timeout_secs: 1800
+  pull_base: true
+  push: false            # 默认只合并本地基分支；需要时再推远端
+  retry_max_secs: 300
+  notify_after: 3
+  pause_after: 0
+  conflict_repair: true
+  repos:
+    "/home/me/src/app":
+      base: main
+      test: cargo test --workspace
 ```
 
-项目层 `.eix/config.toml` 不能设置 `[worktree]` / `[integration]`，这些是可执行策略，
+项目层 `.eix/config.yaml` 不能设置 `worktree` / `integration`，这些是可执行策略，
 只从全局配置读取。
 
 ### 输入框：自研 Vim 风格编辑器
@@ -844,50 +837,45 @@ fork bomb、私钥读取以及把 secret 占位符送进网络/命令/MCP 调用
 
 `write_file` 会先生成 unified diff 和逐 hunk 预览，TUI 审批卡片、
 `eix chat` 和 `eix log` 都会显示；在 TUI 里用 `d` 全屏审阅可以按 hunk 选择应用，命令行用
-`eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。策略由 `[tools]` 配置控制：
+`eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。策略由 `tools:` 配置控制：
 
-```toml
-[tools]
-approval = "ask"          # ask（默认）/ auto；只影响默认 ask，不绕过规则或硬拒绝
-max_output_bytes = 20000
-command_timeout_secs = 60
-max_tool_rounds = 64      # 单轮 turn 的 provider <-> 工具往返上限；最后几轮会提示收敛，最后一轮不再提供工具
-max_parallel_subagents = 4  # spawn_agent 并发默认值，可选 1/2/4/8/16/32；TUI 可在运行时覆盖
-sandbox = "auto"          # auto（默认，可用则隔离）/ required（不可用就询问）/ off
-sandbox_network = false   # false 时加 --unshare-net
-sandbox_read_paths = ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]  # 只读挂载，不再挂整个 $HOME
-sandbox_writable_roots = []  # workspace 之外额外可写目录
-snapshots = true          # false 时跳过执行前快照（大仓库可关）
-external_directory = ["/tmp/eix-shared", "~/.cache/eix/**"]  # 允许文件工具访问 workspace 之外
-network_allow = ["docs.rs", "*.github.com"]  # 可选：配置后 webfetch/websearch 只放行命中域名
+```yaml
+tools:
+  approval: ask            # ask（默认）/ auto；只影响默认 ask，不绕过规则或硬拒绝
+  max_output_bytes: 20000
+  command_timeout_secs: 60
+  max_tool_rounds: 64      # 单轮 turn 的 provider <-> 工具往返上限
+  max_parallel_subagents: 4
+  sandbox: auto            # auto / required / off
+  sandbox_network: false
+  sandbox_read_paths: ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]
+  sandbox_writable_roots: []
+  snapshots: true
+  external_directory: ["/tmp/eix-shared", "~/.cache/eix/**"]
+  network_allow: ["docs.rs", "*.github.com"]
 ```
 
 显式规则按“具体度”选择，`deny` 全局优先，不会被 `auto` / `full` 绕过：
 
-```toml
-[[tools.rules]]
-id = "block-rm"
-tool = "run_command"
-command_regex = "^rm "
-action = "deny"
-
-[[tools.rules]]
-id = "cargo-sandbox"
-tool = "run_command"
-command = ["cargo", "test"]  # argv token 前缀，不是整条 shell 字符串
-action = "sandbox"
-
-[[tools.rules]]
-id = "review-src"
-tool = "write_file"
-path = "src/**"
-action = "ask"
-
-[[tools.rules]]
-id = "docs-allow"
-tool = "webfetch"
-path = "https://docs.rs/**"
-action = "allow"
+```yaml
+tools:
+  rules:
+    - id: block-rm
+      tool: run_command
+      command_regex: "^rm "
+      action: deny
+    - id: cargo-sandbox
+      tool: run_command
+      command: [cargo, test]  # argv token 前缀，不是整条 shell 字符串
+      action: sandbox
+    - id: review-src
+      tool: write_file
+      path: "src/**"
+      action: ask
+    - id: docs-allow
+      tool: webfetch
+      path: "https://docs.rs/**"
+      action: allow
 ```
 
 - 规则字段是 AND 关系；`tool = "*"` 可匹配任意工具。`path` 对文件工具是 workspace 相对
@@ -901,7 +889,7 @@ action = "allow"
   必须在沙箱内执行，bwrap 不可用时转为 `ask` 且 `auto` 不会绕过。`action = "deny"` 最先
   扫描所有来源，哪怕更具体的规则是 `allow`。
 - 规则来源优先级为 `session > user > project > builtin`；具体度相同时越靠近当前 session 的
-  来源胜出。项目 `.eix/config.toml` 只能收紧：`approval = "auto"`、`sandbox = "off"`、
+  来源胜出。项目 `.eix/config.yaml` 只能收紧：`approval = "auto"`、`sandbox = "off"`、
   `sandbox_network = true`、`external_directory`、`network_allow`、额外 sandbox 路径会被忽略，
   `allow` 规则会降级为 `ask`，并写入 `security_warnings`（`eix doctor` 可见）。
 - 审批卡片上的 `a`（`Always allow`）只在中低风险出现：session scope 只存在内存，user scope
@@ -959,7 +947,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
   `session.rewind`：`eix rewind` 会按 `seq >= at` 倒序恢复快照并返回
   新 session。回滚是尽力而为的，恢复失败、缺失文件、被 prune 的旧快照都会在结果的
   `warnings` 里列出，`restored = false` 表示工作区没有完全回到切点。
-- 大仓库可以设 `[tools] snapshots = false` 关掉；关闭后不再
+- 大仓库可以设 `tools.snapshots: false` 关掉；关闭后不再
   记录 `snapshot` 事件。`eix doctor` 会显示当前开关。
 
 ### Provider 自动重试
@@ -1001,7 +989,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 | memory | 跨 session 记忆 + 当前任务列表（`todo`） | 5% |
 
 - token 是启发式估算：ASCII 约 4 字符/token，CJK 约 1 字符/token，每条消息另加 4 token
-  结构开销；总预算和裁剪阈值由 `[context]` 配置。
+  结构开销；总预算和裁剪阈值由 `context:` 配置。
 - `tools` / `history` 超出 sector 预算时，最旧的未 pin 条目会自动标 `cut`；通常保留最新 4 条
   （模型刚拿到的工具输出不会立刻消失）。若 4 条大输出仍超过总预算，会进入 emergency trim：
   保留当前 user 消息和最新工具结果，继续丢弃更旧的历史/工具步骤。`system` / `instructions` /
@@ -1012,7 +1000,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 - 上下文操作（裁剪、压缩、pin/drop）由 daemon 作为内部事件维护，重启后重放一致；compact
   把一段历史换成 summary，原始事件仍保留在日志里但不再发给 provider。
 - workspace summary、instructions 和 memory 在每次重建上下文时重新读取，所以改 `AGENTS.md`
-  或切 branch 后下一次请求就会生效。`[context]` 可改预算、指令文件名或关掉 workspace summary。
+  或切 branch 后下一次请求就会生效。`context:` 可改预算、指令文件名或关掉 workspace summary。
 - 自动压缩：每轮开始前**以及每个工具批次之后**都会重建 ledger；如果 token 超过
   `auto_compact_threshold`（默认 0.8），daemon 先把最旧的 turn 总结掉。保留窗口优先使用
   `auto_compact_keep_tokens`（默认约 8000 tokens），并至少保留
@@ -1045,7 +1033,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 
 ### 外部通知
 
-`[notifications]` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你。
+`notifications:` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你。
 TUI 内的提醒固定显示在底部状态栏中间，不会弹桌面通知：
 
 | 字段 | 默认 | 行为 |
@@ -1054,11 +1042,11 @@ TUI 内的提醒固定显示在底部状态栏中间，不会弹桌面通知：
 | `bell` | `false` | `eix tui` 在**后台** pane 需要 attention 时响终端铃（聚焦 pane 不响） |
 | `cooldown_secs` | `10` | 同一 session 的通知冷却 |
 
-```toml
-[notifications]
-command = "notify-send eix \"$EIX_SESSION_NAME $EIX_STATUS\""
-bell = true
-cooldown_secs = 10
+```yaml
+notifications:
+  command: 'notify-send eix "$EIX_SESSION_NAME $EIX_STATUS"'
+  bell: true
+  cooldown_secs: 10
 ```
 
 `command` 在独立线程里执行，卡住也不会阻塞 daemon；失败只记日志。tmux 用户可用
@@ -1075,7 +1063,7 @@ cooldown_secs = 10
 额外 system prompt，`model` / `permission` 也随之生效（权限只会收紧）。
 
 一个 assistant 批次里的多个 `spawn_agent` 会并发跑（`tokio::spawn`），并发默认值由
-`[tools] max_parallel_subagents` 控制（默认 4，支持 1/2/4/8/16/32）。TUI 里可用
+`tools.max_parallel_subagents` 控制（默认 4，支持 1/2/4/8/16/32）。TUI 里可用
 `/subagents [n]` 覆盖当前运行时上限（`/subagents` 不带参数打开 picker）；`/reload` 或
 daemon 重启后回到配置文件默认值。全是只读工具的批次也会并发执行，其它工具
 仍按顺序执行；结果按调用顺序回填给父模型。子 agent 的 turn 完整写进它自己的事件日志，因此
@@ -1086,10 +1074,10 @@ daemon 重启后回到配置文件默认值。全是只读工具的批次也会�
 
 除 Unix socket / TCP 外，还可以只开一个 HTTP 端口给脚本、SDK 或 Web 前端用：
 
-```toml
-[server]
-http = "127.0.0.1:7778"  # 或用 EIX_HTTP
-token = "..."            # 与 TCP 共用；开 http 时必填
+```yaml
+server:
+  http: 127.0.0.1:7778   # 或用 EIX_HTTP
+  token: "..."           # 与 TCP 共用；开 http 时必填
 ```
 
 - `GET /health`：无需认证，返回 `{"ok":true,"version":"..."}`。
@@ -1133,11 +1121,11 @@ while let Some(notification) = events.next().await {
 
 默认只监听 Unix socket（0600，靠文件系统权限保护）。要跨机器用，在配置里打开 TCP：
 
-```toml
-[server]
-tcp = "127.0.0.1:7777"   # 或用 EIX_TCP
-http = "127.0.0.1:7778"  # 可选；或用 EIX_HTTP
-token = "..."            # 打开 tcp/http 时必填，非空
+```yaml
+server:
+  tcp: 127.0.0.1:7777    # 或用 EIX_TCP
+  http: 127.0.0.1:7778   # 可选；或用 EIX_HTTP
+  token: "..."           # 打开 tcp/http 时必填，非空
 ```
 
 设置 `tcp` 后 token 是强制的（配置校验会拒绝空 token）。TCP 连接必须把 `auth {token}`
@@ -1255,7 +1243,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 显式权限规则（`[[tools.rules]]`：工具名 + 路径 glob + argv 前缀 / 正则 / signature；deny 全局优先、按具体度选择、项目配置只能收紧）
 - [x] 统一风险分析与审计（只读命令分析、硬 deny、network/secret 保护、`permission_evaluated` 事件、审批 scope / risk UX、`external_directory`）
 - [x] 自动压缩（超过 `auto_compact_threshold` 时总结旧 turn，保留最近 N 轮；`context_compacted` 事件）
-- [x] 配置分层 + 占位符 + 热重载 + `cli.json`（全局 → 祖先 `.eix/config.toml`、`{env:}` / `{file:}`、mtime 轮询 + `/reload`、项目默认 model/agent/permission）
+- [x] 配置分层 + 占位符 + 热重载 + `cli.json`（全局 → 祖先 `.eix/config.yaml`、`{env:}` / `{file:}`、mtime 轮询 + `/reload`、项目默认 model/agent/permission）
 - [x] session 管理（undo/redo、export/import、delete、archive、timeline、队列 `rm`/`move`；CLI `eix undo/redo/export/import/delete/archive/timeline`）
 - [x] Skills（原生 `.eix` + 可配置 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 兼容、system prompt 摘要 + `use_skill {name, arguments}`、`$ARGUMENTS` / `$1..$9`、`allowed-tools` 单 turn 限制、带预览的 `/skills` picker）
 - [x] 写入后 formatter（`[[formatter]]` command/extensions/timeout；按顺序首个匹配；直接写入与 staged apply 都生效）

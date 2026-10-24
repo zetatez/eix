@@ -27,6 +27,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: toml::de::Error,
     },
+    #[error("invalid yaml config {path}: {source}")]
+    Yaml {
+        path: PathBuf,
+        source: serde_yaml::Error,
+    },
     #[error("invalid json config {path}: {source}")]
     Json {
         path: PathBuf,
@@ -1454,8 +1459,9 @@ impl Config {
     }
 
     /// Like [`load`](Self::load), but resolves relative project layers from
-    /// `cwd`. Global config first, then ancestor `.eix/config.toml` files
+    /// `cwd`. Global config first, then ancestor `.eix/config.yaml` files
     /// outermost to nearest; nearer files win. Tables merge, arrays replace.
+    /// Legacy `.toml` files are accepted when no YAML file exists.
     pub fn load_for(path: Option<&Path>, cwd: &Path) -> Result<Self, ConfigError> {
         let mut explicit_path = None;
         let mut watch_paths = Vec::new();
@@ -1488,7 +1494,7 @@ impl Config {
             let mut dirs: Vec<PathBuf> = cwd.ancestors().map(Path::to_path_buf).collect();
             dirs.reverse();
             for dir in dirs {
-                let candidate = dir.join(".eix").join("config.toml");
+                let candidate = project_config_path(&dir);
                 if candidate.exists() {
                     let mut layer = read_layer(&candidate)?;
                     sanitize_project_layer(&mut layer, &mut security_warnings);
@@ -2355,7 +2361,7 @@ fn read_layer(path: &Path) -> Result<toml::Value, ConfigError> {
     if text.trim().is_empty() {
         return Ok(toml::Value::Table(toml::map::Map::new()));
     }
-    toml::from_str(&text).map_err(|source| ConfigError::Parse {
+    serde_yaml::from_str::<toml::Value>(&text).map_err(|source| ConfigError::Yaml {
         path: path.to_path_buf(),
         source,
     })
@@ -2454,10 +2460,22 @@ pub fn default_config_path() -> PathBuf {
     if let Some(path) = env_var("EIX_CONFIG") {
         return PathBuf::from(path);
     }
-    config_dir().join("config.toml")
+    config_dir().join("config.yaml")
 }
 
-/// Project-local CLI defaults. This is separate from `config.toml` because it
+/// YAML project config, preferring `.yaml` over `.yml`.
+fn project_config_path(dir: &Path) -> PathBuf {
+    let base = dir.join(".eix");
+    for name in ["config.yaml", "config.yml"] {
+        let candidate = base.join(name);
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+    base.join("config.yaml")
+}
+
+/// Project-local CLI defaults. This is separate from `config.yaml` because it
 /// describes how the CLI should *start* a session, not how the daemon behaves.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -2922,12 +2940,38 @@ base_url = "http://127.0.0.1:11434/v1"
     }
 
     #[test]
-    fn legacy_provider_table_is_migrated() {
-        let dir = config_temp_dir("legacy-provider");
-        let path = dir.join("config.toml");
+    fn yaml_config_loads() {
+        let dir = config_temp_dir("yaml");
+        let path = dir.join("config.yaml");
         std::fs::write(
             &path,
-            "[provider]\nbase_url = \"https://legacy.test/v1\"\nmodel = \"legacy-model\"\ntimeout_secs = 42\n",
+            r#"
+providers:
+  openai:
+    default: true
+    base_url: "https://yaml.test/v1"
+    model: "yaml-model"
+tools:
+  approval: "auto"
+context:
+  budget_tokens: 12345
+"#,
+        )
+        .unwrap();
+        let config = Config::load_for(Some(&path), &dir).expect("yaml config");
+        assert_eq!(config.default_model(), "yaml-model");
+        assert_eq!(config.tools.approval, ApprovalMode::Auto);
+        assert_eq!(config.context.budget_tokens, 12345);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_provider_table_is_migrated() {
+        let dir = config_temp_dir("legacy-provider");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "provider:\n  base_url: https://legacy.test/v1\n  model: legacy-model\n  timeout_secs: 42\n",
         )
         .unwrap();
         let config = Config::load_for(Some(&path), &dir).expect("legacy config");
@@ -3094,18 +3138,18 @@ action = "ask"
         std::fs::create_dir_all(root.join(".eix")).unwrap();
         std::fs::create_dir_all(root.join("repo").join(".eix")).unwrap();
         std::fs::write(
-            root.join(".eix/config.toml"),
-            "[context]\nbudget_tokens = 1111\n[tools]\nmax_output_bytes = 1111\n",
+            root.join(".eix/config.yaml"),
+            "context:\n  budget_tokens: 1111\ntools:\n  max_output_bytes: 1111\n",
         )
         .unwrap();
         std::fs::write(
-            root.join("repo/.eix/config.toml"),
-            "[context]\nbudget_tokens = 2222\n",
+            root.join("repo/.eix/config.yaml"),
+            "context:\n  budget_tokens: 2222\n",
         )
         .unwrap();
         std::fs::write(
-            nested.join(".eix/config.toml"),
-            "[tools]\nmax_output_bytes = 3333\n",
+            nested.join(".eix/config.yaml"),
+            "tools:\n  max_output_bytes: 3333\n",
         )
         .unwrap();
 
@@ -3114,7 +3158,7 @@ action = "ask"
         assert_eq!(config.tools.max_output_bytes, 3333);
         assert!(config
             .watch_paths
-            .contains(&nested.join(".eix/config.toml")));
+            .contains(&nested.join(".eix/config.yaml")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3123,35 +3167,32 @@ action = "ask"
         let root = config_temp_dir("project-tighten");
         std::fs::create_dir_all(root.join(".eix")).unwrap();
         std::fs::write(
-            root.join(".eix/config.toml"),
+            root.join(".eix/config.yaml"),
             r#"
-[tools]
-approval = "auto"
-sandbox = "off"
-sandbox_network = true
-sandbox_read_paths = ["/"]
-sandbox_writable_roots = ["/"]
-external_directory = ["/"]
-network_allow = ["*"]
-snapshots = false
+tools:
+  approval: auto
+  sandbox: off
+  sandbox_network: true
+  sandbox_read_paths: ["/"]
+  sandbox_writable_roots: ["/"]
+  external_directory: ["/"]
+  network_allow: ["*"]
+  snapshots: false
+  rules:
+    - id: repo-allow
+      tool: write_file
+      action: allow
+    - id: repo-shell
+      tool: run_command
+      command: ["true"]
+      action: allow
 
-[compations]
-claude_code = true
-opencode = true
-codex_cli = true
-gemini_cli = true
-pi = true
-
-[[tools.rules]]
-id = "repo-allow"
-tool = "write_file"
-action = "allow"
-
-[[tools.rules]]
-id = "repo-shell"
-tool = "run_command"
-command = ["true"]
-action = "allow"
+compations:
+  claude_code: true
+  opencode: true
+  codex_cli: true
+  gemini_cli: true
+  pi: true
 "#,
         )
         .unwrap();
@@ -3248,10 +3289,10 @@ pi = true
     fn config_placeholders_expand_env_and_file_values() {
         let dir = config_temp_dir("placeholders");
         std::fs::write(dir.join("key.txt"), "secret-from-file\n").unwrap();
-        let path = dir.join("config.toml");
+        let path = dir.join("config.yaml");
         std::fs::write(
             &path,
-            "[providers.openai]\ndefault = true\nmodel = \"gpt-4o-mini\"\napi_key = \"{file:key.txt}\"\nbase_url = \"{env:EIX_TEST_BASE_URL}\"\n",
+            "providers:\n  openai:\n    default: true\n    model: gpt-4o-mini\n    api_key: \"{file:key.txt}\"\n    base_url: \"{env:EIX_TEST_BASE_URL}\"\n",
         )
         .unwrap();
         // The base URL placeholder points at an existing variable so the test

@@ -602,7 +602,7 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
    "required" | "off"` 只决定在哪执行：构建命令默认 sandbox；bwrap 不可用时 auto 降级为
    强制审批，required 直接阻断。
 
-项目层 `.eix/config.toml` 只能收紧：`approval = "auto"`、`sandbox = "off"`、
+项目层 `.eix/config.yaml` 只能收紧：`approval = "auto"`、`sandbox = "off"`、
 `sandbox_network = true`、`external_directory`、`network_allow`、额外 sandbox 只读/可写路径
 会被忽略；项目 `allow` 规则降级为 `ask`；`snapshots = false` 被忽略。`[compations]` 默认全关，
 项目层只能关闭、不能开启其他 agent 的资源加载；所有拒绝都写入 `Config::security_warnings`。
