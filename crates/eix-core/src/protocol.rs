@@ -315,6 +315,18 @@ pub struct SessionAgentParams {
     pub agent: Option<String>,
 }
 
+/// `config.subagents`: change the runtime concurrency limit for `spawn_agent`.
+/// Config reload or a daemon restart restores `[tools] max_parallel_subagents`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentConcurrencyParams {
+    pub max_parallel_subagents: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubagentConcurrencyResult {
+    pub max_parallel_subagents: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelListResult {
     pub models: Vec<crate::ModelInfo>,
@@ -796,6 +808,14 @@ pub struct HelloResult {
     pub model: String,
     pub base_url: String,
     pub sessions: usize,
+    /// Runtime concurrency cap for `spawn_agent`, so the TUI can show the
+    /// current value without an extra request.
+    #[serde(default = "default_max_parallel_subagents")]
+    pub max_parallel_subagents: usize,
+}
+
+fn default_max_parallel_subagents() -> usize {
+    crate::DEFAULT_MAX_PARALLEL_SUBAGENTS
 }
 
 #[cfg(test)]
@@ -833,5 +853,22 @@ mod tests {
         assert_eq!(req.params, Value::Null);
         let create: CreateSessionParams = serde_json::from_str("{}").unwrap();
         assert!(create.name.is_none());
+    }
+
+    #[test]
+    fn hello_defaults_subagent_concurrency_for_older_daemons() {
+        let hello: HelloResult = serde_json::from_value(json!({
+            "protocol": PROTOCOL_VERSION,
+            "version": "0.0.0",
+            "pid": 1,
+            "model": "test",
+            "base_url": "http://127.0.0.1:9/v1",
+            "sessions": 0,
+        }))
+        .unwrap();
+        assert_eq!(
+            hello.max_parallel_subagents,
+            crate::DEFAULT_MAX_PARALLEL_SUBAGENTS
+        );
     }
 }

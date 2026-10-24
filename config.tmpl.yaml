@@ -66,6 +66,9 @@ provider_runtime:
 # Tool approval and safety. Defaults are shown; uncomment to change.
 tools:
   approval: "ask"  # ask | auto
+  # Apply low/medium file edits inside the workspace immediately. Snapshots
+  # and patch records are still kept; set false to review each edit.
+  auto_apply_workspace_edits: true
   # rules:
   #   - tool: "run_command"
   #     command: ["cargo", "test"]

@@ -1252,6 +1252,7 @@ struct LoopWord {
     end: usize,
     command_start: bool,
     quoted: bool,
+    redirection_target: bool,
 }
 
 fn loop_word_end(command: &str, offsets: &[usize], index: usize) -> usize {
@@ -1264,6 +1265,7 @@ fn read_loop_word(
     offsets: &[usize],
     mut i: usize,
     command_start: bool,
+    redirection_target: bool,
 ) -> Option<(LoopWord, usize)> {
     let start = loop_word_end(command, offsets, i);
     let mut text = String::new();
@@ -1357,6 +1359,7 @@ fn read_loop_word(
             end,
             command_start,
             quoted,
+            redirection_target,
         },
         i,
     ))
@@ -1418,14 +1421,14 @@ fn lex_loop_words(command: &str) -> Option<Vec<LoopWord>> {
                 i += 1;
             }
             if i < chars.len() && !matches!(chars[i], ';' | '|' | '&' | '\n') {
-                let (word, next) = read_loop_word(command, &chars, &offsets, i, false)?;
+                let (word, next) = read_loop_word(command, &chars, &offsets, i, false, true)?;
                 words.push(word);
                 i = next;
             }
             command_start = false;
             continue;
         }
-        let (word, next) = read_loop_word(command, &chars, &offsets, i, command_start)?;
+        let (word, next) = read_loop_word(command, &chars, &offsets, i, command_start, false)?;
         words.push(word);
         i = next;
         command_start = false;
@@ -1787,9 +1790,7 @@ fn dynamic_path_list(risk: &RiskAssessment, cwd: &Path) -> Option<DynamicPathLis
     }
     let mut segments = analysis.segments.iter();
     let first = segments.next()?;
-    let Some(program) = first.argv.first() else {
-        return None;
-    };
+    let program = first.argv.first()?;
     let program = program.rsplit('/').next().unwrap_or(program);
     let prefix = match program {
         "find" => find_path_list_prefix(&first.argv[1..], cwd)?,
@@ -1869,7 +1870,6 @@ fn safe_output_consumer(program: &str) -> bool {
             | "base32"
             | "od"
             | "hexdump"
-            | "xxd"
             | "strings"
             | "column"
     )
@@ -2140,10 +2140,13 @@ fn loop_variable_occurrence_is_safe(
     offset: usize,
     output_program: bool,
     command_start: bool,
+    redirection_target: bool,
 ) -> bool {
-    if output_program {
+    if output_program && !redirection_target && !raw.contains("$(") && !raw.contains('`') {
         // echo/test/true/false/: only emit or test data; they cannot write,
         // read file contents, or change shell state through an argument.
+        // Command substitutions and redirection targets execute or open
+        // independently of the output command, so they need path validation.
         return true;
     }
     if command_start {
@@ -2198,14 +2201,26 @@ fn loop_variable_uses_are_safe(body: &str, variable: &str) -> bool {
                 search_from = offset + exact_short.len();
                 continue;
             }
-            if !loop_variable_occurrence_is_safe(raw, offset, output_program, word.command_start) {
+            if !loop_variable_occurrence_is_safe(
+                raw,
+                offset,
+                output_program,
+                word.command_start,
+                word.redirection_target,
+            ) {
                 return false;
             }
             search_from = offset + exact_short.len();
         }
         while let Some(relative) = raw[search_from..].find(&exact_long) {
             let offset = search_from + relative;
-            if !loop_variable_occurrence_is_safe(raw, offset, output_program, word.command_start) {
+            if !loop_variable_occurrence_is_safe(
+                raw,
+                offset,
+                output_program,
+                word.command_start,
+                word.redirection_target,
+            ) {
                 return false;
             }
             search_from = offset + exact_long.len();
@@ -2233,6 +2248,15 @@ fn expand_dynamic_for_loop(command: &str, cwd: &Path) -> Option<String> {
     }
     let do_word = words.get(for_index + 4)?;
     if !is_loop_keyword(do_word, "do") {
+        return None;
+    }
+    if !command[in_word.end..value_word.start]
+        .chars()
+        .all(char::is_whitespace)
+        || !command[value_word.end..do_word.start]
+            .chars()
+            .all(|ch| ch.is_whitespace() || ch == ';')
+    {
         return None;
     }
     let producer = dynamic_producer(value_word, command)?;
@@ -3109,6 +3133,14 @@ fn classify_git(args: &[String], cwd: &Path, risk: &mut RiskAssessment) {
         );
         return;
     };
+    if args.len() == 1 && matches!(sub, "--version" | "-v" | "version") {
+        risk.add(
+            RiskCategory::ExecSafe,
+            RiskLevel::Low,
+            "git version only reports the installed version".to_string(),
+        );
+        return;
+    }
     if let Some(target) = output_target(args) {
         classify_write_path(target, cwd, risk);
         return;
@@ -4731,6 +4763,9 @@ mod tests {
     fn read_only_git_commands_are_safe() {
         for command in [
             "git status",
+            "git --version",
+            "git -v",
+            "git version",
             "git diff --cached",
             "git log --oneline -5",
             "git show HEAD",
@@ -5310,7 +5345,11 @@ mod tests {
             "for f in $(date); do sh; done",
             "for f in $(echo x | sh); do true; done",
             "for f in $(find crates -name '*.rs'); do cat \"./$f\" | sh; done",
+            "for f in $(find crates -name '*.rs'); do echo \"$f\" < \"$f\"; done",
+            "for f in $(find crates -name '*.rs'); do echo \"$(cat \"$f\")\"; done",
             "for f in $(find crates -name '*.rs'); do echo \"$f\"; done | xargs rm",
+            "for f in $(date); do echo \"$f\"; done | sort -o out",
+            "for f in $(date); do echo \"$f\"; done | uniq - out",
             "for f in $(find crates -name '*.rs'); do echo \"$f\"; cat \"$f\"; done",
         ] {
             let risk = assess_command(command, &cwd());

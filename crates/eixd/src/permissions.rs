@@ -410,7 +410,22 @@ pub fn decide(
     }
 
     let default = risk.default_action();
+    // `workspace-write` means exactly that: edits inside the workspace should
+    // not require a manual approval for every file. Snapshots and the recorded
+    // auto-patch still provide an audit trail and undo. Secret paths, external
+    // paths, and higher-risk writes continue to ask or deny.
+    let workspace_edit = config.tools.auto_apply_workspace_edits
+        && permission == PermissionLevel::WorkspaceWrite
+        && matches!(tool, "write_file" | "edit")
+        && default == PermissionAction::Ask
+        && !risk.hard_deny
+        && risk.level <= RiskLevel::Medium;
     let (action, force_ask, reason) = match default {
+        PermissionAction::Ask if workspace_edit => (
+            PermissionAction::Allow,
+            false,
+            "session permission allows in-workspace edits".to_string(),
+        ),
         PermissionAction::Deny => (
             PermissionAction::Deny,
             false,
@@ -590,6 +605,78 @@ mod tests {
     }
 
     #[test]
+    fn workspace_write_applies_in_workspace_edits() {
+        let config = config();
+        for tool in ["write_file", "edit"] {
+            let decision = decide(
+                tool,
+                &json!({"path": "src/main.rs", "content": "x"}),
+                Path::new("/tmp/eix-perm"),
+                &config,
+                PermissionLevel::WorkspaceWrite,
+                &[],
+                false,
+            );
+            assert_eq!(
+                decision.action,
+                PermissionAction::Allow,
+                "{tool}: {decision:?}"
+            );
+            assert!(decision.risk.categories.contains(&RiskCategory::WriteLocal));
+        }
+
+        // Secret and external paths keep their existing guardrails.
+        let secret = decide(
+            "write_file",
+            &json!({"path": ".env", "content": "x"}),
+            Path::new("/tmp/eix-perm"),
+            &config,
+            PermissionLevel::WorkspaceWrite,
+            &[],
+            false,
+        );
+        assert_eq!(secret.action, PermissionAction::Ask, "{secret:?}");
+        let external = decide(
+            "write_file",
+            &json!({"path": "/etc/passwd", "content": "x"}),
+            Path::new("/tmp/eix-perm"),
+            &config,
+            PermissionLevel::WorkspaceWrite,
+            &[],
+            false,
+        );
+        assert_eq!(external.action, PermissionAction::Deny, "{external:?}");
+        assert!(external.risk.hard_deny);
+
+        // Read-only sessions still reject edits.
+        let read_only = decide(
+            "write_file",
+            &json!({"path": "src/main.rs", "content": "x"}),
+            Path::new("/tmp/eix-perm"),
+            &config,
+            PermissionLevel::ReadOnly,
+            &[],
+            false,
+        );
+        assert_eq!(read_only.action, PermissionAction::Deny);
+
+        // The automatic apply can be disabled for users who want to review
+        // every patch.
+        let mut manual = config;
+        manual.tools.auto_apply_workspace_edits = false;
+        let staged = decide(
+            "write_file",
+            &json!({"path": "src/main.rs", "content": "x"}),
+            Path::new("/tmp/eix-perm"),
+            &manual,
+            PermissionLevel::WorkspaceWrite,
+            &[],
+            false,
+        );
+        assert_eq!(staged.action, PermissionAction::Ask, "{staged:?}");
+    }
+
+    #[test]
     fn common_read_only_shell_pipelines_do_not_ask() {
         let config = config();
         for command in [
@@ -598,12 +685,15 @@ mod tests {
             "cd /tmp/eix-perm && sed -n '1,80p' crates/eix-core/src/risk.rs",
             "cd /tmp/eix-perm && awk 'END{print NR}' crates/eix-core/src/risk.rs",
             "cd /tmp/eix-perm && git status --short",
+            "git --version",
             "find . -name '*.rs' | xargs wc -l | sort -n | tail -1",
             "find . -name '*.rs' | xargs cat | wc -l",
             "echo \"lines: $(wc -l < Cargo.toml)\"",
             "for f in crates/*/Cargo.toml; do echo \"--- $f\"; cat \"$f\"; done",
             "for d in crates/*/; do printf '%-24s %6s\\n' \"$d\" \"$(find $d -name '*.rs' | xargs cat | wc -l)\"; done",
             "for c in eix-core eixd; do n=$(find crates/$c -name '*.rs' | xargs cat | wc -l); echo \"$c: $n lines\"; done",
+            "for f in $(find crates -name '*.rs'); do cat \"./$f\"; done",
+            "for f in $(find crates -name '*.rs'); do echo \"$f\"; done | sort",
             "env FOO=1 timeout 5 ls crates",
         ] {
             let decision = decide(
@@ -631,6 +721,8 @@ mod tests {
             "sed -i 's/x/y/' file",
             "awk 'BEGIN{system(\"rm -rf /\")}'",
             "find . -name '*.rs' | xargs sort -o out",
+            "for f in $(find crates -name '*.rs'); do cat \"$f\"; done",
+            "for f in $(date); do echo \"$f\" | sh; done",
             "cd /tmp && cat passwd",
         ] {
             let decision = decide(

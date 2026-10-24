@@ -1492,6 +1492,7 @@ async fn staged_write_is_applied_after_approval() -> anyhow::Result<()> {
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
+    config.tools.auto_apply_workspace_edits = false;
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
@@ -1814,6 +1815,7 @@ async fn staged_write_can_be_revised_before_approval() -> anyhow::Result<()> {
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
+    config.tools.auto_apply_workspace_edits = false;
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
@@ -2270,6 +2272,7 @@ async fn staged_write_applies_only_the_selected_hunks() -> anyhow::Result<()> {
     ));
 
     let mut config = Config::default();
+    config.tools.auto_apply_workspace_edits = false;
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
@@ -2355,6 +2358,7 @@ async fn attention_runs_the_notification_command() -> anyhow::Result<()> {
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
     config.provider_runtime.timeout_secs = 30;
+    config.tools.auto_apply_workspace_edits = false;
     let notified_path = dir.join("notified");
     config.notifications.command = Some(format!(
         "printf '%s %s' \"$EIX_SESSION_NAME\" \"$EIX_STATUS\" > {}",
@@ -2405,6 +2409,7 @@ async fn staged_write_can_be_rejected_and_keeps_the_workspace_untouched() -> any
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
+    config.tools.auto_apply_workspace_edits = false;
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
@@ -2492,6 +2497,7 @@ async fn staged_write_reports_a_conflict_when_the_file_changed() -> anyhow::Resu
     let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
+    config.tools.auto_apply_workspace_edits = false;
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
@@ -2571,6 +2577,7 @@ async fn staged_writes_are_visible_to_reads() -> anyhow::Result<()> {
     let mock = tokio::spawn(staging_read_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
+    config.tools.auto_apply_workspace_edits = false;
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
@@ -5401,6 +5408,49 @@ async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn subagent_concurrency_can_change_at_runtime() -> anyhow::Result<()> {
+    let dir = temp_dir("subagent-concurrency");
+    std::fs::create_dir_all(&dir)?;
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = "http://127.0.0.1:9/v1".into();
+    config.default_provider_mut().model = "test-model".into();
+    config.default_provider_mut().api_key = Some("test".into());
+    config.tools.max_parallel_subagents = 8;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let hello: HelloResult = client.request("hello", Value::Null).await?;
+    assert_eq!(hello.max_parallel_subagents, 8);
+
+    let updated: Value = client
+        .request("config.subagents", json!({ "max_parallel_subagents": 16 }))
+        .await?;
+    assert_eq!(updated["max_parallel_subagents"], 16);
+    let hello: HelloResult = client.request("hello", Value::Null).await?;
+    assert_eq!(hello.max_parallel_subagents, 16);
+
+    for value in [0, 3, 6, 64] {
+        assert_eq!(
+            client
+                .request_error(
+                    "config.subagents",
+                    json!({ "max_parallel_subagents": value }),
+                )
+                .await?,
+            "invalid_params",
+            "{value}"
+        );
+    }
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn sessions_can_be_exported_imported_archived_and_deleted() -> anyhow::Result<()> {
     let dir = temp_dir("session-management");
     std::fs::create_dir_all(&dir)?;
@@ -6039,6 +6089,7 @@ async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::R
     let mock = tokio::spawn(repeat_tool_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
+    config.tools.auto_apply_workspace_edits = false;
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;

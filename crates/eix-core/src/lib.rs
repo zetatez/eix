@@ -25,12 +25,13 @@ pub mod skills;
 pub use agents::{find_agent, load_agents, AgentMode, AgentSpec};
 pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
-    load_cli_config, models_endpoint, theme_preset, ApprovalMode, AutoReady, CliConfig,
-    CompatConfig, Config, ConfigError, ContextConfig, FormatterConfig, FormattersConfig,
-    ImagesConfig, IntegrationConfig, LspConfig, LspServerConfig, McpConfig, McpServerConfig,
-    ModelConfig, ModelInfo, ModelRoute, NotificationsConfig, PermissionAction, PermissionRule,
-    ProviderConfig, ProviderSource, RepoIntegrationConfig, RuleSource, SandboxMode, ServerConfig,
-    ThemeConfig, ThemePreset, ToolsConfig, WorktreeConfig, THEME_PRESETS,
+    load_cli_config, models_endpoint, subagent_concurrency_supported, theme_preset, ApprovalMode,
+    AutoReady, CliConfig, CompatConfig, Config, ConfigError, ContextConfig, FormatterConfig,
+    FormattersConfig, ImagesConfig, IntegrationConfig, LspConfig, LspServerConfig, McpConfig,
+    McpServerConfig, ModelConfig, ModelInfo, ModelRoute, NotificationsConfig, PermissionAction,
+    PermissionRule, ProviderConfig, ProviderSource, RepoIntegrationConfig, RuleSource, SandboxMode,
+    ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, WorktreeConfig,
+    DEFAULT_MAX_PARALLEL_SUBAGENTS, SUBAGENT_CONCURRENCY_OPTIONS, THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
@@ -63,9 +64,9 @@ pub use protocol::{
     RewindResult, ServerMessage, SessionAgentParams, SessionArchiveParams, SessionCdParams,
     SessionExport, SessionExportResult, SessionImportParams, SessionList, SessionModelParams,
     SessionReadyParams, SessionRef, SessionResult, ShellRunParams, ShellRunResult, StatsResult,
-    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult,
-    TodoItem, TodoList, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
-    SESSION_EXPORT_VERSION,
+    SubagentConcurrencyParams, SubagentConcurrencyResult, SubmitParams, SubmitResult,
+    SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, TodoItem, TodoList,
+    WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 pub use risk::{
     analyze_command, assess_command, assess_read_path, assess_write_path, path_is_private_key,

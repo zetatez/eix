@@ -480,8 +480,15 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
   内层命令，或作为非纯输出命令的普通参数（可能变成 `git` / `date` / `grep` 的选项）
   时仍走动态目标审批。静态 `for` 循环（工作区内的字面量/通配符列表）会先展开再逐条
   分析，`n=$(...)` 等小写局部赋值按无副作用赋值处理，`printf -v` 只信任小写局部变量
-  名；绝对外部路径、`..`、隐藏文件通配符、命令替换列表、嵌套控制流、首段无字面前缀的
-  通配符（如裸 `*.rs`）以及循环体内的未知/写入命令仍询问。重定向、
+  名；绝对外部路径、`..`、隐藏文件通配符、嵌套控制流、首段无字面前缀的通配符（如裸
+  `*.rs`）以及循环体内的未知/写入命令仍询问。动态列表
+  `for f in $(...)` 只在列表恰好是一个未加引号的命令替换、生成命令本身可放行，且循环体
+  只把变量用于输出/测试或带字面相对前缀的路径（如 `"./$f"`）时展开；命令替换的分词
+  可能产生以 `-` 或 `/` 开头的片段，因此 `cat "$f"` / `sort "$f"` 仍保持询问。生成命令
+  只接受工作区路径列表（`find` 工作区路径、`git diff --name-only`、`git ls-files`、
+  `git ls-tree -r --name-only`、`rg --files` / `-l`）和保持整行的 `grep` / `head` /
+  `tail` / 简单 `sort` 过滤；写入、网络、secret、外部读取、未知生成命令、带引号/多词
+  列表、循环体写入或把输出送入 `sh` / `xargs` 等执行器时仍询问。重定向、
   后台运行、子 shell、`find -exec` / `-delete` / `-files0-from`、`rg --pre`、`fd -x`、
   `sed -i`、`awk` 的 `system`/重定向、`date -s`、`ss -K`、`sort -o` / `-T` /
   `--files0-from`、`diff --paginate`、`xxd` / `uniq` 的第二个文件参数、`wc` / `du
@@ -551,8 +558,10 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
    - `read-only`：隐藏 `write_file` / `edit` / `patch` / `start_command`；运行时拒绝所有写入、
      危险执行、网络 MCP 和 `ExecUnknown`。保留 `run_command`，以便 `git status` / `cat` /
      `grep` 等只读检查；写重定向和 `rm` 仍会被拒绝。
-   - `workspace-write`：默认级别，路径限制在 workspace 内，是否询问由风险、规则和 approval
-     mode 决定。
+   - `workspace-write`：默认级别，路径限制在 workspace 内。工作区内的低/中风险
+     `write_file` / `edit` 默认直接应用（保留 snapshot 和 auto-patch 记录）；
+     `[tools] auto_apply_workspace_edits = false` 可改回逐次 stage 审核。外部/secret 路径、
+     高风险写入和 shell 写操作仍按风险、规则和 approval mode 决定。
    - `full`：只解除能力上限；仍然执行硬拒绝、`deny` 规则、只读命令分类和沙箱要求。
 2. **风险分析**：`eix-core/src/risk.rs` 对具体调用分类：`Read` / `SecretRead` / `WriteLocal` /
    `WriteExternal` / `ExecSafe` / `ExecUnknown` / `ExecSandboxed` / `Destructive` / `Network` /
@@ -775,7 +784,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
 > 选中的 hunk）。
 > 策略：`[tools] approval = ask|auto`（默认 ask）加 `[[tools.rules]]`；低/中风险 `write_file` /
-> `edit` 在 stage 时生成 unified diff 和逐 hunk 预览并随 `patch_proposed` 事件广播，TUI 卡片与
+> `edit` 在 `workspace-write` 下默认直接应用，`auto_apply_workspace_edits = false` 时改为
+> stage 并生成 unified diff 和逐 hunk 预览、随 `patch_proposed` 事件广播，TUI 卡片与
 > `d` 全屏审阅将 unified diff 转成左旧右新的 side-by-side 视图（syntax highlight，窄宽回退
 > unified），CLI 保留 unified 输出。高风险/forced ask 写入不 stage，直接弹出带风险元数据的审批
 > 卡片。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
@@ -792,8 +802,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 单文件 8 MB、总量 200 MB、条目 5 万上限，跳过数与失败都记入 `snapshot` 事件（失败时工具
 > 输出也带一行说明），每个 session 保留 20 份。`Snapshotter::restore` 已实现并有测试覆盖，
 > 供 Phase 3 的 rewind 调用；事件日志只存索引，快照字节在 `<data>/snapshots/<session>/<id>/`。
-> `[tools] snapshots = false`（`EIX_TOOL_SNAPSHOTS=0`）可在大仓库里关闭。
-> Staged shadow workspace 已落地：`ask` 策略下低/中风险 `write_file` / `edit` 先把提案写入
+> `[tools] snapshots = false` 可在大仓库里关闭。
+> Staged shadow workspace 已落地：关闭 `auto_apply_workspace_edits` 后，低/中风险 `write_file` /
+> `edit` 先把提案写入
 > `<data>/staging/<session>/<patch_id>.json` 并立即返回 `staged ...`，turn 不阻塞；
 > `read_file` / `list_dir` 看到“真实工作区 + staged”合并视图，同一文件再次写入以最新
 > staged 内容为基准，可以叠加。`patch.proposed|applied|rejected|conflict` 事件与同名通知
@@ -860,8 +871,10 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > session（`origin = agent`、`parent_id`、名字 `parent/<label>-N`、cwd 继承），只读工具集
 > `read_file` / `list_dir` / `process_output`；agent session 在 `run_tool_call` 里对写工具
 > 直接拒绝，深度上限 1（child 不能再 spawn）。同一 assistant 批次里的多个 `spawn_agent`
-> 用 `tokio::spawn` 并发跑，其余工具保持顺序，结果按调用顺序回填；child 的完整 turn 写进
-> 自己的事件日志，失败作为普通 tool 结果返回，不打断父 turn。TUI 侧栏用 `↳` 标记。
+> 用 `tokio::spawn` 并发跑，默认上限由 `[tools] max_parallel_subagents` 配置（默认 4，支持
+> 1/2/4/8/16/32）；TUI `/subagents [n]` 通过 `config.subagents` RPC 覆盖运行时值（不写回配置），
+> 其余工具保持顺序，结果按调用顺序回填；child 的完整 turn 写进自己的事件日志，失败作为
+> 普通 tool 结果返回，不打断父 turn。TUI 侧栏用 `↳` 标记。
 >
 > 独立 nvim 前端已落地（2026-10-18）：`eix nvim [--session ID]` 把内嵌 Lua 插件写到
 > `<data>/eix-nvim.lua`，用 `EIX_NVIM_SOCKET` / `EIX_NVIM_TCP` / `EIX_NVIM_TOKEN` 连 daemon，
@@ -896,8 +909,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 工具：`grep {pattern, path?, include?, literal?, caseSensitive?, limit?}`、
 > `glob {pattern, path?, hidden?, limit?}`、`edit {path, oldString, newString, replaceAll?}`
 > 和 `patch {patchText}` 已落地。`read_file` 增加 `offset`/`limit` 且输出带行号。
-> `grep` / `glob` 只读自动放行；`edit` 与 `write_file` 共用 staged shadow workspace
-> （唯一匹配校验、生成 hunks）；`patch` 走阻塞审批，解析 `*** Begin Patch` 的
+> `grep` / `glob` 只读自动放行；`edit` 与 `write_file` 在 `workspace-write` 下默认直接应用，
+> 关闭 `auto_apply_workspace_edits` 时共用 staged shadow workspace（唯一匹配校验、生成
+> hunks）；`patch` 走阻塞审批，解析 `*** Begin Patch` 的
 > Add/Update/Delete，先校验全部文件再写入，并抓工作区树快照。`grep` / `glob` 目前看不到
 > staged 内容（MVP 限制）。
 >

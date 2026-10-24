@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -38,10 +38,10 @@ use eix_core::{
     SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
     SessionList, SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef, SessionResult,
     SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
-    StatusChangedPayload, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
-    TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition, ToolResultPayload,
-    UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
-    SESSION_EXPORT_VERSION,
+    StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
+    SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
+    ToolResultPayload, UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult,
+    PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -81,10 +81,12 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         data_dir.clone(),
     ));
     let blobs = BlobStore::new(data_dir.join("blobs"), config.images.clone());
+    let subagent_concurrency = config.tools.max_parallel_subagents;
     let daemon = Arc::new(Daemon {
         store,
         provider,
         config: arc_swap::ArcSwap::from_pointee(config),
+        subagent_concurrency: AtomicUsize::new(subagent_concurrency),
         bus,
         blobs,
         memory: MemoryStore::new(data_dir.join("memory")),
@@ -160,7 +162,15 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
                 }
                 match watcher.reload_config().await {
                     Ok(paths) => {
-                        watcher.emit_value("config.reloaded", json!({ "paths": paths }));
+                        watcher.emit_value(
+                            "config.reloaded",
+                            json!({
+                                "paths": paths,
+                                "max_parallel_subagents": watcher
+                                    .subagent_concurrency
+                                    .load(Ordering::Relaxed),
+                            }),
+                        );
                         eprintln!("eixd: config reloaded");
                     }
                     Err(err) => {
@@ -309,6 +319,10 @@ pub(crate) struct Daemon {
     store: Arc<Store>,
     provider: arc_swap::ArcSwap<Provider>,
     config: arc_swap::ArcSwap<Config>,
+    /// Runtime cap for concurrent `spawn_agent` calls. Initialized from
+    /// `[tools] max_parallel_subagents` and reset by config reload; the TUI can
+    /// override it until the next reload or daemon restart.
+    subagent_concurrency: AtomicUsize,
     pub(crate) bus: broadcast::Sender<Notification>,
     /// Prompt images, content-addressed on disk.
     blobs: BlobStore,
@@ -1332,6 +1346,7 @@ impl Daemon {
                 model: self.config.load().default_model().to_string(),
                 base_url: self.config.load().default_provider().base_url.clone(),
                 sessions: self.store.session_count()?,
+                max_parallel_subagents: self.subagent_concurrency.load(Ordering::Relaxed),
             })?),
             "ping" => Ok(json!({ "pong": true, "ts": now_ms() })),
             "session.list" => {
@@ -1594,7 +1609,25 @@ impl Daemon {
             }
             "config.reload" => {
                 let paths = self.reload_config().await?;
-                Ok(json!({ "reloaded": true, "paths": paths }))
+                Ok(json!({
+                    "reloaded": true,
+                    "paths": paths,
+                    "max_parallel_subagents": self.subagent_concurrency.load(Ordering::Relaxed),
+                }))
+            }
+            "config.subagents" => {
+                let params: SubagentConcurrencyParams = parse_params(request.params.clone())?;
+                if !eix_core::subagent_concurrency_supported(params.max_parallel_subagents) {
+                    return Err(rpc(
+                        "invalid_params",
+                        "max_parallel_subagents must be one of 1, 2, 4, 8, 16, 32",
+                    ));
+                }
+                self.subagent_concurrency
+                    .store(params.max_parallel_subagents, Ordering::Relaxed);
+                Ok(json!({
+                    "max_parallel_subagents": params.max_parallel_subagents,
+                }))
             }
             "agent.list" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
@@ -2998,9 +3031,12 @@ impl Daemon {
             .iter()
             .map(|path| path.display().to_string())
             .collect();
+        let subagent_concurrency = next.tools.max_parallel_subagents;
         self.blobs.set_config(next.images.clone());
         self.provider.store(Arc::new(provider));
         self.config.store(Arc::new(next));
+        self.subagent_concurrency
+            .store(subagent_concurrency, Ordering::Relaxed);
         *self.model_catalog.lock().await = ModelCatalogCache::default();
         self.mcp.lock().await.clear();
         self.lsp.lock().await.clear();
@@ -3600,7 +3636,7 @@ impl Daemon {
 
             if round == max_tool_rounds {
                 bail!(
-                    "tool loop exceeded {} rounds without a final answer; raise [tools] max_tool_rounds or EIX_TOOL_MAX_ROUNDS if this task legitimately needs more",
+                    "tool loop exceeded {} rounds without a final answer; raise [tools] max_tool_rounds if this task legitimately needs more",
                     max_tool_rounds
                 );
             }
@@ -3665,8 +3701,8 @@ impl Daemon {
             }
         }
 
-        const AGENT_CONCURRENCY: usize = 2;
-        let agent_limit = Arc::new(Semaphore::new(AGENT_CONCURRENCY));
+        let agent_concurrency = self.subagent_concurrency.load(Ordering::Relaxed).max(1);
+        let agent_limit = Arc::new(Semaphore::new(agent_concurrency));
         let mut agents: Vec<(String, tokio::task::JoinHandle<Result<String>>)> = Vec::new();
         if !cancel.load(Ordering::SeqCst) {
             for call in agent_calls {

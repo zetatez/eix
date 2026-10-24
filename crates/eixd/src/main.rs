@@ -72,9 +72,8 @@ OPTIONS:
     -V, --version       show version
 
 ENVIRONMENT:
-    EIX_BASE_URL, EIX_MODEL, EIX_API_KEY, EIX_API_KEY_ENV,
-    EIX_SYSTEM_PROMPT, EIX_TIMEOUT_SECS, EIX_SOCKET, EIX_DATA_DIR, EIX_CONFIG,
-    EIX_CONFIG_DIR
+    EIX_BASE_URL, EIX_MODEL, EIX_API_KEY, EIX_SOCKET, EIX_DATA_DIR,
+    EIX_CONFIG, EIX_CONFIG_DIR, EIX_TCP, EIX_TCP_TOKEN, EIX_HTTP
 
 The daemon runs in the foreground. `eix` starts it automatically."
     );

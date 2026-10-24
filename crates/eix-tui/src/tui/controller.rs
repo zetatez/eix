@@ -82,6 +82,10 @@ pub enum Command {
         session_id: String,
         agent: Option<String>,
     },
+    /// Change the daemon's runtime `spawn_agent` concurrency limit.
+    SetSubagentConcurrency {
+        value: usize,
+    },
     /// List configured models plus each provider's auto-fetched catalog.
     ListModels,
     /// List agents visible from a session's workspace.
@@ -244,6 +248,7 @@ impl Command {
             Self::SetPermission { .. } => "permission",
             Self::SetModel { .. } => "model",
             Self::SetAgent { .. } => "agent",
+            Self::SetSubagentConcurrency { .. } => "subagents",
             Self::ListModels | Self::ListAgents { .. } => "catalog",
             Self::ListMcp => "mcp",
             Self::ReloadConfig => "reload",
@@ -350,8 +355,12 @@ pub enum Event {
     },
     Agents(Vec<eix_core::AgentSpec>),
     Mcp(Vec<eix_core::McpServerInfo>),
+    SubagentConcurrency {
+        value: usize,
+    },
     ConfigReloaded {
         paths: Vec<String>,
+        max_parallel_subagents: usize,
     },
     Archived(Session),
     Deleted(String),
@@ -613,6 +622,21 @@ async fn dispatch(
             let result: SessionResult = decode(value)?;
             send(events, Event::Updated(result.session))
         }
+        Command::SetSubagentConcurrency { value } => {
+            let value = requester
+                .request(
+                    "config.subagents",
+                    json!({ "max_parallel_subagents": value }),
+                )
+                .await?;
+            let result: eix_core::SubagentConcurrencyResult = decode(value)?;
+            send(
+                events,
+                Event::SubagentConcurrency {
+                    value: result.max_parallel_subagents,
+                },
+            )
+        }
         Command::ListModels => {
             let value = requester.request("model.list", Value::Null).await?;
             let result: eix_core::ModelListResult = decode(value)?;
@@ -724,7 +748,17 @@ async fn dispatch(
                         .collect()
                 })
                 .unwrap_or_default();
-            send(events, Event::ConfigReloaded { paths })
+            let max_parallel_subagents = value["max_parallel_subagents"]
+                .as_u64()
+                .map(|value| value as usize)
+                .unwrap_or(eix_core::DEFAULT_MAX_PARALLEL_SUBAGENTS);
+            send(
+                events,
+                Event::ConfigReloaded {
+                    paths,
+                    max_parallel_subagents,
+                },
+            )
         }
         Command::Btw {
             session_id,

@@ -2,8 +2,9 @@
 //!
 //! The config keeps a map of OpenAI-compatible providers; exactly one entry is
 //! marked `default = true`. A few runtime knobs live on the default provider.
-//! Environment variables override the file so ad-hoc use (`EIX_MODEL=... eix
-//! chat`) does not require editing anything.
+//! Only the provider entry point (`EIX_BASE_URL`, `EIX_MODEL`, `EIX_API_KEY`)
+//! and startup/connection settings are read outside the file; every other knob
+//! comes from the config file.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -595,11 +596,28 @@ fn glob_match(pattern: &str, text: &str) -> bool {
     walk(&pattern, &text, 0, 0, &mut memo)
 }
 
+/// Default number of `spawn_agent` children allowed to run concurrently in one
+/// tool batch.
+pub const DEFAULT_MAX_PARALLEL_SUBAGENTS: usize = 4;
+
+/// Supported concurrency levels for `spawn_agent`. Keeping this a small,
+/// explicit set makes the configured default and runtime override predictable.
+pub const SUBAGENT_CONCURRENCY_OPTIONS: [usize; 6] = [1, 2, 4, 8, 16, 32];
+
+/// Whether `value` is a supported `spawn_agent` concurrency level.
+pub fn subagent_concurrency_supported(value: usize) -> bool {
+    SUBAGENT_CONCURRENCY_OPTIONS.contains(&value)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ToolsConfig {
     /// What to do with unruled `ask` calls.
     pub approval: ApprovalMode,
+    /// Apply low/medium writes inside the workspace immediately instead of
+    /// staging them for manual approval. Snapshots and auto-patch records are
+    /// still kept. Set to false to review every file edit.
+    pub auto_apply_workspace_edits: bool,
     /// Tool output is truncated to this many bytes before it enters the log.
     pub max_output_bytes: usize,
     /// Wall-clock limit for `run_command`.
@@ -608,6 +626,10 @@ pub struct ToolsConfig {
     /// rounds include a "summarize now" reminder, and the final round is sent
     /// without tool definitions so the model must produce an answer.
     pub max_tool_rounds: usize,
+    /// Default number of `spawn_agent` children that may run concurrently in
+    /// one tool batch. The TUI can override this at runtime; config reload or
+    /// a daemon restart restores this default.
+    pub max_parallel_subagents: usize,
     /// Filesystem isolation for `run_command` / `start_command`.
     pub sandbox: SandboxMode,
     /// Allow network access inside the sandbox.
@@ -681,15 +703,6 @@ fn url_host(url: &str) -> Option<&str> {
     (!host.is_empty()).then_some(host)
 }
 
-fn split_env_list(value: &str) -> Vec<String> {
-    value
-        .split([',', ':'])
-        .map(str::trim)
-        .filter(|item| !item.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
 fn expand_tilde(pattern: &str) -> String {
     if pattern == "~" {
         return env::var("HOME").unwrap_or_else(|_| "~".to_string());
@@ -706,9 +719,11 @@ impl Default for ToolsConfig {
     fn default() -> Self {
         Self {
             approval: ApprovalMode::Ask,
+            auto_apply_workspace_edits: true,
             max_output_bytes: 20_000,
             command_timeout_secs: 60,
             max_tool_rounds: 64,
+            max_parallel_subagents: DEFAULT_MAX_PARALLEL_SUBAGENTS,
             sandbox: SandboxMode::Auto,
             sandbox_network: false,
             sandbox_read_paths: vec![
@@ -1545,105 +1560,18 @@ impl Config {
     }
 
     fn apply_env(&mut self) {
-        {
-            let provider = self.default_provider_mut();
-            if let Some(value) = env_var("EIX_BASE_URL") {
-                provider.base_url = value;
-            }
-            if let Some(value) = env_var("EIX_MODEL") {
-                provider.model = value;
-            }
-            if let Some(value) = env_var("EIX_API_KEY") {
-                provider.api_key = Some(value);
-            }
-            if let Some(value) = env_var("EIX_API_KEY_ENV") {
-                provider.api_key_env = value;
-            }
+        // Keep only provider entry-point overrides. Every other setting is
+        // configured in the config file so a stale shell export cannot silently
+        // change daemon behavior.
+        let provider = self.default_provider_mut();
+        if let Some(value) = env_var("EIX_BASE_URL") {
+            provider.base_url = value;
         }
-        if let Some(value) = env_var("EIX_SYSTEM_PROMPT") {
-            self.provider_runtime.system_prompt = Some(value);
+        if let Some(value) = env_var("EIX_MODEL") {
+            provider.model = value;
         }
-        if let Some(value) = env_var("EIX_TIMEOUT_SECS").and_then(|v| v.parse().ok()) {
-            self.provider_runtime.timeout_secs = value;
-        }
-        if let Some(value) = env_var("EIX_RETRY_ATTEMPTS").and_then(|v| v.parse().ok()) {
-            self.provider_runtime.retry_attempts = value;
-        }
-        if let Some(value) = env_var("EIX_RETRY_BASE_MS").and_then(|v| v.parse().ok()) {
-            self.provider_runtime.retry_base_ms = value;
-        }
-        if let Some(value) = env_var("EIX_RETRY_MAX_SECS").and_then(|v| v.parse().ok()) {
-            self.provider_runtime.retry_max_secs = value;
-        }
-        if let Some(value) = env_var("EIX_TOOL_APPROVAL") {
-            match value.as_str() {
-                "ask" => self.tools.approval = ApprovalMode::Ask,
-                "auto" => self.tools.approval = ApprovalMode::Auto,
-                _ => {}
-            }
-        }
-        if let Some(value) = env_var("EIX_TOOL_MAX_OUTPUT").and_then(|v| v.parse().ok()) {
-            self.tools.max_output_bytes = value;
-        }
-        if let Some(value) = env_var("EIX_TOOL_TIMEOUT_SECS").and_then(|v| v.parse().ok()) {
-            self.tools.command_timeout_secs = value;
-        }
-        if let Some(value) = env_var("EIX_TOOL_MAX_ROUNDS").and_then(|v| v.parse().ok()) {
-            self.tools.max_tool_rounds = value;
-        }
-        if let Some(value) = env_var("EIX_TOOL_SANDBOX") {
-            match value.as_str() {
-                "auto" => self.tools.sandbox = SandboxMode::Auto,
-                "required" => self.tools.sandbox = SandboxMode::Required,
-                "off" => self.tools.sandbox = SandboxMode::Off,
-                _ => {}
-            }
-        }
-        if let Some(value) = env_var("EIX_TOOL_SANDBOX_NETWORK") {
-            self.tools.sandbox_network = matches!(value.as_str(), "1" | "true" | "yes" | "on");
-        }
-        if let Some(value) = env_var("EIX_TOOL_SANDBOX_READ_PATHS") {
-            self.tools.sandbox_read_paths = split_env_list(&value);
-        }
-        if let Some(value) = env_var("EIX_TOOL_SANDBOX_WRITABLE_ROOTS") {
-            self.tools.sandbox_writable_roots = split_env_list(&value);
-        }
-        if let Some(value) = env_var("EIX_TOOL_NETWORK_ALLOW") {
-            self.tools.network_allow = split_env_list(&value);
-        }
-        if let Some(value) = env_var("EIX_TOOL_SNAPSHOTS") {
-            self.tools.snapshots = matches!(value.as_str(), "1" | "true" | "yes" | "on");
-        }
-        if let Some(value) = env_var("EIX_NOTIFY_COMMAND") {
-            self.notifications.command = Some(value);
-        }
-        if let Some(value) = env_var("EIX_NOTIFY_COOLDOWN_SECS").and_then(|v| v.parse().ok()) {
-            self.notifications.cooldown_secs = value;
-        }
-        if let Some(value) = env_var("EIX_NOTIFY_BELL") {
-            self.notifications.bell = matches!(value.as_str(), "1" | "true" | "yes" | "on");
-        }
-        if let Some(value) = env_var("EIX_CONTEXT_BUDGET").and_then(|v| v.parse().ok()) {
-            self.context.budget_tokens = value;
-        }
-        if let Some(value) = env_var("EIX_CONTEXT_WORKSPACE") {
-            self.context.workspace_summary = matches!(value.as_str(), "1" | "true" | "yes" | "on");
-        }
-        if let Some(value) = env_var("EIX_CONTEXT_TOOL_OUTPUT_TOKENS").and_then(|v| v.parse().ok())
-        {
-            self.context.tool_output_tokens = value;
-        }
-        if let Some(value) = env_var("EIX_CONTEXT_TOOL_SCHEMA_TOKENS").and_then(|v| v.parse().ok())
-        {
-            self.context.max_tool_schema_tokens = value;
-        }
-        if let Some(value) = env_var("EIX_CONTEXT_AUTO_COMPACT") {
-            self.context.auto_compact = matches!(value.as_str(), "1" | "true" | "yes" | "on");
-        }
-        if let Some(value) =
-            env_var("EIX_CONTEXT_AUTO_COMPACT_THRESHOLD").and_then(|v| v.parse().ok())
-        {
-            self.context.auto_compact_threshold = value;
+        if let Some(value) = env_var("EIX_API_KEY") {
+            provider.api_key = Some(value);
         }
         if let Some(value) = env_var("EIX_TCP") {
             self.server.tcp = Some(value);
@@ -1739,6 +1667,11 @@ impl Config {
         if self.tools.max_tool_rounds == 0 {
             return Err(ConfigError::Invalid(
                 "tools.max_tool_rounds must be > 0".into(),
+            ));
+        }
+        if !subagent_concurrency_supported(self.tools.max_parallel_subagents) {
+            return Err(ConfigError::Invalid(
+                "tools.max_parallel_subagents must be one of 1, 2, 4, 8, 16, 32".into(),
             ));
         }
         if self.integration.enabled {
@@ -3423,13 +3356,17 @@ pi = true
             .any(|path| path == "~/.cargo"));
         assert!(default.tools.snapshots);
         assert_eq!(default.tools.approval, ApprovalMode::Ask);
+        assert!(default.tools.auto_apply_workspace_edits);
         assert_eq!(default.tools.max_tool_rounds, 64);
+        assert_eq!(default.tools.max_parallel_subagents, 4);
 
         let parsed: Config = toml::from_str(
             r#"
 [tools]
 approval = "auto"
+auto_apply_workspace_edits = false
 max_tool_rounds = 96
+max_parallel_subagents = 8
 sandbox = "required"
 sandbox_network = true
 sandbox_read_paths = ["~/.cargo"]
@@ -3440,7 +3377,9 @@ snapshots = false
         )
         .expect("tools config");
         assert_eq!(parsed.tools.approval, ApprovalMode::Auto);
+        assert!(!parsed.tools.auto_apply_workspace_edits);
         assert_eq!(parsed.tools.max_tool_rounds, 96);
+        assert_eq!(parsed.tools.max_parallel_subagents, 8);
         assert_eq!(parsed.tools.sandbox, SandboxMode::Required);
         assert!(parsed.tools.sandbox_network);
         assert_eq!(parsed.tools.sandbox_read_paths, vec!["~/.cargo"]);
@@ -3455,6 +3394,33 @@ snapshots = false
         let mut config = Config::default();
         config.tools.max_tool_rounds = 0;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn subagent_concurrency_levels_are_explicit() {
+        assert_eq!(DEFAULT_MAX_PARALLEL_SUBAGENTS, 4);
+        for value in SUBAGENT_CONCURRENCY_OPTIONS {
+            assert!(subagent_concurrency_supported(value), "{value}");
+        }
+        for value in [0, 3, 5, 6, 12, 64] {
+            assert!(!subagent_concurrency_supported(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn configured_subagent_concurrency_must_be_a_supported_level() {
+        for value in [1, 2, 4, 8, 16, 32] {
+            let mut config = Config::default();
+            config.tools.max_parallel_subagents = value;
+            config
+                .validate()
+                .unwrap_or_else(|err| panic!("{value}: {err}"));
+        }
+        for value in [0, 3, 6, 12, 64] {
+            let mut config = Config::default();
+            config.tools.max_parallel_subagents = value;
+            assert!(config.validate().is_err(), "{value}");
+        }
     }
 
     #[test]

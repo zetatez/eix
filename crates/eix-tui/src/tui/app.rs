@@ -147,6 +147,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "search providers/models and switch this session",
         ),
         builtin("agents", "[name]", "choose the session's primary agent"),
+        builtin("subagents", "[n]", "set the max parallel spawn_agent calls"),
         builtin("mcp", "", "browse MCP servers and their tools"),
         builtin("reload", "", "re-read the daemon config files"),
         builtin(
@@ -609,7 +610,7 @@ impl StreamState {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerKind {
     /// Replace the focused pane's session.
     Sessions,
@@ -629,6 +630,8 @@ enum PickerKind {
     Models,
     /// Select the focused session's primary agent.
     Agents,
+    /// Adjust the daemon's runtime subagent concurrency limit.
+    Subagents,
     /// Browse installed skills, with a body preview.
     Skills,
     /// Preview and apply a color preset.
@@ -652,6 +655,7 @@ impl PickerKind {
             | Self::Commands
             | Self::Models
             | Self::Agents
+            | Self::Subagents
             | Self::Skills
             | Self::Themes
             | Self::Mcp
@@ -679,6 +683,7 @@ impl PickerKind {
             Self::Commands => "commands",
             Self::Models => "model — search and switch",
             Self::Agents => "agents — choose the primary agent",
+            Self::Subagents => "subagents — parallel limit",
             Self::Skills => "skills — preview and insert",
             Self::Themes => "colorschemes — live preview",
             Self::Mcp => "mcp — servers and tools",
@@ -697,6 +702,7 @@ impl PickerKind {
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k · Esc close",
             Self::Models => "type to search · Enter switch · Esc close",
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k · Esc close",
+            Self::Subagents => "Enter apply · ↑/↓ or C-j/C-k · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
             Self::Mcp => "Enter close · ↑/↓ or C-j/C-k select · Esc close",
@@ -1221,6 +1227,8 @@ pub struct App {
     pub should_quit: bool,
     pub exit_message: Option<String>,
     hello: Option<HelloResult>,
+    /// Runtime `spawn_agent` concurrency cap reported by the daemon.
+    subagent_concurrency: usize,
     /// Latest `model.list` catalog, kept for the prompt header's model,
     /// provider and variant labels.
     models: Vec<ModelInfo>,
@@ -1391,6 +1399,7 @@ impl App {
             should_quit: false,
             exit_message: None,
             hello: None,
+            subagent_concurrency: eix_core::DEFAULT_MAX_PARALLEL_SUBAGENTS,
             models: Vec::new(),
             sessions: Vec::new(),
             selected: 0,
@@ -2154,6 +2163,7 @@ impl App {
                     ));
                 }
                 self.status = format!("connected to eixd {}", hello.version);
+                self.subagent_concurrency = hello.max_parallel_subagents;
                 self.hello = Some(hello);
                 // Fetch the catalog once so the prompt header can show the
                 // raw model id and provider before `/model` is opened.
@@ -2397,7 +2407,15 @@ impl App {
                     self.status = parts.join(" · ");
                 }
             }
-            Event::ConfigReloaded { paths } => {
+            Event::SubagentConcurrency { value } => {
+                self.subagent_concurrency = value;
+                self.status = format!("subagents → {value} (runtime)");
+            }
+            Event::ConfigReloaded {
+                paths,
+                max_parallel_subagents,
+            } => {
+                self.subagent_concurrency = max_parallel_subagents;
                 self.status = format!("config reloaded ({} layer(s))", paths.len());
             }
             Event::Archived(session) => {
@@ -3292,6 +3310,12 @@ impl App {
                 }
             }
             "config.reloaded" => {
+                if let Some(value) = notification.params["max_parallel_subagents"]
+                    .as_u64()
+                    .map(|value| value as usize)
+                {
+                    self.subagent_concurrency = value;
+                }
                 self.status = "config reloaded".into();
             }
             "config.error" => {
@@ -5512,6 +5536,17 @@ impl App {
                     }
                 }
             }
+            PickerKind::Subagents => {
+                self.picker = None;
+                if let Some(value) = value {
+                    match value.parse::<usize>() {
+                        Ok(value) => self.set_subagent_concurrency(value, tx),
+                        Err(_) => {
+                            self.error = Some("invalid subagent concurrency value".into());
+                        }
+                    }
+                }
+            }
             PickerKind::Skills => {
                 if let Some(value) = value {
                     let cwd = self
@@ -5586,6 +5621,15 @@ impl App {
             picker.loading = true;
             self.status = "agents: loading…".into();
             let _ = tx.send(Command::ListAgents { session_id });
+        } else if kind == PickerKind::Subagents {
+            let current = self.subagent_concurrency;
+            picker.items = subagent_picker_items(current);
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.value == current.to_string())
+                .unwrap_or(0);
+            self.status = format!("subagents: {current} concurrent (runtime)");
         } else if kind == PickerKind::Skills {
             let cwd = self
                 .focused_view()
@@ -5634,6 +5678,7 @@ impl App {
             "branches" => self.open_picker(PickerKind::Branches, tx),
             "model" => self.open_picker(PickerKind::Models, tx),
             "agents" => self.open_picker(PickerKind::Agents, tx),
+            "subagents" => self.open_picker(PickerKind::Subagents, tx),
             "toggle-agent" => self.toggle_agent_mode(tx),
             "skills" => self.open_picker(PickerKind::Skills, tx),
             "colorscheme" => self.open_picker(PickerKind::Themes, tx),
@@ -6127,6 +6172,19 @@ impl App {
                 }
                 true
             }
+            "subagents" => {
+                if args.is_empty() {
+                    self.open_picker(PickerKind::Subagents, tx);
+                } else {
+                    match args.parse::<usize>() {
+                        Ok(value) => self.set_subagent_concurrency(value, tx),
+                        Err(_) => {
+                            self.error = Some("usage: /subagents [1|2|4|8|16|32]".into());
+                        }
+                    }
+                }
+                true
+            }
             "mcp" => {
                 self.open_picker(PickerKind::Mcp, tx);
                 true
@@ -6520,6 +6578,15 @@ already exists, update it in place rather than rewriting it from scratch.";
                 self.error = Some("usage: /permission read-only | workspace-write | full".into());
             }
         }
+    }
+
+    fn set_subagent_concurrency(&mut self, value: usize, tx: &UnboundedSender<Command>) {
+        if !eix_core::subagent_concurrency_supported(value) {
+            self.error = Some("subagent concurrency must be 1, 2, 4, 8, 16, or 32".into());
+            return;
+        }
+        self.status = format!("setting subagents to {value}…");
+        let _ = tx.send(Command::SetSubagentConcurrency { value });
     }
 
     /// Persist the (cleared) draft and quit the whole TUI. Open sessions stay
@@ -9510,6 +9577,24 @@ already exists, update it in place rather than rewriting it from scratch.";
     }
 }
 
+/// Rows for the `/subagents` picker. The runtime override exposes exactly the
+/// supported levels instead of a free-form value.
+fn subagent_picker_items(current: usize) -> Vec<PickerItem> {
+    eix_core::SUBAGENT_CONCURRENCY_OPTIONS
+        .into_iter()
+        .map(|value| {
+            let label = if value == current {
+                format!("{value}  (current)")
+            } else {
+                value.to_string()
+            };
+            PickerItem::new(value.to_string())
+                .with_label(label)
+                .with_detail("maximum concurrent spawn_agent calls")
+        })
+        .collect()
+}
+
 /// Rows for the interactive `/colorscheme` picker. The first row clears the preset;
 /// the rest are the built-in palettes in `THEME_PRESETS` order.
 fn theme_picker_items() -> Vec<PickerItem> {
@@ -9804,6 +9889,11 @@ fn command_items() -> Vec<PickerItem> {
             "agents",
             "agents",
             "Choose the focused session's primary agent",
+        ),
+        (
+            "subagents",
+            "subagent concurrency",
+            "Set the maximum parallel spawn_agent calls",
         ),
         (
             "toggle-agent",
@@ -17049,6 +17139,71 @@ mod tests {
         app.input.set_text("/hel");
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
         assert!(app.help, "Enter runs the highlighted command");
+    }
+
+    #[test]
+    fn subagents_command_and_picker_adjust_the_runtime_limit() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+
+        assert!(app.handle_prompt_command("/subagents 8", &tx));
+        assert!(app.error.is_none());
+        assert!(app.status.contains('8'));
+        match rx.try_recv().expect("set command") {
+            Command::SetSubagentConcurrency { value } => assert_eq!(value, 8),
+            _ => panic!("expected a subagent concurrency command"),
+        }
+
+        app.handle_event(Event::SubagentConcurrency { value: 8 }, &tx);
+        assert_eq!(app.subagent_concurrency, 8);
+        assert!(app.status.contains("runtime"));
+
+        app.open_picker(PickerKind::Subagents, &tx);
+        let selected_value = {
+            let picker = app.picker.as_ref().expect("subagent picker");
+            assert_eq!(picker.kind, PickerKind::Subagents);
+            picker.items[picker.selected].value.clone()
+        };
+        assert_eq!(selected_value, "8");
+        let values = {
+            let picker = app.picker.as_ref().expect("subagent picker");
+            picker
+                .items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values, ["1", "2", "4", "8", "16", "32"]);
+
+        let next = {
+            let picker = app.picker.as_ref().expect("subagent picker");
+            picker
+                .items
+                .iter()
+                .position(|item| item.value == "16")
+                .expect("16 row")
+        };
+        app.picker.as_mut().expect("picker").selected = next;
+        app.picker_enter(PickerKind::Subagents, &tx);
+        assert!(app.picker.is_none());
+        match rx.try_recv().expect("picker command") {
+            Command::SetSubagentConcurrency { value } => assert_eq!(value, 16),
+            _ => panic!("expected a subagent concurrency command"),
+        }
+
+        for invalid in ["0", "6", "12", "64"] {
+            assert!(app.handle_prompt_command(&format!("/subagents {invalid}"), &tx));
+            assert!(
+                app.error
+                    .as_deref()
+                    .is_some_and(|err| err.contains("1, 2, 4, 8, 16, or 32")),
+                "{invalid}"
+            );
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "invalid values must not reach the daemon"
+        );
     }
 
     fn render_text(app: &mut App, width: u16, height: u16) -> String {

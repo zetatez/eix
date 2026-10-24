@@ -186,14 +186,10 @@ extensions = ["py"]
 # quit = "C-q"
 ```
 
-环境变量覆盖：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、`EIX_API_KEY_ENV`、
-`EIX_SYSTEM_PROMPT`、`EIX_TIMEOUT_SECS`、`EIX_RETRY_ATTEMPTS`、`EIX_RETRY_BASE_MS`、
-`EIX_RETRY_MAX_SECS`、`EIX_TOOL_POLICY`、`EIX_TOOL_MAX_OUTPUT`、
-`EIX_TOOL_TIMEOUT_SECS`、`EIX_TOOL_MAX_ROUNDS`、`EIX_TOOL_SANDBOX`、`EIX_TOOL_SANDBOX_NETWORK`、
-`EIX_TOOL_SANDBOX_READ_HOME`、`EIX_TOOL_SNAPSHOTS`、`EIX_CONTEXT_BUDGET`、
-`EIX_CONTEXT_AUTO_COMPACT`、`EIX_CONTEXT_AUTO_COMPACT_THRESHOLD`、`EIX_CONTEXT_TOOL_OUTPUT_TOKENS`、
-`EIX_CONTEXT_WORKSPACE`、`EIX_NOTIFY_COMMAND`、`EIX_NOTIFY_COOLDOWN_SECS`、
-`EIX_NOTIFY_BELL`、`EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`、`EIX_CONFIG_DIR`、`EIX_CLI_CONFIG`。
+环境变量只保留启动、连接和模型入口：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、
+`EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`、`EIX_CONFIG_DIR`、`EIX_CLI_CONFIG`、
+`EIX_TCP`、`EIX_TCP_TOKEN`、`EIX_HTTP`。工具、context、通知、provider runtime 等其余配置
+全部写入 `config.toml`，不再读取环境变量覆盖。
 
 eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `~/Library/Application Support`）：
 `config.toml`、`AGENTS.md`、`skills/`、`cmds/`、`agents/`。可用 `EIX_CONFIG_DIR` 覆盖这个目录。
@@ -226,10 +222,10 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `
 `context.updated`、`context.compacted`、`session.attention`、`turn.completed` 等。
 `eix-core/src/protocol.rs` 是唯一契约来源。
 
-当前限制：低/中风险的 `write_file` / `edit` 在 `ask` 策略下先 stage 到 shadow workspace、
-不阻塞 turn，读取（以及后续写入）看到的是“真实工作区 + staged”合并视图；高风险/forced
-ask 写入、以及 `run_command` 的写操作仍在审批处阻塞（shell 无法 stage），风险分析判定为
-只读的命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
+当前限制：`workspace-write` 默认自动应用工作区内的低/中风险 `write_file` / `edit`，同时
+保留执行前快照和自动补丁记录；把 `[tools] auto_apply_workspace_edits = false` 可恢复逐次
+stage 到 shadow workspace 的审核模式。高风险/forced ask 写入、外部路径、secret 路径以及
+`run_command` 的写操作仍在审批处阻塞（shell 无法 stage），风险分析判定为只读的命令直接执行。bubblewrap 沙箱已接入；context ledger 与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮、`a` 跳转提示，
 并在底部状态栏中间显示提醒（不弹桌面通知）；外部通知命令（dwm/tmux）已接入
 （见 `[notifications]`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：
@@ -371,6 +367,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
 | `/attention` / `/cancel` / `/toggle-agent` | 跳到下一个需要 attention 的 pane / 取消运行 / 切换 Build·Plan |
 | `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `[providers.*]` 自动拉取的 `/models` 和 `[[models]]`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
+| `/subagents [n]` | 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 4，可选 1/2/4/8/16/32）；不带参数打开 picker（仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
 | `/commands` | 从磁盘重新加载自定义 Markdown 命令 |
 | `/reload` | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC） |
@@ -787,9 +784,24 @@ wc -l)"` 可直接放行；但命令替换的结果一旦被当作路径、脚�
 静态、工作区内的 `for` 循环（字面量或通配符列表，如
 `for f in crates/*/Cargo.toml; do ...; done`）会展开后逐条分析，`n=$(...)` 这类小写
 局部变量赋值也不会再被当成未知命令；`printf -v` 仅允许写入小写局部变量。列表含绝对
-外部路径、`..`、隐藏文件通配符、命令替换，或循环体本身是未知/写入/嵌套控制流时仍会
-询问；通配符首段需要字面前缀（`crates/*` 可以，裸 `*` / `*.rs` 会询问，避免展开成
-`-o` 之类的选项）。`cargo test` / `npm test` 等构建命令默认在沙箱内执行；`rm`、写入
+外部路径、`..`、隐藏文件通配符，或循环体本身是未知/写入/嵌套控制流时仍会询问；通配符
+首段需要字面前缀（`crates/*` 可以，裸 `*` / `*.rs` 会询问，避免展开成 `-o` 之类的选项）。
+
+动态列表 `for f in $(...); do ...; done` 也会先判断生成命令的风险。生成命令必须是只读
+且可放行的，例如 `find <工作区路径>`、`git diff --name-only`、`git ls-files`、
+`git ls-tree -r --name-only`、`rg --files` / `rg -l`；管道后只允许 `grep` / `head` /
+`tail` / 简单 `sort` 这类保持整行路径的过滤。循环体只把 `$f` 用于输出/测试
+（`echo`、纯数据 `printf`、`test` / `[` / `true` / `false` / `:`），或用于带字面相对
+前缀的路径，如 `cat "./$f"`、`sed -n '1p' "./$f"`、`wc -l "./$f"`（变量未使用也
+可以）。`echo "$f"`、`printf '%s\n' "$f"` 和 `for f in $(find crates -name '*.rs'); do
+echo "$f"; done | sort | head` 可直接放行。
+
+路径参数必须带安全相对前缀，是因为命令替换会按空白拆分：路径片段可能以 `-` 或 `/`
+开头，`cat "$f"` / `sort "$f"` 可能变成选项或外部绝对路径；`cat "./$f"` 则始终留在
+当前工作区内。生成命令写到文件/网络/secret、读取工作区外、未知命令、带引号的
+`"$(...)"` 列表、多个列表词、嵌套控制流、以及循环体写入或把输出接入 `sh` / `xargs` /
+`sed` / `awk` 等执行器时仍会询问。`cargo test` / `npm test` 等构建命令默认在沙箱内
+执行；`rm`、写入
 重定向、未知程序、脚本解释器、`find -exec`、网络命令等按风险询问。`rm -rf /`、块设备 `dd`、`mkfs`、关机、
 fork bomb、私钥读取以及把 secret 占位符送进网络/命令/MCP 调用会硬拒绝，`auto` / `full`
 和任何 `allow` 规则都不能绕过。
@@ -809,7 +821,7 @@ fork bomb、私钥读取以及把 secret 占位符送进网络/命令/MCP 调用
 
 `write_file` 会先生成 unified diff 和逐 hunk 预览，TUI 审批卡片、
 `eix chat` 和 `eix log` 都会显示；在 TUI 里用 `d` 全屏审阅可以按 hunk 选择应用，命令行用
-`eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。策略由 `[tools]` 配置或环境变量控制：
+`eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。策略由 `[tools]` 配置控制：
 
 ```toml
 [tools]
@@ -817,6 +829,7 @@ approval = "ask"          # ask（默认）/ auto；只影响默认 ask，不绕
 max_output_bytes = 20000
 command_timeout_secs = 60
 max_tool_rounds = 64      # 单轮 turn 的 provider <-> 工具往返上限；最后几轮会提示收敛，最后一轮不再提供工具
+max_parallel_subagents = 4  # spawn_agent 并发默认值，可选 1/2/4/8/16/32；TUI 可在运行时覆盖
 sandbox = "auto"          # auto（默认，可用则隔离）/ required（不可用就询问）/ off
 sandbox_network = false   # false 时加 --unshare-net
 sandbox_read_paths = ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]  # 只读挂载，不再挂整个 $HOME
@@ -923,7 +936,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
   `session.rewind`：`eix rewind` / TUI ledger 的 `w` 会按 `seq >= at` 倒序恢复快照并返回
   新 session。回滚是尽力而为的，恢复失败、缺失文件、被 prune 的旧快照都会在结果的
   `warnings` 里列出，`restored = false` 表示工作区没有完全回到切点。
-- 大仓库可以设 `[tools] snapshots = false`（或 `EIX_TOOL_SNAPSHOTS=0`）关掉；关闭后不再
+- 大仓库可以设 `[tools] snapshots = false` 关掉；关闭后不再
   记录 `snapshot` 事件。`eix doctor` 会显示当前开关。
 
 ### Provider 自动重试
@@ -1037,8 +1050,11 @@ cooldown_secs = 10
 任意 subagent-capable 的 Markdown agent（内置 `explore`），其正文会作为子 session 的
 额外 system prompt，`model` / `permission` 也随之生效（权限只会收紧）。
 
-一个 assistant 批次里的多个 `spawn_agent` 会并发跑（`tokio::spawn`）；全是只读工具的批次也会
-并发执行，其它工具仍按顺序执行；结果按调用顺序回填给父模型。子 agent 的 turn 完整写进它自己的事件日志，因此
+一个 assistant 批次里的多个 `spawn_agent` 会并发跑（`tokio::spawn`），并发默认值由
+`[tools] max_parallel_subagents` 控制（默认 4，支持 1/2/4/8/16/32）。TUI 里可用
+`/subagents [n]` 覆盖当前运行时上限（`/subagents` 不带参数打开 picker）；`/reload` 或
+daemon 重启后回到配置文件默认值。全是只读工具的批次也会并发执行，其它工具
+仍按顺序执行；结果按调用顺序回填给父模型。子 agent 的 turn 完整写进它自己的事件日志，因此
 `eix ls` 能看到、`eix log` 能回放、TUI 侧栏用 `↳` 标出。子 agent 失败时会作为 tool
 结果返回给父模型（父可以重试或忽略），不会把父 turn 直接打成 error。
 
