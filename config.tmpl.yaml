@@ -84,6 +84,35 @@ tools:
   # sandbox_writable_roots=[], snapshots=true.
 
 
+# Session worktrees and the integration queue.
+#   New sessions in a git repo get a worktree lazily on the first prompt, named
+#   with an English slug generated from the task. `--shared` opts out.
+#   After the agent runs `eix ready` (or the session idles), the daemon pulls
+#   the base branch, rebases, runs the test command, then fast-forwards base.
+worktree:
+  auto: true          # false disables lazy worktrees for new sessions
+  base: "auto"        # local branch; auto = origin/HEAD, main/master, current
+
+integration:
+  enabled: true
+  auto_ready: "idle"  # manual | idle
+  idle_secs: 300
+  auto_commit: false  # commit dirty worktrees before queuing
+  test: "auto"        # Cargo / npm / Go / Python / Make detection, or a command
+  timeout_secs: 1800
+  pull_base: true     # git fetch + pull --ff-only on the base branch
+  push: false         # push base after a local fast-forward
+  retry_max_secs: 300
+  notify_after: 3     # notify after this many consecutive failures; 0 disables
+  pause_after: 0      # 0 = retry forever; N = pause after N failures
+  conflict_repair: true  # ask the session agent to repair conflicts/test failures
+  # repos:
+  #   "/absolute/repo/path":
+  #     base: "main"
+  #     test: "cargo test --workspace"
+  #     timeout_secs: 1800
+  #     pull_base: true
+
 # Optional: notify on approval/input/error.
 # notifications:
 #   bell: false

@@ -319,8 +319,8 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `<Space>v` / `<Space>t` / `<Space>r` | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局 |
 | `Ctrl-1` … `Ctrl-9` | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用；`Ctrl-7` 可能用于模型 picker） |
 | `Alt-1` … `Alt-9` | 同上；用于终端无法区分 `Ctrl-1…9` 的情况 |
-| `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；有待审批时卡片上的 `n` 仍是 deny |
-| `<Space>W` | 新建 session，同时在 `.worktrees/<name>` 建 git worktree |
+| `<Space>n` / `<Space>N` | 新建 session 并在新 pane 打开；在 git 仓库里首条 prompt 会自动建英文名 worktree；有待审批时卡片上的 `n` 仍是 deny |
+| `<Space>W` | 新建 session，立即在 `.worktrees/<name>` 建 git worktree（不等首条 prompt） |
 | `y` / `n` | 批准 / 拒绝聚焦 pane 的待审批工具调用（卡片快捷方式） |
 | `a` | `Always allow`：批准并为此 session 记住同类调用（卡片快捷方式） |
 | `Ctrl-J` / `Ctrl-K` · `Enter` | 审批/提问卡片是 Markdown checkbox 列表（`- [ ]` / `- [x]`）：`Ctrl-J`/`Ctrl-K`（或 `j`/`k`、`C-n`/`C-p`）移动，`Enter` 执行高亮项，`1-9` 直接选；首个选项是推荐项 |
@@ -351,9 +351,12 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
 | --- | --- |
 | `/help [query]` | 打开可搜索帮助（命令、快捷键、notes）；可带初始查询 |
 | `/keys [query]` | 只打开快捷键章节，同样支持即时搜索和上下选择 |
-| `/new [name]` | 在聚焦 session 的 cwd 里新建 session，并在新 pane 打开 |
+| `/new [name]` | 新建 session，并在新 pane 打开；git 仓库里首条 prompt 自动建英文名 worktree |
 | `/new-pane` | 打开 session picker，把已有 session 放进新 pane |
-| `/new-worktree [name]` | 在独立 git worktree 里新建 session |
+| `/new-worktree [name]` | 立即在独立 git worktree 里新建 session |
+| `/new-shared [name]` | 新建 session 但共享当前工作区（不建 worktree） |
+| `/ready` | 把当前 worktree 交给 daemon 做 rebase / 测试 / ff merge |
+| `/integrate` | 显示当前 session 的集成队列状态与最近错误 |
 | `/clear` | 清空模型上下文（更早的 turn 仍留在转录和事件日志里，只是不再发给模型） |
 | `/compact [notes]` | 让模型总结当前上下文，用摘要替换历史；`notes` 直接作为摘要文本 |
 | `/btw <question>` | 用一次性上下文回答旁支问题；不写入事件日志，也不进入主对话；`Esc` 关闭 |
@@ -663,7 +666,59 @@ fork 和 rewind 都按“复制历史前缀”工作：新 session 名为 `name~
 worktree 的生命周期与 session 解耦：`eix worktree list` 列出所有带 worktree 的
 session，`eix worktree remove SESSION` 删除空闲 session 的 worktree；有未提交改动时
 git 会拒绝，需显式加 `--force`。删除后 session 的 `cwd` 回到主仓库根目录，worktree
-字段清空。TUI 里 `N` 直接用新 worktree 开 session，`F` 在 repo 内 fork 时也会自动建。
+字段清空，并且不会自动再建；需要隔离工作区时请新建 session。TUI 里 `N` 直接用新 worktree 开 session，`F` 在 repo 内 fork 时也会自动建。
+
+### 自动 worktree 与集成队列
+
+在 git 仓库里，新建 session 默认**延迟到第一条 prompt** 才建 worktree：daemon 让模型
+根据任务内容总结一个英文 kebab-case 短名（例如 `fix-login-redirect`），再创建
+`.worktrees/<slug>` 和分支 `eix/<slug>`。这样不会先出现一个无意义的 `session` 目录；
+模型不可用时退化为 ASCII 词或 `task-<timestamp>`。创建时会把 `.worktrees/` 追加到
+`.git/info/exclude`（只影响本仓库，不改工作区文件），因此主 worktree 不会被 worktree
+目录弄脏。`eix new --shared` 或 TUI `/new-shared` 显式共享工作区。
+
+agent 完成工作并跑过测试后调用 `ready` 工具（无需审批）或运行 `eix ready`（TUI `/ready`）。
+daemon 的串行队列随后：
+
+1. 在干净的主 worktree 上 `git fetch` + `git pull --ff-only` 基分支（`worktree.base=auto`
+   时解析 `origin/HEAD` → `main`/`master`）；
+2. 把 session 分支 rebase 到基分支；
+3. 在 worktree 里运行测试命令（`integration.test=auto` 时识别 Cargo / npm / Go /
+   Python / Make；没有测试命令时不会合并）；
+4. 确认基分支 SHA 未变化后 `git merge --ff-only`。
+
+失败不会进入硬 blocked 状态：队列用 `retrying` 状态和指数退避继续尝试；冲突或测试
+失败会把错误和输出作为修复 prompt 注入原 session，agent 修复并再次 `eix ready` 即可。
+连续失败达到 `notify_after` 时通知，`pause_after=0`（默认）表示永不暂停；设置为 N 时
+暂停后可用 `eix integrate continue` 继续。`eix integrate status` 查看队列；TUI
+statusline 也会显示 `rebasing / testing / repairing / merged` 等状态。
+
+```toml
+[worktree]
+auto = true
+base = "auto"
+
+[integration]
+enabled = true
+auto_ready = "idle"   # manual | idle
+idle_secs = 300
+auto_commit = false
+test = "auto"
+timeout_secs = 1800
+pull_base = true
+push = false           # 默认只合并本地基分支；需要时再推远端
+retry_max_secs = 300
+notify_after = 3
+pause_after = 0
+conflict_repair = true
+
+[integration.repos."/home/me/src/app"]
+base = "main"
+test = "cargo test --workspace"
+```
+
+项目层 `.eix/config.toml` 不能设置 `[worktree]` / `[integration]`，这些是可执行策略，
+只从全局配置读取。
 
 ### 输入框：自研 Vim 风格编辑器
 
@@ -1117,7 +1172,8 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] context ledger（sector 预算 / token 记账、AGENTS.md + workspace 注入、drop / pin / compact、TUI `C` 与 `eix context`）
 - [x] process view（daemon 托管后台进程、`start_command` / `process_output`、流式输出与日志、TUI `P`、`eix ps/tail/kill`）
 - [x] fork / rewind（按消息裁剪历史复制到新 session；`eix rewind` / ledger `w` 还会按快照倒序回滚工作区，并报告无法恢复的改动）
-- [x] git worktree（`--worktree` / TUI `N` / repo 内 fork 自动建 `.worktrees/<name>`、`eix worktree list|remove`）
+- [x] git worktree（新 session 首条 prompt 自动建英文名 `.worktrees/<slug>`、`--shared`、`eix worktree list|remove`）
+- [x] 集成队列（`ready` 工具 / `eix ready`、rebase → 测试 → base ff merge、冲突/测试失败注入修复、退避重试与 `eix integrate`）
 - [x] 子 agent（`spawn_agent`、只读工具集、并发批次、深度上限 1、独立事件日志）
 - [x] `ask_user`（2-6 个选项、首个为推荐项、阻塞式交互选择、`eix answer N` 无头回答）
 - [x] daemon 化的 nvim 前端（内嵌 Lua 插件 + JSON-RPC、`:Eix` 命令、headless 测试）

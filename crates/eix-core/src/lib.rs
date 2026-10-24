@@ -25,11 +25,12 @@ pub mod skills;
 pub use agents::{find_agent, load_agents, AgentMode, AgentSpec};
 pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
-    load_cli_config, models_endpoint, theme_preset, ApprovalMode, CliConfig, CompatConfig, Config,
-    ConfigError, ContextConfig, FormatterConfig, FormattersConfig, ImagesConfig, LspConfig,
-    LspServerConfig, McpConfig, McpServerConfig, ModelConfig, ModelInfo, ModelRoute,
-    NotificationsConfig, PermissionAction, PermissionRule, ProviderConfig, ProviderSource,
-    RuleSource, SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, THEME_PRESETS,
+    load_cli_config, models_endpoint, theme_preset, ApprovalMode, AutoReady, CliConfig,
+    CompatConfig, Config, ConfigError, ContextConfig, FormatterConfig, FormattersConfig,
+    ImagesConfig, IntegrationConfig, LspConfig, LspServerConfig, McpConfig, McpServerConfig,
+    ModelConfig, ModelInfo, ModelRoute, NotificationsConfig, PermissionAction, PermissionRule,
+    ProviderConfig, ProviderSource, RepoIntegrationConfig, RuleSource, SandboxMode, ServerConfig,
+    ThemeConfig, ThemePreset, ToolsConfig, WorktreeConfig, THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{
@@ -54,22 +55,27 @@ pub use protocol::{
     AuthResult, BtwParams, BtwResult, CancelResult, ContextClearParams, ContextCompactParams,
     ContextDropParams, ContextLedgerParams, ContextPinParams, CreateSessionParams, DraftParams,
     DraftResult, Endpoint, EventsParams, EventsResult, ForkParams, HelloResult, InputRespondParams,
-    InputResult, LspDiagnosticInfo, LspWorkspaceParams, LspWorkspaceResult, McpListResult,
-    McpServerInfo, ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
+    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
+    LspDiagnosticInfo, LspWorkspaceParams, LspWorkspaceResult, McpListResult, McpServerInfo,
+    ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
     PatchRejectParams, PatchResult, PatchReviseParams, PermissionParams, ProcessKillParams,
     ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
     RewindResult, ServerMessage, SessionAgentParams, SessionArchiveParams, SessionCdParams,
     SessionExport, SessionExportResult, SessionImportParams, SessionList, SessionModelParams,
-    SessionRef, SessionResult, ShellRunParams, ShellRunResult, StatsResult, SubmitParams,
-    SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, TodoItem,
-    TodoList, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    SessionReadyParams, SessionRef, SessionResult, ShellRunParams, ShellRunResult, StatsResult,
+    SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult,
+    TodoItem, TodoList, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SESSION_EXPORT_VERSION,
 };
 pub use risk::{
     analyze_command, assess_command, assess_read_path, assess_write_path, path_is_private_key,
     path_is_secret, CommandAnalysis, CommandSegment, RiskAssessment, RiskCategory, RiskLevel,
 };
 pub use search::{SearchHit, SearchParams, SearchResult};
-pub use session::{PermissionLevel, Session, SessionId, SessionOrigin, SessionStatus};
+pub use session::{
+    IntegrationState, IntegrationStatus, PermissionLevel, Session, SessionId, SessionOrigin,
+    SessionStatus,
+};
 pub use skills::{available_prompt as available_skills_prompt, find_skill, load_skills, Skill};
 
 use std::time::{SystemTime, UNIX_EPOCH};

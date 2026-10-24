@@ -172,6 +172,132 @@ impl std::str::FromStr for PermissionLevel {
     }
 }
 
+/// Integration state for a session worktree. Kept separate from the turn
+/// status so a failed merge never makes the session look busy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntegrationStatus {
+    /// The session is still being worked on.
+    #[default]
+    Pending,
+    /// Explicitly ready, or auto-ready after idling.
+    Ready,
+    /// Pulling the base branch and updating remote refs.
+    Syncing,
+    /// Rebasing the session branch onto the base branch.
+    Rebasing,
+    /// An agent turn is resolving conflicts or a failing test.
+    Repairing,
+    /// Running the project test command in the rebased worktree.
+    Testing,
+    /// Fast-forwarding the base branch.
+    Merging,
+    /// The branch is part of the base branch.
+    Merged,
+    /// A transient failure; the queue will try again.
+    Retrying,
+}
+
+impl IntegrationStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Ready => "ready",
+            Self::Syncing => "syncing",
+            Self::Rebasing => "rebasing",
+            Self::Repairing => "repairing",
+            Self::Testing => "testing",
+            Self::Merging => "merging",
+            Self::Merged => "merged",
+            Self::Retrying => "retrying",
+        }
+    }
+
+    pub fn symbol(self) -> &'static str {
+        match self {
+            Self::Pending => "·",
+            Self::Ready => "→",
+            Self::Syncing => "⇣",
+            Self::Rebasing => "↻",
+            Self::Repairing => "✎",
+            Self::Testing => "✓",
+            Self::Merging => "⇢",
+            Self::Merged => "●",
+            Self::Retrying => "…",
+        }
+    }
+
+    pub fn is_active(self) -> bool {
+        matches!(
+            self,
+            Self::Syncing | Self::Rebasing | Self::Repairing | Self::Testing | Self::Merging
+        )
+    }
+}
+
+impl std::str::FromStr for IntegrationStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "pending" => Ok(Self::Pending),
+            "ready" => Ok(Self::Ready),
+            "syncing" => Ok(Self::Syncing),
+            "rebasing" => Ok(Self::Rebasing),
+            "repairing" => Ok(Self::Repairing),
+            "testing" => Ok(Self::Testing),
+            "merging" => Ok(Self::Merging),
+            "merged" => Ok(Self::Merged),
+            "retrying" => Ok(Self::Retrying),
+            _ => Err(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IntegrationState {
+    pub session_id: SessionId,
+    pub status: IntegrationStatus,
+    #[serde(default)]
+    pub stage: Option<String>,
+    #[serde(default)]
+    pub base_branch: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub log_path: Option<PathBuf>,
+    #[serde(default)]
+    pub ready_at: Option<i64>,
+    #[serde(default)]
+    pub next_retry_at: Option<i64>,
+    #[serde(default)]
+    pub attempts: u32,
+    #[serde(default)]
+    pub merged_commit: Option<String>,
+    #[serde(default)]
+    pub worktree_disabled: bool,
+    pub updated_at: i64,
+}
+
+impl IntegrationState {
+    pub fn new(session_id: impl Into<SessionId>) -> Self {
+        Self {
+            session_id: session_id.into(),
+            status: IntegrationStatus::Pending,
+            stage: None,
+            base_branch: None,
+            error: None,
+            log_path: None,
+            ready_at: None,
+            next_retry_at: None,
+            attempts: 0,
+            merged_commit: None,
+            worktree_disabled: false,
+            updated_at: now_ms(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub id: SessionId,

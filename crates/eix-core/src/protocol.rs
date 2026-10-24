@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{Event, PermissionLevel, Session, SessionId};
+use crate::{Event, IntegrationState, PermissionLevel, Session, SessionId};
 
 /// Bumped whenever a change breaks older clients.
 pub const PROTOCOL_VERSION: u32 = 1;
@@ -256,6 +256,34 @@ pub struct AttachParams {
     pub session_id: SessionId,
     #[serde(default)]
     pub tail: Option<usize>,
+}
+
+/// `session.ready`: request integration for a session worktree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionReadyParams {
+    pub session_id: SessionId,
+    /// Commit dirty worktree changes with an eix-generated message before
+    /// queuing. Defaults to `integration.auto_commit`.
+    #[serde(default)]
+    pub auto_commit: Option<bool>,
+}
+
+/// `integration.list`: current queue state, optionally for one session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IntegrationListParams {
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationListResult {
+    pub integrations: Vec<IntegrationState>,
+}
+
+/// `integration.continue`: clear failure counters and requeue a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IntegrationContinueParams {
+    pub session_id: SessionId,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

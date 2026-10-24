@@ -64,6 +64,10 @@ pub struct Config {
     /// Optional post-write formatters. Entries are tried in order and the
     /// first matching extension wins.
     pub formatter: FormattersConfig,
+    /// Session worktree defaults.
+    pub worktree: WorktreeConfig,
+    /// Worktree integration queue defaults.
+    pub integration: IntegrationConfig,
     /// Optional TUI palette overrides. Empty values keep the built-in colors.
     pub theme: ThemeConfig,
     /// Transcript-mode key overrides (`action = "C-x"`). Empty keeps defaults.
@@ -98,6 +102,8 @@ impl Default for Config {
             images: ImagesConfig::default(),
             lsp: LspConfig::default(),
             formatter: FormattersConfig::default(),
+            worktree: WorktreeConfig::default(),
+            integration: IntegrationConfig::default(),
             theme: ThemeConfig::default(),
             keys: std::collections::BTreeMap::new(),
             explicit_path: None,
@@ -154,6 +160,134 @@ pub struct ServerConfig {
     /// Shared secret every TCP/HTTP client must present. Required whenever
     /// `tcp` or `http` is set.
     pub token: Option<String>,
+}
+
+/// Worktree policy for new sessions. `auto` creates a worktree lazily on the
+/// first prompt, using an English slug generated from the task text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct WorktreeConfig {
+    /// Create an isolated worktree for every new user/fork session in a git
+    /// repository. Explicit `--shared` sessions opt out.
+    pub auto: bool,
+    /// Local base branch. `auto` resolves `origin/HEAD`, then `main` /
+    /// `master`, then the repository's current branch.
+    pub base: String,
+}
+
+impl Default for WorktreeConfig {
+    fn default() -> Self {
+        Self {
+            auto: true,
+            base: "auto".into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoReady {
+    /// Only an explicit `eix ready` starts integration.
+    Manual,
+    /// After a successful turn and an idle period, mark the session ready.
+    #[default]
+    Idle,
+}
+
+/// Daemon-side integration queue. One session branch is rebased onto the base
+/// branch, tested, then fast-forwarded into the base worktree.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct IntegrationConfig {
+    pub enabled: bool,
+    pub auto_ready: AutoReady,
+    /// Seconds of no activity before an idle session is marked ready.
+    pub idle_secs: u64,
+    /// Commit dirty worktree changes when readiness is requested.
+    pub auto_commit: bool,
+    /// Test command run in the rebased worktree. `auto` detects Cargo/npm/Go/
+    /// Python projects. An empty value is invalid while integration is enabled.
+    pub test: String,
+    /// Wall-clock limit for one test run.
+    pub timeout_secs: u64,
+    /// Fetch and `pull --ff-only` the base branch before each rebase.
+    pub pull_base: bool,
+    /// Push the base branch after a local fast-forward. Off by default.
+    pub push: bool,
+    /// Maximum backoff between transient retries.
+    pub retry_max_secs: u64,
+    /// Notify after this many consecutive failures. 0 disables notifications.
+    pub notify_after: u32,
+    /// Pause automatic retries after this many failures and wait for
+    /// `eix integrate continue`. 0 means never pause.
+    pub pause_after: u32,
+    /// Let the session agent attempt conflict/test repair.
+    pub conflict_repair: bool,
+    /// Per-repository overrides, keyed by canonical repository root.
+    pub repos: BTreeMap<String, RepoIntegrationConfig>,
+}
+
+impl Default for IntegrationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            auto_ready: AutoReady::Idle,
+            idle_secs: 300,
+            auto_commit: false,
+            test: "auto".into(),
+            timeout_secs: 1800,
+            pull_base: true,
+            push: false,
+            retry_max_secs: 300,
+            notify_after: 3,
+            pause_after: 0,
+            conflict_repair: true,
+            repos: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RepoIntegrationConfig {
+    pub base: Option<String>,
+    pub test: Option<String>,
+    pub timeout_secs: Option<u64>,
+    pub pull_base: Option<bool>,
+}
+
+impl IntegrationConfig {
+    fn repo_override(&self, repo: &Path) -> Option<&RepoIntegrationConfig> {
+        let key = repo.to_string_lossy();
+        self.repos.get(key.as_ref()).or_else(|| {
+            repo.file_name()
+                .and_then(|n| self.repos.get(n.to_string_lossy().as_ref()))
+        })
+    }
+
+    /// Base override for a repository, if configured.
+    pub fn repo_base(&self, repo: &Path) -> Option<&str> {
+        self.repo_override(repo)
+            .and_then(|over| over.base.as_deref())
+    }
+
+    pub fn repo_test(&self, repo: &Path) -> &str {
+        self.repo_override(repo)
+            .and_then(|over| over.test.as_deref())
+            .unwrap_or(&self.test)
+    }
+
+    pub fn repo_timeout(&self, repo: &Path) -> u64 {
+        self.repo_override(repo)
+            .and_then(|over| over.timeout_secs)
+            .unwrap_or(self.timeout_secs)
+    }
+
+    pub fn repo_pull_base(&self, repo: &Path) -> bool {
+        self.repo_override(repo)
+            .and_then(|over| over.pull_base)
+            .unwrap_or(self.pull_base)
+    }
 }
 
 /// External alerts when a session starts needing attention (approval, error).
@@ -1594,6 +1728,58 @@ impl Config {
                 "tools.command_timeout_secs must be > 0".into(),
             ));
         }
+        if self.integration.enabled {
+            if self.integration.idle_secs == 0 && self.integration.auto_ready == AutoReady::Idle {
+                return Err(ConfigError::Invalid(
+                    "integration.idle_secs must be > 0 when auto_ready = \"idle\"".into(),
+                ));
+            }
+            if self.integration.timeout_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "integration.timeout_secs must be > 0".into(),
+                ));
+            }
+            if self.integration.retry_max_secs == 0 {
+                return Err(ConfigError::Invalid(
+                    "integration.retry_max_secs must be > 0".into(),
+                ));
+            }
+            if self.integration.test.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "integration.test must be \"auto\" or a command".into(),
+                ));
+            }
+        }
+        for (repo, over) in &self.integration.repos {
+            if repo.trim().is_empty() {
+                return Err(ConfigError::Invalid(
+                    "integration.repos must use a non-empty repository path".into(),
+                ));
+            }
+            if over
+                .base
+                .as_deref()
+                .is_some_and(|base| base.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "integration.repos[{repo:?}].base must not be empty"
+                )));
+            }
+            if over
+                .test
+                .as_deref()
+                .is_some_and(|test| test.trim().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "integration.repos[{repo:?}].test must not be empty"
+                )));
+            }
+            if over.timeout_secs == Some(0) {
+                return Err(ConfigError::Invalid(format!(
+                    "integration.repos[{repo:?}].timeout_secs must be > 0"
+                )));
+            }
+        }
         for (index, formatter) in self.formatter.0.iter().enumerate() {
             if formatter
                 .command
@@ -2172,6 +2358,19 @@ fn sanitize_project_layer(layer: &mut toml::Value, warnings: &mut Vec<String>) {
         if tools.get("snapshots").and_then(toml::Value::as_bool) == Some(false) {
             tools.remove("snapshots");
             warnings.push("project config cannot disable snapshots; ignored".into());
+        }
+    }
+
+    // Automatic merging and test commands are executable policy. Only the
+    // global config (or an explicit trusted layer) may set them.
+    for key in ["integration", "worktree"] {
+        if layer
+            .as_table_mut()
+            .is_some_and(|table| table.remove(key).is_some())
+        {
+            warnings.push(format!(
+                "project config cannot set [{key}]; use the global config"
+            ));
         }
     }
 

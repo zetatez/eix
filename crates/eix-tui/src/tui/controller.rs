@@ -9,8 +9,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use eix_core::{
     ApprovalDecision, ApprovalResult, AttachResult, CancelResult, ContextLedgerResult, Endpoint,
-    EventsResult, HelloResult, InputResult, Notification, ProcessKillResult, ProcessList,
-    ProcessOutput, RewindResult, SearchResult, Session, SessionList, SessionResult, SubmitResult,
+    EventsResult, HelloResult, InputResult, IntegrationListResult, IntegrationState, Notification,
+    ProcessKillResult, ProcessList, ProcessOutput, RewindResult, SearchResult, Session,
+    SessionList, SessionResult, SubmitResult,
 };
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
@@ -27,6 +28,7 @@ pub const HISTORY_PAGE_EVENTS: usize = 500;
 pub enum Command {
     Hello,
     List,
+    ListIntegrations,
     Attach(String),
     /// Fetch a page of events older than `before_seq`.
     LoadHistory {
@@ -34,8 +36,9 @@ pub enum Command {
         before_seq: u64,
     },
     Create {
-        /// Create the session in its own git worktree.
-        worktree: bool,
+        /// `Some(true)` creates a worktree now; `None` lets the daemon create
+        /// one lazily from the first prompt; `Some(false)` shares the cwd.
+        worktree: Option<bool>,
         /// Working directory; defaults to the TUI's launch directory.
         cwd: Option<PathBuf>,
         /// Optional name; the daemon generates one when omitted.
@@ -44,6 +47,10 @@ pub enum Command {
         model: Option<String>,
         agent: Option<String>,
         permission: Option<String>,
+    },
+    /// Mark a worktree session ready for the integration queue.
+    Ready {
+        session_id: String,
     },
     /// Move a session to another working directory.
     SetCwd {
@@ -226,9 +233,11 @@ impl Command {
         match self {
             Self::Hello => "connect",
             Self::List => "list",
+            Self::ListIntegrations => "integrations",
             Self::Attach(_) => "attach",
             Self::LoadHistory { .. } => "history",
             Self::Create { .. } => "create",
+            Self::Ready { .. } => "ready",
             Self::SetCwd { .. } => "cd",
             Self::ClearContext { .. } => "clear",
             Self::CompactContext { .. } => "compact",
@@ -272,6 +281,7 @@ impl Command {
 pub enum Event {
     Hello(HelloResult),
     Sessions(Vec<Session>),
+    Integrations(Vec<IntegrationState>),
     Attached(AttachResult),
     /// An older page of stored events, ready to prepend to a pane.
     HistoryPage {
@@ -440,6 +450,11 @@ async fn dispatch(
     default_cwd: &Path,
 ) -> Result<()> {
     match command {
+        Command::ListIntegrations => {
+            let value = requester.request("integration.list", json!({})).await?;
+            let result: IntegrationListResult = decode(value)?;
+            send(events, Event::Integrations(result.integrations))
+        }
         Command::Hello => {
             let value = requester.request("hello", Value::Null).await?;
             send(events, Event::Hello(decode(value)?))
@@ -509,6 +524,16 @@ async fn dispatch(
                 .await?;
             let result: SessionResult = decode(value)?;
             send(events, Event::Created(result.session))
+        }
+        Command::Ready { session_id } => {
+            let value = requester
+                .request("session.ready", json!({ "session_id": session_id }))
+                .await?;
+            let state: eix_core::IntegrationState = decode(value)?;
+            send(
+                events,
+                Event::Notification(Notification::new("integration.updated", state)),
+            )
         }
         Command::SetCwd { session_id, path } => {
             let value = requester

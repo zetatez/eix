@@ -20,22 +20,24 @@ use base64::Engine as _;
 use eix_core::{
     now_ms, payload, AgentListResult, ApprovalDecision, ApprovalInfo, ApprovalListParams,
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
-    ApprovalScope, AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult,
-    ChatMessage, Config, ContextClearParams, ContextClearedPayload, ContextCompactParams,
-    ContextCompactedPayload, ContextDropParams, ContextDropPayload, ContextLedgerParams,
-    ContextPinParams, ContextPinPayload, CreateSessionParams, DraftParams, DraftResult,
-    ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
-    HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams,
-    InputResult, LspWorkspaceParams, McpListResult, McpServerInfo, ModelListResult, Notification,
-    PatchApplyParams, PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams,
-    PatchResult, PatchResultPayload, PatchReviseParams, PermissionAction, PermissionLevel,
-    PermissionParams, PermissionPayload, PermissionRule, PickerItem, PickerParams,
-    PickerPreviewParams, PickerPreviewResult, PickerResult, ProcessKillParams, ProcessKillResult,
-    ProcessList, ProcessListParams, ProcessOutputParams, RenameParams, Request, Response,
-    RewindParams, RewindResult, RuleSource, SearchParams, SearchResult, ServerMessage, Session,
-    SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
-    SessionId, SessionImportParams, SessionList, SessionModelParams, SessionOrigin, SessionRef,
-    SessionResult, SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
+    ApprovalScope, AttachParams, AttachResult, AuthParams, AutoReady, BtwParams, BtwResult,
+    CancelResult, ChatMessage, Config, ContextClearParams, ContextClearedPayload,
+    ContextCompactParams, ContextCompactedPayload, ContextDropParams, ContextDropPayload,
+    ContextLedgerParams, ContextPinParams, ContextPinPayload, CreateSessionParams, DraftParams,
+    DraftResult, ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams,
+    FunctionCall, HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload,
+    InputRespondParams, InputResult, IntegrationContinueParams, IntegrationListParams,
+    IntegrationListResult, IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult,
+    McpServerInfo, ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
+    PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
+    PermissionAction, PermissionLevel, PermissionParams, PermissionPayload, PermissionRule,
+    PickerItem, PickerParams, PickerPreviewParams, PickerPreviewResult, PickerResult,
+    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
+    RenameParams, Request, Response, RewindParams, RewindResult, RuleSource, SearchParams,
+    SearchResult, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
+    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
+    SessionList, SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef, SessionResult,
+    SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
     StatusChangedPayload, SubmitParams, SubmitResult, SubscribeParams, SubscribeResult,
     TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition, ToolResultPayload,
     UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
@@ -94,6 +96,8 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         lsp: Mutex::new(crate::lsp::LspSet::new()),
         todos: Mutex::new(HashMap::new()),
         turns: Mutex::new(HashMap::new()),
+        worktree_creating: Mutex::new(HashSet::new()),
+        integration_lock: Mutex::new(()),
         approvals: Mutex::new(HashMap::new()),
         always: Mutex::new(HashMap::new()),
         inputs: Mutex::new(HashMap::new()),
@@ -109,6 +113,12 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         eprintln!("eixd: restored {restored} staged patch(es)");
     }
     daemon.recover().await;
+    // One queue owner per daemon. It serializes merges so a session branch is
+    // never rebased while another session is updating the base worktree.
+    let integration = Arc::clone(&daemon);
+    tokio::spawn(async move {
+        integration.integration_loop().await;
+    });
     if let Ok(report) = daemon.gc_blobs().await {
         if report.removed > 0 {
             eprintln!(
@@ -319,6 +329,13 @@ pub(crate) struct Daemon {
     todos: Mutex<HashMap<SessionId, Vec<eix_core::TodoItem>>>,
     /// In-flight turns, used for busy checks and cancellation.
     turns: Mutex<HashMap<SessionId, Arc<AtomicBool>>>,
+    /// Sessions whose first prompt is currently creating a worktree, so two
+    /// concurrent prompts cannot create two branches.
+    worktree_creating: Mutex<HashSet<SessionId>>,
+    /// Serializes "queue claims a ready item" against "prompt resets the item
+    /// to pending and registers a turn". Without it the rebase can begin in
+    /// the gap between those two operations.
+    integration_lock: Mutex<()>,
     /// Tool calls blocked on a user decision, keyed by session.
     approvals: Mutex<HashMap<SessionId, PendingApproval>>,
     /// Session-scoped rules created by "Always allow" on the approval card.
@@ -398,9 +415,711 @@ impl Daemon {
         self.emit("session.updated", session);
     }
 
+    fn emit_integration(&self, state: &IntegrationState) {
+        self.emit("integration.updated", state);
+    }
+
+    fn save_integration(&self, state: &IntegrationState) -> Result<()> {
+        self.store.save_integration(state)?;
+        self.emit_integration(state);
+        Ok(())
+    }
+
+    async fn base_for_repo(&self, repo: &Path) -> Result<String> {
+        let config = self.config.load_full();
+        let configured = config
+            .integration
+            .repo_base(repo)
+            .unwrap_or(&config.worktree.base)
+            .to_string();
+        crate::worktree::resolve_base(repo, &configured).await
+    }
+
+    /// Name a worktree from the user's task text. The model call is on the
+    /// first prompt's critical path, so provider failure falls back to an
+    /// ASCII task slug rather than blocking the turn.
+    async fn generate_worktree_name(&self, session: &Session, text: &str) -> String {
+        let fallback = crate::integration::fallback_worktree_name(text);
+        let config = self.config.load_full();
+        let model = session
+            .model
+            .clone()
+            .unwrap_or_else(|| config.default_model().to_string());
+        let route = config.route(&model);
+        let messages = vec![
+            ChatMessage::system(
+                "You name git worktrees for coding tasks. Reply with only a short English name. Use 2-5 lowercase ASCII words joined by hyphens, at most 48 characters. No punctuation, quotes, explanation, or non-ASCII characters.",
+            ),
+            ChatMessage::user(format!(
+                "User task:\n\n{}\n\nReturn only the worktree name.",
+                cap_text(text.trim(), 4_000)
+            )),
+        ];
+        let cancel = AtomicBool::new(false);
+        let provider = self.provider.load_full();
+        match provider
+            .stream_chat(&messages, &route, &[], &cancel, |_| {})
+            .await
+        {
+            Ok(completion) => {
+                let name = crate::integration::clean_worktree_name(&completion.text);
+                if name.is_empty() {
+                    fallback
+                } else {
+                    name
+                }
+            }
+            Err(_) => fallback,
+        }
+    }
+
+    async fn ensure_auto_worktree(&self, session_id: &str, text: &str) -> Result<Session> {
+        let session = self.require_session(session_id)?;
+        if session.is_agent() || session.has_worktree() {
+            return Ok(session);
+        }
+        if !self.config.load().worktree.auto {
+            return Ok(session);
+        }
+        // Only sessions created with the auto-worktree policy participate.
+        // Legacy rows (and imported sessions) have no integration row; moving
+        // them into a new worktree on their next prompt would be surprising.
+        match self.store.get_integration(session_id)? {
+            Some(state) if state.worktree_disabled => return Ok(session),
+            Some(_) => {}
+            None => return Ok(session),
+        }
+
+        // Two prompts submitted at once must not create two branches. Claim
+        // the session, then re-read it so a completed first creation wins.
+        {
+            let mut creating = self.worktree_creating.lock().await;
+            if !creating.insert(session.id.clone()) {
+                return Err(rpc(
+                    "busy",
+                    format!("session {} is creating its worktree", session.id),
+                ));
+            }
+        }
+        let result = async {
+            let session = self.require_session(session_id)?;
+            if session.is_agent() || session.has_worktree() {
+                return Ok(session);
+            }
+            let Some(repo) = crate::worktree::main_repo(&session.cwd).await else {
+                return Ok(session);
+            };
+            let base = self.base_for_repo(&repo).await?;
+            let name = self.generate_worktree_name(&session, text).await;
+            let created =
+                crate::worktree::create_from_base(&session.cwd, &name, Some(&base)).await?;
+            let updated = self
+                .store
+                .set_session_cwd(&session.id, &created.path, Some(&created.path))?
+                .ok_or_else(|| rpc("not_found", format!("unknown session {}", session.id)))?;
+            let state = self
+                .store
+                .ensure_integration(&session.id, Some(&base), false)?;
+            self.save_integration(&state)?;
+            self.emit_session(&updated);
+            Ok(updated)
+        }
+        .await;
+        self.worktree_creating.lock().await.remove(session_id);
+        result
+    }
+
+    async fn request_ready(
+        &self,
+        session_id: &str,
+        auto_commit: Option<bool>,
+    ) -> Result<IntegrationState> {
+        self.request_ready_inner(session_id, auto_commit, false)
+            .await
+    }
+
+    async fn request_ready_inner(
+        &self,
+        session_id: &str,
+        auto_commit: Option<bool>,
+        allow_busy: bool,
+    ) -> Result<IntegrationState> {
+        let config = self.config.load_full();
+        let session = self.require_session(session_id)?;
+        if !allow_busy
+            && (self.turns.lock().await.contains_key(session_id) || session.status.is_busy())
+        {
+            return Err(rpc(
+                "busy",
+                format!("session {} is still running", session.id),
+            ));
+        }
+        let Some(worktree) = session.worktree.clone() else {
+            return Err(rpc(
+                "invalid_params",
+                format!("session {} has no worktree", session.id),
+            ));
+        };
+        if crate::worktree::in_rebase(&worktree).await {
+            return Err(rpc(
+                "invalid_params",
+                "finish or abort the in-progress rebase before eix ready",
+            ));
+        }
+        // Do not race the queue's ready -> syncing claim. Holding this across
+        // the commit below is cheap and keeps a late `ready` from overwriting
+        // an active rebase/test state.
+        let _claim = self.integration_lock.lock().await;
+        let mut state = self
+            .store
+            .get_integration(session_id)?
+            .unwrap_or_else(|| IntegrationState::new(&session.id));
+        if state.status.is_active() && state.status != IntegrationStatus::Repairing {
+            return Err(rpc(
+                "busy",
+                format!(
+                    "session {} integration is {}",
+                    session.id,
+                    state.status.as_str()
+                ),
+            ));
+        }
+        let base = match state.base_branch.clone() {
+            Some(base) => base,
+            None => {
+                let repo = crate::worktree::main_repo(&worktree)
+                    .await
+                    .unwrap_or_else(|| session.cwd.clone());
+                self.base_for_repo(&repo).await?
+            }
+        };
+        let do_commit = auto_commit.unwrap_or(config.integration.auto_commit);
+        if !crate::worktree::is_clean(&worktree).await? {
+            if !do_commit {
+                return Err(rpc(
+                    "invalid_params",
+                    "worktree has uncommitted changes; commit them or enable integration.auto_commit",
+                ));
+            }
+            if self.session_permission(&session) == PermissionLevel::ReadOnly {
+                return Err(rpc(
+                    "permission_denied",
+                    "read-only sessions cannot auto-commit worktree changes",
+                ));
+            }
+            let message = format!(
+                "eix: {}\n\nEix-Session: {}",
+                session.name.trim(),
+                session.id
+            );
+            crate::worktree::commit_all(&worktree, &message).await?;
+        }
+        state.status = IntegrationStatus::Ready;
+        state.stage = None;
+        state.base_branch = Some(base);
+        state.error = None;
+        state.next_retry_at = None;
+        state.ready_at = Some(now_ms());
+        // Keep the attempt counter across repair/requeue cycles so repeated
+        // failures still trigger notifications and `pause_after`. A new user
+        // prompt intentionally starts a fresh cycle; `integration.continue`
+        // is the explicit reset for a paused queue.
+        state.worktree_disabled = false;
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+        Ok(state)
+    }
+
+    fn integration_continue(&self, session_id: &str) -> Result<IntegrationState> {
+        let mut state = self.store.get_integration(session_id)?.ok_or_else(|| {
+            rpc(
+                "not_found",
+                format!("no integration state for {session_id}"),
+            )
+        })?;
+        state.status = IntegrationStatus::Ready;
+        state.stage = None;
+        state.error = None;
+        state.next_retry_at = None;
+        state.ready_at = Some(now_ms());
+        state.attempts = 0;
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+        Ok(state)
+    }
+
+    /// Called by the queue loop. It never performs a second concurrent merge:
+    /// one daemon task owns the queue and processes one repository item at a
+    /// time.
+    async fn process_next_integration(self: &Arc<Self>) -> Result<()> {
+        // Serialize the ready -> syncing decision with prompt submission.
+        let claim = self.integration_lock.lock().await;
+        let Some(mut state) = self.store.next_integration(now_ms())? else {
+            return Ok(());
+        };
+        let session = self.require_session(&state.session_id)?;
+        if session.archived {
+            state.status = IntegrationStatus::Pending;
+            state.error = Some("session archived".into());
+            state.next_retry_at = None;
+            state.updated_at = now_ms();
+            self.save_integration(&state)?;
+            return Ok(());
+        }
+        if session.status.is_busy() || self.turns.lock().await.contains_key(&session.id) {
+            state.next_retry_at = Some(now_ms() + 10_000);
+            state.updated_at = now_ms();
+            self.save_integration(&state)?;
+            return Ok(());
+        }
+        let Some(worktree) = session.worktree.clone() else {
+            state.status = IntegrationStatus::Pending;
+            state.error = Some("session has no worktree".into());
+            state.updated_at = now_ms();
+            self.save_integration(&state)?;
+            return Ok(());
+        };
+        // Block prompt submission from this point on. integrate_one will
+        // repeat the save (harmless) and then work outside this lock.
+        state.status = IntegrationStatus::Syncing;
+        state.stage = Some("base".into());
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+        drop(claim);
+        let session_id = session.id.clone();
+        match self.integrate_one(session, worktree, state).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                // Most failures already move the row to `retrying`. This is
+                // the last line of defence against an unexpected error leaving
+                // an active status that the queue never picks up again.
+                if let Some(state) = self.store.get_integration(&session_id)? {
+                    if state.status.is_active() {
+                        let session = self.require_session(&session_id)?;
+                        return self.retry_integration(&session, state, format!("{err:#}"));
+                    }
+                }
+                Err(err)
+            }
+        }
+    }
+
+    async fn integrate_one(
+        self: &Arc<Self>,
+        session: Session,
+        worktree: PathBuf,
+        mut state: IntegrationState,
+    ) -> Result<()> {
+        let config = self.config.load_full();
+        let repo = crate::worktree::main_repo(&worktree)
+            .await
+            .unwrap_or_else(|| session.cwd.clone());
+        let base = match state.base_branch.clone() {
+            Some(base) => base,
+            None => match self.base_for_repo(&repo).await {
+                Ok(base) => base,
+                Err(err) => {
+                    return self.retry_integration(&session, state, format!("{err:#}"));
+                }
+            },
+        };
+        state.base_branch = Some(base.clone());
+        state.status = IntegrationStatus::Syncing;
+        state.stage = Some("base".into());
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+
+        let base_head = if config.integration.repo_pull_base(&repo) {
+            match crate::worktree::sync_base(&repo, &base).await {
+                Ok(head) => head,
+                Err(err) => {
+                    return self.retry_integration(&session, state, format!("base sync: {err:#}"));
+                }
+            }
+        } else {
+            match crate::worktree::require_base(&repo, &base).await {
+                Ok(head) => head,
+                Err(err) => {
+                    return self.retry_integration(&session, state, format!("base head: {err:#}"));
+                }
+            }
+        };
+
+        state.status = IntegrationStatus::Rebasing;
+        state.stage = Some("rebase".into());
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+        let rebase = match crate::worktree::rebase(&worktree, &base).await {
+            Ok(output) => output,
+            Err(err) => {
+                return self.retry_integration(&session, state, format!("rebase: {err:#}"));
+            }
+        };
+        if !rebase.success {
+            let conflicts = crate::worktree::conflict_files(&worktree).await;
+            if !conflicts.is_empty() || crate::worktree::in_rebase(&worktree).await {
+                let details = format!(
+                    "rebase conflict on {} (base {base}).\nConflicting files:\n{}\n\n{}",
+                    crate::worktree::branch(&worktree).await.unwrap_or_default(),
+                    conflicts.join("\n"),
+                    crate::integration::tail(&rebase.combined(), 8_000)
+                );
+                return self
+                    .start_repair(&session, &state, "rebase conflict", &details)
+                    .await;
+            }
+            return self.retry_integration(
+                &session,
+                state,
+                format!("rebase: {}", rebase.combined()),
+            );
+        }
+        let head_before_test = match crate::worktree::head(&worktree).await {
+            Ok(head) => head,
+            Err(err) => {
+                return self.retry_integration(&session, state, format!("head: {err:#}"));
+            }
+        };
+
+        let test = match crate::integration::test_command(
+            &worktree,
+            config.integration.repo_test(&repo),
+        ) {
+            Some(test) => test,
+            None => {
+                return self.retry_integration(
+                    &session,
+                    state,
+                    "no test command configured; set [integration] test or a repo override".into(),
+                );
+            }
+        };
+        state.status = IntegrationStatus::Testing;
+        state.stage = Some("test".into());
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+        let run = match crate::integration::run_test(
+            &worktree,
+            &test,
+            config.integration.repo_timeout(&repo),
+        )
+        .await
+        {
+            Ok(run) => run,
+            Err(err) => {
+                return self.retry_integration(&session, state, format!("test: {err:#}"));
+            }
+        };
+        if !run.success {
+            let details = format!(
+                "test command failed: `{test}`\n\n{}",
+                crate::integration::tail(&run.output, 8_000)
+            );
+            return self
+                .start_repair(&session, &state, "test failure", &details)
+                .await;
+        }
+        match crate::worktree::head(&worktree).await {
+            Ok(after) if after == head_before_test => {}
+            Ok(_) => {
+                return self.retry_integration(
+                    &session,
+                    state,
+                    "test command changed the branch HEAD; refusing to merge".into(),
+                );
+            }
+            Err(err) => {
+                return self.retry_integration(&session, state, format!("head: {err:#}"));
+            }
+        }
+        if !crate::worktree::is_clean(&worktree).await? {
+            return self.retry_integration(
+                &session,
+                state,
+                "test command left tracked changes in the worktree; refusing to merge".into(),
+            );
+        }
+
+        let current_base = match crate::worktree::require_base(&repo, &base).await {
+            Ok(head) => head,
+            Err(err) => {
+                return self.retry_integration(&session, state, format!("base head: {err:#}"));
+            }
+        };
+        if current_base != base_head {
+            return self.retry_integration(
+                &session,
+                state,
+                "base branch moved during testing; rebasing again".into(),
+            );
+        }
+        let branch = match crate::worktree::branch(&worktree).await {
+            Some(branch) => branch,
+            None => {
+                return self.retry_integration(&session, state, "worktree has no branch".into());
+            }
+        };
+        state.status = IntegrationStatus::Merging;
+        state.stage = Some("merge".into());
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+        if let Err(err) = crate::worktree::merge_ff(&repo, &branch).await {
+            return self.retry_integration(&session, state, format!("merge: {err:#}"));
+        }
+        let merged_commit = crate::worktree::head(&repo).await.ok();
+        state.status = IntegrationStatus::Merged;
+        state.stage = None;
+        state.error = None;
+        state.next_retry_at = None;
+        state.merged_commit = merged_commit;
+        state.updated_at = now_ms();
+        self.save_integration(&state)?;
+        self.emit_value(
+            "integration.merged",
+            json!({
+                "session_id": session.id,
+                "base": base,
+                "commit": state.merged_commit,
+            }),
+        );
+        if config.integration.push {
+            if let Err(err) = crate::worktree::push_base(&repo, &base).await {
+                eprintln!(
+                    "eixd: integration push failed: {}",
+                    redact(&format!("{err:#}"))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn start_repair(
+        self: &Arc<Self>,
+        session: &Session,
+        state: &IntegrationState,
+        reason: &str,
+        details: &str,
+    ) -> Result<()> {
+        let config = self.config.load_full();
+        if !config.integration.conflict_repair {
+            return self.retry_integration(session, state.clone(), details.to_string());
+        }
+        let mut repairing = state.clone();
+        let paused = self.account_failure(&mut repairing, details);
+        repairing.next_retry_at = None;
+        if paused {
+            repairing.status = IntegrationStatus::Retrying;
+            repairing.next_retry_at = Some(i64::MAX / 4);
+            self.save_integration(&repairing)?;
+            self.notify_failure(session, &repairing);
+            return Ok(());
+        }
+        repairing.status = IntegrationStatus::Repairing;
+        repairing.stage = Some(reason.to_string());
+        if self.turns.lock().await.contains_key(&session.id) || session.status.is_busy() {
+            self.save_integration(&repairing)?;
+            self.notify_failure(session, &repairing);
+            return Ok(());
+        }
+        let worktree = session
+            .worktree
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| session.cwd.display().to_string());
+        let prompt = format!(
+            "Integration failed while landing this session's worktree.\n\n\
+             Reason: {reason}\n\
+             Worktree: {worktree}\n\n{details}\n\n\
+             Please resolve this autonomously. If a rebase is in progress, edit the\n\
+             conflicted files, run `git add <files>`, then `GIT_EDITOR=true git rebase --continue`\n\
+             until the rebase finishes. If you cannot resolve it, run `git rebase --abort` and explain.\n\
+             After resolving, run the project tests, then call the `ready` tool (or run\n\
+             `eix ready`) to requeue. Do not merge or rebase the base branch yourself.",
+        );
+        self.save_integration(&repairing)?;
+        self.notify_failure(session, &repairing);
+        let params = SubmitParams {
+            session_id: session.id.clone(),
+            text: prompt,
+            images: Vec::new(),
+        };
+        if let Err(err) = self.submit_inner(params, true).await {
+            return self.retry_integration(session, repairing, format!("repair turn: {err:#}"));
+        }
+        Ok(())
+    }
+
+    /// Count a conflict/test/transient failure and return whether automatic
+    /// repair should pause for `eix integrate continue`.
+    fn account_failure(&self, state: &mut IntegrationState, error: &str) -> bool {
+        let config = self.config.load_full();
+        state.attempts = state.attempts.saturating_add(1);
+        state.error = Some(crate::integration::tail(error, 8_000));
+        state.updated_at = now_ms();
+        if config.integration.pause_after > 0 && state.attempts >= config.integration.pause_after {
+            state.error = Some(format!(
+                "{} (paused after {} attempts; run `eix integrate continue`)",
+                state.error.clone().unwrap_or_default(),
+                state.attempts
+            ));
+            return true;
+        }
+        false
+    }
+
+    /// Emit one attention notification when the configured failure threshold
+    /// is crossed. Later retries keep the same status without spamming.
+    fn notify_failure(&self, session: &Session, state: &IntegrationState) {
+        let config = self.config.load_full();
+        if config.integration.notify_after > 0 && state.attempts == config.integration.notify_after
+        {
+            self.emit_value(
+                "integration.attention",
+                json!({
+                    "session_id": session.id,
+                    "session_name": session.name,
+                    "attempts": state.attempts,
+                    "error": state.error,
+                }),
+            );
+            // Reuse the configured external alert command. Integration
+            // failures are not a session status transition, so the normal
+            // transition path would never run it.
+            self.notify_attention(session, SessionStatus::Error);
+        }
+    }
+
+    fn retry_integration(
+        &self,
+        session: &Session,
+        mut state: IntegrationState,
+        error: String,
+    ) -> Result<()> {
+        let config = self.config.load_full();
+        let paused = self.account_failure(&mut state, &error);
+        state.status = IntegrationStatus::Retrying;
+        state.stage = None;
+        if paused {
+            state.next_retry_at = Some(i64::MAX / 4);
+        } else {
+            let base = 5u64.saturating_mul(1u64 << state.attempts.saturating_sub(1).min(6));
+            let delay = base.min(config.integration.retry_max_secs.max(5));
+            state.next_retry_at = Some(now_ms() + (delay as i64 * 1_000));
+        }
+        self.save_integration(&state)?;
+        self.notify_failure(session, &state);
+        Ok(())
+    }
+
+    /// Auto-ready and repair-watchdog. Runs on the queue loop; one pass every
+    /// few seconds keeps the daemon simple and restart-safe.
+    async fn auto_ready_idle(&self) -> Result<()> {
+        let config = self.config.load_full();
+        if config.integration.auto_ready != AutoReady::Idle {
+            return Ok(());
+        }
+        let idle_ms = (config.integration.idle_secs.max(1) as i64) * 1_000;
+        let sessions = self.store.list_sessions()?;
+        for session in sessions {
+            if session.archived || session.is_agent() || !session.has_worktree() {
+                continue;
+            }
+            let Some(state) = self.store.get_integration(&session.id)? else {
+                continue;
+            };
+            if state.worktree_disabled {
+                continue;
+            }
+            if !matches!(
+                state.status,
+                IntegrationStatus::Pending | IntegrationStatus::Repairing
+            ) {
+                continue;
+            }
+            if session.status != SessionStatus::Idle
+                || self.turns.lock().await.contains_key(&session.id)
+                || self.approvals.lock().await.contains_key(&session.id)
+                || self.inputs.lock().await.contains_key(&session.id)
+            {
+                continue;
+            }
+            let (draft, _) = self.store.get_draft(&session.id)?;
+            if !draft.trim().is_empty() {
+                continue;
+            }
+            let idle_needed = if state.status == IntegrationStatus::Repairing {
+                idle_ms.min(30_000)
+            } else {
+                idle_ms
+            };
+            if now_ms().saturating_sub(session.updated_at) < idle_needed {
+                continue;
+            }
+            if !self.store.has_user_message(&session.id)? {
+                continue;
+            }
+            if state.status == IntegrationStatus::Repairing {
+                // Do not race a repair turn that is still in a rebase or has
+                // uncommitted conflict resolutions. The agent should finish
+                // (or abort) and call `ready`; the watchdog is only a fallback.
+                if crate::worktree::in_rebase(&session.cwd).await
+                    || !crate::worktree::is_clean(&session.cwd).await?
+                {
+                    continue;
+                }
+                let mut next = state;
+                next.status = IntegrationStatus::Retrying;
+                next.stage = Some("repair watchdog".into());
+                next.error = Some("repair turn finished without eix ready; retrying".into());
+                next.next_retry_at = Some(now_ms());
+                next.updated_at = now_ms();
+                self.save_integration(&next)?;
+                continue;
+            }
+            // A dirty worktree is normal while the agent is still working.
+            // Wait for it to become clean unless auto-commit is enabled; the
+            // next idle scan will try again.
+            if !config.integration.auto_commit && !crate::worktree::is_clean(&session.cwd).await? {
+                continue;
+            }
+            if let Err(err) = self.request_ready(&session.id, None).await {
+                eprintln!(
+                    "eixd: auto-ready skipped for {}: {}",
+                    session.id,
+                    redact(&format!("{err:#}"))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    async fn integration_loop(self: Arc<Self>) {
+        let mut tick = 0u64;
+        loop {
+            if self.config.load().integration.enabled {
+                if let Err(err) = self.process_next_integration().await {
+                    eprintln!("eixd: integration queue: {}", redact(&format!("{err:#}")));
+                }
+                // Auto-ready does a git status per idle session; the default
+                // idle window is minutes, so a 20-second scan is plenty.
+                if tick.is_multiple_of(10) {
+                    if let Err(err) = self.auto_ready_idle().await {
+                        eprintln!(
+                            "eixd: idle integration scan: {}",
+                            redact(&format!("{err:#}"))
+                        );
+                    }
+                }
+            }
+            tick = tick.wrapping_add(1);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+    }
+
     /// A daemon restart cannot resume an in-flight HTTP stream. Mark those
     /// sessions errored instead of pretending they are still running.
     async fn recover(&self) {
+        self.recover_integrations().await;
         let running = match self.store.running_sessions() {
             Ok(sessions) => sessions,
             Err(err) => {
@@ -426,6 +1145,53 @@ impl Daemon {
                 eprintln!(
                     "eixd: cannot recover {}: {}",
                     session.id,
+                    redact(&format!("{err:#}"))
+                );
+            }
+        }
+    }
+
+    /// Active integration rows cannot make progress after a restart: the
+    /// worker that owned them is gone. Abort any half-finished rebase (which
+    /// restores the pre-rebase branch) and put the item back in the retry
+    /// queue; a merge that already landed is a no-op on the next attempt.
+    async fn recover_integrations(&self) {
+        let states = match self.store.list_integrations() {
+            Ok(states) => states,
+            Err(err) => {
+                eprintln!(
+                    "eixd: cannot scan integrations: {}",
+                    redact(&format!("{err:#}"))
+                );
+                return;
+            }
+        };
+        for mut state in states {
+            if !state.status.is_active() {
+                continue;
+            }
+            if let Ok(Some(session)) = self.store.get_session(&state.session_id) {
+                if let Some(worktree) = session.worktree.as_deref() {
+                    if crate::worktree::in_rebase(worktree).await {
+                        if let Err(err) = crate::worktree::abort_rebase(worktree).await {
+                            eprintln!(
+                                "eixd: cannot abort stale rebase for {}: {}",
+                                state.session_id,
+                                redact(&format!("{err:#}"))
+                            );
+                        }
+                    }
+                }
+            }
+            state.status = IntegrationStatus::Retrying;
+            state.stage = None;
+            state.error = Some("daemon restarted during integration; retrying".into());
+            state.next_retry_at = Some(now_ms());
+            state.updated_at = now_ms();
+            if let Err(err) = self.save_integration(&state) {
+                eprintln!(
+                    "eixd: cannot recover integration {}: {}",
+                    state.session_id,
                     redact(&format!("{err:#}"))
                 );
             }
@@ -921,8 +1687,17 @@ impl Daemon {
                     Some(value) => value,
                     None => crate::worktree::repo_root(&source.cwd).await.is_some(),
                 };
+                let mut base_branch = None;
                 let created = if want_worktree {
-                    Some(crate::worktree::create(&source.cwd, &name).await?)
+                    let repo = crate::worktree::main_repo(&source.cwd)
+                        .await
+                        .or_else(|| Some(source.cwd.clone()))
+                        .unwrap_or_else(|| source.cwd.clone());
+                    let base = self.base_for_repo(&repo).await?;
+                    let created =
+                        crate::worktree::create_from_base(&source.cwd, &name, Some(&base)).await?;
+                    base_branch = Some(base);
+                    Some(created)
                 } else {
                     None
                 };
@@ -948,6 +1723,12 @@ impl Daemon {
                         return Err(err);
                     }
                 };
+                let integration = self.store.ensure_integration(
+                    &session.id,
+                    base_branch.as_deref(),
+                    !want_worktree,
+                )?;
+                self.save_integration(&integration)?;
                 self.emit_session(&session);
                 Ok(serde_json::to_value(SessionResult { session })?)
             }
@@ -958,6 +1739,30 @@ impl Daemon {
             "session.worktree.remove" => {
                 let params: WorktreeRemoveParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(self.remove_worktree(params).await?)?)
+            }
+            "session.ready" => {
+                let params: SessionReadyParams = parse_params(request.params.clone())?;
+                let state = self
+                    .request_ready(&params.session_id, params.auto_commit)
+                    .await?;
+                Ok(serde_json::to_value(state)?)
+            }
+            "integration.list" => {
+                let params: IntegrationListParams = parse_params(request.params.clone())?;
+                let mut integrations = self.store.list_integrations()?;
+                if let Some(session_id) = params.session_id.as_deref() {
+                    self.require_session(session_id)?;
+                    integrations.retain(|state| state.session_id == session_id);
+                }
+                Ok(serde_json::to_value(IntegrationListResult {
+                    integrations,
+                })?)
+            }
+            "integration.continue" => {
+                let params: IntegrationContinueParams = parse_params(request.params.clone())?;
+                self.require_session(&params.session_id)?;
+                let state = self.integration_continue(&params.session_id)?;
+                Ok(serde_json::to_value(state)?)
             }
             "session.get" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
@@ -1494,12 +2299,30 @@ impl Daemon {
         {
             session.agent = Some(agent);
         }
-        if params.worktree.unwrap_or(false) {
-            let created = crate::worktree::create(&session.cwd, &session.name).await?;
+        let worktree_mode = params.worktree;
+        let mut base_branch = None;
+        if worktree_mode == Some(true) {
+            let repo = crate::worktree::main_repo(&session.cwd)
+                .await
+                .or_else(|| Some(session.cwd.clone()))
+                .unwrap_or_else(|| session.cwd.clone());
+            let base = self.base_for_repo(&repo).await?;
+            let created =
+                crate::worktree::create_from_base(&session.cwd, &session.name, Some(&base)).await?;
             session.cwd = created.path.clone();
             session.worktree = Some(created.path);
+            base_branch = Some(base);
         }
         self.store.create_session(&session)?;
+        let disabled = match worktree_mode {
+            Some(false) => true,
+            None => !self.config.load().worktree.auto,
+            Some(true) => false,
+        };
+        let integration =
+            self.store
+                .ensure_integration(&session.id, base_branch.as_deref(), disabled)?;
+        self.save_integration(&integration)?;
         self.emit_session(&session);
         Ok(session)
     }
@@ -1939,11 +2762,27 @@ impl Daemon {
     /// a dirty worktree; that refusal is returned as `removed: false` so the
     /// caller can surface it and ask for confirmation.
     async fn remove_worktree(&self, params: WorktreeRemoveParams) -> Result<WorktreeRemoveResult> {
+        // Keep the queue from claiming this session between the busy check and
+        // the actual `git worktree remove`.
+        let _claim = self.integration_lock.lock().await;
         let session = self.require_session(&params.session_id)?;
         if session.status.is_busy() {
             return Err(rpc(
                 "busy",
                 format!("session {} is {}", session.id, session.status.as_str()),
+            ));
+        }
+        if self
+            .store
+            .get_integration(&session.id)?
+            .is_some_and(|state| state.status.is_active())
+        {
+            return Err(rpc(
+                "busy",
+                format!(
+                    "session {} integration is active; finish or `eix integrate continue` first",
+                    session.id
+                ),
             ));
         }
         let Some(path) = session.worktree.clone() else {
@@ -1962,6 +2801,15 @@ impl Daemon {
                 if let Some(updated) = self.store.set_session_cwd(&session.id, &cwd, None)? {
                     self.emit_session(&updated);
                 }
+                if let Some(mut state) = self.store.get_integration(&session.id)? {
+                    state.status = IntegrationStatus::Pending;
+                    state.stage = None;
+                    state.error = None;
+                    state.next_retry_at = None;
+                    state.worktree_disabled = true;
+                    state.updated_at = now_ms();
+                    self.save_integration(&state)?;
+                }
                 Ok(WorktreeRemoveResult {
                     removed: true,
                     message: format!("removed {}", path.display()),
@@ -1975,11 +2823,21 @@ impl Daemon {
     }
 
     async fn submit(self: &Arc<Self>, params: SubmitParams) -> Result<SubmitResult> {
+        self.submit_inner(params, false).await
+    }
+
+    /// `internal` repair turns keep the integration state in `repairing`
+    /// instead of resetting it to `pending` like a normal user prompt.
+    async fn submit_inner(
+        self: &Arc<Self>,
+        params: SubmitParams,
+        internal: bool,
+    ) -> Result<SubmitResult> {
         let text = params.text.trim().to_string();
         if text.is_empty() && params.images.is_empty() {
             return Err(rpc("invalid_params", "prompt must not be empty"));
         }
-        let session = self.require_session(&params.session_id)?;
+        let mut session = self.require_session(&params.session_id)?;
         let images = load_images(
             &session.cwd,
             self.config.load().as_ref(),
@@ -1988,20 +2846,67 @@ impl Daemon {
         )
         .await?;
 
+        // Auto worktrees are created lazily: the first prompt is the first
+        // point where a meaningful English name can be generated.
+        session = self.ensure_auto_worktree(&session.id, &text).await?;
+
+        // The queue takes the same lock while it claims an item. Keep the
+        // critical section short: a few queries and the turn registration.
+        let integration_guard = if internal {
+            None
+        } else {
+            Some(self.integration_lock.lock().await)
+        };
+        if !internal {
+            if let Some(state) = self.store.get_integration(&session.id)? {
+                // `repairing` means the queue is waiting for the agent; a
+                // user prompt may take over (the in-flight repair turn is
+                // still guarded by the turn lock below).
+                if state.status.is_active() && state.status != IntegrationStatus::Repairing {
+                    return Err(rpc(
+                        "busy",
+                        format!(
+                            "session {} integration is {}",
+                            session.id,
+                            state.status.as_str()
+                        ),
+                    ));
+                }
+            }
+        }
+
         let cancel = {
             let mut turns = self.turns.lock().await;
-            if turns.contains_key(&params.session_id) {
+            if turns.contains_key(&session.id) {
                 return Err(rpc(
                     "busy",
-                    format!("session {} is already running", params.session_id),
+                    format!("session {} is already running", session.id),
                 ));
             }
             let flag = Arc::new(AtomicBool::new(false));
-            turns.insert(params.session_id.clone(), Arc::clone(&flag));
+            turns.insert(session.id.clone(), Arc::clone(&flag));
             flag
         };
 
-        let session_id = params.session_id;
+        if !internal {
+            if let Some(mut state) = self.store.get_integration(&session.id)? {
+                if state.status != IntegrationStatus::Pending {
+                    state.status = IntegrationStatus::Pending;
+                    state.stage = None;
+                    state.next_retry_at = None;
+                    state.error = None;
+                    state.attempts = 0;
+                    state.updated_at = now_ms();
+                    if let Err(err) = self.save_integration(&state) {
+                        self.turns.lock().await.remove(&session.id);
+                        return Err(err);
+                    }
+                }
+            }
+        }
+        drop(integration_guard);
+
+        let session_id = session.id.clone();
         let setup = self.submit_setup(session_id.clone(), text, images).await;
         let (session, turn_id) = match setup {
             Ok(setup) => setup,
@@ -3285,6 +4190,25 @@ impl Daemon {
                 Ok(text) => (true, text),
                 Err(err) => (false, format!("{err:#}")),
             };
+            self.record_tool_result(session_id, call, ok, false, &output, 0)?;
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        }
+
+        // The model can mark its worktree ready without a shell approval. The
+        // queue still defers while this turn is running, then rebases/tests.
+        if tool == "ready" {
+            if session.origin == SessionOrigin::Agent {
+                let output = "sub-agents cannot mark a worktree ready".to_string();
+                self.record_tool_result(session_id, call, false, true, &output, 0)?;
+                messages.push(ChatMessage::tool(call.id.clone(), output));
+                return Ok(());
+            }
+            let output = match self.request_ready_inner(session_id, None, true).await {
+                Ok(state) => format!("queued for integration ({})", state.status.as_str()),
+                Err(err) => format!("cannot queue for integration: {err:#}"),
+            };
+            let ok = output.starts_with("queued for integration");
             self.record_tool_result(session_id, call, ok, false, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
@@ -6117,6 +7041,17 @@ fn system_prompt(config: &Config, session: &Session, permission: PermissionLevel
             prompt.push_str(&subagents.join("; "));
             prompt.push('.');
         }
+    }
+    if session.has_worktree() && config.integration.enabled {
+        prompt.push_str(
+            "\n\n## Worktree integration\n\
+             This session runs in an isolated git worktree. Commit your changes before you finish.\n\
+             Run the project tests after your edits. When they pass, call the `ready` tool (or run\n\
+             `eix ready`) so the daemon can rebase, test and fast-forward the base branch. Do not\n\
+             merge or rebase the base branch yourself. If eix asks you to repair a rebase conflict\n\
+             or a failing integration test, resolve it in this worktree, run the tests, then call\n\
+             `ready` again.",
+        );
     }
     let skills = eix_core::load_skills(&session.cwd, &config.compations);
     prompt.push_str(&eix_core::available_skills_prompt(&skills));

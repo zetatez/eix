@@ -116,14 +116,36 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `○`，run
 
 ### 4.6 worktree
 
-- 默认绑定 cwd；`--worktree`（`eix new --worktree`、TUI `N`）或 picker 中一键创建 `.worktrees/<slug>`。
+- 默认绑定 cwd；在 git 仓库里新建 session 默认延迟到首条 prompt 自动创建 `.worktrees/<slug>`。
+  名称由模型根据任务总结成英文 kebab-case；模型失败时用 ASCII 词或 `task-<timestamp>`。
+  `eix new --shared` / `/new-shared` 显式共享工作区；`--worktree` 立即创建。
 - repo 内 fork 默认给新分支建 worktree；`eix fork --shared` / `session.fork worktree=false` 显式共享源工作区。
 - worktree 与 session 生命周期解耦：session 归档不自动删除 worktree，需显式确认。
 - 已实现（2026-10-18）：`eixd/src/worktree.rs` shell out 给 git，`git worktree add -b eix/<slug> .worktrees/<slug>`；
   main repo 用 `git rev-parse --git-common-dir` 解析并 canonicalize（支持 subdir 和 linked worktree），
-  `.worktrees` 已在快照排除表里。删除走 `eix worktree remove SESSION [--force]`（`session.worktree.remove`）：
+  `.worktrees` 已在快照排除表里；创建时也会写入 `.git/info/exclude`，避免未提交
+  `.gitignore` 的仓库把 worktree 目录显示成 untracked 并卡住合并。删除走
+  `eix worktree remove SESSION [--force]`（`session.worktree.remove`）：
   先算出主仓库，`git worktree remove [--force]`，成功后把 session cwd 重置回仓库根并清空 worktree 字段；
   工作区有未提交改动时 git 会拒绝，除非显式 `--force`（dirty 删除返回 `removed:false` 并给出提示）。
+
+### 4.7 集成队列
+
+- session 的 `pending → ready → syncing → rebasing → testing → merging → merged` 状态存在
+  `session_integrations` 表；`retrying` 带 `next_retry_at` 和指数退避，不设硬 blocked。
+- `eix ready`（`session.ready`）检查：无 turn、无 rebase、worktree 干净（或 `auto_commit`
+  自动提交）。agent turn 内也可以用无审批的 `ready` 工具提前置为 ready，队列会等 turn 结束。
+  `auto_ready = idle` 时 daemon 扫描空闲 session：无 turn/审批/输入、草稿为空、
+  至少一条 user message、worktree 干净，且 `idle_secs` 内无更新。
+- 单个 daemon worker 串行处理队列：主 worktree 干净时 `fetch` + `pull --ff-only`，把 session
+  分支 rebase 到基分支，运行 `integration.test`（`auto` 识别 Cargo/npm/Go/Python/Make；没有
+  测试命令则拒绝合并），确认基分支 SHA 未变化后 `merge --ff-only`。`push=false` 默认只更新
+  本地基分支，worktree 在合并后保留。
+- rebase 冲突或测试失败把输出尾部作为修复 prompt 注入 session（`repairing`），agent 在
+  worktree 内解决、跑测试、再次 `eix ready`。`conflict_repair=false` 时只重试并通知。
+- 连续失败达到 `notify_after` 发 `integration.attention`；`pause_after>0` 时暂停等待
+  `integration.continue`，默认 0 表示一直退避重试。daemon 重启时把遗留的 active 行恢复成
+  `retrying`，并 abort 未完成的 rebase 回到 rebase 前状态，避免队列永久卡住。
 
 ## 5. 输入层：自研 Vim 风格编辑器
 
@@ -577,6 +599,7 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 **daemon → client（notification）**
 
 - `session.created|updated|status`、`session.attention`
+- `integration.updated`、`integration.merged`、`integration.attention`
 - `turn.started`、`message.delta`、`reasoning.delta`、`message.reset`、`turn.retrying`、`message.completed`
 - `tool.requested`、`tool.approval_required`、`input.required`、`tool.started`、`tool.output`、`tool.completed`
 - `patch.proposed`、`patch.applied`、`patch.rejected`、`patch.conflict`
@@ -591,6 +614,8 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 - `auth {token}`（仅 TCP：必须是第一个请求）
 - `session.list|create|attach|detach|rename|archive|fork|rewind`
 - `session.worktree.remove {session_id, force?}`
+- `session.ready {session_id, auto_commit?}`
+- `integration.list {session_id?}`、`integration.continue {session_id}`
 - `session.subscribe {session_ids?}`（连接级广播过滤；`null` = 全部）
 - `prompt.submit|cancel|queue`
 - `approval.respond|list`、`input.respond`、`patch.apply|reject|get|revise`
@@ -799,8 +824,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 没有快照 / 快照关闭 / 被 prune / 恢复失败 / 文件缺失都会进 `warnings`，并提示“eix 之外的
 > 改动无法察觉”。TUI ledger `w` 和 CLI `eix rewind` 走这条路径，纯 fork 仍标 `files unchanged`。
 >
-> Worktree 已落地（2026-10-18）：`session.create` / `session.fork` 接受 `worktree: bool?`
-> （`None` = fork 时在 git 仓库里自动建，create 时表示默认不建；`Some(false)` = 共享）。
+> Worktree 已落地（2026-10-18，2026-10-24 扩展）：`session.create` / `session.fork` 接受
+> `worktree: bool?`。`create` 的 `None` 现在表示“首条 prompt 时自动建英文名 worktree”，
+> `Some(true)` 立即建，`Some(false)` 共享；fork 的 `None` 仍在 repo 内自动建。
 > `eixd/src/worktree.rs` 用 `git rev-parse --git-common-dir` 解析主仓库（支持 subdir / linked
 > worktree，canonicalize 后比较），`git worktree add -b eix/<slug> .worktrees/<slug>`；slug
 > 来自 session 名，冲突时加 `-N`。worktree 路径存 `sessions.worktree`，fork 未指定新

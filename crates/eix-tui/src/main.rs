@@ -18,11 +18,12 @@ use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalResult, AssistantMessagePayload,
     AttachResult, CancelResult, Config, ContextCompactedPayload, ContextDropPayload,
     ContextLedgerResult, ContextPinPayload, Endpoint, Event, EventKind, HelloResult,
-    InputAnsweredPayload, InputRequiredPayload, InputResult, PatchProposedPayload,
-    PatchResultPayload, PermissionPayload, ProcessExitedPayload, ProcessKillResult, ProcessList,
-    ProcessOutput, ProcessStartedPayload, RewindResult, SearchResult, Sector, Session, SessionList,
-    SessionResult, SessionStatus, SnapshotPayload, SubmitResult, ToolCallPayload,
-    ToolResultPayload, UserMessagePayload, WorktreeRemoveResult,
+    InputAnsweredPayload, InputRequiredPayload, InputResult, IntegrationListResult,
+    IntegrationState, PatchProposedPayload, PatchResultPayload, PermissionPayload,
+    ProcessExitedPayload, ProcessKillResult, ProcessList, ProcessOutput, ProcessStartedPayload,
+    RewindResult, SearchResult, Sector, Session, SessionList, SessionResult, SessionStatus,
+    SnapshotPayload, SubmitResult, ToolCallPayload, ToolResultPayload, UserMessagePayload,
+    WorktreeRemoveResult,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -107,6 +108,8 @@ async fn main() -> Result<()> {
         } => timeline(&cli, session, limit, json).await,
         Command::Undo { session, redo } => undo(&cli, session, redo).await,
         Command::Worktree(cmd) => worktree(&cli, cmd).await,
+        Command::Ready { session } => ready(&cli, session).await,
+        Command::Integrate { action, session } => integrate(&cli, action, session).await,
         Command::Nvim { session } => nvim(&cli, session).await,
         Command::Processes { session } => processes(&cli, session).await,
         Command::Tail { process } => tail(&cli, &process).await,
@@ -139,8 +142,9 @@ enum Command {
         name: Option<String>,
         cwd: Option<PathBuf>,
         model: Option<String>,
-        /// Create `.worktrees/<name>` and run there.
-        worktree: bool,
+        /// `Some(true)` creates a worktree now, `Some(false)` opts out, and
+        /// `None` creates one lazily from the first prompt.
+        worktree: Option<bool>,
         /// Initial per-session permission level.
         permission: Option<String>,
     },
@@ -240,6 +244,13 @@ enum Command {
         redo: bool,
     },
     Worktree(WorktreeCmd),
+    Ready {
+        session: Option<String>,
+    },
+    Integrate {
+        action: String,
+        session: Option<String>,
+    },
     Nvim {
         session: Option<String>,
     },
@@ -390,7 +401,18 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let name = take_flag(&mut args, "--name")?;
             let cwd = take_flag(&mut args, "--cwd")?.map(PathBuf::from);
             let model = take_flag(&mut args, "--model")?;
-            let worktree = take_switch(&mut args, "--worktree");
+            let explicit_worktree = take_switch(&mut args, "--worktree");
+            let shared = take_switch(&mut args, "--shared");
+            if explicit_worktree && shared {
+                bail!("--worktree and --shared are mutually exclusive");
+            }
+            let worktree = if explicit_worktree {
+                Some(true)
+            } else if shared {
+                Some(false)
+            } else {
+                None
+            };
             let permission = take_flag(&mut args, "--permission")?;
             let name = name.or_else(|| {
                 let joined = args.join(" ").trim().to_string();
@@ -643,6 +665,23 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
                 }
             }
         }
+        "ready" => {
+            let session = take_flag(&mut args, "--session")?;
+            let session = session.or_else(|| args.first().cloned());
+            Ok(Command::Ready { session })
+        }
+        "integrate" | "integration" => {
+            let session = take_flag(&mut args, "--session")?;
+            let action = args.first().cloned().unwrap_or_else(|| "status".into());
+            if !args.is_empty() {
+                args.remove(0);
+            }
+            let session = session.or_else(|| args.first().cloned());
+            if !matches!(action.as_str(), "status" | "continue" | "retry") {
+                bail!("usage: eix integrate [status | continue SESSION] (got {action:?})");
+            }
+            Ok(Command::Integrate { action, session })
+        }
         "nvim" => {
             let session = take_flag(&mut args, "--session")?;
             let session = session.or_else(|| args.first().cloned());
@@ -746,7 +785,7 @@ async fn new_session(
     name: Option<String>,
     cwd: Option<PathBuf>,
     model: Option<String>,
-    worktree: bool,
+    worktree: Option<bool>,
     permission: Option<String>,
 ) -> Result<()> {
     let defaults_cwd = cwd
@@ -837,7 +876,7 @@ async fn chat(cli: &Cli, session: Option<String>) -> Result<()> {
                 }
             }
             "/new" => {
-                session = create_session(&mut client, None, None, None, false, None).await?;
+                session = create_session(&mut client, None, None, None, None, None).await?;
                 println!("new session {} ({})", session.name, short_id(&session.id));
             }
             "/log" => {
@@ -1500,6 +1539,118 @@ async fn timeline(
     Ok(())
 }
 
+async fn ready(cli: &Cli, session: Option<String>) -> Result<()> {
+    let mut client = cli.connect().await?;
+    let target = match session {
+        Some(needle) => resolve_session(&mut client, Some(&needle), false).await?,
+        None => current_worktree_session(&mut client).await?,
+    };
+    let state: IntegrationState = serde_json::from_value(
+        client
+            .request("session.ready", json!({ "session_id": target.id }))
+            .await?,
+    )?;
+    println!(
+        "{} ready · {} · base {}",
+        state.status.symbol(),
+        truncate(&target.name, 28),
+        state.base_branch.as_deref().unwrap_or("auto")
+    );
+    Ok(())
+}
+
+/// Resolve the session that owns the current directory. An explicit session id
+/// is handled by the caller; this never falls back to an unrelated session.
+async fn current_worktree_session(client: &mut Client) -> Result<Session> {
+    let sessions = list_sessions(client).await?;
+    let cwd = std::env::current_dir()
+        .context("cannot determine current directory")?
+        .canonicalize()
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    // Prefer the deepest session workspace containing the caller, so running
+    // from a subdirectory of a worktree still finds that worktree.
+    if let Some(session) = sessions
+        .iter()
+        .filter(|session| {
+            !session.is_agent() && session.has_worktree() && cwd.starts_with(&session.cwd)
+        })
+        .max_by_key(|session| session.cwd.components().count())
+    {
+        return Ok(session.clone());
+    }
+    bail!(
+        "no session is bound to {}; run `eix ready --session ID`",
+        cwd.display()
+    )
+}
+
+async fn integrate(cli: &Cli, action: String, session: Option<String>) -> Result<()> {
+    let mut client = cli.connect().await?;
+    match action.as_str() {
+        "status" => {
+            let filter = match session {
+                Some(needle) => Some(resolve_session(&mut client, Some(&needle), false).await?.id),
+                None => None,
+            };
+            let result: IntegrationListResult =
+                serde_json::from_value(client.request("integration.list", json!({})).await?)?;
+            let integrations: Vec<_> = result
+                .integrations
+                .into_iter()
+                .filter(|state| {
+                    filter
+                        .as_deref()
+                        .is_none_or(|session_id| state.session_id == session_id)
+                })
+                .collect();
+            if integrations.is_empty() {
+                println!("no worktree integrations");
+                return Ok(());
+            }
+            let sessions = list_sessions(&mut client).await?;
+            for state in integrations {
+                let name = sessions
+                    .iter()
+                    .find(|session| session.id == state.session_id)
+                    .map(|session| session.name.as_str())
+                    .unwrap_or("-");
+                let detail = state
+                    .error
+                    .as_deref()
+                    .map(|error| format!(" · {}", truncate(&error.replace('\n', " "), 80)))
+                    .unwrap_or_default();
+                println!(
+                    "{} {:<28} {:<8} {:<9}{}",
+                    state.status.symbol(),
+                    truncate(name, 28),
+                    short_id(&state.session_id),
+                    state.status.as_str(),
+                    detail
+                );
+            }
+            Ok(())
+        }
+        "continue" | "retry" => {
+            let target = match session {
+                Some(needle) => resolve_session(&mut client, Some(&needle), false).await?,
+                None => current_worktree_session(&mut client).await?,
+            };
+            let state: IntegrationState = serde_json::from_value(
+                client
+                    .request("integration.continue", json!({ "session_id": target.id }))
+                    .await?,
+            )?;
+            println!(
+                "{} requeued · {}",
+                state.status.symbol(),
+                state.status.as_str()
+            );
+            Ok(())
+        }
+        _ => unreachable!(),
+    }
+}
+
 async fn worktree(cli: &Cli, cmd: WorktreeCmd) -> Result<()> {
     let mut client = cli.connect().await?;
     match cmd {
@@ -1854,7 +2005,7 @@ async fn create_session(
     name: Option<String>,
     cwd: Option<PathBuf>,
     model: Option<String>,
-    worktree: bool,
+    worktree: Option<bool>,
     permission: Option<String>,
 ) -> Result<Session> {
     let cwd = match cwd {
@@ -1901,7 +2052,7 @@ async fn resolve_session(
         }
     }
     if create {
-        return create_session(client, None, None, None, false, None).await;
+        return create_session(client, None, None, None, None, None).await;
     }
     if let Some(session) = sessions.first() {
         return Ok(session.clone());
@@ -2465,8 +2616,9 @@ COMMANDS:
     send [--session ID] [--image PATH]... TEXT
                               send one prompt and stream the answer
     ls [--archived]            list sessions (--archived includes hidden ones)
-    new [--name N] [--cwd P] [--model M] [--worktree] [--permission LEVEL]
-                               create a session (--worktree: .worktrees/<name>)
+    new [--name N] [--cwd P] [--model M] [--worktree | --shared] [--permission LEVEL]
+                               create a session (default: lazily create an English-named
+                               .worktrees/<name> on the first prompt; --shared opts out)
     permission LEVEL [--session ID] [--temporary]
                                set read-only / workspace-write / full for a session
     log [--session ID]         print the persisted transcript
@@ -2508,6 +2660,9 @@ COMMANDS:
     redo [--session ID]        restore the most recent undo
     worktree [list | remove SESSION [--force]]
                                inspect or delete session worktrees
+    ready [--session ID]       mark the current worktree ready for rebase/test/merge
+    integrate [status | continue SESSION]
+                               show the integration queue or resume a paused session
     nvim [--session ID]        open the Neovim frontend against this daemon
     search QUERY [--session ID] [--limit N]
                                full-text search over message history
@@ -2540,6 +2695,9 @@ EXAMPLES:
     eix rewind --at 12
     eix worktree list
     eix worktree remove 4f2a9c11 --force
+    eix ready --session 4f2a9c11
+    eix integrate status
+    eix integrate continue 4f2a9c11
     eix --tcp 127.0.0.1:7777 --token \"$EIX_TOKEN\" ls
     eix search 'sqlite event log'"
     );

@@ -65,6 +65,11 @@ const TOOL_SPECS: &[ToolSpec] = &[
         parallel_safe: false,
     },
     ToolSpec {
+        name: "ready",
+        subagent_allowed: false,
+        parallel_safe: false,
+    },
+    ToolSpec {
         name: "webfetch",
         subagent_allowed: true,
         parallel_safe: true,
@@ -208,6 +213,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["todos"]
+            }),
+        ),
+        ToolDefinition::function(
+            "ready",
+            "Mark this worktree session ready for integration. Call only after all edits are committed and the project tests pass. The daemon will rebase onto the base branch, run tests again, and fast-forward base. No approval is needed.",
+            json!({
+                "type": "object",
+                "properties": {}
             }),
         ),
         ToolDefinition::function(
@@ -542,6 +555,7 @@ pub fn summarize(tool: &str, args: &Value) -> String {
             let name = optional_string(args, "name").unwrap_or("agent");
             format!("spawn_agent {name}")
         }
+        "ready" => "ready for integration".to_string(),
         "ask_user" => {
             let question = string_arg(args, "question");
             format!("ask_user: {}", truncate(&question, 100))

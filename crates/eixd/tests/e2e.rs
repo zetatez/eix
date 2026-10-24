@@ -3220,6 +3220,296 @@ async fn worktree_sessions_are_created_forked_and_removed() -> anyhow::Result<()
     Ok(())
 }
 
+#[tokio::test]
+async fn integration_rebases_tests_and_fast_forwards_the_base_branch() -> anyhow::Result<()> {
+    let root = temp_dir("integration-queue");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    let init = git(&dir, &["init", "-q", "-b", "main"]);
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    std::fs::write(dir.join("README.md"), "base\n")?;
+    assert!(git(&dir, &["add", "README.md"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+    let repo = dir.canonicalize()?;
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "main".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.test = "true".into();
+    config.integration.timeout_secs = 30;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "feature", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree");
+    std::fs::write(worktree.join("feature.txt"), "from worktree\n")?;
+    assert!(git(&worktree, &["add", "feature.txt"]).status.success());
+    assert!(git(&worktree, &["commit", "-q", "-m", "feature"])
+        .status
+        .success());
+
+    let ready: eix_core::IntegrationState = client
+        .request("session.ready", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(ready.status, eix_core::IntegrationStatus::Ready);
+
+    let mut merged = false;
+    for _ in 0..40 {
+        let list: eix_core::IntegrationListResult = client
+            .request("integration.list", json!({"session_id": session.id}))
+            .await?;
+        let state = list.integrations.first().expect("integration state");
+        if state.status == eix_core::IntegrationStatus::Merged {
+            merged = true;
+            break;
+        }
+        if state.status == eix_core::IntegrationStatus::Retrying {
+            anyhow::bail!("integration retried: {:?}", state.error);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(merged, "integration did not merge");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("feature.txt"))?,
+        "from worktree\n"
+    );
+    assert!(worktree.is_dir());
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_failure_retries_and_continue_requeues() -> anyhow::Result<()> {
+    let root = temp_dir("integration-retry");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    let init = git(&dir, &["init", "-q", "-b", "main"]);
+    assert!(init.status.success());
+    std::fs::write(dir.join(".gitignore"), ".worktrees/\n")?;
+    assert!(git(&dir, &["add", ".gitignore"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "main".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.test = "false".into();
+    config.integration.timeout_secs = 30;
+    config.integration.conflict_repair = false;
+    config.integration.pause_after = 1;
+    config.integration.notify_after = 0;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "broken", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree");
+    std::fs::write(worktree.join("change.txt"), "change\n")?;
+    assert!(git(&worktree, &["add", "change.txt"]).status.success());
+    assert!(git(&worktree, &["commit", "-q", "-m", "change"])
+        .status
+        .success());
+
+    let ready: eix_core::IntegrationState = client
+        .request("session.ready", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(ready.status, eix_core::IntegrationStatus::Ready);
+
+    let mut failed = None;
+    for _ in 0..60 {
+        let list: eix_core::IntegrationListResult = client
+            .request("integration.list", json!({"session_id": session.id}))
+            .await?;
+        let state = list.integrations.first().expect("integration state");
+        if state.status == eix_core::IntegrationStatus::Retrying && state.attempts > 0 {
+            failed = Some(state.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let failed = failed.expect("integration should retry after a failing test");
+    assert!(
+        failed.next_retry_at.is_some(),
+        "paused retry has a due time"
+    );
+    assert!(
+        failed.error.as_deref().unwrap_or_default().contains("test"),
+        "unexpected error: {:?}",
+        failed.error
+    );
+
+    let continued: eix_core::IntegrationState = client
+        .request("integration.continue", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(continued.status, eix_core::IntegrationStatus::Ready);
+    assert_eq!(continued.attempts, 0);
+    assert!(continued.next_retry_at.is_none());
+    assert!(continued.error.is_none());
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_conflict_retries_when_repair_is_disabled() -> anyhow::Result<()> {
+    let root = temp_dir("integration-conflict");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(dir.join("shared.txt"), "base\n")?;
+    assert!(git(&dir, &["add", "shared.txt"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "main".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.test = "true".into();
+    config.integration.conflict_repair = false;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "conflict", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree");
+    std::fs::write(worktree.join("shared.txt"), "feature\n")?;
+    assert!(git(&worktree, &["add", "shared.txt"]).status.success());
+    assert!(git(&worktree, &["commit", "-q", "-m", "feature"])
+        .status
+        .success());
+    // Move main so the rebase must conflict.
+    std::fs::write(dir.join("shared.txt"), "base changed\n")?;
+    assert!(git(&dir, &["add", "shared.txt"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "base change"])
+        .status
+        .success());
+
+    let ready: eix_core::IntegrationState = client
+        .request("session.ready", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(ready.status, eix_core::IntegrationStatus::Ready);
+
+    let mut failed = None;
+    for _ in 0..60 {
+        let list: eix_core::IntegrationListResult = client
+            .request("integration.list", json!({"session_id": session.id}))
+            .await?;
+        let state = list.integrations.first().expect("integration state");
+        if state.status == eix_core::IntegrationStatus::Retrying && state.attempts > 0 {
+            failed = Some(state.clone());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let failed = failed.expect("integration should retry after a rebase conflict");
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .to_lowercase()
+            .contains("conflict"),
+        "unexpected error: {:?}",
+        failed.error
+    );
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn first_prompt_creates_an_english_named_worktree() -> anyhow::Result<()> {
+    let root = temp_dir("auto-worktree");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    let init = git(&dir, &["init", "-q", "-b", "main"]);
+    assert!(init.status.success());
+    std::fs::write(dir.join(".gitignore"), ".worktrees/\n")?;
+    assert!(git(&dir, &["add", ".gitignore"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.worktree.base = "main".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "auto", "cwd": dir}))
+        .await?;
+    assert!(!created.session.has_worktree());
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "fix the login bug"}),
+        )
+        .await?;
+    let updated: SessionResult = client
+        .request("session.get", json!({"session_id": created.session.id}))
+        .await?;
+    let worktree = updated.session.worktree.clone().expect("auto worktree");
+    assert_eq!(
+        worktree.file_name().and_then(|name| name.to_str()),
+        Some("hello-from-mock")
+    );
+    assert!(worktree.is_dir());
+
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
 /// Newline-JSON client for the TCP listener (no auto-start, no Unix socket).
 struct RawTcp {
     reader: BufReader<ReadHalf<tokio::net::TcpStream>>,

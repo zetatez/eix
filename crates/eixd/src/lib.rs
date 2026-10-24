@@ -6,6 +6,7 @@
 pub mod blob;
 pub mod context;
 pub mod http;
+pub mod integration;
 pub mod lsp;
 pub mod mcp;
 pub mod memory;

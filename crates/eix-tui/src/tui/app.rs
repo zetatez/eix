@@ -12,10 +12,10 @@ use crossterm::event::{
 use eix_core::{
     theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
     ContextEntryInfo, ContextLedgerResult, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
-    InputAnsweredPayload, InputOption, InputRequiredPayload, ModelInfo, PatchProposedPayload,
-    PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo, ProcessList, ProcessOutput,
-    ProcessStatus, RewindResult, SearchHit, Sector, Session, SessionStatus, SubmitResult, TodoItem,
-    ToolResultPayload, UserMessagePayload, THEME_PRESETS,
+    InputAnsweredPayload, InputOption, InputRequiredPayload, IntegrationState, IntegrationStatus,
+    ModelInfo, PatchProposedPayload, PatchResultPayload, PermissionLevel, PickerItem, ProcessInfo,
+    ProcessList, ProcessOutput, ProcessStatus, RewindResult, SearchHit, Sector, Session,
+    SessionStatus, SubmitResult, TodoItem, ToolResultPayload, UserMessagePayload, THEME_PRESETS,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -104,6 +104,13 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "[name]",
             "start a session in a new git worktree",
         ),
+        builtin("new-shared", "[name]", "start a session in this workspace"),
+        builtin(
+            "ready",
+            "",
+            "queue this worktree for rebase, tests and merge",
+        ),
+        builtin("integrate", "", "show this session's integration state"),
         builtin("files", "", "browse and insert workspace files"),
         builtin("worktrees", "", "browse and insert git worktrees"),
         builtin("branches", "", "browse and insert git branches"),
@@ -1185,6 +1192,8 @@ pub struct App {
     pending_history: Option<(String, u64)>,
     /// Pane rectangles from the last draw, used to pick a focus direction.
     pane_areas: Vec<Rect>,
+    /// Latest integration state keyed by session id, fed by daemon events.
+    integrations: HashMap<String, IntegrationState>,
     /// Tool calls waiting on a decision, keyed by session id.
     approvals: HashMap<String, PendingApproval>,
     /// `ask_user` questions waiting on an answer, keyed by session id.
@@ -1332,6 +1341,7 @@ impl App {
             copy_toast: None,
             pending_history: None,
             pane_areas: Vec::new(),
+            integrations: HashMap::new(),
             approvals: HashMap::new(),
             inputs: HashMap::new(),
             diff_view: None,
@@ -2067,6 +2077,12 @@ impl App {
                 // Fetch the catalog once so the prompt header can show the
                 // raw model id and provider before `/model` is opened.
                 let _ = tx.send(Command::ListModels);
+                let _ = tx.send(Command::ListIntegrations);
+            }
+            Event::Integrations(integrations) => {
+                for state in integrations {
+                    self.integrations.insert(state.session_id.clone(), state);
+                }
             }
             Event::Sessions(sessions) => {
                 self.sessions = sessions;
@@ -2094,7 +2110,7 @@ impl App {
                         Some(index) => self.select_session(index, tx),
                         // A launch from a new directory gets its own session
                         // instead of attaching to an unrelated one.
-                        None => self.create_session(tx, false),
+                        None => self.create_session(tx, None),
                     }
                 } else {
                     self.reselect_current();
@@ -2756,6 +2772,49 @@ impl App {
         tx: &UnboundedSender<Command>,
     ) {
         match notification.method.as_str() {
+            "integration.updated" => {
+                if let Ok(state) = serde_json::from_value::<IntegrationState>(notification.params) {
+                    let session_id = state.session_id.clone();
+                    let status = state.status;
+                    self.integrations.insert(session_id.clone(), state);
+                    if self
+                        .status_session()
+                        .is_some_and(|session| session.id == session_id)
+                    {
+                        self.status = format!("integration · {}", status.as_str());
+                    }
+                }
+            }
+            "integration.attention" => {
+                let session_id = notification
+                    .params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = notification
+                    .params
+                    .get("session_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("session")
+                    .to_string();
+                let error = notification
+                    .params
+                    .get("error")
+                    .and_then(Value::as_str)
+                    .unwrap_or("integration needs attention")
+                    .to_string();
+                self.last_alert = Some(format!("{name} · integration failed"));
+                self.alert_at = Some(Instant::now());
+                self.status = format!("integration failed · {}", truncate(&error, 100));
+                if self
+                    .status_session()
+                    .is_none_or(|session| session.id != session_id)
+                    && self.bell
+                {
+                    self.ring = true;
+                }
+            }
             "session.updated" => {
                 if let Ok(session) = serde_json::from_value::<Session>(notification.params) {
                     let id = session.id.clone();
@@ -4566,8 +4625,8 @@ impl App {
                 self.should_quit = true;
             }
             KeyAction::Help => self.open_help(),
-            KeyAction::NewSession => self.create_session(tx, false),
-            KeyAction::NewWorktree => self.create_session(tx, true),
+            KeyAction::NewSession => self.create_session(tx, None),
+            KeyAction::NewWorktree => self.create_session(tx, Some(true)),
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
             KeyAction::NewPane => self.open_picker(PickerKind::NewPane, tx),
             KeyAction::Palette => self.open_picker(PickerKind::Commands, tx),
@@ -5446,8 +5505,9 @@ impl App {
             "mcp" => self.open_picker(PickerKind::Mcp, tx),
             "todos" => self.open_picker(PickerKind::Todos, tx),
             "ledger" => self.open_ledger(tx),
-            "new" => self.create_session(tx, false),
-            "new-worktree" => self.create_session(tx, true),
+            "new" => self.create_session(tx, None),
+            "new-worktree" => self.create_session(tx, Some(true)),
+            "new-shared" => self.create_session(tx, Some(false)),
             "fork" => self.fork_focused(tx, None),
             "cancel" => self.cancel(tx),
             "attention" => self.focus_next_attention(),
@@ -5524,7 +5584,7 @@ impl App {
         hits.into_iter().map(|(_, index)| index).collect()
     }
 
-    fn create_session(&mut self, tx: &UnboundedSender<Command>, worktree: bool) {
+    fn create_session(&mut self, tx: &UnboundedSender<Command>, worktree: Option<bool>) {
         self.create_session_in(tx, worktree, None, None);
     }
 
@@ -5533,7 +5593,7 @@ impl App {
     fn create_session_in(
         &mut self,
         tx: &UnboundedSender<Command>,
-        worktree: bool,
+        worktree: Option<bool>,
         cwd: Option<std::path::PathBuf>,
         name: Option<String>,
     ) {
@@ -5542,7 +5602,7 @@ impl App {
         }
         self.creating = true;
         self.error = None;
-        self.status = if worktree {
+        self.status = if worktree == Some(true) {
             "creating session in a new worktree…".into()
         } else {
             "creating session…".into()
@@ -5788,7 +5848,7 @@ impl App {
             "new" => {
                 let cwd = self.focused_view().map(|view| view.session.cwd.clone());
                 let name = (!args.is_empty()).then(|| args.to_string());
-                self.create_session_in(tx, false, cwd, name);
+                self.create_session_in(tx, None, cwd, name);
                 true
             }
             "new-pane" => {
@@ -5798,7 +5858,42 @@ impl App {
             "new-worktree" => {
                 let cwd = self.focused_view().map(|view| view.session.cwd.clone());
                 let name = (!args.is_empty()).then(|| args.to_string());
-                self.create_session_in(tx, true, cwd, name);
+                self.create_session_in(tx, Some(true), cwd, name);
+                true
+            }
+            "new-shared" => {
+                let cwd = self.focused_view().map(|view| view.session.cwd.clone());
+                let name = (!args.is_empty()).then(|| args.to_string());
+                self.create_session_in(tx, Some(false), cwd, name);
+                true
+            }
+            "ready" => {
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::Ready { session_id });
+                    self.status = "queuing worktree for integration…".into();
+                } else {
+                    self.error = Some("no session to mark ready".into());
+                }
+                true
+            }
+            "integrate" => {
+                if let Some(session) = self.status_session() {
+                    if let Some(state) = self.integrations.get(&session.id) {
+                        let error = state
+                            .error
+                            .as_deref()
+                            .map(|error| format!(" · {}", truncate(error, 80)))
+                            .unwrap_or_default();
+                        self.status = format!(
+                            "integration {} · {}{}",
+                            state.status.symbol(),
+                            state.status.as_str(),
+                            error
+                        );
+                    } else {
+                        self.status = "no integration state yet".into();
+                    }
+                }
                 true
             }
             "files" => {
@@ -7897,6 +7992,28 @@ already exists, update it in place rather than rewriting it from scratch.";
             ));
         }
         if let Some(session) = self.status_session() {
+            if let Some(state) = self.integrations.get(&session.id) {
+                if state.status != IntegrationStatus::Pending {
+                    if !spans.is_empty() {
+                        spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                    }
+                    spans.push(Span::styled(
+                        format!("{} {}", state.status.symbol(), state.status.as_str()),
+                        Style::default()
+                            .fg(if state.status == IntegrationStatus::Merged {
+                                theme.string.unwrap_or(warn)
+                            } else if matches!(
+                                state.status,
+                                IntegrationStatus::Retrying | IntegrationStatus::Repairing
+                            ) {
+                                warn
+                            } else {
+                                muted
+                            })
+                            .bg(panel),
+                    ));
+                }
+            }
             if let Some(worktree) = &session.worktree {
                 let name = worktree
                     .file_name()
@@ -11698,7 +11815,7 @@ mod tests {
         assert!(matches!(
             rx.try_recv(),
             Ok(Command::Create {
-                worktree: false,
+                worktree: None,
                 cwd: None,
                 ..
             })
@@ -14696,7 +14813,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
         assert!(app.picker.is_none());
         match rx.try_recv().expect("create command") {
-            Command::Create { worktree, .. } => assert!(!worktree),
+            Command::Create { worktree, .. } => assert!(worktree.is_none()),
             _ => panic!("expected a create command"),
         }
 
@@ -14860,7 +14977,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
         assert!(app.picker.is_none());
         match rx.try_recv().expect("create command") {
-            Command::Create { worktree, .. } => assert!(!worktree),
+            Command::Create { worktree, .. } => assert!(worktree.is_none()),
             _ => panic!("expected a create command"),
         }
 

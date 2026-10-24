@@ -10,7 +10,10 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context, Result};
-use eix_core::{now_ms, Event, EventKind, PermissionLevel, SearchHit, Session, SessionStatus};
+use eix_core::{
+    now_ms, Event, EventKind, IntegrationState, IntegrationStatus, PermissionLevel, SearchHit,
+    Session, SessionStatus,
+};
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 
@@ -118,6 +121,26 @@ impl Store {
                 VALUES ('delete', old.doc_id, old.text);
                 INSERT INTO search_fts(rowid, text) VALUES (new.doc_id, new.text);
             END;
+
+            -- One row per session worktree. The queue is deliberately separate
+            -- from turns so a failed merge cannot make a session look busy.
+            CREATE TABLE IF NOT EXISTS session_integrations (
+                session_id       TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                status           TEXT NOT NULL DEFAULT 'pending',
+                stage            TEXT,
+                base_branch      TEXT,
+                error            TEXT,
+                log_path         TEXT,
+                ready_at         INTEGER,
+                next_retry_at    INTEGER,
+                attempts         INTEGER NOT NULL DEFAULT 0,
+                merged_commit    TEXT,
+                worktree_disabled INTEGER NOT NULL DEFAULT 0,
+                updated_at       INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS session_integrations_due
+                ON session_integrations(status, next_retry_at, ready_at);
             "#,
         )?;
         // Databases created before fork/rewind lack the lineage columns.
@@ -326,6 +349,12 @@ impl Store {
                )",
             params![id],
         )?;
+        if changed > 0 {
+            let _ = conn.execute(
+                "DELETE FROM session_integrations WHERE session_id = ?1",
+                params![id],
+            );
+        }
         Ok(changed > 0)
     }
 
@@ -333,6 +362,10 @@ impl Store {
     /// search rows. Returns false when the session did not exist.
     pub fn delete_session(&self, id: &str) -> Result<bool> {
         let conn = self.conn.lock().expect("store mutex poisoned");
+        let _ = conn.execute(
+            "DELETE FROM session_integrations WHERE session_id = ?1",
+            params![id],
+        );
         let changed = conn.execute("DELETE FROM sessions WHERE id = ?1", params![id])?;
         Ok(changed > 0)
     }
@@ -484,6 +517,18 @@ impl Store {
         let conn = self.conn.lock().expect("store mutex poisoned");
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         Ok(count as usize)
+    }
+
+    /// Whether the session has at least one user turn. Used by the idle
+    /// auto-ready scanner to avoid queuing a pristine session.
+    pub fn has_user_message(&self, session_id: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND kind = 'user_message'",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     /// Unsent prompt for a session; `(text, updated_at)` with empty defaults.
@@ -935,6 +980,154 @@ impl Store {
     }
 }
 
+impl Store {
+    /// Ensure a queue row exists for a session. Existing state is kept.
+    pub fn ensure_integration(
+        &self,
+        session_id: &str,
+        base_branch: Option<&str>,
+        worktree_disabled: bool,
+    ) -> Result<IntegrationState> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO session_integrations
+                (session_id, status, stage, base_branch, worktree_disabled, updated_at)
+             VALUES (?1, 'pending', NULL, ?2, ?3, ?4)
+             ON CONFLICT(session_id) DO UPDATE SET
+                base_branch = COALESCE(excluded.base_branch, session_integrations.base_branch),
+                worktree_disabled = excluded.worktree_disabled,
+                updated_at = excluded.updated_at",
+            params![session_id, base_branch, worktree_disabled as i64, now],
+        )?;
+        integration_row(&conn, session_id)?
+            .ok_or_else(|| anyhow::anyhow!("integration row missing"))
+    }
+
+    pub fn get_integration(&self, session_id: &str) -> Result<Option<IntegrationState>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        integration_row(&conn, session_id)
+    }
+
+    pub fn list_integrations(&self) -> Result<Vec<IntegrationState>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT session_id, status, stage, base_branch, error, log_path, ready_at,
+                    next_retry_at, attempts, merged_commit, worktree_disabled, updated_at
+             FROM session_integrations
+             ORDER BY updated_at DESC",
+        )?;
+        let rows = stmt.query_map([], row_to_integration)?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    pub fn save_integration(&self, state: &IntegrationState) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO session_integrations
+                (session_id, status, stage, base_branch, error, log_path, ready_at,
+                 next_retry_at, attempts, merged_commit, worktree_disabled, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(session_id) DO UPDATE SET
+                status = excluded.status,
+                stage = excluded.stage,
+                base_branch = excluded.base_branch,
+                error = excluded.error,
+                log_path = excluded.log_path,
+                ready_at = excluded.ready_at,
+                next_retry_at = excluded.next_retry_at,
+                attempts = excluded.attempts,
+                merged_commit = excluded.merged_commit,
+                worktree_disabled = excluded.worktree_disabled,
+                updated_at = excluded.updated_at",
+            params![
+                state.session_id,
+                state.status.as_str(),
+                state.stage,
+                state.base_branch,
+                state.error,
+                state.log_path.as_ref().map(|path| path.to_string_lossy()),
+                state.ready_at,
+                state.next_retry_at,
+                state.attempts as i64,
+                state.merged_commit,
+                state.worktree_disabled as i64,
+                state.updated_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Next queue item whose retry time has arrived. Ready items have no
+    /// `next_retry_at` and are always eligible.
+    pub fn next_integration(&self, now: i64) -> Result<Option<IntegrationState>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT session_id, status, stage, base_branch, error, log_path, ready_at,
+                        next_retry_at, attempts, merged_commit, worktree_disabled, updated_at
+                 FROM session_integrations
+                 WHERE status IN ('ready', 'retrying')
+                   AND (next_retry_at IS NULL OR next_retry_at <= ?1)
+                 ORDER BY COALESCE(ready_at, updated_at), updated_at
+                 LIMIT 1",
+                params![now],
+                row_to_integration,
+            )
+            .optional()?)
+    }
+
+    pub fn delete_integration(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "DELETE FROM session_integrations WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+}
+
+fn integration_row(conn: &Connection, session_id: &str) -> Result<Option<IntegrationState>> {
+    Ok(conn
+        .query_row(
+            "SELECT session_id, status, stage, base_branch, error, log_path, ready_at,
+                    next_retry_at, attempts, merged_commit, worktree_disabled, updated_at
+             FROM session_integrations WHERE session_id = ?1",
+            params![session_id],
+            row_to_integration,
+        )
+        .optional()?)
+}
+
+fn row_to_integration(row: &Row<'_>) -> rusqlite::Result<IntegrationState> {
+    let status_text: String = row.get(1)?;
+    let status = status_text.parse::<IntegrationStatus>().map_err(|_| {
+        rusqlite::Error::FromSqlConversionFailure(
+            1,
+            rusqlite::types::Type::Text,
+            format!("unknown integration status {status_text:?}").into(),
+        )
+    })?;
+    Ok(IntegrationState {
+        session_id: row.get(0)?,
+        status,
+        stage: row.get(2)?,
+        base_branch: row.get(3)?,
+        error: row.get(4)?,
+        log_path: row.get::<_, Option<String>>(5)?.map(PathBuf::from),
+        ready_at: row.get(6)?,
+        next_retry_at: row.get(7)?,
+        attempts: row.get::<_, i64>(8)? as u32,
+        merged_commit: row.get(9)?,
+        worktree_disabled: row.get::<_, i64>(10)? != 0,
+        updated_at: row.get(11)?,
+    })
+}
+
 /// Rebuild `search_docs` for one session from the events that are still
 /// visible. Undo/redo change visibility, so the FTS index has to follow.
 fn reindex_search(tx: &rusqlite::Transaction<'_>, session_id: &str) -> Result<()> {
@@ -1286,6 +1479,56 @@ mod tests {
             .fork_session("s1", Some(u64::MAX), "x", None, None)
             .is_err());
         assert!(store.fork_session("s1", Some(0), "x", None, None).is_err());
+    }
+
+    #[test]
+    fn integration_rows_round_trip_and_respect_retry_times() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        assert!(!store.has_user_message("s1").unwrap());
+        store
+            .append_event(
+                "s1",
+                EventKind::UserMessage,
+                serde_json::json!({"text": "work"}),
+            )
+            .unwrap();
+        assert!(store.has_user_message("s1").unwrap());
+
+        let state = store
+            .ensure_integration("s1", Some("master"), false)
+            .unwrap();
+        assert_eq!(state.session_id, "s1");
+        assert_eq!(state.status, IntegrationStatus::Pending);
+        assert_eq!(state.base_branch.as_deref(), Some("master"));
+        assert!(!state.worktree_disabled);
+        assert!(store.next_integration(now_ms()).unwrap().is_none());
+
+        let mut ready = state.clone();
+        ready.status = IntegrationStatus::Ready;
+        ready.ready_at = Some(now_ms());
+        store.save_integration(&ready).unwrap();
+        let due = store.next_integration(now_ms()).unwrap().unwrap();
+        assert_eq!(due.status, IntegrationStatus::Ready);
+
+        let mut retry = ready;
+        retry.status = IntegrationStatus::Retrying;
+        retry.next_retry_at = Some(now_ms() + 60_000);
+        store.save_integration(&retry).unwrap();
+        assert!(store.next_integration(now_ms()).unwrap().is_none());
+        assert_eq!(
+            store
+                .next_integration(now_ms() + 60_001)
+                .unwrap()
+                .unwrap()
+                .status,
+            IntegrationStatus::Retrying
+        );
+
+        let listed = store.list_integrations().unwrap();
+        assert_eq!(listed.len(), 1);
+        store.delete_integration("s1").unwrap();
+        assert!(store.get_integration("s1").unwrap().is_none());
     }
 
     #[test]
