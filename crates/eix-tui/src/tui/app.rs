@@ -512,9 +512,6 @@ impl SessionView {
                             if payload.scopes.len() <= 1 {
                                 summary.push_str(NO_ALWAYS_MARKER);
                             }
-                            if let Some(parsed) = payload.parsed_command.as_deref() {
-                                summary.push_str(&format!("\nparsed: {parsed}"));
-                            }
                             tool = Some(PendingApproval {
                                 kind: PendingKind::Tool,
                                 approval_id: payload.approval_id,
@@ -3239,9 +3236,6 @@ impl App {
                     }
                     if !params.allow_always {
                         summary.push_str(NO_ALWAYS_MARKER);
-                    }
-                    if let Some(parsed) = params.parsed_command.as_deref() {
-                        summary.push_str(&format!("\nparsed: {parsed}"));
                     }
                     self.approvals.insert(
                         params.session_id,
@@ -10028,8 +10022,6 @@ struct ApprovalParams {
     sandbox: String,
     #[serde(default)]
     scopes: Vec<String>,
-    #[serde(default)]
-    parsed_command: Option<String>,
     #[serde(default = "default_allow_always")]
     allow_always: bool,
 }
@@ -16457,8 +16449,8 @@ mod tests {
             pending.summary
         );
         assert!(
-            pending.summary.contains("parsed: curl"),
-            "{}",
+            !pending.summary.contains("parsed:"),
+            "approval cards should stay short: {}",
             pending.summary
         );
         assert!(pending.summary.contains(NO_ALWAYS_MARKER));
