@@ -128,7 +128,8 @@ integration:
 #   budget_tokens: 32000
 #   auto_compact: true
 #   auto_compact_threshold: 0.8
-#   auto_compact_keep_turns: 2
+#   auto_compact_keep_tokens: 8000  # recent conversation kept verbatim
+#   auto_compact_keep_turns: 2      # minimum recent turns even above token cap
 #   tool_output_tokens: 4000
 #   max_tool_schema_tokens: 12000
 #   instructions_files: ["AGENTS.md"]

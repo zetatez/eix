@@ -1842,7 +1842,6 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'w' => "worktrees",
         'b' => "branches",
         'c' => "close-pane",
-        'C' => "ledger",
         'h' => "history",
         'p' => "processes",
         'R' => "approvals",

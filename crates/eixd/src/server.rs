@@ -61,6 +61,102 @@ use crate::store::Store;
 use crate::tools;
 use eix_core::redact::redact;
 
+/// `stage` marker used while the agent's previous turn is still running.
+/// The idle scanner later turns this into a real repair prompt.
+const REPAIR_PENDING_STAGE: &str = "repair pending: ";
+
+/// Keep integration notes useful without letting a huge test log fill the
+/// transcript. The repair prompt still carries its own (larger) failure tail.
+const INTEGRATION_LOG_CHARS: usize = 8_000;
+
+fn render_command_log(log: &crate::worktree::CommandLog) -> String {
+    let command = format!("$ {}", log.command);
+    let output = log.output.trim();
+    if output.is_empty() {
+        command
+    } else {
+        format!(
+            "{command}\n{}",
+            crate::integration::tail(output, INTEGRATION_LOG_CHARS)
+        )
+    }
+}
+
+fn render_command_logs(logs: &[crate::worktree::CommandLog]) -> String {
+    if logs.is_empty() {
+        return "(no remote commands; using the local base)".to_string();
+    }
+    logs.iter()
+        .map(render_command_log)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
+fn render_rebase_recovery(recovery: &crate::worktree::RebaseRecovery) -> String {
+    let short = |value: &str| value.chars().take(12).collect::<String>();
+    let list = |items: &[String]| {
+        if items.is_empty() {
+            return "none".to_string();
+        }
+        let max = 8;
+        let mut text = items
+            .iter()
+            .take(max)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(", ");
+        if items.len() > max {
+            text.push_str(&format!(" (+{} more)", items.len() - max));
+        }
+        text
+    };
+    let mut text = format!(
+        "integration recovered · stale rebase aborted\n\
+         worktree: {}\n\
+         branch: {}\n\
+         onto: {}\n\
+         HEAD: {}\n\
+         conflicts: {}\n\
+         staged: {}\n\
+         unstaged: {}\n\
+         backup: {}\n\
+         backup ref: {}",
+        recovery.worktree.display(),
+        recovery.branch.as_deref().unwrap_or("(detached)"),
+        recovery
+            .onto
+            .as_deref()
+            .map(short)
+            .unwrap_or_else(|| "(unknown)".into()),
+        short(&recovery.head),
+        list(&recovery.conflicts),
+        list(&recovery.staged),
+        list(&recovery.unstaged),
+        recovery.backup_dir.display(),
+        recovery.backup_ref.as_deref().unwrap_or("(none)"),
+    );
+    if let Some(patch) = recovery.backup_patch.as_deref() {
+        text.push_str(&format!("\npatch: {}", patch.display()));
+    }
+    if let Some(files) = recovery.backup_files.as_deref() {
+        text.push_str(&format!("\nfiles: {}", files.display()));
+    }
+    if !recovery.untracked.is_empty() {
+        text.push_str(&format!(
+            "\nuntracked files kept in place: {}",
+            list(&recovery.untracked)
+        ));
+    }
+    if recovery.had_work {
+        text.push_str(
+            "\n\nAny conflict resolution or staged edits were preserved in the backup above; the worktree was restored to the pre-rebase branch and integration continues without them. Reapply the backup if those edits were meant to land.",
+        );
+    } else {
+        text.push_str("\n\nNo tracked rebase work was present; integration can continue.");
+    }
+    text
+}
+
 pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<()> {
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
@@ -439,6 +535,25 @@ impl Daemon {
         Ok(())
     }
 
+    /// Persist a human-readable integration milestone in the session log. The
+    /// queue is otherwise invisible in the transcript until it injects a
+    /// repair turn.
+    fn note_integration(&self, session_id: &str, status: IntegrationStatus, text: String) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let payload = json!({
+            "status": status.as_str(),
+            "text": text,
+        });
+        if let Ok(event) = self
+            .store
+            .append_event(session_id, EventKind::Integration, payload)
+        {
+            self.emit_event(&event);
+        }
+    }
+
     async fn base_for_repo(&self, repo: &Path) -> Result<String> {
         let config = self.config.load_full();
         let configured = config
@@ -544,6 +659,21 @@ impl Daemon {
         result
     }
 
+    /// Back up and remove a stale rebase so integration never stays wedged.
+    /// Returns `Ok(None)` when there is no rebase to recover.
+    async fn recover_stale_rebase(
+        &self,
+        session: &Session,
+        worktree: &Path,
+        status: IntegrationStatus,
+    ) -> Result<Option<crate::worktree::RebaseRecovery>> {
+        let Some(recovery) = crate::worktree::recover_rebase(worktree).await? else {
+            return Ok(None);
+        };
+        self.note_integration(&session.id, status, render_rebase_recovery(&recovery));
+        Ok(Some(recovery))
+    }
+
     async fn request_ready(
         &self,
         session_id: &str,
@@ -575,12 +705,6 @@ impl Daemon {
                 format!("session {} has no worktree", session.id),
             ));
         };
-        if crate::worktree::in_rebase(&worktree).await {
-            return Err(rpc(
-                "invalid_params",
-                "finish or abort the in-progress rebase before eix ready",
-            ));
-        }
         // Do not race the queue's ready -> syncing claim. Holding this across
         // the commit below is cheap and keeps a late `ready` from overwriting
         // an active rebase/test state.
@@ -589,6 +713,10 @@ impl Daemon {
             .store
             .get_integration(session_id)?
             .unwrap_or_else(|| IntegrationState::new(&session.id));
+        let previous_status = state.status;
+        // Never touch a worktree that the queue is actively rebasing/testing/
+        // merging. `Repairing` is different: the agent may have gone idle
+        // without finishing, so an explicit ready is allowed to recover it.
         if state.status.is_active() && state.status != IntegrationStatus::Repairing {
             return Err(rpc(
                 "busy",
@@ -598,6 +726,46 @@ impl Daemon {
                     state.status.as_str()
                 ),
             ));
+        }
+        if crate::worktree::in_rebase(&worktree).await {
+            // An agent calling the `ready` tool may be in the middle of
+            // resolving a conflict. Refuse to throw that work away; send it
+            // back to finish or abort explicitly. A user/CLI `/ready` (and an
+            // agent call with no tracked work) recovers automatically, with a
+            // backup, so a stale rebase can never wedge the queue forever.
+            if allow_busy && crate::worktree::rebase_has_work(&worktree).await {
+                let conflicts = crate::worktree::conflict_files(&worktree).await;
+                let branch = crate::worktree::branch(&worktree)
+                    .await
+                    .unwrap_or_else(|| "(detached)".into());
+                let files = if conflicts.is_empty() {
+                    "(none; tracked edits are staged or unstaged)".to_string()
+                } else {
+                    conflicts.join("\n")
+                };
+                return Err(rpc(
+                    "invalid_params",
+                    format!(
+                        "a rebase is still in progress in {}\n\nBranch: {branch}\nConflicts:\n{files}\n\n\
+                         Resolve the conflicts, stage them with `git add <files>`, then run\n\
+                         `GIT_EDITOR=true git rebase --continue` until the rebase finishes.\n\
+                         To discard the rebase instead, run `git rebase --abort`. Then call ready again.",
+                        worktree.display()
+                    ),
+                ));
+            }
+            if let Err(err) = self
+                .recover_stale_rebase(&session, &worktree, state.status)
+                .await
+            {
+                return Err(rpc(
+                    "invalid_params",
+                    format!(
+                        "cannot recover the in-progress rebase in {}: {err:#}",
+                        worktree.display()
+                    ),
+                ));
+            }
         }
         let base = match state.base_branch.clone() {
             Some(base) => base,
@@ -642,6 +810,14 @@ impl Daemon {
         state.worktree_disabled = false;
         state.updated_at = now_ms();
         self.save_integration(&state)?;
+        if previous_status != IntegrationStatus::Ready {
+            let base = state.base_branch.as_deref().unwrap_or("auto");
+            self.note_integration(
+                &session.id,
+                IntegrationStatus::Ready,
+                format!("integration queued: base {base}"),
+            );
+        }
         Ok(state)
     }
 
@@ -660,6 +836,11 @@ impl Daemon {
         state.attempts = 0;
         state.updated_at = now_ms();
         self.save_integration(&state)?;
+        self.note_integration(
+            session_id,
+            IntegrationStatus::Ready,
+            "integration requeued".into(),
+        );
         Ok(state)
     }
 
@@ -729,6 +910,21 @@ impl Daemon {
         let repo = crate::worktree::main_repo(&worktree)
             .await
             .unwrap_or_else(|| session.cwd.clone());
+        // A previous attempt (or a manual git command) may have left a rebase
+        // behind. The queue owns an idle worktree, so recover it before trying
+        // to rebase again; the backup makes this safe even with conflicts.
+        if crate::worktree::in_rebase(&worktree).await {
+            if let Err(err) = self
+                .recover_stale_rebase(&session, &worktree, state.status)
+                .await
+            {
+                return self.retry_integration(
+                    &session,
+                    state,
+                    format!("recover stale rebase: {err:#}"),
+                );
+            }
+        }
         let base = match state.base_branch.clone() {
             Some(base) => base,
             None => match self.base_for_repo(&repo).await {
@@ -743,27 +939,51 @@ impl Daemon {
         state.stage = Some("base".into());
         state.updated_at = now_ms();
         self.save_integration(&state)?;
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Syncing,
+            format!("integration syncing: base {base}"),
+        );
 
-        let base_head = if config.integration.repo_pull_base(&repo) {
+        let (base_head, sync_commands) = if config.integration.repo_pull_base(&repo) {
             match crate::worktree::sync_base(&repo, &base).await {
-                Ok(head) => head,
+                Ok(run) => (run.head, run.commands),
                 Err(err) => {
-                    return self.retry_integration(&session, state, format!("base sync: {err:#}"));
+                    let detail = format!("base sync: {err:#}");
+                    if detail.contains("uncommitted changes") {
+                        return self
+                            .start_repair(&session, &state, "base worktree dirty", &detail)
+                            .await;
+                    }
+                    return self.retry_integration(&session, state, detail);
                 }
             }
         } else {
             match crate::worktree::require_base(&repo, &base).await {
-                Ok(head) => head,
+                Ok(head) => (head, Vec::new()),
                 Err(err) => {
                     return self.retry_integration(&session, state, format!("base head: {err:#}"));
                 }
             }
         };
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Syncing,
+            format!(
+                "integration synced: base {base}\n{}",
+                render_command_logs(&sync_commands)
+            ),
+        );
 
         state.status = IntegrationStatus::Rebasing;
         state.stage = Some("rebase".into());
         state.updated_at = now_ms();
         self.save_integration(&state)?;
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Rebasing,
+            format!("integration rebasing: session branch onto {base}"),
+        );
         let rebase = match crate::worktree::rebase(&worktree, &base).await {
             Ok(output) => output,
             Err(err) => {
@@ -779,6 +999,34 @@ impl Daemon {
                     conflicts.join("\n"),
                     crate::integration::tail(&rebase.combined(), 8_000)
                 );
+                let log = crate::worktree::CommandLog {
+                    command: format!("git rebase {base}"),
+                    output: rebase.combined(),
+                };
+                self.note_integration(
+                    &session.id,
+                    IntegrationStatus::Rebasing,
+                    format!(
+                        "integration rebase conflict · {base}\n{}",
+                        render_command_log(&log)
+                    ),
+                );
+                if !config.integration.conflict_repair {
+                    // Retrying with the conflicted rebase left in place would
+                    // just wedge the next attempt. Preserve it and clear it
+                    // before backing off.
+                    if let Err(err) = self
+                        .recover_stale_rebase(&session, &worktree, state.status)
+                        .await
+                    {
+                        return self.retry_integration(
+                            &session,
+                            state,
+                            format!("{details}\nrebase recovery failed: {err:#}"),
+                        );
+                    }
+                    return self.retry_integration(&session, state, details);
+                }
                 return self
                     .start_repair(&session, &state, "rebase conflict", &details)
                     .await;
@@ -789,6 +1037,15 @@ impl Daemon {
                 format!("rebase: {}", rebase.combined()),
             );
         }
+        let log = crate::worktree::CommandLog {
+            command: format!("git rebase {base}"),
+            output: rebase.combined(),
+        };
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Rebasing,
+            format!("integration rebased: {base}\n{}", render_command_log(&log)),
+        );
         let head_before_test = match crate::worktree::head(&worktree).await {
             Ok(head) => head,
             Err(err) => {
@@ -798,21 +1055,33 @@ impl Daemon {
 
         let test = match crate::integration::test_command(
             &worktree,
+            Some(&session.cwd),
             config.integration.repo_test(&repo),
         ) {
             Some(test) => test,
             None => {
-                return self.retry_integration(
-                    &session,
-                    state,
-                    "no test command configured; set [integration] test or a repo override".into(),
+                let details = format!(
+                    "no test command configured for {}\n\n\
+                     Set [integration] test or [integration.repos.\"{}\"] in the user config.\n\
+                     If the repository keeps multiple projects in subdirectories, ask the user\n\
+                     which project/command to use before making changes.",
+                    worktree.display(),
+                    repo.display()
                 );
+                return self
+                    .start_repair(&session, &state, "test command missing", &details)
+                    .await;
             }
         };
         state.status = IntegrationStatus::Testing;
         state.stage = Some("test".into());
         state.updated_at = now_ms();
         self.save_integration(&state)?;
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Testing,
+            format!("integration testing: `{test}`"),
+        );
         let run = match crate::integration::run_test(
             &worktree,
             &test,
@@ -822,10 +1091,32 @@ impl Daemon {
         {
             Ok(run) => run,
             Err(err) => {
-                return self.retry_integration(&session, state, format!("test: {err:#}"));
+                let details = format!("test: {err:#}");
+                self.note_integration(
+                    &session.id,
+                    IntegrationStatus::Testing,
+                    format!("integration test could not run · `{test}`\n{details}"),
+                );
+                return self
+                    .start_repair(&session, &state, "test command could not run", &details)
+                    .await;
             }
         };
+        let test_log = crate::worktree::CommandLog {
+            command: test.clone(),
+            output: run.output.clone(),
+        };
         if !run.success {
+            let reason = if run.timed_out {
+                "integration test timed out"
+            } else {
+                "integration test failed"
+            };
+            self.note_integration(
+                &session.id,
+                IntegrationStatus::Testing,
+                format!("{reason} · `{test}`\n{}", render_command_log(&test_log)),
+            );
             let details = format!(
                 "test command failed: `{test}`\n\n{}",
                 crate::integration::tail(&run.output, 8_000)
@@ -834,25 +1125,41 @@ impl Daemon {
                 .start_repair(&session, &state, "test failure", &details)
                 .await;
         }
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Testing,
+            format!(
+                "integration test passed: `{test}`\n{}",
+                render_command_log(&test_log)
+            ),
+        );
         match crate::worktree::head(&worktree).await {
             Ok(after) if after == head_before_test => {}
             Ok(_) => {
-                return self.retry_integration(
-                    &session,
-                    state,
-                    "test command changed the branch HEAD; refusing to merge".into(),
-                );
+                return self
+                    .start_repair(
+                        &session,
+                        &state,
+                        "test command changed branch HEAD",
+                        "The test command created a commit. Integration refuses to merge a branch\n\
+                         that changed while it was being tested.",
+                    )
+                    .await;
             }
             Err(err) => {
                 return self.retry_integration(&session, state, format!("head: {err:#}"));
             }
         }
         if !crate::worktree::is_clean(&worktree).await? {
-            return self.retry_integration(
-                &session,
-                state,
-                "test command left tracked changes in the worktree; refusing to merge".into(),
-            );
+            return self
+                .start_repair(
+                    &session,
+                    &state,
+                    "test command left changes",
+                    "The test command left tracked changes in the worktree. Integration refuses\n\
+                     to merge files that were not part of the session's commit.",
+                )
+                .await;
         }
 
         let current_base = match crate::worktree::require_base(&repo, &base).await {
@@ -871,16 +1178,38 @@ impl Daemon {
         let branch = match crate::worktree::branch(&worktree).await {
             Some(branch) => branch,
             None => {
-                return self.retry_integration(&session, state, "worktree has no branch".into());
+                return self
+                    .start_repair(
+                        &session,
+                        &state,
+                        "worktree has no branch",
+                        "The session worktree is detached and cannot be merged.",
+                    )
+                    .await;
             }
         };
         state.status = IntegrationStatus::Merging;
         state.stage = Some("merge".into());
         state.updated_at = now_ms();
         self.save_integration(&state)?;
-        if let Err(err) = crate::worktree::merge_ff(&repo, &branch).await {
-            return self.retry_integration(&session, state, format!("merge: {err:#}"));
-        }
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Merging,
+            format!("integration merging · {branch} → {base}"),
+        );
+        let merge_log = match crate::worktree::merge_ff(&repo, &branch).await {
+            Ok(log) => log,
+            Err(err) => {
+                return self
+                    .start_repair(
+                        &session,
+                        &state,
+                        "merge failed",
+                        &format!("merge {branch} into {base}: {err:#}"),
+                    )
+                    .await;
+            }
+        };
         let merged_commit = crate::worktree::head(&repo).await.ok();
         state.status = IntegrationStatus::Merged;
         state.stage = None;
@@ -889,6 +1218,21 @@ impl Daemon {
         state.merged_commit = merged_commit;
         state.updated_at = now_ms();
         self.save_integration(&state)?;
+        let commit = state
+            .merged_commit
+            .as_deref()
+            .map(|commit| commit.chars().take(7).collect::<String>())
+            .unwrap_or_default();
+        let headline = if commit.is_empty() {
+            format!("integration merged into {base}")
+        } else {
+            format!("integration merged into {base} · {commit}")
+        };
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Merged,
+            format!("{headline}\n{}", render_command_log(&merge_log)),
+        );
         self.emit_value(
             "integration.merged",
             json!({
@@ -898,11 +1242,23 @@ impl Daemon {
             }),
         );
         if config.integration.push {
-            if let Err(err) = crate::worktree::push_base(&repo, &base).await {
-                eprintln!(
-                    "eixd: integration push failed: {}",
-                    redact(&format!("{err:#}"))
-                );
+            match crate::worktree::push_base(&repo, &base).await {
+                Ok(log) => self.note_integration(
+                    &session.id,
+                    IntegrationStatus::Merged,
+                    format!("integration pushed · {base}\n{}", render_command_log(&log)),
+                ),
+                Err(err) => {
+                    self.note_integration(
+                        &session.id,
+                        IntegrationStatus::Merged,
+                        format!("integration push failed · {base}\n{err:#}"),
+                    );
+                    eprintln!(
+                        "eixd: integration push failed: {}",
+                        redact(&format!("{err:#}"))
+                    );
+                }
             }
         }
         Ok(())
@@ -919,21 +1275,48 @@ impl Daemon {
         if !config.integration.conflict_repair {
             return self.retry_integration(session, state.clone(), details.to_string());
         }
+        // A pending repair is resumed by `resume_pending_repairs` after the
+        // previous turn finishes. Do not count it as a new failure twice.
+        let resuming = state.status == IntegrationStatus::Repairing
+            && state
+                .stage
+                .as_deref()
+                .is_some_and(|stage| stage.starts_with(REPAIR_PENDING_STAGE));
         let mut repairing = state.clone();
-        let paused = self.account_failure(&mut repairing, details);
         repairing.next_retry_at = None;
-        if paused {
-            repairing.status = IntegrationStatus::Retrying;
-            repairing.next_retry_at = Some(i64::MAX / 4);
-            self.save_integration(&repairing)?;
-            self.notify_failure(session, &repairing);
-            return Ok(());
+        if resuming {
+            repairing.stage = Some(reason.to_string());
+        } else {
+            let paused = self.account_failure(&mut repairing, details);
+            if paused {
+                repairing.status = IntegrationStatus::Retrying;
+                repairing.next_retry_at = Some(i64::MAX / 4);
+                self.save_integration(&repairing)?;
+                self.notify_failure(session, &repairing);
+                self.note_integration(
+                    &session.id,
+                    IntegrationStatus::Retrying,
+                    format!(
+                        "integration paused after {} attempts · {reason}\nRun `eix integrate continue` to requeue.",
+                        repairing.attempts
+                    ),
+                );
+                return Ok(());
+            }
+            repairing.status = IntegrationStatus::Repairing;
+            repairing.stage = Some(reason.to_string());
         }
-        repairing.status = IntegrationStatus::Repairing;
-        repairing.stage = Some(reason.to_string());
         if self.turns.lock().await.contains_key(&session.id) || session.status.is_busy() {
+            repairing.stage = Some(format!("{REPAIR_PENDING_STAGE}{reason}"));
             self.save_integration(&repairing)?;
-            self.notify_failure(session, &repairing);
+            if !resuming {
+                self.notify_failure(session, &repairing);
+                self.note_integration(
+                    &session.id,
+                    IntegrationStatus::Repairing,
+                    format!("integration repair pending · {reason}"),
+                );
+            }
             return Ok(());
         }
         let worktree = session
@@ -948,11 +1331,21 @@ impl Daemon {
              Please resolve this autonomously. If a rebase is in progress, edit the\n\
              conflicted files, run `git add <files>`, then `GIT_EDITOR=true git rebase --continue`\n\
              until the rebase finishes. If you cannot resolve it, run `git rebase --abort` and explain.\n\
-             After resolving, run the project tests, then call the `ready` tool (or run\n\
-             `eix ready`) to requeue. Do not merge or rebase the base branch yourself.",
+             If the fix needs a human decision (for example which test command to use, or how\n\
+             to clean the base worktree), ask the user with `ask_user` and wait for the answer.\n\
+             Do not call `ready` again until something has changed. After resolving, run the\n\
+             project tests, then call the `ready` tool (or run `eix ready`) to requeue. Do not\n\
+             merge or rebase the base branch yourself.",
         );
         self.save_integration(&repairing)?;
-        self.notify_failure(session, &repairing);
+        if !resuming {
+            self.notify_failure(session, &repairing);
+        }
+        self.note_integration(
+            &session.id,
+            IntegrationStatus::Repairing,
+            format!("integration repairing · {reason}"),
+        );
         let params = SubmitParams {
             session_id: session.id.clone(),
             text: prompt,
@@ -1011,7 +1404,16 @@ impl Daemon {
         error: String,
     ) -> Result<()> {
         let config = self.config.load_full();
-        let paused = self.account_failure(&mut state, &error);
+        let previous_status = state.status;
+        let previous_error = state.error.clone();
+        let paused_by_config = self.account_failure(&mut state, &error);
+        // A transient failure is worth a few retries. A deterministic failure
+        // (bad test command, dirty base, repeated merge failure) would produce
+        // the same result forever, so stop and hand control back to the user.
+        let repeated = previous_status == IntegrationStatus::Retrying
+            && state.attempts >= 3
+            && state.error == previous_error;
+        let paused = paused_by_config || repeated;
         state.status = IntegrationStatus::Retrying;
         state.stage = None;
         if paused {
@@ -1023,6 +1425,86 @@ impl Daemon {
         }
         self.save_integration(&state)?;
         self.notify_failure(session, &state);
+        // Record the first observation of a failure, not every backoff tick.
+        if previous_status != IntegrationStatus::Retrying
+            || state.error != previous_error
+            || repeated
+        {
+            let detail = crate::integration::tail(state.error.as_deref().unwrap_or(&error), 2_000);
+            let text = if paused {
+                if repeated {
+                    format!(
+                        "integration paused · the same failure repeated {} times · {detail}\nFix the cause, then run `eix integrate continue`.",
+                        state.attempts
+                    )
+                } else {
+                    format!(
+                        "integration paused after {} attempts · {detail}\nRun `eix integrate continue` to requeue.",
+                        state.attempts
+                    )
+                }
+            } else {
+                format!(
+                    "integration retrying (attempt {}) · {detail}",
+                    state.attempts
+                )
+            };
+            self.note_integration(&session.id, IntegrationStatus::Retrying, text);
+        }
+        Ok(())
+    }
+
+    /// A deterministic failure can arrive while the agent is still finishing
+    /// the turn that called `ready`. In that case `start_repair` records a
+    /// pending marker; once the session is idle, inject the repair prompt.
+    async fn resume_pending_repairs(self: &Arc<Self>) -> Result<()> {
+        let sessions = self.store.list_sessions()?;
+        for session in sessions {
+            if session.archived || session.is_agent() || !session.has_worktree() {
+                continue;
+            }
+            let Some(state) = self.store.get_integration(&session.id)? else {
+                continue;
+            };
+            if state.status != IntegrationStatus::Repairing || state.worktree_disabled {
+                continue;
+            }
+            let Some(reason) = state
+                .stage
+                .as_deref()
+                .and_then(|stage| stage.strip_prefix(REPAIR_PENDING_STAGE))
+            else {
+                continue;
+            };
+            let reason = reason.to_string();
+            if reason.trim().is_empty() {
+                continue;
+            }
+            if session.status != SessionStatus::Idle
+                || self.turns.lock().await.contains_key(&session.id)
+                || self.approvals.lock().await.contains_key(&session.id)
+                || self.inputs.lock().await.contains_key(&session.id)
+            {
+                continue;
+            }
+            // Do not overwrite a prompt the user is already drafting.
+            let (draft, _) = self.store.get_draft(&session.id)?;
+            if !draft.trim().is_empty() {
+                continue;
+            }
+            // Let the finishing turn persist its final events first.
+            if now_ms().saturating_sub(session.updated_at) < 1_000 {
+                continue;
+            }
+            let details = state.error.clone().unwrap_or_default();
+            if let Err(err) = self.start_repair(&session, &state, &reason, &details).await {
+                eprintln!(
+                    "eixd: cannot resume repair for {}: {}",
+                    session.id,
+                    redact(&format!("{err:#}"))
+                );
+            }
+        }
         Ok(())
     }
 
@@ -1074,21 +1556,53 @@ impl Daemon {
                 continue;
             }
             if state.status == IntegrationStatus::Repairing {
-                // Do not race a repair turn that is still in a rebase or has
-                // uncommitted conflict resolutions. The agent should finish
-                // (or abort) and call `ready`; the watchdog is only a fallback.
-                if crate::worktree::in_rebase(&session.cwd).await
-                    || !crate::worktree::is_clean(&session.cwd).await?
+                // A pending marker means the repair prompt was never injected
+                // (the previous turn was still running). `resume_pending_repairs`
+                // owns that case.
+                if state
+                    .stage
+                    .as_deref()
+                    .is_some_and(|stage| stage.starts_with(REPAIR_PENDING_STAGE))
                 {
+                    continue;
+                }
+                // A repair turn can end without calling ready, leaving a
+                // rebase (and sometimes resolved conflicts) behind. Preserve
+                // that state in a backup and abort the rebase so the next
+                // ready/queue pass is not wedged. Dirty tracked files still
+                // wait for the agent or auto-commit.
+                let worktree = session.worktree.as_deref().unwrap_or(&session.cwd);
+                if crate::worktree::in_rebase(worktree).await {
+                    if let Err(err) = self
+                        .recover_stale_rebase(&session, worktree, state.status)
+                        .await
+                    {
+                        eprintln!(
+                            "eixd: cannot recover stale rebase for {}: {}",
+                            session.id,
+                            redact(&format!("{err:#}"))
+                        );
+                        continue;
+                    }
+                }
+                if !crate::worktree::is_clean(&session.cwd).await? {
                     continue;
                 }
                 let mut next = state;
                 next.status = IntegrationStatus::Retrying;
                 next.stage = Some("repair watchdog".into());
-                next.error = Some("repair turn finished without eix ready; retrying".into());
-                next.next_retry_at = Some(now_ms());
+                next.error = Some(
+                    "repair turn finished without eix ready; paused (run `eix integrate continue` or call ready)"
+                        .into(),
+                );
+                next.next_retry_at = Some(i64::MAX / 4);
                 next.updated_at = now_ms();
                 self.save_integration(&next)?;
+                self.note_integration(
+                    &session.id,
+                    IntegrationStatus::Retrying,
+                    "integration paused · repair turn finished without ready\nFix the cause and call `ready`, or run `eix integrate continue`.".into(),
+                );
                 continue;
             }
             // A dirty worktree is normal while the agent is still working.
@@ -1114,6 +1628,14 @@ impl Daemon {
             if self.config.load().integration.enabled {
                 if let Err(err) = self.process_next_integration().await {
                     eprintln!("eixd: integration queue: {}", redact(&format!("{err:#}")));
+                }
+                // A repair can only start after the turn that called `ready`
+                // has finished, even when auto-ready is disabled.
+                if let Err(err) = self.resume_pending_repairs().await {
+                    eprintln!(
+                        "eixd: resume pending repairs: {}",
+                        redact(&format!("{err:#}"))
+                    );
                 }
                 // Auto-ready does a git status per idle session; the default
                 // idle window is minutes, so a 20-second scan is plenty.
@@ -1188,9 +1710,12 @@ impl Daemon {
             if let Ok(Some(session)) = self.store.get_session(&state.session_id) {
                 if let Some(worktree) = session.worktree.as_deref() {
                     if crate::worktree::in_rebase(worktree).await {
-                        if let Err(err) = crate::worktree::abort_rebase(worktree).await {
+                        if let Err(err) = self
+                            .recover_stale_rebase(&session, worktree, state.status)
+                            .await
+                        {
                             eprintln!(
-                                "eixd: cannot abort stale rebase for {}: {}",
+                                "eixd: cannot recover stale rebase for {}: {}",
                                 state.session_id,
                                 redact(&format!("{err:#}"))
                             );
@@ -4977,7 +5502,8 @@ impl Daemon {
              5. Task state (what is done, in progress, blocked)\n\
              6. Open questions and the next concrete step\n\
              Be concise but specific. Keep exact paths, commands, error text, and identifiers. \
-             Do not invent facts or add commentary.",
+             Prefer task state, decisions, and next steps over narration; this note may be \
+             updated by later compactions. Do not invent facts or add commentary.",
         );
         if !todos.is_empty() {
             system.push_str("\n\nCurrent task list (preserve it):\n");
@@ -5023,23 +5549,34 @@ impl Daemon {
         last_seq: &mut u64,
         static_context: &StaticContext,
     ) -> (Ledger, bool) {
+        let config = self.config.load();
         let info = ledger.info();
-        let threshold = self.config.load().context.auto_compact_threshold;
-        if info.budget_tokens == 0
-            || (!force && (info.total_tokens as f64) <= threshold * info.budget_tokens as f64)
-        {
+        let threshold = config.context.auto_compact_threshold;
+        if info.budget_tokens == 0 {
+            return (ledger, false);
+        }
+        let over_threshold = (info.total_tokens as f64) > threshold * info.budget_tokens as f64;
+        if !force && !over_threshold {
             return (ledger, false);
         }
         // Forced recovery may have only two user turns, in which case the
-        // configured keep count leaves nothing to summarize. Fall back to
-        // keeping one turn rather than giving up on the request.
-        let range = ledger.auto_compact_range(keep.max(1)).or_else(|| {
-            if force {
-                ledger.auto_compact_range(1)
-            } else {
-                None
-            }
-        });
+        // retention window leaves nothing to summarize. Fall back to keeping
+        // one turn rather than giving up on the request.
+        let range = ledger
+            .auto_compact_range_tokens(config.context.auto_compact_keep_tokens, keep.max(1))
+            .or_else(|| {
+                if force {
+                    ledger.auto_compact_range(1)
+                } else if over_threshold {
+                    // A tiny test budget or a huge token retention window can
+                    // make the whole live conversation fit in the window while
+                    // still exceeding the request budget. Fall back to the
+                    // turn-based minimum so the request can proceed.
+                    ledger.auto_compact_range(keep.max(1))
+                } else {
+                    None
+                }
+            });
         let Some((from_seq, to_seq)) = range else {
             return (ledger, false);
         };
@@ -6731,6 +7268,7 @@ fn timeline_preview(kind: EventKind, payload: &Value) -> Option<String> {
             .unwrap_or("error")
             .to_string(),
         EventKind::ContextCompacted => "context compacted".to_string(),
+        EventKind::Integration => payload.get("text")?.as_str()?.trim().to_string(),
         _ => return None,
     };
     if text.is_empty() {

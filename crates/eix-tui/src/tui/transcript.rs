@@ -548,6 +548,15 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                         .to_string(),
                 });
             }
+            EventKind::Integration => {
+                if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
+                    if !text.trim().is_empty() {
+                        blocks.push(Block::Note {
+                            text: text.to_string(),
+                        });
+                    }
+                }
+            }
             _ => {}
         }
     }

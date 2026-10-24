@@ -133,20 +133,33 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `○`，run
 
 - session 的 `pending → ready → syncing → rebasing → testing → merging → merged` 状态存在
   `session_integrations` 表；`retrying` 带 `next_retry_at` 和指数退避，不设硬 blocked。
-- `eix ready`（`session.ready`）检查：无 turn、无 rebase、worktree 干净；默认
-  `auto_commit = true` 会先提交 dirty worktree（设为 false 则要求先手动提交）。agent turn 内
-  也可以用无审批的 `ready` 工具提前置为 ready，队列会等 turn 结束。
+- `eix ready`（`session.ready`）检查：无 turn、worktree 干净；默认
+  `auto_commit = true` 会先提交 dirty worktree（设为 false 则要求先手动提交）。如果存在
+  残留 rebase，用户侧 `ready` 会先把冲突/暂存内容备份到 `.git/eix/recovery/`、创建
+  `refs/eix/recovery/<stamp>`，再 abort 并继续；agent turn 内调用 `ready` 且仍有冲突或
+  暂存修改时则返回明确错误，要求先 `rebase --continue` 或 `rebase --abort`，避免误丢
+  正在解决的冲突。agent turn 内也可以用无审批的 `ready` 工具提前置为 ready，队列会等
+  turn 结束。
   `auto_ready = idle` 时 daemon 扫描空闲 session：无 turn/审批/输入、草稿为空、
   至少一条 user message、worktree 干净，且 `idle_secs` 内无更新。
 - 单个 daemon worker 串行处理队列：主 worktree 干净时 `fetch` + `pull --ff-only`，把 session
-  分支 rebase 到基分支，运行 `integration.test`（`auto` 识别 Cargo/npm/Go/Python/Make；没有
-  测试命令则拒绝合并），确认基分支 SHA 未变化后 `merge --ff-only`。`push=false` 默认只更新
-  本地基分支，worktree 在合并后保留。
-- rebase 冲突或测试失败把输出尾部作为修复 prompt 注入 session（`repairing`），agent 在
-  worktree 内解决、跑测试、再次 `eix ready`。`conflict_repair=false` 时只重试并通知。
+  分支 rebase 到基分支，运行 `integration.test`（`auto` 识别 Cargo/npm/Go/Python/Make；
+  也支持子目录项目，优先 session cwd 所属项目，多候选不猜；没有测试命令则拒绝合并），
+  确认基分支 SHA 未变化后 `merge --ff-only`。`push=false` 默认只更新本地基分支，worktree
+  在合并后保留。
+- 队列里程碑写为 `integration` 事件（queued / syncing / rebasing / testing / merging /
+  merged / retrying / repairing），包含实际执行的 git / 测试命令和输出尾部；transcript
+  和 `eix log` 可见，不进入 provider 的 chat context。
+- rebase 冲突、测试失败、无测试命令、dirty base 或 merge 失败把错误注入 session
+  （`repairing`），agent 在 worktree 内解决、跑测试、再次 `eix ready`，需要人工决定时可用
+  `ask_user`。失败发生在 agent 当前 turn 尚未结束时先标记 `repair pending`，等 turn 结束后
+  再注入。`conflict_repair=false` 时只重试并通知。
 - 连续失败达到 `notify_after` 发 `integration.attention`；`pause_after>0` 时暂停等待
-  `integration.continue`，默认 0 表示一直退避重试。daemon 重启时把遗留的 active 行恢复成
-  `retrying`，并 abort 未完成的 rebase 回到 rebase 前状态，避免队列永久卡住。
+  `integration.continue`；同一错误连续 3 次也会自动暂停，避免重复无效重试。
+- 残留 rebase 是 recoverable 状态，而不是硬 blocked：`ready`、队列尝试、repair watchdog
+  和 daemon 重启都会先备份（patch、变更文件副本、`refs/eix/recovery/<stamp>`）再 abort；
+  `conflict_repair=false` 的冲突重试同样先清理 rebase。daemon 重启时把遗留的 active 行
+  恢复成 `retrying`，避免队列永久卡住。
 
 ## 5. 输入层：自研 Vim 风格编辑器
 
@@ -328,7 +341,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/` / `?` / `#` | normal 模式：在当前 session 对话中搜索；`/` 向前，`?`/`#` 向后；`n`/`N` 跳匹配，`Esc` 清除高亮；`:history` 搜索所有 session |
 | `F1` / `/help` | 打开可搜索帮助；`/`、`?`、`#` 在 normal 模式打开命令行 |
 | `Ctrl-J` / `Ctrl-K` | normal 模式下浏览已提交的 prompt 历史（newer / older） |
-| `Ctrl-T` | 任意焦点：推理强度 low → medium → high → 空 → low（默认 medium） |
+| `Ctrl-T` | 任意焦点：推理强度 low → medium → high → low（默认 medium） |
 | `Ctrl-/` | 任意焦点：打开可搜索的模型 picker（`Ctrl-_` / `Ctrl-7` 也兼容） |
 | `Ctrl-P` | 转录区 / 输入框 normal 模式：打开命令面板 |
 | `Tab` | normal 模式下切换 Build / Plan 模式（命令面板的 `Build / Plan` 同义） |
@@ -360,7 +373,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/processes` / `/approvals` / `/attention` | 进程 / 审批收件箱 / 下一个 attention |
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
 | `/cancel` / `/toggle-agent` | 取消运行 / 切换 Build·Plan |
-| `/permission <level>` | 设置 `read-only` / `workspace-write` / `full` |
+| `/permission` | picker 搜索并选择 `read-only` / `workspace-write` / `full`；也可直接带 level |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
@@ -618,6 +631,9 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
   消息和最新工具结果，避免一轮大输出让后续请求永久失败。
 - 压缩是**显式事件**：历史里出现 `compacted 12 messages → summary`，可展开查看原文。
 - 自动压缩在每个工具批次后也会检查；provider 报 context-length / 413 时强制压缩并重试。
+  压缩只由上下文压力触发，不按轮数定期执行。保留窗口优先按
+  `auto_compact_keep_tokens`（默认 8000）计算，`auto_compact_keep_turns` 只作为最少轮数
+  下限；裁剪点只落在 user turn 边界。
 - provider 重试按错误类型分派：瞬时故障使用抖动指数退避（默认 8 次、250ms 起）；429 优先
   `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
   `kind`，TUI 用简短标签显示原因。

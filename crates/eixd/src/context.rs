@@ -436,6 +436,51 @@ impl Ledger {
         messages
     }
 
+    /// Range an auto-compaction should summarize, keeping roughly
+    /// `keep_tokens` of the newest conversation and at least `keep_turns` user
+    /// turns. Cutting happens on a user-turn boundary so a tool call is never
+    /// separated from its result.
+    pub fn auto_compact_range_tokens(
+        &self,
+        keep_tokens: usize,
+        keep_turns: usize,
+    ) -> Option<(u64, u64)> {
+        let keep_turns = keep_turns.max(1);
+        let users: Vec<u64> = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
+            .filter(|entry| entry.info.kind == "user")
+            .filter_map(|entry| entry.seq)
+            .collect();
+        if users.len() <= keep_turns {
+            return None;
+        }
+        let turn_cutoff = users[users.len() - keep_turns].saturating_sub(1);
+
+        let mut kept_tokens = 0usize;
+        let mut token_cutoff = None;
+        for entry in self.entries.iter().rev() {
+            if entry.info.dropped || entry.info.compacted || entry.seq.is_none() {
+                continue;
+            }
+            if entry.info.kind == "user" && kept_tokens >= keep_tokens {
+                token_cutoff = entry.seq;
+                break;
+            }
+            kept_tokens = kept_tokens.saturating_add(entry.info.tokens);
+        }
+        // The whole live conversation fits in the retention window.
+        if token_cutoff.is_none() && kept_tokens < keep_tokens {
+            return None;
+        }
+        let to = token_cutoff
+            .map(|seq| turn_cutoff.min(seq.saturating_sub(1)))
+            .unwrap_or(turn_cutoff);
+        let (from, _) = self.message_range()?;
+        (to >= from).then_some((from, to))
+    }
+
     /// Range an auto-compaction should summarize: everything before the last
     /// `keep_turns` user messages. `None` when there is not enough history.
     pub fn auto_compact_range(&self, keep_turns: usize) -> Option<(u64, u64)> {
@@ -1963,6 +2008,10 @@ mod tests {
 
         let range = ledger.messages_in_range(1, 4);
         assert_eq!(range.len(), 4, "two user/assistant pairs");
+        // A tiny token budget keeps the same minimum turns; a budget larger
+        // than the live conversation disables compaction entirely.
+        assert_eq!(ledger.auto_compact_range_tokens(0, 2), Some((1, 4)));
+        assert_eq!(ledger.auto_compact_range_tokens(usize::MAX, 2), None);
 
         // After a compaction, the next range starts after the summary.
         let mut events = events;

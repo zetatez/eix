@@ -114,8 +114,6 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("files", "", "browse and insert workspace files"),
         builtin("worktrees", "", "browse and insert git worktrees"),
         builtin("branches", "", "browse and insert git branches"),
-        builtin("context", "", "browse context entries with previews"),
-        builtin("ledger", "", "open the full context ledger"),
         builtin("history", "", "search conversation history"),
         builtin("processes", "", "list and inspect background processes"),
         builtin("approvals", "", "open the approval inbox"),
@@ -169,8 +167,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("colorscheme", "", "choose a colorscheme with live preview"),
         builtin(
             "permission",
-            "<level>",
-            "read-only · workspace-write · full",
+            "[level]",
+            "choose read-only · workspace-write · full in a search picker",
         ),
         builtin("fork", "[name]", "fork this session into a new pane"),
         builtin("commands", "", "reload user-defined Markdown commands"),
@@ -619,8 +617,6 @@ enum PickerKind {
     Worktrees,
     /// Insert a git branch name into the prompt.
     Branches,
-    /// Open the focused session's context ledger.
-    Context,
     /// Client-side command palette (`Ctrl-P`).
     Commands,
     /// Pin the focused session to a configured model.
@@ -629,6 +625,8 @@ enum PickerKind {
     Agents,
     /// Adjust the daemon's runtime subagent concurrency limit.
     Subagents,
+    /// Choose the focused session's permission level.
+    Permissions,
     /// Browse installed skills, with a body preview.
     Skills,
     /// Preview and apply a color preset.
@@ -646,13 +644,13 @@ impl PickerKind {
             Self::Files => Some(eix_core::KIND_FILES),
             Self::Worktrees => Some(eix_core::KIND_WORKTREES),
             Self::Branches => Some(eix_core::KIND_BRANCHES),
-            Self::Context => Some(eix_core::KIND_CONTEXT),
             Self::Sessions
             | Self::NewPane
             | Self::Commands
             | Self::Models
             | Self::Agents
             | Self::Subagents
+            | Self::Permissions
             | Self::Skills
             | Self::Themes
             | Self::Mcp
@@ -676,11 +674,11 @@ impl PickerKind {
             Self::Files => "files — insert after @",
             Self::Worktrees => "worktrees — insert path",
             Self::Branches => "branches — insert name",
-            Self::Context => "context — open ledger",
             Self::Commands => "commands",
             Self::Models => "model — search and switch",
             Self::Agents => "agents — choose the primary agent",
             Self::Subagents => "subagents — parallel limit",
+            Self::Permissions => "permission — choose session access",
             Self::Skills => "skills — preview and insert",
             Self::Themes => "colorschemes — live preview",
             Self::Mcp => "mcp — servers and tools",
@@ -695,11 +693,11 @@ impl PickerKind {
             Self::Files => "Enter insert · ↑/↓ or C-j/C-k · Esc close",
             Self::Worktrees => "Enter insert path · ↑/↓ or C-j/C-k · Esc close",
             Self::Branches => "Enter insert name · ↑/↓ or C-j/C-k · Esc close",
-            Self::Context => "Enter open ledger · ↑/↓ or C-j/C-k · Esc close",
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k · Esc close",
             Self::Models => "type to search · Enter switch · Esc close",
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k · Esc close",
             Self::Subagents => "Enter apply · ↑/↓ or C-j/C-k · Esc close",
+            Self::Permissions => "type to search · Enter apply · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
             Self::Mcp => "Enter close · ↑/↓ or C-j/C-k select · Esc close",
@@ -2873,9 +2871,10 @@ impl App {
                     let session_id = state.session_id.clone();
                     let status = state.status;
                     self.integrations.insert(session_id.clone(), state);
-                    if self
-                        .status_session()
-                        .is_some_and(|session| session.id == session_id)
+                    if status != IntegrationStatus::Merged
+                        && self
+                            .status_session()
+                            .is_some_and(|session| session.id == session_id)
                     {
                         self.status = format!("integration · {}", status.as_str());
                     }
@@ -3818,7 +3817,7 @@ impl App {
             if self.focused_approval().is_none() && self.focused_input().is_none() {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/w/b · n new · o pane · v/t/r/l layout · R approvals · C ledger · c close · a commands · i input · Z quit · Esc cancel"
+                self.status = "leader: f/w/b · n new · o pane · v/t/r/l layout · R approvals · c close · a commands · i input · Z quit · Esc cancel"
                     .into();
             }
             return true;
@@ -5500,10 +5499,6 @@ impl App {
                     self.insert_prompt(&value);
                 }
             }
-            PickerKind::Context => {
-                self.picker = None;
-                self.open_ledger(tx);
-            }
             PickerKind::Commands => {
                 if let Some(value) = value {
                     self.picker = None;
@@ -5539,6 +5534,12 @@ impl App {
                             self.error = Some("invalid subagent concurrency value".into());
                         }
                     }
+                }
+            }
+            PickerKind::Permissions => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    self.command_permission(&value, tx);
                 }
             }
             PickerKind::Skills => {
@@ -5624,6 +5625,18 @@ impl App {
                 .position(|item| item.value == current.to_string())
                 .unwrap_or(0);
             self.status = format!("subagents: {current} concurrent (runtime)");
+        } else if kind == PickerKind::Permissions {
+            let Some(current) = self.focused_view().map(|view| view.session.permission) else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            picker.items = permission_picker_items(current);
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.value == current.as_str())
+                .unwrap_or(0);
+            self.status = format!("permission: {}", current.as_str());
         } else if kind == PickerKind::Skills {
             let cwd = self
                 .focused_view()
@@ -5676,13 +5689,11 @@ impl App {
             "toggle-agent" => self.toggle_agent_mode(tx),
             "skills" => self.open_picker(PickerKind::Skills, tx),
             "colorscheme" => self.open_picker(PickerKind::Themes, tx),
-            "context" => self.open_picker(PickerKind::Context, tx),
             "history" => self.open_history_search(),
             "processes" => self.open_processes(tx),
             "approvals" => self.open_inbox(),
             "mcp" => self.open_picker(PickerKind::Mcp, tx),
             "todos" => self.open_picker(PickerKind::Todos, tx),
-            "ledger" => self.open_ledger(tx),
             "new" => self.create_session(tx, None),
             "new-worktree" => self.create_session(tx, Some(true)),
             "new-shared" => self.create_session(tx, Some(false)),
@@ -6084,14 +6095,6 @@ impl App {
             }
             "branches" => {
                 self.open_picker(PickerKind::Branches, tx);
-                true
-            }
-            "context" => {
-                self.open_picker(PickerKind::Context, tx);
-                true
-            }
-            "ledger" => {
-                self.open_ledger(tx);
                 true
             }
             "history" => {
@@ -6552,11 +6555,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             return;
         };
         if args.is_empty() {
-            let level = self
-                .focused_view()
-                .map(|view| view.session.permission.as_str())
-                .unwrap_or("?");
-            self.status = format!("permission: {level}");
+            self.open_picker(PickerKind::Permissions, tx);
             return;
         }
         match args.parse::<PermissionLevel>() {
@@ -7466,8 +7465,8 @@ already exists, update it in place rather than rewriting it from scratch.";
     }
 
     /// Cycle the focused session's reasoning strength:
-    /// low → medium → high → none → low. A model without an explicit variant
-    /// starts at the default medium, so the first step is high.
+    /// low → medium → high → low. A model without an explicit variant starts
+    /// at the default medium, so the first step is high.
     fn cycle_reasoning(&mut self, tx: &UnboundedSender<Command>) {
         let Some(session_id) = self.focused_session_id() else {
             self.status = "reasoning: no session".into();
@@ -7482,7 +7481,8 @@ already exists, update it in place rather than rewriting it from scratch.";
         let next = match current.unwrap_or("medium") {
             "low" => "medium",
             "medium" => "high",
-            "high" => "none",
+            "high" => "low",
+            // Older sessions may still carry the retired `#none` step.
             "none" => "low",
             _ => "low",
         };
@@ -7504,7 +7504,6 @@ already exists, update it in place rather than rewriting it from scratch.";
             session_id,
             model: Some(model),
         });
-        self.status = format!("reasoning: {next}");
     }
 
     pub fn draw(&mut self, frame: &mut Frame) {
@@ -8183,6 +8182,8 @@ already exists, update it in place rather than rewriting it from scratch.";
             && status != "attached"
             && status != "connecting…"
             && !status.starts_with("connected to eixd")
+            && !status.starts_with("permission")
+            && !status.starts_with("integration · merged")
             && status != "idle"
             && status != "running";
         if show_status {
@@ -8193,39 +8194,29 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
         if let Some(session) = self.status_session() {
             if let Some(state) = self.integrations.get(&session.id) {
-                if state.status != IntegrationStatus::Pending {
+                if !matches!(
+                    state.status,
+                    IntegrationStatus::Pending | IntegrationStatus::Merged
+                ) {
                     if !spans.is_empty() {
                         spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
                     }
                     spans.push(Span::styled(
                         format!("{} {}", state.status.symbol(), state.status.as_str()),
                         Style::default()
-                            .fg(if state.status == IntegrationStatus::Merged {
-                                theme.string.unwrap_or(warn)
-                            } else if matches!(
-                                state.status,
-                                IntegrationStatus::Retrying | IntegrationStatus::Repairing
-                            ) {
-                                warn
-                            } else {
-                                muted
-                            })
+                            .fg(
+                                if matches!(
+                                    state.status,
+                                    IntegrationStatus::Retrying | IntegrationStatus::Repairing
+                                ) {
+                                    warn
+                                } else {
+                                    muted
+                                },
+                            )
                             .bg(panel),
                     ));
                 }
-            }
-            if let Some(worktree) = &session.worktree {
-                let name = worktree
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "worktree".into());
-                if !spans.is_empty() {
-                    spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
-                }
-                spans.push(Span::styled(
-                    format!("wt:{name}"),
-                    Style::default().fg(warn).bg(panel),
-                ));
             }
         }
         if !self.pending_images.is_empty() {
@@ -9589,6 +9580,39 @@ fn subagent_picker_items(current: usize) -> Vec<PickerItem> {
         .collect()
 }
 
+/// Rows for the interactive `/permission` picker.
+fn permission_picker_items(current: PermissionLevel) -> Vec<PickerItem> {
+    [
+        (
+            PermissionLevel::ReadOnly,
+            "read-only",
+            "inspect only; block writes, risky commands and network mutations",
+        ),
+        (
+            PermissionLevel::WorkspaceWrite,
+            "workspace-write",
+            "edit inside the workspace; ask for external or destructive actions",
+        ),
+        (
+            PermissionLevel::Full,
+            "full",
+            "no workspace path limit; hard denies and explicit rules still apply",
+        ),
+    ]
+    .into_iter()
+    .map(|(level, label, detail)| {
+        let label = if level == current {
+            format!("{label}  (current)")
+        } else {
+            label.to_string()
+        };
+        PickerItem::new(level.as_str())
+            .with_label(label)
+            .with_detail(detail)
+    })
+    .collect()
+}
+
 /// Rows for the interactive `/colorscheme` picker. The first row clears the preset;
 /// the rest are the built-in palettes in `THEME_PRESETS` order.
 fn theme_picker_items() -> Vec<PickerItem> {
@@ -9830,12 +9854,6 @@ fn command_items() -> Vec<PickerItem> {
             "git branches",
             "Insert a branch name into the prompt (b)",
         ),
-        (
-            "context",
-            "context entries",
-            "Browse the context ledger with previews",
-        ),
-        ("ledger", "context ledger", "Open the full ledger (C)"),
         (
             "history",
             "search history",
@@ -10246,10 +10264,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "interactive pickers for sessions, files, worktrees and branches",
             },
             HelpEntry {
-                key: "/context · /ledger",
-                description: "browse context entries · open the full ledger",
-            },
-            HelpEntry {
                 key: "/history · /processes · /approvals",
                 description: "search history · inspect processes · pending approvals",
             },
@@ -10295,7 +10309,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/permission",
-                description: "set read-only · workspace-write · full",
+                description: "choose read-only · workspace-write · full in a search picker",
             },
             HelpEntry {
                 key: "/exit · /quit",
@@ -10343,8 +10357,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt & transcript: new pane / files / worktrees / branches",
             },
             HelpEntry {
-                key: "Space C/h/p",
-                description: "prompt & transcript: ledger / history / processes",
+                key: "Space h/p",
+                description: "prompt & transcript: history / processes",
             },
             HelpEntry {
                 key: "Space r/x/a",
@@ -10404,7 +10418,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Ctrl-T",
-                description: "cycle reasoning (default medium): low / medium / high / none",
+                description: "cycle reasoning (default medium): low / medium / high",
             },
             HelpEntry {
                 key: "Ctrl-/",
@@ -10477,10 +10491,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "g / G",
                 description: "top / follow tail",
-            },
-            HelpEntry {
-                key: "Space C",
-                description: "context ledger (f fork here, w rewind + roll back)",
             },
             HelpEntry {
                 key: "Space p",
@@ -13939,15 +13949,14 @@ mod tests {
     }
 
     #[test]
-    fn opening_the_ledger_sends_a_request_and_closes_with_esc() {
+    fn internal_ledger_view_sends_a_request_and_closes_with_esc() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.views.push(SessionView::new(
             Session::new("s1", "one", "/tmp"),
             Vec::new(),
         ));
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::NONE), &tx);
+        app.open_ledger(&tx);
         assert!(app.ledger.is_some());
         assert!(rx.try_recv().is_ok());
 
@@ -14382,10 +14391,6 @@ mod tests {
         assert_eq!(
             PickerKind::Branches.data_kind(),
             Some(eix_core::KIND_BRANCHES)
-        );
-        assert_eq!(
-            PickerKind::Context.data_kind(),
-            Some(eix_core::KIND_CONTEXT)
         );
         assert!(PickerKind::Sessions.data_kind().is_none());
         assert!(PickerKind::Commands.data_kind().is_none());
@@ -15968,7 +15973,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_git_branch_and_worktree() {
+    fn status_bar_shows_git_branch_without_worktree_badge() {
         let mut app = App::new(None);
         let cwd = std::path::PathBuf::from("/tmp/eix-repo");
         let mut session = Session::new("s1", "one", cwd.clone());
@@ -15983,18 +15988,39 @@ mod tests {
         let workspace = line_text(&workspace);
         assert!(workspace.contains("eix-repo"), "{workspace}");
         assert!(workspace.contains("eix/feat"), "{workspace}");
-        let middle = app.status_bar_middle().expect("middle");
-        let middle = line_text(&middle);
-        assert!(middle.contains("wt:feat"), "{middle}");
+        assert!(
+            app.status_bar_middle().is_none(),
+            "a worktree badge should not occupy the status line"
+        );
 
         // A cached branch for another cwd must not leak into this session.
         app.git_cwd = Some(std::path::PathBuf::from("/tmp/other"));
         let workspace = app.status_bar_workspace().expect("workspace");
         let workspace = line_text(&workspace);
         assert!(!workspace.contains("eix/feat"), "{workspace}");
-        let middle = app.status_bar_middle().expect("middle");
-        let middle = line_text(&middle);
-        assert!(middle.contains("wt:feat"), "{middle}");
+    }
+
+    #[test]
+    fn status_bar_hides_permission_and_merged_noise() {
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.status = "permission: full".into();
+        assert!(app.status_bar_middle().is_none());
+
+        app.integrations.insert(
+            "s1".into(),
+            IntegrationState {
+                session_id: "s1".into(),
+                status: IntegrationStatus::Merged,
+                ..IntegrationState::default()
+            },
+        );
+        app.status = "integration · merged".into();
+        assert!(app.status_bar_middle().is_none());
     }
 
     #[test]
@@ -17198,6 +17224,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn permission_command_opens_a_searchable_picker() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "chat", "/tmp"),
+            Vec::new(),
+        ));
+
+        assert!(app.handle_prompt_command("/permission", &tx));
+        let values = {
+            let picker = app.picker.as_ref().expect("permission picker");
+            assert_eq!(picker.kind, PickerKind::Permissions);
+            picker
+                .items
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(values, ["read-only", "workspace-write", "full"]);
+
+        app.picker.as_mut().expect("picker").query = "full".into();
+        app.picker.as_mut().expect("picker").selected = 0;
+        app.picker_enter(PickerKind::Permissions, &tx);
+        assert!(app.picker.is_none());
+        let mut permission = None;
+        while let Ok(command) = rx.try_recv() {
+            if let Command::SetPermission {
+                permission: level, ..
+            } = command
+            {
+                permission = Some(level);
+            }
+        }
+        assert_eq!(permission, Some(PermissionLevel::Full));
+    }
+
     fn render_text(app: &mut App, width: u16, height: u16) -> String {
         let backend = ratatui::backend::TestBackend::new(width, height);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -17318,22 +17381,24 @@ mod tests {
 
         // No suffix means the default medium, so the first step is high.
         assert_eq!(app.model_header_parts().2.as_deref(), Some("medium"));
-        for (expected, status) in [
-            ("deepseek/deepseek-v4.1-flash#high", "reasoning: high"),
-            ("deepseek/deepseek-v4.1-flash#none", "reasoning: none"),
-            ("deepseek/deepseek-v4.1-flash#low", "reasoning: low"),
-            ("deepseek/deepseek-v4.1-flash", "reasoning: medium"),
-            ("deepseek/deepseek-v4.1-flash#high", "reasoning: high"),
+        app.status = "ready".into();
+        for (expected, variant) in [
+            ("deepseek/deepseek-v4.1-flash#high", "high"),
+            ("deepseek/deepseek-v4.1-flash#low", "low"),
+            ("deepseek/deepseek-v4.1-flash", "medium"),
+            ("deepseek/deepseek-v4.1-flash#high", "high"),
+            ("deepseek/deepseek-v4.1-flash#low", "low"),
         ] {
             app.handle_key(
                 KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
                 &tx,
             );
             assert_eq!(app.views[0].session.model.as_deref(), Some(expected));
-            assert_eq!(app.status, status);
-            if expected.ends_with("#none") {
-                assert_eq!(app.model_header_parts().2, None);
-            }
+            assert_eq!(app.model_header_parts().2.as_deref(), Some(variant));
+            assert_eq!(
+                app.status, "ready",
+                "Ctrl-T must not duplicate the reasoning label"
+            );
             assert!(app.input.text().is_empty());
             match rx.try_recv().expect("set model command") {
                 Command::SetModel { model, .. } => {

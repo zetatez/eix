@@ -40,6 +40,9 @@ pub enum EventKind {
     /// Audit record for a tool permission decision.
     PermissionEvaluated,
     Error,
+    /// A worktree integration lifecycle note. This is transcript metadata, not
+    /// provider chat context.
+    Integration,
 }
 
 impl EventKind {
@@ -67,6 +70,7 @@ impl EventKind {
             Self::Permission => "permission",
             Self::PermissionEvaluated => "permission_evaluated",
             Self::Error => "error",
+            Self::Integration => "integration",
         }
     }
 
@@ -103,6 +107,7 @@ impl std::str::FromStr for EventKind {
             "permission" => Self::Permission,
             "permission_evaluated" => Self::PermissionEvaluated,
             "error" => Self::Error,
+            "integration" => Self::Integration,
             _ => return Err(()),
         })
     }
@@ -463,6 +468,7 @@ mod tests {
             EventKind::Permission,
             EventKind::PermissionEvaluated,
             EventKind::Error,
+            EventKind::Integration,
         ];
         for kind in all {
             assert_eq!(kind.as_str().parse::<EventKind>(), Ok(kind));

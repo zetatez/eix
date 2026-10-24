@@ -1029,7 +1029,12 @@ pub struct ContextConfig {
     pub auto_compact: bool,
     /// Fraction of `budget_tokens` that triggers auto-compaction (0, 1].
     pub auto_compact_threshold: f64,
-    /// Number of newest user turns to keep verbatim.
+    /// Approximate token budget for the newest conversation kept verbatim
+    /// beside the summary. This is the primary retention control, matching
+    /// OpenCode's `compaction.keep.tokens`.
+    pub auto_compact_keep_tokens: usize,
+    /// Minimum number of newest user turns to keep even when their estimated
+    /// token cost exceeds `auto_compact_keep_tokens`.
     pub auto_compact_keep_turns: usize,
     /// Maximum estimated tokens kept for one tool result in provider context.
     /// The full output remains in the event log; older/short results are left
@@ -1049,6 +1054,7 @@ impl Default for ContextConfig {
             workspace_summary: true,
             auto_compact: true,
             auto_compact_threshold: 0.8,
+            auto_compact_keep_tokens: 8_000,
             auto_compact_keep_turns: 2,
             tool_output_tokens: 4_000,
             max_tool_schema_tokens: 12_000,
@@ -2651,6 +2657,14 @@ system_prompt = "custom"
         assert!(runtime.retry_base_ms > 0);
         assert!(runtime.retry_max_secs > 0);
         assert!(runtime.retry_max_secs.saturating_mul(1_000) >= runtime.retry_base_ms);
+    }
+
+    #[test]
+    fn context_compaction_defaults_are_token_first() {
+        let context = ContextConfig::default();
+        assert!(context.auto_compact);
+        assert_eq!(context.auto_compact_keep_tokens, 8_000);
+        assert_eq!(context.auto_compact_keep_turns, 2);
     }
 
     #[test]

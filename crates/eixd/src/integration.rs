@@ -21,27 +21,113 @@ pub struct TestRun {
 /// Pick a test command. `auto` recognizes the common project markers; an
 /// explicit command always wins. An empty result means "no test configured"
 /// and the queue must not merge.
-pub fn test_command(repo: &Path, configured: &str) -> Option<String> {
+///
+/// A repository may keep independent projects in subdirectories (for example
+/// `go/` and `rust/`). When `auto` finds no marker at the worktree root it
+/// prefers the nearest project above `session_cwd`; with no such hint it only
+/// accepts a single nested project. Multiple candidates stay ambiguous so a
+/// wrong test suite is never run silently.
+pub fn test_command(
+    worktree: &Path,
+    session_cwd: Option<&Path>,
+    configured: &str,
+) -> Option<String> {
     let configured = configured.trim();
     if !configured.is_empty() && configured != "auto" {
         return Some(configured.to_string());
     }
-    if repo.join("Cargo.toml").exists() {
+    let root = worktree
+        .canonicalize()
+        .unwrap_or_else(|_| worktree.to_path_buf());
+    if let Some(command) = project_command(&root) {
+        return Some(command);
+    }
+    if let Some(cwd) = session_cwd {
+        let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        if cwd.starts_with(&root) {
+            let mut dir = cwd.as_path();
+            loop {
+                if let Some(command) = project_command(dir) {
+                    return Some(command_in(&root, dir, &command));
+                }
+                if dir == root {
+                    break;
+                }
+                match dir.parent() {
+                    Some(parent) if parent.starts_with(&root) => dir = parent,
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    let mut nested = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&root) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() || ignored_project_dir(&path) {
+                continue;
+            }
+            if let Some(command) = project_command(&path) {
+                nested.push((path, command));
+            }
+        }
+    }
+    nested.sort_by(|a, b| a.0.cmp(&b.0));
+    if nested.len() == 1 {
+        let (dir, command) = &nested[0];
+        return Some(command_in(&root, dir, command));
+    }
+    None
+}
+
+fn project_command(dir: &Path) -> Option<String> {
+    if dir.join("Cargo.toml").exists() {
         return Some("cargo test --workspace".into());
     }
-    if repo.join("package.json").exists() {
+    if dir.join("package.json").exists() {
         return Some("npm test".into());
     }
-    if repo.join("go.mod").exists() {
+    if dir.join("go.mod").exists() {
         return Some("go test ./...".into());
     }
-    if repo.join("pyproject.toml").exists() || repo.join("pytest.ini").exists() {
+    if dir.join("pyproject.toml").exists() || dir.join("pytest.ini").exists() {
         return Some("pytest".into());
     }
-    if repo.join("Makefile").exists() {
+    if dir.join("Makefile").exists() {
         return Some("make test".into());
     }
     None
+}
+
+fn ignored_project_dir(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return true;
+    };
+    name.starts_with('.')
+        || matches!(
+            name,
+            "target" | "node_modules" | "vendor" | "dist" | "build" | "out"
+        )
+}
+
+fn command_in(root: &Path, dir: &Path, command: &str) -> String {
+    if dir == root {
+        return command.to_string();
+    }
+    let relative = dir.strip_prefix(root).unwrap_or(dir);
+    format!("cd -- {} && {command}", shell_quote(relative))
+}
+
+fn shell_quote(path: &Path) -> String {
+    let text = path.to_string_lossy();
+    if text
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.' | '/'))
+    {
+        return text.into_owned();
+    }
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// Run the test command in the worktree with a hard wall-clock limit.
@@ -174,5 +260,60 @@ mod tests {
     #[test]
     fn tail_keeps_the_end() {
         assert_eq!(tail("abcdef", 3), "… (truncated)\ndef");
+    }
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "eix-integration-test-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).unwrap();
+        path
+    }
+
+    #[test]
+    fn auto_detects_nested_project_from_session_cwd() {
+        let root = fixture("nested-cwd");
+        let go = root.join("go");
+        std::fs::create_dir_all(&go).unwrap();
+        std::fs::write(go.join("go.mod"), "module test\n").unwrap();
+
+        assert_eq!(
+            test_command(&root, Some(&go), "auto").as_deref(),
+            Some("cd -- go && go test ./...")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn auto_detects_a_single_nested_project() {
+        let root = fixture("nested-single");
+        let go = root.join("go");
+        std::fs::create_dir_all(&go).unwrap();
+        std::fs::write(go.join("go.mod"), "module test\n").unwrap();
+
+        assert_eq!(
+            test_command(&root, None, "auto").as_deref(),
+            Some("cd -- go && go test ./...")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn ambiguous_nested_projects_need_an_override() {
+        let root = fixture("nested-ambiguous");
+        for (dir, marker) in [("go", "go.mod"), ("rust", "Cargo.toml")] {
+            let path = root.join(dir);
+            std::fs::create_dir_all(&path).unwrap();
+            std::fs::write(path.join(marker), "").unwrap();
+        }
+
+        assert_eq!(test_command(&root, None, "auto"), None);
+        assert_eq!(
+            test_command(&root, None, "cd go && go test ./...").as_deref(),
+            Some("cd go && go test ./...")
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

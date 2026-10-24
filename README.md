@@ -301,7 +301,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `Ctrl-J` | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同） |
 | `Tab` | normal 模式与转录区：在 Build / Plan 模式间切换；Plan 为只读规划，Build 可执行工具 |
 | `Ctrl-G` | session picker：切换聚焦 pane 的 session，右侧实时预览该 session 的最近对话（输入框内外都可用） |
-| `Ctrl-T` | 快速轮换推理强度：low → medium → high → 空 → low（默认 medium，输入框内外都可用） |
+| `Ctrl-T` | 快速轮换推理强度：low → medium → high → low（默认 medium，输入框内外都可用） |
 | `Ctrl-/` | 打开可搜索的模型 picker：输入筛选、`Enter` 切换、`Esc` 关闭（输入框内外都可用；部分终端为 `Ctrl-_` / `Ctrl-7`） |
 | `<Space>o` | session picker：在**新 pane** 中打开（已打开则聚焦该 pane），右侧实时预览最近对话 |
 | `<Space>f` | 文件 picker：搜索 workspace 文件，右侧实时预览文件内容，选中后插入 `@相对路径` |
@@ -325,7 +325,6 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 | `r` | 输入理由并拒绝（Enter 发送，Esc 取消） |
 | `<Space>R` | 跨 session 审批 inbox（`j/k` 选择、`Enter` 跳转、`y/n` 处理、`Esc` 关闭） |
 | `d` | 全屏审阅待审批写入的 side-by-side diff（左旧右新、语法高亮）；有 hunk 时 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/全不选、`y` 应用选中、`n` 拒绝 |
-| `<Space>C` | context ledger：`j/k` 移动、`o` 展开、`p` pin、`d` drop/恢复、`m` 标记、`s` 压缩（单条或 mark 到光标的范围）、`f` fork、`w` rewind 并回滚工作区、`Esc` 关闭 |
 | `<Space>p` | 后台进程：`j/k` 选择、`x` kill、`r` 刷新、`PgUp`/`PgDn` 滚动输出、`Esc` 关闭 |
 | `<Space>F` | fork 当前 session；在 git 仓库里自动建 worktree，仓库外共享工作区 |
 | `:history` / `Ctrl-P` | 打开跨 session 聊天记录搜索：输入 query 回车搜索，`↑/↓` 选择，再回车打开对应 session |
@@ -361,7 +360,6 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
 | `/queue [clear]` | 查看队列；`clear` 清空，`rm N` 删除第 N 条，`move N M` 调整顺序 |
 | `/sessions` | 打开 session picker |
 | `/files` / `/worktrees` / `/branches` | 交互式 picker，选中后插入 `@path` / worktree 路径 / 分支名 |
-| `/context` / `/ledger` | context 条目 picker（右侧预览）/ 打开完整 context ledger |
 | `/history` | 打开全文历史搜索弹窗 |
 | `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
 | `/attention` / `/cancel` / `/toggle-agent` | 跳到下一个需要 attention 的 pane / 取消运行 / 切换 Build·Plan |
@@ -383,7 +381,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
 | `/delete` | 删除当前 session；需要连续执行两次确认 |
 | `/undo` / `/redo` | 隐藏/恢复最近一个 user turn（事件仍在日志里，可通过 redo 恢复） |
 | `/fork [name]` | fork 当前 session（在 git 仓库里自动建 worktree） |
-| `/permission <level>` | 设置工具权限：`read-only` / `workspace-write` / `full` |
+| `/permission` | 弹窗搜索并选择工具权限：`read-only` / `workspace-write` / `full`；也可直接 `/permission <level>` |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
@@ -681,14 +679,27 @@ daemon 的串行队列随后：
    时解析 `origin/HEAD` → `main`/`master`）；
 2. 把 session 分支 rebase 到基分支；
 3. 在 worktree 里运行测试命令（`integration.test=auto` 时识别 Cargo / npm / Go /
-   Python / Make；没有测试命令时不会合并）；
+   Python / Make；也支持 `go/`、`rust/` 这类子目录项目，优先选 session 当前目录所属的
+   项目；多个候选且无法判断时需要在 `[integration.repos."..."]` 里显式配置。没有测试
+   命令时不会合并）；
 4. 确认基分支 SHA 未变化后 `git merge --ff-only`。
 
-失败不会进入硬 blocked 状态：队列用 `retrying` 状态和指数退避继续尝试；冲突或测试
-失败会把错误和输出作为修复 prompt 注入原 session，agent 修复并再次 `eix ready` 即可。
-连续失败达到 `notify_after` 时通知，`pause_after=0`（默认）表示永不暂停；设置为 N 时
-暂停后可用 `eix integrate continue` 继续。`eix integrate status` 查看队列；TUI
-statusline 也会显示 `rebasing / testing / repairing / merged` 等状态。
+失败不会让 session 永久 blocked：瞬时错误用 `retrying` + 指数退避；确定性失败（无测试
+命令、rebase 冲突、测试失败、dirty base、merge 失败）会把错误注入原 session 作为修复
+prompt，agent 可以修复、或通过 `ask_user` 与用户确认，然后再次 `eix ready`。同一错误
+连续 3 次会自动暂停，`pause_after>0` 可更早暂停；暂停后可用 `eix integrate continue`
+继续。连续失败达到 `notify_after` 时通知。`eix integrate status` 查看队列；TUI
+statusline 也会显示 `rebasing / testing / repairing / merged` 等状态。每个阶段还会把实际
+执行的 git / 测试命令和输出（过长时保留尾部）写入 session transcript，错误不会再只停留
+在状态栏。
+
+残留的 rebase 不会再把 worktree 永久卡住：`eix ready`、队列每次尝试、repair watchdog 和
+daemon 重启都会先检查；需要清理时把冲突/暂存内容备份到
+`.git/eix/recovery/<stamp>.patch` / `<stamp>-files/` 并创建 `refs/eix/recovery/<stamp>`，
+然后 abort rebase 继续。agent 在自己的 turn 内调用 `ready` 时，如果还有未解决的冲突或
+暂存修改，仍会收到明确提示，要求先 `git rebase --continue` 或 `git rebase --abort`，避免
+误丢正在处理的冲突；用户手动 `/ready` 则始终可以恢复。`conflict_repair=false` 时，冲突
+rebase 也会先备份并清理再重试。
 
 ```toml
 [worktree]
@@ -966,7 +977,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 
 ### Context ledger
 
-每次请求的上下文由 daemon 从事件日志重建，并按 sector 记账（`eix context` 或 TUI 里按 `<Space>C`）：
+上下文由 daemon 自动维护，不需要用户手动管理。每次请求都会从事件日志重建上下文，并按 sector 记账：
 
 | sector | 内容 | 预算 |
 | --- | --- | --- |
@@ -978,7 +989,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 | memory | 跨 session 记忆 + 当前任务列表（`todo`） | 5% |
 
 - token 是启发式估算：ASCII 约 4 字符/token，CJK 约 1 字符/token，每条消息另加 4 token
-  结构开销；底部显示总量、预算和剩余。
+  结构开销；总预算和裁剪阈值由 `[context]` 配置。
 - `tools` / `history` 超出 sector 预算时，最旧的未 pin 条目会自动标 `cut`；通常保留最新 4 条
   （模型刚拿到的工具输出不会立刻消失）。若 4 条大输出仍超过总预算，会进入 emergency trim：
   保留当前 user 消息和最新工具结果，继续丢弃更旧的历史/工具步骤。`system` / `instructions` /
@@ -986,18 +997,18 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
   agent 行为。
 - 单条工具结果超过 `context.tool_output_tokens`（默认 4000）时只对 provider 视图做
   head/tail 省略，事件日志和 TUI 中的完整输出不受影响。
-- TUI：`j/k` 移动、`o` 展开、`p` pin/unpin、`d` drop/恢复、`m` 标记、`s` 压缩（单条，或从
-  mark 到光标的范围）、`Esc` 关闭。`eix context --drop/--undrop/--pin/--unpin/--compact` 等价。
-- drop / pin / compact 都是事件（`context_dropped` / `context_pinned` /
-  `context_compacted`），重启后重放一致。compact 把一段历史换成一条 summary；原始事件仍在
-  日志里并显示为 `sum`，但不再发给 provider；范围不能与已有 summary 重叠。
+- 上下文操作（裁剪、压缩、pin/drop）由 daemon 作为内部事件维护，重启后重放一致；compact
+  把一段历史换成 summary，原始事件仍保留在日志里但不再发给 provider。
 - workspace summary、instructions 和 memory 在每次重建上下文时重新读取，所以改 `AGENTS.md`
   或切 branch 后下一次请求就会生效。`[context]` 可改预算、指令文件名或关掉 workspace summary。
 - 自动压缩：每轮开始前**以及每个工具批次之后**都会重建 ledger；如果 token 超过
-  `auto_compact_threshold`（默认 0.8），daemon 先把最旧的 turn 总结掉，保留最近
-  `auto_compact_keep_turns` 个 user turn，再发下一次请求。摘要使用固定结构（目标/约束、
-  决策、文件、命令与错误、任务状态、未决问题），并带上当前 todo。摘要失败只记录日志，不会
-  阻塞本轮；事件同样是 `context_compacted`。
+  `auto_compact_threshold`（默认 0.8），daemon 先把最旧的 turn 总结掉。保留窗口优先使用
+  `auto_compact_keep_tokens`（默认约 8000 tokens），并至少保留
+  `auto_compact_keep_turns`（默认 2）个 user turn，裁剪点落在 user turn 边界，避免拆散
+  tool call 和结果。压缩只由上下文压力触发，不按轮数定期执行。
+  摘要使用固定结构（目标/约束、决策和被否方案、文件与改动、命令和错误、任务状态、未决问题），
+  并带上当前 todo；更新时优先保留任务状态、决策和下一步，而不是复述对话。摘要失败只记录日志，
+  不会阻塞本轮，事件同样是 `context_compacted`。
 - provider 返回 context-length / prompt-too-long 类错误时，daemon 会强制压缩并重试当前请求，
   最多两次；第一次优先保留配置的 turn 数（没有可压缩范围时退到 1），第二次只保留 1 个 user
   turn。这比盲目退避更有用。
@@ -1209,7 +1220,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] bubblewrap 沙箱（`run_command` 默认隔离，`[tools] sandbox` 可配，写入只限 workspace）
 - [x] staged shadow workspace（propose → stage → apply、合并读视图、`patch.apply` / `patch.reject`、跨重启恢复）
 - [x] 执行前快照（write_file 单文件 / run_command 整个 workspace，`snapshot` 事件，保留 20 份）
-- [x] context ledger（sector 预算 / token 记账、AGENTS.md + workspace 注入、drop / pin / compact、TUI `C` 与 `eix context`）
+- [x] 自动上下文管理（sector 预算 / token 记账、AGENTS.md + workspace 注入、自动 drop / pin / compact）
 - [x] process view（daemon 托管后台进程、`start_command` / `process_output`、流式输出与日志、TUI `P`、`eix ps/tail/kill`）
 - [x] fork / rewind（按消息裁剪历史复制到新 session；`eix rewind` / ledger `w` 还会按快照倒序回滚工作区，并报告无法恢复的改动）
 - [x] git worktree（新 session 首条 prompt 自动建英文名 `.worktrees/<slug>`、`--shared`、`eix worktree list|remove`）

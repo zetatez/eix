@@ -3244,14 +3244,31 @@ async fn integration_rebases_tests_and_fast_forwards_the_base_branch() -> anyhow
     std::fs::write(dir.join("README.md"), "base\n")?;
     assert!(git(&dir, &["add", "README.md"]).status.success());
     assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+    let remote = root.join("remote.git");
+    assert!(
+        git(&root, &["init", "--bare", "-q", remote.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        git(&dir, &["remote", "add", "origin", remote.to_str().unwrap()])
+            .status
+            .success()
+    );
+    let push = git(&dir, &["push", "-u", "origin", "main"]);
+    assert!(
+        push.status.success(),
+        "git push: {}",
+        String::from_utf8_lossy(&push.stderr)
+    );
     let repo = dir.canonicalize()?;
 
     let mut config = Config::default();
     config.worktree.auto = false;
     config.worktree.base = "main".into();
     config.integration.auto_ready = eix_core::AutoReady::Manual;
-    config.integration.pull_base = false;
-    config.integration.test = "true".into();
+    config.integration.pull_base = true;
+    config.integration.test = "echo unit-tests-passed".into();
     config.integration.timeout_secs = 30;
     let socket = root.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
@@ -3296,7 +3313,338 @@ async fn integration_rebases_tests_and_fast_forwards_the_base_branch() -> anyhow
     );
     assert!(worktree.is_dir());
 
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session.id}))
+        .await?;
+    let notes: Vec<_> = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::Integration)
+        .filter_map(|event| event.payload.get("text").and_then(|text| text.as_str()))
+        .collect();
+    assert!(
+        notes.iter().any(|note| note.contains("queued")),
+        "missing queued note: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.contains("merged")),
+        "missing merged note: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("$ git fetch --prune origin")),
+        "missing fetch command: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("$ git pull --ff-only")),
+        "missing pull command: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.contains("$ git rebase main")),
+        "missing rebase command: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("$ echo unit-tests-passed")
+                && note.contains("unit-tests-passed")),
+        "missing test command/output: {notes:?}"
+    );
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("$ git merge --ff-only")),
+        "missing merge command: {notes:?}"
+    );
+
     daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn ready_recovers_a_stale_rebase_and_records_a_backup() -> anyhow::Result<()> {
+    let root = temp_dir("integration-stale-rebase");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(dir.join("file.txt"), "base\n")?;
+    assert!(git(&dir, &["add", "file.txt"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "base"]).status.success());
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "main".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.conflict_repair = false;
+    config.integration.pause_after = 1;
+    config.integration.test = "true".into();
+    config.integration.timeout_secs = 30;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "stale", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree");
+
+    std::fs::write(worktree.join("file.txt"), "feature\n")?;
+    assert!(git(&worktree, &["add", "file.txt"]).status.success());
+    assert!(git(&worktree, &["commit", "-q", "-m", "feature"])
+        .status
+        .success());
+
+    std::fs::write(dir.join("file.txt"), "main\n")?;
+    assert!(git(&dir, &["add", "file.txt"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "main"]).status.success());
+
+    let rebase = git(&worktree, &["rebase", "main"]);
+    assert!(
+        !rebase.status.success(),
+        "rebase should conflict: {}",
+        String::from_utf8_lossy(&rebase.stderr)
+    );
+    assert!(!git(&worktree, &["ls-files", "-u"]).stdout.is_empty());
+
+    // A user/CLI ready must not be blocked by the stale rebase. It should
+    // preserve it and queue the worktree.
+    let ready: eix_core::IntegrationState = client
+        .request("session.ready", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(ready.status, eix_core::IntegrationStatus::Ready);
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session.id}))
+        .await?;
+    let notes: Vec<_> = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::Integration)
+        .filter_map(|event| event.payload.get("text").and_then(|text| text.as_str()))
+        .collect();
+    assert!(
+        notes
+            .iter()
+            .any(|note| note.contains("integration recovered")),
+        "missing recovery note: {notes:?}"
+    );
+    assert!(
+        notes.iter().any(|note| note.contains("backup:")),
+        "missing recovery backup: {notes:?}"
+    );
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_missing_test_command_hands_off_to_the_agent() -> anyhow::Result<()> {
+    let root = temp_dir("integration-no-test");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(dir.join("README.md"), "base\n")?;
+    assert!(git(&dir, &["add", "README.md"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "main".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.test = "auto".into();
+    config.integration.conflict_repair = true;
+    config.integration.notify_after = 0;
+    config.integration.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "no-test", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+    let worktree = session.worktree.clone().expect("worktree");
+    std::fs::write(worktree.join("change.txt"), "change\n")?;
+
+    let ready: eix_core::IntegrationState = client
+        .request("session.ready", json!({"session_id": session.id}))
+        .await?;
+    assert_eq!(ready.status, eix_core::IntegrationStatus::Ready);
+
+    let mut repairing = None;
+    for _ in 0..60 {
+        let list: eix_core::IntegrationListResult = client
+            .request("integration.list", json!({"session_id": session.id}))
+            .await?;
+        let state = list.integrations.first().expect("integration state");
+        if state.status == eix_core::IntegrationStatus::Repairing {
+            repairing = Some(state.clone());
+            break;
+        }
+        if state.status == eix_core::IntegrationStatus::Retrying {
+            anyhow::bail!(
+                "missing test command should hand off, not retry: {:?}",
+                state.error
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    let repairing = repairing.expect("integration should ask the agent to repair");
+    assert!(
+        repairing
+            .error
+            .as_deref()
+            .unwrap_or_default()
+            .contains("test command"),
+        "unexpected error: {:?}",
+        repairing.error
+    );
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session.id}))
+        .await?;
+    assert!(
+        attached.events.iter().any(|event| {
+            event.kind == EventKind::UserMessage
+                && event
+                    .payload
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .is_some_and(|text| text.contains("no test command configured"))
+        }),
+        "the repair prompt was not injected: {:?}",
+        attached.events
+    );
+    assert!(
+        attached.events.iter().any(|event| {
+            event.kind == EventKind::Integration
+                && event
+                    .payload
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    == Some("repairing")
+        }),
+        "missing repairing note: {:?}",
+        attached.events
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn integration_pending_repair_resumes_when_idle() -> anyhow::Result<()> {
+    let root = temp_dir("integration-resume-repair");
+    let dir = root.join("repo");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(dir.join(".gitignore"), ".worktrees/\n")?;
+    assert!(git(&dir, &["add", ".gitignore"]).status.success());
+    assert!(git(&dir, &["commit", "-q", "-m", "init"]).status.success());
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.worktree.auto = false;
+    config.worktree.base = "main".into();
+    config.integration.auto_ready = eix_core::AutoReady::Manual;
+    config.integration.pull_base = false;
+    config.integration.test = "auto".into();
+    config.integration.conflict_repair = true;
+    config.integration.notify_after = 0;
+    config.integration.timeout_secs = 30;
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    let data = root.join("data");
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data.clone()));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "resume-repair", "cwd": dir, "worktree": true}),
+        )
+        .await?;
+    let session = created.session;
+
+    // Simulate a deterministic failure that arrived while the agent's turn
+    // was still running: the queue records a pending marker instead of
+    // injecting a second turn. The idle scanner must resume it.
+    {
+        let store = eixd::store::Store::open(&data.join("eix.sqlite3"))?;
+        let mut state = store
+            .get_integration(&session.id)?
+            .expect("integration state");
+        state.status = eix_core::IntegrationStatus::Repairing;
+        state.stage = Some("repair pending: test command missing".into());
+        state.error = Some(format!(
+            "no test command configured for {}",
+            session.cwd.display()
+        ));
+        state.updated_at = eix_core::now_ms();
+        store.save_integration(&state)?;
+    }
+
+    let mut saw_prompt = false;
+    for _ in 0..60 {
+        let attached: AttachResult = client
+            .request("session.attach", json!({"session_id": session.id}))
+            .await?;
+        if attached.events.iter().any(|event| {
+            event.kind == EventKind::UserMessage
+                && event
+                    .payload
+                    .get("text")
+                    .and_then(|text| text.as_str())
+                    .is_some_and(|text| text.contains("no test command configured"))
+        }) {
+            saw_prompt = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(saw_prompt, "pending repair prompt was never resumed");
+
+    let list: eix_core::IntegrationListResult = client
+        .request("integration.list", json!({"session_id": session.id}))
+        .await?;
+    let state = list.integrations.first().expect("integration state");
+    assert_eq!(state.status, eix_core::IntegrationStatus::Repairing);
+    assert_eq!(state.stage.as_deref(), Some("test command missing"));
+
+    daemon.abort();
+    mock.abort();
     let _ = tokio::fs::remove_dir_all(&root).await;
     Ok(())
 }
@@ -3366,6 +3714,21 @@ async fn integration_failure_retries_and_continue_requeues() -> anyhow::Result<(
         failed.error.as_deref().unwrap_or_default().contains("test"),
         "unexpected error: {:?}",
         failed.error
+    );
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session.id}))
+        .await?;
+    assert!(
+        attached.events.iter().any(|event| {
+            event.kind == EventKind::Integration
+                && event
+                    .payload
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    == Some("retrying")
+        }),
+        "missing retrying note: {:?}",
+        attached.events
     );
 
     let continued: eix_core::IntegrationState = client

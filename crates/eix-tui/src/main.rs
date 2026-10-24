@@ -2367,6 +2367,11 @@ fn render_events(events: &[Event]) {
                     .unwrap_or("unknown error");
                 println!("error: {message}");
             }
+            EventKind::Integration => {
+                if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
+                    println!("integration> {text}");
+                }
+            }
             EventKind::Snapshot => {
                 if let Ok(payload) =
                     serde_json::from_value::<SnapshotPayload>(event.payload.clone())
@@ -2634,12 +2639,6 @@ COMMANDS:
     status [--json]            daemon and session summary (`--json` for dwmblocks)
     pick [--query Q] [--limit N] [--json]
                                print sessions for rofi/dmenu/fzf (id<TAB>name<TAB>status<TAB>cwd)
-    context [--session ID]     show the context ledger (tokens per sector)
-    context --drop ENTRY       drop an entry (e.g. e12, workspace, instructions:AGENTS.md)
-    context --undrop ENTRY     restore a dropped entry
-    context --pin ENTRY        never auto-trim an entry (--unpin to undo)
-    context --compact FROM:TO [--summary TEXT]
-                               replace a range of history with a summary
     ps [--session ID]          list background processes
     tail PROCESS               print a process's log tail
     kill PROCESS               stop a background process

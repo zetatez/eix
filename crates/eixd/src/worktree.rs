@@ -182,8 +182,9 @@ pub async fn require_base(repo: &Path, base: &str) -> Result<String> {
 
 /// Pull the base branch with `--ff-only` before an integration attempt.
 /// The base worktree must be clean and checked out on that branch.
-pub async fn sync_base(repo: &Path, base: &str) -> Result<String> {
+pub async fn sync_base(repo: &Path, base: &str) -> Result<SyncRun> {
     require_base(repo, base).await?;
+    let mut commands = Vec::new();
     if Command::new("git")
         .args(["remote", "get-url", "origin"])
         .current_dir(repo)
@@ -195,7 +196,7 @@ pub async fn sync_base(repo: &Path, base: &str) -> Result<String> {
         .map(|status| status.success())
         .unwrap_or(false)
     {
-        run_git(repo, &["fetch", "--prune", "origin"]).await?;
+        run_git_logged(repo, &["fetch", "--prune", "origin"], &mut commands).await?;
         // Prefer the configured upstream. Repositories that only have a remote
         // but no tracking branch still integrate against origin/<base>.
         let upstream = git_stdout(
@@ -205,12 +206,16 @@ pub async fn sync_base(repo: &Path, base: &str) -> Result<String> {
         .await
         .unwrap_or_default();
         if !upstream.trim().is_empty() {
-            run_git(repo, &["pull", "--ff-only"]).await?;
+            run_git_logged(repo, &["pull", "--ff-only"], &mut commands).await?;
         } else if ref_exists(repo, &format!("refs/remotes/origin/{base}")).await {
-            run_git(repo, &["merge", "--ff-only", &format!("origin/{base}")]).await?;
+            let target = format!("origin/{base}");
+            run_git_logged(repo, &["merge", "--ff-only", &target], &mut commands).await?;
         }
     }
-    head(repo).await
+    Ok(SyncRun {
+        head: head(repo).await?,
+        commands,
+    })
 }
 
 /// Rebase a worktree branch onto `base`. Returns git's combined output even
@@ -230,13 +235,13 @@ pub async fn continue_rebase(worktree: &Path) -> Result<CommandOutput> {
 }
 
 /// Fast-forward the base branch to `branch`.
-pub async fn merge_ff(base_worktree: &Path, branch: &str) -> Result<()> {
-    run_git(base_worktree, &["merge", "--ff-only", branch]).await
+pub async fn merge_ff(base_worktree: &Path, branch: &str) -> Result<CommandLog> {
+    run_git_log(base_worktree, &["merge", "--ff-only", branch]).await
 }
 
 /// Push the base branch after a local fast-forward. Never forces.
-pub async fn push_base(base_worktree: &Path, base: &str) -> Result<()> {
-    run_git(base_worktree, &["push", "origin", base]).await
+pub async fn push_base(base_worktree: &Path, base: &str) -> Result<CommandLog> {
+    run_git_log(base_worktree, &["push", "origin", base]).await
 }
 
 pub async fn is_clean(path: &Path) -> Result<bool> {
@@ -272,6 +277,184 @@ pub async fn in_rebase(path: &Path) -> bool {
         }
     }
     false
+}
+
+/// Whether the in-progress rebase has tracked work that would be lost by
+/// aborting: unresolved conflicts, staged resolutions, or unstaged edits.
+/// Untracked files survive `git rebase --abort` and are intentionally ignored.
+pub async fn rebase_has_work(worktree: &Path) -> bool {
+    match git_stdout(worktree, &["status", "--porcelain", "--untracked-files=no"]).await {
+        Some(status) => !status.trim().is_empty(),
+        None => true,
+    }
+}
+
+/// Clear a stale rebase so integration can continue. Always preserves a
+/// recovery point: metadata, a patch and copies of changed files under the
+/// worktree's git dir, plus a `refs/eix/recovery/<stamp>` ref.
+pub async fn recover_rebase(worktree: &Path) -> Result<Option<RebaseRecovery>> {
+    if !in_rebase(worktree).await {
+        return Ok(None);
+    }
+
+    let head_name = read_rebase_meta(worktree, "head-name").await;
+    let branch = match head_name
+        .as_deref()
+        .and_then(|name| name.strip_prefix("refs/heads/"))
+    {
+        Some(name) => Some(name.to_string()),
+        None => branch(worktree).await,
+    };
+    let head = head(worktree).await.unwrap_or_default();
+    let orig_head = match read_rebase_meta(worktree, "orig-head").await {
+        Some(value) => Some(value),
+        None => git_stdout(worktree, &["rev-parse", "--verify", "--quiet", "ORIG_HEAD"])
+            .await
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    };
+    let onto = read_rebase_meta(worktree, "onto").await;
+    let conflicts = conflict_files(worktree).await;
+    let staged = name_only(worktree, &["diff", "--cached", "--name-only"]).await;
+    let unstaged = name_only(worktree, &["diff", "--name-only"]).await;
+    let untracked = name_only(worktree, &["ls-files", "--others", "--exclude-standard"]).await;
+    let had_work = !conflicts.is_empty() || !staged.is_empty() || !unstaged.is_empty();
+
+    let stamp = recovery_stamp();
+    // The common git dir survives worktree removal, so backups from linked
+    // worktrees all live under the main repository's `.git/eix/recovery`.
+    let backup_dir = git_common_dir(worktree)
+        .await
+        .map(|dir| dir.join("eix").join("recovery"))
+        .unwrap_or_else(|| worktree.join(".git").join("eix").join("recovery"));
+    std::fs::create_dir_all(&backup_dir)
+        .with_context(|| format!("cannot create {}", backup_dir.display()))?;
+
+    // Patches are convenient; file copies below are the fallback for binary
+    // files and conflict markers that a diff cannot represent cleanly.
+    let mut patch_text = String::new();
+    for (label, args) in [
+        (
+            "staged",
+            &["diff", "--cached", "--binary", "--no-color"][..],
+        ),
+        ("worktree", &["diff", "--binary", "--no-color"][..]),
+    ] {
+        if let Ok(output) = run_git_capture(worktree, args).await {
+            if !output.stdout.trim().is_empty() {
+                patch_text.push_str(&format!("# {label}\n"));
+                patch_text.push_str(&output.stdout);
+                if !patch_text.ends_with('\n') {
+                    patch_text.push('\n');
+                }
+            }
+        }
+    }
+    let backup_patch = if patch_text.trim().is_empty() {
+        None
+    } else {
+        let path = backup_dir.join(format!("{stamp}.patch"));
+        std::fs::write(&path, patch_text)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        Some(path)
+    };
+
+    let files_dir = backup_dir.join(format!("{stamp}-files"));
+    let mut copied = 0usize;
+    // Untracked files survive an abort, so they are listed in the metadata
+    // but not copied. Copying an untracked build directory would be costly.
+    for name in conflicts.iter().chain(staged.iter()).chain(unstaged.iter()) {
+        let Some(relative) = safe_relative_path(name) else {
+            continue;
+        };
+        let source = worktree.join(&relative);
+        if !source.is_file() {
+            continue;
+        }
+        let target = files_dir.join(&relative);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        std::fs::copy(&source, &target)
+            .with_context(|| format!("cannot back up {}", source.display()))?;
+        copied += 1;
+    }
+
+    let backup_ref = if head.is_empty() {
+        None
+    } else {
+        let refname = format!("refs/eix/recovery/{stamp}");
+        match run_git_capture(worktree, &["update-ref", &refname, &head]).await {
+            Ok(output) if output.success => Some(refname),
+            _ => None,
+        }
+    };
+    let backup_files = (copied > 0).then_some(files_dir);
+
+    let metadata_path = backup_dir.join(format!("{stamp}.txt"));
+    let metadata = recovery_metadata(
+        worktree,
+        branch.as_deref(),
+        &head,
+        orig_head.as_deref(),
+        onto.as_deref(),
+        &conflicts,
+        &staged,
+        &unstaged,
+        &untracked,
+        backup_patch.as_deref(),
+        backup_files.as_deref(),
+        backup_ref.as_deref(),
+        copied,
+    );
+    std::fs::write(&metadata_path, metadata)
+        .with_context(|| format!("cannot write {}", metadata_path.display()))?;
+
+    let abort = run_git_capture(worktree, &["rebase", "--abort"]).await?;
+    if !abort.success {
+        // `--abort` normally restores the branch. If the metadata is too
+        // damaged for it, `--quit` at least removes the rebase state; restore
+        // the branch explicitly afterwards.
+        let quit = run_git_capture(worktree, &["rebase", "--quit"]).await?;
+        if !quit.success {
+            bail!(
+                "cannot abort rebase in {}: {} (backup: {})",
+                worktree.display(),
+                abort.combined(),
+                backup_dir.display()
+            );
+        }
+        if let Some(branch) = branch.as_deref() {
+            let _ = run_git(worktree, &["checkout", "-f", branch]).await;
+        } else if let Some(orig) = orig_head.as_deref() {
+            let _ = run_git(worktree, &["checkout", "-f", "--detach", orig]).await;
+        }
+    }
+    if in_rebase(worktree).await {
+        bail!(
+            "rebase metadata is still present after recovery in {} (backup: {})",
+            worktree.display(),
+            backup_dir.display()
+        );
+    }
+
+    Ok(Some(RebaseRecovery {
+        worktree: worktree.to_path_buf(),
+        branch,
+        head,
+        orig_head,
+        onto,
+        conflicts,
+        staged,
+        unstaged,
+        untracked,
+        backup_dir,
+        backup_patch,
+        backup_files,
+        backup_ref,
+        had_work,
+    }))
 }
 
 pub async fn conflict_files(path: &Path) -> Vec<String> {
@@ -315,12 +498,64 @@ impl CommandOutput {
     }
 }
 
+/// A command and its combined output, kept for the integration transcript.
+#[derive(Debug, Clone)]
+pub struct CommandLog {
+    pub command: String,
+    pub output: String,
+}
+
+/// Result of syncing the base branch, including the commands that ran.
+#[derive(Debug, Clone)]
+pub struct SyncRun {
+    pub head: String,
+    pub commands: Vec<CommandLog>,
+}
+
+/// A stale rebase that was backed up and removed so integration can continue.
+///
+/// `backup_dir` always contains a metadata file; when there were tracked
+/// changes it also contains a binary patch and copies of the changed files.
+/// `backup_ref` points at the pre-abort HEAD, which may be an intermediate
+/// rebase commit.
+#[derive(Debug, Clone)]
+pub struct RebaseRecovery {
+    pub worktree: PathBuf,
+    pub branch: Option<String>,
+    pub head: String,
+    pub orig_head: Option<String>,
+    pub onto: Option<String>,
+    pub conflicts: Vec<String>,
+    pub staged: Vec<String>,
+    pub unstaged: Vec<String>,
+    pub untracked: Vec<String>,
+    pub backup_dir: PathBuf,
+    pub backup_patch: Option<PathBuf>,
+    pub backup_files: Option<PathBuf>,
+    pub backup_ref: Option<String>,
+    pub had_work: bool,
+}
+
 async fn run_git(dir: &Path, args: &[&str]) -> Result<()> {
-    let output = run_git_capture(dir, args).await?;
-    if !output.success {
-        bail!("git {} failed: {}", args.join(" "), output.combined());
-    }
+    run_git_log(dir, args).await?;
     Ok(())
+}
+
+async fn run_git_logged(dir: &Path, args: &[&str], logs: &mut Vec<CommandLog>) -> Result<()> {
+    logs.push(run_git_log(dir, args).await?);
+    Ok(())
+}
+
+async fn run_git_log(dir: &Path, args: &[&str]) -> Result<CommandLog> {
+    let output = run_git_capture(dir, args).await?;
+    let command = format!("git {}", args.join(" "));
+    if !output.success {
+        bail!("{command} failed: {}", output.combined());
+    }
+    Ok(CommandLog {
+        command,
+        output: output.combined(),
+    })
 }
 
 async fn run_git_capture(dir: &Path, args: &[&str]) -> Result<CommandOutput> {
@@ -352,6 +587,127 @@ async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+async fn git_path(dir: &Path, name: &str) -> Option<PathBuf> {
+    let raw = git_stdout(dir, &["rev-parse", "--git-path", name]).await?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = Path::new(raw);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        dir.join(path)
+    })
+}
+
+async fn git_common_dir(dir: &Path) -> Option<PathBuf> {
+    let raw = git_stdout(dir, &["rev-parse", "--git-common-dir"]).await?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = Path::new(raw);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        dir.join(path)
+    })
+}
+
+async fn read_rebase_meta(worktree: &Path, name: &str) -> Option<String> {
+    for kind in ["rebase-merge", "rebase-apply"] {
+        let Some(path) = git_path(worktree, &format!("{kind}/{name}")).await else {
+            continue;
+        };
+        if let Ok(text) = std::fs::read_to_string(path) {
+            let text = text.trim();
+            if !text.is_empty() {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+async fn name_only(dir: &Path, args: &[&str]) -> Vec<String> {
+    git_stdout(dir, args)
+        .await
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn safe_relative_path(name: &str) -> Option<PathBuf> {
+    let path = Path::new(name);
+    if path.is_absolute()
+        || !path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::Normal(_) | std::path::Component::CurDir
+            )
+        })
+    {
+        return None;
+    }
+    Some(path.to_path_buf())
+}
+
+fn recovery_stamp() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    format!("{nanos}-{}", std::process::id())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_metadata(
+    worktree: &Path,
+    branch: Option<&str>,
+    head: &str,
+    orig_head: Option<&str>,
+    onto: Option<&str>,
+    conflicts: &[String],
+    staged: &[String],
+    unstaged: &[String],
+    untracked: &[String],
+    backup_patch: Option<&Path>,
+    backup_files: Option<&Path>,
+    backup_ref: Option<&str>,
+    copied_files: usize,
+) -> String {
+    let list = |items: &[String]| {
+        if items.is_empty() {
+            "(none)".to_string()
+        } else {
+            items.join(", ")
+        }
+    };
+    format!(
+        "worktree: {}\nbranch: {}\nHEAD: {}\norig-head: {}\nonto: {}\nconflicts: {}\nstaged: {}\nunstaged: {}\nuntracked: {}\nbackup-patch: {}\nbackup-files: {}\nbackup-ref: {}\nbacked-up-files: {copied_files}\n",
+        worktree.display(),
+        branch.unwrap_or("(detached)"),
+        head,
+        orig_head.unwrap_or("(unknown)"),
+        onto.unwrap_or("(unknown)"),
+        list(conflicts),
+        list(staged),
+        list(unstaged),
+        list(untracked),
+        backup_patch
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+        backup_files
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "(none)".to_string()),
+        backup_ref.unwrap_or("(none)"),
+    )
 }
 
 /// Remove one worktree. Without `force` git refuses when the worktree has
@@ -486,7 +842,8 @@ fn slug(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::slug;
+    use super::{in_rebase, is_clean, rebase_has_work, recover_rebase, slug};
+    use std::path::Path;
 
     #[test]
     fn slugs_are_safe_branch_names() {
@@ -494,5 +851,137 @@ mod tests {
         assert_eq!(slug("Feature/Login"), "feature-login");
         assert_eq!(slug("../../etc"), "etc");
         assert_eq!(slug("中文"), "session");
+    }
+
+    fn git(dir: &Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(["-c", "user.email=eix@example.com", "-c", "user.name=eix"])
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .expect("run git")
+    }
+
+    fn git_env(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> std::process::Output {
+        let mut command = std::process::Command::new("git");
+        command
+            .args(["-c", "user.email=eix@example.com", "-c", "user.name=eix"])
+            .args(args)
+            .current_dir(dir);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("run git")
+    }
+
+    #[tokio::test]
+    async fn recovers_a_conflicted_rebase_with_a_backup() -> anyhow::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("eix-recovery-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+
+        assert!(git(&root, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(root.join("file.txt"), "base\n")?;
+        assert!(git(&root, &["add", "file.txt"]).status.success());
+        assert!(git(&root, &["commit", "-q", "-m", "base"]).status.success());
+
+        assert!(git(&root, &["checkout", "-q", "-b", "feature"])
+            .status
+            .success());
+        std::fs::write(root.join("file.txt"), "feature\n")?;
+        assert!(git(&root, &["add", "file.txt"]).status.success());
+        assert!(git(&root, &["commit", "-q", "-m", "feature"])
+            .status
+            .success());
+
+        assert!(git(&root, &["checkout", "-q", "main"]).status.success());
+        std::fs::write(root.join("file.txt"), "main\n")?;
+        assert!(git(&root, &["add", "file.txt"]).status.success());
+        assert!(git(&root, &["commit", "-q", "-m", "main"]).status.success());
+        assert!(git(&root, &["checkout", "-q", "feature"]).status.success());
+
+        let rebase = git(&root, &["rebase", "main"]);
+        assert!(
+            !rebase.status.success(),
+            "rebase should conflict: {}",
+            String::from_utf8_lossy(&rebase.stderr)
+        );
+        assert!(in_rebase(&root).await);
+        assert!(rebase_has_work(&root).await);
+
+        let recovery = recover_rebase(&root)
+            .await?
+            .expect("recovery should run for an in-progress rebase");
+        assert!(recovery.had_work);
+        assert!(recovery.conflicts.iter().any(|file| file == "file.txt"));
+        assert!(recovery.backup_dir.is_dir());
+        assert!(std::fs::read_dir(&recovery.backup_dir)?.next().is_some());
+        let backup_ref = recovery.backup_ref.as_deref().expect("backup ref");
+        assert!(git(&root, &["rev-parse", "--verify", backup_ref])
+            .status
+            .success());
+        assert!(!in_rebase(&root).await);
+        assert!(is_clean(&root).await?);
+        assert_eq!(std::fs::read_to_string(root.join("file.txt"))?, "feature\n");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recovers_an_edit_stopped_rebase_without_work() -> anyhow::Result<()> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("eix-recovery-edit-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+
+        assert!(git(&root, &["init", "-q", "-b", "main"]).status.success());
+        std::fs::write(root.join("file.txt"), "base\n")?;
+        assert!(git(&root, &["add", "file.txt"]).status.success());
+        assert!(git(&root, &["commit", "-q", "-m", "base"]).status.success());
+        assert!(git(&root, &["checkout", "-q", "-b", "feature"])
+            .status
+            .success());
+        std::fs::write(root.join("file.txt"), "feature\n")?;
+        assert!(git(&root, &["add", "file.txt"]).status.success());
+        assert!(git(&root, &["commit", "-q", "-m", "feature"])
+            .status
+            .success());
+
+        let rebase = git_env(
+            &root,
+            &["rebase", "-i", "main"],
+            &[
+                ("GIT_SEQUENCE_EDITOR", "sed -i '1s/^pick /edit /'"),
+                ("GIT_EDITOR", "true"),
+            ],
+        );
+        assert!(
+            in_rebase(&root).await,
+            "rebase should stop at edit: {}",
+            String::from_utf8_lossy(&rebase.stderr)
+        );
+        assert!(!rebase_has_work(&root).await);
+
+        let recovery = recover_rebase(&root)
+            .await?
+            .expect("recovery should clear an edit-stopped rebase");
+        assert!(!recovery.had_work);
+        assert!(recovery.backup_patch.is_none());
+        assert!(recovery.backup_files.is_none());
+        assert!(recovery.backup_dir.is_dir());
+        assert!(!in_rebase(&root).await);
+        assert!(is_clean(&root).await?);
+        assert_eq!(std::fs::read_to_string(root.join("file.txt"))?, "feature\n");
+
+        let _ = std::fs::remove_dir_all(&root);
+        Ok(())
     }
 }
