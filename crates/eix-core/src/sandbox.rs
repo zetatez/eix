@@ -85,6 +85,25 @@ pub fn bwrap_args(
             args.push(path.as_os_str().to_owned());
         }
     }
+    // Tool caches are often mounted read-only (`~/.cache`), but Go, npm and
+    // friends abort when they cannot open their build cache for writing. Give
+    // them a persistent writable cache below the eix data cache instead of
+    // forcing the agent to discover `GOCACHE=...` through trial and error.
+    if let Some(cache) = home
+        .as_ref()
+        .map(|home| home.join(".cache/eix/sandbox"))
+        .filter(|cache| std::fs::create_dir_all(cache).is_ok())
+    {
+        args.push("--bind".into());
+        args.push(cache.as_os_str().to_owned());
+        args.push(cache.as_os_str().to_owned());
+        args.push("--setenv".into());
+        args.push("XDG_CACHE_HOME".into());
+        args.push(cache.as_os_str().to_owned());
+        args.push("--setenv".into());
+        args.push("GOCACHE".into());
+        args.push(cache.join("go-build").into_os_string());
+    }
     if !network {
         args.push("--unshare-net".into());
     }
@@ -175,6 +194,29 @@ mod tests {
         );
         assert!(!args.iter().any(|arg| arg == "--unshare-net"), "{args:?}");
         assert!(args.iter().any(|arg| arg == "--die-with-parent"));
+    }
+
+    #[test]
+    fn gives_build_tools_a_writable_cache() {
+        if home_dir().is_none() {
+            return;
+        }
+        let args = text(&bwrap_args(
+            Path::new("/w"),
+            Path::new("/w"),
+            true,
+            &[],
+            &[],
+        ));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["--setenv", "XDG_CACHE_HOME"]),
+            "{args:?}"
+        );
+        assert!(
+            args.windows(2).any(|pair| pair == ["--setenv", "GOCACHE"]),
+            "{args:?}"
+        );
     }
 
     #[test]

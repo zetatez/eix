@@ -513,9 +513,10 @@ impl Daemon {
             let name = self.generate_worktree_name(&session, text).await;
             let created =
                 crate::worktree::create_from_base(&session.cwd, &name, Some(&base)).await?;
+            let cwd = worktree_session_cwd(&repo, &session.cwd, &created.path);
             let updated = self
                 .store
-                .set_session_cwd(&session.id, &created.path, Some(&created.path))?
+                .set_session_cwd(&session.id, &cwd, Some(&created.path))?
                 .ok_or_else(|| rpc("not_found", format!("unknown session {}", session.id)))?;
             let state = self
                 .store
@@ -6703,6 +6704,19 @@ fn default_name(cwd: &Path) -> String {
         .to_string()
 }
 
+/// Keep a session in the same subdirectory when its auto-worktree is created.
+/// Starting in `repo/go` must not silently move the agent to the repository
+/// root, otherwise it loses the language/tooling context the user already had.
+fn worktree_session_cwd(repo: &Path, original: &Path, worktree: &Path) -> PathBuf {
+    original
+        .strip_prefix(repo)
+        .ok()
+        .filter(|relative| !relative.as_os_str().is_empty())
+        .map(|relative| worktree.join(relative))
+        .filter(|path| path.is_dir())
+        .unwrap_or_else(|| worktree.to_path_buf())
+}
+
 fn needs_auto_name(session: &Session) -> bool {
     let name = session.name.trim();
     name.is_empty() || name == "session" || name == default_name(&session.cwd)
@@ -7083,8 +7097,12 @@ fn system_prompt(config: &Config, session: &Session, permission: PermissionLevel
             "You are eix, a coding agent in the user's terminal. Work inside `{}`.\n\
              Be concise, concrete, and honest. If you are unsure, inspect the workspace or ask.\n\
              Do not claim to have run commands or changed files unless you actually did.\n\
-             For multi-step work, keep a short task list with the `todo` tool and update it as \
-             work progresses. Inspect the relevant code before editing, make the smallest \
+             Infer the language and toolchain from the session cwd and nearby files; do not ask \
+             which language to use when the working directory already makes it clear.\n\
+             For small, self-contained tasks, skip the task list and repository/git metadata \
+             checks: implement directly, run one focused verification, and state assumptions.\n\
+             For larger multi-step work, keep a short task list with the `todo` tool and update \
+             it as work progresses. Inspect the relevant code before editing, make the smallest \
              coherent change, and verify it with focused tests or builds. When a tool fails, \
              read the error and adjust instead of repeating the same call. Use `memory` only for \
              durable workspace facts that will help future sessions.{permission_note}",
@@ -7168,6 +7186,33 @@ mod tests {
     fn default_names_fall_back_to_session() {
         assert_eq!(default_name(Path::new("/")), "session");
         assert_eq!(default_name(Path::new("/home/me/eix")), "eix");
+    }
+
+    #[test]
+    fn auto_worktree_keeps_the_original_subdirectory() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let base =
+            std::env::temp_dir().join(format!("eix-worktree-cwd-{}-{stamp}", std::process::id()));
+        let repo = base.join("repo");
+        let subdir = repo.join("go");
+        let worktree = base.join("worktree");
+        std::fs::create_dir_all(worktree.join("go")).unwrap();
+        std::fs::create_dir_all(&subdir).unwrap();
+
+        assert_eq!(
+            worktree_session_cwd(&repo, &subdir, &worktree),
+            worktree.join("go")
+        );
+        assert_eq!(worktree_session_cwd(&repo, &repo, &worktree), worktree);
+        assert_eq!(
+            worktree_session_cwd(&repo, &repo.join("missing"), &worktree),
+            worktree
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
