@@ -44,6 +44,11 @@ echo 'review the diff' | ./target/debug/eix send
 指定 `--session` 时，会优先 attach 当前目录最近更新的 user session，当前目录没有 session
 则新建一个。`eix log` 等只读子命令找不到当前目录 session 时仍回退到最近 session。
 
+TUI 会按工作目录记住上次退出时仍打开的 pane：`Ctrl-C` / `Ctrl-D` / `Z` / `/quit` /
+`/exit` 退出时保存 pane 顺序和焦点，下次在同一目录启动时依次恢复；`:q` / `:qa` /
+`:wq` / `:x`（以及最后一个 pane 的 `/close`）会关闭 pane，不保存为活跃状态。没有可恢复的
+pane 时，仍回退到该目录最近更新的 user session。显式 `eix tui --session ID` 会忽略保存的 pane。
+
 未手动命名的 session 在前两轮对话完成后，daemon 会让模型总结这段对话并生成一个短标题；
 标题保留 Unicode 字母/数字和英文词之间的单个空格，最多 32 个字符（含空格），去掉其他标点；
 然后通过 `session.updated` 更新 TUI pane 标题和 tab。手动 `eix rename` / TUI 重命名会阻止
@@ -225,8 +230,10 @@ stage 到 shadow workspace 的审核模式。高风险/forced ask 写入、外�
 running 状态使用田字方块旋转动画（`◰ ◳ ◲ ◱`），完成/空闲使用静态 `⠶`），
 右侧靠右显示 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及
 pane/队列/attention 计数在空间允许时显示在中部或右侧，变窄时优先保留 cwd/branch。
-只有没有其他 UI 反馈的失败、后台 attention 和复制确认会以右上角浮动通知显示（最多 3 条；
-失败约 4 秒，attention 约 8 秒，复制约 2 秒）；命令成功反馈、进度和 picker/弹窗内容不再重复通知。
+只有没有其他 UI 反馈的失败、后台 attention、复制确认、布局切换和 `/reload` 完成会以右上角
+单条浮动通知显示（不堆叠；当前通知至少保留其时长，期间的新消息只保留最新一条等待替换；
+失败约 4 秒，attention 约 8 秒，复制 / 布局 / `/reload` 约 2 秒）；除 `/reload` 外，命令成功
+反馈、进度和 picker/弹窗内容不再重复通知。
 终端高度足够时，statusline 下方常驻一行空白命令行；normal 模式按 `:` 激活并显示 `:` 前缀：
 `Enter` 执行；`Esc` 先收起命令菜单并保留已输入内容，再按一次关闭命令行；`↑`/`↓` 浏览历史，`Tab` 显示匹配命令并补全首个命令；菜单打开后
 `Ctrl-J`/`Ctrl-K` 或 `Ctrl-N`/`Ctrl-P` 上下选择匹配项，`Enter` 执行选中项；它接受与 `/命令` 相同的名字，并支持 `:q`（关闭 pane）、
@@ -263,8 +270,8 @@ turn 完成或等待审批/输入都不会移动它。session 视作双向链表
 `Enter` 选择、`Esc` 关闭。输入框只保留正文和边框；下方 statusline 左侧按
 `N/I/V/VL · Plan/Build/Auto/Bypass · 状态 · 模型 · provider · reasoning` 排列，右侧靠右显示
 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及 pane/队列/attention
-计数在空间允许时出现在中部或右侧。只有没有其他可见反馈的失败、后台 attention 和复制确认
-显示在右上角浮动通知中，不会挤动 statusline。
+计数在空间允许时出现在中部或右侧。只有没有其他可见反馈的失败、后台 attention、复制确认
+和 `/reload` 完成显示在右上角浮动通知中，不会挤动 statusline。
 
 转录区按对话渲染：用户消息右对齐并包在圆角气泡框中，agent 输出左对齐（保留 2 空格缩进）；消息正文仍使用普通文本、不加角色前缀；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
@@ -298,6 +305,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Shift+,` / `Shift+.` | 转录区 / 输入框 normal：上一个 / 下一个 pane（实际按键 `<` / `>`） |
  | `Ctrl-W` `Ctrl-W`     | 转录区 / 输入框 normal：1 秒内连按两次聚焦下一个 pane              |
  | `Z`                   | normal 模式退出                                                    |
+ | `q`                   | normal 模式关闭当前 pane（最后一个 pane 保持打开）                  |
  | `Ctrl-C` / `Ctrl-D`   | 任意模式退出（先保存草稿）                                         |
  | `Esc Esc`             | normal 模式：中断运行中的 turn，或进入转录区                       |
 
@@ -449,7 +457,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
  | `/ready`                                   | 把当前 worktree 交给 daemon 做 rebase / 测试 / ff merge                                                                                                                      |
  | `/integrate`                               | 显示当前 session 的集成队列状态与最近错误                                                                                                                                    |
  | `/clear`                                   | 清空模型上下文（更早的 turn 仍留在转录和事件日志里，只是不再发给模型）                                                                                                       |
- | `/compact [notes]`                         | 让模型总结当前上下文，用摘要替换历史；`notes` 直接作为摘要文本                                                                                                               |
+ | `/compact [notes]`                         | 让模型总结当前上下文，用摘要替换历史；生成的 summary 会显示在对话中，`notes` 直接作为摘要文本                                                                                 |
  | `/btw <question>`                          | 用一次性上下文回答旁支问题；不写入事件日志，也不进入主对话；`Esc` 关闭                                                                                                       |
  | `/cd [path]`                               | 切换当前 session 的 cwd（支持 `~` 和相对路径）；省略时显示当前路径                                                                                                           |
  | `/init`                                    | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送                                                                                                                 |
@@ -458,13 +466,12 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
  | `/files`                                   | 文件 picker，选中后插入 `@path`                                                                                                                                              |
  | `/git`                                     | git picker：worktrees + branches，选中后插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用）                                                                  |
  | `/processes` / `/approvals`                | 背景进程列表 / 审批收件箱                                                                                                                                                    |
- | `/attention` / `/cancel` / `/toggle-mode` | 跳到下一个需要 attention 的 pane / 取消运行 / 正向循环执行模式                                                                                                                |
+ | `/attention` / `/cancel`                   | 跳到下一个需要 attention 的 pane / 取消运行                                                                                                                                    |
  | `/model [id]`                              | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `providers.*` 自动拉取的 `/models` 和 `models:`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
  | `/agents [name]`                           | 选择当前 session 的 primary agent；`build` / `plan` 是内置的                                                                                                                 |
  | `/subagents [n]`                           | 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 4，可选 2/4/8/16/32/64/128/256）；不带参数打开 picker（仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值）           |
  | `/mcp`                                     | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误）                                                                                                            |
- | `/commands`                                | 从磁盘重新加载自定义 Markdown 命令                                                                                                                                           |
- | `/reload`                                  | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC）                                                                                                                     |
+ | `/reload`                                  | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC），并重新加载自定义 Markdown 命令                                                                                     |
  | `/colorscheme`                             | 打开 colorscheme picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原配色                                                                         |
  | `/skills [name] [args]`                    | 打开 skill picker（右侧预览正文）；带名字时把正文放进输入框并展开 `$ARGUMENTS` / `$1..$9`                                                                                    |
  | `/todos`                                   | 打开任务列表 picker（搜索任务，显示状态和详情；内存态，daemon 重启后清空）                                                                                                   |
@@ -563,6 +570,9 @@ $PI_CODING_AGENT_DIR/prompts/*.md     # pi
 ~/.gemini/agents/*.md                # gemini_cli
 <project>/.gemini/agents/*.md
 ```
+
+自定义命令在启动时自动加载一次；修改或新增命令文件后执行 `/reload` 重新加载，不会在每次
+打开命令菜单时扫描磁盘。
 
 命令本质上就是提示词模板：`~/.config/eix/cmds/review.md` 会出现在 `/` 命令菜单里，输入
 `/review <args>` 即展开模板并发送到当前 session。frontmatter 支持 `description`、`agent`、`model`；正文是模板，支持
@@ -664,9 +674,10 @@ files / git / worktrees / branches / context 由 daemon 的 `picker.query` 提�
 长草稿最多 10 行内容 / 12 行总高）；底边保持普通边框，输入框下方一行 statusline 左侧按
 `N/I/V/VL · Plan/Build/Auto/Bypass · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及 pane/排队/attention
-计数在空间允许时显示在中部或右侧；只有没有其他可见反馈的失败、后台 attention 和复制确认
-显示在右上角浮动通知中（失败约 4 秒，attention 约 8 秒，复制约 2 秒，最多堆叠 3 条），
-不会挤动 statusline；
+计数在空间允许时显示在中部或右侧；只有没有其他可见反馈的失败、后台 attention、复制确认、
+布局切换和 `/reload` 完成显示在右上角单条浮动通知中（失败约 4 秒，attention 约 8 秒，
+复制 / 布局 / `/reload` 约 2 秒；不堆叠，当前通知至少保留其时长，期间只保留最新一条等待
+替换），不会挤动 statusline；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
@@ -687,8 +698,8 @@ TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **lea
 （`<Space>c` 关闭当前 pane）、`<Space>f` 文件、
 `<Space>g` git（worktrees + branches）、
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>m` 完整执行模式、
-`Ctrl-P` 命令面板。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
-除此之外，裸字母 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
+`Ctrl-P` 命令面板。normal 模式下裸 `q` 关闭当前 pane（最后一个 pane 保持打开），
+裸 `Z`（`Shift+Z`）退出 eix；除此之外，裸字母 `o`/`p`/`n` 等不再触发任何 TUI 动作。
 
 新建 session 后如果既没有提交内容、也没有保留草稿就退出，空 session 会从历史列表删除；
 有草稿的 session 会保留。worktree session 不自动删除，避免误删工作区。
@@ -1161,7 +1172,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 ### 外部通知
 
 `notifications:` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你。
-TUI 内的提醒固定显示在右上角（约 8 秒），不会弹桌面通知，也不会移动 statusline：
+TUI 内的提醒固定显示在右上角（约 8 秒，同一时间只显示最新一条），不会弹桌面通知，也不会移动 statusline：
 
 | 字段 | 默认 | 行为 |
 | --- | --- | --- |

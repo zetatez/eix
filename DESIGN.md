@@ -87,6 +87,10 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
 - session 常驻 daemon；client attach 只是订阅 + 渲染。
 - TUI / `chat` / `send` 未指定 session 时，按启动目录选择最近更新的 user session attach；
   当前目录没有 session 则新建。其他只读 CLI 命令找不到当前目录 session 时回退到最近 session。
+- TUI 按启动目录把仍打开的 pane 记录在 `<data_dir>/workspaces.json`：`Ctrl-C` / `Ctrl-D` /
+  `Z` / `/quit` / `/exit` 退出时保存 pane 顺序与焦点，下次启动依次重新 attach；`:q` /
+  `:qa` / `:wq` / `:x` 或最后一个 pane 的 `/close` 退出时清除记录。记录为空或 session 已
+  失效时，回退到该目录最近更新的 user session。显式 session 参数覆盖恢复。
 - 同一 session 可被多 client 观察，但**只有一个输入所有者（controller）**。
 - 所有者断开 → 自动转移给最早的 watcher；显式抢占用 `<leader>a C`（claim）。
 - draft 由 daemon 持有，client 的 nvim 只是视图；所有权切换时重新加载 draft。
@@ -195,9 +199,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `o` 打开 session picker（已有 session 放进新 pane）、`c` 关闭 pane、`f` 文件、
   `g` git（worktrees + branches）、`p` 进程、`a` 审批、
   `N` 新建、`W` 当前 session 移入 worktree、`F` fork、`x` 取消、`A` attention、`m` 完整执行模式 picker、
-  `i` 聚焦输入框、`Ctrl-P` 命令面板。单字母基本留给 vim；转录区裸字母不触发动作，仅保留
-  `i`（聚焦输入框）、`Z`（退出）、`j/k`/`g/G` 等导航、`/`/`?`/`#` 当前对话搜索和 `Ctrl-P`；布局动作
-  同样走 leader（`v`/`t`/`r`/`l`）。
+  `i` 聚焦输入框、`Ctrl-P` 命令面板。单字母基本留给 vim；转录区裸 `q` 关闭当前 pane
+  （最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、`j/k`/`g/G` 等导航、
+  `/`/`?`/`#` 当前对话搜索和 `Ctrl-P`；布局动作同样走 leader（`v`/`t`/`r`/`l`）。
 - 输入框 normal 模式复用转录区的 TUI 动作：leader、`/`/`?`/`#` 当前对话搜索、翻页/滚动和
   `[keys]` 绑定行为一致；`j/k` 行移动、`Tab` / `Shift-Tab` 循环执行模式等 vim/编辑器键仍归输入框。
 - `Shift+,` / `Shift+.`（即 `<` / `>`）在转录区和输入框 normal 模式线性切换上一个 / 下一个 pane。
@@ -244,8 +248,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   右侧靠右显示 `cwd（~ 缩写） · git 分支`；
   worktree/图片数、运行中的 integration 状态，以及多 pane 时的 `当前/总数`、排队数和 attention
   数在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。只有没有其他可见反馈的失败、
-  后台 attention 和复制确认使用右上角浮动通知；成功的命令反馈、进度和 picker/弹窗内容不再
-  重复通知，因此状态栏不会随命令消息跳动。
+  后台 attention、复制确认和 `/reload` 完成使用右上角浮动通知；同一时间只显示一条，当前
+  通知至少保留其时长，期间的新消息只保留最新一条等待替换。成功的命令反馈（`/reload`
+  除外）、进度和 picker/弹窗内容不再重复通知，因此状态栏不会随命令消息跳动。
 - 终端高度足够时，statusline **下方**常驻一行空白命令行；normal 模式按 `:` 激活并显示
   `:` 前缀 + 文本 + 光标，`Enter` 执行；`Esc` 先收起命令菜单并保留输入，再按一次关闭命令行；
   `↑`/`↓` 浏览历史，`Tab` 显示并补全命令名；
@@ -297,7 +302,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   左侧按 `N/I/V/VL · SessionMode · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
   cwd（`~` 缩写）和 git 分支；worktree/图片数、运行中的 integration 状态、pane 位置、prompt
   队列和 attention 信息在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。只有没有
-  其他可见反馈的失败、后台 attention 和复制确认显示在右上角浮动通知中，不占用 statusline 中部。
+  其他可见反馈的失败、后台 attention、复制确认和 `/reload` 完成显示在右上角浮动通知中，
+  同一时间只显示一条，不占用 statusline 中部。
 - 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i` 或 `<Space>i` 聚焦输入并进入 insert；
   `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。聚焦 pane 使用
   更亮的单格虚线边框、标题加粗；非聚焦 pane 保持低对比实线灰，attention 仍用警示色。
@@ -323,6 +329,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<C-g><C-g>` | 回到上一个 session |
 | `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
 | `<Space>l` | 循环 grid / horizontal / tabby / fibonacci |
+| `q` | 转录区 / 输入框 normal：关闭当前 pane（最后一个 pane 保持打开） |
 | `<Space>a` | 跨 session 审批收件箱 |
 | `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab；需 kitty 键盘协议；`Ctrl-7` 在部分终端等价于 `Ctrl-/`） |
 | `Alt-1…9` | 同上；终端无法区分 `Ctrl-1…9` 时使用 |
@@ -379,7 +386,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/new-pane` | session picker，把已有 session 放进新 pane |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示 |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
-| `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要 |
+| `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要，生成结果在 transcript 中展示 |
 | `/btw <question>` | 一次性旁支问答，不写事件日志；`btw.delta` / `btw.completed` 通知，`btw.cancel` 中断 |
 | `/cd [path]` | 切换 session cwd（`session.cd`，canonicalize 后校验在 worktree 内） |
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
@@ -388,7 +395,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/files` / `/git` | picker；`/files` 插入 `@路径`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
 | `/processes` / `/approvals` / `/attention` | 进程 / 审批收件箱 / 下一个 attention |
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
-| `/cancel` / `/toggle-mode` | 取消运行 / 正向循环执行模式 |
+| `/cancel` | 取消运行 |
 | `/perm` | picker 搜索并选择 `plan` / `build` / `auto` / `bypass`；也可直接带 mode；与 `Space m` 相同；旧名 `/mode` 仍可用 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
@@ -742,9 +749,11 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 ## 13. 通知
 
-- TUI：只有没有其他 UI 反馈的失败、复制确认和后台 attention 显示在右上角浮动通知中
-  （失败约 4 秒，复制约 2 秒，attention 约 8 秒，最多堆叠 3 条），不会移动 statusline；
-  成功的命令反馈、进度和 picker/弹窗内容不重复通知；可选终端 bell，不弹桌面通知。
+- TUI：只有没有其他 UI 反馈的失败、复制确认、布局切换、后台 attention 和 `/reload` 完成
+  显示在右上角浮动通知中（失败约 4 秒，复制 / 布局 / `/reload` 约 2 秒，attention 约 8 秒；
+  同一时间只显示一条，当前通知至少保留其时长，期间只保留最新一条等待替换），不会移动
+  statusline；成功的命令反馈（`/reload` 除外）、进度和 picker/弹窗内容不重复通知；可选
+  终端 bell，不弹桌面通知。
 - 桌面：`notify-send`（dunst），可通过配置替换命令。
 - dwmblocks：`agent status --json` 输出 `{running, approval, error}`。
 - 仅在状态跃迁时通知；当前聚焦 session 不通知；冷却时间可配。

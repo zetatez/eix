@@ -180,6 +180,13 @@ enum Block {
     Note {
         text: String,
     },
+    /// A manual `/compact` summary. Unlike an automatic compaction, the
+    /// generated summary is user-visible so the result of the command is not
+    /// hidden behind a one-line status note.
+    Compaction {
+        messages: usize,
+        summary: String,
+    },
     Error {
         text: String,
     },
@@ -297,6 +304,9 @@ fn render_blocks(
                 }
             }
             Block::Note { text } => note(&mut out, '◇', &text, comment(theme), width),
+            Block::Compaction { messages, summary } => {
+                compaction_summary(&mut out, messages, &summary, width, theme)
+            }
             Block::Error { text } => {
                 note(&mut out, '!', &text, theme.error.unwrap_or(DANGER), width)
             }
@@ -523,12 +533,24 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                 if let Ok(payload) =
                     serde_json::from_value::<ContextCompactedPayload>(event.payload.clone())
                 {
-                    blocks.push(Block::Note {
-                        text: format!(
-                            "context compacted · {} message(s) replaced by a summary",
-                            payload.messages
-                        ),
-                    });
+                    let summary = payload.summary.trim();
+                    // Automatic compactions happen mid-turn and roll previous
+                    // summaries forward. Keep those as a short note; only a
+                    // manual `/compact` should expand the generated summary in
+                    // the conversation.
+                    if !payload.rolling && !summary.is_empty() {
+                        blocks.push(Block::Compaction {
+                            messages: payload.messages,
+                            summary: summary.to_string(),
+                        });
+                    } else {
+                        blocks.push(Block::Note {
+                            text: format!(
+                                "context compacted · {} message(s) replaced by a summary",
+                                payload.messages
+                            ),
+                        });
+                    }
                 }
             }
             EventKind::ContextCleared => {
@@ -776,6 +798,31 @@ fn note(out: &mut Transcript, marker: char, text: &str, color: Color, width: usi
             Span::raw(" ".repeat(prefix_width))
         };
         out.push(Line::from(vec![lead, Span::styled(segment, style)]), None);
+    }
+    out.blank();
+}
+
+/// A manual compaction shows both the bookkeeping line and the summary that
+/// replaced the compacted messages. The summary is Markdown, like an assistant
+/// message, because that is what the model generated.
+fn compaction_summary(
+    out: &mut Transcript,
+    messages: usize,
+    summary: &str,
+    width: usize,
+    theme: Theme,
+) {
+    note(
+        out,
+        '◇',
+        &format!("context compacted · {messages} message(s) replaced by this summary"),
+        comment(theme),
+        width,
+    );
+    let indent = "    ";
+    let content_width = width.saturating_sub(indent.len()).max(1);
+    for line in markdown::render_with_indent(summary, content_width, theme, indent) {
+        out.push(line, None);
     }
     out.blank();
 }

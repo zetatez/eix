@@ -14,6 +14,7 @@ mod net;
 mod syntax;
 mod theme;
 mod transcript;
+mod workspace;
 
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
@@ -64,12 +65,14 @@ pub async fn run(
     app.theme_config = loaded.theme.clone();
     app.keybinds = Keybinds::from_config(&loaded.keys);
     let cli_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let saved_workspace = workspace::load(&data_dir, &cli_cwd);
+    app.restore_workspace(saved_workspace.sessions, saved_workspace.focused);
     if let Ok(Some(defaults)) = eix_core::load_cli_config(&cli_cwd) {
         app.default_model = defaults.model;
         app.default_agent = defaults.agent;
         app.default_mode = defaults.mode;
     }
-    let (cmd_tx, mut ev_rx, controller) = controller::spawn(endpoint, data_dir, config);
+    let (cmd_tx, mut ev_rx, controller) = controller::spawn(endpoint, data_dir.clone(), config);
     let _ = cmd_tx.send(Command::Hello);
     let _ = cmd_tx.send(Command::List);
 
@@ -138,12 +141,29 @@ pub async fn run(
         }
     }
 
+    let active = workspace::ActiveWorkspace {
+        sessions: app.workspace_sessions(),
+        focused: app.workspace_focused(),
+    };
+    let workspace_result: Result<()> = if app.should_clear_active_workspace() {
+        workspace::clear(&data_dir, &cli_cwd)
+    } else if active.sessions.is_empty() {
+        // An interrupted startup that never attached a pane must not erase the
+        // state saved by the previous run.
+        Ok(())
+    } else {
+        workspace::save(&data_dir, &cli_cwd, &active)
+    };
+
     // Give queued commands (in particular the final draft save) a chance to
     // reach the daemon before the runtime is torn down.
     drop(cmd_tx);
     let _ = tokio::time::timeout(Duration::from_millis(500), controller).await;
 
     restore_terminal(&mut terminal)?;
+    if let Err(err) = workspace_result {
+        eprintln!("eix: cannot save active sessions: {err:#}");
+    }
     if let Some(message) = app.exit_message.take() {
         eprintln!("eix: {message}");
     }

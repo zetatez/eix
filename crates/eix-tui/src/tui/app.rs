@@ -53,6 +53,10 @@ const CTRL_W_WINDOW: Duration = Duration::from_millis(1000);
 /// Keep the Vim `:` history bounded for long-running clients.
 const CMDLINE_HISTORY_LIMIT: usize = 100;
 
+/// Width of the command name column in the `/` menu and the Ctrl-P palette.
+/// Sharing it keeps the description/annotation column aligned in both places.
+const COMMAND_NAME_WIDTH: usize = 22;
+
 /// Picker value for "no preset" (keep the terminal/default palette).
 const THEME_DEFAULT_VALUE: &str = "@default";
 
@@ -144,11 +148,6 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("approvals", "", "open the approval inbox"),
         builtin("attention", "", "jump to the next pane needing attention"),
         builtin("cancel", "", "cancel the focused session's running turn"),
-        builtin(
-            "toggle-mode",
-            "",
-            "cycle Plan / Build / Auto / Bypass (Shift-Tab reverses)",
-        ),
         builtin("clear", "", "forget this conversation's context"),
         builtin(
             "compact",
@@ -200,7 +199,6 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "choose the session permission mode in a search picker",
         ),
         builtin("fork", "[name]", "fork this session into a new pane"),
-        builtin("commands", "", "reload user-defined Markdown commands"),
         builtin("exit", "", "save the draft and quit eix"),
         builtin("quit", "", "save the draft and quit eix"),
         builtin(
@@ -295,19 +293,39 @@ enum ToastTone {
 }
 
 /// Short-lived top-right notification. Only failures that have no other UI
-/// surface, background attention and copy confirmations use this; successful
-/// commands and popup navigation are already visible where they happen.
+/// surface, background attention, copy confirmations and layout changes use
+/// this; successful commands and popup navigation are already visible where
+/// they happen.
 struct Toast {
     text: String,
     tone: ToastTone,
-    until: Instant,
+    min_until: Instant,
+}
+
+/// A newer message waiting for the visible toast to finish its minimum
+/// display time. Only the latest waiting message is kept, so a burst never
+/// stacks or delays stale notices.
+struct PendingToast {
+    text: String,
+    tone: ToastTone,
+    duration: Duration,
+}
+
+impl PendingToast {
+    fn show(self, now: Instant) -> Toast {
+        Toast {
+            text: self.text,
+            tone: self.tone,
+            min_until: now + self.duration,
+        }
+    }
 }
 
 const COPY_TOAST_DISPLAY: Duration = Duration::from_secs(2);
+const LAYOUT_TOAST_DISPLAY: Duration = Duration::from_secs(2);
 const WARNING_TOAST_DISPLAY: Duration = Duration::from_secs(4);
 const ATTENTION_TOAST_DISPLAY: Duration = Duration::from_secs(8);
-/// Keep the corner readable without letting a burst of feedback cover a pane.
-const MAX_TOASTS: usize = 3;
+const RELOAD_TOAST_DISPLAY: Duration = Duration::from_secs(2);
 
 /// Whether a status change is a failure the user cannot otherwise see. Normal
 /// progress, successful command feedback and popup contents stay silent.
@@ -770,7 +788,7 @@ impl PickerKind {
             Self::Sessions => "sessions — switch focused pane",
             Self::NewPane => "sessions — open in a new pane",
             Self::Files => "files — insert after @",
-            Self::Git => "git — insert worktree path or branch",
+            Self::Git => "git — worktree/branch",
             Self::Commands => "commands",
             Self::Models => "model — search and switch",
             Self::Agents => "agents — choose the primary agent",
@@ -1221,7 +1239,7 @@ enum PaneLayout {
 impl PaneLayout {
     fn label(self) -> &'static str {
         match self {
-            Self::Grid => "layout_grid",
+            Self::Grid => "grid",
             Self::Horizontal => "horizontal",
             Self::Tabby => "tabby",
             Self::Fibonacci => "fibonacci",
@@ -1259,6 +1277,14 @@ pub struct App {
     layout: PaneLayout,
     pending_attach: Option<PendingAttach>,
     initial_session: Option<String>,
+    /// Session ids to re-open as panes after the first session list arrives.
+    restore_sessions: Vec<String>,
+    /// Restore ids still waiting for the previous attach to finish.
+    restore_queue: Vec<String>,
+    /// Pane to focus after all restored panes have attached.
+    restore_focused: Option<String>,
+    /// Set when `:q` / `:qa` intentionally closes the client's panes.
+    clear_active_on_quit: bool,
     initialized: bool,
     creating: bool,
     submitting: bool,
@@ -1289,8 +1315,11 @@ pub struct App {
     /// Text selected with the mouse, waiting for the event loop to copy it to
     /// the system clipboard.
     pending_clipboard: Option<String>,
-    /// Transient top-right notifications, newest first.
-    toasts: Vec<Toast>,
+    /// The single visible top-right notification.
+    toast: Option<Toast>,
+    /// Latest notification waiting for the visible one to reach its minimum
+    /// display time.
+    pending_toast: Option<PendingToast>,
     /// Status text last observed, so repeated assignments do not retrigger the
     /// warning check even though most call sites write `status` directly.
     last_seen_status: String,
@@ -1402,7 +1431,6 @@ pub struct App {
 
 impl App {
     pub fn new(initial_session: Option<String>) -> Self {
-        let launch_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let compat = eix_core::CompatConfig::default();
         Self {
             should_quit: false,
@@ -1417,6 +1445,10 @@ impl App {
             layout: PaneLayout::Grid,
             pending_attach: None,
             initial_session,
+            restore_sessions: Vec::new(),
+            restore_queue: Vec::new(),
+            restore_focused: None,
+            clear_active_on_quit: false,
             initialized: false,
             creating: false,
             submitting: false,
@@ -1435,7 +1467,8 @@ impl App {
             pending_leader: false,
             leader_status_backup: None,
             pending_clipboard: None,
-            toasts: Vec::new(),
+            toast: None,
+            pending_toast: None,
             last_seen_status: "connecting…".into(),
             pending_history: None,
             pane_areas: Vec::new(),
@@ -1476,7 +1509,8 @@ impl App {
             queued_inflight: None,
             submitting_session: None,
             command_cursor: 0,
-            commands: merge_commands(&launch_cwd, &compat),
+            // Custom commands are loaded once by `set_compat` at startup.
+            commands: builtin_commands(),
             compat,
             command_dismissed: false,
             cmdline: None,
@@ -1490,10 +1524,34 @@ impl App {
         }
     }
 
-    /// Apply the daemon config's compatibility switches and reload commands
-    /// from all enabled harness sources.
-    pub fn set_compat(&mut self, compat: eix_core::CompatConfig) {
-        self.compat = compat;
+    /// Stage the pane state saved by the previous TUI run in this directory.
+    /// The ids are resolved against the first session list, so stale entries
+    /// are ignored instead of blocking startup.
+    pub fn restore_workspace(&mut self, sessions: Vec<String>, focused: Option<String>) {
+        self.restore_sessions = sessions;
+        self.restore_focused = focused;
+    }
+
+    /// Session ids currently open as panes, in pane order.
+    pub fn workspace_sessions(&self) -> Vec<String> {
+        self.views
+            .iter()
+            .map(|view| view.session.id.clone())
+            .collect()
+    }
+
+    /// Session id of the focused pane, when one is open.
+    pub fn workspace_focused(&self) -> Option<String> {
+        self.focused_view().map(|view| view.session.id.clone())
+    }
+
+    /// Whether the exit path explicitly closed the panes (`:q` / `:qa`).
+    pub fn should_clear_active_workspace(&self) -> bool {
+        self.clear_active_on_quit
+    }
+
+    /// Re-read user-defined Markdown commands from the focused workspace.
+    fn reload_commands(&mut self) {
         let cwd = self
             .focused_view()
             .map(|view| view.session.cwd.clone())
@@ -1501,6 +1559,13 @@ impl App {
                 std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
             });
         self.commands = merge_commands(&cwd, &self.compat);
+    }
+
+    /// Apply the daemon config's compatibility switches and load commands from
+    /// all enabled harness sources. This is called once at startup.
+    pub fn set_compat(&mut self, compat: eix_core::CompatConfig) {
+        self.compat = compat;
+        self.reload_commands();
     }
 
     /// True when no full-screen overlay owns the keyboard, so a prompt request
@@ -2174,23 +2239,29 @@ impl App {
                 self.sessions = sessions;
                 if !self.initialized {
                     self.initialized = true;
-                    let index = match self.initial_session.as_deref() {
-                        Some(needle) => match self.find_session(needle) {
+                    let index = if let Some(needle) = self.initial_session.as_deref() {
+                        self.restore_sessions.clear();
+                        self.restore_queue.clear();
+                        self.restore_focused = None;
+                        match self.find_session(needle) {
                             Some(index) => Some(index),
                             None => {
                                 self.error = Some(format!("unknown session {needle:?}"));
                                 (!self.sessions.is_empty())
                                     .then(|| self.selected.min(self.sessions.len() - 1))
                             }
-                        },
-                        None => match std::env::current_dir() {
-                            Ok(cwd) => self.sessions.iter().position(|session| {
-                                !session.is_agent() && session.cwd_matches(&cwd)
-                            }),
-                            // Without a usable launch directory, preserve the
-                            // previous "most recent session" fallback.
-                            Err(_) => (!self.sessions.is_empty()).then_some(0),
-                        },
+                        }
+                    } else {
+                        let restored = self.take_restore_sessions();
+                        match restored.split_first() {
+                            Some((first, rest)) => {
+                                self.restore_queue = rest.to_vec();
+                                self.sessions
+                                    .iter()
+                                    .position(|session| session.id == *first)
+                            }
+                            None => self.last_session_for_cwd(),
+                        }
                     };
                     match index {
                         Some(index) => self.select_session(index, tx),
@@ -2202,7 +2273,7 @@ impl App {
                     self.reselect_current();
                 }
             }
-            Event::Attached(attached) => self.attached(attached),
+            Event::Attached(attached) => self.attached(attached, tx),
             Event::HistoryPage {
                 session_id,
                 events,
@@ -2358,7 +2429,12 @@ impl App {
                 max_parallel_subagents,
             } => {
                 self.subagent_concurrency = max_parallel_subagents;
-                self.status = format!("config reloaded ({} layer(s))", paths.len());
+                // Command files are intentionally read at startup and on an
+                // explicit reload, not every time the menu opens.
+                self.reload_commands();
+                let message = format!("config reloaded ({} layer(s))", paths.len());
+                self.status = message.clone();
+                self.push_toast(message, ToastTone::Success, RELOAD_TOAST_DISPLAY);
             }
             Event::Archived(session) => {
                 let id = session.id.clone();
@@ -2687,7 +2763,7 @@ impl App {
         }
     }
 
-    fn attached(&mut self, attached: AttachResult) {
+    fn attached(&mut self, attached: AttachResult, tx: &UnboundedSender<Command>) {
         let Some(pending) = &self.pending_attach else {
             return;
         };
@@ -2724,6 +2800,28 @@ impl App {
         self.selected = self.find_session(&session_id).unwrap_or(self.selected);
         self.error = None;
         self.status = "attached".into();
+        self.attach_next_restore(tx);
+    }
+
+    /// Restored panes are attached one at a time because the app only keeps a
+    /// single pending attach. The last response restores the saved focus.
+    fn attach_next_restore(&mut self, tx: &UnboundedSender<Command>) {
+        if !self.restore_queue.is_empty() {
+            let session_id = self.restore_queue.remove(0);
+            self.pending_attach = Some(PendingAttach {
+                session_id: session_id.clone(),
+                slot: AttachSlot::New,
+            });
+            self.error = None;
+            let _ = tx.send(Command::Attach(session_id));
+            return;
+        }
+        if let Some(focused) = self.restore_focused.take() {
+            if let Some(index) = self.open_session(&focused) {
+                self.focused = index;
+                self.sync_selected_to_focus();
+            }
+        }
     }
 
     /// Merge a page of older stored events and keep the viewport anchored on
@@ -4411,6 +4509,9 @@ impl App {
             }
             "qa" | "qall" | "quitall" => {
                 self.handle_command_text("/quit", tx, false);
+                if self.should_quit {
+                    self.clear_active_on_quit = true;
+                }
             }
             "w" => {
                 self.save_draft_now(tx);
@@ -4670,6 +4771,14 @@ impl App {
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
             {
                 self.run_action("quit", tx)
+            }
+            // `q` closes the focused pane; the last pane stays open.
+            KeyCode::Char('q')
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.run_action("close-pane", tx)
             }
             KeyCode::Char('<') => self.cycle_pane(-1),
             KeyCode::Char('>') => self.cycle_pane(1),
@@ -5161,7 +5270,19 @@ impl App {
             PickerKind::Commands => {
                 if let Some(value) = value {
                     self.picker = None;
-                    self.run_action(&value, tx);
+                    let line = self
+                        .commands
+                        .iter()
+                        .find(|spec| spec.name == value)
+                        .map(|spec| {
+                            if spec.args.is_empty() {
+                                format!("/{}", spec.name)
+                            } else {
+                                format!("/{} ", spec.name)
+                            }
+                        })
+                        .unwrap_or_else(|| format!("/{value}"));
+                    self.handle_prompt_command(&line, tx);
                 }
             }
             PickerKind::Models => {
@@ -5270,7 +5391,7 @@ impl App {
                 kind: provider.to_string(),
             });
         } else if kind == PickerKind::Commands {
-            picker.items = command_items();
+            picker.items = command_items(&self.commands);
         } else if kind == PickerKind::Models {
             picker.loading = true;
             self.status = "model: loading provider catalogs…".into();
@@ -5438,7 +5559,7 @@ impl App {
         });
     }
 
-    /// Tab cycles forward; `/toggle-mode` and the command palette use this too.
+    /// Tab cycles forward; Shift-Tab reverses in the host.
     fn toggle_mode(&mut self, tx: &UnboundedSender<Command>) {
         self.cycle_mode(1, tx);
     }
@@ -5840,10 +5961,6 @@ impl App {
                 self.cancel(tx);
                 true
             }
-            "toggle-mode" => {
-                self.toggle_mode(tx);
-                true
-            }
             "cd" => {
                 self.command_cd(args, tx);
                 true
@@ -6033,24 +6150,6 @@ impl App {
                     });
                     self.status = "forking…".into();
                 }
-                true
-            }
-            "commands" => {
-                let cwd = self
-                    .focused_view()
-                    .map(|view| view.session.cwd.clone())
-                    .unwrap_or_else(|| {
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-                    });
-                self.commands = merge_commands(&cwd, &self.compat);
-                self.status = format!(
-                    "{} commands ({} user-defined)",
-                    self.commands.len(),
-                    self.commands
-                        .iter()
-                        .filter(|spec| spec.template.is_some())
-                        .count()
-                );
                 true
             }
             _ => {
@@ -6327,6 +6426,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         });
         if self.views.len() <= 1 {
             self.status = format!("saved {name} · quitting");
+            self.clear_active_on_quit = true;
             self.should_quit = true;
             return;
         }
@@ -6362,6 +6462,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.save_draft_now(tx);
         if self.views.len() <= 1 {
             self.status = format!("saved {name} · quitting");
+            self.clear_active_on_quit = true;
             self.should_quit = true;
             return;
         }
@@ -6898,7 +6999,9 @@ already exists, update it in place rather than rewriting it from scratch.";
 
     fn set_layout(&mut self, layout: PaneLayout) {
         self.layout = layout;
-        self.status = format!("layout: {}", layout.label());
+        let status = format!("layout: {}", layout.label());
+        self.status.clone_from(&status);
+        self.push_toast(status, ToastTone::Success, LAYOUT_TOAST_DISPLAY);
     }
 
     /// Focus the Nth open session (`Ctrl-1` is the first pane). In tabby
@@ -7010,6 +7113,45 @@ already exists, update it in place rather than rewriting it from scratch.";
             }
         }
         self.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+    }
+
+    /// Resolve the ids saved by the previous TUI run. Unknown, agent and
+    /// duplicate ids are dropped so a stale workspace file can never block
+    /// startup. The focused id is discarded when its pane is gone.
+    fn take_restore_sessions(&mut self) -> Vec<String> {
+        let requested = std::mem::take(&mut self.restore_sessions);
+        let mut seen = HashSet::new();
+        let restored: Vec<String> = requested
+            .into_iter()
+            .filter(|id| !id.is_empty() && seen.insert(id.clone()))
+            .filter(|id| {
+                self.sessions
+                    .iter()
+                    .any(|session| session.id == *id && !session.is_agent())
+            })
+            .collect();
+        if self
+            .restore_focused
+            .as_ref()
+            .is_some_and(|focused| !restored.contains(focused))
+        {
+            self.restore_focused = None;
+        }
+        restored
+    }
+
+    /// Fallback for a workspace with no saved panes: the most recently updated
+    /// user session bound to this directory. `list_sessions` is newest first.
+    fn last_session_for_cwd(&self) -> Option<usize> {
+        match std::env::current_dir() {
+            Ok(cwd) => self
+                .sessions
+                .iter()
+                .position(|session| !session.is_agent() && session.cwd_matches(&cwd)),
+            // Without a usable launch directory, preserve the previous
+            // "most recent session" fallback.
+            Err(_) => (!self.sessions.is_empty()).then_some(0),
+        }
     }
 
     fn find_session(&self, needle: &str) -> Option<usize> {
@@ -7236,7 +7378,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
 
         let now = Instant::now();
-        self.toasts.retain(|toast| toast.until > now);
+        self.expire_toasts(now);
         self.sync_status_toast();
         self.draw_toasts(frame, area);
     }
@@ -7281,54 +7423,79 @@ already exists, update it in place rather than rewriting it from scratch.";
         if text.is_empty() {
             return;
         }
-        let until = Instant::now() + duration;
-        if let Some(existing) = self.toasts.iter_mut().find(|toast| toast.text == text) {
-            existing.tone = tone;
-            existing.until = until;
+        let now = Instant::now();
+        // A repeated warning should keep the visible message fresh instead of
+        // queueing the same text behind itself.
+        if let Some(active) = self.toast.as_mut().filter(|toast| toast.text == text) {
+            active.tone = tone;
+            active.min_until = active.min_until.max(now + duration);
+            self.pending_toast = None;
             return;
         }
-        self.toasts.insert(0, Toast { text, tone, until });
-        self.toasts.truncate(MAX_TOASTS);
+        let next = PendingToast {
+            text,
+            tone,
+            duration,
+        };
+        match &self.toast {
+            Some(active) if now < active.min_until => {
+                // Only the newest message can wait behind the visible one.
+                self.pending_toast = Some(next);
+            }
+            _ => {
+                self.toast = Some(next.show(now));
+                self.pending_toast = None;
+            }
+        }
     }
 
-    /// Notifications stack below one another in the top-right corner and float
-    /// above panes and dialogs, matching the original copy confirmation.
+    /// Promote the newest waiting message once the visible toast has met its
+    /// minimum display time. Nothing is ever stacked.
+    fn expire_toasts(&mut self, now: Instant) {
+        if self
+            .toast
+            .as_ref()
+            .is_some_and(|toast| now >= toast.min_until)
+        {
+            self.toast = self.pending_toast.take().map(|toast| toast.show(now));
+        }
+    }
+
+    /// One notification sits in the top-right corner and floats above panes
+    /// and dialogs, matching the original copy confirmation.
     fn draw_toasts(&self, frame: &mut Frame, area: Rect) {
         if area.width < 2 || area.height < 2 {
             return;
         }
+        let Some(toast) = &self.toast else {
+            return;
+        };
         let available = area.width.saturating_sub(2);
-        for (index, toast) in self.toasts.iter().enumerate() {
-            let y = area.y + 1 + index as u16;
-            if y >= area.y.saturating_add(area.height) {
-                break;
-            }
-            let text = truncate(&format!(" {} ", toast.text), available as usize);
-            let width = text.width() as u16;
-            if width == 0 {
-                continue;
-            }
-            let rect = Rect {
-                x: area.x + area.width - width - 1,
-                y,
-                width,
-                height: 1,
-            };
-            let color = match toast.tone {
-                ToastTone::Success => composer_success(self.theme),
-                ToastTone::Warning => composer_warn(self.theme),
-            };
-            frame.render_widget(Clear, rect);
-            frame.render_widget(
-                Paragraph::new(text).alignment(Alignment::Right).style(
-                    Style::default()
-                        .fg(badge_text_color(color))
-                        .bg(color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                rect,
-            );
+        let text = truncate(&format!(" {} ", toast.text), available as usize);
+        let width = text.width() as u16;
+        if width == 0 {
+            return;
         }
+        let rect = Rect {
+            x: area.x + area.width - width - 1,
+            y: area.y + 1,
+            width,
+            height: 1,
+        };
+        let color = match toast.tone {
+            ToastTone::Success => composer_success(self.theme),
+            ToastTone::Warning => composer_warn(self.theme),
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(
+            Paragraph::new(text).alignment(Alignment::Right).style(
+                Style::default()
+                    .fg(badge_text_color(color))
+                    .bg(color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            rect,
+        );
     }
 
     /// Compact status icon shared by the pane title and the prompt header.
@@ -8196,7 +8363,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         let accent = composer_accent(self.theme);
         let inner = width.saturating_sub(2) as usize;
         let marker_width = 3usize;
-        let name_width = 22.min(inner.saturating_sub(marker_width + 2));
+        let name_width = COMMAND_NAME_WIDTH.min(inner.saturating_sub(marker_width + 2));
         let desc_width = inner
             .saturating_sub(marker_width + name_width)
             .saturating_sub(2);
@@ -8226,11 +8393,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             } else {
                 Style::default().fg(muted).bg(row_bg)
             };
-            let name = if spec.args.is_empty() {
-                format!("/{}", spec.name)
-            } else {
-                format!("/{} {}", spec.name, spec.args)
-            };
+            let name = command_label(spec, "/");
             let name = pad_to(&truncate(&name, name_width), name_width);
             let description = pad_to(&truncate(&spec.description, desc_width), desc_width);
             let gap = inner.saturating_sub(marker_width + name_width + desc_width);
@@ -8297,7 +8460,7 @@ already exists, update it in place rather than rewriting it from scratch.";
         let accent = composer_accent(self.theme);
         let inner = width.saturating_sub(2) as usize;
         let marker_width = 3usize;
-        let name_width = 22.min(inner.saturating_sub(marker_width + 2));
+        let name_width = COMMAND_NAME_WIDTH.min(inner.saturating_sub(marker_width + 2));
         let desc_width = inner
             .saturating_sub(marker_width + name_width)
             .saturating_sub(2);
@@ -8327,11 +8490,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             } else {
                 Style::default().fg(muted).bg(row_bg)
             };
-            let name = if spec.args.is_empty() {
-                format!(":{}", spec.name)
-            } else {
-                format!(":{} {}", spec.name, spec.args)
-            };
+            let name = command_label(spec, ":");
             let name = pad_to(&truncate(&name, name_width), name_width);
             let description = pad_to(&truncate(&spec.description, desc_width), desc_width);
             let gap = inner.saturating_sub(marker_width + name_width + desc_width);
@@ -8999,6 +9158,11 @@ already exists, update it in place rather than rewriting it from scratch.";
                     .map(|item| {
                         let label = if kind == PickerKind::Models {
                             format!("{:<width$}", item.label, width = model_width)
+                        } else if kind == PickerKind::Commands {
+                            pad_to(
+                                &truncate(&item.label, COMMAND_NAME_WIDTH),
+                                COMMAND_NAME_WIDTH,
+                            )
                         } else {
                             item.label.clone()
                         };
@@ -9434,124 +9598,29 @@ fn skill_picker_items(skills: &[eix_core::Skill]) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Rows for the `Ctrl-P` command palette. `value` is dispatched by
-/// [`App::run_action`]; the label and help are only for display.
-fn command_items() -> Vec<PickerItem> {
-    const COMMANDS: &[(&str, &str, &str)] = &[
-        (
-            "sessions",
-            "switch session",
-            "Pick the focused pane's session (p)",
-        ),
-        (
-            "new-pane",
-            "open session in a new pane",
-            "Pick a session for a split (o)",
-        ),
-        (
-            "files",
-            "workspace files",
-            "Insert @path into the prompt (@)",
-        ),
-        (
-            "git",
-            "git worktrees & branches",
-            "Insert a worktree path or branch name into the prompt (Space g)",
-        ),
-        (
-            "processes",
-            "background processes",
-            "List and inspect processes (P)",
-        ),
-        ("approvals", "approval inbox", "Pending approvals (Space a)"),
-        (
-            "mcp",
-            "mcp servers",
-            "Browse configured MCP servers and tool counts",
-        ),
-        ("todos", "task list", "Browse the focused session's tasks"),
-        (
-            "attention",
-            "next attention",
-            "Jump to the next pane needing approval or input",
-        ),
-        (
-            "close-pane",
-            "close pane",
-            "Close the focused pane (Space c)",
-        ),
-        (
-            "new",
-            "new session",
-            "Create a session; reuse the focused session's worktree if present (n / Space n)",
-        ),
-        (
-            "new-worktree",
-            "move session into a worktree",
-            "Move the focused session into an isolated worktree (Space W)",
-        ),
-        (
-            "fork",
-            "fork focused session",
-            "Fork at the current tail (F)",
-        ),
-        (
-            "cancel",
-            "cancel the running turn",
-            "Stop the focused session (x)",
-        ),
-        (
-            "agents",
-            "agents",
-            "Choose the focused session's primary agent",
-        ),
-        (
-            "subagents",
-            "subagent concurrency",
-            "Set the maximum parallel spawn_agent calls",
-        ),
-        (
-            "toggle-mode",
-            "cycle execution mode",
-            "Cycle Plan → Build → Auto → Bypass (Tab; Shift-Tab reverses)",
-        ),
-        (
-            "perm",
-            "permission mode",
-            "Choose Plan, Build, Auto or Bypass for this session (Space m)",
-        ),
-        (
-            "skills",
-            "skills",
-            "Browse installed skills with a body preview",
-        ),
-        (
-            "model",
-            "model",
-            "Search provider model catalogs and switch this session",
-        ),
-        (
-            "colorscheme",
-            "colorscheme",
-            "Choose a colorscheme with live preview",
-        ),
-        (
-            "help",
-            "key help",
-            "Search the key and command reference (?)",
-        ),
-        ("keys", "key bindings", "Search just the key map"),
-        ("quit", "quit eix", "Leave the TUI (q)"),
-    ];
-    COMMANDS
+/// Rows for the `Ctrl-P` command palette. It is generated from the same
+/// built-in/user command list as the prompt's `/` menu, so both stay in sync.
+/// `value` is the command name dispatched as `/name`.
+fn command_items(commands: &[CommandSpec]) -> Vec<PickerItem> {
+    commands
         .iter()
-        .map(|(id, label, help)| {
-            PickerItem::new(*id)
-                .with_label(*label)
-                .with_detail(*help)
-                .with_preview(format!("{label}\n\n{help}"))
+        .map(|spec| {
+            let label = command_label(spec, "/");
+            PickerItem::new(&spec.name)
+                .with_label(label.clone())
+                .with_detail(&spec.description)
+                .with_preview(format!("{label}\n\n{}", spec.description))
         })
         .collect()
+}
+
+/// The display form used by the `/` and `:` menus and the command palette.
+fn command_label(spec: &CommandSpec, prefix: &str) -> String {
+    if spec.args.is_empty() {
+        format!("{prefix}{}", spec.name)
+    } else {
+        format!("{prefix}{} {}", spec.name, spec.args)
+    }
 }
 
 #[derive(Deserialize)]
@@ -9922,10 +9991,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "cancel the focused session's running turn",
             },
             HelpEntry {
-                key: "/toggle-mode",
-                description: "cycle Plan → Build → Auto → Bypass (Shift-Tab reverses)",
-            },
-            HelpEntry {
                 key: "/timeline",
                 description: "search this session's user inputs; Enter jumps to the message",
             },
@@ -10029,6 +10094,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "Space n/c",
                 description: "prompt & transcript: new session / close pane",
+            },
+            HelpEntry {
+                key: "q",
+                description: "prompt normal & transcript: close the focused pane (the last one stays)",
             },
             HelpEntry {
                 key: "Shift+, / Shift+.",
@@ -11656,6 +11725,75 @@ mod tests {
     }
 
     #[test]
+    fn startup_restores_saved_panes_in_order_and_restores_focus() {
+        let mut app = App::new(None);
+        app.restore_workspace(vec!["a".into(), "b".into()], Some("a".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = vec![
+            Session::new("a", "a", "/tmp/eix-workspace"),
+            Session::new("b", "b", "/tmp/eix-workspace"),
+        ];
+        app.handle_event(Event::Sessions(sessions.clone()), &tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "a"));
+
+        app.handle_event(
+            Event::Attached(AttachResult {
+                session: sessions[0].clone(),
+                events: Vec::new(),
+                has_more: false,
+            }),
+            &tx,
+        );
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "b"));
+
+        app.handle_event(
+            Event::Attached(AttachResult {
+                session: sessions[1].clone(),
+                events: Vec::new(),
+                has_more: false,
+            }),
+            &tx,
+        );
+
+        assert_eq!(view_order(&app), vec!["a", "b"]);
+        assert_eq!(app.focused, 0);
+        assert_eq!(app.selected, 0);
+    }
+
+    #[test]
+    fn startup_falls_back_to_the_latest_workspace_session_for_stale_restore_ids() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut app = App::new(None);
+        app.restore_workspace(vec!["deleted".into()], Some("deleted".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = vec![
+            Session::new("newest", "newest", cwd.clone()),
+            Session::new("older", "older", cwd),
+        ];
+        app.handle_event(Event::Sessions(sessions), &tx);
+
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "newest"));
+        assert!(!matches!(rx.try_recv(), Ok(Command::Create { .. })));
+    }
+
+    #[test]
+    fn explicit_session_ignores_saved_restore_state() {
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut app = App::new(Some("explicit".into()));
+        app.restore_workspace(vec!["saved".into()], Some("saved".into()));
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let sessions = vec![
+            Session::new("explicit", "explicit", cwd.clone()),
+            Session::new("saved", "saved", cwd),
+        ];
+        app.handle_event(Event::Sessions(sessions), &tx);
+
+        assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "explicit"));
+        assert!(app.restore_queue.is_empty());
+        assert!(app.restore_focused.is_none());
+    }
+
+    #[test]
     fn startup_creates_a_session_when_the_launch_directory_has_none() {
         let mut app = App::new(None);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -12169,14 +12307,30 @@ mod tests {
             ('r', PaneLayout::Fibonacci),
             ('l', PaneLayout::Grid),
         ] {
+            // Let the previous feedback finish its minimum display time so
+            // each shortcut's toast can be checked independently.
+            if let Some(toast) = app.toast.as_mut() {
+                toast.min_until = Instant::now() - Duration::from_millis(1);
+            }
             app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
             app.handle_key(
                 KeyEvent::new(KeyCode::Char(leader), KeyModifiers::NONE),
                 &tx,
             );
             assert_eq!(app.layout, expected, "leader {leader}");
+            let toast = app.toast.as_ref().expect("layout toast");
+            assert_eq!(toast.text, format!("layout: {}", expected.label()));
+            assert_eq!(toast.tone, ToastTone::Success);
         }
-        assert_eq!(app.status, "layout: layout_grid");
+        assert_eq!(app.status, "layout: grid");
+        let rendered = render_text(&mut app, 80, 20);
+        assert!(
+            rendered
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("layout: grid")),
+            "{rendered}"
+        );
     }
 
     #[test]
@@ -12895,9 +13049,32 @@ mod tests {
         let view = SessionView::new(session, events);
         let rendered = render_transcript(&view, 60);
         assert!(rendered.contains("context compacted · 1 message(s)"));
+        assert!(rendered.contains("we talked"));
         assert!(rendered.contains("context cleared"));
         // Clearing context never removes the transcript history.
         assert!(rendered.contains("old question"));
+    }
+
+    #[test]
+    fn automatic_compaction_keeps_the_summary_compact() {
+        let session = Session::new("s1", "ctx", "/tmp");
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::ContextCompacted,
+            serde_json::json!({
+                "from_seq": 1,
+                "to_seq": 1,
+                "messages": 1,
+                "tokens": 10,
+                "summary": "internal rolling summary",
+                "rolling": true,
+            }),
+        )];
+        let view = SessionView::new(session, events);
+        let rendered = render_transcript(&view, 60);
+        assert!(rendered.contains("context compacted · 1 message(s)"));
+        assert!(!rendered.contains("internal rolling summary"));
     }
 
     #[test]
@@ -13401,7 +13578,7 @@ mod tests {
 
         assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
         assert_eq!(
-            app.toasts.first().map(|toast| toast.text.as_str()),
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
             Some("Copied 5 chars")
         );
         assert!(app.views[0].selection.is_some());
@@ -13422,35 +13599,68 @@ mod tests {
     }
 
     #[test]
-    fn toasts_stack_newest_first_and_merge_duplicates() {
+    fn toast_shows_only_latest_and_honors_minimum_duration() {
         let mut app = App::new(None);
-        for (text, tone) in [
-            ("first", ToastTone::Success),
-            ("second", ToastTone::Success),
-            ("third", ToastTone::Success),
-            ("fourth", ToastTone::Success),
-        ] {
-            app.push_toast(text.into(), tone, Duration::from_secs(10));
-        }
+        app.push_toast("first".into(), ToastTone::Success, Duration::from_secs(10));
+        app.push_toast("second".into(), ToastTone::Success, Duration::from_secs(10));
+        app.push_toast("third".into(), ToastTone::Success, Duration::from_secs(10));
+
+        // The first message keeps its minimum time; only the newest waiting
+        // message is retained instead of stacking all three rows.
         assert_eq!(
-            app.toasts
-                .iter()
-                .map(|toast| toast.text.as_str())
-                .collect::<Vec<_>>(),
-            vec!["fourth", "third", "second"]
+            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("first")
         );
-
-        // Refreshing a visible message updates it in place instead of adding
-        // a duplicate row.
-        app.push_toast("second".into(), ToastTone::Warning, Duration::from_secs(20));
-        assert_eq!(app.toasts.len(), MAX_TOASTS);
-        assert_eq!(app.toasts[2].tone, ToastTone::Warning);
-
+        assert_eq!(
+            app.pending_toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("third")
+        );
         let text = render_text(&mut app, 80, 20);
-        let rows: Vec<_> = text.lines().take(4).collect();
-        assert!(rows[1].contains("fourth"), "{text}");
-        assert!(rows[2].contains("third"), "{text}");
-        assert!(rows[3].contains("second"), "{text}");
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("first")),
+            "{text}"
+        );
+        assert!(!text.contains("second"), "{text}");
+        assert!(!text.contains("third"), "{text}");
+
+        // Once the visible toast reaches its minimum, the saved latest
+        // message replaces it.
+        app.toast.as_mut().expect("visible toast").min_until =
+            Instant::now() - Duration::from_millis(1);
+        let text = render_text(&mut app, 80, 20);
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("third")),
+            "{text}"
+        );
+        assert!(!text.contains("first"), "{text}");
+        assert!(!text.contains("second"), "{text}");
+        assert!(app.pending_toast.is_none());
+
+        // Repeating the visible text refreshes it and discards an older
+        // waiting message.
+        app.push_toast("second".into(), ToastTone::Success, Duration::from_secs(10));
+        assert_eq!(
+            app.pending_toast.as_ref().map(|toast| toast.text.as_str()),
+            Some("second")
+        );
+        app.push_toast("third".into(), ToastTone::Warning, Duration::from_secs(20));
+        assert_eq!(
+            app.toast.as_ref().map(|toast| toast.tone),
+            Some(ToastTone::Warning)
+        );
+        assert!(app.pending_toast.is_none());
+
+        // Expiry clears the only slot when nothing newer is waiting.
+        app.toast.as_mut().expect("visible toast").min_until =
+            Instant::now() - Duration::from_millis(1);
+        let text = render_text(&mut app, 80, 20);
+        assert!(!text.contains("third"), "{text}");
+        assert!(app.toast.is_none());
+        assert!(app.pending_toast.is_none());
     }
 
     #[test]
@@ -14278,7 +14488,7 @@ mod tests {
 
     #[test]
     fn command_palette_ids_are_unique() {
-        let items = command_items();
+        let items = command_items(&builtin_commands());
         assert!(items.len() >= 10);
         let mut ids: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
         ids.sort_unstable();
@@ -14608,6 +14818,54 @@ mod tests {
         assert!(text.contains("/approvals"), "{text}");
         assert!(text.contains("pending-approval inbox"), "{text}");
         assert!(text.contains("› /approvals"), "{text}");
+    }
+
+    #[test]
+    fn command_palette_aligns_descriptions() {
+        let commands = vec![
+            builtin("a", "", "first description"),
+            builtin("long-command", "[arg]", "second description"),
+        ];
+        let mut app = App::new(None);
+        app.picker = Some(Picker {
+            kind: PickerKind::Commands,
+            query: String::new(),
+            selected: 0,
+            items: command_items(&commands),
+            loading: false,
+            preview: PickerPreview::default(),
+            preview_request: None,
+        });
+
+        let rendered = render_text(&mut app, 60, 20);
+        let first = rendered
+            .lines()
+            .find_map(|line| line.find("first description"))
+            .expect("first command description");
+        let second = rendered
+            .lines()
+            .find_map(|line| line.find("second description"))
+            .expect("second command description");
+        assert_eq!(first, second, "{rendered}");
+    }
+
+    #[test]
+    fn command_palette_includes_user_commands() {
+        let mut commands = builtin_commands();
+        commands.push(CommandSpec {
+            name: "deploy".into(),
+            args: "[env]".into(),
+            description: "custom deployment command".into(),
+            template: Some("deploy {{args}}".into()),
+            agent: None,
+            model: None,
+        });
+        let items = command_items(&commands);
+        assert!(items.iter().any(|item| {
+            item.value == "deploy"
+                && item.label == "/deploy [env]"
+                && item.detail.as_deref() == Some("custom deployment command")
+        }));
     }
 
     #[test]
@@ -15042,6 +15300,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
         assert_eq!(view_order(&app), vec!["s2"]);
+        assert!(!app.should_clear_active_workspace());
         assert_eq!(app.input.mode(), Mode::Normal);
         let mut saved = None;
         while let Ok(command) = rx.try_recv() {
@@ -15092,6 +15351,7 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
         assert!(app.should_quit);
+        assert!(app.should_clear_active_workspace());
         let mut saved = None;
         while let Ok(command) = rx.try_recv() {
             if let Command::DraftSet { session_id, text } = command {
@@ -15168,6 +15428,7 @@ mod tests {
                 &tx,
             );
             assert!(app.should_quit, "Ctrl-{key} should quit from insert mode");
+            assert!(!app.should_clear_active_workspace());
 
             let mut app = App::new(None);
             app.focus = Focus::Transcript;
@@ -15179,6 +15440,7 @@ mod tests {
                 app.should_quit,
                 "Ctrl-{key} should quit from the transcript"
             );
+            assert!(!app.should_clear_active_workspace());
         }
     }
 
@@ -15284,7 +15546,7 @@ mod tests {
     }
 
     #[test]
-    fn transcript_pane_requires_leader_for_pane_actions() {
+    fn transcript_pane_requires_leader_for_pane_actions_except_q() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.views.push(SessionView::new(
@@ -15294,8 +15556,9 @@ mod tests {
         app.focused = 0;
         app.focus = Focus::Transcript;
 
-        // Bare letters are inert: no pane action, no accidental quit.
-        for ch in ['o', 'p', 'n', 'N', 'c', 'w', 'b', 'x', 'a', 'q'] {
+        // Bare letters are inert: no pane action, no accidental quit. `q` is
+        // the one exception and is checked below.
+        for ch in ['o', 'p', 'n', 'N', 'c', 'w', 'b', 'x', 'a'] {
             app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
             assert!(app.picker.is_none(), "bare {ch} opened a picker");
             assert!(app.process_view.is_none(), "bare {ch} opened processes");
@@ -15303,6 +15566,13 @@ mod tests {
         }
         assert!(!app.creating, "bare n created a session");
         assert!(rx.try_recv().is_err(), "bare keys sent a command");
+
+        // `q` closes the focused pane, except when it is the last one.
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views.len(), 1, "bare q closed the last pane");
+        assert!(!app.should_quit, "bare q quit the app");
+        assert_eq!(app.status, "cannot close the last pane");
+        let _ = rx.try_recv();
 
         // `i` is the vim-style exception: it focuses the prompt in insert mode.
         app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
@@ -15499,6 +15769,35 @@ mod tests {
         assert_eq!(app.focused, 1);
         assert!(matches!(app.focus, Focus::Input));
         assert_eq!(app.input.mode(), Mode::Normal);
+    }
+
+    #[test]
+    fn q_closes_the_focused_pane_and_never_quits_on_the_last() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.views.push(SessionView::new(
+            Session::new("s2", "two", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Input;
+        app.input.enter_normal();
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views.len(), 1);
+        assert_eq!(app.views[0].session.id, "s2");
+        assert!(!app.should_quit);
+
+        // The transcript accepts the same key, but the last pane stays open.
+        app.focus = Focus::Transcript;
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views.len(), 1);
+        assert!(!app.should_quit);
+        assert_eq!(app.status, "cannot close the last pane");
     }
 
     #[test]
@@ -16249,7 +16548,7 @@ mod tests {
             "{text}"
         );
         assert!(app.status_bar_middle().is_none());
-        assert!(app.toasts.is_empty());
+        assert!(app.toast.is_none() && app.pending_toast.is_none());
 
         app.integrations.insert(
             "s1".into(),
@@ -16263,7 +16562,7 @@ mod tests {
         let text = render_text(&mut app, 80, 20);
         assert!(!text.contains("integration · merged"), "{text}");
         assert!(app.status_bar_middle().is_none());
-        assert!(app.toasts.is_empty());
+        assert!(app.toast.is_none() && app.pending_toast.is_none());
     }
 
     #[test]
@@ -16300,8 +16599,85 @@ mod tests {
             let bar = status_bar_row(&text);
             assert!(!bar.contains(status), "{status}: {bar}");
             assert!(app.status_bar_middle().is_none(), "{status}");
-            assert!(app.toasts.is_empty(), "{status}");
+            assert!(
+                app.toast.is_none() && app.pending_toast.is_none(),
+                "{status}"
+            );
         }
+    }
+
+    #[test]
+    fn config_reload_finishes_with_a_top_right_toast() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+
+        app.handle_event(
+            Event::ConfigReloaded {
+                paths: vec!["/tmp/global.yaml".into(), "/tmp/project.yaml".into()],
+                max_parallel_subagents: 8,
+            },
+            &tx,
+        );
+
+        assert_eq!(app.status, "config reloaded (2 layer(s))");
+        assert_eq!(app.subagent_concurrency, 8);
+        let toast = app.toast.as_ref().expect("reload toast");
+        assert_eq!(toast.text, "config reloaded (2 layer(s))");
+        assert_eq!(toast.tone, ToastTone::Success);
+
+        let text = render_text(&mut app, 80, 20);
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("config reloaded (2 layer(s))")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn config_reload_refreshes_user_commands() {
+        let dir = std::env::temp_dir().join(format!(
+            "eix-commands-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let commands_dir = dir.join(".eix/cmds");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(commands_dir.join("live.md"), "first\n").unwrap();
+
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", dir.clone()),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.set_compat(eix_core::CompatConfig::default());
+
+        let template = |app: &App, name: &str| {
+            app.commands
+                .iter()
+                .find(|spec| spec.name == name)
+                .and_then(|spec| spec.template.clone())
+        };
+        assert_eq!(template(&app, "live").as_deref(), Some("first"));
+
+        std::fs::write(commands_dir.join("live.md"), "second\n").unwrap();
+        std::fs::write(commands_dir.join("new.md"), "new\n").unwrap();
+        app.handle_event(
+            Event::ConfigReloaded {
+                paths: Vec::new(),
+                max_parallel_subagents: 4,
+            },
+            &tx,
+        );
+
+        assert_eq!(template(&app, "live").as_deref(), Some("second"));
+        assert_eq!(template(&app, "new").as_deref(), Some("new"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -17045,6 +17421,7 @@ mod tests {
         app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
 
         assert!(app.should_quit, "closing the last pane quits the TUI");
+        assert!(app.should_clear_active_workspace());
         assert_eq!(app.views.len(), 1);
         assert!(app.status.contains("quitting"));
         match rx.try_recv().expect("draft save") {
@@ -17054,38 +17431,14 @@ mod tests {
     }
 
     #[test]
-    fn slash_commands_mirror_the_action_palette() {
+    fn command_palette_mirrors_the_slash_command_menu() {
         let commands = builtin_commands();
-        let builtins: HashSet<&str> = commands.iter().map(|spec| spec.name.as_str()).collect();
-        for item in command_items() {
-            let slash = if item.value == "close-pane" {
-                "close"
-            } else {
-                item.value.as_str()
-            };
-            assert!(
-                builtins.contains(slash),
-                "palette action {:?} has no /{slash} command",
-                item.value
-            );
-        }
-    }
-
-    #[test]
-    fn every_palette_action_has_a_working_slash_command() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
-        for item in command_items() {
-            let name = if item.value == "close-pane" {
-                "close"
-            } else {
-                item.value.as_str()
-            };
-            let mut app = App::new(None);
-            assert!(
-                app.handle_prompt_command(&format!("/{name}"), &tx),
-                "/{name} was not handled"
-            );
-            assert!(app.error.is_none(), "/{name} failed: {:?}", app.error);
+        let items = command_items(&commands);
+        assert_eq!(items.len(), commands.len());
+        for (item, spec) in items.iter().zip(commands.iter()) {
+            assert_eq!(item.value, spec.name);
+            assert_eq!(item.label, command_label(spec, "/"));
+            assert_eq!(item.detail.as_deref(), Some(spec.description.as_str()));
         }
     }
 
@@ -18015,7 +18368,10 @@ mod tests {
                     .is_some_and(|line| line.contains(hidden)),
                 "{hidden}: {text}"
             );
-            assert!(app.toasts.is_empty(), "{hidden}");
+            assert!(
+                app.toast.is_none() && app.pending_toast.is_none(),
+                "{hidden}"
+            );
         }
         assert!(!status_bar_row(&render_text(&mut app, 80, 20)).contains("status test"));
 
@@ -18055,7 +18411,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(
-            app.toasts.last().map(|toast| toast.tone),
+            app.toast.as_ref().map(|toast| toast.tone),
             Some(ToastTone::Warning)
         );
 
@@ -18139,7 +18495,7 @@ mod tests {
         assert!(app.status_warning_is_redundant());
         let text = render_text(&mut app, 80, 20);
         assert!(text.contains("provider returned 500"), "{text}");
-        assert!(app.toasts.is_empty());
+        assert!(app.toast.is_none() && app.pending_toast.is_none());
     }
 
     #[test]
@@ -18156,7 +18512,7 @@ mod tests {
 
         assert!(app.status_warning_is_redundant());
         let _text = render_text(&mut app, 80, 20);
-        assert!(app.toasts.is_empty());
+        assert!(app.toast.is_none() && app.pending_toast.is_none());
     }
 
     #[test]
@@ -18195,13 +18551,14 @@ mod tests {
         assert!(!bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");
         assert_eq!(
-            app.toasts.first().map(|toast| toast.tone),
+            app.toast.as_ref().map(|toast| toast.tone),
             Some(ToastTone::Warning)
         );
 
         // Expiry removes the notice without replaying the alert or moving the
         // persistent statusline metadata.
-        app.toasts[0].until = Instant::now() - ATTENTION_TOAST_DISPLAY;
+        app.toast.as_mut().expect("attention toast").min_until =
+            Instant::now() - ATTENTION_TOAST_DISPLAY;
         let text = render_text(&mut app, 80, 20);
         assert!(!text.contains("worker · awaiting_approval"), "{text}");
         let bar = status_bar_row(&text);

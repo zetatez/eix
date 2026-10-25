@@ -605,6 +605,10 @@ impl Editor {
             'Z' if self.op.is_none() && self.count.is_none() => {
                 return Outcome::Action("quit");
             }
+            // `q` closes the focused pane, but never the last one.
+            'q' if self.op.is_none() && self.count.is_none() => {
+                return Outcome::Action("close-pane");
+            }
             '1'..='9' => {
                 self.push_count(c);
                 return Outcome::Ignored;
@@ -2088,6 +2092,24 @@ mod tests {
         let mut editor = Editor::new();
         key(&mut editor, KeyCode::Char('Z'));
         assert_eq!(editor.text(), "Z");
+    }
+
+    #[test]
+    fn normal_q_closes_the_pane_but_insert_q_types() {
+        let mut editor = editor_with("");
+        assert_eq!(
+            key(&mut editor, KeyCode::Char('q')),
+            Outcome::Action("close-pane")
+        );
+
+        // A pending vim prefix keeps `q` for the editor.
+        let mut editor = editor_with("one");
+        press(&mut editor, "2");
+        assert_eq!(key(&mut editor, KeyCode::Char('q')), Outcome::Ignored);
+
+        let mut editor = Editor::new();
+        key(&mut editor, KeyCode::Char('q'));
+        assert_eq!(editor.text(), "q");
     }
 
     #[test]
