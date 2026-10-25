@@ -1,0 +1,240 @@
+# ============================================================================
+# eix config template (YAML reference)
+# ============================================================================
+# eix loads YAML.
+# Global: ~/.config/eix/config.yaml
+# Project: <ancestor>/.eix/config.yaml (nearest wins; arrays replace)
+# Placeholders: {env:NAME}, {file:path}
+# Keep secrets in environment variables, not in this file.
+# ============================================================================
+
+
+# OpenAI-compatible providers. Exactly one entry must set default = true; its
+# table key is the model prefix. The default provider's model is the fallback
+# used when a session has no explicit model. Common endpoints are listed below.
+providers:
+  llmgate:
+    default: true
+    base_url: "http://127.0.0.1:3210/v1"
+    model: "deepseek/deepseek-v4.1-flash"
+    api_key: ""
+
+  # openai:
+  #   default: true
+  #   name: "OpenAI"                 # optional display name
+  #   base_url: "https://api.openai.com/v1"
+  #   model: "gpt-4o-mini"
+  #   api_key_env: "OPENAI_API_KEY"
+  # deepseek:
+  #   base_url: "https://api.deepseek.com"
+  #   api_key_env: "DEEPSEEK_API_KEY"
+  # opencode:
+  #   base_url: "https://opencode.ai/zen/v1"
+  #   api_key_env: "OPENCODE_API_KEY"
+  # groq:
+  #   base_url: "https://api.groq.com/openai/v1"
+  #   api_key_env: "GROQ_API_KEY"
+  # gemini:
+  #   base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+  #   api_key_env: "GEMINI_API_KEY"
+  # anthropic:
+  #   base_url: "https://api.anthropic.com/v1/"  # OpenAI compatibility layer
+  #   api_key_env: "ANTHROPIC_API_KEY"
+  # xai:
+  #   base_url: "https://api.x.ai/v1"
+  #   api_key_env: "XAI_API_KEY"
+  # ollama:
+  #   base_url: "http://localhost:11434/v1"  # no key
+
+# Global provider runtime knobs (timeout, retries, default context window and
+# system prompt). These are not per-provider settings.
+provider_runtime:
+  timeout_secs: 300
+  retry_attempts: 8
+  retry_base_ms: 250
+  retry_max_secs: 60
+  # context_tokens: 128000
+  # system_prompt: "You are eix..."
+
+# Optional pinned models. `provider` references a providers key.
+# models:
+#   - id: "openrouter/gpt-5"
+#     provider: "openrouter"
+#     model: "openai/gpt-5"
+#     variants: ["low", "medium", "high"]
+
+# Tool safety. Defaults are shown; uncomment to change.
+# The session mode (Plan/Build/Auto/Bypass) decides the capability ceiling and
+# whether unruled default asks run automatically; explicit rules still apply.
+tools:
+  # Apply low/medium file edits inside the workspace immediately. Snapshots
+  # and patch records are still kept; set false to review each edit.
+  auto_apply_workspace_edits: true
+  # rules:
+  #   - tool: "run_command"
+  #     command: ["cargo", "test"]
+  #     action: "sandbox"
+  #   - tool: "run_command"
+  #     command_regex: '^rm '
+  #     action: "deny"
+  #   - tool: "write_file"
+  #     path: "src/**"
+  #     action: "ask"
+  # external_directory: ["/tmp/shared", "~/.cache/tool/**"]
+  # network_allow: ["docs.rs", "*.github.com"]
+  # Other defaults: max_output_bytes=20000, command_timeout_secs=60,
+  # max_tool_rounds=64, sandbox=auto, sandbox_network=false,
+  # sandbox_read_paths=[~/.cargo, ~/.rustup, ~/.cache, ~/.npm],
+  # sandbox_writable_roots=[], snapshots=true.
+
+
+# Worktrees are opt-in: use `eix new --worktree` or `/new-worktree`.
+# `worktree.auto: true` restores lazy creation on the first prompt.
+# `/ready` is user-triggered unless integration.auto_ready is enabled.
+worktree:
+  auto: false
+  base: auto          # session's starting branch; or an explicit branch
+
+integration:
+  auto_ready: false   # true scans idle sessions
+  auto_commit: true   # commit the worktree before /ready merges it
+
+# Optional: notify on approval/input/error.
+# notifications:
+#   bell: false
+#   command: 'notify-send eix "$EIX_SESSION_NAME: $EIX_STATUS"'
+#   cooldown_secs: 10
+
+
+# Context budget and compaction. Defaults are shown.
+# context:
+#   budget_tokens: 32000
+#   auto_compact: true
+#   auto_compact_threshold: 0.8
+#   auto_compact_keep_tokens: 8000  # recent conversation kept verbatim
+#   auto_compact_keep_turns: 2      # minimum recent turns even above token cap
+#   tool_output_tokens: 4000
+#   max_tool_schema_tokens: 12000
+#   instructions_files: ["AGENTS.md"]
+#   workspace_summary: true
+
+
+# Compatibility with other agent harnesses. All switches are OFF by default;
+# native .eix / ~/.config/eix resources are always loaded.
+#
+# Set one to true to load that harness's global and project resources:
+#   claude_code: ~/.claude + .claude  (skills, commands, agents, CLAUDE.md)
+#   opencode:    ~/.config/opencode + .opencode (skills, commands, agents, AGENTS.md)
+#   codex_cli:   $CODEX_HOME + .codex (skills, prompts, AGENTS.md)
+#   gemini_cli:  ~/.gemini + .gemini (skills, TOML commands, agents, GEMINI.md)
+#   pi:          $PI_CODING_AGENT_DIR + .pi (skills, prompts, AGENTS.md/CLAUDE.md)
+#
+# Paseo skills live under ~/.claude/skills, so enable claude_code for those.
+# OpenCode commands such as fix.bug live under ~/.config/opencode/commands,
+# so enable opencode for those.
+#
+# Project .eix/config.yaml may only turn these switches OFF; it cannot enable
+# another agent's resources.
+compations:
+  claude_code: false
+  opencode: false
+  codex_cli: false
+  gemini_cli: false
+  pi: false
+
+
+# Optional: remote TCP/HTTP attach. token is required when enabled.
+# server:
+#   tcp: "127.0.0.1:7420"
+#   http: "127.0.0.1:7421"
+#   token: "{env:EIX_REMOTE_TOKEN}"
+
+
+# Common MCP servers. They start lazily and require Node.js/npx.
+mcp:
+  servers:
+    context7:
+      command: "npx"
+      args: ["-y", "@upstash/context7-mcp"]
+    sequential-thinking:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+    memory:
+      command: "npx"
+      args: ["-y", "@modelcontextprotocol/server-memory"]
+      env:
+        MEMORY_FILE_PATH: "{env:HOME}/.config/eix/memory.json"
+
+    # Optional browser automation; run `npx playwright install chromium` first.
+    # playwright:
+    #   command: "npx"
+    #   args: ["-y", "@playwright/mcp@latest"]
+
+    # Use allowed_tools / denied_tools to narrow tools if needed.
+
+
+# Image defaults: 4 per prompt, 8 MiB each, 30-day retention, 2 GiB store.
+# images:
+#   max_prompt_images: 4
+#   max_image_bytes: 8388608
+#   retention_days: 30
+#   max_store_bytes: 2147483648
+
+
+# Diagnostics after writes are enabled by default for bash, cpp, css, go, html,
+# json, lua, markdown, python, rust, sql, toml, typescript, and yaml. Servers
+# start lazily when installed. Add [lsp.servers.<name>] only to override one or
+# add another language.
+
+
+# Post-write formatting is enabled by default and selected by extension,
+# including Go, Rust, Python, JS/TS, C/C++, Shell, Lua, TOML, SQL, HCL, Nix,
+# Kotlin, Swift, Dart, Elixir, Haskell, OCaml, Scala, Ruby, PHP, R, Zig, Nim,
+# V, Crystal, Gleam, Elm, Clojure, Solidity, Markdown, JSON, YAML, HTML/CSS,
+# GraphQL, Proto, and more. Missing executables are skipped silently.
+# eix appends the file path to `command`; entries listed here override the
+# built-in candidates. Set `formatter_defaults: false` to disable the built-in
+# fallback entirely.
+# formatter:
+#   - command: "rustfmt --edition 2021"
+#     extensions: ["rs"]
+#   - command: "prettier --write"
+#     extensions: ["json"]
+
+
+# Optional: TUI palette. Available presets:
+#   github-dark, github-light, gruvbox-dark, solarized-dark, solarized-light, nord, dracula, catppuccin-mocha
+theme:
+  preset: "github-dark"
+
+
+# Optional: transcript key overrides. Defaults are built in; `keys` only
+# overrides them. Leader = Space.
+#   quit            Z / Ctrl-C / Ctrl-D
+#   help            ? / F1
+#   new_session     Space n / Space N
+#   new_worktree    Space W
+#   sessions        Space s / Ctrl-G
+#   new_pane        Space o
+#   palette         Ctrl-P / Space a
+#   model           Ctrl-/
+#   worktrees       Space w
+#   branches        Space b
+#   ledger          Space C
+#   processes       Space p
+#   inbox           Space R
+#   fork            Space F
+#   attention       Space A
+#   cancel          Space x
+#   next_session    Shift+. / >
+#   prev_session    Shift+, / <
+#   scroll_down     j / Down / PgDn
+#   scroll_up       k / Up / PgUp / Ctrl-U
+#   timeline        /timeline
+#   todos           /todos
+#   undo            /undo
+#   redo            /redo
+# Prompt normal mode keeps vim keys; overlay keys are in README.
+# Override with a modified/named/punctuation key; bare letters are ignored.
+# Examples: sessions: "C-t" · new_session: "C-n" · help: "F2"
+keys: {}

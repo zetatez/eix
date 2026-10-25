@@ -1,0 +1,18 @@
+[package]
+name = "eix-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed Rust client for the eix HTTP JSON-RPC API"
+
+[dependencies]
+eix-core = { path = "../eix-core" }
+futures-util = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

@@ -1,0 +1,551 @@
+//! The append-only event log is the source of truth for a session's history.
+//! Everything a frontend shows (transcript, approvals, patches, status) is a
+//! projection of these events.
+
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use crate::{SessionId, SessionMode, SessionStatus, ToolCall, Usage};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventKind {
+    UserMessage,
+    AssistantMessage,
+    ToolCall,
+    ToolResult,
+    PatchProposed,
+    PatchApplied,
+    PatchRejected,
+    PatchConflict,
+    ApprovalRequired,
+    /// The model asked the user a question and is waiting for an answer.
+    InputRequired,
+    /// The user answered an `InputRequired`.
+    InputAnswered,
+    /// Pre-execution snapshot of what a mutating tool is about to touch.
+    Snapshot,
+    /// A background process started / finished. Output is not an event.
+    ProcessStarted,
+    ProcessExited,
+    StatusChanged,
+    ContextCompacted,
+    ContextPinned,
+    ContextDropped,
+    /// Everything before this event is ignored when rebuilding provider
+    /// messages. The transcript and event log keep it.
+    ContextCleared,
+    /// A session's execution mode changed (including temporary changes).
+    Mode,
+    /// Audit record for a tool permission decision.
+    PermissionEvaluated,
+    Error,
+    /// A worktree integration lifecycle note. This is transcript metadata, not
+    /// provider chat context.
+    Integration,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UserMessage => "user_message",
+            Self::AssistantMessage => "assistant_message",
+            Self::ToolCall => "tool_call",
+            Self::ToolResult => "tool_result",
+            Self::PatchProposed => "patch_proposed",
+            Self::PatchApplied => "patch_applied",
+            Self::PatchRejected => "patch_rejected",
+            Self::PatchConflict => "patch_conflict",
+            Self::ApprovalRequired => "approval_required",
+            Self::InputRequired => "input_required",
+            Self::InputAnswered => "input_answered",
+            Self::Snapshot => "snapshot",
+            Self::ProcessStarted => "process_started",
+            Self::ProcessExited => "process_exited",
+            Self::StatusChanged => "status_changed",
+            Self::ContextCompacted => "context_compacted",
+            Self::ContextPinned => "context_pinned",
+            Self::ContextDropped => "context_dropped",
+            Self::ContextCleared => "context_cleared",
+            Self::Mode => "mode",
+            Self::PermissionEvaluated => "permission_evaluated",
+            Self::Error => "error",
+            Self::Integration => "integration",
+        }
+    }
+
+    /// Kinds that become provider chat messages when rebuilding context.
+    pub fn is_message(self) -> bool {
+        matches!(self, Self::UserMessage | Self::AssistantMessage)
+    }
+}
+
+impl std::str::FromStr for EventKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+            "user_message" => Self::UserMessage,
+            "assistant_message" => Self::AssistantMessage,
+            "tool_call" => Self::ToolCall,
+            "tool_result" => Self::ToolResult,
+            "patch_proposed" => Self::PatchProposed,
+            "patch_applied" => Self::PatchApplied,
+            "patch_rejected" => Self::PatchRejected,
+            "patch_conflict" => Self::PatchConflict,
+            "approval_required" => Self::ApprovalRequired,
+            "input_required" => Self::InputRequired,
+            "input_answered" => Self::InputAnswered,
+            "snapshot" => Self::Snapshot,
+            "process_started" => Self::ProcessStarted,
+            "process_exited" => Self::ProcessExited,
+            "status_changed" => Self::StatusChanged,
+            "context_compacted" => Self::ContextCompacted,
+            "context_pinned" => Self::ContextPinned,
+            "context_dropped" => Self::ContextDropped,
+            "context_cleared" => Self::ContextCleared,
+            "mode" => Self::Mode,
+            // Old logs may still contain `permission` events. Reading them as
+            // mode events keeps the append-only log loadable; their old
+            // payload is simply not rendered by the new frontends.
+            "permission" => Self::Mode,
+            "permission_evaluated" => Self::PermissionEvaluated,
+            "error" => Self::Error,
+            "integration" => Self::Integration,
+            _ => return Err(()),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Event {
+    pub session_id: SessionId,
+    pub seq: u64,
+    pub ts: i64,
+    pub kind: EventKind,
+    pub payload: Value,
+}
+
+impl Event {
+    pub fn new(
+        session_id: impl Into<SessionId>,
+        seq: u64,
+        kind: EventKind,
+        payload: Value,
+    ) -> Self {
+        Self {
+            session_id: session_id.into(),
+            seq,
+            ts: crate::now_ms(),
+            kind,
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserMessagePayload {
+    pub text: String,
+    /// Images attached to this prompt. New prompts reference content-addressed
+    /// blobs; legacy events may still carry inline base64.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ImageAttachment {
+    /// Path as entered by the user, for display.
+    pub path: String,
+    pub mime: String,
+    /// Base64, without the `data:` prefix. New prompts leave this empty and
+    /// reference `blob`; older events remain readable.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub data: String,
+    /// Content-addressed blob id under `<data>/blobs`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blob: Option<String>,
+    /// Original image size in bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AssistantMessagePayload {
+    pub text: String,
+    pub model: String,
+    /// Streamed chain-of-thought, when the provider exposed it. Display-only:
+    /// it is never sent back as a chat message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// True when the turn was cancelled and only a partial answer was kept.
+    #[serde(default)]
+    pub cancelled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    /// Tool calls requested alongside this assistant message. The matching
+    /// `tool_call` / `tool_result` events carry the same call ids.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<ToolCall>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolCallPayload {
+    pub call_id: String,
+    pub tool: String,
+    pub arguments: Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolResultPayload {
+    pub call_id: String,
+    pub tool: String,
+    pub ok: bool,
+    /// The user denied the call; `output` explains why.
+    #[serde(default)]
+    pub denied: bool,
+    pub output: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+}
+
+/// One selectable hunk of a proposed write, including its rendered lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HunkInfo {
+    pub index: usize,
+    pub header: String,
+    pub lines: Vec<String>,
+}
+
+/// A write that has been staged in the session's shadow workspace. The bytes
+/// live under `<data>/staging/<session>/<patch_id>.json`; this event carries the
+/// reviewable diff and hunk preview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchProposedPayload {
+    pub patch_id: String,
+    pub call_id: String,
+    pub tool: String,
+    /// Workspace-relative path, for display.
+    pub path: String,
+    pub summary: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<HunkInfo>,
+}
+
+/// Outcome of applying, rejecting or conflicting a staged patch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PatchResultPayload {
+    pub patch_id: String,
+    pub call_id: String,
+    pub path: String,
+    /// True when the change landed on disk.
+    #[serde(default)]
+    pub applied: bool,
+    /// True when the file changed after the patch was staged.
+    #[serde(default)]
+    pub conflict: bool,
+    /// Hunk indices that were applied (empty means the whole change).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    /// Unified diff rebuilt from the bytes that actually landed on disk. It
+    /// updates the pre-approval preview after formatting, and is the only
+    /// diff for writes that applied without a `patch_proposed` event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// One selectable answer to an `ask_user` question.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputOption {
+    pub label: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+/// The model asked the user a multiple-choice question and is blocked until
+/// they answer. `options` is ordered best-first; index 0 is the recommendation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputRequiredPayload {
+    pub input_id: String,
+    pub call_id: String,
+    pub question: String,
+    pub options: Vec<InputOption>,
+}
+
+/// The user's answer to an `InputRequired`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputAnsweredPayload {
+    pub input_id: String,
+    pub call_id: String,
+    pub answer: String,
+    pub option_index: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApprovalRequiredPayload {
+    pub approval_id: String,
+    pub call_id: String,
+    pub tool: String,
+    pub summary: String,
+    pub arguments: Value,
+    /// Unified diff preview for file-writing tools. Absent for tools that
+    /// cannot be previewed, such as shell commands.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+    /// Per-hunk preview for file-writing tools, used for hunk-level approval.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hunks: Vec<HunkInfo>,
+    /// `low`, `medium`, `high` or `critical`.
+    #[serde(default)]
+    pub risk: String,
+    /// Machine tags such as `exec-sandboxed`, `network`, `write-local`.
+    #[serde(default)]
+    pub risk_categories: Vec<String>,
+    /// Why the risk analyser / rule produced this decision.
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// Matching rule id, when an explicit rule caused the prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    /// `builtin`, `user`, `project` or `session`.
+    #[serde(default)]
+    pub rule_source: String,
+    /// `sandbox`, `direct` or `unavailable`.
+    #[serde(default)]
+    pub sandbox: String,
+    /// Shell segments as parsed by the risk analyser (wrappers preserved).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parsed_command: Option<String>,
+    /// Scopes the UI may offer for an "Always" choice.
+    #[serde(default)]
+    pub scopes: Vec<String>,
+}
+
+/// Audit record for one permission decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PermissionEvaluatedPayload {
+    pub call_id: String,
+    pub tool: String,
+    pub action: String,
+    pub risk: String,
+    pub risk_categories: Vec<String>,
+    pub reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
+    pub rule_source: String,
+    pub sandbox: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parsed_command: Option<String>,
+    /// Present when `auto` mode consulted the model classifier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classifier: Option<ClassifierAuditPayload>,
+}
+
+/// One classifier verdict, kept beside the static permission audit so users
+/// can see why a call ran without a prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClassifierAuditPayload {
+    /// `allow` or `ask`.
+    pub decision: String,
+    pub confidence: f64,
+    pub reason: String,
+    pub model: String,
+    /// True when an identical recent call reused a cached allow.
+    #[serde(default)]
+    pub cached: bool,
+    /// Wall-clock classification latency in milliseconds.
+    #[serde(default)]
+    pub latency_ms: u64,
+}
+
+/// Metadata for a pre-execution snapshot. The bytes live in
+/// `<data>/snapshots/<session>/<snapshot_id>/`; this event only records that
+/// the copy happened (or why it did not).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotPayload {
+    pub snapshot_id: String,
+    pub call_id: String,
+    pub tool: String,
+    /// `file` when a single write target was copied, `tree` for a workspace
+    /// snapshot taken before a shell command.
+    pub scope: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub files: usize,
+    #[serde(default)]
+    pub bytes: u64,
+    /// Files that could not be copied (too large, over budget, symlinks, ...).
+    #[serde(default)]
+    pub skipped: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusChangedPayload {
+    pub from: SessionStatus,
+    pub to: SessionStatus,
+}
+
+/// A change to a session's execution mode. `temporary` marks an in-memory
+/// change that will not survive a daemon restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModePayload {
+    pub from: SessionMode,
+    pub to: SessionMode,
+    #[serde(default)]
+    pub temporary: bool,
+}
+
+/// Pin (or unpin) one ledger entry so trimming never drops it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextPinPayload {
+    pub entry: String,
+    pub pinned: bool,
+}
+
+/// Drop one ledger entry from the provider context (or restore it).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextDropPayload {
+    pub entry: String,
+    #[serde(default = "default_true")]
+    pub dropped: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+/// A range of history was replaced with a summary. The original events remain
+/// in the log; this only affects what is sent to the provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCompactedPayload {
+    pub from_seq: u64,
+    pub to_seq: u64,
+    pub messages: usize,
+    pub tokens: usize,
+    pub summary: String,
+    /// Automatic compactions include the previous summary and supersede older
+    /// summary entries in the provider context. Manual compactions leave this
+    /// false so unrelated summaries remain visible.
+    #[serde(default)]
+    pub rolling: bool,
+}
+
+/// Everything with `seq <=` this event's sequence is excluded from provider
+/// messages. The log keeps it so the transcript stays complete and the user can
+/// still search it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextClearedPayload {}
+
+/// A background process was started by `start_command`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessStartedPayload {
+    pub process_id: String,
+    pub command: String,
+    pub cwd: String,
+    pub pid: u32,
+}
+
+/// A background process ended (on its own or because it was killed).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessExitedPayload {
+    pub process_id: String,
+    pub status: String,
+    #[serde(default)]
+    pub exit_code: Option<i32>,
+    #[serde(default)]
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorPayload {
+    pub message: String,
+}
+
+/// Build a `serde_json::Value` for an event payload.
+pub fn payload<T: Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap_or(Value::Null)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kind_round_trips() {
+        let all = [
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::ToolCall,
+            EventKind::ToolResult,
+            EventKind::PatchProposed,
+            EventKind::PatchApplied,
+            EventKind::PatchRejected,
+            EventKind::PatchConflict,
+            EventKind::ApprovalRequired,
+            EventKind::InputRequired,
+            EventKind::InputAnswered,
+            EventKind::Snapshot,
+            EventKind::ProcessStarted,
+            EventKind::ProcessExited,
+            EventKind::StatusChanged,
+            EventKind::ContextCompacted,
+            EventKind::ContextPinned,
+            EventKind::ContextDropped,
+            EventKind::ContextCleared,
+            EventKind::Mode,
+            EventKind::PermissionEvaluated,
+            EventKind::Error,
+            EventKind::Integration,
+        ];
+        for kind in all {
+            assert_eq!(kind.as_str().parse::<EventKind>(), Ok(kind));
+        }
+        assert!("nope".parse::<EventKind>().is_err());
+    }
+
+    #[test]
+    fn message_payloads() {
+        let user = payload(&UserMessagePayload {
+            text: "hi".into(),
+            images: Vec::new(),
+        });
+        assert_eq!(user["text"], "hi");
+
+        let assistant = payload(&AssistantMessagePayload {
+            text: "yo".into(),
+            model: "m".into(),
+            reasoning: None,
+            cancelled: false,
+            usage: None,
+            tool_calls: Vec::new(),
+        });
+        assert_eq!(assistant["text"], "yo");
+        assert!(assistant.get("usage").is_none());
+        assert!(assistant.get("tool_calls").is_none());
+
+        let call = payload(&ToolCallPayload {
+            call_id: "call_1".into(),
+            tool: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.rs"}),
+        });
+        assert_eq!(call["tool"], "read_file");
+
+        let result = payload(&ToolResultPayload {
+            call_id: "call_1".into(),
+            tool: "read_file".into(),
+            ok: true,
+            denied: false,
+            output: "hi".into(),
+            duration_ms: None,
+        });
+        assert_eq!(result["ok"], true);
+        assert!(result.get("duration_ms").is_none());
+    }
+}
