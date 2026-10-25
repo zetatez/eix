@@ -328,11 +328,10 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Space W`             | 在新 git worktree 中新建 session |
  | `Space c`             | 保存并关闭当前 pane              |
  | `Space x`             | 取消当前 turn                    |
- | `Space R`             | 跨 session 审批收件箱            |
+ | `Space a`             | 跨 session 审批收件箱            |
  | `Space m`             | 完整执行模式 picker              |
  | `Space f`             | 文件 picker                      |
- | `Space w`             | worktree picker                  |
- | `Space b`             | branch picker                    |
+ | `Space g`             | git picker（worktrees + branches）|
  | `Space p`             | 后台进程列表                     |
  | `Space v`             | horizontal 布局                  |
  | `Space t`             | tabby 布局                       |
@@ -351,7 +350,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `d`                                                 | 全屏审阅 diff；`Space` 勾选 hunk |
  | `e` / `o`                                           | 编辑 staged 内容 / 打开真实文件  |
  | `r`                                                 | 输入理由并拒绝                   |
- | `Space R`                                           | 跨 session 审批收件箱            |
+ | `Space a`                                           | 跨 session 审批收件箱            |
 
 #### Picker / 浮层通用
 
@@ -408,9 +407,8 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Ctrl-/`                                          | 打开可搜索的模型 picker：输入筛选、`Enter` 切换、`Esc` 关闭（输入框内外都可用；部分终端为 `Ctrl-_` / `Ctrl-7`）                                                                                                                                                                                                                                                                     |
  | `<Space>o`                                        | session picker：在**新 pane** 中打开（已打开则聚焦该 pane），右侧实时预览最近对话                                                                                                                                                                                                                                                                                                   |
  | `<Space>f`                                        | 文件 picker：搜索 workspace 文件，右侧实时预览文件内容，选中后插入 `@相对路径`                                                                                                                                                                                                                                                                                                      |
- | `Ctrl-P`                                          | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / worktrees / branches / processes / approvals / new / fork / cancel / help / quit）                                                                                                                                                                                     |
- | `<Space>w`                                        | worktree picker：选中后把路径插入聚焦 pane 的输入框                                                                                                                                                                                                                                                                                                                                 |
- | `<Space>b`                                        | branch picker：选中后把分支名插入输入框                                                                                                                                                                                                                                                                                                                                             |
+ | `Ctrl-P`                                          | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / git / processes / approvals / new / fork / cancel / help / quit）                                                                                                                                                                                     |
+ | `<Space>g`                                        | git picker：同时列出 worktrees 和 branches；没有 linked worktree 时只显示 branches，选中后把路径或分支名插入聚焦 pane 的输入框                                                                                                                                                                                                                                                      |
  | `@`（输入框内）                                   | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发）                                                                                                                                                                                                                                                                                                                             |
  | `Shift+,` / `Shift+.`                             | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式）                                                                                                                                                                                                                                                                                                             |
  | `Ctrl-W` `Ctrl-W`                                 | 1 秒内连续按两次：聚焦下一个 pane，最后一个回绕到第一个（转录区与输入框 normal 模式）                                                                                                                                                                                                                                                                                               |
@@ -424,7 +422,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | 提问卡片                                          | 模型用 `ask_user` 提问时显示选项：`Ctrl-J`/`Ctrl-K` 移动、`Enter` 确认（`1-9` 直接选）；无头场景用 `eix answer N`                                                                                                                                                                                                                                                                   |
  | `e` / `o`                                         | 编辑 staged 的新内容（改完重新 stage）/ 在 `$EDITOR` 打开真实文件                                                                                                                                                                                                                                                                                                                   |
  | `r`                                               | 输入理由并拒绝（Enter 发送，Esc 取消）                                                                                                                                                                                                                                                                                                                                              |
- | `<Space>R`                                        | 跨 session 审批 inbox（`j/k` 选择、`Enter` 跳转、`y/n` 处理、`Esc` 关闭）                                                                                                                                                                                                                                                                                                           |
+ | `<Space>a`                                        | 跨 session 审批 inbox（`j/k` 选择、`Enter` 跳转、`y/n` 处理、`Esc` 关闭）                                                                                                                                                                                                                                                                                                           |
  | `d`                                               | 全屏审阅待审批写入的 side-by-side diff（左旧右新、语法高亮）；有 hunk 时 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/全不选、`y` 应用选中、`n` 拒绝                                                                                                                                                                                                                  |
  | `<Space>p`                                        | 后台进程：`j/k` 选择、`x` kill、`r` 刷新、`PgUp`/`PgDn` 滚动输出、`Esc` 关闭                                                                                                                                                                                                                                                                                                        |
  | `<Space>x`                                        | 取消聚焦 pane 的 turn                                                                                                                                                                                                                                                                                                                                                               |
@@ -458,7 +456,8 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
  | `/init`                                    | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送                                                                                                                 |
  | `/queue [clear]`                           | 查看队列；`clear` 清空，`rm N` 删除第 N 条，`move N M` 调整顺序                                                                                                              |
  | `/sessions`                                | 打开 session picker                                                                                                                                                          |
- | `/files` / `/worktrees` / `/branches`      | 交互式 picker，选中后插入 `@path` / worktree 路径 / 分支名                                                                                                                   |
+ | `/files`                                   | 文件 picker，选中后插入 `@path`                                                                                                                                              |
+ | `/git`                                     | git picker：worktrees + branches，选中后插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用）                                                                  |
  | `/processes` / `/approvals`                | 背景进程列表 / 审批收件箱                                                                                                                                                    |
  | `/attention` / `/cancel` / `/toggle-mode` | 跳到下一个需要 attention 的 pane / 取消运行 / 正向循环执行模式                                                                                                                |
  | `/model [id]`                              | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `providers.*` 自动拉取的 `/models` 和 `models:`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
@@ -646,7 +645,7 @@ leader；`/`、`?`、`#` 当前对话搜索、翻页/滚动和 `keys:` 绑定也
 vim 编辑键（如 `j`/`k` 行移动、`Tab` / `Shift-Tab` 循环执行模式）保留编辑器语义。
 转录区动作可以通过 `[keys]` 覆盖，但裸字母会被忽略，请用 `C-`/`A-` 修饰键或
 命名键，例如 `sessions = "C-t"`、`new_session = "C-n"`、`help = "F2"`。可用动作：`quit`、`help`、`new_session`、
-`new_worktree`、`sessions`、`new_pane`、`palette`、`model`、`worktrees`、`branches`、
+`new_worktree`、`sessions`、`new_pane`、`palette`、`model`、`git`、
 `processes`、`inbox`、`fork`、`attention`、`cancel`、`next_session`、
 `prev_session`、`scroll_down`、`scroll_up`、`timeline`、`todos`、`undo`、`redo`。
 键写法支持 `Space`、`Tab`、`BackTab`、`Enter`、`Esc`、方向键、`PageUp/PageDown`、
@@ -657,7 +656,7 @@ vim 编辑键（如 `j`/`k` 行移动、`Tab` / `Shift-Tab` 循环执行模式�
 files picker 会按当前选择读取文件内容（带行号，超长自动截断）；sessions picker 会按当前
 选择读取该 session 的最近对话事件，并在右侧显示最新的 you / assistant / tool / error 记录。
 worktree、branch、context 显示 daemon 给出的详情；skills 显示来源、allowed-tools 和正文。
-files / worktrees / branches / context 由 daemon 的 `picker.query` 提供，预览由
+files / git / worktrees / branches / context 由 daemon 的 `picker.query` 提供，预览由
 `picker.preview` 懒加载，其余（sessions、命令面板、skills）在客户端生成。历史 session 不在左侧栏
 常驻，只通过这个浮动 picker 打开（`Ctrl-G` / `/sessions`）。
 
@@ -687,7 +686,7 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：
 `<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
 （`<Space>c` 关闭当前 pane）、`<Space>f` 文件、
-`<Space>w`/`b` worktree/分支、
+`<Space>g` git（worktrees + branches）、
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>m` 完整执行模式、
 `Ctrl-P` 命令面板。normal 模式下裸 `Z`（`Shift+Z`）退出 eix；
 除此之外，裸字母 `o`/`p`/`n`/`q` 等不再触发任何 TUI 动作。
@@ -1359,7 +1358,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] daemon 化的 nvim 前端（内嵌 Lua 插件 + JSON-RPC、`:Eix` 命令、headless 测试）
 - [x] 远程 attach（TCP + 强制 token、首请求 `auth`、CLI `--tcp/--token`）
 - [x] 按连接过滤广播（`session.subscribe`，`null` = 全部；`eix nvim` 只订阅当前 session）
-- [x] 审批增强（`e` 编辑 staged 内容、`o` 打开真实文件、`r` 带理由拒绝、`<Space>R` 跨 session 审批 inbox、风险标签）
+- [x] 审批增强（`e` 编辑 staged 内容、`o` 打开真实文件、`r` 带理由拒绝、`<Space>a` 跨 session 审批 inbox、风险标签）
 - [x] 审批/提问卡片改为 Markdown checkbox 列表（`Ctrl-J/K` / `j/k` 选择、`Enter` 执行、`1-9` 直选、首项推荐；prompt 聚焦和 `tabby` 布局下按键优先给卡片）
 - [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
 - [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）
@@ -1385,7 +1384,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 独立 Neovim 前端交互：`<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`
 - [x] 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider）、两次 `Esc` 回转录区、长草稿自动增高（默认 3 行，总高上限 12 行）
 - [x] 草稿镜像（编辑器变更同步到 `draft.set`，切 session 时从 daemon 回填）
-- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / worktrees / branches，`o`/`Ctrl-P`/`w`/`b`/`@` 入口；独立前端 `:Eix pick [KIND]`）
+- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / git / worktrees / branches，`o`/`Ctrl-P`/`g`/`@` 入口；独立前端 `:Eix pick [KIND]`）
 - [x] 工具补齐：`grep` / `glob` / `edit` / `patch`，`read_file` 行号 + `offset`/`limit` 分页（只读工具自动放行）
 - [x] 自定义 Markdown 命令（`~/.config/eix/cmds`、项目 `.eix/cmds`，兼容旧 `commands` 目录；`/name` 快速调用、`$ARGUMENTS` / `$1..$9`、frontmatter `description`/`agent`/`model`）
 - [x] 自定义 Markdown agent（`~/.config/eix/agents`、项目 `.eix/agents`；`role`/`model`，`/agents` 选择 primary、`spawn_agent agent:` 选择 subagent）

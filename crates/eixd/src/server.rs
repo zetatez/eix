@@ -2579,6 +2579,10 @@ impl Daemon {
                         crate::picker::branches(&session.cwd, params.query.as_deref(), params.limit)
                             .await
                     }
+                    eix_core::KIND_GIT => {
+                        crate::picker::git(&session.cwd, params.query.as_deref(), params.limit)
+                            .await
+                    }
                     _ => unreachable!("validated data kind"),
                 };
                 Ok(serde_json::to_value(result)?)

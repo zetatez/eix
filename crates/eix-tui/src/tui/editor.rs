@@ -1841,11 +1841,10 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
     Some(match ch {
         'o' => "new-pane",
         'f' => "files",
-        'w' => "worktrees",
-        'b' => "branches",
+        'g' => "git",
         'c' => "close-pane",
         'p' => "processes",
-        'R' => "approvals",
+        'a' => "approvals",
         'n' => "new",
         'W' => "new-worktree",
         'v' => "layout-horizontal",
@@ -2069,9 +2068,9 @@ mod tests {
             key(&mut editor, KeyCode::Char('o')),
             Outcome::Action("new-pane")
         );
-        // The command palette is Ctrl-P only; leader+a is not an action.
+        // Unknown leader chords are ignored.
         let _ = key(&mut editor, KeyCode::Char(' '));
-        assert_eq!(key(&mut editor, KeyCode::Char('a')), Outcome::Ignored);
+        assert_eq!(key(&mut editor, KeyCode::Char('z')), Outcome::Ignored);
         // In insert mode space is a literal.
         let mut editor = Editor::new();
         key(&mut editor, KeyCode::Char(' '));
@@ -2131,13 +2130,20 @@ mod tests {
     }
 
     #[test]
-    fn leader_shift_r_opens_approvals() {
+    fn leader_a_opens_approvals() {
         let mut editor = editor_with("");
         let _ = key(&mut editor, KeyCode::Char(' '));
         assert_eq!(
-            key(&mut editor, KeyCode::Char('R')),
+            key(&mut editor, KeyCode::Char('a')),
             Outcome::Action("approvals")
         );
+    }
+
+    #[test]
+    fn leader_g_opens_git_picker() {
+        let mut editor = editor_with("");
+        let _ = key(&mut editor, KeyCode::Char(' '));
+        assert_eq!(key(&mut editor, KeyCode::Char('g')), Outcome::Action("git"));
     }
 
     #[test]

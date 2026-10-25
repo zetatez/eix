@@ -5118,6 +5118,28 @@ async fn picker_query_lists_git_worktrees_and_branches() -> anyhow::Result<()> {
     assert_eq!(branches.items.len(), 1);
     assert_eq!(branches.items[0].value, "feature");
 
+    let combined: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "git", "session_id": session_id}),
+        )
+        .await?;
+    assert_eq!(combined.kind, eix_core::KIND_GIT);
+    assert!(
+        combined.items.iter().any(|item| {
+            item.value == linked.to_string_lossy().as_ref()
+                && item.detail.as_deref() == Some("worktree · eix/linked")
+        }),
+        "linked worktree missing from combined picker: {combined:?}"
+    );
+    assert!(
+        combined
+            .items
+            .iter()
+            .any(|item| item.value == "feature" && item.detail.as_deref() == Some("branch · init")),
+        "branch missing from combined picker: {combined:?}"
+    );
+
     daemon.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())

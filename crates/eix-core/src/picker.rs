@@ -6,10 +6,10 @@
 //! selected row's body with `picker.preview`, and add their own fuzzy filtering
 //! and actions.
 //!
-//! Providers today: `files` (workspace paths), `worktrees` and `branches` (git),
-//! and `context` (the session's ledger). Frontends may also synthesize rows
-//! locally (the TUI command palette), so nothing here assumes the daemon sent
-//! every item.
+//! Providers today: `files` (workspace paths), `git` (worktrees + branches),
+//! `worktrees` and `branches` (git), and `context` (the session's ledger).
+//! Frontends may also synthesize rows locally (the TUI command palette), so
+//! nothing here assumes the daemon sent every item.
 
 use serde::{Deserialize, Serialize};
 
@@ -21,11 +21,13 @@ pub const KIND_FILES: &str = "files";
 pub const KIND_WORKTREES: &str = "worktrees";
 /// Provider name for git branches of the session's repository.
 pub const KIND_BRANCHES: &str = "branches";
+/// Provider name for the combined git worktree/branch picker.
+pub const KIND_GIT: &str = "git";
 /// Preview provider name for a session's recent conversation.
 pub const KIND_SESSION_PREVIEW: &str = "sessions";
 
 /// Every provider the daemon answers for `picker.query`.
-pub const DATA_KINDS: [&str; 3] = [KIND_FILES, KIND_WORKTREES, KIND_BRANCHES];
+pub const DATA_KINDS: [&str; 4] = [KIND_FILES, KIND_WORKTREES, KIND_BRANCHES, KIND_GIT];
 
 /// True when `kind` is a daemon-backed provider.
 pub fn is_data_kind(kind: &str) -> bool {

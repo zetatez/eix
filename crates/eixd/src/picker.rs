@@ -10,7 +10,7 @@ use std::process::Stdio;
 use anyhow::{bail, Context};
 use eix_core::{
     Config, Event, EventKind, PickerItem, PickerPreviewResult, PickerResult, KIND_BRANCHES,
-    KIND_FILES, KIND_SESSION_PREVIEW, KIND_WORKTREES,
+    KIND_FILES, KIND_GIT, KIND_SESSION_PREVIEW, KIND_WORKTREES,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -296,7 +296,7 @@ fn truncate_chars(text: &str, max: usize) -> String {
 
 /// Git worktrees reachable from `cwd`'s repository.
 pub async fn worktrees(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> PickerResult {
-    let raw = git(cwd, &["worktree", "list", "--porcelain"]).await;
+    let raw = run_git(cwd, &["worktree", "list", "--porcelain"]).await;
     let mut items = parse_worktrees(&raw);
     let needle = lower(query);
     items.retain(|item| matches(item, needle.as_deref()));
@@ -305,6 +305,55 @@ pub async fn worktrees(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> P
         kind: KIND_WORKTREES.to_string(),
         items,
     }
+}
+
+/// Worktrees first, then local branches, with the row detail making the type
+/// explicit so a same-named branch and worktree stay distinguishable.
+pub async fn git(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> PickerResult {
+    let (tree_raw, branch_raw) = tokio::join!(
+        run_git(cwd, &["worktree", "list", "--porcelain"]),
+        run_git(
+            cwd,
+            &[
+                "branch",
+                "--format=%(HEAD)\t%(refname:short)\t%(objectname:short)\t%(subject)",
+            ],
+        )
+    );
+    let mut items = combined_git_items(&tree_raw, &branch_raw);
+    let needle = lower(query);
+    items.retain(|item| matches(item, needle.as_deref()));
+    items.truncate(clamp_rows(limit));
+    PickerResult {
+        kind: KIND_GIT.to_string(),
+        items,
+    }
+}
+
+fn combined_git_items(tree_raw: &str, branch_raw: &str) -> Vec<PickerItem> {
+    let mut items = parse_worktrees(tree_raw);
+    // `git worktree list` always includes the main checkout. It is redundant
+    // in the combined picker until there is at least one linked worktree.
+    if items.len() <= 1 {
+        items.clear();
+    }
+    for item in &mut items {
+        prefix_detail(item, "worktree");
+    }
+    for mut item in parse_branches(branch_raw) {
+        prefix_detail(&mut item, "branch");
+        items.push(item);
+    }
+    items
+}
+
+fn prefix_detail(item: &mut PickerItem, kind: &str) {
+    let detail = item.detail.take().unwrap_or_default();
+    item.detail = Some(if detail.is_empty() {
+        kind.to_string()
+    } else {
+        format!("{kind} · {detail}")
+    });
 }
 
 #[derive(Default)]
@@ -371,7 +420,7 @@ fn parse_worktrees(raw: &str) -> Vec<PickerItem> {
 
 /// Local branches of `cwd`'s repository.
 pub async fn branches(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> PickerResult {
-    let raw = git(
+    let raw = run_git(
         cwd,
         &[
             "branch",
@@ -379,6 +428,17 @@ pub async fn branches(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> Pi
         ],
     )
     .await;
+    let mut items = parse_branches(&raw);
+    let needle = lower(query);
+    items.retain(|item| matches(item, needle.as_deref()));
+    items.truncate(clamp_rows(limit));
+    PickerResult {
+        kind: KIND_BRANCHES.to_string(),
+        items,
+    }
+}
+
+fn parse_branches(raw: &str) -> Vec<PickerItem> {
     let mut items = Vec::new();
     for line in raw.lines() {
         let mut parts = line.splitn(4, '\t');
@@ -409,18 +469,12 @@ pub async fn branches(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> Pi
                 .with_preview(preview),
         );
     }
-    let needle = lower(query);
-    items.retain(|item| matches(item, needle.as_deref()));
-    items.truncate(clamp_rows(limit));
-    PickerResult {
-        kind: KIND_BRANCHES.to_string(),
-        items,
-    }
+    items
 }
 
 /// Run `git` and return stdout, or an empty string when it fails (not a repo,
 /// git missing, ...). The picker then simply shows no rows.
-async fn git(cwd: &Path, args: &[&str]) -> String {
+async fn run_git(cwd: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
         .args(args)
         .current_dir(cwd)
@@ -589,11 +643,37 @@ mod tests {
         assert_eq!(items[2].detail.as_deref(), Some("detached"));
     }
 
+    #[test]
+    fn combined_git_omits_the_main_worktree_without_linked_ones() {
+        let tree = "worktree /repo\nHEAD abc123\nbranch refs/heads/main\n";
+        let branches = "*\tmain\tabc123\tinit\n";
+        let items = combined_git_items(tree, branches);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].value, "main");
+        assert_eq!(items[0].detail.as_deref(), Some("branch · init"));
+    }
+
+    #[test]
+    fn combined_git_keeps_the_main_worktree_when_a_linked_one_exists() {
+        let tree = "worktree /repo\nHEAD abc123\nbranch refs/heads/main\n\n\
+                    worktree /repo/.worktrees/feat\nHEAD def456\nbranch refs/heads/eix/feat\n";
+        let branches = "*\tmain\tabc123\tinit\n";
+        let items = combined_git_items(tree, branches);
+        assert!(items.iter().any(|item| {
+            item.value == "/repo" && item.detail.as_deref() == Some("worktree · main")
+        }));
+        assert!(items.iter().any(|item| {
+            item.value == "/repo/.worktrees/feat"
+                && item.detail.as_deref() == Some("worktree · eix/feat")
+        }));
+    }
+
     #[tokio::test]
     async fn git_providers_return_empty_without_a_repo() {
         let dir = temp_dir("no-repo");
         assert!(worktrees(&dir, None, None).await.items.is_empty());
         assert!(branches(&dir, None, None).await.items.is_empty());
+        assert!(git(&dir, None, None).await.items.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 }

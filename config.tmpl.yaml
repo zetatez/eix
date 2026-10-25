@@ -219,13 +219,12 @@ theme:
 #   new_worktree    Space W
 #   sessions        Space s / Ctrl-G
 #   new_pane        Space o
-#   palette         Ctrl-P / Space a
+#   palette         Ctrl-P
 #   model           Ctrl-/
-#   worktrees       Space w
-#   branches        Space b
+#   git             Space g
 #   ledger          Space C
 #   processes       Space p
-#   inbox           Space R
+#   inbox           Space a
 #   fork            Space F
 #   attention       Space A
 #   cancel          Space x

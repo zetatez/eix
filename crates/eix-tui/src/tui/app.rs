@@ -102,7 +102,8 @@ fn builtin(name: &str, args: &str, description: &str) -> CommandSpec {
 /// Old slash-command spellings that stay accepted, mapped to the canonical
 /// name. Aliases are transparent in the menu: typing one shows only its
 /// canonical command, so `/mode` no longer competes with `/model`.
-const COMMAND_ALIASES: &[(&str, &str)] = &[("mode", "perm")];
+const COMMAND_ALIASES: &[(&str, &str)] =
+    &[("mode", "perm"), ("worktrees", "git"), ("branches", "git")];
 
 fn command_alias(name: &str) -> Option<&'static str> {
     COMMAND_ALIASES
@@ -131,8 +132,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("integrate", "", "show this session's integration state"),
         builtin("files", "", "browse and insert workspace files"),
-        builtin("worktrees", "", "browse and insert git worktrees"),
-        builtin("branches", "", "browse and insert git branches"),
+        builtin(
+            "git",
+            "",
+            "browse worktrees and branches, insert a path or name",
+        ),
         builtin("processes", "", "list and inspect background processes"),
         builtin("approvals", "", "open the approval inbox"),
         builtin("attention", "", "jump to the next pane needing attention"),
@@ -704,10 +708,8 @@ enum PickerKind {
     NewPane,
     /// Insert a workspace file after `@` in the prompt.
     Files,
-    /// Insert a git worktree path into the prompt.
-    Worktrees,
-    /// Insert a git branch name into the prompt.
-    Branches,
+    /// Insert a git worktree path or branch name into the prompt.
+    Git,
     /// Client-side command palette (`Ctrl-P`).
     Commands,
     /// Pin the focused session to a configured model.
@@ -735,8 +737,7 @@ impl PickerKind {
     fn data_kind(self) -> Option<&'static str> {
         match self {
             Self::Files => Some(eix_core::KIND_FILES),
-            Self::Worktrees => Some(eix_core::KIND_WORKTREES),
-            Self::Branches => Some(eix_core::KIND_BRANCHES),
+            Self::Git => Some(eix_core::KIND_GIT),
             Self::Sessions
             | Self::NewPane
             | Self::Commands
@@ -766,8 +767,7 @@ impl PickerKind {
             Self::Sessions => "sessions — switch focused pane",
             Self::NewPane => "sessions — open in a new pane",
             Self::Files => "files — insert after @",
-            Self::Worktrees => "worktrees — insert path",
-            Self::Branches => "branches — insert name",
+            Self::Git => "git — insert worktree path or branch",
             Self::Commands => "commands",
             Self::Models => "model — search and switch",
             Self::Agents => "agents — choose the primary agent",
@@ -786,8 +786,7 @@ impl PickerKind {
             Self::Sessions => "Enter open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::NewPane => "Enter split · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Files => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
-            Self::Worktrees => "Enter insert path · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
-            Self::Branches => "Enter insert name · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
+            Self::Git => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Models => "type to search · Enter switch · Esc close",
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
@@ -1079,7 +1078,7 @@ struct BtwView {
     scroll: usize,
 }
 
-/// Cross-session list of pending approvals, opened with `A`.
+/// Cross-session list of pending approvals, opened with `Space a`.
 struct InboxView {
     items: Vec<InboxItem>,
     cursor: usize,
@@ -3680,7 +3679,7 @@ impl App {
             if self.focused_approval().is_none() && self.focused_input().is_none() {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/w/b · n new · o pane · v/t/r/l layout · R approvals · c close · m mode · i input · Z quit · Esc cancel"
+                self.status = "leader: f/g · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · i input · Z quit · Esc cancel"
                     .into();
             }
             return true;
@@ -4708,8 +4707,7 @@ impl App {
             KeyAction::NewPane => self.open_picker(PickerKind::NewPane, tx),
             KeyAction::Palette => self.open_picker(PickerKind::Commands, tx),
             KeyAction::Models => self.open_picker(PickerKind::Models, tx),
-            KeyAction::Worktrees => self.open_picker(PickerKind::Worktrees, tx),
-            KeyAction::Branches => self.open_picker(PickerKind::Branches, tx),
+            KeyAction::Git => self.open_picker(PickerKind::Git, tx),
             KeyAction::Processes => self.open_processes(tx),
             KeyAction::Inbox => self.open_inbox(),
             KeyAction::Fork => self.fork_focused(tx, None),
@@ -5151,7 +5149,7 @@ impl App {
                     self.insert_prompt(&format!("@{value}"));
                 }
             }
-            PickerKind::Worktrees | PickerKind::Branches => {
+            PickerKind::Git => {
                 if let Some(value) = value {
                     self.picker = None;
                     self.insert_prompt(&value);
@@ -5362,8 +5360,7 @@ impl App {
             "sessions" => self.open_picker(PickerKind::Sessions, tx),
             "new-pane" => self.open_picker(PickerKind::NewPane, tx),
             "files" => self.open_picker(PickerKind::Files, tx),
-            "worktrees" => self.open_picker(PickerKind::Worktrees, tx),
-            "branches" => self.open_picker(PickerKind::Branches, tx),
+            "git" | "worktrees" | "branches" => self.open_picker(PickerKind::Git, tx),
             "model" => self.open_picker(PickerKind::Models, tx),
             "agents" => self.open_picker(PickerKind::Agents, tx),
             "subagents" => self.open_picker(PickerKind::Subagents, tx),
@@ -5788,12 +5785,8 @@ impl App {
                 self.open_picker(PickerKind::Files, tx);
                 true
             }
-            "worktrees" => {
-                self.open_picker(PickerKind::Worktrees, tx);
-                true
-            }
-            "branches" => {
-                self.open_picker(PickerKind::Branches, tx);
+            "git" => {
+                self.open_picker(PickerKind::Git, tx);
                 true
             }
             "processes" => {
@@ -9426,21 +9419,16 @@ fn command_items() -> Vec<PickerItem> {
             "Insert @path into the prompt (@)",
         ),
         (
-            "worktrees",
-            "git worktrees",
-            "Insert a worktree path into the prompt (w)",
-        ),
-        (
-            "branches",
-            "git branches",
-            "Insert a branch name into the prompt (b)",
+            "git",
+            "git worktrees & branches",
+            "Insert a worktree path or branch name into the prompt (Space g)",
         ),
         (
             "processes",
             "background processes",
             "List and inspect processes (P)",
         ),
-        ("approvals", "approval inbox", "Pending approvals (A)"),
+        ("approvals", "approval inbox", "Pending approvals (Space a)"),
         (
             "mcp",
             "mcp servers",
@@ -9867,12 +9855,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "search workspace files and insert a path",
             },
             HelpEntry {
-                key: "/worktrees",
-                description: "search git worktrees and insert a path",
-            },
-            HelpEntry {
-                key: "/branches",
-                description: "search git branches and insert a name",
+                key: "/git",
+                description: "search git worktrees and branches, insert a path or name",
             },
             HelpEntry {
                 key: "/processes",
@@ -9992,15 +9976,15 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "newline (insert mode)",
             },
             HelpEntry {
-                key: "Space o/f/w/b",
-                description: "prompt & transcript: new pane / files / worktrees / branches",
+                key: "Space o/f/g",
+                description: "prompt & transcript: new pane / files / git",
             },
             HelpEntry {
                 key: "Space p",
                 description: "prompt & transcript: processes",
             },
             HelpEntry {
-                key: "Space R/x",
+                key: "Space a/x",
                 description: "prompt & transcript: approvals / cancel",
             },
             HelpEntry {
@@ -10068,8 +10052,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "open session in a new pane",
             },
             HelpEntry {
-                key: "Space w / Space b",
-                description: "insert a git worktree path / branch name",
+                key: "Space g",
+                description: "insert a git worktree path or branch name",
             },
             HelpEntry {
                 key: "@ (in prompt)",
@@ -10124,7 +10108,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "deny the pending approval with a reason",
             },
             HelpEntry {
-                key: "Space r",
+                key: "Space a",
                 description: "approvals inbox across sessions",
             },
             HelpEntry {
@@ -14245,14 +14229,7 @@ mod tests {
     #[test]
     fn picker_kinds_map_to_daemon_providers() {
         assert_eq!(PickerKind::Files.data_kind(), Some(eix_core::KIND_FILES));
-        assert_eq!(
-            PickerKind::Worktrees.data_kind(),
-            Some(eix_core::KIND_WORKTREES)
-        );
-        assert_eq!(
-            PickerKind::Branches.data_kind(),
-            Some(eix_core::KIND_BRANCHES)
-        );
+        assert_eq!(PickerKind::Git.data_kind(), Some(eix_core::KIND_GIT));
         assert!(PickerKind::Sessions.data_kind().is_none());
         assert!(PickerKind::Commands.data_kind().is_none());
         assert!(PickerKind::Themes.data_kind().is_none());
@@ -14604,10 +14581,7 @@ mod tests {
         }
         let filtered = app.picker_filtered();
         assert_eq!(filtered.len(), 1);
-        assert_eq!(
-            app.picker.as_ref().unwrap().items[filtered[0]].value,
-            "worktrees"
-        );
+        assert_eq!(app.picker.as_ref().unwrap().items[filtered[0]].value, "git");
     }
 
     #[test]
@@ -14619,12 +14593,12 @@ mod tests {
             Vec::new(),
         ));
         app.focused = 0;
-        app.open_picker(PickerKind::Branches, &tx);
+        app.open_picker(PickerKind::Git, &tx);
         assert!(app.picker.as_ref().unwrap().loading);
         match rx.try_recv().expect("picker command") {
             Command::PickerData { session_id, kind } => {
                 assert_eq!(session_id, "s1");
-                assert_eq!(kind, eix_core::KIND_BRANCHES);
+                assert_eq!(kind, eix_core::KIND_GIT);
             }
             _ => panic!("expected a picker command"),
         }
@@ -15205,11 +15179,17 @@ mod tests {
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE), &tx);
-        assert!(
-            app.picker.is_none(),
-            "leader+a no longer opens the command palette"
-        );
+        assert!(app.picker.is_none(), "leader+a is not the command palette");
+        assert_eq!(app.status, "no pending approvals");
 
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Git)
+        ));
+
+        app.picker = None;
         app.handle_key(
             KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
             &tx,
