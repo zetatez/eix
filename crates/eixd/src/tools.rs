@@ -555,6 +555,12 @@ pub fn summarize(tool: &str, args: &Value) -> String {
             let question = string_arg(args, "question");
             format!("ask_user: {}", truncate(&question, 100))
         }
+        other if other.starts_with(eix_core::PLUGIN_TOOL_PREFIX) => {
+            // Plugin arguments are opaque to the host, so show a bounded JSON
+            // preview in the approval card instead of only the tool name.
+            let args = serde_json::to_string(args).unwrap_or_default();
+            format!("{other} {}", truncate(&args, 200))
+        }
         other => other.to_string(),
     }
 }
@@ -3344,6 +3350,9 @@ mod tests {
             "read_file src/a.rs"
         );
         assert!(summarize("run_command", &json!({"command": "ls"})).starts_with("run_command:"));
+        assert!(
+            summarize("plugin__acme__deploy", &json!({"env": "prod"})).contains("\"env\":\"prod\"")
+        );
         assert!(is_known("ask_user"));
         assert!(is_known("grep"));
         assert!(hard_mutating("write_file"));

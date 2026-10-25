@@ -1,0 +1,9 @@
+name = "echo"
+version = "0.1.0"
+description = "Example eix server plugin: tools, commands, events and storage."
+api_version = 1
+capabilities = ["tools", "commands", "events", "storage"]
+
+[server]
+command = "python3"
+entry = "plugin.py"

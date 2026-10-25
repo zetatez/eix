@@ -13,6 +13,7 @@ pub mod event;
 pub mod message;
 pub mod nvim_plugin;
 pub mod picker;
+pub mod plugin;
 pub mod process;
 pub mod protocol;
 pub mod redact;
@@ -48,6 +49,11 @@ pub use picker::{
     is_data_kind, PickerItem, PickerParams, PickerPreviewParams, PickerPreviewResult, PickerResult,
     DATA_KINDS, KIND_BRANCHES, KIND_FILES, KIND_GIT, KIND_GREP, KIND_SESSION_PREVIEW,
     KIND_WORKTREES,
+};
+pub use plugin::{
+    PluginCapability, PluginCommandInfo, PluginCommandList, PluginConfig, PluginInfo,
+    PluginListResult, PluginManifest, PluginToolCallParams, PluginToolCallResult,
+    PLUGIN_API_VERSION, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{

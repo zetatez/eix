@@ -28,6 +28,9 @@ pub enum RiskCategory {
     GitPublish,
     GitRewrite,
     McpWrite,
+    /// An out-of-process plugin tool. Always treated as potentially mutating
+    /// because the host cannot prove what the child process will do.
+    Plugin,
     Privilege,
     SecretExfil,
 }
@@ -47,6 +50,7 @@ impl RiskCategory {
             Self::GitPublish => "git-publish",
             Self::GitRewrite => "git-rewrite",
             Self::McpWrite => "mcp-write",
+            Self::Plugin => "plugin",
             Self::Privilege => "privilege",
             Self::SecretExfil => "secret-exfil",
         }
@@ -128,6 +132,7 @@ impl RiskAssessment {
                     | RiskCategory::ExecSandboxed
                     | RiskCategory::Destructive
                     | RiskCategory::GitRewrite
+                    | RiskCategory::Plugin
             )
         })
     }

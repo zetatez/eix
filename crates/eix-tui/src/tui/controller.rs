@@ -99,6 +99,8 @@ pub enum Command {
     },
     /// List configured MCP servers and their tool counts.
     ListMcp,
+    /// List prompt commands contributed by server plugins.
+    ListPluginCommands,
     /// Re-read the daemon config files.
     ReloadConfig,
     /// Hide or restore a session.
@@ -229,6 +231,7 @@ impl Command {
             Self::SetSubagentConcurrency { .. } => "subagents",
             Self::ListModels | Self::ListAgents { .. } => "catalog",
             Self::ListMcp => "mcp",
+            Self::ListPluginCommands => "plugin commands",
             Self::ReloadConfig => "reload",
             Self::ArchiveSession { .. } => "archive",
             Self::DeleteSession { .. } => "delete",
@@ -324,6 +327,7 @@ pub enum Event {
     },
     Agents(Vec<eix_core::AgentSpec>),
     Mcp(Vec<eix_core::McpServerInfo>),
+    PluginCommands(Vec<eix_core::PluginCommandInfo>),
     SubagentConcurrency {
         value: usize,
     },
@@ -638,6 +642,11 @@ async fn dispatch(
             let result: eix_core::McpListResult = decode(value)?;
             send(events, Event::Mcp(result.servers))
         }
+        Command::ListPluginCommands => {
+            let value = requester.request("plugin.commands", Value::Null).await?;
+            let result: eix_core::PluginCommandList = decode(value)?;
+            send(events, Event::PluginCommands(result.commands))
+        }
         Command::ArchiveSession {
             session_id,
             archived,
@@ -720,13 +729,21 @@ async fn dispatch(
                 .as_u64()
                 .map(|value| value as usize)
                 .unwrap_or(eix_core::DEFAULT_MAX_PARALLEL_SUBAGENTS);
+            let plugin_commands = requester
+                .request("plugin.commands", Value::Null)
+                .await
+                .ok()
+                .and_then(|value| decode::<eix_core::PluginCommandList>(value).ok())
+                .map(|result| result.commands)
+                .unwrap_or_default();
             send(
                 events,
                 Event::ConfigReloaded {
                     paths,
                     max_parallel_subagents,
                 },
-            )
+            )?;
+            send(events, Event::PluginCommands(plugin_commands))
         }
         Command::Btw {
             session_id,

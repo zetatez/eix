@@ -63,6 +63,9 @@ pub struct Config {
     pub models: Vec<ModelConfig>,
     /// Model Context Protocol servers (stdio transport).
     pub mcp: McpConfig,
+    /// Out-of-process extensions. Only the global config may add plugins;
+    /// project layers are sanitized before merge.
+    pub plugins: BTreeMap<String, crate::plugin::PluginConfig>,
     /// Prompt image limits and blob retention.
     pub images: ImagesConfig,
     /// Language servers used for diagnostics after edits.
@@ -110,6 +113,7 @@ impl Default for Config {
             server: ServerConfig::default(),
             models: Vec::new(),
             mcp: McpConfig::default(),
+            plugins: BTreeMap::new(),
             images: ImagesConfig::default(),
             lsp: LspConfig::default(),
             formatter: FormattersConfig::default(),
@@ -1961,6 +1965,24 @@ impl Config {
                 )));
             }
         }
+        for (name, plugin) in &self.plugins {
+            if !crate::plugin::valid_plugin_name(name) {
+                return Err(ConfigError::Invalid(format!(
+                    "plugins.{name}: names may contain only letters, digits, '.', '_' or '-', \
+                     without '__', and must not be '.' or '..'"
+                )));
+            }
+            if plugin.timeout_secs == 0 {
+                return Err(ConfigError::Invalid(format!(
+                    "plugins.{name}.timeout_secs must be > 0"
+                )));
+            }
+            if plugin.enabled && plugin.command.trim().is_empty() && plugin.manifest.is_none() {
+                return Err(ConfigError::Invalid(format!(
+                    "plugins.{name} needs `command` or `manifest`"
+                )));
+            }
+        }
         for (index, formatter) in self.formatter.0.iter().enumerate() {
             if formatter
                 .command
@@ -2531,6 +2553,15 @@ fn sanitize_project_layer(layer: &mut toml::Value, warnings: &mut Vec<String>) {
             tools.remove("snapshots");
             warnings.push("project config cannot disable snapshots; ignored".into());
         }
+    }
+
+    // Plugins execute code. A cloned project must never be able to add one, so
+    // drop the whole table before it is merged into the global config.
+    if layer
+        .as_table_mut()
+        .is_some_and(|table| table.remove("plugins").is_some())
+    {
+        warnings.push("project config cannot add or configure plugins; ignored".into());
     }
 
     // Automatic merging and test commands are executable policy. Only the
@@ -3239,6 +3270,43 @@ context:
     }
 
     #[test]
+    fn plugins_parse_and_require_an_entry_point() {
+        let dir = config_temp_dir("plugins");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            r#"
+plugins:
+  echo:
+    enabled: true
+    command: python3
+    args: [plugin.py]
+    capabilities: [tools, commands]
+"#,
+        )
+        .unwrap();
+        let config = Config::load_for(Some(&path), &dir).expect("plugin config");
+        let plugin = config.plugins.get("echo").expect("echo plugin");
+        assert!(plugin.enabled);
+        assert_eq!(plugin.command, "python3");
+        assert_eq!(
+            plugin.capabilities,
+            vec![
+                crate::plugin::PluginCapability::Tools,
+                crate::plugin::PluginCapability::Commands
+            ]
+        );
+
+        std::fs::write(
+            &path,
+            "plugins:\n  broken:\n    enabled: true\n    timeout_secs: 5\n",
+        )
+        .unwrap();
+        assert!(Config::load_for(Some(&path), &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn legacy_provider_table_is_migrated() {
         let dir = config_temp_dir("legacy-provider");
         let path = dir.join("config.yaml");
@@ -3459,6 +3527,11 @@ tools:
       command: ["true"]
       action: allow
 
+plugins:
+  repo-plugin:
+    enabled: true
+    command: python3
+
 compations:
   claude_code: true
   opencode: true
@@ -3470,6 +3543,7 @@ compations:
         .unwrap();
 
         let config = Config::load_for(None, &root).expect("project config");
+        assert!(config.plugins.is_empty());
         assert_eq!(config.tools.sandbox, SandboxMode::Auto);
         assert!(!config.tools.sandbox_network);
         assert!(!config
@@ -3506,6 +3580,7 @@ compations:
             "external_directory",
             "network_allow",
             "snapshots",
+            "plugins",
             "allow",
             "compations.claude_code",
             "compations.opencode",

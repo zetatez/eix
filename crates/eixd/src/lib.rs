@@ -14,6 +14,7 @@ pub mod memory;
 pub mod model_catalog;
 pub mod permissions;
 pub mod picker;
+pub mod plugin;
 pub mod process;
 pub mod provider;
 pub mod server;

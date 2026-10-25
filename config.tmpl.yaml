@@ -175,6 +175,20 @@ mcp:
     # Use allowed_tools / denied_tools to narrow tools if needed.
 
 
+# Optional: out-of-process server plugins. Only this global config can add
+# plugins; project `.eix/config.yaml` cannot. Plugins are trusted child
+# processes (not an OS sandbox); their tools default to approval.
+# See examples/plugins/echo/ for a runnable manifest + Python plugin.
+# plugins:
+#   echo:
+#     enabled: true
+#     manifest: examples/plugins/echo/eix-plugin.toml
+#     capabilities: [tools, commands, events, storage]
+#     timeout_secs: 30
+#     allowed_tools: ["word_*", "recall"]
+#     denied_tools: ["remember"]
+
+
 # Image defaults: 4 per prompt, 8 MiB each, 30-day retention, 2 GiB store.
 # images:
 #   max_prompt_images: 4

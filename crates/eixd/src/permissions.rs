@@ -210,6 +210,27 @@ pub fn assess_tool(
             }
             risk
         }
+        tool if tool.starts_with(eix_core::PLUGIN_TOOL_PREFIX) => {
+            let mut risk = RiskAssessment::new();
+            if eix_core::redact::contains_placeholder(&args.to_string()) {
+                risk.add(
+                    RiskCategory::SecretExfil,
+                    RiskLevel::Critical,
+                    "plugin arguments contain a withheld secret placeholder".to_string(),
+                );
+                risk.hard_deny = true;
+                return risk;
+            }
+            // The host knows the child process and capability grant, but it
+            // cannot prove what the plugin will do with its arguments. Always
+            // require approval; read-only tools can become low risk later.
+            risk.add(
+                RiskCategory::Plugin,
+                RiskLevel::High,
+                "calls an external plugin tool".to_string(),
+            );
+            risk
+        }
         tool if tool.starts_with(crate::mcp::PREFIX) => {
             let mut risk = RiskAssessment::new();
             if eix_core::redact::contains_placeholder(&args.to_string()) {
@@ -542,6 +563,7 @@ fn read_only_denial(
                 | RiskCategory::GitPublish
                 | RiskCategory::GitRewrite
                 | RiskCategory::McpWrite
+                | RiskCategory::Plugin
                 | RiskCategory::Privilege
                 | RiskCategory::SecretExfil
         ) || (shell_command && *category == RiskCategory::Network)

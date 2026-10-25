@@ -73,6 +73,7 @@ pub fn eligible(tool: &str, risk: &RiskAssessment, max_risk: RiskLevel) -> bool 
                 | RiskCategory::SecretExfil
                 | RiskCategory::WriteExternal
                 | RiskCategory::Destructive
+                | RiskCategory::Plugin
                 | RiskCategory::Privilege
         )
     })
@@ -315,6 +316,16 @@ mod tests {
         let push = risk("git push");
         assert!(eligible("run_command", &push, RiskLevel::High));
         assert!(!eligible("run_command", &push, RiskLevel::Medium));
+
+        // Plugin tools are always manual: the classifier cannot approve code
+        // the host has no visibility into.
+        let mut plugin = RiskAssessment::new();
+        plugin.add(
+            RiskCategory::Plugin,
+            RiskLevel::High,
+            "calls an external plugin tool",
+        );
+        assert!(!eligible("plugin__acme__deploy", &plugin, RiskLevel::High));
     }
 
     #[test]

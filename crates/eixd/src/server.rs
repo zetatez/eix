@@ -32,12 +32,12 @@ use eix_core::{
     ModeParams, ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
     PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
     PermissionAction, PermissionRule, PickerParams, PickerPreviewParams, PickerPreviewResult,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    RenameParams, Request, Response, RewindParams, RewindResult, RuleSource, ServerMessage,
-    Session, SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport,
-    SessionExportResult, SessionId, SessionImportParams, SessionList, SessionMode,
-    SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef, SessionResult,
-    SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
+    PluginCommandList, PluginListResult, ProcessKillParams, ProcessKillResult, ProcessList,
+    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
+    RewindResult, RuleSource, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
+    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
+    SessionList, SessionMode, SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef,
+    SessionResult, SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
     StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
     SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
     ToolResultPayload, UserMessagePayload, WorktreeCreateParams, WorktreeRemoveParams,
@@ -234,6 +234,8 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     ));
     let blobs = BlobStore::new(data_dir.join("blobs"), config.images.clone());
     let subagent_concurrency = config.tools.max_parallel_subagents;
+    let plugins = crate::plugin::PluginManager::new(Arc::clone(&store), data_dir.clone());
+    plugins.load(&config).await;
     let daemon = Arc::new(Daemon {
         store,
         provider,
@@ -247,6 +249,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         staging,
         processes,
         mcp: Mutex::new(crate::mcp::McpSet::new()),
+        plugins,
         lsp: Mutex::new(crate::lsp::LspSet::new()),
         todos: Mutex::new(HashMap::new()),
         turns: Mutex::new(HashMap::new()),
@@ -443,6 +446,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     let _ = fs::remove_file(&socket);
     // Background processes are children of this daemon; take them with us.
     daemon.processes.kill_all().await;
+    daemon.plugins.shutdown().await;
     Ok(())
 }
 
@@ -490,6 +494,8 @@ pub(crate) struct Daemon {
     processes: Arc<ProcessRegistry>,
     /// Lazily started MCP servers and their tools.
     mcp: Mutex<crate::mcp::McpSet>,
+    /// Out-of-process server plugins and their contributions.
+    plugins: Arc<crate::plugin::PluginManager>,
     lsp: Mutex<crate::lsp::LspSet>,
     /// Model-managed task lists, keyed by session. In-memory: a daemon
     /// restart clears them.
@@ -577,10 +583,13 @@ struct ApprovalReply {
 
 impl Daemon {
     fn emit<T: Serialize>(&self, method: &str, params: &T) {
-        let _ = self.bus.send(Notification::new(method, params));
+        let value = serde_json::to_value(params).unwrap_or(Value::Null);
+        self.plugins.publish(method, &value);
+        let _ = self.bus.send(Notification::new(method, value));
     }
 
     fn emit_value(&self, method: &str, params: Value) {
+        self.plugins.publish(method, &params);
         let _ = self.bus.send(Notification::new(method, params));
     }
 
@@ -2451,6 +2460,24 @@ impl Daemon {
                     .collect();
                 Ok(serde_json::to_value(McpListResult { servers })?)
             }
+            "plugin.list" => {
+                let list: PluginListResult = self.plugins.list().await;
+                Ok(serde_json::to_value(list)?)
+            }
+            "plugin.commands" => {
+                let list: PluginCommandList = self.plugins.commands().await;
+                Ok(serde_json::to_value(list)?)
+            }
+            "plugin.restart" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.restart needs `name`"))?;
+                let config = self.config.load_full();
+                self.plugins.restart(name, &config).await?;
+                Ok(json!({"restarted": name}))
+            }
             "stats" => Ok(serde_json::to_value(self.stats().await?)?),
             "lsp.workspace" => {
                 let params: LspWorkspaceParams = parse_params(request.params.clone())?;
@@ -3812,12 +3839,13 @@ impl Daemon {
         let subagent_concurrency = next.tools.max_parallel_subagents;
         self.blobs.set_config(next.images.clone());
         self.provider.store(Arc::new(provider));
-        self.config.store(Arc::new(next));
         self.subagent_concurrency
             .store(subagent_concurrency, Ordering::Relaxed);
         *self.model_catalog.lock().await = ModelCatalogCache::default();
         self.mcp.lock().await.clear();
+        self.plugins.load(&next).await;
         self.lsp.lock().await.clear();
+        self.config.store(Arc::new(next));
         Ok(paths)
     }
 
@@ -4013,26 +4041,35 @@ impl Daemon {
         if !worktree_ready {
             definitions.retain(|tool| tool.function.name != "ready");
         }
-        if !read_only && !sub_agent && mcp_configured {
+        if !read_only && !sub_agent {
             let config = self.config.load_full();
-            let mcp_tools = {
-                let mut mcp = self.mcp.lock().await;
-                mcp.ensure_loaded(&config).await;
-                mcp.refresh(&config).await;
-                mcp.tool_definitions()
-            };
-            // Tool schemas are paid for on every request. Built-ins always fit;
-            // cap dynamic MCP schemas so a large server cannot consume the
-            // whole context before the model sees the user's message.
-            let cap = config.context.max_tool_schema_tokens;
-            let (kept, omitted) =
-                cap_tool_schemas(std::mem::take(&mut definitions), mcp_tools, cap);
-            definitions = kept;
-            if omitted > 0 {
-                eprintln!(
-                    "eixd: omitted {omitted} MCP tool(s) to keep tool schemas under \
-                     {cap} tokens; narrow mcp.servers.*.allowed_tools to expose them"
-                );
+            let mut dynamic = Vec::new();
+            if mcp_configured {
+                let mcp_tools = {
+                    let mut mcp = self.mcp.lock().await;
+                    mcp.ensure_loaded(&config).await;
+                    mcp.refresh(&config).await;
+                    mcp.tool_definitions()
+                };
+                dynamic.extend(mcp_tools);
+            }
+            // Plugin tools are exposed only to normal sessions. A plan or
+            // sub-agent session must not see a tool that can mutate state.
+            dynamic.extend(self.plugins.tool_definitions().await);
+            if !dynamic.is_empty() {
+                // Tool schemas are paid for on every request. Built-ins always
+                // fit; cap dynamic schemas so one large integration cannot
+                // consume the whole context before the model sees the user.
+                let cap = config.context.max_tool_schema_tokens;
+                let (kept, omitted) =
+                    cap_tool_schemas(std::mem::take(&mut definitions), dynamic, cap);
+                definitions = kept;
+                if omitted > 0 {
+                    eprintln!(
+                        "eixd: omitted {omitted} dynamic tool(s) to keep tool schemas under \
+                         {cap} tokens; narrow mcp.servers.*.allowed_tools or plugin tool filters"
+                    );
+                }
             }
         }
         if let Err(err) = self
@@ -5014,7 +5051,9 @@ impl Daemon {
         self.emit_event(&event);
 
         let mcp_known = tool.starts_with(crate::mcp::PREFIX) && self.mcp.lock().await.knows(tool);
-        if !tools::is_known(tool) && !mcp_known {
+        let plugin_known =
+            tool.starts_with(eix_core::PLUGIN_TOOL_PREFIX) && self.plugins.knows(tool).await;
+        if !tools::is_known(tool) && !mcp_known && !plugin_known {
             let output = format!("unknown tool {tool:?}");
             self.record_tool_result(session_id, call, false, false, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
@@ -5085,8 +5124,15 @@ impl Daemon {
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
         }
-        if session.origin == SessionOrigin::Agent && decision.action != PermissionAction::Allow {
-            let output = if decision.action == PermissionAction::Deny {
+        // Plugin tools are never available to sub-agents, even if an explicit
+        // allow rule would otherwise approve the call. The tool list already
+        // hides them; this catches a hallucinated or injected name.
+        if session.origin == SessionOrigin::Agent
+            && (plugin_known || decision.action != PermissionAction::Allow)
+        {
+            let output = if plugin_known {
+                "sub-agents cannot call plugin tools".to_string()
+            } else if decision.action == PermissionAction::Deny {
                 format!("sub-agents are read-only; {}", decision.reason)
             } else {
                 "sub-agents are read-only; mutating or interactive tools are not available"
@@ -5314,6 +5360,18 @@ impl Daemon {
                     None if tool == "process_output" => self.read_process(session_id, &args),
                     None if is_mcp_meta(tool) => self.call_mcp_meta(tool, &args).await,
                     None if mcp_known => self.call_mcp(tool, &args).await,
+                    None if plugin_known => {
+                        let session = self.require_session(session_id)?;
+                        self.plugins
+                            .call(
+                                tool,
+                                &args,
+                                session_id,
+                                &session.cwd,
+                                self.config.load().tools.max_output_bytes,
+                            )
+                            .await
+                    }
                     None => {
                         let session = self.require_session(session_id)?;
                         match self
@@ -5621,14 +5679,15 @@ impl Daemon {
     /// `context.*` requests, where the exact turn tool list is not available.
     async fn build_ledger(&self, session_id: &str) -> Result<Ledger> {
         let session = self.require_session(session_id)?;
-        let tools = self.standard_tool_definitions(&session);
+        let tools = self.standard_tool_definitions(&session).await;
         self.build_ledger_with_tools(session_id, &tools, None).await
     }
 
     /// The tools a normal turn would see, without starting MCP servers.
     /// Dynamic MCP tool schemas are only known after a turn starts, so ledger
-    /// reads outside the turn use the built-in set and MCP meta-tools.
-    fn standard_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
+    /// reads outside the turn use the built-in set and MCP meta-tools. Plugin
+    /// tools are already initialized, so they can be included exactly.
+    async fn standard_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
         let read_only = self.session_mode(session) == SessionMode::Plan;
         let sub_agent = session.origin == SessionOrigin::Agent;
         let mut definitions = if read_only || sub_agent {
@@ -5648,6 +5707,9 @@ impl Daemon {
             .any(|server| server.enabled);
         if !mcp_configured || read_only || sub_agent {
             definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
+        }
+        if !read_only && !sub_agent {
+            definitions.extend(self.plugins.tool_definitions().await);
         }
         let worktree_ready = session.has_worktree() && self.config.load().integration.enabled;
         if !worktree_ready {
@@ -6963,6 +7025,13 @@ impl Daemon {
                 }
             }
             "patch" | "run_command" => {
+                self.snapshots
+                    .capture_tree(session_id, tool, &call.id, &cwd)
+                    .await
+            }
+            _ if tool.starts_with(eix_core::PLUGIN_TOOL_PREFIX) => {
+                // The host cannot know which paths a plugin will touch, so
+                // plugin calls always capture the whole workspace tree.
                 self.snapshots
                     .capture_tree(session_id, tool, &call.id, &cwd)
                     .await

@@ -6,8 +6,8 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AgentRole, AttachResult, Config, EventKind, EventsResult, FormatterConfig, HelloResult,
-    ModelConfig, PermissionAction, PermissionRule, ProviderConfig, Request, Response,
+    AgentRole, ApprovalResult, AttachResult, Config, EventKind, EventsResult, FormatterConfig,
+    HelloResult, ModelConfig, PermissionAction, PermissionRule, ProviderConfig, Request, Response,
     ServerMessage, SessionMode, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
@@ -1106,6 +1106,184 @@ for line in sys.stdin:
         .as_str()
         .unwrap()
         .contains("review this"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn plugin_tools_and_commands_are_hosted() -> anyhow::Result<()> {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return Ok(()); // no Python: nothing to run the plugin with
+    }
+    let dir = temp_dir("plugin");
+    std::fs::create_dir_all(&dir)?;
+    let script = dir.join("plugin.py");
+    std::fs::write(
+        &script,
+        r#"import sys, json
+
+def send(obj):
+    sys.stdout.write(json.dumps(obj) + "\n")
+    sys.stdout.flush()
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    if method == "initialize":
+        send({"id": msg["id"], "result": {
+            "name": "mock",
+            "version": "0.1.0",
+            "api_version": 1,
+            "tools": [{
+                "name": "echo",
+                "description": "Echo text",
+                "input_schema": {"type": "object",
+                                 "properties": {"text": {"type": "string"}},
+                                 "required": ["text"]},
+                "read_only": True}],
+            "commands": [{
+                "name": "review",
+                "description": "Review a path",
+                "args": "<path>",
+                "prompt": "Review $ARGUMENTS"}],
+            "events": []}})
+    elif method == "tools/call":
+        text = msg["params"]["arguments"].get("text", "")
+        send({"id": msg["id"], "result": {"ok": True, "output": "plugin:" + text}})
+    else:
+        send({"id": msg.get("id"),
+              "error": {"code": "unsupported", "message": "unknown method"}})
+"#,
+    )?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(plugin_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.plugins.insert(
+        "mock".to_string(),
+        eix_core::PluginConfig {
+            command: "python3".to_string(),
+            args: vec![script.to_string_lossy().into_owned()],
+            capabilities: vec![
+                eix_core::PluginCapability::Tools,
+                eix_core::PluginCapability::Commands,
+            ],
+            ..eix_core::PluginConfig::default()
+        },
+    );
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let list: eix_core::PluginListResult = client.request("plugin.list", Value::Null).await?;
+    assert_eq!(list.plugins.len(), 1);
+    assert_eq!(list.plugins[0].name, "mock");
+    assert_eq!(list.plugins[0].state, "running");
+    assert_eq!(list.plugins[0].tools, 1);
+    assert_eq!(list.plugins[0].commands, 1);
+    assert!(list.plugins[0].error.is_none());
+
+    let commands: eix_core::PluginCommandList =
+        client.request("plugin.commands", Value::Null).await?;
+    assert_eq!(commands.commands.len(), 1);
+    assert_eq!(commands.commands[0].name, "plugin/mock/review");
+    assert_eq!(commands.commands[0].prompt, "Review $ARGUMENTS");
+
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "plugin", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let _: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "echo something"}),
+        )
+        .await?;
+
+    let approval = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            break notification.params.clone();
+        }
+    };
+    assert_eq!(approval["tool"], "plugin__mock__echo");
+    let approval_id = approval["approval_id"].as_str().unwrap().to_string();
+    let answered: ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "decision": "approve",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert!(completed["error"].is_null());
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let result = attached
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::ToolResult && event.payload["tool"] == "plugin__mock__echo"
+        })
+        .expect("plugin tool result");
+    assert!(
+        result.payload["output"]
+            .as_str()
+            .unwrap()
+            .contains("plugin:hi"),
+        "{}",
+        result.payload["output"]
+    );
+    let snapshot = attached
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::Snapshot && event.payload["tool"] == "plugin__mock__echo"
+        })
+        .expect("plugin call snapshot");
+    assert_eq!(snapshot.payload["scope"], "tree");
+    assert_eq!(snapshot.payload["ok"], true);
+
+    let bodies = bodies.lock().await;
+    let first: Value = serde_json::from_str(&bodies[0])?;
+    assert!(
+        first["tools"].as_array().is_some_and(|tools| tools
+            .iter()
+            .any(|tool| { tool["function"]["name"] == "plugin__mock__echo" })),
+        "plugin tool was not advertised: {}",
+        first["tools"]
+    );
+    drop(bodies);
 
     daemon.abort();
     mock.abort();
@@ -7068,6 +7246,53 @@ async fn mcp_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
                             "id": format!("call_mcp_{tool_count}"),
                             "type": "function",
                             "function": {"name": name, "arguments": arguments},
+                        }]
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            });
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
+/// A provider that asks for the mock plugin's `echo` tool, then answers.
+async fn plugin_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            if has_tool_result {
+                let chunk = json!({
+                    "model": "mock-plugin",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                });
+                write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+                return;
+            }
+            let chunk = json!({
+                "model": "mock-plugin",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": "call_plugin_0",
+                            "type": "function",
+                            "function": {
+                                "name": "plugin__mock__echo",
+                                "arguments": json!({"text": "hi"}).to_string(),
+                            },
                         }]
                     },
                     "finish_reason": "tool_calls",

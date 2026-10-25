@@ -232,8 +232,8 @@ running 状态使用田字方块旋转动画（`◰ ◳ ◲ ◱`），完成/空
 右侧靠右显示 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及
 pane/队列/attention 计数在空间允许时显示在中部或右侧，变窄时优先保留 cwd/branch。
 只有没有其他 UI 反馈的失败、后台 attention、复制确认、布局切换和 `/reload` 完成会以右上角
-浮动通知显示（失败 / attention 约 3 秒，复制 / 布局 / `/reload` 约 1.5 秒；不设置最低等待时长，
-新消息立即出现；多条同时存在时逐条堆叠，最新一条在最上方）；除 `/reload` 外，命令成功
+单条浮动通知显示（不堆叠；当前通知至少保留其时长，期间的新消息只保留最新一条等待替换；
+失败约 4 秒，attention 约 8 秒，复制 / 布局 / `/reload` 约 2 秒）；除 `/reload` 外，命令成功
 反馈、进度和 picker/弹窗内容不再重复通知。
 终端高度足够时，statusline 下方常驻一行空白命令行；normal 模式按 `:` 激活并显示 `:` 前缀：
 `Enter` 执行；`Esc` 先收起命令菜单并保留已输入内容，再按一次关闭命令行；`↑`/`↓` 浏览历史，`Tab` 显示匹配命令并补全首个命令；菜单打开后
@@ -260,9 +260,8 @@ pane 不超过 5 个时全部显示，超过时只显示第一个 pane + 后续 
 或前后移动切换时窗口会跟随焦点滑动；终端矮时压缩为标题行/单行内容，不退回 tabby）、
 `tabby`（输入框上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个稳定的 session 顺序：pane 按打开顺序排列，发送任务、
-turn 完成或等待审批/输入都不会移动它；normal 模式按 `Enter` 会主动把当前 pane 的 session 提到第一位。
-session 视作双向链表，`<` / `>` 或 1 秒内连续按两次 `Ctrl-W` 在前后节点间移动；
-`Ctrl-1` … `Ctrl-9` 直接跳到对应 session，其余情况下顺序保持不变。
+turn 完成或等待审批/输入都不会移动它。session 视作双向链表，`<` / `>` 或 1 秒内
+连续按两次 `Ctrl-W` 在前后节点间移动；`Ctrl-1` … `Ctrl-9` 直接跳到对应 session，顺序保持不变。
 在 `tabby` 布局下就是切换到第 N 个 tab
 （输入框内也可用）。这些组合键需要终端支持 kitty 键盘协议；不支持的终端可能无法区分。
 `Ctrl-7` 在部分终端等价于 `Ctrl-/`，会打开模型 picker。在转录区或输入框 normal 模式下，
@@ -318,7 +317,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Esc`                 | 输入框：回到 normal 模式                                     |
  | `:`                   | 打开命令行                                                   |
  | `/` / `?` / `#`       | 搜索当前 transcript；`n` / `N` 跳下一个 / 上一个，`Esc` 清除 |
- | `Enter`               | insert 模式发送（turn 运行中自动排队）；normal / 转录区把当前 session 提到第一位 |
+ | `Enter`               | insert 模式发送；turn 运行中自动排队                         |
  | `Ctrl-J`              | insert 模式换行                                              |
  | `Ctrl-P`              | 命令面板（输入框 normal / 转录区）                           |
  | `Tab`                 | 输入框 normal / 转录区：Plan → Build → Auto → Bypass 循环    |
@@ -415,7 +414,7 @@ normal / 转录区专用。overlay 内部导航键仍固定。完整默认值和
  | `:`（normal 模式）                                | 激活 statusline 下方的常驻命令行；按 `Tab` 才显示匹配命令列表并补全首个命令，普通输入不弹窗；菜单中 `Ctrl-J`/`Ctrl-K`、`Ctrl-N`/`Ctrl-P` 上下选择，`Enter` 执行选中项；菜单打开时 `Esc` 先收起菜单并保留输入，再按一次退出命令行回到 normal，`↑`/`↓` 历史；支持所有 `/命令` 名以及 `:q` / `:qa` / `:w` / `:wq` / `:x`；`:!cmd` 直接执行 shell，`:r!cmd` 把输出插入输入框 |
  | `/` / `?` / `#`（normal 模式）                    | 打开带对应前缀的命令行：`/xxx` 在当前 session 对话中向后搜索，`?xxx` / `#xxx` 向后搜索；`n` / `N` 跳到下一个/上一个匹配，`Esc` 清除高亮                                                                                                                                                                                                                                             |
  | `F1` / `/help`                                    | 打开可搜索的帮助/按键参考；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭                                                                                                                                                                                                                                                                             |
- | `Enter`                                           | insert 模式：发送到聚焦 pane（turn 还在跑时自动排队，结束后按顺序发出）；normal / 转录区：把当前 pane 的 session 提到第一位                                                                                                                                                                                                                                                          |
+ | `Enter`                                           | insert 模式：发送到聚焦 pane（turn 还在跑时自动排队，结束后按顺序发出）                                                                                                                                                                                                                                                                                                             |
  | `/exit` / `/quit`                                 | 保存草稿并退出整个 eix 客户端（不关闭 session pane）                                                                                                                                                                                                                                                                                                                                |
  | `/close`                                          | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix                                                                                                                                                                                                                                                                                                                     |
  | `Ctrl-J`                                          | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同）                                                                                                                                                                                                                                                                                                                             |
@@ -659,6 +658,59 @@ resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server �
 通配，deny 优先；allowed 为空表示全部）；被过滤的工具既不出现在模型工具表里，也无法调用。
 `/mcp` 显示 server 状态、工具/资源/prompt 数量和错误。
 
+### 插件（out-of-process）
+
+插件是独立子进程，不是 Rust `dylib`，因此崩溃或死循环不会拖垮 daemon。`eixd` 通过
+stdin/stdout 的 newline-delimited JSON 与插件通信，协议版本是独立的
+`PLUGIN_API_VERSION = 1`。每个 `[plugins.<name>]` 条目只启动一个 server 进程：
+
+```yaml
+plugins:
+  echo:
+    enabled: true
+    manifest: examples/plugins/echo/eix-plugin.toml
+    capabilities: [tools, commands, events, storage]
+    timeout_secs: 30
+```
+
+`manifest` 指向 `eix-plugin.toml`，其中声明 `name`、`version`、`api_version`、
+`capabilities` 和 `[server]` 入口。也可以直接写 `command` / `args` 跳过 manifest。
+manifest 的 capability 是“申请”，配置里的 `capabilities` 是“授权”；配置可以收窄，
+不能扩大 manifest 的申请。没有 manifest 且未写 `capabilities` 时默认只授予
+`tools` + `commands`。
+
+启动握手：
+
+1. daemon 启动子进程，发送 `initialize`（协议版本、插件名、host 版本、授权能力、
+   workspace、数据目录）。
+2. 插件返回 `tools`、`commands`、`events` 和 `api_version`。
+3. daemon 校验名称、能力、schema 和数量；未授权却声明贡献会启动失败，而不是静默放大权限。
+4. 工具以 `plugin__<plugin>__<tool>` 暴露，命令以 `plugin/<plugin>/<command>` 合并进
+   TUI 的 `/` 菜单；命令目前是提示词模板（`$ARGUMENTS` / `$1..$9`），action command 尚未启用。
+
+插件工具**默认需要审批**（显式 `allow` 规则或 `bypass` 模式除外），风险类别为
+`plugin`，执行前会抓工作区快照；`auto` 模式的分类器不会替插件工具放行。`plan` session
+和 sub-agent 看不到插件工具。插件命令不会覆盖内置命令或用户 Markdown 命令。
+`allowed_tools` / `denied_tools` 支持 `*` / `?`，deny 优先。
+
+能力边界：
+
+- `tools`：注册模型工具。
+- `commands`：注册提示词命令。
+- `events`：订阅 daemon 通知（如 `session.*`、`tool.completed`）。投递是 fire-and-forget，
+  慢插件不会阻塞 turn。
+- `storage`：使用 host 管理的 SQLite KV（`global` 或 `workspace:<path>`，按插件名隔离）。
+- `hooks` / `rpc` / `ui` / `network` / `workspace_read` / `workspace_write` / `secrets`：
+  协议中保留，当前 host 不提供对应 API。
+
+**安全边界**：能力校验限制的是 host API，不是操作系统。插件仍以 daemon 用户身份运行，
+可以直接读写该用户可访问的文件，因此只应安装可信插件。需要强隔离时应使用单独的
+用户/容器运行 daemon；项目配置永远不能添加插件。
+
+相关 RPC：`plugin.list`（状态、工具/命令数、错误）、`plugin.commands`（TUI 命令目录）、
+`plugin.restart {name}`（重启单个插件）。`/reload` 会重新读取插件配置并重启全部插件。
+完整示例见 `examples/plugins/echo/`。
+
 排队只保存在 TUI 内存里：退出应用会丢弃尚未发送的 prompt。`/clear`、`/compact`、`/cd`
 在 turn 运行时会被拒绝，先 `Esc Esc` 中断（或按 `<Space>x`）再执行。
 
@@ -691,9 +743,9 @@ files / sessions 预览由 `picker.preview` 懒加载，grep 的每行自带匹�
 `N/I/V/VL · Plan/Build/Auto/Bypass · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及 pane/排队/attention
 计数在空间允许时显示在中部或右侧；只有没有其他可见反馈的失败、后台 attention、复制确认、
-布局切换和 `/reload` 完成显示在右上角浮动通知中（失败 / attention 约 3 秒，
-复制 / 布局 / `/reload` 约 1.5 秒；不设置最低等待时长，新消息立即出现；多条同时存在时
-逐条堆叠，最新一条在最上方），不会挤动 statusline；
+布局切换和 `/reload` 完成显示在右上角单条浮动通知中（失败约 4 秒，attention 约 8 秒，
+复制 / 布局 / `/reload` 约 2 秒；不堆叠，当前通知至少保留其时长，期间只保留最新一条等待
+替换），不会挤动 statusline；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
@@ -707,7 +759,7 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
   越过最新一条会恢复当前草稿。`j`、`k`、`3j`、`dj`、方向键是草稿内的行移动
 - 模式切换：输入框 normal 模式与转录区都可用 `Tab` 按 Plan → Build → Auto → Bypass → Plan 循环；`Shift-Tab` 反向循环（Build → Plan → Bypass → Auto）。`Space m` 或 `/perm`（旧名 `/mode` 仍可用）仍可打开完整 picker 直接选择某个模式
 - `Enter` 在 insert 模式提交；turn 运行中提交的内容自动排队（`/queue` 查看，`Esc Esc` 中断当前 turn）。
-  normal 模式会把当前 pane 的 session 提到第一位；切换 session 用 `Ctrl-1` … `Ctrl-9` 或前后移动
+  normal 模式不改变 pane 顺序；切换 session 用 `Ctrl-1` … `Ctrl-9` 或前后移动
 
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（默认空格，可用 `[keys].leader` 修改）+ 键**：
 `<Space>n` 新建 session 并在新 pane 打开（当前 session 有 worktree 时复用）、`<Space>o` 把已有 session 放进新 pane
@@ -926,6 +978,7 @@ daemon 目前向模型暴露这些工具：
 | `spawn_agent` | 起一个只读子 agent 并发处理独立问题，可用 `agent` 指定自定义 agent | 自动放行（子 agent 只读） |
 | `ask_user` | 让用户从 2-6 个选项中选择 | 交互，不修改文件 |
 | `mcp__*` | MCP server 暴露的工具 | 默认询问；读取型 resource/prompt 放行 |
+| `plugin__*` | 外部插件暴露的工具 | 默认询问（显式 allow / bypass 例外）；plan/sub-agent 不可见；执行前快照 |
 
 所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出先按
 `max_output_bytes` 截断，进入 provider 上下文时再按 `context.tool_output_tokens` 做 head/tail
@@ -1193,7 +1246,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 ### 外部通知
 
 `notifications:` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你。
-TUI 内的提醒固定显示在右上角（约 3 秒；多条同时存在时逐条堆叠，最新一条在最上方），不会弹桌面通知，也不会移动 statusline：
+TUI 内的提醒固定显示在右上角（约 8 秒，同一时间只显示最新一条），不会弹桌面通知，也不会移动 statusline：
 
 | 字段 | 默认 | 行为 |
 | --- | --- | --- |
@@ -1429,3 +1482,4 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 自定义 Markdown agent（`~/.config/eix/agents`、项目 `.eix/agents`；`role`/`model`，`/agents` 选择 primary、`spawn_agent agent:` 选择 subagent）
 - [x] 多 provider 模型目录（`providers.*` 命名 endpoint、自动拉取 `/models`、`models[]` 手动补充成本/变体、`/model` 搜索切换；token usage 与成本记录在事件日志，不在状态栏常驻）
 - [x] MCP stdio client（`mcp.servers.*`、懒启动、`tools/list` / `tools/call` / `resources/*` / `prompts/*`、分页、`list_changed` 刷新、`allowed_tools` / `denied_tools`、`mcp__server__tool` 审批 + 树快照、`/mcp` 状态）
+- [x] 外部插件基础（`plugins.*`、`eix-plugin.toml`、`initialize` 握手、`plugin__*` 工具审批 + 快照、`plugin/*` 提示词命令、`session.*` 事件订阅、SQLite 插件存储、`plugin.list` / `plugin.commands` / `plugin.restart`；TUI widget host 与 action command 尚未实现）

@@ -114,6 +114,18 @@ impl Store {
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+
+            -- Plugin-scoped key/value storage. `scope` is `global` or
+            -- `workspace:<absolute path>`; plugins never see another plugin's
+            -- rows because every query includes the plugin name.
+            CREATE TABLE IF NOT EXISTS plugin_kv (
+                plugin     TEXT NOT NULL,
+                scope      TEXT NOT NULL,
+                key        TEXT NOT NULL,
+                value      TEXT NOT NULL,
+                updated_at INTEGER NOT NULL,
+                PRIMARY KEY (plugin, scope, key)
+            );
             "#,
         )?;
         // Databases created before fork/rewind lack the lineage columns.
@@ -802,6 +814,58 @@ impl Store {
             }
         }
         Ok(ids)
+    }
+
+    /// Read one plugin storage value. Missing keys are `None`, not an error.
+    pub fn plugin_kv_get(&self, plugin: &str, scope: &str, key: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        Ok(conn
+            .query_row(
+                "SELECT value FROM plugin_kv
+                 WHERE plugin = ?1 AND scope = ?2 AND key = ?3",
+                params![plugin, scope, key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    pub fn plugin_kv_set(&self, plugin: &str, scope: &str, key: &str, value: &str) -> Result<()> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        conn.execute(
+            "INSERT INTO plugin_kv (plugin, scope, key, value, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(plugin, scope, key)
+             DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at",
+            params![plugin, scope, key, value, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    pub fn plugin_kv_delete(&self, plugin: &str, scope: &str, key: &str) -> Result<bool> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let changed = conn.execute(
+            "DELETE FROM plugin_kv WHERE plugin = ?1 AND scope = ?2 AND key = ?3",
+            params![plugin, scope, key],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// List keys (and values) for one plugin/scope. Values are included so a
+    /// plugin can restore a small cursor cache without N round trips.
+    pub fn plugin_kv_list(&self, plugin: &str, scope: &str) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock().expect("store mutex poisoned");
+        let mut stmt = conn.prepare(
+            "SELECT key, value FROM plugin_kv
+             WHERE plugin = ?1 AND scope = ?2 ORDER BY key",
+        )?;
+        let rows = stmt.query_map(params![plugin, scope], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
     }
 
     pub fn set_permissions(path: &Path) -> Result<()> {

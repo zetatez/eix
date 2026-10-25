@@ -219,7 +219,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   picker 直接选择某个模式。输入框下方 statusline 左侧显示当前模式；本地立即更新以支持
   连续切换，daemon 的 session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
-- `Enter` 在 insert 提交；normal 模式把当前 pane 的 session 提到第一位。
+- `Enter` 在 insert 提交；normal 模式不改变 pane 顺序。
 - `@`（insert，行首/空白后）打开文件 picker；`<Space>g` / `<Space>h` 在 normal / 转录区打开
   session picker / 用户输入 timeline。
 - picker：`Ctrl-J`/`Ctrl-K`（或 `↑`/`↓`）上下选择。
@@ -255,8 +255,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   右侧靠右显示 `cwd（~ 缩写） · git 分支`；
   worktree/图片数、运行中的 integration 状态，以及多 pane 时的 `当前/总数`、排队数和 attention
   数在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。只有没有其他可见反馈的失败、
-  后台 attention、复制确认和 `/reload` 完成使用右上角浮动通知；单条约 1.5–3 秒，最长 3 秒。
-  多条同时存在时逐条堆叠，最新消息立即显示，不设置最低等待时长。成功的命令反馈（`/reload`
+  后台 attention、复制确认和 `/reload` 完成使用右上角浮动通知；同一时间只显示一条，当前
+  通知至少保留其时长，期间的新消息只保留最新一条等待替换。成功的命令反馈（`/reload`
   除外）、进度和 picker/弹窗内容不再重复通知，因此状态栏不会随命令消息跳动。
 - 终端高度足够时，statusline **下方**常驻一行空白命令行；normal 模式按 `:` 激活并显示
   `:` 前缀 + 文本 + 光标，`Enter` 执行；`Esc` 先收起命令菜单并保留输入，再按一次关闭命令行；
@@ -302,15 +302,15 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   在 `tabby` 下即切换到第 N 个 tab。TUI 启动时请求 kitty 键盘协议（CSI-u），否则传统终端
   会把 `Ctrl-2`/`Ctrl-3` 等编码成 NUL/Esc；不支持该协议时用 `Alt-1` … `Alt-9`。
 - session 顺序：`views` 是稳定顺序（可视为双向链表），pane 打开后保持位置。发送任务、turn
-  完成、等待审批/输入都不会移动 session；焦点只改变当前节点，不改变 `views` 顺序。
-  normal 模式按 `Enter` 会把当前 pane 的 session 主动提到第一位；用 `<` / `>`（`Shift+,` /
-  `Shift+.`）或 1 秒内连续两次 `Ctrl-W` 在前后节点间移动，`Ctrl-1` … `Ctrl-9` 直接跳到对应 session。
+  完成、等待审批/输入都不会移动 session；焦点只改变当前节点，不改变 `views` 顺序。用
+  `Shift+,` / `Shift+.`（`<` / `>`）或 1 秒内连续两次 `Ctrl-W` 在前后节点间移动，
+  `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。
 - 不再有独立顶部 header 行，输入框也不再有底部信息行；输入框下方保留一行 statusline，
   左侧按 `N/I/V/VL · SessionMode · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
   cwd（`~` 缩写）和 git 分支；worktree/图片数、运行中的 integration 状态、pane 位置、prompt
   队列和 attention 信息在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。只有没有
   其他可见反馈的失败、后台 attention、复制确认和 `/reload` 完成显示在右上角浮动通知中，
-  多条可同时堆叠、最新一条在上方，不占用 statusline 中部。
+  同一时间只显示一条，不占用 statusline 中部。
 - 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i` 或 `<Space>i` 聚焦输入并进入 insert；
   `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。聚焦 pane 使用
   更亮的单格虚线边框、标题加粗；非聚焦 pane 保持低对比实线灰，attention 仍用警示色。
@@ -367,7 +367,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 | 键 | 行为 |
 |---|---|
-| `<CR>` | insert 提交（turn 运行中进入 prompt 队列）；normal 模式把当前 pane 的 session 提到第一位 |
+| `<CR>` | insert 提交（turn 运行中进入 prompt 队列）；normal 模式不改变 pane 顺序 |
 | `/命令` | 整条消息作为 prompt 命令处理，不发给模型（见下表） |
 | `<C-j>` / `<C-Enter>` / `<S-Enter>` | 换行（仅 insert） |
 | `@` | 文件 picker（行首/空白后） |
@@ -760,7 +760,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 ## 12. 持久化
 
-- SQLite（WAL）：`sessions`、`events`、`messages`、`drafts`、`approvals`、`patches`、`frecency`。
+- SQLite（WAL）：`sessions`、`events`、`messages`、`drafts`、`approvals`、`patches`、`frecency`、`plugin_kv`。
 - 大输出/补丁走内容寻址 blob；prompt 图片走 `<data>/blobs/<sha256 前两位>/<sha256>`（自动去重、保留/GC 策略见上文）。
 - 文件权限：目录 0700、文件 0600；日志写入前做密钥脱敏（API key、token、`.env` 内容）。
 - 事件日志天然是回放测试夹具：record/replay 用于集成测试。
@@ -768,10 +768,10 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 ## 13. 通知
 
 - TUI：只有没有其他 UI 反馈的失败、复制确认、布局切换、后台 attention 和 `/reload` 完成
-  显示在右上角浮动通知中（失败 / attention 约 3 秒，复制 / 布局 / `/reload` 约 1.5 秒；
-  多条同时存在时逐条堆叠，最新消息立即显示，不设置最低等待时长），不会移动 statusline；
-  成功的命令反馈（`/reload` 除外）、进度和 picker/弹窗内容不重复通知；可选终端 bell，
-  不弹桌面通知。
+  显示在右上角浮动通知中（失败约 4 秒，复制 / 布局 / `/reload` 约 2 秒，attention 约 8 秒；
+  同一时间只显示一条，当前通知至少保留其时长，期间只保留最新一条等待替换），不会移动
+  statusline；成功的命令反馈（`/reload` 除外）、进度和 picker/弹窗内容不重复通知；可选
+  终端 bell，不弹桌面通知。
 - 桌面：`notify-send`（dunst），可通过配置替换命令。
 - dwmblocks：`agent status --json` 输出 `{running, approval, error}`。
 - 仅在状态跃迁时通知；当前聚焦 session 不通知；冷却时间可配。
@@ -1030,6 +1030,18 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 暴露，不需要审批。`notifications/*/list_changed` 标记缓存失效，下次 turn 或 `/mcp` 刷新。
 > `allowed_tools` / `denied_tools` 支持 `*` / `?`（`*` 也匹配 `/`，deny 优先）；`mcp.list` 与
 > `/mcp` 显示状态、工具/资源/prompt 数量和错误。
+>
+> Plugins：`eix-core/src/plugin.rs` 定义 `eix-plugin.toml`、`PluginConfig`、
+> `PLUGIN_API_VERSION = 1` 和 newline-delimited JSON DTO；`eixd/src/plugin.rs` 每个启用的
+> server plugin 启动一个子进程并完成 `initialize` 握手。manifest 的 capabilities 是申请，
+> 全局 config 的 `capabilities` 是授权（可收窄、不可扩大）；未授权的贡献会让启动失败。
+> 工具暴露为 `plugin__<plugin>__<tool>`，默认走 `RiskCategory::Plugin` 审批并抓树快照
+> （显式 `allow` 规则或 `bypass` 模式除外；`auto` 分类器不放行），
+> `plan` / sub-agent 不可见；命令暴露为 `plugin/<plugin>/<command>`，当前只支持提示词模板。
+> 事件通过 mpsc fire-and-forget 投递，慢插件不会阻塞 turn；storage 由 `plugin_kv` 表按
+> 插件名和 `global` / `workspace:<path>` 隔离。项目层 config 在 merge 前删除整个 `plugins`
+> 表。进程边界只隔离崩溃，不是 OS sandbox：插件仍以 daemon 用户权限运行。TUI widget host、
+> action command、hooks/rpc/network/workspace/secrets API 仍是后续阶段。
 >
 > Session 管理：`session.archive` / `session.delete` / `session.export` / `session.import` /
 > `session.timeline` / `session.undo` / `session.redo` / `session.todos` RPC；archive 是持久化
