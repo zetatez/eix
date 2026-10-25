@@ -1,8 +1,8 @@
 //! Per-workspace pane state that survives a TUI detach.
 //!
-//! Only session ids and the focused pane are stored. The daemon owns the
-//! sessions themselves, so a stale id is dropped when the next session list
-//! arrives.
+//! Only session ids, the focused pane and the pane layout are stored. The
+//! daemon owns the sessions themselves, so a stale id is dropped when the next
+//! session list arrives.
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,12 +12,25 @@ use serde::{Deserialize, Serialize};
 
 const FILE_NAME: &str = "workspaces.json";
 
+/// Pane arrangement persisted with the active sessions.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkspaceLayout {
+    #[default]
+    Grid,
+    Horizontal,
+    Tabby,
+    Fibonacci,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveWorkspace {
     #[serde(default)]
     pub sessions: Vec<String>,
     #[serde(default)]
     pub focused: Option<String>,
+    #[serde(default)]
+    pub layout: WorkspaceLayout,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -133,10 +146,12 @@ mod tests {
         let first = ActiveWorkspace {
             sessions: vec!["s1".into(), "s2".into()],
             focused: Some("s2".into()),
+            layout: WorkspaceLayout::Tabby,
         };
         let second = ActiveWorkspace {
             sessions: vec!["s3".into()],
             focused: None,
+            layout: WorkspaceLayout::Fibonacci,
         };
         save(&data, Path::new("/tmp/eix-workspace-a"), &first).unwrap();
         save(&data, Path::new("/tmp/eix-workspace-b"), &second).unwrap();
@@ -150,15 +165,24 @@ mod tests {
     }
 
     #[test]
+    fn missing_layout_defaults_to_grid() {
+        let active: ActiveWorkspace =
+            serde_json::from_str(r#"{"sessions":["s1"],"focused":"s1"}"#).unwrap();
+        assert_eq!(active.layout, WorkspaceLayout::Grid);
+    }
+
+    #[test]
     fn clearing_removes_only_that_workspace() {
         let data = temp_dir();
         let first = ActiveWorkspace {
             sessions: vec!["s1".into()],
             focused: Some("s1".into()),
+            layout: WorkspaceLayout::Grid,
         };
         let second = ActiveWorkspace {
             sessions: vec!["s2".into()],
             focused: None,
+            layout: WorkspaceLayout::Horizontal,
         };
         save(&data, Path::new("/tmp/eix-workspace-a"), &first).unwrap();
         save(&data, Path::new("/tmp/eix-workspace-b"), &second).unwrap();
@@ -177,6 +201,7 @@ mod tests {
         let active = ActiveWorkspace {
             sessions: vec!["s1".into()],
             focused: Some("s1".into()),
+            layout: WorkspaceLayout::Tabby,
         };
         save(&data, Path::new("/tmp/eix-workspace-a"), &active).unwrap();
         save(
@@ -196,6 +221,7 @@ mod tests {
             ActiveWorkspace {
                 sessions: vec!["s1".into()],
                 focused: Some("missing".into()),
+                layout: WorkspaceLayout::Fibonacci,
             },
         );
         write_file(&data, &file).unwrap();

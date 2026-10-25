@@ -66,7 +66,7 @@ pub async fn run(
     app.keybinds = Keybinds::from_config(&loaded.keys);
     let cli_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
     let saved_workspace = workspace::load(&data_dir, &cli_cwd);
-    app.restore_workspace(saved_workspace.sessions, saved_workspace.focused);
+    app.restore_workspace(saved_workspace);
     if let Ok(Some(defaults)) = eix_core::load_cli_config(&cli_cwd) {
         app.default_model = defaults.model;
         app.default_agent = defaults.agent;
@@ -141,10 +141,7 @@ pub async fn run(
         }
     }
 
-    let active = workspace::ActiveWorkspace {
-        sessions: app.workspace_sessions(),
-        focused: app.workspace_focused(),
-    };
+    let active = app.workspace_state();
     let workspace_result: Result<()> = if app.should_clear_active_workspace() {
         workspace::clear(&data_dir, &cli_cwd)
     } else if active.sessions.is_empty() {

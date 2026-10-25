@@ -45,9 +45,10 @@ echo 'review the diff' | ./target/debug/eix send
 则新建一个。`eix log` 等只读子命令找不到当前目录 session 时仍回退到最近 session。
 
 TUI 会按工作目录记住上次退出时仍打开的 pane：`Ctrl-C` / `Ctrl-D` / `Z` / `/quit` /
-`/exit` 退出时保存 pane 顺序和焦点，下次在同一目录启动时依次恢复；`:q` / `:qa` /
+`/exit` 退出时保存 pane 顺序、焦点和 layout，下次在同一目录启动时依次恢复；`:q` / `:qa` /
 `:wq` / `:x`（以及最后一个 pane 的 `/close`）会关闭 pane，不保存为活跃状态。没有可恢复的
-pane 时，仍回退到该目录最近更新的 user session。显式 `eix tui --session ID` 会忽略保存的 pane。
+pane 时，仍回退到该目录最近更新的 user session。显式 `eix tui --session ID` 会忽略保存的
+pane、焦点和 layout。
 
 未手动命名的 session 在前两轮对话完成后，daemon 会让模型总结这段对话并生成一个短标题；
 标题保留 Unicode 字母/数字和英文词之间的单个空格，最多 32 个字符（含空格），去掉其他标点；

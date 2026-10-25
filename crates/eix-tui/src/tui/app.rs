@@ -35,6 +35,7 @@ use super::editor::{leader_action, Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
 use super::theme::Theme;
 use super::transcript::{self, FoldId, Subagent, SubagentStatus};
+use super::workspace::{ActiveWorkspace, WorkspaceLayout};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -1254,6 +1255,24 @@ impl PaneLayout {
             Self::Fibonacci => Self::Grid,
         }
     }
+
+    fn workspace_layout(self) -> WorkspaceLayout {
+        match self {
+            Self::Grid => WorkspaceLayout::Grid,
+            Self::Horizontal => WorkspaceLayout::Horizontal,
+            Self::Tabby => WorkspaceLayout::Tabby,
+            Self::Fibonacci => WorkspaceLayout::Fibonacci,
+        }
+    }
+
+    fn from_workspace_layout(layout: WorkspaceLayout) -> Self {
+        match layout {
+            WorkspaceLayout::Grid => Self::Grid,
+            WorkspaceLayout::Horizontal => Self::Horizontal,
+            WorkspaceLayout::Tabby => Self::Tabby,
+            WorkspaceLayout::Fibonacci => Self::Fibonacci,
+        }
+    }
 }
 
 pub struct App {
@@ -1526,10 +1545,23 @@ impl App {
 
     /// Stage the pane state saved by the previous TUI run in this directory.
     /// The ids are resolved against the first session list, so stale entries
-    /// are ignored instead of blocking startup.
-    pub fn restore_workspace(&mut self, sessions: Vec<String>, focused: Option<String>) {
-        self.restore_sessions = sessions;
-        self.restore_focused = focused;
+    /// are ignored instead of blocking startup. An explicit `--session`
+    /// overrides the saved workspace, including its layout.
+    pub fn restore_workspace(&mut self, active: ActiveWorkspace) {
+        self.restore_sessions = active.sessions;
+        self.restore_focused = active.focused;
+        if self.initial_session.is_none() {
+            self.layout = PaneLayout::from_workspace_layout(active.layout);
+        }
+    }
+
+    /// Snapshot of the state to persist for this working directory.
+    pub fn workspace_state(&self) -> ActiveWorkspace {
+        ActiveWorkspace {
+            sessions: self.workspace_sessions(),
+            focused: self.workspace_focused(),
+            layout: self.layout.workspace_layout(),
+        }
     }
 
     /// Session ids currently open as panes, in pane order.
@@ -11655,6 +11687,7 @@ fn percent_decode(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::workspace::{ActiveWorkspace, WorkspaceLayout};
     use super::*;
 
     #[test]
@@ -11725,9 +11758,15 @@ mod tests {
     }
 
     #[test]
-    fn startup_restores_saved_panes_in_order_and_restores_focus() {
+    fn startup_restores_saved_panes_layout_and_focus() {
         let mut app = App::new(None);
-        app.restore_workspace(vec!["a".into(), "b".into()], Some("a".into()));
+        app.restore_workspace(ActiveWorkspace {
+            sessions: vec!["a".into(), "b".into()],
+            focused: Some("a".into()),
+            layout: WorkspaceLayout::Fibonacci,
+        });
+        assert_eq!(app.layout, PaneLayout::Fibonacci);
+        assert_eq!(app.workspace_state().layout, WorkspaceLayout::Fibonacci);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sessions = vec![
             Session::new("a", "a", "/tmp/eix-workspace"),
@@ -11764,7 +11803,12 @@ mod tests {
     fn startup_falls_back_to_the_latest_workspace_session_for_stale_restore_ids() {
         let cwd = std::env::current_dir().expect("cwd");
         let mut app = App::new(None);
-        app.restore_workspace(vec!["deleted".into()], Some("deleted".into()));
+        app.restore_workspace(ActiveWorkspace {
+            sessions: vec!["deleted".into()],
+            focused: Some("deleted".into()),
+            layout: WorkspaceLayout::Tabby,
+        });
+        assert_eq!(app.layout, PaneLayout::Tabby);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sessions = vec![
             Session::new("newest", "newest", cwd.clone()),
@@ -11780,7 +11824,12 @@ mod tests {
     fn explicit_session_ignores_saved_restore_state() {
         let cwd = std::env::current_dir().expect("cwd");
         let mut app = App::new(Some("explicit".into()));
-        app.restore_workspace(vec!["saved".into()], Some("saved".into()));
+        app.restore_workspace(ActiveWorkspace {
+            sessions: vec!["saved".into()],
+            focused: Some("saved".into()),
+            layout: WorkspaceLayout::Horizontal,
+        });
+        assert_eq!(app.layout, PaneLayout::Grid);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let sessions = vec![
             Session::new("explicit", "explicit", cwd.clone()),

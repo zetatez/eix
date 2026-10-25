@@ -88,9 +88,10 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
 - TUI / `chat` / `send` 未指定 session 时，按启动目录选择最近更新的 user session attach；
   当前目录没有 session 则新建。其他只读 CLI 命令找不到当前目录 session 时回退到最近 session。
 - TUI 按启动目录把仍打开的 pane 记录在 `<data_dir>/workspaces.json`：`Ctrl-C` / `Ctrl-D` /
-  `Z` / `/quit` / `/exit` 退出时保存 pane 顺序与焦点，下次启动依次重新 attach；`:q` /
-  `:qa` / `:wq` / `:x` 或最后一个 pane 的 `/close` 退出时清除记录。记录为空或 session 已
-  失效时，回退到该目录最近更新的 user session。显式 session 参数覆盖恢复。
+  `Z` / `/quit` / `/exit` 退出时保存 pane 顺序、焦点与 layout，下次启动依次重新 attach；
+  `:q` / `:qa` / `:wq` / `:x` 或最后一个 pane 的 `/close` 退出时清除记录。记录为空或 session
+  已失效时，回退到该目录最近更新的 user session；旧记录缺少 layout 时按 grid 处理。显式
+  session 参数忽略保存的 pane、焦点与 layout。
 - 同一 session 可被多 client 观察，但**只有一个输入所有者（controller）**。
 - 所有者断开 → 自动转移给最早的 watcher；显式抢占用 `<leader>a C`（claim）。
 - draft 由 daemon 持有，client 的 nvim 只是视图；所有权切换时重新加载 draft。
