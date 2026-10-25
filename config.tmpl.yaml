@@ -213,32 +213,55 @@ theme:
   preset: "github-dark"
 
 
-# Optional: transcript key overrides. Defaults are built in; `keys` only
-# overrides them. Leader = Space.
-#   quit            Z / Ctrl-C / Ctrl-D
-#   help            ? / F1
-#   new_session     Space n / Space N
-#   new_worktree    Space W
-#   sessions        Space s / Ctrl-G
-#   new_pane        Space o
-#   palette         Ctrl-P
-#   model           Ctrl-/
-#   git             Space g
-#   ledger          Space C
-#   processes       Space p
-#   inbox           Space a
-#   fork            Space F
-#   attention       Space A
-#   cancel          Space x
-#   next_session    Shift+. / >
-#   prev_session    Shift+, / <
-#   scroll_down     j / Down / PgDn
-#   scroll_up       k / Up / PgUp / Ctrl-U
-#   timeline        /timeline
-#   todos           /todos
-#   undo            /undo
-#   redo            /redo
-# Prompt normal mode keeps vim keys; overlay keys are in README.
-# Override with a modified/named/punctuation key; bare letters are ignored.
-# Examples: sessions: "C-t" · new_session: "C-n" · help: "F2"
-keys: {}
+# Optional: global/TUI keymap. Defaults are built in; an entry here replaces
+# that action's default binding(s), it does not add an alias. The leader prefix
+# defaults to Space and can be changed with `leader`.
+#
+# Values are one key ("C-t", "F2", "?") or one leader chord ("Space n" /
+# "leader n"). Bare letters are allowed for normal/transcript actions; actions
+# that can be configured globally (quit/help/sessions/models/timeline/reasoning/
+# tab_N) are demoted to normal/transcript mode when given a bare letter.
+# Overlay-internal navigation (picker/help/approval/diff/process/inbox) is fixed.
+#
+# Defaults:
+#   leader            Space
+#   quit              Ctrl-C / Ctrl-D / Z (Z only in normal/transcript)
+#   help              F1
+#   sessions          Space g
+#   palette           Ctrl-P
+#   models            Ctrl-/ / Ctrl-_ / Ctrl-7
+#   timeline          Space h
+#   cycle_reasoning   Ctrl-T
+#   tab_1 … tab_9     Ctrl-1 … Ctrl-9 (tab_7 is unused; Ctrl-7 = models)
+#   new_session       Space n
+#   new_worktree      Space W
+#   new_pane          Space o
+#   files             Space f
+#   grep              Space s
+#   git               Space G
+#   processes         Space p
+#   inbox             Space a
+#   cancel            Space x
+#   close_pane        q / Space c
+#   mode              Space m
+#   layout_horizontal Space v
+#   layout_tabby      Space t
+#   layout_fibonacci  Space r
+#   layout_cycle      Space l
+#   pane_prev         <
+#   pane_next         >
+#   cycle_mode        Tab
+#   cycle_mode_back   Shift-Tab
+#   page_up           PageUp / Ctrl-B / Ctrl-U
+#   page_down         PageDown / Ctrl-F
+#
+# Config-only actions (no default key): scroll_up, scroll_down, next_session,
+# prev_session, fork, attention, todos, undo, redo.
+#
+# Example overrides (leader defaults to Space):
+keys:
+  leader: Space
+  # sessions: C-t
+  # new_session: leader N
+  # close_pane: C-q
+  # help: F2

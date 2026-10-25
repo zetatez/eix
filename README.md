@@ -172,14 +172,14 @@ theme:
   # diff_delete: "#f44747"
   # panel: black
 
-# 转录区快捷键覆盖
+# 全局 / TUI 快捷键覆盖。默认值内置；配置某个动作会替换它的默认绑定。
 keys:
+  leader: Space          # 默认前缀
   # sessions: C-t
-  # new_session: C-n
+  # new_session: leader N
   # help: F2
-  # palette: C-p
-  # model: C-/
-  # quit: C-q
+  # close_pane: C-q
+  # page_up: C-y
 ```
 
 环境变量只保留启动、连接和模型入口：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、
@@ -260,14 +260,14 @@ pane 不超过 5 个时全部显示，超过时只显示第一个 pane + 后续 
 或前后移动切换时窗口会跟随焦点滑动；终端矮时压缩为标题行/单行内容，不退回 tabby）、
 `tabby`（输入框上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个稳定的 session 顺序：pane 按打开顺序排列，发送任务、
-turn 完成或等待审批/输入都不会移动它。session 视作双向链表，`Shift+,` / `Shift+.` 或 1 秒内
+turn 完成或等待审批/输入都不会移动它。session 视作双向链表，`<` / `>` 或 1 秒内
 连续按两次 `Ctrl-W` 在前后节点间移动；`Ctrl-1` … `Ctrl-9` 直接跳到对应 session，顺序保持不变。
 在 `tabby` 布局下就是切换到第 N 个 tab
 （输入框内也可用）。这些组合键需要终端支持 kitty 键盘协议；不支持的终端可能无法区分。
 `Ctrl-7` 在部分终端等价于 `Ctrl-/`，会打开模型 picker。在转录区或输入框 normal 模式下，
 1 秒内连续按两次 `Ctrl-W` 会聚焦下一个 pane；已经是最后一个时回绕到第一个。
 
-历史 session 不再占用左侧栏：按 `Ctrl-G`（或 `/sessions`）打开浮动 picker，输入即模糊搜索、
+历史 session 不再占用左侧栏：按 `leader g`（默认 `Space g`，或 `/sessions`）打开浮动 picker，输入即模糊搜索、
 `Enter` 选择、`Esc` 关闭；列表只含普通/worktree session，子 agent 从父 transcript 卡片进入，
 子 session 底部点击 `← parent agent` 返回。
 输入框只保留正文和边框；下方 statusline 左侧按
@@ -294,21 +294,18 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
 
 ### 快捷键总览
 
-#### 全局
+#### 全局与窗口
 
  | 快捷键                | 功能                                                               |
  | ---                   | ---                                                                |
- | `F1`                  | 打开可搜索帮助                                                     |
- | `Ctrl-P`              | 命令面板                                                           |
- | `Ctrl-G`              | session picker；切换当前 pane 的 session                           |
- | `Ctrl-H`              | 当前 session 的用户输入 timeline picker                            |
- | `Ctrl-T`              | 切换 reasoning：low / medium / high                                |
- | `Ctrl-/`              | 模型 picker（部分终端为 `Ctrl-_` / `Ctrl-7`）                      |
- | `Ctrl-1` … `Ctrl-9`   | 跳到第 N 个已打开 session / tabby tab                              |
- | `Shift+,` / `Shift+.` | 转录区 / 输入框 normal：上一个 / 下一个 pane（实际按键 `<` / `>`） |
+ | `F1`                  | 打开可搜索帮助（任意模式）                                         |
+ | `Ctrl-T`              | 切换 reasoning：low / medium / high（任意模式）                    |
+ | `Ctrl-/`              | 模型 picker（任意模式；部分终端为 `Ctrl-_` / `Ctrl-7`）             |
+ | `Ctrl-1` … `Ctrl-9`   | 跳到第 N 个已打开 session / tabby tab（`Ctrl-7` 通常留给模型 picker） |
+ | `<` / `>`             | 转录区 / 输入框 normal：上一个 / 下一个 pane（即 `Shift+,` / `Shift+.`） |
  | `Ctrl-W` `Ctrl-W`     | 转录区 / 输入框 normal：1 秒内连按两次聚焦下一个 pane              |
- | `Z`                   | normal 模式退出                                                    |
- | `q`                   | normal 模式关闭当前 pane（最后一个 pane 保持打开）                  |
+ | `Z`                   | normal / 转录区退出                                                |
+ | `q`                   | normal / 转录区关闭当前 pane（最后一个 pane 保持打开）              |
  | `Ctrl-C` / `Ctrl-D`   | 任意模式退出（先保存草稿）                                         |
  | `Esc Esc`             | normal 模式：中断运行中的 turn，或进入转录区                       |
 
@@ -322,15 +319,22 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `/` / `?` / `#`       | 搜索当前 transcript；`n` / `N` 跳下一个 / 上一个，`Esc` 清除 |
  | `Enter`               | insert 模式发送；turn 运行中自动排队                         |
  | `Ctrl-J`              | insert 模式换行                                              |
+ | `Ctrl-P`              | 命令面板（输入框 normal / 转录区）                           |
  | `Tab`                 | 输入框 normal / 转录区：Plan → Build → Auto → Bypass 循环    |
  | `Shift-Tab`           | 反向循环：Build → Plan → Bypass → Auto                       |
  | `j` / `k`             | 转录区滚动；输入框 normal 下移动草稿行                       |
  | `Ctrl-J` / `Ctrl-K`   | 输入框 normal：浏览已提交的 prompt 历史                      |
  | `g` / `G`             | 转录区顶部 / 跟随末尾                                        |
  | `PageUp` / `PageDown` | 翻页                                                         |
- | `Ctrl-B` / `Ctrl-F`   | 快速前后翻页                                                 |
+ | `Ctrl-B` / `Ctrl-U`   | 快速向上翻页（`Ctrl-F` 向下）                                |
 
-#### Leader：`Space` + 键
+全局 / TUI 动作和 leader 组合都可以在 `[keys]` 中覆盖；配置某个动作会替换它的默认绑定，
+不会保留旧键作为别名。`leader` 可改前缀，组合键写作 `leader N` 或 `Space N`。裸字母只对
+normal / 转录区动作安全；`quit`、`help`、`sessions`、`models`、`timeline`、
+`cycle_reasoning`、`tab_N` 这类可配置为全局的动作如果配成裸字母，会自动降级为
+normal / 转录区专用。overlay 内部导航键仍固定。完整默认值和动作名见 `config.tmpl.yaml`。
+
+#### Leader（默认 `Space`，可配置）+ 键
 
  | 快捷键                | 功能                             |
  | ---                   | ---                              |
@@ -343,7 +347,9 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Space m`             | 完整执行模式 picker              |
  | `Space f`             | 文件 picker                      |
  | `Space s`             | 搜索文件内容并插入 `@path:line`  |
- | `Space g`             | git picker（worktrees + branches）|
+ | `Space g`             | session picker（切换聚焦 pane）  |
+ | `Space h`             | 用户输入 timeline picker         |
+ | `Space G`             | git picker（worktrees + branches）|
  | `Space p`             | 后台进程列表                     |
  | `Space v`             | horizontal 布局                  |
  | `Space t`             | tabby 布局                       |
@@ -414,16 +420,17 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Ctrl-J`                                          | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同）                                                                                                                                                                                                                                                                                                                             |
  | `Tab`                                             | normal 模式与转录区：按 Plan → Build → Auto → Bypass → Plan 循环执行模式                                                                                                                                                                                                                                                                                                            |
  | `Shift-Tab`                                       | normal 模式与转录区：反向循环，Build → Plan → Bypass → Auto → Build                                                                                                                                                                                                                                                                                                                 |
- | `Ctrl-G`                                          | session picker：切换聚焦 pane 的 session，右侧实时预览该 session 的最近对话（输入框内外都可用；只列普通/worktree session，子 agent 从父 transcript 卡片进入）                                                                                                                                                                                                                       |
+ | `<Space>g`                                        | session picker：切换聚焦 pane 的 session，右侧实时预览该 session 的最近对话（输入框 normal / 转录区可用；只列普通/worktree session，子 agent 从父 transcript 卡片进入）                                                                                                                                                                                                              |
+ | `<Space>h`                                        | 当前 session 的用户输入 timeline picker（输入框 normal / 转录区）                                                                                                                                                                                                                                                              |
  | `Ctrl-T`                                          | 快速轮换推理强度：low → medium → high → low（默认 medium，输入框内外都可用）                                                                                                                                                                                                                                                                                                        |
  | `Ctrl-/`                                          | 打开可搜索的模型 picker：输入筛选、`Enter` 切换、`Esc` 关闭（输入框内外都可用；部分终端为 `Ctrl-_` / `Ctrl-7`）                                                                                                                                                                                                                                                                     |
  | `<Space>o`                                        | session picker：在**新 pane** 中打开（已打开则聚焦该 pane），右侧实时预览最近对话；子 agent 不在此列表                                                                                                                                                                                                                                                                              |
  | `<Space>f`                                        | 文件 picker：搜索 workspace 文件，右侧实时预览文件内容，选中后插入 `@相对路径`                                                                                                                                                                                                                                                                                                      |
  | `<Space>s`                                        | 内容 picker：搜索 workspace 文件内容，选中后插入 `@相对路径:行号`；也可用 `/grep [query]`                                                                                                                                                                                                                                                                                            |
  | `Ctrl-P`                                          | 命令面板（转录区、以及输入框的 normal 模式都可用）：与 `/` 命令菜单使用同一份 built-in / 自定义命令和描述，命令名与说明分列对齐；选中后按 `/命令` 执行                                                                                                                                                                                               |
- | `<Space>g`                                        | git picker：同时列出 worktrees 和 branches；没有 linked worktree 时只显示 branches，选中后把路径或分支名插入聚焦 pane 的输入框                                                                                                                                                                                                                                                      |
+ | `<Space>G`                                        | git picker：同时列出 worktrees 和 branches；没有 linked worktree 时只显示 branches，选中后把路径或分支名插入聚焦 pane 的输入框                                                                                                                                                                                                                                                      |
  | `@`（输入框内）                                   | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发）                                                                                                                                                                                                                                                                                                                             |
- | `Shift+,` / `Shift+.`                             | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式）                                                                                                                                                                                                                                                                                                             |
+ | `<` / `>`                                         | 线性切换到上一个 / 下一个 pane（即 `Shift+,` / `Shift+.`；转录区与输入框 normal 模式）                                                                                                                                                                                                                                                                                              |
  | `Ctrl-W` `Ctrl-W`                                 | 1 秒内连续按两次：聚焦下一个 pane，最后一个回绕到第一个（转录区与输入框 normal 模式）                                                                                                                                                                                                                                                                                               |
  | `<Space>v` / `<Space>t` / `<Space>r`              | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局                                                                                                                                                                                                                                                                                                                        |
  | `Ctrl-1` … `Ctrl-9`                               | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用；`Ctrl-7` 可能用于模型 picker）                                                                                                                                                                                                                                                                            |
@@ -482,7 +489,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
  | `/skills [name] [args]`                    | 打开 skill picker（右侧预览正文）；带名字时把正文放进输入框并展开 `$ARGUMENTS` / `$1..$9`                                                                                    |
  | `/todos`                                   | 打开任务列表 picker（搜索任务，显示状态和详情；内存态，daemon 重启后清空）                                                                                                   |
  | `/image <path>`                            | 把图片挂到下一条 prompt（png / jpg / gif / webp，最多 4 张、每张 8 MB）；不带参数时显示已挂图片，`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI               |
- | `/timeline`                                | 当前 session 用户输入历史，按时间倒序；带时间戳、搜索和完整预览，`Ctrl-J/K` 或 `Ctrl-N/P` 选择，`Enter` 跳到对应消息位置（`Ctrl-H` 同效）                                    |
+ | `/timeline`                                | 当前 session 用户输入历史，按时间倒序；带时间戳、搜索和完整预览，`Ctrl-J/K` 或 `Ctrl-N/P` 选择，`Enter` 跳到对应消息位置（`Space h` 同效）                                    |
  | `/archive`                                 | 归档当前 session（从 picker/列表隐藏，事件保留）                                                                                                                             |
  | `/delete`                                  | 删除当前 session；需要连续执行两次确认                                                                                                                                       |
  | `/undo` / `/redo`                          | 隐藏/恢复最近一个 user turn（事件仍在日志里，可通过 redo 恢复）                                                                                                              |
@@ -675,7 +682,7 @@ worktree、branch、context 显示 daemon 给出的详情；skills 显示来源�
 files / grep / git / worktrees / branches / context 由 daemon 的 `picker.query` 提供；
 files / sessions 预览由 `picker.preview` 懒加载，grep 的每行自带匹配行预览；
 其余（sessions、命令面板、skills）在客户端生成。历史 session 不在左侧栏
-常驻，只通过这个浮动 picker 打开（`Ctrl-G` / `/sessions`）。
+常驻，只通过这个浮动 picker 打开（`Space g` / `/sessions`）。
 
 输入框是自研的 Vim 风格编辑器（不再内嵌 Neovim 进程，输入零往返延迟）。外框使用透明背景的
 圆角边框，跟随主题的 `background`（未设置时用终端背景），默认 3 行内容 + 上下边框（共 5 行，
@@ -701,18 +708,20 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
 - `Enter` 在 insert 模式提交；turn 运行中提交的内容自动排队（`/queue` 查看，`Esc Esc` 中断当前 turn）。
   normal 模式不改变 pane 顺序；切换 session 用 `Ctrl-1` … `Ctrl-9` 或前后移动
 
-TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：
+TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（默认空格，可用 `[keys].leader` 修改）+ 键**：
 `<Space>n` 新建 session 并在新 pane 打开（当前 session 有 worktree 时复用）、`<Space>o` 把已有 session 放进新 pane
 （`<Space>c` 关闭当前 pane）、`<Space>f` 文件、
 `<Space>g` git（worktrees + branches）、
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>m` 完整执行模式、
 `Ctrl-P` 命令面板。normal 模式下裸 `q` 关闭当前 pane（最后一个 pane 保持打开），
-裸 `Z`（`Shift+Z`）退出 eix；除此之外，裸字母 `o`/`p`/`n` 等不再触发任何 TUI 动作。
+裸 `Z`（`Shift+Z`）退出 eix；除此之外，裸字母 `o`/`p`/`n` 等默认不触发 TUI 动作。
+这些默认值都可以通过 `[keys]` 覆盖；例如 `close_pane: C-q` 会同时停用 `q` 和 `<Space>c`；
+`leader` 默认是 `Space`，也可以改成任意键。
 
 新建 session 后如果既没有提交内容、也没有保留草稿就退出，空 session 会从历史列表删除；
 有草稿的 session 会保留。worktree session 不自动删除，避免误删工作区。
-insert 模式下保留 `Ctrl-G`（session picker）、`Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）
-和 `@`（文件 picker）。所有 picker 都支持 `Ctrl-J`/`Ctrl-K` 或
+insert 模式下保留 `Ctrl-Enter`/`Shift-Enter`/`Ctrl-J`（换行）和 `@`（文件 picker）；
+session / timeline picker 走 `leader g` / `leader h`（normal / 转录区）。所有 picker 都支持 `Ctrl-J`/`Ctrl-K` 或
 `Ctrl-N`/`Ctrl-P`（以及 `↑`/`↓`）上下选择；`:` 命令菜单打开后也支持这组键。normal 模式下 `Esc Esc` 先中断运行中的 turn；
 空闲时回到转录区。
 输入框默认 3 行内容（加边框共 5 行；终端过矮时优先让给转录区），长草稿最多向上生长到
@@ -1407,7 +1416,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 可配置 TUI 调色板（`[theme]`，颜色名 / hex / ANSI 索引）
 - [x] HTTP API（`[server] http`；`/health`、`/stats`、POST `/rpc`、SSE `/events` + `session_id` 过滤，Bearer token、CORS/OPTIONS；`eix-sdk` 类型化 Rust client）
 - [x] 图片附件（`eix send --image` / TUI `/image` / 粘贴拖入路径或 `file://`，OpenAI 多模态 content，SHA-256 blob 存储、保留/GC、export/import 往返）
-- [x] 可配置转录区快捷键（`[keys] action = "C-x"`，含命名键/F1-F12）
+- [x] 可配置全局 / TUI / leader 快捷键（`[keys] action = "C-x"` 或 `action = "leader N"`，含命名键/F1-F12；overlay 导航键固定）
 - [x] LSP diagnostics（内置常见语言 server、懒启动 stdio client、写入后附诊断、`lsp_diagnostics`、`lsp.workspace` 全工作区扫描 RPC；可按语言覆盖）
 - [x] prompt `!<cmd>` 直接执行 shell（sandbox + snapshot + 只读拒绝，保留 tool 事件）
 - [x] 独立 Neovim 前端交互：`<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`

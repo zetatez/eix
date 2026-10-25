@@ -31,7 +31,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::controller::{Command, Event};
-use super::editor::{leader_action, Editor, Mode, Outcome};
+use super::editor::{Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
 use super::theme::Theme;
 use super::transcript::{self, FoldId, Subagent, SubagentStatus};
@@ -3705,14 +3705,10 @@ impl App {
         if self.pending_leader {
             self.restore_leader_status();
         }
-        // Ctrl-C / Ctrl-D quit the TUI from every mode, including insert and
-        // any open overlay. Save the draft first so quitting never loses it.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(
-                key.code,
-                KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('d') | KeyCode::Char('D')
-            )
-        {
+        // Quit works from every mode, including insert and any open overlay.
+        // Save the draft first so quitting never loses it.
+        if self.keybinds.global_action(key) == Some(KeyAction::Quit) {
+            self.pending_leader = false;
             self.sync_draft(tx);
             self.should_quit = true;
             return;
@@ -3734,7 +3730,8 @@ impl App {
             self.handle_cmdline_key(key, tx);
             return;
         }
-        if matches!(key.code, KeyCode::F(1)) {
+        if self.keybinds.global_action(key) == Some(KeyAction::Help) {
+            self.pending_leader = false;
             self.open_help();
             return;
         }
@@ -3860,45 +3857,13 @@ impl App {
             return;
         }
 
-        // Queue-position shortcuts work from both the prompt and transcript.
-        // Ctrl-1..9 needs a terminal with keyboard disambiguation (kitty
-        // protocol).
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            if let KeyCode::Char(ch @ '1'..='9') = key.code {
-                // Ctrl-7 is the legacy encoding of Ctrl-/ and belongs to the
-                // model picker below, not the tab strip.
-                if ch != '7' {
-                    self.focus_tab(ch as usize - '1' as usize);
-                    return;
-                }
-            }
-        }
-
-        // Global model picker: Ctrl-/ (terminals encode it as '/', '_', or Ctrl-7).
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(
-                key.code,
-                KeyCode::Char('/') | KeyCode::Char('_') | KeyCode::Char('7')
-            )
-        {
-            self.open_picker(PickerKind::Models, tx);
-            return;
-        }
-
-        // Ctrl-H opens this session's user-input timeline. Some terminals
-        // report Ctrl-H as a control-modified Backspace.
-        if key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('h') | KeyCode::Backspace)
-        {
-            self.open_picker(PickerKind::Timeline, tx);
-            return;
-        }
-
-        // Global reasoning shortcut: cycle low → medium → high → none → low.
-        // Updating the session locally first keeps rapid presses advancing
-        // even before the daemon round-trip lands.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('t') {
-            self.cycle_reasoning(tx);
+        // Global/TUI actions that work from both the prompt and the
+        // transcript. Ctrl-1..9 needs a terminal with keyboard disambiguation
+        // (kitty protocol); Ctrl-7 is the legacy encoding of Ctrl-/ on some
+        // terminals and is therefore a model-picker alias by default.
+        if let Some(action) = self.keybinds.global_action(key) {
+            self.pending_leader = false;
+            self.run_key_action(action, tx);
             return;
         }
 
@@ -3927,81 +3892,59 @@ impl App {
     }
 
     /// TUI actions shared by transcript focus and the prompt's normal mode.
-    /// The prompt keeps its vim editing keys (`j`/`k`, `Tab`, `Enter`, ...);
-    /// only actions the editor does not own are handled here.
+    /// The prompt keeps its vim editing keys (`j`/`k`, `Enter`, ...); this
+    /// handler owns the configurable normal/transcript keymap and leader.
     fn handle_shared_normal_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) -> bool {
+        let available = self.focused_approval().is_none() && self.focused_input().is_none();
         if self.pending_leader {
-            let available = self.focused_approval().is_none() && self.focused_input().is_none();
             self.pending_leader = false;
             if available {
-                if let KeyCode::Char(ch) = key.code {
-                    if let Some(action) = leader_action(ch) {
-                        self.run_action(action, tx);
-                    }
+                if let Some(action) = self.keybinds.leader_action(key) {
+                    self.run_key_action(action, tx);
                 }
             }
             return true;
         }
-        if key.code == KeyCode::Char(' ')
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::ALT)
-        {
+        if self.keybinds.is_leader(key) {
             // A blocking card owns the keyboard; never start a hidden leader
             // under it, and never let the editor start a second one either.
-            if self.focused_approval().is_none() && self.focused_input().is_none() {
+            if available {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/g/s · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · i input · Z quit · Esc cancel"
+                self.status = "leader: f/g/s · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
                     .into();
             }
             return true;
         }
-        if self.focused_approval().is_none() && self.focused_input().is_none() {
-            if let Some(action) = self.keybinds.action(key) {
+        if available {
+            if let Some(action) = self.keybinds.normal_action(key) {
                 self.run_key_action(action, tx);
                 return true;
             }
         }
-        // Shift-Tab walks the same mode ring backwards. The prompt only reaches
-        // this handler while normal-idle, so a pending count/operator stays
-        // with the editor instead of being cleared by a mode switch.
-        let back_tab = matches!(key.code, KeyCode::BackTab)
-            || (key.code == KeyCode::Tab && key.modifiers.contains(KeyModifiers::SHIFT));
-        if back_tab && self.focused_approval().is_none() && self.focused_input().is_none() {
-            self.cycle_mode(-1, tx);
+        // The editor has its own legacy Space leader for direct tests. In the
+        // app, consume Space when the user moved the leader elsewhere so that
+        // old chords cannot stay active behind the config.
+        if key.code == KeyCode::Char(' ')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
             return true;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) {
-            match key.code {
-                KeyCode::Char('w') | KeyCode::Char('W') => {
-                    let now = Instant::now();
-                    let double = self
-                        .ctrl_w_at
-                        .is_some_and(|last| now.duration_since(last) < CTRL_W_WINDOW);
-                    self.ctrl_w_at = (!double).then_some(now);
-                    if double {
-                        self.cycle_pane(1);
-                    }
-                    return true;
-                }
-                KeyCode::Char('p') | KeyCode::Char('P') => {
-                    self.open_picker(PickerKind::Commands, tx);
-                    return true;
-                }
-                KeyCode::Char('b') | KeyCode::Char('B') => {
-                    self.scroll_focused(-10);
-                    return true;
-                }
-                KeyCode::Char('f') | KeyCode::Char('F') => {
-                    self.scroll_focused(10);
-                    return true;
-                }
-                KeyCode::Char('u') => {
-                    self.scroll_focused(-10);
-                    return true;
-                }
-                _ => {}
+        // Ctrl-W stays a Vim-style gesture (and deletes a word in insert).
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('w') | KeyCode::Char('W'))
+        {
+            let now = Instant::now();
+            let double = self
+                .ctrl_w_at
+                .is_some_and(|last| now.duration_since(last) < CTRL_W_WINDOW);
+            self.ctrl_w_at = (!double).then_some(now);
+            if double {
+                self.cycle_pane(1);
             }
+            return true;
         }
         if matches!(key.code, KeyCode::Char('n') | KeyCode::Char('N'))
             && !key
@@ -4015,14 +3958,6 @@ impl App {
         match key.code {
             KeyCode::Char(ch @ ('/' | '?' | '#')) => {
                 self.open_cmdline_with(ch);
-                true
-            }
-            KeyCode::PageDown => {
-                self.scroll_focused(10);
-                true
-            }
-            KeyCode::PageUp => {
-                self.scroll_focused(-10);
                 true
             }
             _ => false,
@@ -4051,13 +3986,16 @@ impl App {
         {
             return;
         }
-        // Cross-mode session picker. It is a TUI binding, so it works in every
-        // editor mode (and does not consume a normal-mode letter).
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
-            self.open_picker(PickerKind::Sessions, tx);
+        // A half-typed vim prefix keeps the key for the editor, but Space must
+        // not revive the editor's legacy leader map behind `[keys].leader`.
+        if self.input.mode() == Mode::Normal
+            && key.code == KeyCode::Char(' ')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
             return;
         }
-
         // Normal-mode `p`/`P` can paste the desktop clipboard as well as the
         // editor's own register. Prefer the register when it already holds a
         // yank/delete so Vim editing keeps working; otherwise read the system
@@ -4172,7 +4110,19 @@ impl App {
             Outcome::Submit => self.submit(tx),
             Outcome::FilePicker => self.open_picker(PickerKind::Files, tx),
             Outcome::History(delta) => self.navigate_history(delta),
-            Outcome::Action(id) if self.overlay_closed() => self.run_action(id, tx),
+            Outcome::Action(id) if self.overlay_closed() => {
+                // The editor still knows the old Vim-adjacent TUI shortcuts
+                // (`q`, `Z`, `<`, `>`, Tab). They are only allowed when the
+                // current keymap still binds that action to this key; after a
+                // `[keys]` override the legacy key becomes inert.
+                if let Some(action) = KeyAction::parse(id) {
+                    if self.keybinds.normal_action(key) == Some(action) {
+                        self.run_key_action(action, tx);
+                    }
+                } else {
+                    self.run_action(id, tx);
+                }
+            }
             Outcome::Ignored | Outcome::Action(_) => {}
         }
     }
@@ -4926,38 +4876,13 @@ impl App {
             }
             return;
         }
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('g')) {
-            self.open_picker(PickerKind::Sessions, tx);
-            return;
-        }
-        // Pane actions are leader-only. Single letters are reserved for
-        // navigation (j/k, g/G) and the prompt's own vim editing; the only
-        // direct shortcuts left are shifted punctuation (`?`/`#`/`<`/`>`)
-        // plus Ctrl-P for the palette in the shared handler above.
+        // Vim navigation stays in the transcript. Global/TUI actions (including
+        // q/Z/< >/Tab) are handled by the shared keymap above so `[keys]` can
+        // rebind or remove them.
         match key.code {
-            // Shift+Z is the vim-adjacent quit key in normal mode.
-            KeyCode::Char('Z')
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.run_action("quit", tx)
-            }
-            // `q` closes the focused pane; the last pane stays open.
-            KeyCode::Char('q')
-                if !key
-                    .modifiers
-                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
-            {
-                self.run_action("close-pane", tx)
-            }
-            KeyCode::Char('<') => self.cycle_pane(-1),
-            KeyCode::Char('>') => self.cycle_pane(1),
             // `i` is the one bare letter that stays: focusing the prompt is
             // the normal way out of the transcript, like vim insert mode.
-            // Enter (pane promotion) is shared with prompt normal mode.
             KeyCode::Char('i') => self.focus_input(),
-            KeyCode::Tab => self.toggle_mode(tx),
             KeyCode::Char('j') | KeyCode::Down => self.scroll_focused(1),
             KeyCode::Char('k') | KeyCode::Up => self.scroll_focused(-1),
             KeyCode::Char('g') => {
@@ -4979,27 +4904,30 @@ impl App {
 
     fn run_key_action(&mut self, action: KeyAction, tx: &UnboundedSender<Command>) {
         match action {
-            KeyAction::Quit => {
-                self.sync_draft(tx);
-                self.should_quit = true;
-            }
+            KeyAction::Quit => self.run_action("quit", tx),
             KeyAction::Help => self.open_help(),
-            KeyAction::NewSession => self.new_session(tx, None),
-            KeyAction::NewWorktree => self.new_worktree(tx, None),
+            KeyAction::NewSession => self.run_action("new", tx),
+            KeyAction::NewWorktree => self.run_action("new-worktree", tx),
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
-            KeyAction::NewPane => self.open_picker(PickerKind::NewPane, tx),
-            KeyAction::Palette => self.open_picker(PickerKind::Commands, tx),
-            KeyAction::Models => self.open_picker(PickerKind::Models, tx),
-            KeyAction::Git => self.open_picker(PickerKind::Git, tx),
-            KeyAction::Processes => self.open_processes(tx),
-            KeyAction::Inbox => self.open_inbox(),
-            KeyAction::Fork => self.fork_focused(tx, None),
-            KeyAction::Attention => self.focus_next_attention(),
-            KeyAction::Cancel => self.cancel(tx),
+            KeyAction::NewPane => self.run_action("new-pane", tx),
+            KeyAction::Palette => self.run_action("commands", tx),
+            KeyAction::Files => self.run_action("files", tx),
+            KeyAction::Grep => self.run_action("grep", tx),
+            KeyAction::Models => self.run_action("model", tx),
+            KeyAction::Git => self.run_action("git", tx),
+            KeyAction::Processes => self.run_action("processes", tx),
+            KeyAction::Inbox => self.run_action("approvals", tx),
+            KeyAction::Fork => self.run_action("fork", tx),
+            KeyAction::Attention => self.run_action("attention", tx),
+            KeyAction::Cancel => self.run_action("cancel", tx),
             KeyAction::NextSession => self.cycle_session(1, tx),
             KeyAction::PrevSession => self.cycle_session(-1, tx),
+            KeyAction::PaneNext => self.run_action("pane-next", tx),
+            KeyAction::PanePrev => self.run_action("pane-prev", tx),
             KeyAction::ScrollDown => self.scroll_focused(1),
             KeyAction::ScrollUp => self.scroll_focused(-1),
+            KeyAction::PageDown => self.scroll_focused(10),
+            KeyAction::PageUp => self.scroll_focused(-10),
             KeyAction::Timeline => self.open_picker(PickerKind::Timeline, tx),
             KeyAction::Todos => {
                 if let Some(session_id) = self.focused_session_id() {
@@ -5014,6 +4942,16 @@ impl App {
                     self.status = if redo { "redoing…" } else { "undoing…" }.into();
                 }
             }
+            KeyAction::ClosePane => self.run_action("close-pane", tx),
+            KeyAction::ModePicker => self.run_action("mode", tx),
+            KeyAction::LayoutHorizontal => self.run_action("layout-horizontal", tx),
+            KeyAction::LayoutTabby => self.run_action("layout-tabby", tx),
+            KeyAction::LayoutFibonacci => self.run_action("layout-fibonacci", tx),
+            KeyAction::LayoutCycle => self.run_action("layout-cycle", tx),
+            KeyAction::CycleMode => self.toggle_mode(tx),
+            KeyAction::CycleModeBack => self.cycle_mode(-1, tx),
+            KeyAction::CycleReasoning => self.cycle_reasoning(tx),
+            KeyAction::FocusTab(index) => self.focus_tab(index as usize - 1),
         }
     }
 
@@ -7835,7 +7773,7 @@ already exists, update it in place rather than rewriting it from scratch.";
     }
 
     fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
-        // Sessions live in the floating picker (`Ctrl-G` / `/sessions`), not in
+        // Sessions live in the floating picker (`Space g` / `/sessions`), not in
         // a permanent sidebar: panes get the whole body.
         if self.views.is_empty()
             || self.effective_layout(area) != PaneLayout::Tabby
@@ -10460,7 +10398,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt normal & transcript: close the focused pane (the last one stays)",
             },
             HelpEntry {
-                key: "Shift+, / Shift+.",
+                key: "< / >",
                 description: "prompt normal & transcript: previous / next pane",
             },
             HelpEntry {
@@ -10472,7 +10410,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "horizontal / tabby / fibonacci layout",
             },
             HelpEntry {
-                key: "Space L",
+                key: "Space l",
                 description: "cycle grid / horizontal / tabby / fibonacci layout",
             },
             HelpEntry {
@@ -10481,7 +10419,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "session order",
-                description: "panes keep their order; Ctrl-1…9 jumps directly, Shift+,/. or Ctrl-W Ctrl-W moves prev/next",
+                description: "panes keep their order; Ctrl-1…9 jumps directly, < / > or Ctrl-W Ctrl-W moves prev/next",
             },
             HelpEntry {
                 key: "Space W",
@@ -10500,11 +10438,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "command palette (prompt normal mode and transcript)",
             },
             HelpEntry {
-                key: "Ctrl-G",
+                key: "Space g",
                 description: "session picker (switch the focused pane's session)",
             },
             HelpEntry {
-                key: "Ctrl-H",
+                key: "Space h",
                 description: "search this session's user-input history and jump",
             },
             HelpEntry {
@@ -10513,14 +10451,14 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Ctrl-/",
-                description: "open the searchable model picker",
+                description: "open the searchable model picker (Ctrl-_ / Ctrl-7 also work)",
             },
             HelpEntry {
                 key: "Space o",
                 description: "open session in a new pane",
             },
             HelpEntry {
-                key: "Space g",
+                key: "Space G",
                 description: "insert a git worktree path or branch name",
             },
             HelpEntry {
@@ -10588,6 +10526,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "top / follow tail",
             },
             HelpEntry {
+                key: "PageUp / PageDown",
+                description: "page the transcript (Ctrl-B / Ctrl-U and Ctrl-F also work)",
+            },
+            HelpEntry {
                 key: "Space p",
                 description: "background processes (x kills, r refreshes)",
             },
@@ -10601,7 +10543,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Z / Ctrl-C / Ctrl-D",
-                description: "quit from any mode (draft is saved first)",
+                description: "quit (Z in normal/transcript; Ctrl-C/D in any mode; draft is saved first)",
+            },
+            HelpEntry {
+                key: "[keys]",
+                description: "override global/TUI actions and leader chords in config.yaml; `leader` changes the prefix",
             },
             HelpEntry {
                 key: "help search",
@@ -12353,7 +12299,7 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_h_opens_the_timeline_picker() {
+    fn leader_h_opens_the_timeline_picker() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let events = vec![SessionEvent::new(
             "s1",
@@ -12368,13 +12314,27 @@ mod tests {
         ));
         app.focused = 0;
 
-        app.handle_key(
-            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::CONTROL),
-            &tx,
-        );
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE), &tx);
         let picker = app.picker.as_ref().expect("timeline picker");
         assert_eq!(picker.kind, PickerKind::Timeline);
         assert_eq!(picker.items.len(), 1);
+    }
+
+    #[test]
+    fn leader_g_opens_the_session_picker() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+        let picker = app.picker.as_ref().expect("session picker");
+        assert_eq!(picker.kind, PickerKind::Sessions);
     }
 
     #[test]
@@ -15459,7 +15419,7 @@ mod tests {
             .expect("long key row");
         let short = text
             .lines()
-            .find(|line| line.contains("Space L"))
+            .find(|line| line.contains("Space l"))
             .expect("short key row");
         let column = |line: &str, needle: &str| {
             let index = line.find(needle).expect("description");
@@ -16256,7 +16216,7 @@ mod tests {
         assert_eq!(app.status, "no pending approvals");
 
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT), &tx);
         assert!(matches!(
             app.picker.as_ref().map(|picker| picker.kind),
             Some(PickerKind::Git)
@@ -16690,6 +16650,141 @@ mod tests {
                 "transcript and prompt normal mode disagreed on {keys:?}"
             );
         }
+    }
+
+    #[test]
+    fn config_remaps_global_and_leader_actions() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        for id in ["s1", "s2"] {
+            app.views
+                .push(SessionView::new(Session::new(id, id, "/tmp"), Vec::new()));
+        }
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.keybinds = Keybinds::from_config(&std::collections::BTreeMap::from([
+            ("sessions".to_string(), "C-t".to_string()),
+            ("new_session".to_string(), "leader N".to_string()),
+            ("help".to_string(), "F2".to_string()),
+            ("close_pane".to_string(), "C-q".to_string()),
+            ("quit".to_string(), "C-x".to_string()),
+        ]));
+
+        // Ctrl-G is no longer a default, and the sessions override removes the
+        // leader-g default too. Ctrl-T wins over reasoning because overrides
+        // are matched first.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(app.picker.is_none());
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Sessions)
+        ));
+        app.picker = None;
+
+        // Leader actions can be remapped independently of the prefix.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT), &tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::Create { .. })));
+
+        // F1 is replaced by F2.
+        app.handle_key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE), &tx);
+        assert!(app.help);
+        app.help = false;
+        app.handle_key(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE), &tx);
+        assert!(!app.help);
+
+        // q and Z are inert after their actions move elsewhere.
+        app.handle_key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.views.len(), 2);
+        app.handle_key(KeyEvent::new(KeyCode::Char('Z'), KeyModifiers::SHIFT), &tx);
+        assert!(!app.should_quit);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(!app.should_quit);
+
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert_eq!(app.views.len(), 1);
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn config_leader_prefix_replaces_space() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.keybinds = Keybinds::from_config(&std::collections::BTreeMap::from([
+            ("leader".to_string(), "C-b".to_string()),
+            ("new_session".to_string(), "leader n".to_string()),
+        ]));
+
+        // Space is no longer a leader; the old chord must stay inert.
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        assert!(!app.pending_leader);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+        assert!(rx.try_recv().is_err());
+
+        // Ctrl-B is now the leader, even though it is also a default page-up
+        // binding; the leader prefix has priority.
+        app.handle_key(
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL),
+            &tx,
+        );
+        assert!(app.pending_leader);
+        app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
+        assert!(matches!(rx.try_recv(), Ok(Command::Create { .. })));
+    }
+
+    #[test]
+    fn config_bare_letter_is_normal_only() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.focus = Focus::Transcript;
+        app.keybinds = Keybinds::from_config(&std::collections::BTreeMap::from([(
+            "sessions".to_string(),
+            "o".to_string(),
+        )]));
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Sessions)
+        ));
+        app.picker = None;
+
+        // In insert mode the bare letter types instead of opening the picker.
+        app.focus_input();
+        app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.input.text(), "o");
+        assert!(app.picker.is_none());
     }
 
     #[test]

@@ -30,7 +30,7 @@
 | 输入 | 一个 client 一个内置模态编辑器，对准聚焦 pane | 零启动/按键延迟；模态语义自持 | 只覆盖常用 vim 子集 |
 | 内核 | 从零手写 | 上下文与工具策略完全可控 | 工作量与质量风险 |
 | provider | 优先 OpenAI 兼容接口 | 一套 adapter 覆盖 OpenAI / Ollama / vLLM / OpenRouter 等，本地模型零成本接入 | 各家非标准字段需归一 |
-| leader | `<Space>`（输入框 normal / 转录区） | 单字母全部留给 vim；转录区动作也必须经过 leader | insert 下不可用，用 `<C-g>` 补充 |
+| leader | `<Space>`（可配置；输入框 normal / 转录区） | 单字母主要留给 vim；TUI 动作走 leader，少量窗口动作（`q`/`Z`/`<`/`>`/Tab）是 normal 默认 | insert 下 TUI 键不可用，全局键用 `Ctrl-*` / `F1` 补充 |
 | 转录 | ratatui 自绘 + 对话式布局 + 可折叠块 | 流式 reasoning/工具/审批卡片可见，性能可控 | 需维护一套只读导航键位 |
 | 审批 | propose → stage → apply | hunk 级审批才有意义；可回滚 | 需虚拟工作区/补丁暂存 |
 | 上下文 | 内部自动管理的 context ledger | 不需要用户维护 | 中等额外工作量 |
@@ -195,17 +195,22 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 撤销是快照栈：一次 insert 会话、一次 `dd`/`p` 各算一步；`u` / `Ctrl-r`。
 - 未命名寄存器保存最近一次 yank/delete；`p`/`P` 区分字符与整行；寄存器为空时读取
   系统剪贴板（鼠标选中的转录文本可直接粘贴），且外部粘贴不覆盖内部寄存器。
-- `<Space>` 是 leader（输入框 normal 与转录区共用同一映射）：`n` 新建 session 并开新 pane
-  （当前 session 有 worktree 时复用）、
-  `o` 打开 session picker（已有 session 放进新 pane）、`c` 关闭 pane、`f` 文件、
-  `s` 文件内容（类似 rg）、`g` git（worktrees + branches）、`p` 进程、`a` 审批、
-  `N` 新建、`W` 当前 session 移入 worktree、`F` fork、`x` 取消、`A` attention、`m` 完整执行模式 picker、
-  `i` 聚焦输入框、`Ctrl-P` 命令面板。单字母基本留给 vim；转录区裸 `q` 关闭当前 pane
-  （最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、`j/k`/`g/G` 等导航、
-  `/`/`?`/`#` 当前对话搜索和 `Ctrl-P`；布局动作同样走 leader（`v`/`t`/`r`/`l`）。
+- leader 前缀默认 `<Space>`，可通过 `[keys].leader` 修改；输入框 normal 与转录区共用同一映射：
+  `n` 新建 session 并开新 pane（当前 session 有 worktree 时复用）、`W` 当前 session 移入 worktree、
+  `o` 打开 session picker（已有 session 放进新 pane；只列普通/worktree session，
+  不列子 agent）、`c` 关闭 pane、`f` 文件、
+  `s` 文件内容（类似 rg）、`g` session picker、`h` 用户输入 timeline、`G` git（worktrees + branches）、
+  `p` 进程、`a` 审批 inbox、`x` 取消、`m` 完整执行模式 picker、
+  `v`/`t`/`r`/`l` 布局。单字母默认留给 vim；转录区裸
+  `q` 关闭当前 pane（最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、
+  `j/k`/`g/G` 等导航、`/`/`?`/`#` 当前对话搜索和 `Ctrl-P`。
+- 全局 / TUI 动作和 leader 组合都可通过 `[keys]` 覆盖；配置某个动作会替换它的默认绑定，
+  不会保留旧键作为别名。裸字母对 normal / 转录区动作安全；可配置为全局的动作
+  （`quit`、`help`、`sessions`、`models`、`timeline`、`cycle_reasoning`、`tab_N`）配成裸字母时
+  自动降级为 normal / 转录区专用。overlay 内部导航键固定。
 - 输入框 normal 模式复用转录区的 TUI 动作：leader、`/`/`?`/`#` 当前对话搜索、翻页/滚动和
   `[keys]` 绑定行为一致；`j/k` 行移动、`Tab` / `Shift-Tab` 循环执行模式等 vim/编辑器键仍归输入框。
-- `Shift+,` / `Shift+.`（即 `<` / `>`）在转录区和输入框 normal 模式线性切换上一个 / 下一个 pane。
+- `<` / `>`（即 `Shift+,` / `Shift+.`）在转录区和输入框 normal 模式线性切换上一个 / 下一个 pane。
 - 在转录区和输入框 normal 模式，1 秒内连续按两次 `Ctrl-W` 聚焦下一个 pane；最后一个 pane 会回绕到第一个。
   insert 模式的 `Ctrl-W` 仍用于删除前一个词。
 - `Ctrl-J`/`Ctrl-K` 上下翻转录历史（`j`/`k`、`3j`、`dj`、`↑`/`↓` 是草稿内行移动）。
@@ -215,7 +220,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   连续切换，daemon 的 session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
 - `Enter` 在 insert 提交；normal 模式不改变 pane 顺序。
-- `@`（insert，行首/空白后）打开文件 picker；`Ctrl-G` 在任意模式打开 session picker。
+- `@`（insert，行首/空白后）打开文件 picker；`<Space>g` / `<Space>h` 在 normal / 转录区打开
+  session picker / 用户输入 timeline。
 - picker：`Ctrl-J`/`Ctrl-K`（或 `↑`/`↓`）上下选择。
 - 不再有 `[input] backend` / `minimal` 配置，也没有 nvim 回退路径。
 
@@ -319,22 +325,27 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 
 ## 7. 键位总表
 
-> 内置编辑器与转录区共用 `<Space>` leader（输入框 normal 模式 / 转录区）；`<C-g>` 是跨模式补充入口。
-> `eix nvim` 前端沿用你的 `mapleader`（下表以 `<Space>` 为例）。
+> 内置编辑器与转录区共用一套可配置的全局 / normal / leader 键位；leader 前缀默认 `<Space>`，
+> 可用 `[keys].leader` 修改。`eix nvim` 前端沿用你的 `mapleader`（下表以 `<Space>` 为例）。
 
-**全局（转录区 / picker / 任意非输入焦点）**
+**全局与窗口**
 
 | 键 | 行为 |
 |---|---|
-| `<C-g>` | session picker（直达） |
-| `<C-g><C-g>` | 回到上一个 session |
+| `F1` | 任意模式：可搜索帮助 |
+| `<Space>g` | 转录区 / 输入框 normal：session picker |
+| `<Space>h` | 转录区 / 输入框 normal：当前 session 的 user-input timeline |
+| `<Space>G` | 转录区 / 输入框 normal：git picker（worktrees + branches） |
+| `<C-t>` | 任意模式：reasoning low / medium / high |
+| `<C-/>` / `<C-_>` / `<C-7>` | 任意模式：模型 picker |
+| `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab；需 kitty 键盘协议；`Ctrl-7` 通常留给模型 picker） |
 | `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
 | `<Space>l` | 循环 grid / horizontal / tabby / fibonacci |
-| `q` | 转录区 / 输入框 normal：关闭当前 pane（最后一个 pane 保持打开） |
+| `q` / `<Space>c` | 转录区 / 输入框 normal：关闭当前 pane（最后一个 pane 保持打开） |
 | `<Space>a` | 跨 session 审批收件箱 |
-| `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab；需 kitty 键盘协议；`Ctrl-7` 在部分终端等价于 `Ctrl-/`） |
-| `Alt-1…9` | 同上；终端无法区分 `Ctrl-1…9` 时使用 |
+| `<` / `>` | 转录区 / 输入框 normal：上一个 / 下一个 pane |
 | `Ctrl-W Ctrl-W` | 转录区 / 输入框 normal 模式 1 秒内连按两次：聚焦下一个 pane，最后一个回绕到第一个 |
+| `Ctrl-C` / `Ctrl-D` | 任意模式：保存草稿并退出 |
 
 **`eix nvim` 前端（`:Eix` palette）**
 
@@ -372,7 +383,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `Tab` | normal 模式下正向循环 Plan → Build → Auto → Bypass（命令面板的 `cycle execution mode` 同义） |
 | `Shift-Tab` | normal 模式下反向循环 Build → Plan → Bypass → Auto |
 | `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
-| `<Space>o/f/w/b/c/C/h/p/a/n/N/W/F/v/t/r/l/x/i/A/m` | TUI 动作（见 5.1）；裸字母不触发动作 |
+| `<Space>n/W/o/f/s/g/p/c/a/x/m/v/t/r/l` | TUI 动作（见 5.1）；可用 `[keys]` 覆盖 |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
 | `d c y` + motion / `dd cc yy` / `iw aw` | 操作符 |
 | `v V` + `d x y c p ~ o` | visual |
@@ -480,10 +491,10 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     `← parent agent`；worktree 标记 `⑂` 单独占一列，紧跟 session id 前；
     files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
     grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
-  - 入口：`<C-g>`（sessions，切换 pane）、`<Space>o`（sessions，新 pane）、`<Space>f`（files）、
-    `<Space>s`（grep，文件内容）、`Ctrl-P`（commands，命令面板；转录区与输入框 normal 模式都可用）、
-    `<Space>g`（git，统一列出 worktrees 和 branches；没有 linked worktree 时省略仓库主路径）、
-    prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
+  - 入口：`<Space>g`（sessions，切换 pane）、`<Space>h`（timeline）、`<Space>o`（sessions，新 pane）、
+    `<Space>f`（files）、`<Space>s`（grep，文件内容）、`Ctrl-P`（commands，命令面板；转录区与输入框
+    normal 模式都可用）、`<Space>G`（git，统一列出 worktrees 和 branches；没有 linked worktree 时
+    省略仓库主路径）、prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
   - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`grep`
     （大小写不敏感的字面量内容搜索，返回 `path:line`，跳过二进制/派生目录/4 MiB 以上文件）、`git`
     （worktrees + branches，worktree 行在前，detail 标注 `worktree` / `branch`）、`worktrees`
@@ -840,6 +851,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 内容 picker（2026-10-26）：daemon 新增 `grep` provider，按 case-insensitive 字面量搜索
 > workspace 文件内容并返回 `path:line`；TUI 用 `<Space>s` / `/grep [query]` 打开，查询按 tick
 > 防抖，Enter 插入 `@path:line`。搜索跳过派生目录、二进制文件和大于 4 MiB 的文件。
+> 快捷键调整（2026-10-26）：TUI 的 sessions 从 `Ctrl-G` 移到 `<Space>g`，timeline 从
+> `Ctrl-H` / `Ctrl-Backspace` 移到 `<Space>h`；git picker 从 `<Space>g` 移到 `<Space>G`。
 > 输入焦点（2026-10-18）：`Esc` 只在 insert/visual 下回到 normal 并保留焦点，500ms 内
 > 再按一次才回到转录；`<CR>` 只在 insert 提交；`<C-g>` 在任意模式打开 picker；
 > `Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 只在 insert 换行；`F1` 全局帮助；
@@ -1040,7 +1053,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 回退。直接写入、blocking apply、staged apply 后运行
 > （`$1` 为路径，按顺序首个匹配，失败只附注）。`todo` / `webfetch` / `websearch`
 > 为新增工具；`todo` 是 daemon 内存态任务表，网络工具无 API key（DuckDuckGo HTML），读取结果会截断。
-> TUI 支持 `[theme]` 调色板、`[keys]` 转录区快捷键覆盖（输入框保持 vim 行为），以及 prompt 里的
+> TUI 支持 `[theme]` 调色板、`[keys]` 全局 / TUI 动作与 leader 覆盖（输入框的 vim 编辑键仍由编辑器
+> 自己处理），以及 prompt 里的
 > `!<cmd>`：直接执行 shell（同样沙箱、先抓 tree snapshot、只读 session 拒绝），命令和输出写入 tool 事件。
 >
 > 图片：`prompt.submit` 接受 `images: [path]`，daemon 经 `resolve_path_in` 校验后按 SHA-256 写入
