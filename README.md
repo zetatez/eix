@@ -232,8 +232,8 @@ running 状态使用田字方块旋转动画（`◰ ◳ ◲ ◱`），完成/空
 右侧靠右显示 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及
 pane/队列/attention 计数在空间允许时显示在中部或右侧，变窄时优先保留 cwd/branch。
 只有没有其他 UI 反馈的失败、后台 attention、复制确认、布局切换和 `/reload` 完成会以右上角
-单条浮动通知显示（不堆叠；当前通知至少保留其时长，期间的新消息只保留最新一条等待替换；
-失败约 4 秒，attention 约 8 秒，复制 / 布局 / `/reload` 约 2 秒）；除 `/reload` 外，命令成功
+浮动通知显示（失败 / attention 约 3 秒，复制 / 布局 / `/reload` 约 1.5 秒；不设置最低等待时长，
+新消息立即出现；多条同时存在时逐条堆叠，最新一条在最上方）；除 `/reload` 外，命令成功
 反馈、进度和 picker/弹窗内容不再重复通知。
 终端高度足够时，statusline 下方常驻一行空白命令行；normal 模式按 `:` 激活并显示 `:` 前缀：
 `Enter` 执行；`Esc` 先收起命令菜单并保留已输入内容，再按一次关闭命令行；`↑`/`↓` 浏览历史，`Tab` 显示匹配命令并补全首个命令；菜单打开后
@@ -260,8 +260,9 @@ pane 不超过 5 个时全部显示，超过时只显示第一个 pane + 后续 
 或前后移动切换时窗口会跟随焦点滑动；终端矮时压缩为标题行/单行内容，不退回 tabby）、
 `tabby`（输入框上方显示 tab，只显示当前 session）和 `fibonacci`（螺旋分屏，不显示 tab）；`<Space>l` 在四种布局
 （含默认 grid）间循环。所有布局共享同一个稳定的 session 顺序：pane 按打开顺序排列，发送任务、
-turn 完成或等待审批/输入都不会移动它。session 视作双向链表，`<` / `>` 或 1 秒内
-连续按两次 `Ctrl-W` 在前后节点间移动；`Ctrl-1` … `Ctrl-9` 直接跳到对应 session，顺序保持不变。
+turn 完成或等待审批/输入都不会移动它；normal 模式按 `Enter` 会主动把当前 pane 的 session 提到第一位。
+session 视作双向链表，`<` / `>` 或 1 秒内连续按两次 `Ctrl-W` 在前后节点间移动；
+`Ctrl-1` … `Ctrl-9` 直接跳到对应 session，其余情况下顺序保持不变。
 在 `tabby` 布局下就是切换到第 N 个 tab
 （输入框内也可用）。这些组合键需要终端支持 kitty 键盘协议；不支持的终端可能无法区分。
 `Ctrl-7` 在部分终端等价于 `Ctrl-/`，会打开模型 picker。在转录区或输入框 normal 模式下，
@@ -317,7 +318,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Esc`                 | 输入框：回到 normal 模式                                     |
  | `:`                   | 打开命令行                                                   |
  | `/` / `?` / `#`       | 搜索当前 transcript；`n` / `N` 跳下一个 / 上一个，`Esc` 清除 |
- | `Enter`               | insert 模式发送；turn 运行中自动排队                         |
+ | `Enter`               | insert 模式发送（turn 运行中自动排队）；normal / 转录区把当前 session 提到第一位 |
  | `Ctrl-J`              | insert 模式换行                                              |
  | `Ctrl-P`              | 命令面板（输入框 normal / 转录区）                           |
  | `Tab`                 | 输入框 normal / 转录区：Plan → Build → Auto → Bypass 循环    |
@@ -414,7 +415,7 @@ normal / 转录区专用。overlay 内部导航键仍固定。完整默认值和
  | `:`（normal 模式）                                | 激活 statusline 下方的常驻命令行；按 `Tab` 才显示匹配命令列表并补全首个命令，普通输入不弹窗；菜单中 `Ctrl-J`/`Ctrl-K`、`Ctrl-N`/`Ctrl-P` 上下选择，`Enter` 执行选中项；菜单打开时 `Esc` 先收起菜单并保留输入，再按一次退出命令行回到 normal，`↑`/`↓` 历史；支持所有 `/命令` 名以及 `:q` / `:qa` / `:w` / `:wq` / `:x`；`:!cmd` 直接执行 shell，`:r!cmd` 把输出插入输入框 |
  | `/` / `?` / `#`（normal 模式）                    | 打开带对应前缀的命令行：`/xxx` 在当前 session 对话中向后搜索，`?xxx` / `#xxx` 向后搜索；`n` / `N` 跳到下一个/上一个匹配，`Esc` 清除高亮                                                                                                                                                                                                                                             |
  | `F1` / `/help`                                    | 打开可搜索的帮助/按键参考；打开后直接输入即筛选 key/命令，`↑`/`↓` 选择匹配项，`Ctrl-U` 清空，`Esc` 关闭                                                                                                                                                                                                                                                                             |
- | `Enter`                                           | insert 模式：发送到聚焦 pane（turn 还在跑时自动排队，结束后按顺序发出）                                                                                                                                                                                                                                                                                                             |
+ | `Enter`                                           | insert 模式：发送到聚焦 pane（turn 还在跑时自动排队，结束后按顺序发出）；normal / 转录区：把当前 pane 的 session 提到第一位                                                                                                                                                                                                                                                          |
  | `/exit` / `/quit`                                 | 保存草稿并退出整个 eix 客户端（不关闭 session pane）                                                                                                                                                                                                                                                                                                                                |
  | `/close`                                          | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix                                                                                                                                                                                                                                                                                                                     |
  | `Ctrl-J`                                          | 换行（仅 insert 模式；`Ctrl-Enter` / `Shift-Enter` 同）                                                                                                                                                                                                                                                                                                                             |
@@ -690,9 +691,9 @@ files / sessions 预览由 `picker.preview` 懒加载，grep 的每行自带匹�
 `N/I/V/VL · Plan/Build/Auto/Bypass · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及 pane/排队/attention
 计数在空间允许时显示在中部或右侧；只有没有其他可见反馈的失败、后台 attention、复制确认、
-布局切换和 `/reload` 完成显示在右上角单条浮动通知中（失败约 4 秒，attention 约 8 秒，
-复制 / 布局 / `/reload` 约 2 秒；不堆叠，当前通知至少保留其时长，期间只保留最新一条等待
-替换），不会挤动 statusline；
+布局切换和 `/reload` 完成显示在右上角浮动通知中（失败 / attention 约 3 秒，
+复制 / 布局 / `/reload` 约 1.5 秒；不设置最低等待时长，新消息立即出现；多条同时存在时
+逐条堆叠，最新一条在最上方），不会挤动 statusline；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
@@ -706,7 +707,7 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
   越过最新一条会恢复当前草稿。`j`、`k`、`3j`、`dj`、方向键是草稿内的行移动
 - 模式切换：输入框 normal 模式与转录区都可用 `Tab` 按 Plan → Build → Auto → Bypass → Plan 循环；`Shift-Tab` 反向循环（Build → Plan → Bypass → Auto）。`Space m` 或 `/perm`（旧名 `/mode` 仍可用）仍可打开完整 picker 直接选择某个模式
 - `Enter` 在 insert 模式提交；turn 运行中提交的内容自动排队（`/queue` 查看，`Esc Esc` 中断当前 turn）。
-  normal 模式不改变 pane 顺序；切换 session 用 `Ctrl-1` … `Ctrl-9` 或前后移动
+  normal 模式会把当前 pane 的 session 提到第一位；切换 session 用 `Ctrl-1` … `Ctrl-9` 或前后移动
 
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（默认空格，可用 `[keys].leader` 修改）+ 键**：
 `<Space>n` 新建 session 并在新 pane 打开（当前 session 有 worktree 时复用）、`<Space>o` 把已有 session 放进新 pane
@@ -1192,7 +1193,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 ### 外部通知
 
 `notifications:` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你。
-TUI 内的提醒固定显示在右上角（约 8 秒，同一时间只显示最新一条），不会弹桌面通知，也不会移动 statusline：
+TUI 内的提醒固定显示在右上角（约 3 秒；多条同时存在时逐条堆叠，最新一条在最上方），不会弹桌面通知，也不会移动 statusline：
 
 | 字段 | 默认 | 行为 |
 | --- | --- | --- |
