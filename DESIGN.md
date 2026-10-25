@@ -116,11 +116,15 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
 
 ### 4.6 worktree
 
-- 默认绑定 cwd 并共享当前工作区；新建 session 不自动创建 worktree。显式 `--worktree` / `/new-worktree` 才创建 `.worktrees/<slug>`。
-  worktree 从**创建 session 时 cwd 所在的分支**拉出，而不是固定从 `master`；`worktree.base`
-  或 per-repo `base` 显式设置时覆盖。名称由模型根据任务总结成英文 kebab-case；模型失败时用
-  ASCII 词或 `task-<timestamp>`。`worktree.auto: true` 可恢复首条 prompt 自动创建；
-  `eix new --shared` / `/new-shared` 显式共享工作区。
+- 默认绑定 cwd 并共享当前工作区。`eix new --worktree` 新建隔离 session；TUI
+  `/new` 在当前 session 有 worktree 时于同一 worktree 新建 session（新 session 只共享
+  目录，不持有 worktree 标记），否则共享其 cwd，不创建新 worktree；`/new-worktree` /
+  `<Space>W` 则把**当前 session** 移入
+  `.worktrees/<slug>`，已有 worktree 时只提示、不重复创建。
+  worktree 从**执行命令时 cwd 所在的分支**拉出，而不是固定从 `master`；`worktree.base`
+  或 per-repo `base` 显式设置时覆盖。自动 worktree 的名称由模型根据任务总结成英文 kebab-case；
+  模型失败时用 ASCII 词或 `task-<timestamp>`。`worktree.auto: true` 可恢复 CLI /
+  自动启动 session 的首条 prompt 自动创建；`eix new --shared` 显式共享工作区。
 - repo 内 fork 默认共享源工作区；`worktree.auto: true` 时才给新分支建 worktree；`eix fork --shared` / `session.fork worktree=false` 显式共享。
 - worktree 与 session 生命周期解耦：session 归档不自动删除 worktree，需显式确认。
 - 已实现（2026-10-18）：`eixd/src/worktree.rs` shell out 给 git，`git worktree add -b eix/<slug> .worktrees/<slug>`；
@@ -186,10 +190,11 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 撤销是快照栈：一次 insert 会话、一次 `dd`/`p` 各算一步；`u` / `Ctrl-r`。
 - 未命名寄存器保存最近一次 yank/delete；`p`/`P` 区分字符与整行；寄存器为空时读取
   系统剪贴板（鼠标选中的转录文本可直接粘贴），且外部粘贴不覆盖内部寄存器。
-- `<Space>` 是 leader（输入框 normal 与转录区共用同一映射）：`n` 新建 session 并开新 pane、
+- `<Space>` 是 leader（输入框 normal 与转录区共用同一映射）：`n` 新建 session 并开新 pane
+  （当前 session 有 worktree 时复用）、
   `o` 打开 session picker（已有 session 放进新 pane）、`c` 关闭 pane、`f` 文件、
   `g` git（worktrees + branches）、`p` 进程、`a` 审批、
-  `N` 新建、`W` 新建 worktree、`F` fork、`x` 取消、`A` attention、`m` 完整执行模式 picker、
+  `N` 新建、`W` 当前 session 移入 worktree、`F` fork、`x` 取消、`A` attention、`m` 完整执行模式 picker、
   `i` 聚焦输入框、`Ctrl-P` 命令面板。单字母基本留给 vim；转录区裸字母不触发动作，仅保留
   `i`（聚焦输入框）、`Z`（退出）、`j/k`/`g/G` 等导航、`/`/`?`/`#` 当前对话搜索和 `Ctrl-P`；布局动作
   同样走 leader（`v`/`t`/`r`/`l`）。
@@ -370,9 +375,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 |---|---|
 | `/help [query]` | 可搜索帮助（命令 / 快捷键 / notes），可带初始查询 |
 | `/keys [query]` | 只搜索快捷键章节 |
-| `/new [name]` | 在聚焦 session 的 cwd 新建 session 并打开 pane |
+| `/new [name]` | 新建 session；聚焦 session 有 worktree 时复用它，否则共享其 cwd（不建 worktree） |
 | `/new-pane` | session picker，把已有 session 放进新 pane |
-| `/new-worktree [name]` | 在独立 git worktree 新建 session |
+| `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示 |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
 | `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要 |
 | `/btw <question>` | 一次性旁支问答，不写事件日志；`btw.delta` / `btw.completed` 通知，`btw.cancel` 中断 |
@@ -700,6 +705,7 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - `hello`（版本握手）
 - `auth {token}`（仅 TCP：必须是第一个请求）
 - `session.list|create|attach|detach|rename|archive|fork|rewind`
+- `session.worktree.create {session_id, name?}`
 - `session.worktree.remove {session_id, force?}`
 - `session.ready {session_id, auto_commit?}`
 - `integration.list {session_id?}`、`integration.continue {session_id}`
@@ -793,7 +799,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 实现快照（2026-10-18）：多 pane TUI 已落地（`eix` 无命令默认打开，或 `eix tui`）。左侧 session 栏 + 右侧自动
 > 平铺 pane（1/2/3/4+ 分别全屏、左右、左大右二、网格），每个 pane 独立维护 session、
 > 转录、滚动与流式跟随；`<Space>o` 在新 pane 打开，`Ctrl-G` 切换聚焦 pane 的 session，
-> `Shift+,` / `Shift+.` 切换 pane、`<Space>n` 新建 session、`<Space>c` 关闭；同一 session 只出现一次，
+> `Shift+,` / `Shift+.` 切换 pane、`<Space>n` 新建 session（有 worktree 则复用）、`<Space>c` 关闭；同一 session 只出现一次，
 > picker 选中已打开 session 会聚焦既有 pane。输入框是自研的 Vim 风格模态编辑器
 > （`tui/editor.rs`）：normal / insert / visual / visual-line，常用 motion + operator +
 > count、`u`/`Ctrl-r`、未命名寄存器；不启动子进程、不加载 nvim 配置，按键零往返。
@@ -915,7 +921,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `eixd/src/worktree.rs` 用 `git rev-parse --git-common-dir` 解析主仓库（支持 subdir / linked
 > worktree，canonicalize 后比较），`git worktree add -b eix/<slug> .worktrees/<slug>`；slug
 > 来自 session 名，冲突时加 `-N`。worktree 路径存 `sessions.worktree`，fork 未指定新
-> worktree 时继承源值。`eix worktree list` / `remove SESSION [--force]` 对
+> worktree 时继承源值。`session.worktree.create {session_id, name?}` 把已有 session
+> 移入新 worktree（TUI `/new-worktree`，已有 worktree 时返回 `invalid_params`）；
+> `eix worktree list` / `remove SESSION [--force]` 对
 > `session.worktree.remove`：先确定主仓库再 `git worktree remove [--force]`，成功后
 > `set_session_cwd(repo_root)` 并清空 worktree；dirty 且没 `--force` 时返回 `removed:false`。
 > `.worktrees` 已在快照排除表里，避免把 worktree 自身复制进快照。

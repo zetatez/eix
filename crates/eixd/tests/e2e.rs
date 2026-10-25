@@ -3322,6 +3322,85 @@ async fn worktree_sessions_are_created_forked_and_removed() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn worktree_create_moves_an_existing_session_once() -> anyhow::Result<()> {
+    let dir = temp_dir("worktree-attach");
+    std::fs::create_dir_all(&dir)?;
+    let init = git(&dir, &["init", "-q"]);
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let commit = git(&dir, &["commit", "-q", "--allow-empty", "-m", "init"]);
+    assert!(
+        commit.status.success(),
+        "git commit: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let repo = dir.canonicalize()?;
+    let base = git_stdout(&dir, &["symbolic-ref", "--short", "HEAD"]);
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = "http://127.0.0.1:1/v1".to_string();
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "shared", "cwd": dir}))
+        .await?;
+    assert!(!created.session.has_worktree());
+
+    let moved: SessionResult = client
+        .request(
+            "session.worktree.create",
+            json!({"session_id": created.session.id, "name": "moved"}),
+        )
+        .await?;
+    let worktree = moved.session.worktree.clone().expect("worktree path");
+    assert_eq!(moved.session.id, created.session.id);
+    assert_eq!(moved.session.name, "shared");
+    assert_eq!(moved.session.cwd, worktree);
+    assert!(worktree.starts_with(repo.join(".worktrees")));
+    assert!(worktree.is_dir());
+
+    let integrations: eix_core::IntegrationListResult = client
+        .request(
+            "integration.list",
+            json!({"session_id": created.session.id}),
+        )
+        .await?;
+    let state = integrations
+        .integrations
+        .first()
+        .expect("integration state");
+    assert_eq!(state.base_branch.as_deref(), Some(base.as_str()));
+    assert!(!state.worktree_disabled);
+
+    // The daemon rejects a second worktree instead of nesting one inside the
+    // first; the TUI surfaces the same condition as a top-right warning.
+    assert_eq!(
+        client
+            .request_error(
+                "session.worktree.create",
+                json!({"session_id": created.session.id}),
+            )
+            .await?,
+        "invalid_params"
+    );
+    assert_eq!(std::fs::read_dir(repo.join(".worktrees"))?.count(), 1);
+
+    let got: SessionResult = client
+        .request("session.get", json!({"session_id": created.session.id}))
+        .await?;
+    assert_eq!(got.session.cwd, worktree);
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn integration_rebases_tests_and_fast_forwards_the_base_branch() -> anyhow::Result<()> {
     let root = temp_dir("integration-queue");
     let dir = root.join("repo");

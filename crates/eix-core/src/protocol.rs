@@ -217,6 +217,16 @@ pub struct RewindResult {
     pub warnings: Vec<String>,
 }
 
+/// `session.worktree.create`: move an existing session into a new git
+/// worktree. The session keeps its history; only `cwd`/`worktree` change.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeCreateParams {
+    pub session_id: SessionId,
+    /// Worktree/branch name; defaults to the session name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeRemoveParams {
     pub session_id: SessionId,

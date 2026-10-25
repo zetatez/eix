@@ -88,8 +88,10 @@ tools:
   # sandbox_writable_roots=[], snapshots=true.
 
 
-# Worktrees are opt-in: use `eix new --worktree` or `/new-worktree`.
-# `worktree.auto: true` restores lazy creation on the first prompt.
+# Worktrees are opt-in: `eix new --worktree` creates an isolated session,
+# while TUI `/new-worktree` moves the current session into one.
+# TUI `/new` only reuses the focused session's worktree, if any.
+# `worktree.auto: true` restores lazy creation for CLI / auto-started sessions.
 # `/ready` is user-triggered unless integration.auto_ready is enabled.
 worktree:
   auto: false

@@ -117,14 +117,17 @@ fn builtin_commands() -> Vec<CommandSpec> {
     vec![
         builtin("help", "[query]", "search the key and command reference"),
         builtin("keys", "[query]", "search just the key map"),
-        builtin("new", "[name]", "start a new session in this workspace"),
+        builtin(
+            "new",
+            "[name]",
+            "start a session; reuse the focused session's worktree if present",
+        ),
         builtin("new-pane", "", "open a session in a new pane"),
         builtin(
             "new-worktree",
             "[name]",
-            "start a session in a new git worktree",
+            "move this session into a new git worktree",
         ),
-        builtin("new-shared", "[name]", "start a session in this workspace"),
         builtin(
             "ready",
             "",
@@ -4701,8 +4704,8 @@ impl App {
                 self.should_quit = true;
             }
             KeyAction::Help => self.open_help(),
-            KeyAction::NewSession => self.create_session(tx, None),
-            KeyAction::NewWorktree => self.create_session(tx, Some(true)),
+            KeyAction::NewSession => self.new_session(tx, None),
+            KeyAction::NewWorktree => self.new_worktree(tx, None),
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
             KeyAction::NewPane => self.open_picker(PickerKind::NewPane, tx),
             KeyAction::Palette => self.open_picker(PickerKind::Commands, tx),
@@ -5372,9 +5375,8 @@ impl App {
             "approvals" => self.open_inbox(),
             "mcp" => self.open_picker(PickerKind::Mcp, tx),
             "todos" => self.open_picker(PickerKind::Todos, tx),
-            "new" => self.create_session(tx, None),
-            "new-worktree" => self.create_session(tx, Some(true)),
-            "new-shared" => self.create_session(tx, Some(false)),
+            "new" => self.new_session(tx, None),
+            "new-worktree" => self.new_worktree(tx, None),
             "fork" => self.fork_focused(tx, None),
             "cancel" => self.cancel(tx),
             "attention" => self.focus_next_attention(),
@@ -5465,6 +5467,47 @@ impl App {
 
     fn create_session(&mut self, tx: &UnboundedSender<Command>, worktree: Option<bool>) {
         self.create_session_in(tx, worktree, None, None);
+    }
+
+    /// Create a session on the focused session's workspace. If it already runs
+    /// in a worktree the new session shares that worktree; otherwise it shares
+    /// the plain workspace. `/new` never creates a new worktree — that is what
+    /// `/new-worktree` is for.
+    fn new_session(&mut self, tx: &UnboundedSender<Command>, name: Option<String>) {
+        let cwd = self.focused_view().map(|view| view.session.cwd.clone());
+        self.create_session_in(tx, Some(false), cwd, name);
+    }
+
+    /// Move the focused session into a new worktree. A session can only own
+    /// one worktree; when it already has one, leave everything untouched and
+    /// surface the reason in the top-right toast.
+    fn new_worktree(&mut self, tx: &UnboundedSender<Command>, name: Option<String>) {
+        let Some(session) = self.focused_view().map(|view| view.session.clone()) else {
+            let message = "attach a session first";
+            self.status = message.into();
+            self.push_toast(message.into(), ToastTone::Warning, WARNING_TOAST_DISPLAY);
+            return;
+        };
+        if session.has_worktree() {
+            let message = "this session already has a worktree";
+            self.error = None;
+            self.status = message.into();
+            self.push_toast(message.into(), ToastTone::Warning, WARNING_TOAST_DISPLAY);
+            return;
+        }
+        if session.status.is_busy() {
+            let message = "wait for the turn to finish before creating a worktree";
+            self.error = None;
+            self.status = message.into();
+            self.push_toast(message.into(), ToastTone::Warning, WARNING_TOAST_DISPLAY);
+            return;
+        }
+        self.error = None;
+        self.status = "creating worktree…".into();
+        let _ = tx.send(Command::CreateWorktree {
+            session_id: session.id,
+            name,
+        });
     }
 
     /// Create a session and open it in a new pane. `cwd`/`name` default to the
@@ -5731,9 +5774,8 @@ impl App {
                 true
             }
             "new" => {
-                let cwd = self.focused_view().map(|view| view.session.cwd.clone());
                 let name = (!args.is_empty()).then(|| args.to_string());
-                self.create_session_in(tx, None, cwd, name);
+                self.new_session(tx, name);
                 true
             }
             "new-pane" => {
@@ -5741,15 +5783,8 @@ impl App {
                 true
             }
             "new-worktree" => {
-                let cwd = self.focused_view().map(|view| view.session.cwd.clone());
                 let name = (!args.is_empty()).then(|| args.to_string());
-                self.create_session_in(tx, Some(true), cwd, name);
-                true
-            }
-            "new-shared" => {
-                let cwd = self.focused_view().map(|view| view.session.cwd.clone());
-                let name = (!args.is_empty()).then(|| args.to_string());
-                self.create_session_in(tx, Some(false), cwd, name);
+                self.new_worktree(tx, name);
                 true
             }
             "ready" => {
@@ -9445,11 +9480,15 @@ fn command_items() -> Vec<PickerItem> {
             "close pane",
             "Close the focused pane (Space c)",
         ),
-        ("new", "new session", "Create a session (n / Space n)"),
+        (
+            "new",
+            "new session",
+            "Create a session; reuse the focused session's worktree if present (n / Space n)",
+        ),
         (
             "new-worktree",
-            "new session in a worktree",
-            "Create an isolated session (N)",
+            "move session into a worktree",
+            "Move the focused session into an isolated worktree (Space W)",
         ),
         (
             "fork",
@@ -9812,7 +9851,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/new",
-                description: "start a new session in the current workspace",
+                description: "start a session; reuse the focused session's worktree if present",
             },
             HelpEntry {
                 key: "/new-pane",
@@ -9820,7 +9859,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/new-worktree",
-                description: "start a new session in an isolated git worktree",
+                description: "move the current session into an isolated git worktree",
             },
             HelpEntry {
                 key: "/clear",
@@ -10017,7 +10056,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Space W",
-                description: "prompt & transcript: new worktree",
+                description: "prompt & transcript: move this session into a worktree",
             },
             HelpEntry {
                 key: "Ctrl-J / Ctrl-K",
@@ -10073,11 +10112,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Space n",
-                description: "new session in a new pane",
+                description: "new session; reuse the focused session's worktree if present",
             },
             HelpEntry {
                 key: "Space W",
-                description: "new session in a fresh git worktree",
+                description: "move this session into a fresh git worktree",
             },
             HelpEntry {
                 key: "Space x",
@@ -15173,7 +15212,10 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
         assert!(app.picker.is_none());
         match rx.try_recv().expect("create command") {
-            Command::Create { worktree, .. } => assert!(worktree.is_none()),
+            Command::Create { worktree, cwd, .. } => {
+                assert_eq!(worktree, Some(false));
+                assert_eq!(cwd.as_deref().and_then(|path| path.to_str()), Some("/tmp"));
+            }
             _ => panic!("expected a create command"),
         }
 
@@ -15330,7 +15372,72 @@ mod tests {
     }
 
     #[test]
-    fn leader_n_creates_a_session_and_q_does_not_close_a_pane() {
+    fn new_worktree_moves_the_focused_session_and_warns_when_it_already_has_one() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+
+        app.run_action("new-worktree", &tx);
+        match rx.try_recv().expect("worktree command") {
+            Command::CreateWorktree { session_id, name } => {
+                assert_eq!(session_id, "s1");
+                assert!(name.is_none());
+            }
+            _ => panic!("expected a worktree command"),
+        }
+
+        let mut moved = app.views[0].session.clone();
+        moved.worktree = Some("/tmp/.worktrees/one".into());
+        app.handle_event(Event::Updated(moved), &tx);
+
+        app.run_action("new-worktree", &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "an existing worktree must not create another one"
+        );
+        assert_eq!(app.status, "this session already has a worktree");
+    }
+
+    #[test]
+    fn new_session_reuses_the_focused_worktree_without_creating_one() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "one", "/tmp/repo/.worktrees/feat/src");
+        session.worktree = Some("/tmp/repo/.worktrees/feat".into());
+        app.views.push(SessionView::new(session, Vec::new()));
+        app.focused = 0;
+
+        assert!(app.handle_command_text("/new feature", &tx, false));
+        match rx.try_recv().expect("create command") {
+            Command::Create {
+                worktree,
+                cwd,
+                name,
+                ..
+            } => {
+                assert_eq!(worktree, Some(false), "must never create a second worktree");
+                assert_eq!(
+                    cwd,
+                    Some(std::path::PathBuf::from("/tmp/repo/.worktrees/feat/src"))
+                );
+                assert_eq!(name.as_deref(), Some("feature"));
+            }
+            _ => panic!("expected a create command"),
+        }
+        assert!(!app.commands.iter().any(|spec| spec.name == "new-shared"));
+        assert!(app.handle_command_text("/new-shared", &tx, false));
+        assert!(app
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("unknown command /new-shared")));
+    }
+
+    #[test]
+    fn leader_n_creates_a_session_and_leader_q_does_not_close_a_pane() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.views.push(SessionView::new(
@@ -15349,7 +15456,10 @@ mod tests {
         app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE), &tx);
         assert!(app.picker.is_none());
         match rx.try_recv().expect("create command") {
-            Command::Create { worktree, .. } => assert!(worktree.is_none()),
+            Command::Create { worktree, cwd, .. } => {
+                assert_eq!(worktree, Some(false));
+                assert_eq!(cwd.as_deref().and_then(|path| path.to_str()), Some("/tmp"));
+            }
             _ => panic!("expected a create command"),
         }
 

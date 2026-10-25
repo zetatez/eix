@@ -48,6 +48,11 @@ pub enum Command {
         agent: Option<String>,
         mode: Option<String>,
     },
+    /// Move an existing session into a new worktree.
+    CreateWorktree {
+        session_id: String,
+        name: Option<String>,
+    },
     /// Mark a worktree session ready for the integration queue.
     Ready {
         session_id: String,
@@ -211,6 +216,7 @@ impl Command {
             Self::Attach(_) => "attach",
             Self::LoadHistory { .. } => "history",
             Self::Create { .. } => "create",
+            Self::CreateWorktree { .. } => "worktree",
             Self::Ready { .. } => "ready",
             Self::SetCwd { .. } => "cd",
             Self::ClearContext { .. } => "clear",
@@ -492,6 +498,16 @@ async fn dispatch(
                 .await?;
             let result: SessionResult = decode(value)?;
             send(events, Event::Created(result.session))
+        }
+        Command::CreateWorktree { session_id, name } => {
+            let value = requester
+                .request(
+                    "session.worktree.create",
+                    json!({ "session_id": session_id, "name": name }),
+                )
+                .await?;
+            let result: SessionResult = decode(value)?;
+            send(events, Event::Updated(result.session))
         }
         Command::Ready { session_id } => {
             let value = requester

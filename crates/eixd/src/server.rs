@@ -40,8 +40,8 @@ use eix_core::{
     SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
     StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
     SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
-    ToolResultPayload, UserMessagePayload, WorktreeRemoveParams, WorktreeRemoveResult,
-    PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    ToolResultPayload, UserMessagePayload, WorktreeCreateParams, WorktreeRemoveParams,
+    WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -736,22 +736,123 @@ impl Daemon {
                 None => self.base_for_session(&session.cwd, &repo).await?,
             };
             let name = self.generate_worktree_name(&session, text).await;
-            let created =
-                crate::worktree::create_from_base(&session.cwd, &name, Some(&base)).await?;
-            let cwd = worktree_session_cwd(&repo, &session.cwd, &created.path);
-            let updated = self
-                .store
-                .set_session_cwd(&session.id, &cwd, Some(&created.path))?
-                .ok_or_else(|| rpc("not_found", format!("unknown session {}", session.id)))?;
-            let state = self
-                .store
-                .ensure_integration(&session.id, Some(&base), false)?;
-            self.save_integration(&state)?;
-            self.emit_session(&updated);
-            Ok(updated)
+            self.move_session_to_worktree(&session, &repo, &base, &name)
+                .await
         }
         .await;
         self.worktree_creating.lock().await.remove(session_id);
+        result
+    }
+
+    /// Move an existing session into a new worktree and persist both the new
+    /// cwd and its integration base. Callers are responsible for claiming the
+    /// session in `worktree_creating`.
+    async fn move_session_to_worktree(
+        &self,
+        session: &Session,
+        repo: &Path,
+        base: &str,
+        name: &str,
+    ) -> Result<Session> {
+        let created = crate::worktree::create_from_base(&session.cwd, name, Some(base)).await?;
+        let cwd = worktree_session_cwd(repo, &session.cwd, &created.path);
+        let updated = match self
+            .store
+            .set_session_cwd(&session.id, &cwd, Some(&created.path))
+        {
+            Ok(Some(updated)) => updated,
+            Ok(None) => {
+                let _ = crate::worktree::remove(&created.path, true).await;
+                return Err(rpc("not_found", format!("unknown session {}", session.id)));
+            }
+            Err(err) => {
+                let _ = crate::worktree::remove(&created.path, true).await;
+                return Err(err);
+            }
+        };
+        let state = self
+            .store
+            .ensure_integration(&session.id, Some(base), false)?;
+        self.save_integration(&state)?;
+        self.emit_session(&updated);
+        Ok(updated)
+    }
+
+    /// `session.worktree.create`: attach a worktree to an existing session.
+    /// The TUI also checks this before sending, but keep the daemon side
+    /// authoritative so another client cannot create a second worktree.
+    async fn create_worktree(&self, params: WorktreeCreateParams) -> Result<Session> {
+        let session = self.require_session(&params.session_id)?;
+        if session.is_agent() {
+            return Err(rpc(
+                "invalid_params",
+                "sub-agent sessions cannot have their own worktree",
+            ));
+        }
+        if session.has_worktree() {
+            return Err(rpc(
+                "invalid_params",
+                format!("session {} already has a worktree", session.id),
+            ));
+        }
+        if session.status.is_busy() {
+            return Err(rpc(
+                "busy",
+                "wait for the turn to finish before creating a worktree",
+            ));
+        }
+
+        // Serialize with lazy auto-worktree creation for the same session.
+        {
+            let mut creating = self.worktree_creating.lock().await;
+            if !creating.insert(session.id.clone()) {
+                return Err(rpc(
+                    "busy",
+                    format!("session {} is creating its worktree", session.id),
+                ));
+            }
+        }
+        let result = async {
+            // Re-read after claiming: a prompt may have completed and already
+            // moved the session into its auto worktree.
+            let session = self.require_session(&params.session_id)?;
+            if session.has_worktree() {
+                return Err(rpc(
+                    "invalid_params",
+                    format!("session {} already has a worktree", session.id),
+                ));
+            }
+            if session.status.is_busy() {
+                return Err(rpc(
+                    "busy",
+                    "wait for the turn to finish before creating a worktree",
+                ));
+            }
+            let Some(repo) = crate::worktree::main_repo(&session.cwd).await else {
+                return Err(rpc(
+                    "invalid_params",
+                    format!("{} is not inside a git work tree", session.cwd.display()),
+                ));
+            };
+            // A manual worktree follows the branch checked out now. Only
+            // auto-created worktrees use the branch recorded at session
+            // creation, so switching branches before `/new-worktree` is
+            // respected.
+            let base = self.base_for_session(&session.cwd, &repo).await?;
+            let requested = params
+                .name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            let name = requested.unwrap_or(&session.name);
+            self.move_session_to_worktree(&session, &repo, &base, name)
+                .await
+        }
+        .await;
+        self.worktree_creating
+            .lock()
+            .await
+            .remove(&params.session_id);
         result
     }
 
@@ -2466,6 +2567,12 @@ impl Daemon {
             "session.rewind" => {
                 let params: RewindParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(self.rewind_session(params).await?)?)
+            }
+            "session.worktree.create" => {
+                let params: WorktreeCreateParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(SessionResult {
+                    session: self.create_worktree(params).await?,
+                })?)
             }
             "session.worktree.remove" => {
                 let params: WorktreeRemoveParams = parse_params(request.params.clone())?;

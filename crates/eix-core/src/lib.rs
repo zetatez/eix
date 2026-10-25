@@ -64,8 +64,8 @@ pub use protocol::{
     SessionList, SessionModelParams, SessionReadyParams, SessionRef, SessionResult, ShellRunParams,
     ShellRunResult, StatsResult, SubagentConcurrencyParams, SubagentConcurrencyResult,
     SubmitParams, SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult,
-    TodoItem, TodoList, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
-    SESSION_EXPORT_VERSION,
+    TodoItem, TodoList, WorktreeCreateParams, WorktreeRemoveParams, WorktreeRemoveResult,
+    PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 pub use risk::{
     analyze_command, assess_command, assess_read_path, assess_write_path, path_is_private_key,

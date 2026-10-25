@@ -324,8 +324,8 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | 快捷键                | 功能                             |
  | ---                   | ---                              |
  | `Space o`             | 把已有 session 开到新 pane       |
- | `Space n`             | 新建 session                     |
- | `Space W`             | 在新 git worktree 中新建 session |
+ | `Space n`             | 新建 session（有 worktree 则复用） |
+ | `Space W`             | 把当前 session 移入新 worktree   |
  | `Space c`             | 保存并关闭当前 pane              |
  | `Space x`             | 取消当前 turn                    |
  | `Space a`             | 跨 session 审批收件箱            |
@@ -414,8 +414,8 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Ctrl-W` `Ctrl-W`                                 | 1 秒内连续按两次：聚焦下一个 pane，最后一个回绕到第一个（转录区与输入框 normal 模式）                                                                                                                                                                                                                                                                                               |
  | `<Space>v` / `<Space>t` / `<Space>r`              | horizontal / tabby / fibonacci 布局；`<Space>l` 循环所有布局                                                                                                                                                                                                                                                                                                                        |
  | `Ctrl-1` … `Ctrl-9`                               | 聚焦第 N 个已打开 session；`tabby` 下即切换到第 N 个 tab（输入框内也可用；`Ctrl-7` 可能用于模型 picker）                                                                                                                                                                                                                                                                            |
- | `<Space>n`                           | 新建 session 并在新 pane 打开，默认共享当前工作区；有待审批时卡片上的 `n` 仍是 deny                                                                                                                                                                                                                                                                                                 |
- | `<Space>W`                                        | 新建 session，立即在 `.worktrees/<name>` 建 git worktree（不等首条 prompt）                                                                                                                                                                                                                                                                                                         |
+ | `<Space>n`                           | 新建 session 并在新 pane 打开；当前 session 有 worktree 时复用，否则共享当前工作区。有待审批时卡片上的 `n` 仍是 deny                                                                                                                                                                                                                                                               |
+ | `<Space>W`                                        | 把当前 session 移入 `.worktrees/<name>`；已有 worktree 时只在右上角提示                                                                                                                                                                                                                                                                                                              |
  | `y` / `n`                                         | 批准 / 拒绝聚焦 pane 的待审批工具调用（卡片快捷方式）                                                                                                                                                                                                                                                                                                                               |
  | `a`                                               | `Always allow`：批准并为此 session 记住同类调用（卡片快捷方式）                                                                                                                                                                                                                                                                                                                     |
  | `Ctrl-J` / `Ctrl-K` · `Enter`                     | 审批/提问卡片是 Markdown checkbox 列表（`- [ ]` / `- [x]`）：`Ctrl-J`/`Ctrl-K`（或 `j`/`k`、`C-n`/`C-p`）移动，`Enter` 执行高亮项，`1-9` 直接选；首个选项是推荐项                                                                                                                                                                                                            |
@@ -443,10 +443,9 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
  | ---                                        | ---                                                                                                                                                                          |
  | `/help [query]`                            | 打开可搜索帮助（命令、快捷键、notes）；可带初始查询                                                                                                                          |
  | `/keys [query]`                            | 只打开快捷键章节，同样支持即时搜索和上下选择                                                                                                                                 |
- | `/new [name]`                              | 新建 session，并在新 pane 打开，默认共享当前工作区                                                                                                                           |
+ | `/new [name]`                              | 新建 session：当前 session 有 worktree 时复用它，否则共享当前工作区（不建 worktree）                                                                                          |
  | `/new-pane`                                | 打开 session picker，把已有 session 放进新 pane                                                                                                                              |
- | `/new-worktree [name]`                     | 立即在独立 git worktree 里新建 session                                                                                                                                       |
- | `/new-shared [name]`                       | 新建 session 但共享当前工作区（不建 worktree）                                                                                                                               |
+ | `/new-worktree [name]`                     | 把当前 session 移入独立 git worktree；已有 worktree 时只提示，不重复创建                                                                                                     |
  | `/ready`                                   | 把当前 worktree 交给 daemon 做 rebase / 测试 / ff merge                                                                                                                      |
  | `/integrate`                               | 显示当前 session 的集成队列状态与最近错误                                                                                                                                    |
  | `/clear`                                   | 清空模型上下文（更早的 turn 仍留在转录和事件日志里，只是不再发给模型）                                                                                                       |
@@ -684,7 +683,7 @@ insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动�
   normal 模式不改变 pane 顺序；切换 session 用 `Ctrl-1` … `Ctrl-9` 或前后移动
 
 TUI 动作在**转录区**和**输入框 normal 模式**下共用同一套 **leader（空格）+ 键**：
-`<Space>n` 新建 session 并在新 pane 打开、`<Space>o` 把已有 session 放进新 pane
+`<Space>n` 新建 session 并在新 pane 打开（当前 session 有 worktree 时复用）、`<Space>o` 把已有 session 放进新 pane
 （`<Space>c` 关闭当前 pane）、`<Space>f` 文件、
 `<Space>g` git（worktrees + branches）、
 `<Space>v`/`t`/`r` 布局、`<Space>l` 循环布局、`<Space>m` 完整执行模式、
@@ -784,20 +783,26 @@ fork 和 rewind 都按“复制历史前缀”工作：新 session 名为 `name~
 worktree 的生命周期与 session 解耦：`eix worktree list` 列出所有带 worktree 的
 session，`eix worktree remove SESSION` 删除空闲 session 的 worktree；有未提交改动时
 git 会拒绝，需显式加 `--force`。删除后 session 的 `cwd` 回到主仓库根目录，worktree
-字段清空，并且不会自动再建；需要隔离工作区时请新建 session。TUI 里 `N` 直接用新 worktree 开 session。
+字段清空，并且不会自动再建；需要隔离工作区时可在 TUI 里对当前 session 执行
+`/new-worktree` / `<Space>W`，把该 session 移入新的 worktree。
 
 ### Worktree 与集成队列
 
 默认情况下，新建 session **直接在原有工作区和当前分支上运行**，不会自动创建 worktree。
-需要隔离工作区时，用户显式使用 `eix new --worktree`、TUI `/new-worktree` 或 `<Space>W`；
-这时才会创建 `.worktrees/<slug>` 和 `eix/<slug>` 分支。worktree 的基线是**用户创建
-session 时所在的分支**（例如当前在 `feature/login`，就从 `feature/login` 拉出
+TUI `/new` 同样不创建新 worktree：当前 session 已有 worktree 时，新 session 直接复用
+同一个 worktree 目录（worktree 仍归原 session 所有）；否则共享当前 cwd。需要隔离工作区时，
+CLI 用 `eix new --worktree` 新建隔离 session；TUI 用 `/new-worktree` 或 `<Space>W`
+把**当前 session** 移入新的 worktree，创建
+`.worktrees/<slug>` 和 `eix/<slug>` 分支。当前 session 已经有 worktree 时不会重复创建，
+只在右上角提示。worktree 的基线是**执行命令时
+session cwd 所在的分支**（例如当前在 `feature/login`，就从 `feature/login` 拉出
 `eix/<slug>`），而不是固定从 `master` 拉。这样可以在同一个 feature 分支上并发多个
 session；每个 session 最终合并回这个 feature 分支，feature → master 的合并由用户自己控制。
 `worktree.base` / `[integration.repos."..."].base` 显式配置时仍以配置为准；`auto` 表示
 使用 session 创建时的当前分支。创建时会把 `.worktrees/` 追加到 `.git/info/exclude`
 （只影响本仓库，不改工作区文件），因此主 worktree 不会被 worktree 目录弄脏。
-`worktree.auto: true` 可恢复“首条 prompt 自动建 worktree”的旧行为。
+`worktree.auto: true` 可恢复 CLI / 自动启动 session 的“首条 prompt 自动建 worktree”行为；
+TUI `/new` 不受它影响，只复用当前 session 的 worktree（如有）。
 
 agent 完成工作并跑过测试后调用 `ready` 工具（无需审批）或运行 `eix ready`（TUI `/ready`）。
 daemon 的串行队列随后：
@@ -1351,7 +1356,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 自动上下文管理（sector 预算 / token 记账、AGENTS.md + workspace 注入、自动 drop / pin / compact）
 - [x] process view（daemon 托管后台进程、`start_command` / `process_output`、流式输出与日志、TUI `P`、`eix ps/tail/kill`）
 - [x] fork / rewind（按消息裁剪历史复制到新 session；`eix rewind` 还会按快照倒序回滚工作区，并报告无法恢复的改动）
-- [x] git worktree（默认共享工作区；显式 `--worktree` / `/new-worktree` 才建 `.worktrees/<slug>`，`eix worktree list|remove`）
+- [x] git worktree（默认共享工作区；`eix new --worktree` 新建隔离 session，TUI `/new-worktree` 把当前 session 移入 `.worktrees/<slug>`，`eix worktree list|remove`）
 - [x] 集成队列（`ready` 工具 / `eix ready`、rebase → 测试 → base ff merge、冲突/测试失败注入修复、退避重试与 `eix integrate`）
 - [x] 子 agent（`spawn_agent`、只读工具集、并发批次、深度上限 1、独立事件日志）
 - [x] `ask_user`（2-6 个选项、首个为推荐项、阻塞式交互选择、`eix answer N` 无头回答）
