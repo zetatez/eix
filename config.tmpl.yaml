@@ -202,8 +202,11 @@ mcp:
 #     extensions: ["json"]
 
 
-# Optional: TUI palette. Available presets:
-#   github-dark, github-light, gruvbox-dark, solarized-dark, solarized-light, nord, dracula, catppuccin-mocha
+# Optional: TUI palette. Available presets (light and dark):
+#   github-dark, github-light, gruvbox-dark, gruvbox-light, solarized-dark,
+#   solarized-light, nord, dracula, catppuccin-mocha, catppuccin-latte,
+#   one-dark, one-light, tokyo-night, monokai, sublime-mariana, rose-pine-dawn
+# monokai / sublime-mariana are Sublime Text-inspired.
 theme:
   preset: "github-dark"
 

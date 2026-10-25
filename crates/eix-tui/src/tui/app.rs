@@ -50,9 +50,6 @@ const ESC_WINDOW: Duration = Duration::from_millis(1000);
 /// Two `Ctrl-W` presses within this window focus the next pane.
 const CTRL_W_WINDOW: Duration = Duration::from_millis(1000);
 
-/// Background-attention alerts stay centered in the status bar this long.
-const ALERT_DISPLAY: Duration = Duration::from_secs(8);
-
 /// Keep the Vim `:` history bounded for long-running clients.
 const CMDLINE_HISTORY_LIMIT: usize = 100;
 
@@ -255,6 +252,10 @@ const COMPOSER_WARN: Color = Color::Rgb(229, 192, 123);
 const COMPOSER_ORANGE: Color = Color::Rgb(245, 169, 127);
 const COMPOSER_DANGER: Color = Color::Rgb(231, 130, 132);
 const COMPOSER_BADGE_TEXT: Color = Color::Rgb(20, 22, 28);
+const COMPOSER_BADGE_TEXT_LIGHT: Color = Color::Rgb(248, 250, 252);
+/// Keep accent text/badges legible on themed backgrounds without abandoning
+/// their hue. Bold status text is checked against the WCAG large-text floor.
+const MIN_ACCENT_CONTRAST: f32 = 3.0;
 const COMPOSER_SELECTION: Color = Color::Rgb(54, 60, 76);
 
 /// Fine dashed focus ring. Quadruple-dash box drawing keeps the focused pane
@@ -279,13 +280,69 @@ struct TextSelection {
     moved: bool,
 }
 
-/// Short-lived top-right confirmation after a mouse selection was copied.
-struct CopyToast {
+/// Visual tone for a transient top-right notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToastTone {
+    Success,
+    Warning,
+}
+
+/// Short-lived top-right notification. Only failures that have no other UI
+/// surface, background attention and copy confirmations use this; successful
+/// commands and popup navigation are already visible where they happen.
+struct Toast {
     text: String,
+    tone: ToastTone,
     until: Instant,
 }
 
 const COPY_TOAST_DISPLAY: Duration = Duration::from_secs(2);
+const WARNING_TOAST_DISPLAY: Duration = Duration::from_secs(4);
+const ATTENTION_TOAST_DISPLAY: Duration = Duration::from_secs(8);
+/// Keep the corner readable without letting a burst of feedback cover a pane.
+const MAX_TOASTS: usize = 3;
+
+/// Whether a status change is a failure the user cannot otherwise see. Normal
+/// progress, successful command feedback and popup contents stay silent.
+fn status_needs_warning(status: &str) -> bool {
+    const MARKERS: &[&str] = &[
+        "failed",
+        "error",
+        "stale",
+        "conflict",
+        "cannot ",
+        "usage:",
+        "editor:",
+        "dropped ",
+        "only staged",
+        "wait for ",
+        "still loading",
+        "out of range",
+        "no session",
+        "no previous search",
+        "no matches",
+        "no earlier prompts",
+        "no queued prompt",
+        "no pending approval",
+        "no diff to review",
+        "no hunks selected",
+        "no file to open",
+        "no integration state",
+        "no model",
+        "no longer listed",
+        "attach a session",
+        "does not exist",
+        "not running",
+        "not loaded",
+        "not open",
+    ];
+    let status = status.trim();
+    // A retry is progress: the eventual failure arrives through the error
+    // dialog, so do not turn each attempt into a warning toast.
+    !status.is_empty()
+        && !status.contains("retrying ")
+        && MARKERS.iter().any(|marker| status.contains(marker))
+}
 
 /// Parsed and wrapped history for one pane. Only the live turn is re-rendered
 /// on each frame; stored events stay here until the log, width, theme or fold
@@ -1230,8 +1287,11 @@ pub struct App {
     /// Text selected with the mouse, waiting for the event loop to copy it to
     /// the system clipboard.
     pending_clipboard: Option<String>,
-    /// Top-right confirmation shown briefly after copying a selection.
-    copy_toast: Option<CopyToast>,
+    /// Transient top-right notifications, newest first.
+    toasts: Vec<Toast>,
+    /// Status text last observed, so repeated assignments do not retrigger the
+    /// warning check even though most call sites write `status` directly.
+    last_seen_status: String,
     /// Older-history request picked up by the event loop after drawing.
     pending_history: Option<(String, u64)>,
     /// Pane rectangles from the last draw, used to pick a focus direction.
@@ -1264,10 +1324,6 @@ pub struct App {
     pub default_mode: Option<String>,
     /// Set when a notification should ring; cleared by the event loop.
     ring: bool,
-    /// Text for the next alert (session name + status).
-    last_alert: Option<String>,
-    /// When the status-bar alert should disappear.
-    alert_at: Option<Instant>,
     /// Session whose daemon draft is being loaded into a fresh buffer.
     draft_loading: Option<String>,
     /// Last draft submitted from the prompt (session id, text), kept so a
@@ -1377,7 +1433,8 @@ impl App {
             pending_leader: false,
             leader_status_backup: None,
             pending_clipboard: None,
-            copy_toast: None,
+            toasts: Vec::new(),
+            last_seen_status: "connecting…".into(),
             pending_history: None,
             pane_areas: Vec::new(),
             integrations: HashMap::new(),
@@ -1398,8 +1455,6 @@ impl App {
             default_agent: None,
             default_mode: None,
             ring: false,
-            last_alert: None,
-            alert_at: None,
             draft_loading: None,
             pending_draft: None,
             input_session: None,
@@ -2005,10 +2060,11 @@ impl App {
                     self.views[index].folds.insert(fold.id, !fold.open);
                     self.views[index].selection = None;
                 } else if let Some(text) = copied {
-                    self.copy_toast = Some(CopyToast {
-                        text: format!("Copied {} chars", text.chars().count()),
-                        until: Instant::now() + COPY_TOAST_DISPLAY,
-                    });
+                    self.push_toast(
+                        format!("Copied {} chars", text.chars().count()),
+                        ToastTone::Success,
+                        COPY_TOAST_DISPLAY,
+                    );
                     // Seed the prompt's unnamed register too: normal-mode `p`
                     // can then paste the same text even if the native
                     // clipboard helper is unavailable.
@@ -2771,9 +2827,13 @@ impl App {
                     .and_then(Value::as_str)
                     .unwrap_or("integration needs attention")
                     .to_string();
-                self.last_alert = Some(format!("{name} · integration failed"));
-                self.alert_at = Some(Instant::now());
                 self.status = format!("integration failed · {}", truncate(&error, 100));
+                self.last_seen_status.clone_from(&self.status);
+                self.push_toast(
+                    format!("{name} · integration failed"),
+                    ToastTone::Warning,
+                    ATTENTION_TOAST_DISPLAY,
+                );
                 if self
                     .status_session()
                     .is_none_or(|session| session.id != session_id)
@@ -2816,16 +2876,12 @@ impl App {
                         }
                     }
                     if alert {
-                        self.last_alert = self
-                            .views
-                            .iter()
-                            .find(|view| view.session.id == params.session_id)
-                            .map(|view| {
-                                format!("{} · {}", view.session.name, params.status.as_str())
-                            });
-                        if self.last_alert.is_some() {
-                            self.alert_at = Some(Instant::now());
-                        }
+                        self.last_seen_status.clone_from(&self.status);
+                        self.push_toast(
+                            self.status.clone(),
+                            ToastTone::Warning,
+                            ATTENTION_TOAST_DISPLAY,
+                        );
                         if self.bell {
                             self.ring = true;
                         }
@@ -3358,6 +3414,9 @@ impl App {
         };
         if self.status.starts_with("leader:") {
             self.status = status;
+            // The restored text was already seen before the leader hint; do
+            // not replay it as a brand-new notification.
+            self.last_seen_status.clone_from(&self.status);
         }
     }
 
@@ -7148,44 +7207,100 @@ already exists, update it in place rather than rewriting it from scratch.";
             self.draw_error_dialog(frame, area);
         }
 
-        if self
-            .copy_toast
-            .as_ref()
-            .is_some_and(|toast| toast.until <= Instant::now())
-        {
-            self.copy_toast = None;
-        }
-        self.draw_copy_toast(frame, area);
+        let now = Instant::now();
+        self.toasts.retain(|toast| toast.until > now);
+        self.sync_status_toast();
+        self.draw_toasts(frame, area);
     }
 
-    /// A small confirmation in the top-right corner. It intentionally floats
-    /// above panes and dialogs so copy feedback is visible without moving the
-    /// eye to the status bar.
-    fn draw_copy_toast(&self, frame: &mut Frame, area: Rect) {
-        let Some(toast) = &self.copy_toast else {
-            return;
-        };
-        let text = format!(" {} ", toast.text);
-        let width = (text.width() as u16).min(area.width.saturating_sub(2));
-        if width == 0 || area.height < 2 {
+    /// Turn a changed app status into a notification only when it reports a
+    /// failure that is not already visible in a dialog or overlay. Most call
+    /// sites assign `status` directly, so observing it at draw time keeps the
+    /// rule in one place.
+    fn sync_status_toast(&mut self) {
+        if self.status == self.last_seen_status {
             return;
         }
-        let rect = Rect {
-            x: area.x + area.width.saturating_sub(width + 1),
-            y: area.y + 1,
-            width,
-            height: 1,
-        };
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(text).alignment(Alignment::Right).style(
-                Style::default()
-                    .fg(COMPOSER_BADGE_TEXT)
-                    .bg(COMPOSER_SUCCESS)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            rect,
+        self.last_seen_status.clone_from(&self.status);
+        if !status_needs_warning(&self.status) || self.status_warning_is_redundant() {
+            return;
+        }
+        self.push_toast(
+            self.status.clone(),
+            ToastTone::Warning,
+            WARNING_TOAST_DISPLAY,
         );
+    }
+
+    /// Some failures are already explained by the surface that caused them.
+    /// Do not repeat them as a toast while that surface is still open.
+    fn status_warning_is_redundant(&self) -> bool {
+        self.error.is_some()
+            || self.picker.is_some()
+            || self.help
+            || self.diff_view.is_some()
+            || self.process_view.is_some()
+            || self.btw.is_some()
+            || self.reason_prompt.is_some()
+    }
+
+    fn push_toast(&mut self, text: String, tone: ToastTone, duration: Duration) {
+        let text = text
+            .trim()
+            .replace(['\n', '\r', '\t'], " ")
+            .trim()
+            .to_string();
+        if text.is_empty() {
+            return;
+        }
+        let until = Instant::now() + duration;
+        if let Some(existing) = self.toasts.iter_mut().find(|toast| toast.text == text) {
+            existing.tone = tone;
+            existing.until = until;
+            return;
+        }
+        self.toasts.insert(0, Toast { text, tone, until });
+        self.toasts.truncate(MAX_TOASTS);
+    }
+
+    /// Notifications stack below one another in the top-right corner and float
+    /// above panes and dialogs, matching the original copy confirmation.
+    fn draw_toasts(&self, frame: &mut Frame, area: Rect) {
+        if area.width < 2 || area.height < 2 {
+            return;
+        }
+        let available = area.width.saturating_sub(2);
+        for (index, toast) in self.toasts.iter().enumerate() {
+            let y = area.y + 1 + index as u16;
+            if y >= area.y.saturating_add(area.height) {
+                break;
+            }
+            let text = truncate(&format!(" {} ", toast.text), available as usize);
+            let width = text.width() as u16;
+            if width == 0 {
+                continue;
+            }
+            let rect = Rect {
+                x: area.x + area.width - width - 1,
+                y,
+                width,
+                height: 1,
+            };
+            let color = match toast.tone {
+                ToastTone::Success => composer_success(self.theme),
+                ToastTone::Warning => composer_warn(self.theme),
+            };
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(text).alignment(Alignment::Right).style(
+                    Style::default()
+                        .fg(badge_text_color(color))
+                        .bg(color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rect,
+            );
+        }
     }
 
     /// Compact status icon shared by the pane title and the prompt header.
@@ -7780,32 +7895,19 @@ already exists, update it in place rather than rewriting it from scratch.";
         Line::from(spans)
     }
 
-    /// Secondary statusline context: transient app status, worktree and pending
-    /// image count. It is dropped first when the bar gets narrow.
+    /// Secondary statusline context: the pending leader hint plus persistent
+    /// integration and image state. Transient messages live in top-right
+    /// toasts instead, so this area stays stable while commands run. It is
+    /// dropped first when the bar gets narrow.
     fn status_bar_middle(&self) -> Option<Line<'static>> {
         let theme = self.theme;
         let panel = composer_background(theme);
         let muted = composer_muted(theme);
         let warn = composer_warn(theme);
         let mut spans = Vec::new();
-        // Lifecycle chatter is redundant here: the pane title already carries
-        // the session name, and the status glyph carries the connection state.
-        let status = self.status.as_str();
-        let show_status = !status.is_empty()
-            && status != "attached"
-            && status != "connecting…"
-            && !status.starts_with("connected to eixd")
-            && !status.starts_with("mode")
-            && !status.starts_with("integration · merged")
-            && !status.starts_with("patch ")
-            && !status.starts_with("process ")
-            && status != "running shell command…"
-            && status != "reading shell output…"
-            && !status.ends_with(" sent")
-            && !status.starts_with("answered:")
-            && status != "idle"
-            && status != "running";
-        if show_status {
+        // The leader hint is a key guide rather than command feedback, so it
+        // stays in the statusline until the next key restores the old status.
+        if self.pending_leader && self.status.starts_with("leader:") {
             spans.push(Span::styled(
                 self.status.clone(),
                 Style::default().fg(muted).bg(panel),
@@ -7912,34 +8014,20 @@ already exists, update it in place rather than rewriting it from scratch.";
         Line::from(spans)
     }
 
-    /// Background-attention notice shown in the middle of the status bar.
-    /// Desktop popups are intentionally avoided, so this is the only alert UI.
-    fn status_bar_alert(&self) -> Option<Line<'static>> {
-        let text = self.last_alert.as_deref()?;
-        if self.alert_at?.elapsed() >= ALERT_DISPLAY {
-            return None;
-        }
-        let panel = composer_background(self.theme);
-        Some(Line::from(Span::styled(
-            format!(" {text} "),
-            Style::default()
-                .fg(composer_warn(self.theme))
-                .bg(panel)
-                .add_modifier(Modifier::BOLD),
-        )))
-    }
-
     fn draw_status_bar(&self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let panel = composer_background(self.theme);
         let background = Style::default().bg(panel);
+        // Paint the whole row first: the middle section is often empty now
+        // that transient messages live in toasts, and unpainted cells would
+        // keep the terminal's default background instead of the theme's.
+        frame.render_widget(Paragraph::new(Line::default()).style(background), area);
         let left = self.status_bar_left();
         let middle = self.status_bar_middle();
         let counters = self.status_bar_right();
         let workspace = self.status_bar_workspace();
-        let alert = self.status_bar_alert();
 
         let counters_width = counters.width();
         let workspace_width = workspace.as_ref().map_or(0, |line| line.width());
@@ -8004,14 +8092,7 @@ already exists, update it in place rather than rewriting it from scratch.";
             let left = truncate_line(left, left_width as usize);
             frame.render_widget(Paragraph::new(left).style(background), chunks[0]);
         }
-        if let Some(alert) = alert {
-            frame.render_widget(
-                Paragraph::new(alert)
-                    .alignment(Alignment::Center)
-                    .style(background),
-                chunks[1],
-            );
-        } else if middle_width > 0 {
+        if middle_width > 0 {
             if let Some(middle) = middle {
                 let middle = truncate_line(middle, middle_width as usize);
                 frame.render_widget(Paragraph::new(middle).style(background), chunks[1]);
@@ -11079,12 +11160,13 @@ fn composer_status_color(status: SessionStatus, theme: Theme) -> Color {
 /// and Bypass is unguarded pink. Auto keeps its own orange because the theme
 /// palettes have no slot that stays distinct from every other mode color.
 fn session_mode_color(mode: SessionMode, theme: Theme) -> Color {
-    match mode {
+    let color = match mode {
         SessionMode::Plan => composer_warn(theme),
         SessionMode::Build => composer_accent(theme),
         SessionMode::Auto => COMPOSER_ORANGE,
         SessionMode::Bypass => composer_danger(theme),
-    }
+    };
+    readable_mode_color(color, theme)
 }
 
 /// Insert is the active writing mode (green), normal is the Vim home mode
@@ -11097,14 +11179,86 @@ fn composer_mode_color(mode: Mode, theme: Theme) -> Color {
     }
 }
 
-fn composer_mode_style(mode: Mode, focused: bool, theme: Theme) -> Style {
-    let color = if focused {
-        composer_mode_color(mode, theme)
+/// Pick dark or light badge text using WCAG contrast. ANSI colors keep the
+/// default dark text because their RGB values depend on the terminal palette.
+fn badge_text_color(background: Color) -> Color {
+    let Color::Rgb(red, green, blue) = background else {
+        return COMPOSER_BADGE_TEXT;
+    };
+    let background = relative_luminance(red, green, blue);
+    let dark = relative_luminance(20, 22, 28);
+    let light = relative_luminance(248, 250, 252);
+    if contrast_ratio(background, light) > contrast_ratio(background, dark) {
+        COMPOSER_BADGE_TEXT_LIGHT
     } else {
-        composer_border(theme)
+        COMPOSER_BADGE_TEXT
+    }
+}
+
+fn relative_luminance(red: u8, green: u8, blue: u8) -> f32 {
+    fn channel(value: u8) -> f32 {
+        let value = value as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel(red) + 0.7152 * channel(green) + 0.0722 * channel(blue)
+}
+
+fn contrast_ratio(first: f32, second: f32) -> f32 {
+    let (lighter, darker) = if first > second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    (lighter + 0.05) / (darker + 0.05)
+}
+
+/// Darken accents on light backgrounds (and lighten them on dark ones) until
+/// they reach the minimum statusline contrast. Presets keep their hue; custom
+/// themes without an explicit background are left untouched.
+fn readable_mode_color(color: Color, theme: Theme) -> Color {
+    let Some(Color::Rgb(background_red, background_green, background_blue)) = theme.background
+    else {
+        return color;
+    };
+    let Color::Rgb(red, green, blue) = color else {
+        return color;
+    };
+    let background = relative_luminance(background_red, background_green, background_blue);
+    let light = background > 0.6;
+    let mut channels = [red, green, blue];
+    for _ in 0..64 {
+        if contrast_ratio(
+            relative_luminance(channels[0], channels[1], channels[2]),
+            background,
+        ) >= MIN_ACCENT_CONTRAST
+        {
+            break;
+        }
+        for channel in &mut channels {
+            *channel = if light {
+                (*channel as f32 * 0.92) as u8
+            } else {
+                (*channel as f32 + (255.0 - *channel as f32) * 0.08) as u8
+            };
+        }
+    }
+    Color::Rgb(channels[0], channels[1], channels[2])
+}
+
+fn composer_mode_style(mode: Mode, focused: bool, theme: Theme) -> Style {
+    let (color, foreground) = if focused {
+        let color = composer_mode_color(mode, theme);
+        (color, badge_text_color(color))
+    } else {
+        // Blurred badges keep deliberately low contrast.
+        (composer_border(theme), COMPOSER_BADGE_TEXT)
     };
     Style::default()
-        .fg(COMPOSER_BADGE_TEXT)
+        .fg(foreground)
         .bg(color)
         .add_modifier(Modifier::BOLD)
 }
@@ -13224,7 +13378,7 @@ mod tests {
 
         assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
         assert_eq!(
-            app.copy_toast.as_ref().map(|toast| toast.text.as_str()),
+            app.toasts.first().map(|toast| toast.text.as_str()),
             Some("Copied 5 chars")
         );
         assert!(app.views[0].selection.is_some());
@@ -13242,6 +13396,38 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
         assert_eq!(app.input.text(), "hello");
+    }
+
+    #[test]
+    fn toasts_stack_newest_first_and_merge_duplicates() {
+        let mut app = App::new(None);
+        for (text, tone) in [
+            ("first", ToastTone::Success),
+            ("second", ToastTone::Success),
+            ("third", ToastTone::Success),
+            ("fourth", ToastTone::Success),
+        ] {
+            app.push_toast(text.into(), tone, Duration::from_secs(10));
+        }
+        assert_eq!(
+            app.toasts
+                .iter()
+                .map(|toast| toast.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["fourth", "third", "second"]
+        );
+
+        // Refreshing a visible message updates it in place instead of adding
+        // a duplicate row.
+        app.push_toast("second".into(), ToastTone::Warning, Duration::from_secs(20));
+        assert_eq!(app.toasts.len(), MAX_TOASTS);
+        assert_eq!(app.toasts[2].tone, ToastTone::Warning);
+
+        let text = render_text(&mut app, 80, 20);
+        let rows: Vec<_> = text.lines().take(4).collect();
+        assert!(rows[1].contains("fourth"), "{text}");
+        assert!(rows[2].contains("third"), "{text}");
+        assert!(rows[3].contains("second"), "{text}");
     }
 
     #[test]
@@ -14300,6 +14486,15 @@ mod tests {
         terminal.draw(|frame| app.draw(frame)).unwrap();
         let nord_bg = Color::Rgb(46, 52, 64);
         assert_eq!(terminal.backend().buffer()[(2, 2)].bg, nord_bg);
+        // The status bar's empty middle must use the theme background too, not
+        // whatever the terminal painted there previously.
+        for x in 30..50 {
+            assert_eq!(
+                terminal.backend().buffer()[(x, 22)].bg,
+                nord_bg,
+                "status bar background at x={x}"
+            );
+        }
 
         // Previewing the first built-in preset must repaint the pane and the
         // picker dialog, not leave either on the terminal's default background.
@@ -14315,6 +14510,7 @@ mod tests {
         // palette, not the terminal's default background.
         assert_eq!(terminal.backend().buffer()[(8, 4)].bg, preview_bg);
         assert_eq!(terminal.backend().buffer()[(10, 7)].bg, preview_bg);
+        assert_eq!(terminal.backend().buffer()[(40, 22)].bg, preview_bg);
     }
 
     #[test]
@@ -15784,7 +15980,20 @@ mod tests {
     }
 
     #[test]
-    fn session_mode_colors_stay_distinct_in_every_theme() {
+    fn badge_text_contrasts_with_light_and_dark_accents() {
+        assert_eq!(
+            badge_text_color(Color::Rgb(250, 250, 250)),
+            COMPOSER_BADGE_TEXT
+        );
+        assert_eq!(
+            badge_text_color(Color::Rgb(3, 47, 98)),
+            COMPOSER_BADGE_TEXT_LIGHT
+        );
+        assert_eq!(badge_text_color(Color::Cyan), COMPOSER_BADGE_TEXT);
+    }
+
+    #[test]
+    fn session_mode_colors_stay_distinct_and_readable_in_every_theme() {
         let mut themes = vec![Theme::default()];
         themes.extend(THEME_PRESETS.iter().map(|preset| {
             Theme::from_config(&eix_core::ThemeConfig {
@@ -15808,6 +16017,20 @@ mod tests {
                     assert_ne!(
                         color, other,
                         "mode colors collide for preset {:?}: {colors:?}",
+                        theme.preset
+                    );
+                }
+            }
+            if let Some(Color::Rgb(red, green, blue)) = theme.background {
+                let background = relative_luminance(red, green, blue);
+                for color in &colors {
+                    let Color::Rgb(red, green, blue) = *color else {
+                        continue;
+                    };
+                    assert!(
+                        contrast_ratio(relative_luminance(red, green, blue), background)
+                            >= MIN_ACCENT_CONTRAST,
+                        "mode color {color:?} is too faint on preset {:?}",
                         theme.preset
                     );
                 }
@@ -15916,15 +16139,27 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_hides_mode_and_merged_noise() {
+    fn mode_feedback_stays_out_of_toasts() {
         let mut app = App::new(None);
         app.views.push(SessionView::new(
             Session::new("s1", "one", "/tmp"),
             Vec::new(),
         ));
         app.focused = 0;
+
         app.status = "mode: bypass".into();
+        let text = render_text(&mut app, 80, 20);
+        let bar = status_bar_row(&text);
+        assert!(!bar.contains("mode: bypass"), "{bar}");
+        assert!(
+            !text
+                .lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("mode: bypass")),
+            "{text}"
+        );
         assert!(app.status_bar_middle().is_none());
+        assert!(app.toasts.is_empty());
 
         app.integrations.insert(
             "s1".into(),
@@ -15935,11 +16170,14 @@ mod tests {
             },
         );
         app.status = "integration · merged".into();
+        let text = render_text(&mut app, 80, 20);
+        assert!(!text.contains("integration · merged"), "{text}");
         assert!(app.status_bar_middle().is_none());
+        assert!(app.toasts.is_empty());
     }
 
     #[test]
-    fn status_bar_hides_patch_and_command_chatter() {
+    fn command_feedback_stays_out_of_toasts() {
         let mut app = App::new(None);
         app.views.push(SessionView::new(
             Session::new("s1", "one", "/tmp"),
@@ -15956,9 +16194,23 @@ mod tests {
             "approval sent",
             "answer sent",
             "answered: Option A",
+            "draft saved",
+            "config reloaded",
+            "no changes",
         ] {
             app.status = status.into();
+            let text = render_text(&mut app, 80, 20);
+            assert!(
+                !text
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|line| line.contains(status)),
+                "{status}: {text}"
+            );
+            let bar = status_bar_row(&text);
+            assert!(!bar.contains(status), "{status}: {bar}");
             assert!(app.status_bar_middle().is_none(), "{status}");
+            assert!(app.toasts.is_empty(), "{status}");
         }
     }
 
@@ -17630,7 +17882,7 @@ mod tests {
     }
 
     #[test]
-    fn status_bar_shows_latest_status() {
+    fn status_feedback_uses_top_right_toasts() {
         let mut app = App::new(None);
         let mut session = Session::new("s1", "status test", "/tmp");
         session.model = Some("openai/gpt-5".into());
@@ -17639,51 +17891,83 @@ mod tests {
         app.focus = Focus::Input;
         app.connected = true;
 
-        // Attach/lifecycle chatter stays out of the statusline; the pane title
-        // already shows the session name.
-        app.status = "attached".into();
-        let text = render_text(&mut app, 80, 20);
-        let bar = status_bar_row(&text);
-        assert!(!bar.contains("attached"), "{bar}");
-        assert!(!bar.contains("status test"), "{bar}");
-
-        app.status = "connected to eixd 0.1.0".into();
-        let text = render_text(&mut app, 80, 20);
-        let bar = status_bar_row(&text);
-        assert!(!bar.contains("connected"), "{bar}");
-
-        // The spinner/status glyph already conveys idle/running.
-        for hidden in ["idle", "running"] {
+        // Lifecycle chatter, progress, popup contents and successful command
+        // feedback are already visible elsewhere; none of them become toasts.
+        for hidden in [
+            "attached",
+            "connected to eixd 0.1.0",
+            "idle",
+            "running",
+            "sending…",
+            "sending queued prompt…",
+            "retrying 2/5",
+            "model: loading provider catalogs…",
+            "approvals · Enter opens · y/n answer · Esc closes",
+            "layout: grid",
+            "mode: bypass",
+            "pane closed",
+            "no tasks",
+            "no MCP servers configured (see [mcp.servers])",
+            "no branch matched",
+            "3 model(s)",
+            "inserted skill foo",
+            "colorscheme preview · Enter apply · Esc cancel",
+            "no images attached",
+        ] {
             app.status = hidden.into();
             let text = render_text(&mut app, 80, 20);
             let bar = status_bar_row(&text);
-            assert!(!bar.contains(hidden), "{bar}");
+            assert!(!bar.contains(hidden), "{hidden}: {bar}");
+            assert!(
+                !text
+                    .lines()
+                    .nth(1)
+                    .is_some_and(|line| line.contains(hidden)),
+                "{hidden}: {text}"
+            );
+            assert!(app.toasts.is_empty(), "{hidden}");
         }
+        assert!(!status_bar_row(&render_text(&mut app, 80, 20)).contains("status test"));
 
         app.status = "retrying 2/5".into();
         let text = render_text(&mut app, 80, 20);
         let bar = status_bar_row(&text);
         assert!(bar.contains("Build  ·"), "{bar}");
-        assert!(bar.contains("retrying 2/5"), "{bar}");
+        assert!(!bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");
-        // The primary group is ordered Vim mode → agent mode → status → model
-        // → provider → reasoning, and cwd stays pinned to the right edge.
+
+        // The primary group is ordered Vim mode → agent mode → model →
+        // provider → reasoning, and cwd stays pinned to the right edge.
         assert!(bar.trim_start().starts_with("I · Build  ·"), "{bar}");
         let vim_mode = bar.find('I').unwrap();
         let build = bar.find("Build").unwrap();
-        let status = bar.find("Build  · ").unwrap() + "Build  · ".len();
         let model = bar.find("gpt-5").unwrap();
         let provider = bar.find("openai").unwrap();
         let reasoning = bar.find("medium").unwrap();
         assert!(
-            vim_mode < build
-                && build < status
-                && status < model
-                && model < provider
-                && provider < reasoning,
+            vim_mode < build && build < model && model < provider && provider < reasoning,
             "{bar}"
         );
         assert!(bar.trim_end().ends_with("/tmp"), "{bar}");
+        assert!(app.status_bar_middle().is_none());
+
+        // A failure with no other visible surface is worth one warning toast.
+        app.status = "cannot close the last pane".into();
+        let text = render_text(&mut app, 80, 20);
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("cannot close the last pane")),
+            "{text}"
+        );
+        assert!(
+            !status_bar_row(&text).contains("cannot close the last pane"),
+            "{text}"
+        );
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.tone),
+            Some(ToastTone::Warning)
+        );
 
         // The mode badge follows the active context, not the editor buffer.
         app.focus = Focus::Transcript;
@@ -17693,34 +17977,144 @@ mod tests {
     }
 
     #[test]
-    fn attention_alerts_render_centered_in_the_status_bar() {
+    fn warning_status_filter_is_narrow() {
+        for status in [
+            "cannot close the last pane",
+            "no session",
+            "no session to search",
+            "no previous search",
+            "no matches",
+            "no earlier prompts in this session",
+            "no pending approvals",
+            "no queued prompts",
+            "no queued prompt at that index",
+            "no diff to review",
+            "no hunks selected; press a to select all",
+            "this approval has no file to open",
+            "no integration state yet",
+            "reasoning: no model",
+            "that session is no longer listed",
+            "session 3 is not open",
+            "process is not running",
+            "approval was stale; the daemon is still waiting",
+            "editor: permission denied",
+            "usage: :r!<shell command>",
+            "dropped 3 notifications",
+            "wait for the running turn before sending images",
+            "patch conflict: go/main.go",
+            "queue index out of range",
+        ] {
+            assert!(status_needs_warning(status), "{status}");
+        }
+
+        for status in [
+            "sending…",
+            "upstream error · retrying 2/5 in 1.5s: 500",
+            "rate limited · retrying 1/5 in 4.0s",
+            "model: loading provider catalogs…",
+            "approvals · Enter opens · y/n answer · Esc closes",
+            "layout: grid",
+            "mode → Build",
+            "pane closed",
+            "session created",
+            "draft saved",
+            "no tasks",
+            "no MCP servers configured (see [mcp.servers])",
+            "no branch matched",
+            "no images attached",
+            "no changes",
+            "3 model(s)",
+            "inserted skill foo",
+            "colorscheme preview · Enter apply · Esc cancel",
+            "patch applied: go/main.go",
+            "process abcd1234 exited (0)",
+            "sub-agent finished",
+            "session is already open",
+        ] {
+            assert!(!status_needs_warning(status), "{status}");
+        }
+    }
+
+    #[test]
+    fn visible_error_dialog_suppresses_duplicate_warning() {
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.error = Some("provider returned 500".into());
+        app.status = "config error".into();
+
+        assert!(app.status_warning_is_redundant());
+        let text = render_text(&mut app, 80, 20);
+        assert!(text.contains("provider returned 500"), "{text}");
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn open_picker_suppresses_status_warnings() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.views.push(SessionView::new(
+            Session::new("s1", "one", "/tmp"),
+            Vec::new(),
+        ));
+        app.focused = 0;
+        app.open_picker(PickerKind::Commands, &tx);
+        app.status = "mcp: error — connection refused".into();
+
+        assert!(app.status_warning_is_redundant());
+        let _text = render_text(&mut app, 80, 20);
+        assert!(app.toasts.is_empty());
+    }
+
+    #[test]
+    fn attention_alerts_render_top_right_without_moving_the_statusline() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         let mut session = Session::new("s1", "status test", "/tmp");
         session.model = Some("openai/gpt-5".into());
         app.views.push(SessionView::new(session, Vec::new()));
+        app.views.push(SessionView::new(
+            Session::new("s2", "worker", "/tmp"),
+            Vec::new(),
+        ));
         app.focused = 0;
         app.focus = Focus::Input;
         app.connected = true;
         app.status = "retrying 2/5".into();
-        app.last_alert = Some("worker · awaiting approval".into());
-        app.alert_at = Some(Instant::now());
+
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                "session.attention",
+                serde_json::json!({"session_id": "s2", "status": "awaiting_approval"}),
+            )),
+            &tx,
+        );
 
         let text = render_text(&mut app, 80, 20);
+        assert!(
+            text.lines()
+                .nth(1)
+                .is_some_and(|line| line.contains("worker · awaiting_approval in pane 2")),
+            "{text}"
+        );
         let bar = status_bar_row(&text);
-        let alert = bar
-            .find("worker · awaiting approval")
-            .expect("center alert");
-        assert!(alert > bar.find("Build").unwrap(), "{bar}");
-        assert!(alert < bar.find("/tmp").unwrap(), "{bar}");
+        assert!(!bar.contains("worker · awaiting_approval"), "{bar}");
         assert!(!bar.contains("retrying 2/5"), "{bar}");
+        assert!(bar.contains("gpt-5"), "{bar}");
+        assert_eq!(
+            app.toasts.first().map(|toast| toast.tone),
+            Some(ToastTone::Warning)
+        );
 
-        // The alert temporarily replaces the secondary metadata; once it
-        // expires the session status and model context come back.
-        app.alert_at = Some(Instant::now() - ALERT_DISPLAY);
+        // Expiry removes the notice without replaying the alert or moving the
+        // persistent statusline metadata.
+        app.toasts[0].until = Instant::now() - ATTENTION_TOAST_DISPLAY;
         let text = render_text(&mut app, 80, 20);
+        assert!(!text.contains("worker · awaiting_approval"), "{text}");
         let bar = status_bar_row(&text);
-        assert!(!bar.contains("worker · awaiting approval"), "{bar}");
-        assert!(bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");
     }
 

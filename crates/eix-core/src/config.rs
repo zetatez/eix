@@ -747,10 +747,10 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
-    /// Built-in palette name (`github-dark`, `github-light`, `gruvbox-dark`,
-    /// `solarized-dark`, `nord`, `dracula`, …). Explicit fields below override
-    /// individual slots of the preset; without a preset the terminal palette is
-    /// used (transparent background).
+    /// Built-in palette name (`github-dark`, `one-light`, `tokyo-night`,
+    /// `monokai`, `sublime-mariana`, `catppuccin-latte`, …). Explicit fields
+    /// below override individual slots of the preset; without a preset the
+    /// terminal palette is used (transparent background).
     pub preset: Option<String>,
     pub normal: Option<String>,
     pub comment: Option<String>,
@@ -797,7 +797,7 @@ impl ThemePreset {
 
 /// Every built-in preset, in picker order. Aliases resolve through
 /// [`theme_preset`].
-pub const THEME_PRESETS: [ThemePreset; 8] = [
+pub const THEME_PRESETS: [ThemePreset; 16] = [
     ThemePreset {
         name: "github-dark",
         description: "GitHub Dark / Primer",
@@ -902,6 +902,110 @@ pub const THEME_PRESETS: [ThemePreset; 8] = [
         diff_delete: Some("#f38ba8"),
         panel: Some("#313244"),
     },
+    ThemePreset {
+        name: "one-dark",
+        description: "Atom One Dark",
+        background: Some("#282c34"),
+        normal: Some("#abb2bf"),
+        comment: Some("#5c6370"),
+        string: Some("#e5c07b"),
+        function: Some("#61afef"),
+        error: Some("#e06c75"),
+        diff_add: Some("#98c379"),
+        diff_delete: Some("#e06c75"),
+        panel: Some("#21252b"),
+    },
+    ThemePreset {
+        name: "one-light",
+        description: "Atom One Light",
+        background: Some("#fafafa"),
+        normal: Some("#383a42"),
+        comment: Some("#a0a1a7"),
+        string: Some("#c18401"),
+        function: Some("#4078f2"),
+        error: Some("#e45649"),
+        diff_add: Some("#50a14f"),
+        diff_delete: Some("#e45649"),
+        panel: Some("#f0f0f1"),
+    },
+    ThemePreset {
+        name: "tokyo-night",
+        description: "Tokyo Night",
+        background: Some("#1a1b26"),
+        normal: Some("#c0caf5"),
+        comment: Some("#565f89"),
+        string: Some("#e0af68"),
+        function: Some("#7aa2f7"),
+        error: Some("#f7768e"),
+        diff_add: Some("#9ece6a"),
+        diff_delete: Some("#f7768e"),
+        panel: Some("#24283b"),
+    },
+    ThemePreset {
+        name: "monokai",
+        description: "Sublime Text Monokai",
+        background: Some("#272822"),
+        normal: Some("#f8f8f2"),
+        comment: Some("#75715e"),
+        string: Some("#e6db74"),
+        function: Some("#66d9ef"),
+        error: Some("#f92672"),
+        diff_add: Some("#a6e22e"),
+        diff_delete: Some("#f92672"),
+        panel: Some("#3e3d32"),
+    },
+    ThemePreset {
+        name: "sublime-mariana",
+        description: "Sublime Text Mariana",
+        background: Some("#303841"),
+        normal: Some("#d8dee9"),
+        comment: Some("#a6acb9"),
+        string: Some("#fac761"),
+        function: Some("#6699cc"),
+        error: Some("#ec5f66"),
+        diff_add: Some("#99c794"),
+        diff_delete: Some("#ec5f66"),
+        panel: Some("#343d46"),
+    },
+    ThemePreset {
+        name: "gruvbox-light",
+        description: "Gruvbox Light",
+        background: Some("#fbf1c7"),
+        normal: Some("#3c3836"),
+        comment: Some("#928374"),
+        string: Some("#b57614"),
+        function: Some("#076678"),
+        error: Some("#9d0006"),
+        diff_add: Some("#79740e"),
+        diff_delete: Some("#9d0006"),
+        panel: Some("#ebdbb2"),
+    },
+    ThemePreset {
+        name: "catppuccin-latte",
+        description: "Catppuccin Latte",
+        background: Some("#eff1f5"),
+        normal: Some("#4c4f69"),
+        comment: Some("#8c8fa1"),
+        string: Some("#df8e1d"),
+        function: Some("#1e66f5"),
+        error: Some("#d20f39"),
+        diff_add: Some("#40a02b"),
+        diff_delete: Some("#d20f39"),
+        panel: Some("#e6e9ef"),
+    },
+    ThemePreset {
+        name: "rose-pine-dawn",
+        description: "Rosé Pine Dawn",
+        background: Some("#faf4ed"),
+        normal: Some("#464261"),
+        comment: Some("#9893a5"),
+        string: Some("#ea9d34"),
+        function: Some("#286983"),
+        error: Some("#b4637a"),
+        diff_add: Some("#56949f"),
+        diff_delete: Some("#b4637a"),
+        panel: Some("#f2e9e1"),
+    },
 ];
 
 /// Look up a preset by name, accepting case/`-`/`_` variations plus a few
@@ -915,6 +1019,14 @@ pub fn theme_preset(name: &str) -> Option<&'static ThemePreset> {
         "solarized" | "solarized-dark-high-contrast" => "solarized-dark",
         "solarized-light-high-contrast" => "solarized-light",
         "catppuccin" | "catppuccin-mocha-dark" | "mocha" => "catppuccin-mocha",
+        "atom-one-dark" | "onedark" => "one-dark",
+        "atom-one-light" | "onelight" => "one-light",
+        "tokyo" | "tokyonight" | "tokyo-night-storm" => "tokyo-night",
+        "sublime" | "sublime-monokai" | "monokai-sublime" => "monokai",
+        "mariana" => "sublime-mariana",
+        "gruvbox-light-hard" | "gruvbox-light-medium" | "gruvbox-light-soft" => "gruvbox-light",
+        "latte" => "catppuccin-latte",
+        "rosepine-dawn" | "rose-pine-light" => "rose-pine-dawn",
         other => other,
     };
     THEME_PRESETS.iter().find(|preset| preset.name == canonical)
@@ -2811,6 +2923,67 @@ system_prompt = "custom"
         assert!(theme_preset("light").is_none());
         assert!(theme_preset("github-dark").is_some());
         assert!(Config::default().theme.preset.is_none());
+    }
+
+    #[test]
+    fn theme_presets_are_complete_and_resolvable() {
+        use std::collections::BTreeSet;
+
+        let mut names = BTreeSet::new();
+        for preset in &THEME_PRESETS {
+            assert!(
+                names.insert(preset.name),
+                "duplicate preset {}",
+                preset.name
+            );
+            assert_eq!(
+                theme_preset(preset.name).map(|found| found.name),
+                Some(preset.name),
+                "{} does not resolve to itself",
+                preset.name
+            );
+            for slot in [
+                "background",
+                "normal",
+                "comment",
+                "string",
+                "function",
+                "error",
+                "diff_add",
+                "diff_delete",
+                "panel",
+            ] {
+                let value = preset
+                    .slot(slot)
+                    .unwrap_or_else(|| panic!("{} is missing {slot}", preset.name));
+                assert!(
+                    value.len() == 7 && value.starts_with('#'),
+                    "{} {slot} should be #rrggbb, got {value}",
+                    preset.name
+                );
+            }
+        }
+        assert_eq!(names.len(), THEME_PRESETS.len());
+    }
+
+    #[test]
+    fn theme_preset_aliases_resolve() {
+        for (alias, canonical) in [
+            ("atom-one-dark", "one-dark"),
+            ("atom-one-light", "one-light"),
+            ("tokyonight", "tokyo-night"),
+            ("sublime", "monokai"),
+            ("mariana", "sublime-mariana"),
+            ("gruvbox-light-medium", "gruvbox-light"),
+            ("latte", "catppuccin-latte"),
+            ("rose-pine-light", "rose-pine-dawn"),
+        ] {
+            assert_eq!(
+                theme_preset(alias).map(|preset| preset.name),
+                Some(canonical),
+                "{alias}"
+            );
+        }
     }
 
     #[test]

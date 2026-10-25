@@ -153,6 +153,10 @@ formatter:
     extensions: [json, yaml, yml, md]
 
 # TUI 调色板（可选）
+# 内置 preset（亮色 / 暗色）：github-dark、github-light、gruvbox-dark、gruvbox-light、
+# solarized-dark、solarized-light、nord、dracula、catppuccin-mocha、catppuccin-latte、
+# one-dark、one-light、tokyo-night、monokai、sublime-mariana、rose-pine-dawn。
+# monokai / sublime-mariana 为 Sublime Text 风格。
 theme:
   # preset: github-dark
   # normal: white
@@ -213,14 +217,16 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `
 stage 到 shadow workspace 的审核模式。高风险/forced ask 写入、外部路径、secret 路径以及
 `run_command` 的写操作仍在审批处阻塞（shell 无法 stage），风险分析判定为只读的命令直接执行。bubblewrap 沙箱已接入；自动上下文管理与 process view 已接入
 （见下）。TUI 已支持多 pane；后台 pane 的 attention 用边框/侧栏高亮、`a` 跳转提示，
-并在底部状态栏中间显示提醒（不弹桌面通知）；外部通知命令（dwm/tmux）已接入
+并以右上角浮动通知显示提醒（不弹桌面通知、不移动 statusline）；外部通知命令（dwm/tmux）已接入
 （见 `notifications:`）；输入框使用内置的 Vim 风格编辑器（见下），外观是无独立填充的透明圆角面板：
 默认 3 行内容 + 上下边框（共 5 行，长草稿最多 10 行内容 / 12 行总高）；正文左侧留 1 格内边距，
 底边保持普通边框；输入框下方是一行 statusline，左侧依次显示
 `N/I/V/VL · Plan/Build/Auto/Bypass · 状态图标 · 模型 · provider · reasoning`（命令行激活时模式徽标显示 `C`；
 running 状态使用田字方块旋转动画（`◰ ◳ ◲ ◱`），完成/空闲使用静态 `⠶`），
-右侧靠右显示 `cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数以及 pane/队列/attention 计数在空间允许时
-显示在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用中间区域（约 8 秒）。
+右侧靠右显示 `cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及
+pane/队列/attention 计数在空间允许时显示在中部或右侧，变窄时优先保留 cwd/branch。
+只有没有其他 UI 反馈的失败、后台 attention 和复制确认会以右上角浮动通知显示（最多 3 条；
+失败约 4 秒，attention 约 8 秒，复制约 2 秒）；命令成功反馈、进度和 picker/弹窗内容不再重复通知。
 终端高度足够时，statusline 下方常驻一行空白命令行；normal 模式按 `:` 激活并显示 `:` 前缀：
 `Enter` 执行；`Esc` 先收起命令菜单并保留已输入内容，再按一次关闭命令行；`↑`/`↓` 浏览历史，`Tab` 显示匹配命令并补全首个命令；菜单打开后
 `Ctrl-J`/`Ctrl-K` 或 `Ctrl-N`/`Ctrl-P` 上下选择匹配项，`Enter` 执行选中项；它接受与 `/命令` 相同的名字，并支持 `:q`（关闭 pane）、
@@ -256,8 +262,9 @@ turn 完成或等待审批/输入都不会移动它。session 视作双向链表
 历史 session 不再占用左侧栏：按 `Ctrl-G`（或 `/sessions`）打开浮动 picker，输入即模糊搜索、
 `Enter` 选择、`Esc` 关闭。输入框只保留正文和边框；下方 statusline 左侧按
 `N/I/V/VL · Plan/Build/Auto/Bypass · 状态 · 模型 · provider · reasoning` 排列，右侧靠右显示
-`cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数、pane/队列/attention 计数在空间允许时
-出现在中部或右侧；后台提醒会临时占用中间区域。
+`cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及 pane/队列/attention
+计数在空间允许时出现在中部或右侧。只有没有其他可见反馈的失败、后台 attention 和复制确认
+显示在右上角浮动通知中，不会挤动 statusline。
 
 转录区按对话渲染：用户消息右对齐并包在圆角气泡框中，agent 输出左对齐（保留 2 空格缩进）；消息正文仍使用普通文本、不加角色前缀；agent 的
 思考过程收在 `Thinking` 模块里流式展开；每次工具调用（shell / read / write / agent …）
@@ -658,8 +665,10 @@ files / worktrees / branches / context 由 daemon 的 `picker.query` 提供，�
 圆角边框，跟随主题的 `background`（未设置时用终端背景），默认 3 行内容 + 上下边框（共 5 行，
 长草稿最多 10 行内容 / 12 行总高）；底边保持普通边框，输入框下方一行 statusline 左侧按
 `N/I/V/VL · Plan/Build/Auto/Bypass · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
-`cwd（~ 缩写） · git 分支`；最近状态、worktree/图片数以及 pane/排队/attention 计数在空间允许时
-显示在中部或右侧；后台 attention 提醒会临时占用中间区域（约 8 秒）；
+`cwd（~ 缩写） · git 分支`；worktree/图片数、运行中的 integration 状态以及 pane/排队/attention
+计数在空间允许时显示在中部或右侧；只有没有其他可见反馈的失败、后台 attention 和复制确认
+显示在右上角浮动通知中（失败约 4 秒，attention 约 8 秒，复制约 2 秒，最多堆叠 3 条），
+不会挤动 statusline；
 insert / normal / visual 分别用绿 / 蓝 / 琥珀色标识，失焦时自动转为低对比度。单次 `Esc`
 只退出 insert、焦点仍留在输入框，normal 模式支持常用按键：
 
@@ -1148,7 +1157,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 ### 外部通知
 
 `notifications:` 让后台 session 进入 attention（`awaiting_approval` / `error`）时提醒你。
-TUI 内的提醒固定显示在底部状态栏中间，不会弹桌面通知：
+TUI 内的提醒固定显示在右上角（约 8 秒），不会弹桌面通知，也不会移动 statusline：
 
 | 字段 | 默认 | 行为 |
 | --- | --- | --- |

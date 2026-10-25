@@ -237,8 +237,10 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   Plan 琥珀、Build 蓝色、Auto 淡橙、Bypass 粉红；idle 显示 `⠶`，running 显示田字方块动画，
   其他状态显示符号和状态名；四种模式固定 6 列宽（Bypass 最长），切换时状态栏不位移）。
   右侧靠右显示 `cwd（~ 缩写） · git 分支`；
-  最近状态、worktree/图片数，以及多 pane 时的 `当前/总数`、排队数和 attention 数在空间允许时
-  出现在中部或右侧，变窄时优先保留 cwd/branch。后台 attention 提醒会临时占用中间区域。
+  worktree/图片数、运行中的 integration 状态，以及多 pane 时的 `当前/总数`、排队数和 attention
+  数在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。只有没有其他可见反馈的失败、
+  后台 attention 和复制确认使用右上角浮动通知；成功的命令反馈、进度和 picker/弹窗内容不再
+  重复通知，因此状态栏不会随命令消息跳动。
 - 终端高度足够时，statusline **下方**常驻一行空白命令行；normal 模式按 `:` 激活并显示
   `:` 前缀 + 文本 + 光标，`Enter` 执行；`Esc` 先收起命令菜单并保留输入，再按一次关闭命令行；
   `↑`/`↓` 浏览历史，`Tab` 显示并补全命令名；
@@ -288,8 +290,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。
 - 不再有独立顶部 header 行，输入框也不再有底部信息行；输入框下方保留一行 statusline，
   左侧按 `N/I/V/VL · SessionMode · 状态图标 · 模型 · provider · reasoning` 排列，右侧靠右显示
-  cwd（`~` 缩写）和 git 分支；最近状态、worktree/图片数、pane 位置、prompt 队列和 attention
-  信息在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。
+  cwd（`~` 缩写）和 git 分支；worktree/图片数、运行中的 integration 状态、pane 位置、prompt
+  队列和 attention 信息在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。只有没有
+  其他可见反馈的失败、后台 attention 和复制确认显示在右上角浮动通知中，不占用 statusline 中部。
 - 焦点：`Shift+,` / `Shift+.`（`<` / `>`）线性切换 pane；转录区按 `i` 或 `<Space>i` 聚焦输入并进入 insert；
   `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。聚焦 pane 使用
   更亮的单格虚线边框、标题加粗；非聚焦 pane 保持低对比实线灰，attention 仍用警示色。
@@ -408,8 +411,10 @@ diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syn
 `Copied N chars`；优先调用
 `wl-copy` / `xclip` / `xsel` / `pbcopy`，不可用时回退到 OSC 52。
 `/colorscheme` 打开带实时预览的 colorscheme picker：上下移动立即重绘界面，`Enter` 应用，`Esc`
-恢复打开前的配色；不再通过 `/colorscheme <name>` 直接切换。预设里的 `background` 会同时应用到
-转录区、colorscheme picker 和其他浮层；默认配色和没有 `background` 的自定义配色继续使用终端背景。
+恢复打开前的配色；不再通过 `/colorscheme <name>` 直接切换。内置 preset 覆盖 GitHub、One、
+Tokyo Night、Monokai、Mariana、Gruvbox、Catppuccin 与 Rosé Pine 的亮色/暗色版本。亮色主题下
+模式徽标会保留色相并自动压暗，保证至少 3:1 的对比度。预设里的 `background` 会同时应用到转录区、
+colorscheme picker 和其他浮层；默认配色和没有 `background` 的自定义配色继续使用终端背景。
 输入框不再使用独立的 `panel` 填充，始终跟随主题 `background`（默认即终端背景）。
 转录渲染按 pane 缓存已存储事件：只有 live tail 和当前可见窗口每帧重绘，长会话的滚动、
 选择与流式输出不会反复解析整段历史；事件、宽度、主题或折叠状态变化时才重建缓存。
@@ -729,7 +734,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 ## 13. 通知
 
-- TUI：后台 attention 提醒显示在底部状态栏中间（约 8 秒），可选终端 bell；不弹桌面通知。
+- TUI：只有没有其他 UI 反馈的失败、复制确认和后台 attention 显示在右上角浮动通知中
+  （失败约 4 秒，复制约 2 秒，attention 约 8 秒，最多堆叠 3 条），不会移动 statusline；
+  成功的命令反馈、进度和 picker/弹窗内容不重复通知；可选终端 bell，不弹桌面通知。
 - 桌面：`notify-send`（dunst），可通过配置替换命令。
 - dwmblocks：`agent status --json` 输出 `{running, approval, error}`。
 - 仅在状态跃迁时通知；当前聚焦 session 不通知；冷却时间可配。
@@ -794,8 +801,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `session.attention`，TUI 标记边框/侧栏并支持 `<Space>A` 跳到下一个；重新 attach 会从事件日志
 > 恢复未完成的审批卡片。外部通知也已接入：`[notifications] command` 由 daemon 在 attention
 > 时用 `sh -c` 执行并传入 `EIX_SESSION_ID` / `EIX_SESSION_NAME` / `EIX_SESSION_CWD` /
-> `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；TUI 内提醒显示在底部状态栏中间，
-> 可用 `bell = true` 额外响终端铃。
+> `EIX_STATUS`，同一 session 有 `cooldown_secs` 冷却；TUI 内提醒显示在右上角浮动通知中，
+> 不挤动 statusline，可用 `bell = true` 额外响终端铃。
 > 输入框补齐（2026-10-18）：`@`（词首）打开 `picker.query` 的 files provider，选中后以
 > `@<相对路径>` 插入；编辑变化按 200ms tick 镜像到 `draft.set`，切 session 时 `draft.get` 回填。
 > 独立前端补上 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick [KIND]` 与 `:Eix doctor`。

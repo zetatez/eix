@@ -124,7 +124,7 @@ pub async fn run(
             maybe = ev_rx.recv() => match maybe {
                 Some(event) => {
                     app.handle_event(event, &cmd_tx);
-                    // Attention alerts render in the status bar; no desktop
+                    // Attention alerts render as top-right toasts; no desktop
                     // notification popups or terminal-title changes.
                     if app.take_ring() {
                         let mut stdout = io::stdout();

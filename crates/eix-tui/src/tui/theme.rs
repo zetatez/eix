@@ -108,4 +108,28 @@ mod tests {
         assert_eq!(parse_color("123"), Some(Color::Indexed(123)));
         assert_eq!(parse_color("not-a-color"), None);
     }
+
+    #[test]
+    fn every_builtin_preset_resolves_all_slots() {
+        for preset in eix_core::THEME_PRESETS {
+            let theme = Theme::from_config(&ThemeConfig {
+                preset: Some(preset.name.to_string()),
+                ..Default::default()
+            });
+            assert_eq!(theme.preset, Some(preset.name));
+            for (slot, color) in [
+                ("background", theme.background),
+                ("normal", theme.normal),
+                ("comment", theme.comment),
+                ("string", theme.string),
+                ("function", theme.function),
+                ("error", theme.error),
+                ("diff_add", theme.diff_add),
+                ("diff_delete", theme.diff_delete),
+                ("panel", theme.panel),
+            ] {
+                assert!(color.is_some(), "{} did not resolve {slot}", preset.name);
+            }
+        }
+    }
 }
