@@ -127,7 +127,7 @@ impl PluginSpec {
 
 /// One initialized plugin and its stdio channels.
 struct PluginClient {
-    _child: Child,
+    child: Child,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
@@ -150,7 +150,7 @@ impl PluginClient {
         workspace: PathBuf,
     ) -> Self {
         Self {
-            _child: child,
+            child,
             stdin,
             stdout: BufReader::new(stdout),
             next_id: 1,
@@ -404,6 +404,25 @@ impl PluginClient {
         }
         self.write(&PluginNotification::new(method, params.clone()))
             .await
+    }
+
+    /// Return a redacted reason when the child is no longer running. `None`
+    /// means it is still alive, so callers can keep using it.
+    fn exit_reason(&mut self) -> Option<String> {
+        match self.child.try_wait() {
+            Ok(Some(status)) => Some(format!("plugin exited unexpectedly ({status})")),
+            Ok(None) => None,
+            Err(err) => Some(format!("plugin process check failed: {err}")),
+        }
+    }
+
+    /// Best-effort graceful stop. A plugin that ignores the notification is
+    /// killed when the client is dropped. The short timeout keeps daemon
+    /// shutdown responsive even when a plugin is stuck.
+    async fn shutdown(&mut self) {
+        let notification = PluginNotification::new("shutdown", json!({}));
+        let _ = tokio::time::timeout(Duration::from_millis(500), self.write(&notification)).await;
+        let _ = tokio::time::timeout(Duration::from_millis(500), self.child.wait()).await;
     }
 }
 
@@ -663,7 +682,67 @@ impl PluginManager {
         );
     }
 
+    /// Detect children that exited without a tool call in flight. This keeps
+    /// `plugin.list`, command reloads, and tool definitions from advertising a
+    /// dead process. Busy clients are skipped: their request will notice the
+    /// broken pipe and fail on its own.
+    async fn refresh(&self) {
+        let clients = { self.clients.lock().await.clone() };
+        let mut dead = Vec::new();
+        for (name, client) in clients {
+            let reason = match client.try_lock() {
+                Ok(mut client) => client.exit_reason(),
+                Err(_) => None,
+            };
+            if let Some(reason) = reason {
+                dead.push((name, client, reason));
+            }
+        }
+        for (name, client, reason) in dead {
+            self.drop_client(&name, &client, Some(reason)).await;
+        }
+    }
+
+    /// Remove `client` only if it is still the registered client for `name`.
+    /// A concurrent restart may already have installed a replacement; in that
+    /// case the old client's failure must not remove the new one or its tools.
+    async fn drop_client(
+        &self,
+        name: &str,
+        client: &Arc<Mutex<PluginClient>>,
+        error: Option<String>,
+    ) -> bool {
+        let removed = {
+            let mut clients = self.clients.lock().await;
+            match clients.get(name) {
+                Some(current) if Arc::ptr_eq(current, client) => {
+                    clients.remove(name);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if !removed {
+            return false;
+        }
+        self.tools.lock().await.retain(|tool| tool.plugin != name);
+        self.commands
+            .lock()
+            .await
+            .retain(|command| command.plugin != name);
+        if let Some(error) = error {
+            if let Some(status) = self.statuses.lock().await.get_mut(name) {
+                status.state = "failed".to_string();
+                status.error = Some(redact(&error));
+                status.tools = 0;
+                status.commands = 0;
+            }
+        }
+        true
+    }
+
     pub async fn list(&self) -> PluginListResult {
+        self.refresh().await;
         let statuses = self.statuses.lock().await;
         PluginListResult {
             plugins: statuses.values().map(PluginStatus::info).collect(),
@@ -671,6 +750,7 @@ impl PluginManager {
     }
 
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
+        self.refresh().await;
         self.tools
             .lock()
             .await
@@ -694,6 +774,7 @@ impl PluginManager {
     }
 
     pub async fn commands(&self) -> PluginCommandList {
+        self.refresh().await;
         let commands = self.commands.lock().await;
         PluginCommandList {
             commands: commands
@@ -774,13 +855,10 @@ impl PluginManager {
             Err(err) => {
                 let message = redact(&format!("plugin {} failed: {err:#}", tool.plugin));
                 // A crashed or unresponsive child is unusable for later
-                // calls. Drop it so the next plugin.restart can recover
-                // cleanly and make the failure visible in plugin.list.
-                self.clients.lock().await.remove(&tool.plugin);
-                if let Some(status) = self.statuses.lock().await.get_mut(&tool.plugin) {
-                    status.state = "failed".to_string();
-                    status.error = Some(message.clone());
-                }
+                // calls. Drop it and its advertised contributions so the next
+                // plugin.restart can recover cleanly and plugin.list is honest.
+                self.drop_client(&tool.plugin, &client, Some(message.clone()))
+                    .await;
                 ToolOutcome {
                     ok: false,
                     output: message,
@@ -841,6 +919,18 @@ impl PluginManager {
     }
 
     pub async fn shutdown(&self) {
+        // Give idle plugins a chance to flush their own state. A busy client
+        // is skipped; dropping the client kills it, which is acceptable during
+        // daemon shutdown and avoids waiting for a long tool timeout.
+        let clients: Vec<_> = {
+            let clients = self.clients.lock().await;
+            clients.values().cloned().collect()
+        };
+        for client in clients {
+            if let Ok(mut client) = client.try_lock() {
+                client.shutdown().await;
+            }
+        }
         self.clients.lock().await.clear();
         self.tools.lock().await.clear();
         self.commands.lock().await.clear();
@@ -1275,5 +1365,227 @@ for line in sys.stdin:
         let manager =
             PluginManager::new(Arc::new(Store::in_memory().unwrap()), PathBuf::from("/tmp"));
         assert!(manager.validate_tools(&spec, &capabilities, &init).is_err());
+    }
+
+    fn python3_available() -> bool {
+        std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    fn temp_dir(prefix: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{nanos}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn crashed_plugin_is_marked_failed_and_loses_its_tools() -> anyhow::Result<()> {
+        if !python3_available() {
+            return Ok(());
+        }
+        let dir = temp_dir("eix-plugin-crash-test");
+        std::fs::create_dir_all(&dir)?;
+        let script = dir.join("crash.py");
+        std::fs::write(
+            &script,
+            r#"import sys, json
+line = sys.stdin.readline()
+message = json.loads(line)
+if message.get("method") == "initialize":
+    sys.stdout.write(json.dumps({
+        "id": message["id"],
+        "result": {
+            "name": "crash", "version": "0.1.0", "api_version": 1,
+            "tools": [{"name": "boom", "description": "boom",
+                       "input_schema": {"type": "object"}}],
+            "commands": [], "events": []
+        }
+    }) + "\n")
+    sys.stdout.flush()
+# Exit without waiting for another request.
+"#,
+        )?;
+
+        let mut config = Config::default();
+        config.load_cwd = dir.clone();
+        config.plugins.insert(
+            "crash".to_string(),
+            PluginConfig {
+                command: "python3".to_string(),
+                args: vec![script.to_string_lossy().into_owned()],
+                capabilities: vec![PluginCapability::Tools],
+                timeout_secs: 5,
+                ..PluginConfig::default()
+            },
+        );
+        let manager = PluginManager::new(Arc::new(Store::in_memory()?), dir.join("data"));
+        manager.load(&config).await;
+
+        let mut last = manager.list().await;
+        for _ in 0..100 {
+            if last
+                .plugins
+                .first()
+                .is_some_and(|plugin| plugin.state == "failed")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            last = manager.list().await;
+        }
+        let plugin = last.plugins.first().expect("plugin status");
+        assert_eq!(plugin.state, "failed", "{plugin:?}");
+        assert_eq!(plugin.tools, 0);
+        assert_eq!(plugin.commands, 0);
+        assert!(
+            plugin
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("exited")),
+            "{plugin:?}"
+        );
+        assert!(!manager.knows("plugin__crash__boom").await);
+        manager.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_tool_call_drops_the_plugin_and_its_tools() -> anyhow::Result<()> {
+        if !python3_available() {
+            return Ok(());
+        }
+        let dir = temp_dir("eix-plugin-tool-failure-test");
+        std::fs::create_dir_all(&dir)?;
+        let script = dir.join("fail.py");
+        std::fs::write(
+            &script,
+            r#"import sys, json
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        sys.stdout.write(json.dumps({
+            "id": message["id"],
+            "result": {
+                "name": "badtool", "version": "0.1.0", "api_version": 1,
+                "tools": [{"name": "fail", "description": "fail",
+                           "input_schema": {"type": "object"}}],
+                "commands": [], "events": []
+            }
+        }) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        sys.stdout.write(json.dumps({
+            "id": message["id"],
+            "error": {"message": "intentional failure"}
+        }) + "\n")
+        sys.stdout.flush()
+    elif method == "shutdown":
+        break
+"#,
+        )?;
+
+        let mut config = Config::default();
+        config.load_cwd = dir.clone();
+        config.plugins.insert(
+            "badtool".to_string(),
+            PluginConfig {
+                command: "python3".to_string(),
+                args: vec![script.to_string_lossy().into_owned()],
+                capabilities: vec![PluginCapability::Tools],
+                timeout_secs: 5,
+                ..PluginConfig::default()
+            },
+        );
+        let manager = PluginManager::new(Arc::new(Store::in_memory()?), dir.join("data"));
+        manager.load(&config).await;
+        let outcome = manager
+            .call(
+                "plugin__badtool__fail",
+                &serde_json::json!({}),
+                "session",
+                &dir,
+                1024,
+            )
+            .await;
+        assert!(!outcome.ok);
+        assert!(
+            outcome.output.contains("intentional failure"),
+            "{}",
+            outcome.output
+        );
+        let listed = manager.list().await;
+        assert_eq!(listed.plugins[0].state, "failed");
+        assert_eq!(listed.plugins[0].tools, 0);
+        assert!(manager.tool_definitions().await.is_empty());
+        assert!(!manager.knows("plugin__badtool__fail").await);
+        manager.shutdown().await;
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_notifies_idle_plugins() -> anyhow::Result<()> {
+        if !python3_available() {
+            return Ok(());
+        }
+        let dir = temp_dir("eix-plugin-shutdown-test");
+        std::fs::create_dir_all(&dir)?;
+        let script = dir.join("shutdown.py");
+        let marker = dir.join("stopped");
+        std::fs::write(
+            &script,
+            r#"import sys, json, pathlib
+marker = sys.argv[1]
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    if method == "initialize":
+        sys.stdout.write(json.dumps({
+            "id": message["id"],
+            "result": {
+                "name": "bye", "version": "0.1.0", "api_version": 1,
+                "tools": [], "commands": [], "events": []
+            }
+        }) + "\n")
+        sys.stdout.flush()
+    elif method == "shutdown":
+        pathlib.Path(marker).write_text("bye")
+        break
+"#,
+        )?;
+
+        let mut config = Config::default();
+        config.load_cwd = dir.clone();
+        config.plugins.insert(
+            "bye".to_string(),
+            PluginConfig {
+                command: "python3".to_string(),
+                args: vec![
+                    script.to_string_lossy().into_owned(),
+                    marker.to_string_lossy().into_owned(),
+                ],
+                timeout_secs: 5,
+                ..PluginConfig::default()
+            },
+        );
+        let manager = PluginManager::new(Arc::new(Store::in_memory()?), dir.join("data"));
+        manager.load(&config).await;
+        assert_eq!(
+            manager.list().await.plugins[0].state,
+            "running",
+            "plugin should start"
+        );
+
+        manager.shutdown().await;
+        assert!(marker.exists(), "plugin did not observe shutdown");
+        assert_eq!(manager.list().await.plugins[0].state, "stopped");
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
     }
 }

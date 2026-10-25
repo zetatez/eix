@@ -17,6 +17,11 @@ use eix_core::{
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 
+/// Per-plugin storage is bounded so a buggy or untrusted plugin cannot fill
+/// the daemon's database. Row and byte limits are enforced by `plugin_kv_set`.
+pub const MAX_PLUGIN_STORAGE_ROWS: i64 = 10_000;
+pub const MAX_PLUGIN_STORAGE_BYTES: i64 = 16 * 1024 * 1024;
+
 pub struct Store {
     conn: Mutex<Connection>,
 }
@@ -831,6 +836,34 @@ impl Store {
 
     pub fn plugin_kv_set(&self, plugin: &str, scope: &str, key: &str, value: &str) -> Result<()> {
         let conn = self.conn.lock().expect("store mutex poisoned");
+        let existing_bytes: Option<i64> = conn
+            .query_row(
+                "SELECT LENGTH(CAST(value AS BLOB)) FROM plugin_kv
+                 WHERE plugin = ?1 AND scope = ?2 AND key = ?3",
+                params![plugin, scope, key],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let (rows, bytes): (i64, i64) = conn.query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(CAST(value AS BLOB))), 0)
+             FROM plugin_kv WHERE plugin = ?1",
+            params![plugin],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        let next_rows = rows + i64::from(existing_bytes.is_none());
+        let next_bytes = bytes - existing_bytes.unwrap_or(0) + value.len() as i64;
+        if next_rows > MAX_PLUGIN_STORAGE_ROWS {
+            bail!(
+                "plugin {plugin} storage exceeds {MAX_PLUGIN_STORAGE_ROWS} rows; \
+                 delete keys to free space"
+            );
+        }
+        if next_bytes > MAX_PLUGIN_STORAGE_BYTES {
+            bail!(
+                "plugin {plugin} storage exceeds {MAX_PLUGIN_STORAGE_BYTES} bytes; \
+                 delete keys to free space"
+            );
+        }
         conn.execute(
             "INSERT INTO plugin_kv (plugin, scope, key, value, updated_at)
              VALUES (?1, ?2, ?3, ?4, ?5)
@@ -1547,5 +1580,66 @@ mod tests {
         assert_eq!(listed.len(), 1);
         store.delete_integration("s1").unwrap();
         assert!(store.get_integration("s1").unwrap().is_none());
+    }
+
+    #[test]
+    fn plugin_storage_is_scoped_and_quota_limited() {
+        let store = Store::in_memory().unwrap();
+        store.plugin_kv_set("alpha", "global", "k", "v").unwrap();
+        assert_eq!(
+            store
+                .plugin_kv_get("alpha", "global", "k")
+                .unwrap()
+                .as_deref(),
+            Some("v")
+        );
+        assert_eq!(
+            store
+                .plugin_kv_get("alpha", "workspace:/tmp/x", "k")
+                .unwrap(),
+            None
+        );
+        assert_eq!(store.plugin_kv_get("beta", "global", "k").unwrap(), None);
+
+        // Fill the row quota directly so the test does not depend on thousands
+        // of individual round trips.
+        {
+            let mut conn = store.conn.lock().expect("store mutex poisoned");
+            let tx = conn.transaction().unwrap();
+            for index in 0..MAX_PLUGIN_STORAGE_ROWS {
+                tx.execute(
+                    "INSERT INTO plugin_kv (plugin, scope, key, value, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params!["rows", "global", format!("k{index}"), "x", now_ms()],
+                )
+                .unwrap();
+            }
+            tx.commit().unwrap();
+        }
+        let error = store
+            .plugin_kv_set("rows", "global", "overflow", "x")
+            .unwrap_err();
+        assert!(error.to_string().contains("rows"), "{error}");
+        store.plugin_kv_delete("rows", "global", "k0").unwrap();
+        store
+            .plugin_kv_set("rows", "global", "overflow", "x")
+            .expect("deleting a row frees the quota");
+
+        // The value limit is 1 MB, so 16 chunks fit just under 16 MiB.
+        let chunk = "x".repeat(1_000_000);
+        for index in 0..16 {
+            store
+                .plugin_kv_set("bytes", "global", &format!("k{index}"), &chunk)
+                .unwrap();
+        }
+        let error = store
+            .plugin_kv_set("bytes", "global", "k16", &chunk)
+            .unwrap_err();
+        assert!(error.to_string().contains("bytes"), "{error}");
+        // Replacing an existing key does not consume another row and keeps the
+        // same byte count, so it remains allowed at the limit.
+        store
+            .plugin_kv_set("bytes", "global", "k0", &chunk)
+            .expect("same-size update stays within quota");
     }
 }

@@ -165,6 +165,8 @@ def main():
 
         # Event notifications from the daemon have no id.
         if method is not None and request_id is None:
+            if method == "shutdown":
+                return
             if method.startswith("session."):
                 print(
                     f"echo plugin: event {method}",

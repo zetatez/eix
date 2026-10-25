@@ -23,7 +23,8 @@ After `/reload` (or a daemon restart), `/` lists `plugin/echo/review`. The model
 sees `plugin__echo__word_count`, `plugin__echo__remember` and
 `plugin__echo__recall`. Plugin tool calls default to approval and are hidden
 from plan sessions and sub-agents. `session.*` notifications are printed to
-stderr.
+stderr. The daemon's best-effort `shutdown` notification makes the example exit
+cleanly when eixd stops.
 
 See the "插件" section in the repository README for the protocol and security
 model.

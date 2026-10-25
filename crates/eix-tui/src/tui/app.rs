@@ -332,33 +332,19 @@ enum ToastTone {
 struct Toast {
     text: String,
     tone: ToastTone,
-    min_until: Instant,
+    expires_at: Instant,
 }
 
-/// A newer message waiting for the visible toast to finish its minimum
-/// display time. Only the latest waiting message is kept, so a burst never
-/// stacks or delays stale notices.
-struct PendingToast {
-    text: String,
-    tone: ToastTone,
-    duration: Duration,
-}
-
-impl PendingToast {
-    fn show(self, now: Instant) -> Toast {
-        Toast {
-            text: self.text,
-            tone: self.tone,
-            min_until: now + self.duration,
-        }
-    }
-}
-
-const COPY_TOAST_DISPLAY: Duration = Duration::from_secs(2);
-const LAYOUT_TOAST_DISPLAY: Duration = Duration::from_secs(2);
-const WARNING_TOAST_DISPLAY: Duration = Duration::from_secs(4);
-const ATTENTION_TOAST_DISPLAY: Duration = Duration::from_secs(8);
-const RELOAD_TOAST_DISPLAY: Duration = Duration::from_secs(2);
+/// Notifications never wait for a previous one to finish. Each record expires
+/// independently, so a burst can stack while a new message appears at once.
+const COPY_TOAST_DISPLAY: Duration = Duration::from_millis(1500);
+const LAYOUT_TOAST_DISPLAY: Duration = Duration::from_millis(1500);
+const WARNING_TOAST_DISPLAY: Duration = Duration::from_secs(3);
+const ATTENTION_TOAST_DISPLAY: Duration = Duration::from_secs(3);
+const RELOAD_TOAST_DISPLAY: Duration = Duration::from_millis(1500);
+/// Keep the top-right corner from becoming a long-lived notification log.
+const MAX_TOAST_DISPLAY: Duration = Duration::from_secs(3);
+const MAX_TOASTS: usize = 8;
 
 /// Whether a status change is a failure the user cannot otherwise see. Normal
 /// progress, successful command feedback and popup contents stay silent.
@@ -1391,11 +1377,9 @@ pub struct App {
     /// Text selected with the mouse, waiting for the event loop to copy it to
     /// the system clipboard.
     pending_clipboard: Option<String>,
-    /// The single visible top-right notification.
-    toast: Option<Toast>,
-    /// Latest notification waiting for the visible one to reach its minimum
-    /// display time.
-    pending_toast: Option<PendingToast>,
+    /// Top-right notifications, oldest first. The newest record is drawn on
+    /// the top row; each one expires independently.
+    toasts: Vec<Toast>,
     /// Status text last observed, so repeated assignments do not retrigger the
     /// warning check even though most call sites write `status` directly.
     last_seen_status: String,
@@ -1550,8 +1534,7 @@ impl App {
             pending_leader: false,
             leader_status_backup: None,
             pending_clipboard: None,
-            toast: None,
-            pending_toast: None,
+            toasts: Vec::new(),
             last_seen_status: "connecting…".into(),
             pending_history: None,
             pane_areas: Vec::new(),
@@ -3926,8 +3909,8 @@ impl App {
     }
 
     /// TUI actions shared by transcript focus and the prompt's normal mode.
-    /// The prompt keeps its vim editing keys (`j`/`k`, `Enter`, ...); this
-    /// handler owns the configurable normal/transcript keymap and leader.
+    /// The prompt keeps its vim editing keys (`j`/`k`, ...); this handler owns
+    /// the configurable normal/transcript keymap, leader, and session promotion.
     fn handle_shared_normal_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) -> bool {
         let available = self.focused_approval().is_none() && self.focused_input().is_none();
         if self.pending_leader {
@@ -3955,6 +3938,18 @@ impl App {
                 self.run_key_action(action, tx);
                 return true;
             }
+        }
+        // Normal-mode Enter promotes the focused pane's session to the front.
+        // Keep it after `normal_action` so an explicit `[keys]` binding wins.
+        if available
+            && self.pending_attach.is_none()
+            && key.code == KeyCode::Enter
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+        {
+            self.promote_focused_session();
+            return true;
         }
         // The editor has its own legacy Space leader for direct tests. In the
         // app, consume Space when the user moved the leader elsewhere so that
@@ -7267,6 +7262,20 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.focus_pane(next);
     }
 
+    /// Move the focused pane's session to the first slot while keeping the
+    /// same session focused. Bound to Enter in normal/transcript mode.
+    fn promote_focused_session(&mut self) {
+        if self.focused == 0 || self.views.len() < 2 {
+            return;
+        }
+        let view = self.views.remove(self.focused);
+        let name = view.session.name.clone();
+        self.views.insert(0, view);
+        self.focused = 0;
+        self.sync_selected_to_focus();
+        self.status = format!("{name} promoted to first");
+    }
+
     fn close_focused_pane(&mut self) -> Option<String> {
         if self.views.len() <= 1 {
             self.status = "cannot close the last pane".into();
@@ -7711,78 +7720,60 @@ already exists, update it in place rather than rewriting it from scratch.";
             return;
         }
         let now = Instant::now();
-        // A repeated warning should keep the visible message fresh instead of
-        // queueing the same text behind itself.
-        if let Some(active) = self.toast.as_mut().filter(|toast| toast.text == text) {
-            active.tone = tone;
-            active.min_until = active.min_until.max(now + duration);
-            self.pending_toast = None;
-            return;
-        }
-        let next = PendingToast {
+        // Repeating a message refreshes it and moves it back to the top instead
+        // of stacking identical rows.
+        self.toasts.retain(|toast| toast.text != text);
+        self.toasts.push(Toast {
             text,
             tone,
-            duration,
-        };
-        match &self.toast {
-            Some(active) if now < active.min_until => {
-                // Only the newest message can wait behind the visible one.
-                self.pending_toast = Some(next);
-            }
-            _ => {
-                self.toast = Some(next.show(now));
-                self.pending_toast = None;
-            }
+            expires_at: now + duration.min(MAX_TOAST_DISPLAY),
+        });
+        if self.toasts.len() > MAX_TOASTS {
+            self.toasts.remove(0);
         }
     }
 
-    /// Promote the newest waiting message once the visible toast has met its
-    /// minimum display time. Nothing is ever stacked.
+    /// Drop records independently; there is no minimum display time and no
+    /// waiting queue, so new messages are visible immediately.
     fn expire_toasts(&mut self, now: Instant) {
-        if self
-            .toast
-            .as_ref()
-            .is_some_and(|toast| now >= toast.min_until)
-        {
-            self.toast = self.pending_toast.take().map(|toast| toast.show(now));
-        }
+        self.toasts.retain(|toast| now < toast.expires_at);
     }
 
-    /// One notification sits in the top-right corner and floats above panes
-    /// and dialogs, matching the original copy confirmation.
+    /// Notifications stack in the top-right corner, newest first, floating
+    /// above panes and dialogs. Each row can have a different width.
     fn draw_toasts(&self, frame: &mut Frame, area: Rect) {
         if area.width < 2 || area.height < 2 {
             return;
         }
-        let Some(toast) = &self.toast else {
-            return;
-        };
         let available = area.width.saturating_sub(2);
-        let text = truncate(&format!(" {} ", toast.text), available as usize);
-        let width = text.width() as u16;
-        if width == 0 {
-            return;
+        let rows = area.height.saturating_sub(1) as usize;
+        for (row, toast) in self.toasts.iter().rev().take(rows).enumerate() {
+            let text = truncate(&format!(" {} ", toast.text), available as usize);
+            let width = text.width() as u16;
+            if width == 0 {
+                continue;
+            }
+            let rect = Rect {
+                x: area.x + area.width - width - 1,
+                y: area.y + 1 + row as u16,
+                width,
+                height: 1,
+            };
+            let color = match toast.tone {
+                ToastTone::Success => composer_success(self.theme),
+                ToastTone::Warning => composer_warn(self.theme),
+            };
+            frame.render_widget(Clear, rect);
+            frame.render_widget(
+                Paragraph::new(text).alignment(Alignment::Right).style(
+                    Style::default()
+                        .fg(badge_text_color(color))
+                        .bg(color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                rect,
+            );
         }
-        let rect = Rect {
-            x: area.x + area.width - width - 1,
-            y: area.y + 1,
-            width,
-            height: 1,
-        };
-        let color = match toast.tone {
-            ToastTone::Success => composer_success(self.theme),
-            ToastTone::Warning => composer_warn(self.theme),
-        };
-        frame.render_widget(Clear, rect);
-        frame.render_widget(
-            Paragraph::new(text).alignment(Alignment::Right).style(
-                Style::default()
-                    .fg(badge_text_color(color))
-                    .bg(color)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            rect,
-        );
     }
 
     /// Compact status icon shared by the pane title and the prompt header.
@@ -10401,7 +10392,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Enter",
-                description: "insert: send (queued while busy)",
+                description: "insert: send (queued while busy); normal / transcript: promote the focused session to first",
             },
             HelpEntry {
                 key: "Ctrl-J",
@@ -10453,7 +10444,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "session order",
-                description: "panes keep their order; Ctrl-1…9 jumps directly, < / > or Ctrl-W Ctrl-W moves prev/next",
+                description: "normal Enter promotes the focused session to first; Ctrl-1…9 jumps directly, < / > or Ctrl-W Ctrl-W moves prev/next",
             },
             HelpEntry {
                 key: "Space W",
@@ -12718,18 +12709,13 @@ mod tests {
             ('r', PaneLayout::Fibonacci),
             ('l', PaneLayout::Grid),
         ] {
-            // Let the previous feedback finish its minimum display time so
-            // each shortcut's toast can be checked independently.
-            if let Some(toast) = app.toast.as_mut() {
-                toast.min_until = Instant::now() - Duration::from_millis(1);
-            }
             app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
             app.handle_key(
                 KeyEvent::new(KeyCode::Char(leader), KeyModifiers::NONE),
                 &tx,
             );
             assert_eq!(app.layout, expected, "leader {leader}");
-            let toast = app.toast.as_ref().expect("layout toast");
+            let toast = app.toasts.last().expect("layout toast");
             assert_eq!(toast.text, format!("layout: {}", expected.label()));
             assert_eq!(toast.tone, ToastTone::Success);
         }
@@ -14076,7 +14062,7 @@ mod tests {
 
         assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
         assert_eq!(
-            app.toast.as_ref().map(|toast| toast.text.as_str()),
+            app.toasts.last().map(|toast| toast.text.as_str()),
             Some("Copied 5 chars")
         );
         assert!(app.views[0].selection.is_some());
@@ -14097,36 +14083,21 @@ mod tests {
     }
 
     #[test]
-    fn toast_shows_only_latest_and_honors_minimum_duration() {
+    fn toasts_stack_and_expire_independently() {
         let mut app = App::new(None);
         app.push_toast("first".into(), ToastTone::Success, Duration::from_secs(10));
         app.push_toast("second".into(), ToastTone::Success, Duration::from_secs(10));
         app.push_toast("third".into(), ToastTone::Success, Duration::from_secs(10));
 
-        // The first message keeps its minimum time; only the newest waiting
-        // message is retained instead of stacking all three rows.
+        // New messages are visible immediately; they do not wait behind a
+        // minimum display time. Newest renders on the top row.
         assert_eq!(
-            app.toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("first")
+            app.toasts
+                .iter()
+                .map(|toast| toast.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third"]
         );
-        assert_eq!(
-            app.pending_toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("third")
-        );
-        let text = render_text(&mut app, 80, 20);
-        assert!(
-            text.lines()
-                .nth(1)
-                .is_some_and(|line| line.contains("first")),
-            "{text}"
-        );
-        assert!(!text.contains("second"), "{text}");
-        assert!(!text.contains("third"), "{text}");
-
-        // Once the visible toast reaches its minimum, the saved latest
-        // message replaces it.
-        app.toast.as_mut().expect("visible toast").min_until =
-            Instant::now() - Duration::from_millis(1);
         let text = render_text(&mut app, 80, 20);
         assert!(
             text.lines()
@@ -14134,31 +14105,50 @@ mod tests {
                 .is_some_and(|line| line.contains("third")),
             "{text}"
         );
-        assert!(!text.contains("first"), "{text}");
-        assert!(!text.contains("second"), "{text}");
-        assert!(app.pending_toast.is_none());
-
-        // Repeating the visible text refreshes it and discards an older
-        // waiting message.
-        app.push_toast("second".into(), ToastTone::Success, Duration::from_secs(10));
-        assert_eq!(
-            app.pending_toast.as_ref().map(|toast| toast.text.as_str()),
-            Some("second")
+        assert!(
+            text.lines()
+                .nth(2)
+                .is_some_and(|line| line.contains("second")),
+            "{text}"
         );
-        app.push_toast("third".into(), ToastTone::Warning, Duration::from_secs(20));
+        assert!(
+            text.lines()
+                .nth(3)
+                .is_some_and(|line| line.contains("first")),
+            "{text}"
+        );
+
+        // Repeating a message refreshes it and moves it back to the top.
+        app.push_toast("second".into(), ToastTone::Warning, Duration::from_secs(10));
         assert_eq!(
-            app.toast.as_ref().map(|toast| toast.tone),
+            app.toasts
+                .iter()
+                .map(|toast| toast.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "third", "second"]
+        );
+        assert_eq!(
+            app.toasts.last().map(|toast| toast.tone),
             Some(ToastTone::Warning)
         );
-        assert!(app.pending_toast.is_none());
 
-        // Expiry clears the only slot when nothing newer is waiting.
-        app.toast.as_mut().expect("visible toast").min_until =
-            Instant::now() - Duration::from_millis(1);
+        // Expiry removes each row on its own schedule.
+        let now = Instant::now();
+        app.toasts[0].expires_at = now - Duration::from_millis(1);
+        app.toasts[1].expires_at = now - Duration::from_millis(1);
+        app.expire_toasts(now);
+        assert_eq!(
+            app.toasts
+                .iter()
+                .map(|toast| toast.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["second"]
+        );
+
+        app.toasts[0].expires_at = now - Duration::from_millis(1);
         let text = render_text(&mut app, 80, 20);
-        assert!(!text.contains("third"), "{text}");
-        assert!(app.toast.is_none());
-        assert!(app.pending_toast.is_none());
+        assert!(!text.contains("second"), "{text}");
+        assert!(app.toasts.is_empty());
     }
 
     #[test]
@@ -17133,7 +17123,7 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_enter_keeps_the_session_order() {
+    fn normal_mode_enter_promotes_the_focused_session() {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         for focus in [Focus::Transcript, Focus::Input] {
             let mut app = app_with_panes(&["a", "b", "c"]);
@@ -17146,10 +17136,11 @@ mod tests {
             }
 
             app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-            assert_eq!(view_order(&app), vec!["a", "b", "c"]);
-            assert_eq!(app.focused, 2);
+            assert_eq!(view_order(&app), vec!["c", "a", "b"]);
+            assert_eq!(app.focused, 0);
             assert_eq!(app.focused_session_id().as_deref(), Some("c"));
             assert!(app.focus == focus, "Enter changed the focus");
+            assert_eq!(app.status, "session c promoted to first");
             if focus == Focus::Input {
                 assert_eq!(app.input.mode(), Mode::Normal);
             }
@@ -17485,7 +17476,7 @@ mod tests {
             "{text}"
         );
         assert!(app.status_bar_middle().is_none());
-        assert!(app.toast.is_none() && app.pending_toast.is_none());
+        assert!(app.toasts.is_empty());
 
         app.integrations.insert(
             "s1".into(),
@@ -17499,7 +17490,7 @@ mod tests {
         let text = render_text(&mut app, 80, 20);
         assert!(!text.contains("integration · merged"), "{text}");
         assert!(app.status_bar_middle().is_none());
-        assert!(app.toast.is_none() && app.pending_toast.is_none());
+        assert!(app.toasts.is_empty());
     }
 
     #[test]
@@ -17536,10 +17527,7 @@ mod tests {
             let bar = status_bar_row(&text);
             assert!(!bar.contains(status), "{status}: {bar}");
             assert!(app.status_bar_middle().is_none(), "{status}");
-            assert!(
-                app.toast.is_none() && app.pending_toast.is_none(),
-                "{status}"
-            );
+            assert!(app.toasts.is_empty(), "{status}");
         }
     }
 
@@ -17558,7 +17546,7 @@ mod tests {
 
         assert_eq!(app.status, "config reloaded (2 layer(s))");
         assert_eq!(app.subagent_concurrency, 8);
-        let toast = app.toast.as_ref().expect("reload toast");
+        let toast = app.toasts.last().expect("reload toast");
         assert_eq!(toast.text, "config reloaded (2 layer(s))");
         assert_eq!(toast.tone, ToastTone::Success);
 
@@ -19305,10 +19293,7 @@ mod tests {
                     .is_some_and(|line| line.contains(hidden)),
                 "{hidden}: {text}"
             );
-            assert!(
-                app.toast.is_none() && app.pending_toast.is_none(),
-                "{hidden}"
-            );
+            assert!(app.toasts.is_empty(), "{hidden}");
         }
         assert!(!status_bar_row(&render_text(&mut app, 80, 20)).contains("status test"));
 
@@ -19348,7 +19333,7 @@ mod tests {
             "{text}"
         );
         assert_eq!(
-            app.toast.as_ref().map(|toast| toast.tone),
+            app.toasts.last().map(|toast| toast.tone),
             Some(ToastTone::Warning)
         );
 
@@ -19432,7 +19417,7 @@ mod tests {
         assert!(app.status_warning_is_redundant());
         let text = render_text(&mut app, 80, 20);
         assert!(text.contains("provider returned 500"), "{text}");
-        assert!(app.toast.is_none() && app.pending_toast.is_none());
+        assert!(app.toasts.is_empty());
     }
 
     #[test]
@@ -19449,7 +19434,7 @@ mod tests {
 
         assert!(app.status_warning_is_redundant());
         let _text = render_text(&mut app, 80, 20);
-        assert!(app.toast.is_none() && app.pending_toast.is_none());
+        assert!(app.toasts.is_empty());
     }
 
     #[test]
@@ -19488,14 +19473,14 @@ mod tests {
         assert!(!bar.contains("retrying 2/5"), "{bar}");
         assert!(bar.contains("gpt-5"), "{bar}");
         assert_eq!(
-            app.toast.as_ref().map(|toast| toast.tone),
+            app.toasts.last().map(|toast| toast.tone),
             Some(ToastTone::Warning)
         );
 
         // Expiry removes the notice without replaying the alert or moving the
         // persistent statusline metadata.
-        app.toast.as_mut().expect("attention toast").min_until =
-            Instant::now() - ATTENTION_TOAST_DISPLAY;
+        app.toasts.last_mut().expect("attention toast").expires_at =
+            Instant::now() - Duration::from_millis(1);
         let text = render_text(&mut app, 80, 20);
         assert!(!text.contains("worker · awaiting_approval"), "{text}");
         let bar = status_bar_row(&text);
