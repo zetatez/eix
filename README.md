@@ -797,7 +797,9 @@ fork 和 rewind 都按“复制历史前缀”工作：新 session 名为 `name~
   的改动、以及被保留策略 prune 掉的旧快照都无法恢复。结果里会列 `warnings`，
   `restored=false` 表示有快照恢复失败或有文件缺失，命令会明确打印，不会假装成功。
 - 快照默认开启（`tools.snapshots = false` 可关）；`.worktrees`、`.git`、缓存目录等
-  不参与快照。session 栏里 `⑂` 表示该 session 在独立 worktree，`↳` 表示子 agent。
+  不参与快照。session picker 里 `⑂` 表示该 session 在独立 worktree；子 agent
+  不出现在全局 picker 中，点击主 agent 转录区的子 agent 卡片即可打开它的 session，
+  在子 session 底部点击 `← parent agent` 回到父 agent。
 
 worktree 的生命周期与 session 解耦：`eix worktree list` 列出所有带 worktree 的
 session，`eix worktree remove SESSION` 删除空闲 session 的 worktree；有未提交改动时
@@ -1219,8 +1221,10 @@ daemon 重启后回到配置文件默认值。如果批次里只有只读工具�
 看到半写入状态。纯只读批次会并发执行，其他批次只并行开头的连续只读工具，其余按顺序
 执行；结果按调用顺序回填给父模型。子 agent 使用精简的只读 system prompt，不会为每个
 child 重复完整的父 prompt。子 agent 的 turn 完整写进它自己的事件日志，因此
-`eix ls` 能看到、`eix log` 能回放、TUI 侧栏用 `↳` 标出。子 agent 失败时会作为 tool
-结果返回给父模型（父可以重试或忽略），不会把父 turn 直接打成 error。
+`eix ls` 能看到、`eix log` 能回放；TUI 在主 agent 的转录区用 subagent 卡片显示，
+点击卡片会在新 pane 打开子 session，子 session 底部点击 `← parent agent` 回到父
+agent。子 agent 失败时会作为 tool 结果返回给父模型（父可以重试或忽略），不会把父
+turn 直接打成 error。
 
 ### HTTP API
 
