@@ -475,6 +475,9 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 - 已实现（2026-10-18，统一 picker 体系）：
   - TUI 用单一 `Picker`（`kind` + `query` + `selected` + `items`）承载所有 provider，左侧列表、右侧预览。
     session 的预览会随选中项通过 `picker.preview` 拉取最近对话（you / assistant / tool / error）；
+    session picker 只列普通 session 和 worktree session，`origin = agent` 的子 session 不进入列表，
+    只能从父 transcript 的 subagent 卡片打开；child transcript 底部提供可点击的
+    `← parent agent`；worktree 标记 `⑂` 单独占一列，紧跟 session id 前；
     files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
     grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
   - 入口：`<C-g>`（sessions，切换 pane）、`<Space>o`（sessions，新 pane）、`<Space>f`（files）、
@@ -956,7 +959,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 只读 system prompt，而不是重复完整父 prompt；同时复用父 turn 的 instructions/workspace
 > 快照（与父 turn 每轮所用快照一致，文件读取仍读实时内容），避免大规模 fan-out 重复
 > walk/git。child 的完整 turn 写进自己的事件日志，失败作为
-> 普通 tool 结果返回，不打断父 turn。TUI 侧栏用 `↳` 标记。
+> 普通 tool 结果返回，不打断父 turn。TUI 在父 transcript 里用 subagent 卡片显示；
+> 点击卡片会在新 pane 打开 child session；child transcript 底部有可点击的
+> `← parent agent`，点击回到父 agent。
 >
 > 独立 nvim 前端已落地（2026-10-18）：`eix nvim [--session ID]` 把内嵌 Lua 插件写到
 > `<data>/eix-nvim.lua`，用 `EIX_NVIM_SOCKET` / `EIX_NVIM_TCP` / `EIX_NVIM_TOKEN` 连 daemon，

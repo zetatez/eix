@@ -541,6 +541,24 @@ impl SessionView {
         }
     }
 
+    /// Resolve a rendered `spawn_agent` card back to the child session id.
+    fn subagent_session_for_fold(&self, fold: FoldId) -> Option<&str> {
+        let FoldId::Event(seq) = fold else {
+            return None;
+        };
+        let event = self.events.iter().find(|event| event.seq == seq)?;
+        if event.kind != EventKind::ToolCall
+            || event.payload.get("tool").and_then(Value::as_str) != Some("spawn_agent")
+        {
+            return None;
+        }
+        let call_id = event.payload.get("call_id").and_then(Value::as_str)?;
+        self.subagents
+            .iter()
+            .find(|(_, subagent)| subagent.call_id == call_id)
+            .map(|(session_id, _)| session_id.as_str())
+    }
+
     /// A parent `spawn_agent` tool result is the final fallback when the
     /// `agent.completed` notification was missed or predates this pane.
     fn finish_subagent_by_call(&mut self, call_id: &str, ok: bool, output: &str) {
@@ -2111,8 +2129,9 @@ impl App {
 
     /// Mouse clicks focus a pane; dragging selects transcript text and copies
     /// it on release. A click without a drag still toggles the block under the
-    /// cursor. The wheel scrolls the pane under the cursor.
-    pub fn handle_mouse(&mut self, mouse: MouseEvent) {
+    /// cursor, except that clicking a subagent card opens its session. The
+    /// wheel scrolls the pane under the cursor.
+    pub fn handle_mouse(&mut self, mouse: MouseEvent, tx: &UnboundedSender<Command>) {
         self.ctrl_w_at = None;
         self.restore_leader_status();
         self.pending_leader = false;
@@ -2203,6 +2222,8 @@ impl App {
             MouseEventKind::Up(MouseButton::Left) => {
                 let mut copied = None;
                 let mut fold = None;
+                let mut jump = None;
+                let mut clicked = None;
                 {
                     let view = &mut self.views[index];
                     let Some(selection) = view.selection.as_mut() else {
@@ -2215,10 +2236,46 @@ impl App {
                             copied = Some(text);
                         }
                     } else {
-                        fold = view.slots.get(selection.anchor.0).and_then(|slot| *slot);
+                        clicked = Some(selection.anchor);
                     }
                 }
-                if let Some(fold) = fold {
+                if let Some((line, column)) = clicked {
+                    let parent_link = self.views[index]
+                        .text_lines
+                        .get(line)
+                        .is_some_and(|text| is_parent_link(text));
+                    if parent_link {
+                        self.views[index].selection = None;
+                        self.back_to_parent(tx);
+                        return;
+                    }
+                    let view = &self.views[index];
+                    let candidate = view.slots.get(line).and_then(|slot| *slot);
+                    if let Some(candidate) = candidate {
+                        let text = view
+                            .text_lines
+                            .get(line)
+                            .map(String::as_str)
+                            .unwrap_or_default();
+                        let is_subagent_header = (text.starts_with("  ▾ ")
+                            || text.starts_with("  ▸ "))
+                            && text.contains(" ↳ ");
+                        // The caret remains the fold handle; the rest of the
+                        // subagent header opens the child session.
+                        if is_subagent_header && column > 3 {
+                            jump = view
+                                .subagent_session_for_fold(candidate.id)
+                                .map(str::to_string);
+                        }
+                        if jump.is_none() {
+                            fold = Some(candidate);
+                        }
+                    }
+                }
+                if let Some(session_id) = jump {
+                    self.views[index].selection = None;
+                    self.open_session_id_in_new_pane(session_id, tx);
+                } else if let Some(fold) = fold {
                     self.views[index].folds.insert(fold.id, !fold.open);
                     self.views[index].selection = None;
                 } else if let Some(text) = copied {
@@ -2885,6 +2942,7 @@ impl App {
         let pending = self.pending_attach.take().expect("checked above");
         self.upsert_session(attached.session.clone(), false);
         let session_id = attached.session.id.clone();
+        let is_subagent = attached.session.is_agent();
         let has_more = attached.has_more;
         let mut view = SessionView::new(attached.session, attached.events);
         view.history_has_more = has_more;
@@ -2908,7 +2966,9 @@ impl App {
         self.focused = self.focused.min(self.views.len().saturating_sub(1));
         self.reload_pending(&session_id);
         self.reload_input(&session_id);
-        self.selected = self.find_session(&session_id).unwrap_or(self.selected);
+        if !is_subagent {
+            self.selected = self.find_session(&session_id).unwrap_or(self.selected);
+        }
         self.error = None;
         self.status = "attached".into();
         self.attach_next_restore(tx);
@@ -5617,7 +5677,19 @@ impl App {
             self.theme_picker_backup = Some((self.theme_config.clone(), self.theme));
             self.status = "colorscheme preview · Enter apply · Esc cancel".into();
         } else {
-            picker.selected = self.selected.min(self.sessions.len().saturating_sub(1));
+            // Subagent sessions are intentionally absent from the picker.
+            // Resolve the focused session against the visible rows instead of
+            // reusing its index in the full session list.
+            let visible = self.visible_session_indices();
+            picker.selected = self
+                .focused_session_id()
+                .and_then(|id| {
+                    visible
+                        .iter()
+                        .position(|&index| self.sessions[index].id == id)
+                })
+                .or_else(|| visible.iter().position(|&index| index >= self.selected))
+                .unwrap_or(0);
         }
         self.picker = Some(picker);
     }
@@ -5734,19 +5806,33 @@ impl App {
         self.cycle_mode(1, tx);
     }
 
+    /// Session indices shown in the picker. Subagents live inside their
+    /// parent's transcript, not in the global session list.
+    fn visible_session_indices(&self) -> Vec<usize> {
+        self.sessions
+            .iter()
+            .enumerate()
+            .filter(|(_, session)| !session.is_agent())
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     fn filtered_sessions(&self) -> Vec<usize> {
         let Some(picker) = &self.picker else {
             return Vec::new();
         };
         let query = picker.query.trim().to_lowercase();
         if query.is_empty() {
-            return (0..self.sessions.len()).collect();
+            return self.visible_session_indices();
         }
         let mut hits: Vec<(i32, usize)> = self
             .sessions
             .iter()
             .enumerate()
             .filter_map(|(index, session)| {
+                if session.is_agent() {
+                    return None;
+                }
                 let haystack = format!("{} {} {}", session.name, session.id, session.cwd.display())
                     .to_lowercase();
                 fuzzy_score(&query, &haystack).map(|score| (score, index))
@@ -7165,6 +7251,9 @@ already exists, update it in place rather than rewriting it from scratch.";
 
     fn sync_selected_to_focus(&mut self) {
         if let Some(view) = self.focused_view() {
+            if view.session.is_agent() {
+                return;
+            }
             if let Some(index) = self.find_session(&view.session.id) {
                 self.selected = index;
             }
@@ -7219,11 +7308,21 @@ already exists, update it in place rather than rewriting it from scratch.";
     }
 
     fn cycle_session(&mut self, delta: isize, tx: &UnboundedSender<Command>) {
-        if self.sessions.is_empty() {
+        let visible = self.visible_session_indices();
+        if visible.is_empty() {
             return;
         }
-        let len = self.sessions.len() as isize;
-        let next = (self.selected as isize + delta).rem_euclid(len) as usize;
+        let current = visible
+            .iter()
+            .position(|&index| index == self.selected)
+            .unwrap_or_else(|| {
+                visible
+                    .iter()
+                    .position(|&index| index > self.selected)
+                    .unwrap_or(0)
+            });
+        let len = visible.len() as isize;
+        let next = visible[(current as isize + delta).rem_euclid(len) as usize];
         self.select_session(next, tx);
     }
 
@@ -7231,8 +7330,11 @@ already exists, update it in place rather than rewriting it from scratch.";
         if self.sessions.is_empty() {
             return;
         }
-        self.selected = index.min(self.sessions.len() - 1);
-        let id = self.sessions[self.selected].id.clone();
+        let index = index.min(self.sessions.len() - 1);
+        if !self.sessions[index].is_agent() {
+            self.selected = index;
+        }
+        let id = self.sessions[index].id.clone();
         if self.jump_to_session(&id) {
             self.focus = Focus::Input;
             self.status = "focused open pane".into();
@@ -7259,6 +7361,12 @@ already exists, update it in place rather than rewriting it from scratch.";
         }
         self.selected = index.min(self.sessions.len() - 1);
         let id = self.sessions[self.selected].id.clone();
+        self.open_session_id_in_new_pane(id, tx);
+    }
+
+    /// Open or focus one session in a new pane. The subagent card uses the
+    /// child session id directly because it is not listed in the picker.
+    fn open_session_id_in_new_pane(&mut self, id: String, tx: &UnboundedSender<Command>) {
         if let Some(open) = self.open_session(&id) {
             self.focused = open;
             self.status = "session is already open".into();
@@ -7273,16 +7381,49 @@ already exists, update it in place rather than rewriting it from scratch.";
         let _ = tx.send(Command::Attach(id));
     }
 
+    /// Return from a subagent session to the main agent that spawned it.
+    fn back_to_parent(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(view) = self.focused_view() else {
+            self.status = "attach a session first".into();
+            return;
+        };
+        if !view.session.is_agent() {
+            self.status = "current session has no parent agent".into();
+            return;
+        }
+        let Some(parent_id) = view.session.parent_id.clone() else {
+            self.status = "subagent has no parent session".into();
+            return;
+        };
+        if let Some(index) = self.open_session(&parent_id) {
+            self.focus_pane(index);
+            self.status = "parent agent focused".into();
+            return;
+        }
+        self.pending_attach = Some(PendingAttach {
+            session_id: parent_id.clone(),
+            slot: AttachSlot::Existing(self.focused),
+        });
+        self.error = None;
+        self.status = "opening parent agent…".into();
+        self.focus = Focus::Input;
+        let _ = tx.send(Command::Attach(parent_id));
+    }
+
     fn reselect_current(&mut self) {
         if let Some(view) = self.focused_view() {
-            if let Some(index) = self.find_session(&view.session.id) {
-                self.selected = index;
-                return;
+            if !view.session.is_agent() {
+                if let Some(index) = self.find_session(&view.session.id) {
+                    self.selected = index;
+                    return;
+                }
             }
         }
         if let Some(pending) = &self.pending_attach {
             if let Some(index) = self.find_session(&pending.session_id) {
-                self.selected = index;
+                if !self.sessions[index].is_agent() {
+                    self.selected = index;
+                }
                 return;
             }
         }
@@ -7861,8 +8002,8 @@ already exists, update it in place rather than rewriting it from scratch.";
             .map(|queue| queue.iter().cloned().collect())
             .unwrap_or_default();
         let transcript::Transcript {
-            lines: tail_lines,
-            slots: tail_slots,
+            lines: mut tail_lines,
+            slots: mut tail_slots,
             user_lines: _,
         } = {
             let view = &self.views[index];
@@ -7879,6 +8020,11 @@ already exists, update it in place rather than rewriting it from scratch.";
                 self.tick,
             )
         };
+        let view = &self.views[index];
+        if view.session.is_agent() && view.session.parent_id.is_some() {
+            tail_lines.push(parent_link_line(theme));
+            tail_slots.push(None);
+        }
         let history_len = self.views[index]
             .history_cache
             .as_ref()
@@ -9279,15 +9425,12 @@ already exists, update it in place rather than rewriting it from scratch.";
                                 Style::default().fg(status_color(session.status)),
                             ),
                             Span::styled(
-                                pad_to(
-                                    &format!(
-                                        "{}{}",
-                                        origin_marker(session),
-                                        truncate(&session.name, 28)
-                                    ),
-                                    29,
-                                ),
+                                pad_to(&truncate(&session.name, 28), 28),
                                 Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                pad_to(origin_marker(session), 1),
+                                Style::default().fg(Color::DarkGray),
                             ),
                             Span::styled(
                                 format!("  {}  ", short_id(&session.id)),
@@ -10270,7 +10413,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "mouse",
-                description: "click folds a Thinking / tool block; wheel scrolls the transcript",
+                description: "click folds Thinking / tool blocks; click a subagent card to open it; click ← parent agent in a child to return; wheel scrolls",
             },
             HelpEntry {
                 key: "Esc",
@@ -11383,11 +11526,31 @@ fn compact_path(path: &str) -> String {
     }
 }
 
-/// Sidebar prefix: `↳` for sub-agents and `⑂` for sessions in a worktree.
+/// Clickable footer shown at the end of a child agent's transcript.
+fn parent_link_line(theme: Theme) -> Line<'static> {
+    let muted = theme.comment.unwrap_or(Color::DarkGray);
+    Line::from(vec![
+        Span::styled("  ← ", Style::default().fg(muted)),
+        Span::styled(
+            "parent agent",
+            Style::default()
+                .fg(theme.function.unwrap_or(Color::Cyan))
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" · click to return", Style::default().fg(muted)),
+    ])
+}
+
+/// Whether a transcript line is the clickable parent link.
+fn is_parent_link(text: &str) -> bool {
+    text.trim_start().starts_with("← parent agent")
+}
+
+/// Picker marker column before the session id: `⑂` for worktrees.
+/// Subagent sessions are reached from their parent transcript and are not
+/// listed in the session picker.
 fn origin_marker(session: &Session) -> &'static str {
-    if session.is_agent() {
-        "↳"
-    } else if session.has_worktree() {
+    if session.has_worktree() {
         "⑂"
     } else {
         ""
@@ -13789,6 +13952,7 @@ mod tests {
         })];
         app.views.push(view);
         app.pane_areas = vec![Rect::new(0, 0, 40, 10)];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let click = |kind, row| MouseEvent {
             kind,
@@ -13800,16 +13964,101 @@ mod tests {
         let release = MouseEventKind::Up(MouseButton::Left);
         // The first inner row is the block header. A click toggles on release
         // so the same gesture can also start a drag selection.
-        app.handle_mouse(click(press, 1));
-        app.handle_mouse(click(release, 1));
+        app.handle_mouse(click(press, 1), &tx);
+        app.handle_mouse(click(release, 1), &tx);
         assert_eq!(app.views[0].folds.get(&FoldId::Event(1)), Some(&true));
         app.views[0].slots[0] = Some(transcript::Fold {
             id: FoldId::Event(1),
             open: true,
         });
-        app.handle_mouse(click(press, 1));
-        app.handle_mouse(click(release, 1));
+        app.handle_mouse(click(press, 1), &tx);
+        app.handle_mouse(click(release, 1), &tx);
         assert_eq!(app.views[0].folds.get(&FoldId::Event(1)), Some(&false));
+    }
+
+    #[test]
+    fn clicking_a_subagent_card_opens_the_child_session() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let parent = Session::new("parent", "parent", "/tmp");
+        let mut child = Session::new("child-1", "parent/scout-1", "/tmp");
+        child.origin = eix_core::SessionOrigin::Agent;
+        child.parent_id = Some("parent".into());
+        app.sessions = vec![parent.clone(), child.clone()];
+        let mut view = SessionView::new(parent, parent_spawn_events());
+        view.upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+        view.slots = vec![Some(transcript::Fold {
+            id: FoldId::Event(1),
+            open: true,
+        })];
+        view.text_lines = vec!["  ▾ ● ↳ parent/scout-1 · running".into()];
+        app.views.push(view);
+        app.pane_areas = vec![Rect::new(0, 0, 60, 10)];
+
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 6, 1), &tx);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 1), &tx);
+
+        assert_eq!(
+            app.pending_attach
+                .as_ref()
+                .map(|pending| pending.session_id.as_str()),
+            Some("child-1")
+        );
+        match rx.try_recv() {
+            Ok(Command::Attach(session_id)) => assert_eq!(session_id, "child-1"),
+            Ok(_) => panic!("unexpected command"),
+            Err(err) => panic!("unexpected command error: {err}"),
+        }
+    }
+
+    #[test]
+    fn subagent_transcript_shows_a_parent_link() {
+        let mut app = App::new(None);
+        let mut child = Session::new("child-1", "parent/scout-1", "/tmp");
+        child.origin = eix_core::SessionOrigin::Agent;
+        child.parent_id = Some("parent".into());
+        app.views.push(SessionView::new(child, Vec::new()));
+
+        let rendered = render_text(&mut app, 80, 20);
+        assert!(
+            rendered.contains("← parent agent · click to return"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn clicking_the_parent_link_returns_to_the_parent_agent() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let parent = Session::new("parent", "parent", "/tmp");
+        let mut child = Session::new("child-1", "parent/scout-1", "/tmp");
+        child.origin = eix_core::SessionOrigin::Agent;
+        child.parent_id = Some("parent".into());
+        app.sessions = vec![parent.clone(), child.clone()];
+        app.views.push(SessionView::new(parent, Vec::new()));
+        let mut child_view = SessionView::new(child, Vec::new());
+        child_view.text_lines = vec!["  ← parent agent · click to return".into()];
+        app.views.push(child_view);
+        app.focused = 1;
+        app.pane_areas = vec![Rect::new(0, 0, 30, 10), Rect::new(30, 0, 30, 10)];
+
+        let mouse = |kind, column, row| MouseEvent {
+            kind,
+            column,
+            row,
+            modifiers: KeyModifiers::NONE,
+        };
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 40, 1), &tx);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 40, 1), &tx);
+
+        assert_eq!(app.focused, 0);
+        assert_eq!(app.status, "parent agent focused");
     }
 
     #[test]
@@ -13819,6 +14068,7 @@ mod tests {
         view.text_lines = vec!["hello world".into(), "second line".into()];
         app.views.push(view);
         app.pane_areas = vec![Rect::new(0, 0, 40, 10)];
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
         let mouse = |kind, column, row| MouseEvent {
             kind,
@@ -13826,9 +14076,9 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1));
-        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 6, 1));
-        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 1));
+        app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 1, 1), &tx);
+        app.handle_mouse(mouse(MouseEventKind::Drag(MouseButton::Left), 6, 1), &tx);
+        app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 6, 1), &tx);
 
         assert_eq!(app.take_clipboard().as_deref(), Some("hello"));
         assert_eq!(
@@ -14967,6 +15217,42 @@ mod tests {
             app.picker_preview_lines(&filtered),
             vec!["you:".to_string(), "  hello".to_string()]
         );
+    }
+
+    #[test]
+    fn session_picker_hides_subagents_and_marks_worktrees_before_ids() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut worktree = Session::new("s2", "worktree", "/tmp/wt");
+        worktree.worktree = Some(std::path::PathBuf::from("/tmp/wt"));
+        let mut child = Session::new("s3", "child", "/tmp");
+        child.origin = eix_core::SessionOrigin::Agent;
+        child.parent_id = Some("s1".into());
+        app.sessions = vec![Session::new("s1", "normal", "/tmp"), worktree, child];
+
+        app.open_picker(PickerKind::NewPane, &tx);
+        let filtered = app.picker_filtered();
+        assert_eq!(filtered, vec![0, 1]);
+        assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+
+        // Searching goes through the same agent filter.
+        app.picker.as_mut().unwrap().query = "child".into();
+        assert!(app.filtered_sessions().is_empty());
+        app.picker.as_mut().unwrap().query = "worktree".into();
+        assert_eq!(app.filtered_sessions(), vec![1]);
+        app.picker.as_mut().unwrap().query.clear();
+
+        let rendered = render_text(&mut app, 120, 30);
+        assert!(!rendered.contains("child"), "{rendered}");
+        assert!(!rendered.contains('↳'), "{rendered}");
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("worktree"))
+            .unwrap_or_else(|| panic!("worktree row missing: {rendered}"));
+        let name = row.find("worktree").expect("name");
+        let marker = row.find('⑂').expect("worktree marker");
+        let id = row.find("s2").expect("session id");
+        assert!(name < marker && marker < id, "{row:?}");
     }
 
     #[test]
