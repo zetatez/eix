@@ -340,6 +340,7 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Space a`             | 跨 session 审批收件箱            |
  | `Space m`             | 完整执行模式 picker              |
  | `Space f`             | 文件 picker                      |
+ | `Space s`             | 搜索文件内容并插入 `@path:line`  |
  | `Space g`             | git picker（worktrees + branches）|
  | `Space p`             | 后台进程列表                     |
  | `Space v`             | horizontal 布局                  |
@@ -416,7 +417,8 @@ agent 输出和用户消息都按 Markdown 渲染：标题、粗体/斜体/删�
  | `Ctrl-/`                                          | 打开可搜索的模型 picker：输入筛选、`Enter` 切换、`Esc` 关闭（输入框内外都可用；部分终端为 `Ctrl-_` / `Ctrl-7`）                                                                                                                                                                                                                                                                     |
  | `<Space>o`                                        | session picker：在**新 pane** 中打开（已打开则聚焦该 pane），右侧实时预览最近对话                                                                                                                                                                                                                                                                                                   |
  | `<Space>f`                                        | 文件 picker：搜索 workspace 文件，右侧实时预览文件内容，选中后插入 `@相对路径`                                                                                                                                                                                                                                                                                                      |
- | `Ctrl-P`                                          | 命令面板（转录区、以及输入框的 normal 模式都可用）：搜所有动作与 provider（session / files / git / processes / approvals / new / fork / cancel / help / quit）                                                                                                                                                                                     |
+ | `<Space>s`                                        | 内容 picker：搜索 workspace 文件内容，选中后插入 `@相对路径:行号`；也可用 `/grep [query]`                                                                                                                                                                                                                                                                                            |
+ | `Ctrl-P`                                          | 命令面板（转录区、以及输入框的 normal 模式都可用）：与 `/` 命令菜单使用同一份 built-in / 自定义命令和描述，命令名与说明分列对齐；选中后按 `/命令` 执行                                                                                                                                                                                               |
  | `<Space>g`                                        | git picker：同时列出 worktrees 和 branches；没有 linked worktree 时只显示 branches，选中后把路径或分支名插入聚焦 pane 的输入框                                                                                                                                                                                                                                                      |
  | `@`（输入框内）                                   | 文件 picker：选中后插入 `@相对路径`（行首或空白后触发）                                                                                                                                                                                                                                                                                                                             |
  | `Shift+,` / `Shift+.`                             | 线性切换到上一个 / 下一个 pane（`<` / `>`；转录区与输入框 normal 模式）                                                                                                                                                                                                                                                                                                             |
@@ -465,6 +467,7 @@ normal 模式下的 `:` 命令行接受下表同样的命令名（不带 `/`）�
  | `/queue [clear]`                           | 查看队列；`clear` 清空，`rm N` 删除第 N 条，`move N M` 调整顺序                                                                                                              |
  | `/sessions`                                | 打开 session picker                                                                                                                                                          |
  | `/files`                                   | 文件 picker，选中后插入 `@path`                                                                                                                                              |
+ | `/grep [query]`                            | 内容 picker：搜索 workspace 文件内容，选中后插入 `@path:line`；可直接带初始查询                                                                                              |
  | `/git`                                     | git picker：worktrees + branches，选中后插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用）                                                                  |
  | `/processes` / `/approvals`                | 背景进程列表 / 审批收件箱                                                                                                                                                    |
  | `/attention` / `/cancel`                   | 跳到下一个需要 attention 的 pane / 取消运行                                                                                                                                    |
@@ -662,12 +665,14 @@ vim 编辑键（如 `j`/`k` 行移动、`Tab` / `Shift-Tab` 循环执行模式�
 `F1`..`F12` 以及 `C-` / `S-` / `A-` 修饰符；裸字母会被忽略，标点键（如 `?`、`#`）可用。
 
 同一个 session 只会出现在一个 pane；从 picker 选中已打开的 session 会直接聚焦它。
-所有 picker 共用同一个 overlay：上方输入框做模糊过滤，左侧是候选列表，右侧是预览。
+所有 picker 共用同一个 overlay：普通 picker 上方输入框做模糊过滤；grep picker 的输入
+直接作为内容搜索查询，由 daemon 防抖查询，左侧是候选列表，右侧是预览。
 files picker 会按当前选择读取文件内容（带行号，超长自动截断）；sessions picker 会按当前
 选择读取该 session 的最近对话事件，并在右侧显示最新的 you / assistant / tool / error 记录。
 worktree、branch、context 显示 daemon 给出的详情；skills 显示来源、allowed-tools 和正文。
-files / git / worktrees / branches / context 由 daemon 的 `picker.query` 提供，预览由
-`picker.preview` 懒加载，其余（sessions、命令面板、skills）在客户端生成。历史 session 不在左侧栏
+files / grep / git / worktrees / branches / context 由 daemon 的 `picker.query` 提供；
+files / sessions 预览由 `picker.preview` 懒加载，grep 的每行自带匹配行预览；
+其余（sessions、命令面板、skills）在客户端生成。历史 session 不在左侧栏
 常驻，只通过这个浮动 picker 打开（`Ctrl-G` / `/sessions`）。
 
 输入框是自研的 Vim 风格编辑器（不再内嵌 Neovim 进程，输入零往返延迟）。外框使用透明背景的
@@ -875,6 +880,7 @@ integration:
 - visual：`v` / `V` 选中后 `d x y c p ~ o`；选中区域反色显示
 - `Enter` 只在 insert 模式提交；`Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 换行
 - `@`（行首或空白后）打开 workspace 文件 picker，选中后插入 `@相对路径`；其余位置插入字面 `@`
+- `Space s` / `/grep [query]` 搜索 workspace 文件内容，选中后插入 `@路径:行号`；输入查询会防抖后发给 daemon
 - 草稿镜像到 `draft.set`，切换 session 时回填；提交失败会把 draft 放回输入框
 - 输入框默认 3 行内容（加边框共 5 行），长草稿最多增长到 10 行内容（总 12 行）后在框内滚动，normal 模式也不会收缩
 - 转录区使用固定配色（不再从编辑器 colorscheme 采样）
@@ -1401,7 +1407,7 @@ Linux x86_64/aarch64、macOS Intel/Apple Silicon，以及 Arch x86_64 容器。W
 - [x] 独立 Neovim 前端交互：`<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`
 - [x] 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider）、两次 `Esc` 回转录区、长草稿自动增高（默认 3 行，总高上限 12 行）
 - [x] 草稿镜像（编辑器变更同步到 `draft.set`，切 session 时从 daemon 回填）
-- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / git / worktrees / branches，`o`/`Ctrl-P`/`g`/`@` 入口；独立前端 `:Eix pick [KIND]`）
+- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / grep / git / worktrees / branches，`o`/`Ctrl-P`/`g`/`s`/`@` 入口；独立前端 `:Eix pick [KIND]`）
 - [x] 工具补齐：`grep` / `glob` / `edit` / `patch`，`read_file` 行号 + `offset`/`limit` 分页（只读工具自动放行）
 - [x] 自定义 Markdown 命令（`~/.config/eix/cmds`、项目 `.eix/cmds`，兼容旧 `commands` 目录；`/name` 快速调用、`$ARGUMENTS` / `$1..$9`、frontmatter `description`/`agent`/`model`）
 - [x] 自定义 Markdown agent（`~/.config/eix/agents`、项目 `.eix/agents`；`role`/`model`，`/agents` 选择 primary、`spawn_agent agent:` 选择 subagent）

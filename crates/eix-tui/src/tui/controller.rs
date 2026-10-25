@@ -177,8 +177,10 @@ pub enum Command {
     },
     PickerData {
         session_id: String,
-        /// Daemon provider (`files`, `worktrees`, `branches`, `context`).
+        /// Daemon provider (`files`, `grep`, `git`, ...).
         kind: String,
+        /// Live provider query; `None` keeps the provider's default listing.
+        query: Option<String>,
     },
     /// Fetch the selected row's content for the picker preview pane.
     PickerPreview {
@@ -308,6 +310,7 @@ pub enum Event {
     PickerData {
         kind: String,
         items: Vec<eix_core::PickerItem>,
+        query: Option<String>,
     },
     PickerPreview {
         kind: String,
@@ -871,13 +874,18 @@ async fn dispatch(
             let result: SessionResult = decode(value)?;
             send(events, Event::Forked(result.session))
         }
-        Command::PickerData { session_id, kind } => {
+        Command::PickerData {
+            session_id,
+            kind,
+            query,
+        } => {
             let value = requester
                 .request(
                     "picker.query",
                     json!({
                         "kind": kind,
                         "session_id": session_id,
+                        "query": query,
                         "limit": 2000
                     }),
                 )
@@ -888,6 +896,7 @@ async fn dispatch(
                 Event::PickerData {
                     kind: result.kind,
                     items: result.items,
+                    query,
                 },
             )
         }

@@ -1845,6 +1845,7 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
     Some(match ch {
         'o' => "new-pane",
         'f' => "files",
+        's' => "grep",
         'g' => "git",
         'c' => "close-pane",
         'p' => "processes",
@@ -2166,6 +2167,16 @@ mod tests {
         let mut editor = editor_with("");
         let _ = key(&mut editor, KeyCode::Char(' '));
         assert_eq!(key(&mut editor, KeyCode::Char('g')), Outcome::Action("git"));
+    }
+
+    #[test]
+    fn leader_s_opens_grep_picker() {
+        let mut editor = editor_with("");
+        let _ = key(&mut editor, KeyCode::Char(' '));
+        assert_eq!(
+            key(&mut editor, KeyCode::Char('s')),
+            Outcome::Action("grep")
+        );
     }
 
     #[test]

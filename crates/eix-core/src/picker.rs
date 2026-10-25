@@ -6,8 +6,9 @@
 //! selected row's body with `picker.preview`, and add their own fuzzy filtering
 //! and actions.
 //!
-//! Providers today: `files` (workspace paths), `git` (worktrees + branches),
-//! `worktrees` and `branches` (git), and `context` (the session's ledger).
+//! Providers today: `files` (workspace paths), `grep` (workspace file
+//! contents as `path:line` rows), `git` (worktrees + branches), `worktrees`
+//! and `branches` (git), and `context` (the session's ledger).
 //! Frontends may also synthesize rows locally (the TUI command palette), so
 //! nothing here assumes the daemon sent every item.
 
@@ -23,11 +24,19 @@ pub const KIND_WORKTREES: &str = "worktrees";
 pub const KIND_BRANCHES: &str = "branches";
 /// Provider name for the combined git worktree/branch picker.
 pub const KIND_GIT: &str = "git";
+/// Provider name for workspace file contents (`path:line` matches).
+pub const KIND_GREP: &str = "grep";
 /// Preview provider name for a session's recent conversation.
 pub const KIND_SESSION_PREVIEW: &str = "sessions";
 
 /// Every provider the daemon answers for `picker.query`.
-pub const DATA_KINDS: [&str; 4] = [KIND_FILES, KIND_WORKTREES, KIND_BRANCHES, KIND_GIT];
+pub const DATA_KINDS: [&str; 5] = [
+    KIND_FILES,
+    KIND_WORKTREES,
+    KIND_BRANCHES,
+    KIND_GIT,
+    KIND_GREP,
+];
 
 /// True when `kind` is a daemon-backed provider.
 pub fn is_data_kind(kind: &str) -> bool {
@@ -83,7 +92,8 @@ pub struct PickerParams {
     /// Workspace to search. Required by providers that read the filesystem.
     #[serde(default)]
     pub session_id: Option<SessionId>,
-    /// Case-insensitive substring filter applied by the daemon.
+    /// Provider query: a case-insensitive row filter for files/git, and the
+    /// content search pattern for `grep`.
     #[serde(default)]
     pub query: Option<String>,
     /// Requested row count; the daemon clamps it to a sane range.

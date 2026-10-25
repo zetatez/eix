@@ -198,7 +198,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - `<Space>` 是 leader（输入框 normal 与转录区共用同一映射）：`n` 新建 session 并开新 pane
   （当前 session 有 worktree 时复用）、
   `o` 打开 session picker（已有 session 放进新 pane）、`c` 关闭 pane、`f` 文件、
-  `g` git（worktrees + branches）、`p` 进程、`a` 审批、
+  `s` 文件内容（类似 rg）、`g` git（worktrees + branches）、`p` 进程、`a` 审批、
   `N` 新建、`W` 当前 session 移入 worktree、`F` fork、`x` 取消、`A` attention、`m` 完整执行模式 picker、
   `i` 聚焦输入框、`Ctrl-P` 命令面板。单字母基本留给 vim；转录区裸 `q` 关闭当前 pane
   （最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、`j/k`/`g/G` 等导航、
@@ -360,6 +360,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/命令` | 整条消息作为 prompt 命令处理，不发给模型（见下表） |
 | `<C-j>` / `<C-Enter>` / `<S-Enter>` | 换行（仅 insert） |
 | `@` | 文件 picker（行首/空白后） |
+| `<Space>s` / `/grep [query]` | 内容 picker：逐字防抖搜索 workspace，插入 `@path:line` |
 | `Esc` | insert/visual → normal；normal 下 500ms 内再按一次：有 turn 在跑时中断它，否则回到转录区 |
 | `:` | normal 模式：激活 statusline 下方的命令行；`Tab` 才显示匹配命令并补全；菜单中 `Ctrl-J`/`Ctrl-K`、`Ctrl-N`/`Ctrl-P` 上下选择，`Enter` 执行选中项；菜单打开时 `Esc` 先收起菜单并保留输入，再按一次关闭命令行，`↑`/`↓` 历史；`:!cmd` / `:r!cmd` 直接执行/读取 shell |
 | `/` / `?` / `#` | normal 模式：在当前 session 对话中搜索；`/` 向前，`?`/`#` 向后；`n`/`N` 跳匹配，`Esc` 清除高亮 |
@@ -393,7 +394,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
 | `/queue [clear]` | 查看/清空本 session 的待发送队列 |
 | `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
-| `/files` / `/git` | picker；`/files` 插入 `@路径`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
+| `/files` / `/grep` / `/git` | picker；`/files` 插入 `@路径`，`/grep [query]` 搜索内容并插入 `@路径:行号`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
 | `/processes` / `/approvals` / `/attention` | 进程 / 审批收件箱 / 下一个 attention |
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
 | `/cancel` | 取消运行 |
@@ -470,21 +471,23 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 
 统一的 `查询 → 过滤 → 预览 → 动作` overlay，provider 可插拔：
 
-- 规划：sessions / files(`@`) / history / commands / models / git（worktrees + branches）/ diff hunks / context items。
+- 规划：sessions / files(`@`) / grep（文件内容） / history / commands / models / git（worktrees + branches）/ diff hunks / context items。
 - 已实现（2026-10-18，统一 picker 体系）：
   - TUI 用单一 `Picker`（`kind` + `query` + `selected` + `items`）承载所有 provider，左侧列表、右侧预览。
     session 的预览会随选中项通过 `picker.preview` 拉取最近对话（you / assistant / tool / error）；
-    files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload。
+    files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
+    grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
   - 入口：`<C-g>`（sessions，切换 pane）、`<Space>o`（sessions，新 pane）、`<Space>f`（files）、
-    `Ctrl-P`（commands，命令面板；转录区与输入框 normal 模式都可用）、
+    `<Space>s`（grep，文件内容）、`Ctrl-P`（commands，命令面板；转录区与输入框 normal 模式都可用）、
     `<Space>g`（git，统一列出 worktrees 和 branches；没有 linked worktree 时省略仓库主路径）、
-    prompt 内 `@`（files）、`Eix pick` 经独立前端选择。
-  - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`git`
+    prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
+  - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`grep`
+    （大小写不敏感的字面量内容搜索，返回 `path:line`，跳过二进制/派生目录/4 MiB 以上文件）、`git`
     （worktrees + branches，worktree 行在前，detail 标注 `worktree` / `branch`）、`worktrees`
-    （`git worktree list --porcelain`）、`branches`（`git branch`）；
-    值为 entry id）。默认 500、上限 5000；跳过 `.git` / `target` 等派生目录。
-  - 动作：files → 在 prompt 光标处插入 `@path`；git → 插入 worktree 路径或分支名；sessions → 切换/新 pane；
-    commands → 执行（session / files / git /
+    （`git worktree list --porcelain`）、`branches`（`git branch`）、`context`（值为 entry id）。
+    默认 500、上限 5000；跳过 `.git` / `target` 等派生目录。
+  - 动作：files → 在 prompt 光标处插入 `@path`；grep → 插入 `@path:line`；git → 插入 worktree 路径或分支名；sessions → 切换/新 pane；
+    commands → 执行（session / files / grep / git /
     processes / approvals / new / fork / cancel / help / quit）。
   - 独立 nvim 前端：`:Eix pick [sessions|files|worktrees|branches|context]`（`sessions` 为默认），
     文件/分支/worktree 选中后插入光标处，context 选中后在 scratch 分屏显示条目详情。
@@ -723,8 +726,8 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - `draft.get|set`（按 session 的未发送输入；空文本删除）
 - `context.compact|clear`（自动压缩与 `/compact` / `/clear` 内部使用）
 - `process.list|output|kill`
-- `picker.query {kind, session_id?, query?, limit?}`（provider：`files` / `git` / `worktrees` / `branches` / `context`；
-  返回 `{value, label, detail?, preview?}` 行；`context` 的 value 是 entry id）
+- `picker.query {kind, session_id?, query?, limit?}`（provider：`files` / `grep` / `git` / `worktrees` / `branches` / `context`；
+  返回 `{value, label, detail?, preview?}` 行；`grep` 的 value 是 `path:line`；`context` 的 value 是 entry id）
 - `picker.preview {kind, session_id?, value, limit?}`（`files` 读取 workspace 文件内容；`sessions` 读取目标
   session 的最近对话事件；返回 `{kind, value, text}`，供 picker 右侧懒加载）
 - `nvim.claim`（输入所有权；planned）
@@ -826,11 +829,14 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 独立前端补上 `<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick [KIND]` 与 `:Eix doctor`。
 > 统一 picker（2026-10-18）：TUI 用单一 overlay 承载 sessions / files / worktrees / branches /
 > context / commands，左侧列表右侧预览；`Ctrl-G`/`<Space>o`/`Ctrl-P`/`<Space>w`/`<Space>b`/`@` 为入口，files 插入 `@path`，
-> worktrees/branches 插入值，commands 直接执行。daemon `picker.query` 新增
+> worktrees/branches 插入值，commands 与 prompt 的 `/` 菜单共用同一份 built-in / 自定义命令表，按 `/命令` 执行。daemon `picker.query` 新增
 > `worktrees`（porcelain）、`branches`（`git branch`）两个 provider；
 > 独立前端 `:Eix pick files|worktrees|branches|context` 用 `vim.ui.select` 选择。
 > 合并 git picker（2026-10-25）：TUI 的 `<Space>w` / `<Space>b` 合并为 `<Space>g`，一次列出
 > worktrees 和 branches；daemon 新增 `git` provider，旧的两个 provider 继续供独立前端和兼容使用。
+> 内容 picker（2026-10-26）：daemon 新增 `grep` provider，按 case-insensitive 字面量搜索
+> workspace 文件内容并返回 `path:line`；TUI 用 `<Space>s` / `/grep [query]` 打开，查询按 tick
+> 防抖，Enter 插入 `@path:line`。搜索跳过派生目录、二进制文件和大于 4 MiB 的文件。
 > 输入焦点（2026-10-18）：`Esc` 只在 insert/visual 下回到 normal 并保留焦点，500ms 内
 > 再按一次才回到转录；`<CR>` 只在 insert 提交；`<C-g>` 在任意模式打开 picker；
 > `Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 只在 insert 换行；`F1` 全局帮助；

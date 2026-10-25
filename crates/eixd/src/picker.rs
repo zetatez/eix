@@ -10,7 +10,7 @@ use std::process::Stdio;
 use anyhow::{bail, Context};
 use eix_core::{
     Config, Event, EventKind, PickerItem, PickerPreviewResult, PickerResult, KIND_BRANCHES,
-    KIND_FILES, KIND_GIT, KIND_SESSION_PREVIEW, KIND_WORKTREES,
+    KIND_FILES, KIND_GIT, KIND_GREP, KIND_SESSION_PREVIEW, KIND_WORKTREES,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -25,6 +25,11 @@ const PREVIEW_BYTES: usize = 64 * 1024;
 const PREVIEW_LINES: usize = 400;
 /// Avoid giant single-line files (minified JavaScript, data files, ...).
 const PREVIEW_LINE_CHARS: usize = 400;
+/// Skip files larger than this during content search; the picker is for
+/// navigation, not for scanning multi-gigabyte logs.
+const GREP_FILE_BYTES: u64 = 4 * 1024 * 1024;
+/// Keep one matching line from flooding the row/detail payload.
+const GREP_LINE_CHARS: usize = 400;
 /// Fetch enough recent events to fill a typical preview without replaying a
 /// long session from the beginning.
 const SESSION_PREVIEW_EVENTS: usize = 120;
@@ -117,6 +122,109 @@ fn walk_files(root: &Path, needle: Option<&str>, limit: usize) -> Vec<PickerItem
         }
     }
     items.sort_by(|left, right| left.value.cmp(&right.value));
+    items
+}
+
+/// Search workspace file contents for a case-insensitive literal query.
+/// Empty queries intentionally return no rows: scanning an entire workspace
+/// before the user has typed anything would make opening the picker expensive.
+pub async fn grep(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> PickerResult {
+    let root = cwd.to_path_buf();
+    let needle = query
+        .map(str::trim)
+        .filter(|query| !query.is_empty())
+        .map(str::to_lowercase);
+    let limit = clamp_rows(limit);
+    let items = match needle {
+        Some(needle) => tokio::task::spawn_blocking(move || search_contents(&root, &needle, limit))
+            .await
+            .unwrap_or_default(),
+        None => Vec::new(),
+    };
+    PickerResult {
+        kind: KIND_GREP.to_string(),
+        items,
+    }
+}
+
+fn search_contents(root: &Path, needle: &str, limit: usize) -> Vec<PickerItem> {
+    let mut items = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if items.len() >= limit {
+            break;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        // Stable order makes repeated searches and tests deterministic.
+        let mut entries: Vec<_> = read.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            if items.len() >= limit {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if crate::snapshot::is_excluded_dir(&entry.file_name()) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            if metadata.len() > GREP_FILE_BYTES {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            // A NUL byte is a cheap binary-file signal. Lossy UTF-8 below keeps
+            // the picker usable for files that are mostly text.
+            if bytes.iter().take(8192).any(|byte| *byte == 0) {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let text = String::from_utf8_lossy(&bytes);
+            for (index, line) in text.lines().enumerate() {
+                if !line.to_lowercase().contains(needle) {
+                    continue;
+                }
+                let line_no = index + 1;
+                let detail = truncate_chars(line.trim(), GREP_LINE_CHARS);
+                let detail = if detail.is_empty() {
+                    "(blank line)".to_string()
+                } else {
+                    detail
+                };
+                let value = format!("{relative}:{line_no}");
+                let preview = format!("{relative}:{line_no}\n\n{detail}");
+                items.push(
+                    PickerItem::new(value.clone())
+                        .with_label(value)
+                        .with_detail(detail)
+                        .with_preview(preview),
+                );
+                if items.len() >= limit {
+                    break;
+                }
+            }
+        }
+    }
     items
 }
 
@@ -524,6 +632,51 @@ mod tests {
         let missing = files(&dir, Some("nope"), None).await;
         assert!(missing.items.is_empty());
 
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn greps_contents_and_returns_path_line_rows() {
+        let dir = temp_dir("grep");
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(
+            dir.join("src/main.rs"),
+            "fn main() {}\nlet needle = 1;\nNEEDLE again\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join(".git/config"), "needle").unwrap();
+        std::fs::write(dir.join("target/debug"), "needle").unwrap();
+        std::fs::write(
+            dir.join("binary.bin"),
+            [0u8, b'n', b'e', b'e', b'd', b'l', b'e'],
+        )
+        .unwrap();
+
+        let result = grep(&dir, Some("needle"), None).await;
+        assert_eq!(result.kind, KIND_GREP);
+        let values: Vec<&str> = result
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect();
+        assert_eq!(values, vec!["src/main.rs:2", "src/main.rs:3"]);
+        assert!(result.items[0]
+            .detail
+            .as_deref()
+            .unwrap()
+            .contains("needle"));
+        assert!(result.items[0]
+            .preview
+            .as_deref()
+            .unwrap()
+            .contains("src/main.rs:2"));
+
+        let limited = grep(&dir, Some("needle"), Some(1)).await;
+        assert_eq!(limited.items.len(), 1);
+        let empty = grep(&dir, Some("   "), None).await;
+        assert!(empty.items.is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
 

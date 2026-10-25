@@ -5100,6 +5100,17 @@ async fn picker_query_lists_workspace_files() -> anyhow::Result<()> {
     assert_eq!(preview.value, "src/main.rs");
     assert!(preview.text.contains("fn main() {}"), "{}", preview.text);
 
+    let grep: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "grep", "session_id": session_id, "query": "MAIN"}),
+        )
+        .await?;
+    assert_eq!(grep.kind, eix_core::KIND_GREP);
+    assert_eq!(grep.items.len(), 1);
+    assert_eq!(grep.items[0].value, "src/main.rs:1");
+    assert!(grep.items[0].detail.as_deref().unwrap().contains("fn main"));
+
     // The session must belong to the daemon, and the kind must be known.
     assert_eq!(
         client

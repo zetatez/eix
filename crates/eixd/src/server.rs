@@ -2674,6 +2674,10 @@ impl Daemon {
                         crate::picker::files(&session.cwd, params.query.as_deref(), params.limit)
                             .await
                     }
+                    eix_core::KIND_GREP => {
+                        crate::picker::grep(&session.cwd, params.query.as_deref(), params.limit)
+                            .await
+                    }
                     eix_core::KIND_WORKTREES => {
                         crate::picker::worktrees(
                             &session.cwd,

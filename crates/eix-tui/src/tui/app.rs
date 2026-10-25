@@ -58,6 +58,13 @@ const CMDLINE_HISTORY_LIMIT: usize = 100;
 /// Sharing it keeps the description/annotation column aligned in both places.
 const COMMAND_NAME_WIDTH: usize = 22;
 
+/// Maximum label column for picker rows that also render a detail. Labels
+/// longer than this are truncated so the detail column stays visible.
+const PICKER_LABEL_MAX: usize = 28;
+
+/// Maximum key column in the searchable help/key reference.
+const HELP_KEY_MAX: usize = 28;
+
 /// Picker value for "no preset" (keep the terminal/default palette).
 const THEME_DEFAULT_VALUE: &str = "@default";
 
@@ -140,6 +147,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("integrate", "", "show this session's integration state"),
         builtin("files", "", "browse and insert workspace files"),
+        builtin(
+            "grep",
+            "[query]",
+            "search file contents and insert @path:line",
+        ),
         builtin(
             "git",
             "",
@@ -730,6 +742,8 @@ enum PickerKind {
     NewPane,
     /// Insert a workspace file after `@` in the prompt.
     Files,
+    /// Search workspace file contents and insert `@path:line`.
+    Grep,
     /// Insert a git worktree path or branch name into the prompt.
     Git,
     /// Client-side command palette (`Ctrl-P`).
@@ -759,6 +773,7 @@ impl PickerKind {
     fn data_kind(self) -> Option<&'static str> {
         match self {
             Self::Files => Some(eix_core::KIND_FILES),
+            Self::Grep => Some(eix_core::KIND_GREP),
             Self::Git => Some(eix_core::KIND_GIT),
             Self::Sessions
             | Self::NewPane
@@ -789,6 +804,7 @@ impl PickerKind {
             Self::Sessions => "sessions — switch focused pane",
             Self::NewPane => "sessions — open in a new pane",
             Self::Files => "files — insert after @",
+            Self::Grep => "grep — file contents",
             Self::Git => "git — worktree/branch",
             Self::Commands => "commands",
             Self::Models => "model — search and switch",
@@ -808,6 +824,7 @@ impl PickerKind {
             Self::Sessions => "Enter open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::NewPane => "Enter split · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Files => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
+            Self::Grep => "type to search · Enter insert @path:line · Esc close",
             Self::Git => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Models => "type to search · Enter switch · Esc close",
@@ -1311,6 +1328,8 @@ pub struct App {
     input: Editor,
     focus: Focus,
     picker: Option<Picker>,
+    /// A live picker query changed and should be sent on the next tick.
+    picker_query_due: bool,
     help: bool,
     /// Restrict the help overlay to one `HELP_SECTIONS` title.
     help_scope: Option<&'static str>,
@@ -1451,6 +1470,10 @@ pub struct App {
 impl App {
     pub fn new(initial_session: Option<String>) -> Self {
         let compat = eix_core::CompatConfig::default();
+        // Opening the prompt is not an edit: start in normal mode and let the
+        // user enter insert mode with `i`, `a`, etc.
+        let mut input = Editor::new();
+        input.enter_normal();
         Self {
             should_quit: false,
             exit_message: None,
@@ -1472,9 +1495,10 @@ impl App {
             creating: false,
             submitting: false,
             pending_prompt: None,
-            input: Editor::new(),
+            input,
             focus: Focus::Input,
             picker: None,
+            picker_query_due: false,
             help: false,
             help_scope: None,
             help_query: String::new(),
@@ -1907,7 +1931,46 @@ impl App {
         self.tick = self.tick.wrapping_add(1);
         self.refresh_git_branch();
         self.sync_draft(tx);
+        self.flush_picker_query(tx);
         self.flush_queues(tx);
+    }
+
+    /// Send the latest content-search query. The 200 ms tick debounces fast
+    /// typing without adding another timer to the event loop.
+    fn flush_picker_query(&mut self, tx: &UnboundedSender<Command>) {
+        if !std::mem::take(&mut self.picker_query_due) {
+            return;
+        }
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        if picker.kind != PickerKind::Grep {
+            return;
+        }
+        let query = picker.query.trim().to_string();
+        if query.is_empty() {
+            if let Some(picker) = &mut self.picker {
+                picker.items.clear();
+                picker.selected = 0;
+                picker.loading = false;
+            }
+            self.status = "grep: type to search".into();
+            return;
+        }
+        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+            self.status = "attach a session first".into();
+            return;
+        };
+        if let Some(picker) = &mut self.picker {
+            picker.loading = true;
+            picker.selected = 0;
+        }
+        self.status = "grep: searching…".into();
+        let _ = tx.send(Command::PickerData {
+            session_id,
+            kind: eix_core::KIND_GREP.to_string(),
+            query: Some(query),
+        });
     }
 
     /// Update the branch shown in the prompt header. Spawning `git` on every
@@ -2352,16 +2415,32 @@ impl App {
                 };
                 let _ = tx.send(Command::Attach(id));
             }
-            Event::PickerData { kind, items } => {
-                let count = items.len();
-                if let Some(picker) = &mut self.picker {
-                    if picker.kind.data_kind() == Some(kind.as_str()) {
-                        picker.items = items;
-                        picker.selected = 0;
-                        picker.loading = false;
-                    }
+            Event::PickerData { kind, items, query } => {
+                let Some(picker) = &mut self.picker else {
+                    return;
+                };
+                if picker.kind.data_kind() != Some(kind.as_str()) {
+                    return;
                 }
-                if count == 0 {
+                // A grep response can arrive after the user typed more; keep
+                // the newer query's rows instead of flashing stale matches.
+                if kind == eix_core::KIND_GREP
+                    && query.as_deref().unwrap_or_default() != picker.query.trim()
+                {
+                    return;
+                }
+                let count = items.len();
+                let grep = kind == eix_core::KIND_GREP;
+                picker.items = items;
+                picker.selected = 0;
+                picker.loading = false;
+                if grep {
+                    self.status = if count == 0 {
+                        "grep: no matches".into()
+                    } else {
+                        format!("grep: {count} match(es)")
+                    };
+                } else if count == 0 {
                     self.status = format!("no {kind} matched");
                 } else {
                     self.status = format!("{count} {kind} row(s)");
@@ -3812,7 +3891,7 @@ impl App {
             if self.focused_approval().is_none() && self.focused_input().is_none() {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/g · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · i input · Z quit · Esc cancel"
+                self.status = "leader: f/g/s · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · i input · Z quit · Esc cancel"
                     .into();
             }
             return true;
@@ -5145,6 +5224,7 @@ impl App {
                     picker.query.pop();
                     picker.selected = 0;
                 }
+                self.note_picker_query_change(kind);
             }
             KeyCode::Char(c)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -5154,10 +5234,25 @@ impl App {
                     picker.query.push(c);
                     picker.selected = 0;
                 }
+                self.note_picker_query_change(kind);
             }
             _ => {}
         }
         self.preview_theme_selection();
+    }
+
+    /// Content search is provider-backed: clear the old rows now and let the
+    /// next tick coalesce rapid keystrokes into one daemon request.
+    fn note_picker_query_change(&mut self, kind: PickerKind) {
+        if kind != PickerKind::Grep {
+            return;
+        }
+        self.picker_query_due = true;
+        if let Some(picker) = &mut self.picker {
+            picker.items.clear();
+            picker.selected = 0;
+            picker.loading = !picker.query.trim().is_empty();
+        }
     }
 
     fn move_picker(&mut self, delta: i32) {
@@ -5242,6 +5337,13 @@ impl App {
         let Some(picker) = &self.picker else {
             return Vec::new();
         };
+        // Grep rows are already filtered and ordered by the daemon. Running
+        // the fuzzy matcher again would reorder matches and drop rows because
+        // the query usually matches the content detail, not the path:line
+        // label.
+        if picker.kind == PickerKind::Grep {
+            return (0..picker.items.len()).collect();
+        }
         let query = picker.query.trim().to_lowercase();
         if query.is_empty() {
             return (0..picker.items.len()).collect();
@@ -5287,7 +5389,7 @@ impl App {
                 self.picker = None;
                 self.open_in_new_pane(index, tx);
             }
-            PickerKind::Files => {
+            PickerKind::Files | PickerKind::Grep => {
                 if let Some(value) = value {
                     self.picker = None;
                     self.insert_prompt(&format!("@{value}"));
@@ -5314,7 +5416,9 @@ impl App {
                             }
                         })
                         .unwrap_or_else(|| format!("/{value}"));
-                    self.handle_prompt_command(&line, tx);
+                    // The palette is an overlay over a possibly non-empty
+                    // draft, so run the command without clearing the prompt.
+                    self.handle_command_text(&line, tx, false);
                 }
             }
             PickerKind::Models => {
@@ -5397,6 +5501,7 @@ impl App {
     fn open_picker(&mut self, kind: PickerKind, tx: &UnboundedSender<Command>) {
         // A picker opening clears any half-finished double-Esc gesture.
         self.esc_at = None;
+        self.picker_query_due = false;
         // Switching from one picker to another must not keep a previewed theme.
         if let Some((config, theme)) = self.theme_picker_backup.take() {
             self.theme_config = config;
@@ -5411,6 +5516,15 @@ impl App {
             preview: PickerPreview::default(),
             preview_request: None,
         };
+        if kind == PickerKind::Grep {
+            if self.focused_view().is_none() {
+                self.status = "attach a session first".into();
+                return;
+            }
+            self.status = "grep: type to search".into();
+            self.picker = Some(picker);
+            return;
+        }
         if let Some(provider) = kind.data_kind() {
             let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
                 self.status = "attach a session first".into();
@@ -5421,6 +5535,7 @@ impl App {
             let _ = tx.send(Command::PickerData {
                 session_id,
                 kind: provider.to_string(),
+                query: None,
             });
         } else if kind == PickerKind::Commands {
             picker.items = command_items(&self.commands);
@@ -5507,6 +5622,28 @@ impl App {
         self.picker = Some(picker);
     }
 
+    /// Open the content picker, optionally with a prefilled query from
+    /// `/grep <query>`.
+    fn open_grep_picker(&mut self, query: &str, tx: &UnboundedSender<Command>) {
+        self.open_picker(PickerKind::Grep, tx);
+        let query = query.trim();
+        if query.is_empty() {
+            return;
+        }
+        let Some(picker) = self
+            .picker
+            .as_mut()
+            .filter(|picker| picker.kind == PickerKind::Grep)
+        else {
+            return;
+        };
+        picker.query = query.to_string();
+        picker.selected = 0;
+        picker.loading = true;
+        self.picker_query_due = true;
+        self.status = "grep: searching…".into();
+    }
+
     /// Run a command-palette entry or a prompt leader action (`<Space>xx`).
     /// Unknown ids are ignored.
     fn run_action(&mut self, id: &str, tx: &UnboundedSender<Command>) {
@@ -5516,6 +5653,7 @@ impl App {
             "sessions" => self.open_picker(PickerKind::Sessions, tx),
             "new-pane" => self.open_picker(PickerKind::NewPane, tx),
             "files" => self.open_picker(PickerKind::Files, tx),
+            "grep" => self.open_grep_picker("", tx),
             "git" | "worktrees" | "branches" => self.open_picker(PickerKind::Git, tx),
             "model" => self.open_picker(PickerKind::Models, tx),
             "agents" => self.open_picker(PickerKind::Agents, tx),
@@ -5971,6 +6109,10 @@ impl App {
             }
             "files" => {
                 self.open_picker(PickerKind::Files, tx);
+                true
+            }
+            "grep" => {
+                self.open_grep_picker(args, tx);
                 true
             }
             "git" => {
@@ -9054,7 +9196,13 @@ already exists, update it in place rather than rewriting it from scratch.";
         };
 
         if filtered.is_empty() {
-            let text = if loading { "loading…" } else { "no matches" };
+            let text = if loading {
+                "loading…"
+            } else if kind == PickerKind::Grep && query.trim().is_empty() {
+                "type to search…"
+            } else {
+                "no matches"
+            };
             frame.render_widget(
                 Paragraph::new(text).style(Style::default().fg(muted).bg(dialog_bg)),
                 list_area,
@@ -9131,10 +9279,13 @@ already exists, update it in place rather than rewriting it from scratch.";
                                 Style::default().fg(status_color(session.status)),
                             ),
                             Span::styled(
-                                format!(
-                                    "{}{}",
-                                    origin_marker(session),
-                                    truncate(&session.name, 28)
+                                pad_to(
+                                    &format!(
+                                        "{}{}",
+                                        origin_marker(session),
+                                        truncate(&session.name, 28)
+                                    ),
+                                    29,
                                 ),
                                 Style::default().add_modifier(Modifier::BOLD),
                             ),
@@ -9167,17 +9318,36 @@ already exists, update it in place rather than rewriting it from scratch.";
                 } else {
                     Color::DarkGray
                 };
-                // Keep the provider column aligned under the longest model id
-                // in the catalog, not just the currently filtered rows.
+                // Keep the second column aligned under the longest label in
+                // the whole picker, not just the currently filtered rows.
+                // Models use a wider separator; commands keep the `/` menu's
+                // fixed command-name width.
                 let model_width = if kind == PickerKind::Models {
                     picker
                         .items
                         .iter()
-                        .map(|item| item.label.chars().count())
+                        .map(|item| UnicodeWidthStr::width(item.label.as_str()))
                         .max()
                         .unwrap_or(0)
+                        .min(PICKER_LABEL_MAX)
                 } else {
                     0
+                };
+                let detail_width = if matches!(kind, PickerKind::Models | PickerKind::Commands) {
+                    0
+                } else {
+                    picker
+                        .items
+                        .iter()
+                        .filter(|item| {
+                            item.detail
+                                .as_deref()
+                                .is_some_and(|detail| !detail.is_empty())
+                        })
+                        .map(|item| UnicodeWidthStr::width(item.label.as_str()))
+                        .max()
+                        .unwrap_or(0)
+                        .min(PICKER_LABEL_MAX)
                 };
                 let separator = if kind == PickerKind::Models {
                     "    "
@@ -9188,15 +9358,22 @@ already exists, update it in place rather than rewriting it from scratch.";
                     .iter()
                     .filter_map(|&index| picker.items.get(index))
                     .map(|item| {
-                        let label = if kind == PickerKind::Models {
-                            format!("{:<width$}", item.label, width = model_width)
-                        } else if kind == PickerKind::Commands {
-                            pad_to(
+                        let label = match kind {
+                            PickerKind::Models => {
+                                pad_to(&truncate(&item.label, model_width), model_width)
+                            }
+                            PickerKind::Commands => pad_to(
                                 &truncate(&item.label, COMMAND_NAME_WIDTH),
                                 COMMAND_NAME_WIDTH,
-                            )
-                        } else {
-                            item.label.clone()
+                            ),
+                            _ if item
+                                .detail
+                                .as_deref()
+                                .is_some_and(|detail| !detail.is_empty()) =>
+                            {
+                                pad_to(&truncate(&item.label, detail_width), detail_width)
+                            }
+                            _ => item.label.clone(),
                         };
                         let mut spans = vec![Span::styled(label, label_style)];
                         if let Some(detail) = &item.detail {
@@ -9995,6 +10172,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "search workspace files and insert a path",
             },
             HelpEntry {
+                key: "/grep",
+                description: "search file contents and insert @path:line (/grep query)",
+            },
+            HelpEntry {
                 key: "/git",
                 description: "search git worktrees and branches, insert a path or name",
             },
@@ -10114,6 +10295,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "Space o/f/g",
                 description: "prompt & transcript: new pane / files / git",
+            },
+            HelpEntry {
+                key: "Space s",
+                description: "prompt & transcript: search file contents and insert @path:line",
             },
             HelpEntry {
                 key: "Space p",
@@ -10357,6 +10542,16 @@ fn draw_help(
         .filter(|section| scope.is_none_or(|scope| scope == section.title))
         .map(|section| section.entries.len())
         .sum();
+    // Size the key column from the whole scope, not the filtered rows, so
+    // descriptions do not jump horizontally while the user types.
+    let key_width = HELP_SECTIONS
+        .iter()
+        .filter(|section| scope.is_none_or(|scope| scope == section.title))
+        .flat_map(|section| section.entries.iter())
+        .map(|entry| UnicodeWidthStr::width(entry.key))
+        .max()
+        .unwrap_or(0)
+        .min(HELP_KEY_MAX);
 
     let rect = search_dialog_rect(area);
     frame.render_widget(Clear, rect);
@@ -10423,7 +10618,7 @@ fn draw_help(
                             Style::default().fg(Color::DarkGray),
                         ),
                         Span::styled(
-                            format!("{:<15} ", entry.key),
+                            format!("{} ", pad_to(&truncate(entry.key, key_width), key_width)),
                             Style::default()
                                 .fg(Color::Cyan)
                                 .add_modifier(Modifier::BOLD),
@@ -11742,6 +11937,16 @@ mod tests {
         assert!(fuzzy_score("ses", "session").is_some());
         assert!(fuzzy_score("xyz", "session").is_none());
         assert!(fuzzy_score("", "anything").is_some());
+    }
+
+    #[test]
+    fn app_starts_in_normal_mode() {
+        let mut app = App::new(None);
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        assert_eq!(app.input.mode(), Mode::Normal);
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+        assert_eq!(app.input.mode(), Mode::Insert);
     }
 
     #[test]
@@ -14527,6 +14732,7 @@ mod tests {
     #[test]
     fn picker_kinds_map_to_daemon_providers() {
         assert_eq!(PickerKind::Files.data_kind(), Some(eix_core::KIND_FILES));
+        assert_eq!(PickerKind::Grep.data_kind(), Some(eix_core::KIND_GREP));
         assert_eq!(PickerKind::Git.data_kind(), Some(eix_core::KIND_GIT));
         assert!(PickerKind::Sessions.data_kind().is_none());
         assert!(PickerKind::Commands.data_kind().is_none());
@@ -14564,6 +14770,88 @@ mod tests {
         assert!(app.picker.is_none());
         assert_eq!(app.input.text(), "@src/main.rs");
         assert!(matches!(app.focus, Focus::Input));
+    }
+
+    #[test]
+    fn grep_picker_searches_live_and_inserts_at_path_line() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        app.open_grep_picker("needle", &tx);
+        let picker = app.picker.as_ref().expect("grep picker");
+        assert_eq!(picker.kind, PickerKind::Grep);
+        assert_eq!(picker.query, "needle");
+        assert!(app.picker_query_due);
+
+        app.flush_picker_query(&tx);
+        match rx.try_recv().expect("grep query") {
+            Command::PickerData {
+                session_id,
+                kind,
+                query,
+            } => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(kind, eix_core::KIND_GREP);
+                assert_eq!(query.as_deref(), Some("needle"));
+            }
+            _ => panic!("expected a picker command"),
+        }
+
+        app.handle_event(
+            Event::PickerData {
+                kind: eix_core::KIND_GREP.into(),
+                items: vec![PickerItem::new("src/main.rs:3")
+                    .with_label("src/main.rs:3")
+                    .with_detail("let needle = 1;")],
+                query: Some("needle".into()),
+            },
+            &tx,
+        );
+        assert_eq!(app.picker.as_ref().unwrap().items.len(), 1);
+
+        // The next keystroke clears the old rows; a response for the old
+        // query must not repopulate them.
+        app.handle_picker_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE), &tx);
+        assert!(app.picker.as_ref().unwrap().items.is_empty());
+        app.handle_event(
+            Event::PickerData {
+                kind: eix_core::KIND_GREP.into(),
+                items: vec![PickerItem::new("src/main.rs:3")],
+                query: Some("needle".into()),
+            },
+            &tx,
+        );
+        assert!(app.picker.as_ref().unwrap().items.is_empty());
+
+        app.flush_picker_query(&tx);
+        match rx.try_recv().expect("updated grep query") {
+            Command::PickerData { query, .. } => {
+                assert_eq!(query.as_deref(), Some("needlex"));
+            }
+            _ => panic!("expected a picker command"),
+        }
+        app.handle_event(
+            Event::PickerData {
+                kind: eix_core::KIND_GREP.into(),
+                items: vec![PickerItem::new("src/main.rs:3")],
+                query: Some("needlex".into()),
+            },
+            &tx,
+        );
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none());
+        assert_eq!(app.input.text(), "@src/main.rs:3");
+    }
+
+    #[test]
+    fn grep_command_opens_with_an_initial_query() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app_with_panes(&["s1"]);
+        assert!(app.handle_command_text("/grep TODO", &tx, true));
+        let picker = app.picker.as_ref().expect("grep picker");
+        assert_eq!(picker.kind, PickerKind::Grep);
+        assert_eq!(picker.query, "TODO");
+        assert!(picker.loading);
+        assert!(app.picker_query_due);
     }
 
     #[test]
@@ -14870,6 +15158,57 @@ mod tests {
     }
 
     #[test]
+    fn help_key_descriptions_align() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.open_help();
+        for ch in "layout".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        }
+
+        let text = render_text(&mut app, 120, 40);
+        let long = text
+            .lines()
+            .find(|line| line.contains("Space v"))
+            .expect("long key row");
+        let short = text
+            .lines()
+            .find(|line| line.contains("Space L"))
+            .expect("short key row");
+        let column = |line: &str, needle: &str| {
+            let index = line.find(needle).expect("description");
+            UnicodeWidthStr::width(&line[..index])
+        };
+        assert_eq!(
+            column(long, "horizontal"),
+            column(short, "cycle grid"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn command_palette_keeps_the_prompt_draft() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        app.focus_input();
+        app.input.set_text("keep this draft");
+        app.open_picker(PickerKind::Commands, &tx);
+        let help = app
+            .picker
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .position(|item| item.value == "help")
+            .expect("help command");
+        app.picker.as_mut().unwrap().selected = help;
+
+        app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+        assert!(app.help);
+        assert_eq!(app.input.text(), "keep this draft");
+    }
+
+    #[test]
     fn command_palette_aligns_descriptions() {
         let commands = vec![
             builtin("a", "", "first description"),
@@ -14887,15 +15226,104 @@ mod tests {
         });
 
         let rendered = render_text(&mut app, 60, 20);
-        let first = rendered
-            .lines()
-            .find_map(|line| line.find("first description"))
-            .expect("first command description");
-        let second = rendered
-            .lines()
-            .find_map(|line| line.find("second description"))
-            .expect("second command description");
-        assert_eq!(first, second, "{rendered}");
+        let column = |needle: &str| {
+            rendered
+                .lines()
+                .find_map(|line| {
+                    line.find(needle)
+                        .map(|index| UnicodeWidthStr::width(&line[..index]))
+                })
+                .expect("command description")
+        };
+        assert_eq!(
+            column("first description"),
+            column("second description"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn picker_detail_columns_align_for_every_kind() {
+        let kinds = [
+            PickerKind::Files,
+            PickerKind::Grep,
+            PickerKind::Git,
+            PickerKind::Commands,
+            PickerKind::Models,
+            PickerKind::Agents,
+            PickerKind::Subagents,
+            PickerKind::Modes,
+            PickerKind::Timeline,
+            PickerKind::Skills,
+            PickerKind::Themes,
+            PickerKind::Mcp,
+            PickerKind::Todos,
+        ];
+        for kind in kinds {
+            let mut app = App::new(None);
+            app.picker = Some(Picker {
+                kind,
+                query: String::new(),
+                selected: 0,
+                items: vec![
+                    PickerItem::new("a").with_label("a").with_detail("first"),
+                    PickerItem::new("b")
+                        .with_label("long-label")
+                        .with_detail("second"),
+                    PickerItem::new("c")
+                        .with_label("a-very-long-label-that-exceeds-the-cap")
+                        .with_detail("third"),
+                ],
+                loading: false,
+                preview: PickerPreview::default(),
+                preview_request: None,
+            });
+
+            let rendered = render_text(&mut app, 60, 20);
+            let column = |needle: &str| {
+                rendered
+                    .lines()
+                    .find_map(|line| {
+                        line.find(needle)
+                            .map(|index| UnicodeWidthStr::width(&line[..index]))
+                    })
+                    .unwrap_or_else(|| panic!("{kind:?}: missing {needle}\n{rendered}"))
+            };
+            let first = column("first");
+            assert_eq!(first, column("second"), "{kind:?}\n{rendered}");
+            assert_eq!(first, column("third"), "{kind:?}\n{rendered}");
+        }
+    }
+
+    #[test]
+    fn session_picker_metadata_columns_align() {
+        let mut app = App::new(None);
+        app.sessions = vec![
+            Session::new("aaaaaaaa1", "a", "/tmp/one"),
+            Session::new("bbbbbbbb2", "a much longer session name", "/tmp/two"),
+        ];
+        app.picker = Some(Picker {
+            kind: PickerKind::Sessions,
+            query: String::new(),
+            selected: 0,
+            items: Vec::new(),
+            loading: false,
+            preview: PickerPreview::default(),
+            preview_request: None,
+        });
+
+        let rendered = render_text(&mut app, 80, 20);
+        let column = |needle: &str| {
+            rendered
+                .lines()
+                .find_map(|line| {
+                    line.find(needle)
+                        .map(|index| UnicodeWidthStr::width(&line[..index]))
+                })
+                .unwrap_or_else(|| panic!("missing {needle}\n{rendered}"))
+        };
+        assert_eq!(column("aaaaaaaa"), column("bbbbbbbb"), "{rendered}");
+        assert_eq!(column("/tmp/one"), column("/tmp/two"), "{rendered}");
     }
 
     #[test]
@@ -14942,9 +15370,14 @@ mod tests {
         app.open_picker(PickerKind::Git, &tx);
         assert!(app.picker.as_ref().unwrap().loading);
         match rx.try_recv().expect("picker command") {
-            Command::PickerData { session_id, kind } => {
+            Command::PickerData {
+                session_id,
+                kind,
+                query,
+            } => {
                 assert_eq!(session_id, "s1");
                 assert_eq!(kind, eix_core::KIND_GIT);
+                assert!(query.is_none());
             }
             _ => panic!("expected a picker command"),
         }
@@ -14993,6 +15426,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         app.focus = Focus::Input;
+        app.input.enter_insert();
 
         // Leaving insert mode does not arm the gesture.
         app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
@@ -15629,10 +16063,14 @@ mod tests {
         assert_eq!(app.input.mode(), Mode::Insert);
         app.focus = Focus::Transcript;
 
-        // leader+s no longer switches the focused pane's session.
+        // leader+s opens the content picker instead of switching sessions.
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE), &tx);
-        assert!(app.picker.is_none(), "leader+s still opened sessions");
+        assert!(matches!(
+            app.picker.as_ref().map(|picker| picker.kind),
+            Some(PickerKind::Grep)
+        ));
+        app.picker = None;
 
         // The leader retains the action.
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
@@ -16368,7 +16806,7 @@ mod tests {
         let reference = left(&app);
         assert_eq!(
             reference,
-            " I · Build  · ⠶ · deepseek-v4.1-flash · llmgate · high"
+            " N · Build  · ⠶ · deepseek-v4.1-flash · llmgate · high"
         );
         let first_dot = reference.find('·').expect("separator");
 
@@ -18341,7 +18779,7 @@ mod tests {
             "the composer keeps its border: {empty}"
         );
         assert!(!empty.contains("❯"), "{empty}");
-        assert!(empty.contains(" I "), "{empty}");
+        assert!(empty.contains(" N "), "{empty}");
         assert!(!empty.contains("INSERT"), "{empty}");
         let lines: Vec<&str> = empty.lines().collect();
         let top_border = lines
@@ -18354,9 +18792,9 @@ mod tests {
             .expect("prompt bottom");
         let status_bar = status_bar_row(&empty);
         assert!(!lines[top_border].contains("~/git/eix"), "{empty}");
-        assert!(!lines[prompt_bottom - 1].contains(" I "), "{empty}");
+        assert!(!lines[prompt_bottom - 1].contains(" N "), "{empty}");
         assert!(!lines[prompt_bottom - 1].contains("Build"), "{empty}");
-        assert!(status_bar.contains(" I · Build  ·"), "{empty}");
+        assert!(status_bar.contains(" N · Build  ·"), "{empty}");
         assert!(status_bar.contains("~/git/eix"), "{empty}");
         assert!(!lines[prompt_bottom - 1].contains("gpt-5"), "{empty}");
         assert!(status_bar.contains("gpt-5"), "{empty}");
@@ -18433,8 +18871,8 @@ mod tests {
 
         // The primary group is ordered Vim mode → agent mode → model →
         // provider → reasoning, and cwd stays pinned to the right edge.
-        assert!(bar.trim_start().starts_with("I · Build  ·"), "{bar}");
-        let vim_mode = bar.find('I').unwrap();
+        assert!(bar.trim_start().starts_with("N · Build  ·"), "{bar}");
+        let vim_mode = bar.find('N').unwrap();
         let build = bar.find("Build").unwrap();
         let model = bar.find("gpt-5").unwrap();
         let provider = bar.find("openai").unwrap();
