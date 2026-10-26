@@ -3384,12 +3384,25 @@ async fn rewind_restores_the_workspace_before_a_write() -> anyhow::Result<()> {
 }
 
 fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    std::process::Command::new("git")
+    let output = std::process::Command::new("git")
         .args(["-c", "user.email=eix@example.com", "-c", "user.name=eix"])
         .args(args)
         .current_dir(dir)
         .output()
-        .expect("run git")
+        .expect("run git");
+    // `-c` only covers this invocation, but the daemon shells out to git on its
+    // own (`worktree::commit_all`), so the identity has to be persisted into the
+    // repo config for those commits to succeed. Worktrees share the repo config.
+    if args.first() == Some(&"init") && output.status.success() {
+        for (key, value) in [("user.email", "eix@example.com"), ("user.name", "eix")] {
+            std::process::Command::new("git")
+                .args(["config", key, value])
+                .current_dir(dir)
+                .output()
+                .expect("git config");
+        }
+    }
+    output
 }
 
 fn git_stdout(dir: &Path, args: &[&str]) -> String {
