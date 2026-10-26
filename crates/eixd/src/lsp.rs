@@ -250,22 +250,30 @@ impl Client {
     async fn workspace_diagnostics(
         &mut self,
         paths: &[(PathBuf, String)],
-    ) -> Vec<(PathBuf, Vec<Diagnostic>)> {
+    ) -> Vec<(PathBuf, Result<Vec<Diagnostic>>)> {
         let mut opened = Vec::new();
+        let mut failed = Vec::new();
         for (path, language_id) in paths {
             match self.open_document(path, language_id).await {
                 Ok(uri) => opened.push((path.clone(), uri)),
-                Err(err) => eprintln!("eixd: lsp open {}: {err:#}", path.display()),
+                Err(err) => {
+                    eprintln!("eixd: lsp open {}: {err:#}", path.display());
+                    failed.push((path.clone(), err));
+                }
             }
         }
-        let deadline = Instant::now() + self.timeout.min(Duration::from_secs(5));
-        if let Err(err) = self.collect(deadline, Duration::from_millis(800)).await {
-            eprintln!("eixd: lsp workspace collection failed: {err:#}");
+        if !opened.is_empty() {
+            let deadline = Instant::now() + self.timeout.min(Duration::from_secs(5));
+            if let Err(err) = self.collect(deadline, Duration::from_millis(800)).await {
+                eprintln!("eixd: lsp workspace collection failed: {err:#}");
+            }
         }
-        opened
+        let mut results: Vec<_> = opened
             .into_iter()
-            .map(|(path, uri)| (path, self.diagnostics.remove(&uri).unwrap_or_default()))
-            .collect()
+            .map(|(path, uri)| (path, Ok(self.diagnostics.remove(&uri).unwrap_or_default())))
+            .collect();
+        results.extend(failed.into_iter().map(|(path, err)| (path, Err(err))));
+        results
     }
 }
 
@@ -309,6 +317,72 @@ impl LspSet {
         let language_id = language_id(server, path);
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         client.diagnostics(&path, &language_id).await
+    }
+
+    /// Diagnostics for several explicit files. Files handled by the same
+    /// language server are opened together and collected in one pass, so a
+    /// parallel write segment pays the collection window once instead of once
+    /// per file. Paths with no configured server return an empty list.
+    pub async fn diagnostics_many(
+        &mut self,
+        config: &Config,
+        cwd: &Path,
+        paths: &[PathBuf],
+    ) -> Vec<(PathBuf, std::result::Result<Vec<Diagnostic>, String>)> {
+        let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+        let mut grouped: HashMap<(String, PathBuf), Vec<(PathBuf, String)>> = HashMap::new();
+        let mut targets = Vec::with_capacity(paths.len());
+        for path in paths {
+            let canonical = path.canonicalize().unwrap_or_else(|_| path.clone());
+            targets.push((path.clone(), canonical.clone()));
+            let Some((name, server)) = server_for(config, path) else {
+                continue;
+            };
+            grouped
+                .entry((name.to_string(), root.clone()))
+                .or_default()
+                .push((canonical, language_id(server, path)));
+        }
+
+        let mut collected: HashMap<PathBuf, std::result::Result<Vec<Diagnostic>, String>> =
+            HashMap::new();
+        for (key, entries) in grouped {
+            let Some(server) = config.lsp.servers.get(&key.0) else {
+                continue;
+            };
+            if let Err(err) = ensure_client(
+                &mut self.clients,
+                &mut self.failures,
+                &key.0,
+                server,
+                &key.1,
+            )
+            .await
+            {
+                let message = format!("{err:#}");
+                for (path, _) in entries {
+                    collected.insert(path, Err(message.clone()));
+                }
+                continue;
+            }
+            let Some(client) = self.clients.get_mut(&key) else {
+                continue;
+            };
+            for (path, result) in client.workspace_diagnostics(&entries).await {
+                collected.insert(path, result.map_err(|err| format!("{err:#}")));
+            }
+        }
+
+        targets
+            .into_iter()
+            .map(|(path, canonical)| {
+                let result = collected
+                    .get(&canonical)
+                    .cloned()
+                    .unwrap_or_else(|| Ok(Vec::new()));
+                (path, result)
+            })
+            .collect()
     }
 
     /// Open every source file under `cwd` that a configured server claims and
@@ -368,6 +442,13 @@ impl LspSet {
             let client = self.clients.get_mut(&key).expect("inserted above");
             let results = client.workspace_diagnostics(paths).await;
             for (path, list) in results {
+                let list = match list {
+                    Ok(list) => list,
+                    Err(err) => {
+                        eprintln!("eixd: lsp diagnostics {}: {err:#}", path.display());
+                        continue;
+                    }
+                };
                 for diagnostic in list {
                     diagnostics.push(LspDiagnosticInfo {
                         path: path.clone(),
@@ -733,6 +814,99 @@ while True:
         let limited = set.workspace(&config, &dir, 1).await.unwrap();
         assert_eq!(limited.files, 1);
         assert_eq!(limited.skipped, 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn batch_diagnostics_opens_every_file_before_collecting() {
+        if Command::new("python3")
+            .arg("--version")
+            .output()
+            .await
+            .is_err()
+        {
+            eprintln!("python3 unavailable; skipping LSP batch test");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "eix-lsp-batch-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("server.py");
+        std::fs::write(
+            &script,
+            r#"
+import sys, json
+
+def read():
+    headers = {}
+    line = sys.stdin.buffer.readline()
+    if not line:
+        return None
+    while line not in (b"\r\n", b"\n"):
+        key, value = line.split(b":", 1)
+        headers[key.strip().lower()] = value.strip()
+        line = sys.stdin.buffer.readline()
+    return json.loads(sys.stdin.buffer.read(int(headers[b"content-length"])))
+
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+opened = []
+while True:
+    message = read()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {}}})
+    elif method == "textDocument/didOpen":
+        uri = message["params"]["textDocument"]["uri"]
+        opened.append(uri)
+        if len(opened) == 2:
+            for index, uri in enumerate(opened):
+                send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
+                    "uri": uri, "diagnostics": [{"range": {"start": {"line": 0, "character": 0}},
+                    "severity": 2, "message": "batch %d" % index}]}})
+"#,
+        )
+        .unwrap();
+        let first = dir.join("a.rs");
+        let second = dir.join("b.rs");
+        std::fs::write(&first, "fn a() {}\n").unwrap();
+        std::fs::write(&second, "fn b() {}\n").unwrap();
+        let mut config = Config::default();
+        config.lsp.servers.clear();
+        config.lsp.servers.insert(
+            "fake".into(),
+            LspServerConfig {
+                command: "python3".into(),
+                args: vec![script.display().to_string()],
+                extensions: vec!["rs".into()],
+                timeout_secs: 5,
+                ..Default::default()
+            },
+        );
+
+        let mut set = LspSet::new();
+        let results = set
+            .diagnostics_many(&config, &dir, &[first.clone(), second.clone()])
+            .await;
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].0, first);
+        assert_eq!(results[1].0, second);
+        for (_, result) in results {
+            let diagnostics = result.expect("batch diagnostics");
+            assert_eq!(diagnostics.len(), 1);
+            assert!(diagnostics[0].message.starts_with("batch "));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

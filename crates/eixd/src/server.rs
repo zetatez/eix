@@ -89,6 +89,23 @@ enum ParallelCall {
     Write(PermissionDecision, PathBuf),
 }
 
+/// A direct write whose tool result is recorded only after the whole write
+/// segment has collected diagnostics for every touched file.
+struct PendingWrite {
+    call: ToolCall,
+    ok: bool,
+    output: String,
+    duration_ms: u64,
+    paths: Vec<PathBuf>,
+}
+
+enum WriteCallOutcome {
+    /// The call failed before execution or was denied; its result is already
+    /// recorded.
+    Recorded(ChatMessage),
+    Pending(PendingWrite),
+}
+
 /// True when a call is read-only at the risk-analysis level. This is used for
 /// both the parallel segment and the earlier sub-agent overlap decision.
 fn call_is_parallel_readonly(call: &ToolCall, cwd: &Path) -> bool {
@@ -103,13 +120,15 @@ fn call_is_parallel_readonly(call: &ToolCall, cwd: &Path) -> bool {
         .is_some_and(|args| command_is_parallel_readonly(&args, cwd))
 }
 
-/// A batch of only reads and sub-agent starts can overlap safely: reads never
-/// change the workspace, so a child cannot observe a half-applied write.
-fn batch_can_overlap_agents(calls: &[ToolCall], cwd: &Path) -> bool {
-    calls.iter().any(|call| call.function.name == "spawn_agent")
-        && calls
-            .iter()
-            .all(|call| call.function.name == "spawn_agent" || call_is_parallel_readonly(call, cwd))
+/// Index of the last call that can change the workspace or daemon state.
+/// Sub-agents may start once this call has finished: everything after it is
+/// read-only (or another sub-agent start), so a child cannot observe a
+/// half-applied mutation. `None` means the whole batch is safe to overlap.
+fn last_agent_barrier(calls: &[ToolCall], cwd: &Path) -> Option<usize> {
+    calls.iter().enumerate().rev().find_map(|(index, call)| {
+        (call.function.name != "spawn_agent" && !call_is_parallel_readonly(call, cwd))
+            .then_some(index)
+    })
 }
 
 fn classifier_cache_key(
@@ -4745,9 +4764,11 @@ impl Daemon {
     /// are appended in call order even when the calls finish out of order.
     ///
     /// Every `spawn_agent` also runs concurrently and its result is appended
-    /// in call order. Children are read-only, so they may start before the
-    /// reads; batches containing writes or non-read-only commands still defer
-    /// them until those finish to avoid exposing a half-applied workspace.
+    /// in call order. Children are read-only, so they start as soon as the
+    /// last mutating call has finished and overlap with any trailing reads.
+    /// Mutating calls, approval-gated calls, and calls the risk analyzer cannot
+    /// prove read-only remain barriers, so a child never observes a
+    /// half-applied change.
     async fn run_tool_batch(
         self: &Arc<Self>,
         session_id: &str,
@@ -4758,43 +4779,50 @@ impl Daemon {
         cancel: &Arc<AtomicBool>,
     ) -> Result<()> {
         let session = self.require_session(session_id)?;
-        // Start sub-agents before the reads when the batch is only reads and
-        // sub-agent starts. There are no writes, so a child cannot observe a
-        // half-applied change; starting early overlaps its provider latency
-        // with the parent's reads. Other batches keep the old ordering.
-        let start_agents_early = batch_can_overlap_agents(calls, &session.cwd);
-        let mut agents = if start_agents_early {
-            let agent_calls: Vec<ToolCall> = calls
-                .iter()
-                .filter(|call| call.function.name == "spawn_agent")
-                .cloned()
-                .collect();
-            let agent_concurrency = self.subagent_concurrency.load(Ordering::Relaxed).max(2);
-            let agent_limit = Arc::new(Semaphore::new(agent_concurrency));
-            self.start_agent_tasks(
+        let agent_calls: Vec<ToolCall> = calls
+            .iter()
+            .filter(|call| call.function.name == "spawn_agent")
+            .cloned()
+            .collect();
+        let agent_start_after = if agent_calls.is_empty() {
+            None
+        } else {
+            last_agent_barrier(calls, &session.cwd)
+        };
+        let mut agents_started = agent_calls.is_empty();
+        let mut agents = Vec::new();
+        // With no mutating call in the batch, every read can overlap the child.
+        if !agents_started && agent_start_after.is_none() {
+            agents = self.start_batch_agents(
                 session_id,
                 turn_id,
-                agent_calls,
+                agent_calls.clone(),
                 Arc::clone(static_context),
-                agent_limit,
                 Arc::clone(cancel),
-            )
-        } else {
-            Vec::new()
-        };
+            );
+            agents_started = true;
+        }
 
         let mut index = 0;
         let mut tool_error = None;
-        let mut agent_calls = Vec::new();
         while index < calls.len() && tool_error.is_none() {
             if cancel.load(Ordering::SeqCst) {
                 break;
             }
+            // The loop has advanced past the last mutating call, so trailing
+            // reads may now run alongside the child.
+            if !agents_started && agent_start_after.is_some_and(|barrier| index > barrier) {
+                agents = self.start_batch_agents(
+                    session_id,
+                    turn_id,
+                    agent_calls.clone(),
+                    Arc::clone(static_context),
+                    Arc::clone(cancel),
+                );
+                agents_started = true;
+            }
             let call = &calls[index];
             if call.function.name == "spawn_agent" {
-                if !start_agents_early {
-                    agent_calls.push(call.clone());
-                }
                 index += 1;
                 continue;
             }
@@ -4930,31 +4958,35 @@ impl Daemon {
                             }
                         },
                     ));
+                    let mut outcomes = Vec::new();
                     for result in results.await {
                         match result {
-                            Ok(message) => messages.push(message),
+                            Ok(outcome) => outcomes.push(outcome),
                             Err(err) => {
                                 tool_error = Some(err);
                                 break;
                             }
                         }
                     }
+                    if let Err(err) = self
+                        .finish_file_write_segment(session_id, turn_id, outcomes, messages)
+                        .await
+                    {
+                        if tool_error.is_none() {
+                            tool_error = Some(err);
+                        }
+                    }
                 }
             }
         }
 
-        // Run writes/commands first, then the remaining sub-agents. A child is
-        // read-only but shares the workspace; starting it before the parent's
-        // writes in the same batch would let it observe a half-applied change.
-        if !start_agents_early && tool_error.is_none() {
-            let agent_concurrency = self.subagent_concurrency.load(Ordering::Relaxed).max(2);
-            let agent_limit = Arc::new(Semaphore::new(agent_concurrency));
-            agents = self.start_agent_tasks(
+        // If the last mutating call was the final call, start the child now.
+        if !agents_started && tool_error.is_none() {
+            agents = self.start_batch_agents(
                 session_id,
                 turn_id,
                 agent_calls,
                 Arc::clone(static_context),
-                agent_limit,
                 Arc::clone(cancel),
             );
         }
@@ -5029,6 +5061,19 @@ impl Daemon {
     /// Start `spawn_agent` calls concurrently under the configured fan-out.
     /// Each handle returns the child's final answer; tool events are recorded
     /// by `spawn_agent` itself.
+    fn start_batch_agents(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_id: &str,
+        calls: Vec<ToolCall>,
+        static_context: Arc<StaticContext>,
+        cancel: Arc<AtomicBool>,
+    ) -> Vec<(String, tokio::task::JoinHandle<Result<String>>)> {
+        let concurrency = self.subagent_concurrency.load(Ordering::Relaxed).max(2);
+        let limit = Arc::new(Semaphore::new(concurrency));
+        self.start_agent_tasks(session_id, turn_id, calls, static_context, limit, cancel)
+    }
+
     fn start_agent_tasks(
         self: &Arc<Self>,
         session_id: &str,
@@ -5200,14 +5245,17 @@ impl Daemon {
         call: &ToolCall,
         decision: &PermissionDecision,
         cancel: &AtomicBool,
-    ) -> Result<ChatMessage> {
+    ) -> Result<WriteCallOutcome> {
         let tool = call.function.name.as_str();
         let args: Value = match serde_json::from_str(&call.function.arguments) {
             Ok(args) => args,
             Err(err) => {
                 let output = format!("invalid JSON arguments: {err}");
                 self.record_tool_result(session_id, call, false, false, &output, 0)?;
-                return Ok(ChatMessage::tool(call.id.clone(), output));
+                return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
+                    call.id.clone(),
+                    output,
+                )));
             }
         };
         let event = self.store.append_event(
@@ -5224,17 +5272,26 @@ impl Daemon {
         if cancel.load(Ordering::SeqCst) {
             let output = "cancelled".to_string();
             self.record_tool_result(session_id, call, false, false, &output, 0)?;
-            return Ok(ChatMessage::tool(call.id.clone(), output));
+            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
+                call.id.clone(),
+                output,
+            )));
         }
         if !tools::is_known(tool) {
             let output = format!("unknown tool {tool:?}");
             self.record_tool_result(session_id, call, false, false, &output, 0)?;
-            return Ok(ChatMessage::tool(call.id.clone(), output));
+            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
+                call.id.clone(),
+                output,
+            )));
         }
         if !self.skill_allows(session_id, tool).await {
             let output = format!("the active skill does not allow the {tool} tool");
             self.record_tool_result(session_id, call, false, true, &output, 0)?;
-            return Ok(ChatMessage::tool(call.id.clone(), output));
+            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
+                call.id.clone(),
+                output,
+            )));
         }
 
         let session = self.require_session(session_id)?;
@@ -5243,7 +5300,10 @@ impl Daemon {
                 "sub-agents are read-only; mutating or interactive tools are not available"
                     .to_string();
             self.record_tool_result(session_id, call, false, true, &output, 0)?;
-            return Ok(ChatMessage::tool(call.id.clone(), output));
+            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
+                call.id.clone(),
+                output,
+            )));
         }
 
         self.record_permission(session_id, &call.id, tool, decision, None)?;
@@ -5262,11 +5322,15 @@ impl Daemon {
                     "duration_ms": 0,
                 }),
             );
-            return Ok(ChatMessage::tool(call.id.clone(), output));
+            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
+                call.id.clone(),
+                output,
+            )));
         }
 
-        self.run_direct_file_write(session_id, turn_id, call, &args, decision, cancel)
+        self.execute_direct_file_write(session_id, turn_id, call, &args, decision, cancel)
             .await
+            .map(WriteCallOutcome::Pending)
     }
 
     /// Run an already-approved direct `write_file` / `edit` and return its
@@ -5281,6 +5345,31 @@ impl Daemon {
         decision: &PermissionDecision,
         cancel: &AtomicBool,
     ) -> Result<ChatMessage> {
+        let pending = self
+            .execute_direct_file_write(session_id, turn_id, call, args, decision, cancel)
+            .await?;
+        let notes = if pending.ok {
+            let session = self.require_session(session_id)?;
+            let config = self.config.load();
+            self.lsp_notes(&config, &session.cwd, &pending.paths).await
+        } else {
+            String::new()
+        };
+        self.finish_direct_write(session_id, turn_id, pending, notes)
+    }
+
+    /// Apply an already-approved direct write without recording its result.
+    /// The caller either finalizes it immediately or batches diagnostics for
+    /// every write in the segment before recording the tool results.
+    async fn execute_direct_file_write(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        args: &Value,
+        decision: &PermissionDecision,
+        cancel: &AtomicBool,
+    ) -> Result<PendingWrite> {
         let tool = call.function.name.as_str();
         let session = self.require_session(session_id)?;
         let cwd = session.cwd.clone();
@@ -5326,10 +5415,6 @@ impl Daemon {
         if let Some(warning) = snapshot_warning {
             output.push_str(&format!("\n[snapshot failed: {warning}]"));
         }
-        if ok {
-            let paths = written_paths(tool, args, &cwd, &config);
-            output.push_str(&self.lsp_notes(&config, &cwd, &paths).await);
-        }
         let auto_diff = if ok {
             match auto_plan.as_ref() {
                 Some(plan) => Some(tools::refresh_plan(plan, &config).await.diff().to_string()),
@@ -5352,21 +5437,89 @@ impl Daemon {
                 auto_diff.as_deref(),
             )?;
         }
+        let paths = if ok {
+            written_paths(tool, args, &cwd, &config)
+        } else {
+            Vec::new()
+        };
+        Ok(PendingWrite {
+            call: call.clone(),
+            ok,
+            output,
+            duration_ms,
+            paths,
+        })
+    }
 
-        self.record_tool_result(session_id, call, ok, false, &output, duration_ms)?;
+    /// Record results for one write segment after a single LSP pass.
+    async fn finish_file_write_segment(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        outcomes: Vec<WriteCallOutcome>,
+        messages: &mut Vec<ChatMessage>,
+    ) -> Result<()> {
+        let session = self.require_session(session_id)?;
+        let config = self.config.load();
+        let mut paths = Vec::new();
+        let mut seen = HashSet::new();
+        for outcome in &outcomes {
+            if let WriteCallOutcome::Pending(pending) = outcome {
+                for path in &pending.paths {
+                    if seen.insert(path.clone()) {
+                        paths.push(path.clone());
+                    }
+                }
+            }
+        }
+        let notes = self.lsp_notes_many(&config, &session.cwd, &paths).await;
+        for outcome in outcomes {
+            match outcome {
+                WriteCallOutcome::Recorded(message) => messages.push(message),
+                WriteCallOutcome::Pending(pending) => {
+                    let notes = pending
+                        .paths
+                        .iter()
+                        .filter_map(|path| notes.get(path))
+                        .cloned()
+                        .collect::<String>();
+                    messages.push(self.finish_direct_write(session_id, turn_id, pending, notes)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish_direct_write(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        mut pending: PendingWrite,
+        notes: String,
+    ) -> Result<ChatMessage> {
+        pending.output.push_str(&notes);
+        let call = pending.call;
+        self.record_tool_result(
+            session_id,
+            &call,
+            pending.ok,
+            false,
+            &pending.output,
+            pending.duration_ms,
+        )?;
         self.emit_value(
             "tool.completed",
             json!({
                 "session_id": session_id,
                 "turn_id": turn_id,
-                "call_id": call.id,
-                "tool": tool,
-                "ok": ok,
+                "call_id": call.id.clone(),
+                "tool": call.function.name.clone(),
+                "ok": pending.ok,
                 "denied": false,
-                "duration_ms": duration_ms,
+                "duration_ms": pending.duration_ms,
             }),
         );
-        Ok(ChatMessage::tool(call.id.clone(), output))
+        Ok(ChatMessage::tool(call.id, pending.output))
     }
 
     /// Start one sub-agent and return its final answer as tool output.
@@ -7760,6 +7913,41 @@ impl Daemon {
         notes
     }
 
+    /// Collect diagnostics for every file written by one parallel segment in a
+    /// single pass, then return the rendered note for each path.
+    async fn lsp_notes_many(
+        &self,
+        config: &Config,
+        cwd: &Path,
+        paths: &[PathBuf],
+    ) -> HashMap<PathBuf, String> {
+        if paths.is_empty() {
+            return HashMap::new();
+        }
+        let results = {
+            let mut lsp = self.lsp.lock().await;
+            lsp.diagnostics_many(config, cwd, paths).await
+        };
+        results
+            .into_iter()
+            .map(|(path, result)| {
+                let mut notes = String::new();
+                match result {
+                    Ok(diagnostics) if !diagnostics.is_empty() => {
+                        notes.push_str("\n\nLSP diagnostics:\n");
+                        for diagnostic in diagnostics.iter().take(50) {
+                            notes.push_str(&diagnostic.label(&path));
+                            notes.push('\n');
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) => notes.push_str(&format!("\n[lsp: {err}]")),
+                }
+                (path, notes)
+            })
+            .collect()
+    }
+
     fn record_tool_result(
         &self,
         session_id: &str,
@@ -9081,7 +9269,7 @@ mod tests {
     }
 
     #[test]
-    fn read_and_agent_batches_overlap_only_without_mutations() {
+    fn agent_overlap_barrier_is_the_last_mutation() {
         fn call(name: &str, arguments: &str) -> ToolCall {
             ToolCall {
                 id: name.to_string(),
@@ -9094,45 +9282,69 @@ mod tests {
         }
         let cwd = Path::new("/tmp/eix-agent-overlap");
 
-        assert!(batch_can_overlap_agents(
-            &[
-                call("read_file", "{}"),
-                call("spawn_agent", "{}"),
-                call("grep", "{}"),
-            ],
-            cwd,
-        ));
-        assert!(batch_can_overlap_agents(&[call("spawn_agent", "{}")], cwd));
-        assert!(batch_can_overlap_agents(
-            &[
-                call("spawn_agent", "{}"),
-                call("run_command", r#"{"command":"git status --short"}"#),
-            ],
-            cwd,
-        ));
-        assert!(!batch_can_overlap_agents(
-            &[call("read_file", "{}"), call("grep", "{}")],
-            cwd
-        ));
-        assert!(!batch_can_overlap_agents(
-            &[
-                call("read_file", "{}"),
-                call("spawn_agent", "{}"),
-                call("write_file", "{}"),
-            ],
-            cwd
-        ));
-        assert!(!batch_can_overlap_agents(
-            &[
-                call("spawn_agent", "{}"),
-                call("run_command", r#"{"command":"rm -rf target"}"#),
-            ],
-            cwd
-        ));
-        assert!(!batch_can_overlap_agents(
-            &[call("spawn_agent", "{}"), call("todo", "{}")],
-            cwd
-        ));
+        assert_eq!(
+            last_agent_barrier(
+                &[
+                    call("read_file", "{}"),
+                    call("spawn_agent", "{}"),
+                    call("grep", "{}"),
+                ],
+                cwd,
+            ),
+            None
+        );
+        assert_eq!(last_agent_barrier(&[call("spawn_agent", "{}")], cwd), None);
+        assert_eq!(
+            last_agent_barrier(
+                &[
+                    call("spawn_agent", "{}"),
+                    call("run_command", r#"{"command":"git status --short"}"#),
+                ],
+                cwd,
+            ),
+            None
+        );
+        assert_eq!(
+            last_agent_barrier(&[call("read_file", "{}"), call("grep", "{}")], cwd),
+            None
+        );
+        // A write before the child still lets a trailing read overlap.
+        assert_eq!(
+            last_agent_barrier(
+                &[
+                    call("write_file", "{}"),
+                    call("spawn_agent", "{}"),
+                    call("read_file", "{}"),
+                ],
+                cwd,
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            last_agent_barrier(
+                &[
+                    call("read_file", "{}"),
+                    call("spawn_agent", "{}"),
+                    call("write_file", "{}"),
+                ],
+                cwd,
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            last_agent_barrier(
+                &[
+                    call("spawn_agent", "{}"),
+                    call("run_command", r#"{"command":"rm -rf target"}"#),
+                ],
+                cwd,
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            last_agent_barrier(&[call("spawn_agent", "{}"), call("todo", "{}")], cwd),
+            Some(1)
+        );
     }
 
     #[test]

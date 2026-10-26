@@ -7,13 +7,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
     AgentRole, ApprovalResult, AttachResult, Config, EventKind, EventsResult, FormatterConfig,
-    HelloResult, ModelConfig, PermissionAction, PermissionRule, ProviderConfig, Request, Response,
-    ServerMessage, SessionMode, SessionResult, SubmitResult, PROTOCOL_VERSION,
+    HelloResult, LspServerConfig, ModelConfig, PermissionAction, PermissionRule, ProviderConfig,
+    Request, Response, ServerMessage, SessionMode, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
 use tokio::net::{TcpListener, UnixStream};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, oneshot, Mutex};
 
 type ClientReader = BufReader<ReadHalf<UnixStream>>;
 
@@ -5007,6 +5007,116 @@ async fn spawn_agent_runs_a_readonly_child_and_returns_its_answer() -> anyhow::R
 }
 
 #[tokio::test]
+async fn subagents_start_after_writes_and_overlap_trailing_reads() -> anyhow::Result<()> {
+    let dir = temp_dir("agent-early");
+    std::fs::create_dir_all(&dir)?;
+
+    let slow = TcpListener::bind("127.0.0.1:0").await?;
+    let slow_addr = slow.local_addr()?;
+    let (read_started_tx, mut read_started_rx) = mpsc::channel(1);
+    let (release_tx, release_rx) = oneshot::channel::<()>();
+    let slow_http = tokio::spawn(async move {
+        let Ok((mut socket, _)) = slow.accept().await else {
+            return;
+        };
+        let mut buf = [0u8; 2048];
+        let _ = socket.read(&mut buf).await;
+        let _ = read_started_tx.send(()).await;
+        let _ = release_rx.await;
+        let body = "slow body";
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = socket.write_all(response.as_bytes()).await;
+    });
+
+    let child_started = Arc::new(AtomicBool::new(false));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(early_agent_provider(
+        listener,
+        format!("http://{slow_addr}/slow"),
+        Arc::clone(&child_started),
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-agent-early".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "parent", "cwd": dir}))
+        .await?;
+    let parent = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": parent, "text": "write, inspect, and verify"}),
+        )
+        .await?;
+
+    let read_started = tokio::time::timeout(Duration::from_secs(10), read_started_rx.recv()).await;
+    if !matches!(read_started, Ok(Some(()))) {
+        let _ = release_tx.send(());
+        daemon.abort();
+        mock.abort();
+        slow_http.abort();
+        anyhow::bail!("the trailing read never started");
+    }
+    let child_ok = tokio::time::timeout(Duration::from_secs(5), async {
+        while !child_started.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+    // Let the blocked read finish even when the assertion below will fail.
+    let _ = release_tx.send(());
+
+    let mut text = String::new();
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "message.delta" if notification.params["session_id"] == parent.as_str() => {
+                if let Some(delta) = notification.params["delta"].as_str() {
+                    text.push_str(delta);
+                }
+            }
+            "turn.completed"
+                if notification.params["session_id"] == parent.as_str()
+                    && notification.params["turn_id"] == submitted.turn_id.as_str() =>
+            {
+                break notification.params.clone();
+            }
+            _ => {}
+        }
+    };
+
+    assert!(completed["error"].is_null(), "{completed}");
+    assert_eq!(text, "parent done");
+    assert!(
+        child_ok,
+        "the child should start after the write and overlap the trailing read"
+    );
+    assert_eq!(std::fs::read_to_string(dir.join("early.txt"))?, "written\n");
+
+    daemon.abort();
+    mock.abort();
+    slow_http.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancelling_the_parent_stops_a_running_sub_agent() -> anyhow::Result<()> {
     let dir = temp_dir("agent-cancel");
     std::fs::create_dir_all(&dir)?;
@@ -7539,6 +7649,91 @@ async fn plugin_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>)
     }
 }
 
+/// Parent asks for a write, a child, and a slow read in one batch. The child
+/// marks itself started as soon as its provider request arrives.
+async fn early_agent_provider(
+    listener: TcpListener,
+    read_url: String,
+    child_started: Arc<AtomicBool>,
+) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let read_url = read_url.clone();
+        let child_started = Arc::clone(&child_started);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let tool_messages = value["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                })
+                .unwrap_or(0);
+            let can_spawn = value["tools"]
+                .as_array()
+                .map(|tools| {
+                    tools
+                        .iter()
+                        .any(|tool| tool["function"]["name"] == "spawn_agent")
+                })
+                .unwrap_or(false);
+
+            let chunk = if can_spawn && tool_messages == 0 {
+                let write = json!({"path": "early.txt", "content": "written\n"}).to_string();
+                let spawn = json!({"prompt": "investigate", "name": "scout"}).to_string();
+                let fetch = json!({"url": read_url}).to_string();
+                json!({
+                    "model": "mock-agent-early",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call_write",
+                                    "type": "function",
+                                    "function": {"name": "write_file", "arguments": write},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "call_agent",
+                                    "type": "function",
+                                    "function": {"name": "spawn_agent", "arguments": spawn},
+                                },
+                                {
+                                    "index": 2,
+                                    "id": "call_read",
+                                    "type": "function",
+                                    "function": {"name": "webfetch", "arguments": fetch},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            } else if can_spawn {
+                json!({
+                    "model": "mock-agent-early",
+                    "choices": [{"delta": {"content": "parent done"}, "finish_reason": "stop"}],
+                })
+            } else {
+                child_started.store(true, Ordering::SeqCst);
+                json!({
+                    "model": "mock-agent-early",
+                    "choices": [{"delta": {"content": "child answer"}, "finish_reason": "stop"}],
+                })
+            };
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
 /// A provider for the sub-agent test: the parent (whose tool list contains
 /// `spawn_agent`) asks for one child; the child (read-only tools) answers;
 /// the parent then stops with "parent done".
@@ -8850,6 +9045,116 @@ async fn parallel_write_provider(
     }
 }
 
+/// Provider that asks for two writes and only accepts an answer when both tool
+/// results contain the batched LSP diagnostics.
+async fn parallel_write_diagnostics_provider(listener: TcpListener) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let messages = value["messages"].as_array().cloned().unwrap_or_default();
+            let tool_messages: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            let chunk = if tool_messages.len() >= 2 {
+                let first = tool_messages[tool_messages.len() - 2]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let second = tool_messages[tool_messages.len() - 1]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let answer =
+                    if first.contains("LSP diagnostics") && second.contains("LSP diagnostics") {
+                        "diagnostics ok"
+                    } else {
+                        "missing diagnostics"
+                    };
+                json!({
+                    "model": "mock-parallel-diagnostics",
+                    "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
+                })
+            } else {
+                let a = json!({"path": "a.rs", "content": "fn a() {}\n"}).to_string();
+                let b = json!({"path": "b.rs", "content": "fn b() {}\n"}).to_string();
+                json!({
+                    "model": "mock-parallel-diagnostics",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "write_a",
+                                    "type": "function",
+                                    "function": {"name": "write_file", "arguments": a},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "write_b",
+                                    "type": "function",
+                                    "function": {"name": "write_file", "arguments": b},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
+fn batch_diagnostics_script(dir: &Path) -> PathBuf {
+    let script = dir.join("batch-lsp.py");
+    std::fs::write(
+        &script,
+        r#"
+import sys, json
+
+def read():
+    headers = {}
+    line = sys.stdin.buffer.readline()
+    if not line:
+        return None
+    while line not in (b"\r\n", b"\n"):
+        key, value = line.split(b":", 1)
+        headers[key.strip().lower()] = value.strip()
+        line = sys.stdin.buffer.readline()
+    return json.loads(sys.stdin.buffer.read(int(headers[b"content-length"])))
+
+def send(value):
+    body = json.dumps(value).encode()
+    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
+    sys.stdout.buffer.flush()
+
+opened = []
+while True:
+    message = read()
+    if message is None:
+        break
+    method = message.get("method")
+    if method == "initialize":
+        send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {}}})
+    elif method == "textDocument/didOpen":
+        uri = message["params"]["textDocument"]["uri"]
+        opened.append(uri)
+        if len(opened) == 2:
+            for index, uri in enumerate(opened):
+                send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
+                    "uri": uri, "diagnostics": [{"range": {"start": {"line": 0, "character": 0}},
+                    "severity": 2, "message": "batch %d" % index}]}})
+"#,
+    )
+    .expect("write batch LSP script");
+    script
+}
+
 fn waiting_formatter_script(dir: &Path) -> PathBuf {
     let script = dir.join("wait-for-release.sh");
     std::fs::write(
@@ -8973,6 +9278,110 @@ async fn parallel_write_batch_overlaps_independent_files_and_keeps_order() -> an
     assert_eq!(answer, "order ok");
     assert_eq!(std::fs::read_to_string(dir.join("a.txt"))?, "AAA\n");
     assert_eq!(std::fs::read_to_string(dir.join("b.txt"))?, "BBB\n");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn parallel_write_batch_collects_diagnostics_once() -> anyhow::Result<()> {
+    if std::process::Command::new("python3")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("python3 unavailable; skipping parallel LSP test");
+        return Ok(());
+    }
+    let dir = temp_dir("parallel-lsp");
+    std::fs::create_dir_all(&dir)?;
+    let script = batch_diagnostics_script(&dir);
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(parallel_write_diagnostics_provider(listener));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-parallel-diagnostics".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+    config.lsp.servers.clear();
+    config.lsp.servers.insert(
+        "fake".into(),
+        LspServerConfig {
+            command: "python3".into(),
+            args: vec![script.display().to_string()],
+            extensions: vec!["rs".into()],
+            timeout_secs: 5,
+            ..Default::default()
+        },
+    );
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "parallel-lsp", "cwd": dir}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write both files"}),
+        )
+        .await?;
+    let turn_id = submitted.turn_id.clone();
+
+    let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let notification = client.next_notification().await?;
+            if notification.method == "turn.completed"
+                && notification.params["session_id"] == session_id.as_str()
+                && notification.params["turn_id"] == turn_id.as_str()
+            {
+                return Ok::<Value, anyhow::Error>(notification.params.clone());
+            }
+        }
+    })
+    .await;
+
+    let completed = match completed {
+        Ok(result) => result?,
+        Err(_) => {
+            daemon.abort();
+            mock.abort();
+            anyhow::bail!("timed out waiting for the parallel LSP write turn");
+        }
+    };
+    assert!(completed["error"].is_null(), "{completed}");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let answer = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .map(|event| {
+            event.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(answer, "diagnostics ok");
+    assert_eq!(std::fs::read_to_string(dir.join("a.rs"))?, "fn a() {}\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.rs"))?, "fn b() {}\n");
 
     daemon.abort();
     mock.abort();
