@@ -52,7 +52,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::context::{estimate_request_tokens, estimate_tool_schema_tokens, Ledger, StaticContext};
-use crate::permissions::{decide as permission_decide, PermissionDecision};
+use crate::permissions::{
+    command_is_parallel_readonly, decide as permission_decide, PermissionDecision,
+};
 use crate::process::ProcessRegistry;
 use crate::provider::{Provider, ProviderError, RetryClass};
 use crate::snapshot::{Scope, Snapshotter};
@@ -69,16 +71,45 @@ const REPAIR_PENDING_STAGE: &str = "repair pending: ";
 /// transcript. The repair prompt still carries its own (larger) failure tail.
 const INTEGRATION_LOG_CHARS: usize = 8_000;
 
-/// Bound fan-out for one read-only tool batch.
-const READONLY_CONCURRENCY: usize = 8;
+/// Bound fan-out for one read-only tool batch, including `run_command` calls
+/// that passed the read-only risk check.
+const PARALLEL_TOOL_CONCURRENCY: usize = 8;
+
+/// Bound fan-out for one write segment. File writes to independent paths are
+/// I/O-bound, so they can tolerate more overlap than reads.
+const PARALLEL_WRITE_CONCURRENCY: usize = 32;
+
+/// A call that may join a concurrent tool-batch segment. The permission
+/// decision is computed before the segment starts so every parallel call
+/// records exactly the decision that admitted it.
+enum ParallelCall {
+    Read(PermissionDecision),
+    /// A direct (already allowed) file write and the canonical identity of its
+    /// target. Two writes may overlap only when these identities do not.
+    Write(PermissionDecision, PathBuf),
+}
+
+/// True when a call is read-only at the risk-analysis level. This is used for
+/// both the parallel segment and the earlier sub-agent overlap decision.
+fn call_is_parallel_readonly(call: &ToolCall, cwd: &Path) -> bool {
+    if tools::parallel_safe(&call.function.name) {
+        return true;
+    }
+    if call.function.name != "run_command" {
+        return false;
+    }
+    serde_json::from_str::<Value>(&call.function.arguments)
+        .ok()
+        .is_some_and(|args| command_is_parallel_readonly(&args, cwd))
+}
 
 /// A batch of only reads and sub-agent starts can overlap safely: reads never
 /// change the workspace, so a child cannot observe a half-applied write.
-fn batch_can_overlap_agents(calls: &[ToolCall]) -> bool {
+fn batch_can_overlap_agents(calls: &[ToolCall], cwd: &Path) -> bool {
     calls.iter().any(|call| call.function.name == "spawn_agent")
-        && calls.iter().all(|call| {
-            call.function.name == "spawn_agent" || tools::parallel_safe(&call.function.name)
-        })
+        && calls
+            .iter()
+            .all(|call| call.function.name == "spawn_agent" || call_is_parallel_readonly(call, cwd))
 }
 
 fn classifier_cache_key(
@@ -246,6 +277,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         memory: MemoryStore::new(data_dir.join("memory")),
         started: Instant::now(),
         snapshots,
+        snapshot_lock: Mutex::new(()),
         staging,
         processes,
         mcp: Mutex::new(crate::mcp::McpSet::new()),
@@ -488,6 +520,11 @@ pub(crate) struct Daemon {
     started: Instant,
     /// Pre-execution snapshots for mutating tools.
     snapshots: Snapshotter,
+    /// Serializes snapshot capture/pruning. File snapshots are cheap, but
+    /// pruning is not safe while another capture is creating its directory;
+    /// holding this only around the snapshot (not the mutation) keeps writes to
+    /// different files concurrent.
+    snapshot_lock: Mutex<()>,
     /// Staged `write_file` proposals, the session shadow workspace.
     staging: Staging,
     /// Background processes started with `start_command`.
@@ -4478,10 +4515,21 @@ impl Daemon {
         Ok(())
     }
 
-    /// Run one assistant tool batch. Regular tools run in call order; every
-    /// `spawn_agent` call runs concurrently and its result is appended in call
-    /// order, so several sub-agents can work at once without racing files
-    /// (they are read-only).
+    /// Run one assistant tool batch in two kinds of concurrent segments:
+    ///
+    /// - consecutive read-only calls (including proven read-only commands)
+    /// - consecutive direct `write_file` / `edit` calls whose target files do
+    ///   not overlap
+    ///
+    /// Reads, non-read-only commands, approval-gated calls, interactive calls,
+    /// overlapping writes, and `patch` act as segment barriers, so call order
+    /// is preserved and a read after a write always sees the new bytes. Results
+    /// are appended in call order even when the calls finish out of order.
+    ///
+    /// Every `spawn_agent` also runs concurrently and its result is appended
+    /// in call order. Children are read-only, so they may start before the
+    /// reads; batches containing writes or non-read-only commands still defer
+    /// them until those finish to avoid exposing a half-applied workspace.
     async fn run_tool_batch(
         self: &Arc<Self>,
         session_id: &str,
@@ -4491,11 +4539,12 @@ impl Daemon {
         messages: &mut Vec<ChatMessage>,
         cancel: &Arc<AtomicBool>,
     ) -> Result<()> {
+        let session = self.require_session(session_id)?;
         // Start sub-agents before the reads when the batch is only reads and
         // sub-agent starts. There are no writes, so a child cannot observe a
         // half-applied change; starting early overlaps its provider latency
         // with the parent's reads. Other batches keep the old ordering.
-        let start_agents_early = batch_can_overlap_agents(calls);
+        let start_agents_early = batch_can_overlap_agents(calls, &session.cwd);
         let mut agents = if start_agents_early {
             let agent_calls: Vec<ToolCall> = calls
                 .iter()
@@ -4516,63 +4565,169 @@ impl Daemon {
             Vec::new()
         };
 
-        // Only a leading read-only prefix can run concurrently. A read after a
-        // write may need to observe the written bytes, so later reads stay in
-        // call order. This covers the common "inspect several files" batch
-        // without changing the provider contract.
-        let readonly = calls
-            .iter()
-            .take_while(|call| tools::parallel_safe(&call.function.name))
-            .count();
         let mut index = 0;
         let mut tool_error = None;
-        if readonly > 1 {
-            let limit = Arc::new(Semaphore::new(READONLY_CONCURRENCY));
-            let results = futures_util::future::join_all(calls[..readonly].iter().map(|call| {
-                let daemon = Arc::clone(self);
-                let limit = Arc::clone(&limit);
-                async move {
-                    let _permit = limit.acquire_owned().await.expect("semaphore open");
-                    daemon
-                        .run_readonly_call(session_id, turn_id, call, cancel.as_ref())
-                        .await
+        let mut agent_calls = Vec::new();
+        while index < calls.len() && tool_error.is_none() {
+            if cancel.load(Ordering::SeqCst) {
+                break;
+            }
+            let call = &calls[index];
+            if call.function.name == "spawn_agent" {
+                if !start_agents_early {
+                    agent_calls.push(call.clone());
                 }
-            }));
-            for result in results.await {
-                match result {
-                    Ok(message) => messages.push(message),
-                    Err(err) => {
-                        tool_error = Some(err);
-                        break;
+                index += 1;
+                continue;
+            }
+
+            let Some(kind) = self.parallel_call_kind(&session, call).await else {
+                if let Err(err) = self
+                    .run_tool_call(session_id, turn_id, call, messages, cancel.as_ref())
+                    .await
+                {
+                    tool_error = Some(err);
+                }
+                index += 1;
+                continue;
+            };
+
+            match kind {
+                ParallelCall::Read(decision) => {
+                    // Grow the read segment until the next write, non-read-only
+                    // command, interactive call, agent, or call needing
+                    // approval. A read after a write therefore never joins the
+                    // earlier read segment.
+                    let mut segment = vec![(call.clone(), decision)];
+                    index += 1;
+                    while index < calls.len() {
+                        let next = &calls[index];
+                        if next.function.name == "spawn_agent" {
+                            break;
+                        }
+                        match self.parallel_call_kind(&session, next).await {
+                            Some(ParallelCall::Read(decision)) => {
+                                segment.push((next.clone(), decision));
+                                index += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    if segment.len() == 1 {
+                        let (call, _) = segment.pop().expect("one call");
+                        if let Err(err) = self
+                            .run_tool_call(session_id, turn_id, &call, messages, cancel.as_ref())
+                            .await
+                        {
+                            tool_error = Some(err);
+                        }
+                        continue;
+                    }
+
+                    let limit = Arc::new(Semaphore::new(PARALLEL_TOOL_CONCURRENCY));
+                    let results = futures_util::future::join_all(segment.into_iter().map(
+                        |(call, decision)| {
+                            let daemon = Arc::clone(self);
+                            let limit = Arc::clone(&limit);
+                            let cancel = Arc::clone(cancel);
+                            async move {
+                                let _permit = limit.acquire_owned().await.expect("semaphore open");
+                                daemon
+                                    .run_readonly_call(
+                                        session_id,
+                                        turn_id,
+                                        &call,
+                                        &decision,
+                                        cancel.as_ref(),
+                                    )
+                                    .await
+                            }
+                        },
+                    ));
+                    for result in results.await {
+                        match result {
+                            Ok(message) => messages.push(message),
+                            Err(err) => {
+                                tool_error = Some(err);
+                                break;
+                            }
+                        }
+                    }
+                }
+                ParallelCall::Write(decision, target) => {
+                    // Same-file writes must stay in call order: the second may
+                    // be an `edit` based on the first result. Different files
+                    // have disjoint snapshots and formatter runs, so they can
+                    // overlap. `patch` and approval-gated writes never enter
+                    // this branch.
+                    let mut segment = vec![(call.clone(), decision, target)];
+                    index += 1;
+                    while index < calls.len() {
+                        let next = &calls[index];
+                        if next.function.name == "spawn_agent" {
+                            break;
+                        }
+                        match self.parallel_call_kind(&session, next).await {
+                            Some(ParallelCall::Write(decision, target))
+                                if segment.iter().all(|(_, _, existing)| {
+                                    !write_paths_overlap(existing, &target)
+                                }) =>
+                            {
+                                segment.push((next.clone(), decision, target));
+                                index += 1;
+                            }
+                            _ => break,
+                        }
+                    }
+
+                    if segment.len() == 1 {
+                        let (call, _, _) = segment.pop().expect("one call");
+                        if let Err(err) = self
+                            .run_tool_call(session_id, turn_id, &call, messages, cancel.as_ref())
+                            .await
+                        {
+                            tool_error = Some(err);
+                        }
+                        continue;
+                    }
+
+                    let limit = Arc::new(Semaphore::new(PARALLEL_WRITE_CONCURRENCY));
+                    let results = futures_util::future::join_all(segment.into_iter().map(
+                        |(call, decision, _)| {
+                            let daemon = Arc::clone(self);
+                            let limit = Arc::clone(&limit);
+                            let cancel = Arc::clone(cancel);
+                            async move {
+                                let _permit = limit.acquire_owned().await.expect("semaphore open");
+                                daemon
+                                    .run_file_write_call(
+                                        session_id,
+                                        turn_id,
+                                        &call,
+                                        &decision,
+                                        cancel.as_ref(),
+                                    )
+                                    .await
+                            }
+                        },
+                    ));
+                    for result in results.await {
+                        match result {
+                            Ok(message) => messages.push(message),
+                            Err(err) => {
+                                tool_error = Some(err);
+                                break;
+                            }
+                        }
                     }
                 }
             }
-            index = readonly;
         }
 
         // Run writes/commands first, then the remaining sub-agents. A child is
         // read-only but shares the workspace; starting it before the parent's
         // writes in the same batch would let it observe a half-applied change.
-        let mut agent_calls = Vec::new();
-        if tool_error.is_none() {
-            for call in &calls[index..] {
-                if cancel.load(Ordering::SeqCst) {
-                    break;
-                }
-                if call.function.name == "spawn_agent" {
-                    if !start_agents_early {
-                        agent_calls.push(call.clone());
-                    }
-                } else if let Err(err) = self
-                    .run_tool_call(session_id, turn_id, call, messages, cancel.as_ref())
-                    .await
-                {
-                    tool_error = Some(err);
-                    break;
-                }
-            }
-        }
-
         if !start_agents_early && tool_error.is_none() {
             let agent_concurrency = self.subagent_concurrency.load(Ordering::Relaxed).max(2);
             let agent_limit = Arc::new(Semaphore::new(agent_concurrency));
@@ -4590,6 +4745,67 @@ impl Daemon {
             return Err(err);
         }
         Ok(())
+    }
+
+    /// Decide whether a call can join a concurrent segment and return the
+    /// permission decision that the parallel path must record.
+    ///
+    /// Reads and `run_command` calls are checked through the normal permission
+    /// pipeline: a secret read, an explicit ask/deny rule, or a command the
+    /// risk analyzer cannot prove read-only stays sequential.
+    ///
+    /// Direct `write_file` / `edit` calls join a write segment only when the
+    /// static decision is already `allow` (the default auto-apply path or an
+    /// explicit allow rule). Writes that need approval, classifier review,
+    /// staging, or a `patch` tree snapshot stay sequential.
+    async fn parallel_call_kind(&self, session: &Session, call: &ToolCall) -> Option<ParallelCall> {
+        let tool = call.function.name.as_str();
+        let args: Value = serde_json::from_str(&call.function.arguments).ok()?;
+        let session_rules = self
+            .always
+            .lock()
+            .await
+            .get(&session.id)
+            .cloned()
+            .unwrap_or_default();
+        let config = self.config.load();
+
+        if tools::parallel_safe(tool) || tool == "run_command" {
+            if tool == "run_command" && !command_is_parallel_readonly(&args, &session.cwd) {
+                return None;
+            }
+            let decision = permission_decide(
+                tool,
+                &args,
+                &session.cwd,
+                &config,
+                self.session_mode(session),
+                &session_rules,
+                false,
+            );
+            return (decision.action == PermissionAction::Allow
+                && !decision.force_ask
+                && !decision.risk.mutates_workspace())
+            .then_some(ParallelCall::Read(decision));
+        }
+
+        if !matches!(tool, "write_file" | "edit") || session.origin == SessionOrigin::Agent {
+            return None;
+        }
+        let decision = permission_decide(
+            tool,
+            &args,
+            &session.cwd,
+            &config,
+            self.session_mode(session),
+            &session_rules,
+            false,
+        );
+        if decision.action != PermissionAction::Allow || decision.force_ask {
+            return None;
+        }
+        let target = write_target_identity(&args, &session.cwd, &config)?;
+        Some(ParallelCall::Write(decision, target))
     }
 
     /// Start `spawn_agent` calls concurrently under the configured fan-out.
@@ -4645,13 +4861,16 @@ impl Daemon {
     }
 
     /// Execute one read-only call without borrowing `messages`, so a whole
-    /// batch can be joined concurrently. Event recording and notifications are
-    /// the same as the sequential path.
+    /// segment can be joined concurrently. Event recording and notifications
+    /// are the same as the sequential path. The permission decision was made
+    /// before the call joined the segment and is recorded here, so the
+    /// parallel path cannot bypass the approval pipeline.
     async fn run_readonly_call(
         &self,
         session_id: &str,
         turn_id: &str,
         call: &ToolCall,
+        decision: &PermissionDecision,
         cancel: &AtomicBool,
     ) -> Result<ChatMessage> {
         let tool = call.function.name.as_str();
@@ -4691,6 +4910,24 @@ impl Daemon {
         }
 
         let session = self.require_session(session_id)?;
+        self.record_permission(session_id, &call.id, tool, decision, None)?;
+        if decision.action != PermissionAction::Allow {
+            let output = decision.reason.clone();
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            self.emit_value(
+                "tool.completed",
+                json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "call_id": call.id,
+                    "tool": tool,
+                    "ok": false,
+                    "denied": true,
+                    "duration_ms": 0,
+                }),
+            );
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
         self.emit_value(
             "tool.started",
             json!({
@@ -4718,6 +4955,186 @@ impl Daemon {
             }
         };
         let (ok, output, duration_ms) = (outcome.ok, outcome.output, outcome.duration_ms);
+        self.record_tool_result(session_id, call, ok, false, &output, duration_ms)?;
+        self.emit_value(
+            "tool.completed",
+            json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "call_id": call.id,
+                "tool": tool,
+                "ok": ok,
+                "denied": false,
+                "duration_ms": duration_ms,
+            }),
+        );
+        Ok(ChatMessage::tool(call.id.clone(), output))
+    }
+
+    /// Execute one direct `write_file` / `edit` call in a concurrent write
+    /// segment. The permission decision was computed before the segment
+    /// started; this path only records it and never prompts, snapshots a
+    /// different file, or lets a write join a segment whose target overlaps.
+    async fn run_file_write_call(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        decision: &PermissionDecision,
+        cancel: &AtomicBool,
+    ) -> Result<ChatMessage> {
+        let tool = call.function.name.as_str();
+        let args: Value = match serde_json::from_str(&call.function.arguments) {
+            Ok(args) => args,
+            Err(err) => {
+                let output = format!("invalid JSON arguments: {err}");
+                self.record_tool_result(session_id, call, false, false, &output, 0)?;
+                return Ok(ChatMessage::tool(call.id.clone(), output));
+            }
+        };
+        let event = self.store.append_event(
+            session_id,
+            EventKind::ToolCall,
+            payload(&ToolCallPayload {
+                call_id: call.id.clone(),
+                tool: tool.to_string(),
+                arguments: args.clone(),
+            }),
+        )?;
+        self.emit_event(&event);
+
+        if cancel.load(Ordering::SeqCst) {
+            let output = "cancelled".to_string();
+            self.record_tool_result(session_id, call, false, false, &output, 0)?;
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+        if !tools::is_known(tool) {
+            let output = format!("unknown tool {tool:?}");
+            self.record_tool_result(session_id, call, false, false, &output, 0)?;
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+        if !self.skill_allows(session_id, tool).await {
+            let output = format!("the active skill does not allow the {tool} tool");
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+
+        let session = self.require_session(session_id)?;
+        if session.origin == SessionOrigin::Agent {
+            let output =
+                "sub-agents are read-only; mutating or interactive tools are not available"
+                    .to_string();
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+
+        self.record_permission(session_id, &call.id, tool, decision, None)?;
+        if decision.action != PermissionAction::Allow || decision.force_ask {
+            let output = decision.reason.clone();
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            self.emit_value(
+                "tool.completed",
+                json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "call_id": call.id,
+                    "tool": tool,
+                    "ok": false,
+                    "denied": true,
+                    "duration_ms": 0,
+                }),
+            );
+            return Ok(ChatMessage::tool(call.id.clone(), output));
+        }
+
+        self.run_direct_file_write(session_id, turn_id, call, &args, decision, cancel)
+            .await
+    }
+
+    /// Run an already-approved direct `write_file` / `edit` and return its
+    /// provider message. Kept separate from `run_tool_call` so a whole write
+    /// segment can join without borrowing the transcript vector.
+    async fn run_direct_file_write(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        args: &Value,
+        decision: &PermissionDecision,
+        cancel: &AtomicBool,
+    ) -> Result<ChatMessage> {
+        let tool = call.function.name.as_str();
+        let session = self.require_session(session_id)?;
+        let cwd = session.cwd.clone();
+        let config = self.config.load();
+        // Direct writes bypass the approval card. Remember the pre-write base
+        // so the post-format file can still be diffed against the old bytes.
+        let auto_plan = tools::write_plan(tool, args, &cwd, &config).await;
+        let snapshot_warning = self
+            .capture_snapshot(
+                session_id,
+                tool,
+                call,
+                args,
+                &decision.risk,
+                auto_plan.as_ref(),
+            )
+            .await?;
+
+        self.emit_value(
+            "tool.started",
+            json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "call_id": call.id,
+                "tool": tool,
+            }),
+        );
+        let outcome = match &auto_plan {
+            Some(plan) => tools::apply_plan(plan, None, &cwd, &config).await,
+            None => {
+                tools::execute_in(
+                    tool,
+                    args,
+                    &cwd,
+                    &config,
+                    Some(cancel),
+                    session.worktree.as_deref(),
+                )
+                .await
+            }
+        };
+        let (ok, mut output, duration_ms) = (outcome.ok, outcome.output, outcome.duration_ms);
+        if let Some(warning) = snapshot_warning {
+            output.push_str(&format!("\n[snapshot failed: {warning}]"));
+        }
+        if ok {
+            let paths = written_paths(tool, args, &cwd, &config);
+            output.push_str(&self.lsp_notes(&config, &cwd, &paths).await);
+        }
+        let auto_diff = if ok {
+            match auto_plan.as_ref() {
+                Some(plan) => Some(tools::refresh_plan(plan, &config).await.diff().to_string()),
+                None => None,
+            }
+        } else {
+            None
+        };
+        if ok {
+            let path = auto_plan
+                .as_ref()
+                .map(|plan| plan.label().to_string())
+                .or_else(|| args.get("path").and_then(Value::as_str).map(str::to_string))
+                .unwrap_or_default();
+            self.record_auto_patch(
+                session_id,
+                call,
+                &path,
+                &decision.reason,
+                auto_diff.as_deref(),
+            )?;
+        }
+
         self.record_tool_result(session_id, call, ok, false, &output, duration_ms)?;
         self.emit_value(
             "tool.completed",
@@ -5263,6 +5680,16 @@ impl Daemon {
             return Ok(());
         }
 
+        // Direct file writes share the execution path used by parallel write
+        // segments. Approval-gated writes and staged proposals stay below.
+        if decision.action != PermissionAction::Ask && matches!(tool, "write_file" | "edit") {
+            let message = self
+                .run_direct_file_write(session_id, turn_id, call, &args, &decision, cancel)
+                .await?;
+            messages.push(message);
+            return Ok(());
+        }
+
         // Low/medium writes under an `ask` decision go into the shadow
         // workspace and return immediately. The user applies or rejects them
         // later. High/critical writes and forced asks block on an approval card
@@ -5306,14 +5733,6 @@ impl Daemon {
 
         let denied = denial.is_some();
         let direct_write = !denied && decision.action != PermissionAction::Ask;
-        // Direct writes bypass the approval card. Remember the pre-write base
-        // so the post-format file can still be diffed against the old bytes.
-        let auto_plan = if direct_write && matches!(tool, "write_file" | "edit") {
-            let session = self.require_session(session_id)?;
-            tools::write_plan(tool, &args, &session.cwd, &self.config.load()).await
-        } else {
-            None
-        };
         let auto_patch_ops = if direct_write && tool == "patch" {
             let session = self.require_session(session_id)?;
             let patch_text = args
@@ -5412,7 +5831,7 @@ impl Daemon {
         // auto-applied cards both show the code that actually landed on disk.
         let auto_diff = if ok {
             let config = self.config.load();
-            if let Some(plan) = plan.as_ref().or(auto_plan.as_ref()) {
+            if let Some(plan) = plan.as_ref() {
                 Some(tools::refresh_plan(plan, &config).await.diff().to_string())
             } else if let Some(ops) = patch_ops.as_ref().filter(|ops| !ops.is_empty()) {
                 Some(tools::refresh_patch_diff(ops, &config).await)
@@ -5429,7 +5848,6 @@ impl Daemon {
         if ok && record_change {
             let path = plan
                 .as_ref()
-                .or(auto_plan.as_ref())
                 .map(|plan| plan.label().to_string())
                 .or_else(|| args.get("path").and_then(Value::as_str).map(str::to_string))
                 .or_else(|| auto_diff.as_deref().and_then(first_diff_path))
@@ -6994,6 +7412,10 @@ impl Daemon {
         if !(risk.mutates_workspace() || mcp_mutating) || !self.config.load().tools.snapshots {
             return Ok(None);
         }
+        // Snapshot directories are pruned after each capture. Serializing just
+        // this part keeps concurrent writes to different files from deleting
+        // each other's fresh snapshot while still letting the writes overlap.
+        let _snapshot_guard = self.snapshot_lock.lock().await;
         let cwd = self.require_session(session_id)?.cwd;
         let scope = if matches!(tool, "write_file" | "edit") {
             Scope::File
@@ -7959,6 +8381,40 @@ fn first_diff_path(diff: &str) -> Option<String> {
     })
 }
 
+/// Canonical identity of a `write_file` / `edit` target, used only to decide
+/// whether two writes overlap. Existing files resolve through symlinks; a new
+/// file resolves through its nearest existing ancestor. Ambiguous targets (for
+/// example a dangling symlink) return `None` and stay in the sequential path.
+fn write_target_identity(args: &Value, cwd: &Path, config: &Config) -> Option<PathBuf> {
+    let target = tools::write_target(args, cwd, config)?;
+    if let Ok(real) = target.canonicalize() {
+        return Some(real);
+    }
+    if target.symlink_metadata().is_ok() {
+        return None;
+    }
+    let mut suffix = Vec::new();
+    let mut current = target.as_path();
+    loop {
+        if let Ok(real) = current.canonicalize() {
+            let mut resolved = real;
+            for name in suffix.iter().rev() {
+                resolved.push(name);
+            }
+            return Some(resolved);
+        }
+        suffix.push(current.file_name()?.to_os_string());
+        current = current.parent()?;
+    }
+}
+
+/// Two writes overlap when they name the same file or one target is an
+/// ancestor directory of the other. Component-aware `starts_with` avoids
+/// treating sibling names such as `a.txt` and `a.txt.bak` as a prefix match.
+fn write_paths_overlap(a: &Path, b: &Path) -> bool {
+    a == b || a.starts_with(b) || b.starts_with(a)
+}
+
 /// Files a successful write touched, for post-edit diagnostics.
 fn written_paths(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Vec<PathBuf> {
     if matches!(tool, "write_file" | "edit") {
@@ -8377,40 +8833,57 @@ mod tests {
 
     #[test]
     fn read_and_agent_batches_overlap_only_without_mutations() {
-        fn call(name: &str) -> ToolCall {
+        fn call(name: &str, arguments: &str) -> ToolCall {
             ToolCall {
                 id: name.to_string(),
                 kind: "function".to_string(),
                 function: FunctionCall {
                     name: name.to_string(),
-                    arguments: "{}".to_string(),
+                    arguments: arguments.to_string(),
                 },
             }
         }
+        let cwd = Path::new("/tmp/eix-agent-overlap");
 
-        assert!(batch_can_overlap_agents(&[
-            call("read_file"),
-            call("spawn_agent"),
-            call("grep"),
-        ]));
-        assert!(batch_can_overlap_agents(&[call("spawn_agent")]));
-        assert!(!batch_can_overlap_agents(&[
-            call("read_file"),
-            call("grep")
-        ]));
-        assert!(!batch_can_overlap_agents(&[
-            call("read_file"),
-            call("spawn_agent"),
-            call("write_file"),
-        ]));
-        assert!(!batch_can_overlap_agents(&[
-            call("spawn_agent"),
-            call("run_command"),
-        ]));
-        assert!(!batch_can_overlap_agents(&[
-            call("spawn_agent"),
-            call("todo"),
-        ]));
+        assert!(batch_can_overlap_agents(
+            &[
+                call("read_file", "{}"),
+                call("spawn_agent", "{}"),
+                call("grep", "{}"),
+            ],
+            cwd,
+        ));
+        assert!(batch_can_overlap_agents(&[call("spawn_agent", "{}")], cwd));
+        assert!(batch_can_overlap_agents(
+            &[
+                call("spawn_agent", "{}"),
+                call("run_command", r#"{"command":"git status --short"}"#),
+            ],
+            cwd,
+        ));
+        assert!(!batch_can_overlap_agents(
+            &[call("read_file", "{}"), call("grep", "{}")],
+            cwd
+        ));
+        assert!(!batch_can_overlap_agents(
+            &[
+                call("read_file", "{}"),
+                call("spawn_agent", "{}"),
+                call("write_file", "{}"),
+            ],
+            cwd
+        ));
+        assert!(!batch_can_overlap_agents(
+            &[
+                call("spawn_agent", "{}"),
+                call("run_command", r#"{"command":"rm -rf target"}"#),
+            ],
+            cwd
+        ));
+        assert!(!batch_can_overlap_agents(
+            &[call("spawn_agent", "{}"), call("todo", "{}")],
+            cwd
+        ));
     }
 
     #[test]
@@ -8609,5 +9082,42 @@ mod tests {
             ),
             max
         );
+    }
+
+    #[test]
+    fn write_target_identity_resolves_symlinks_and_overlap_prefixes() {
+        let dir = std::env::temp_dir().join(format!(
+            "eix-write-identity-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("file.txt"), "contents").unwrap();
+        std::os::unix::fs::symlink(dir.join("file.txt"), dir.join("link.txt")).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing.txt"), dir.join("dangling.txt")).unwrap();
+        let config = Config::default();
+
+        let linked = write_target_identity(&json!({"path": "link.txt"}), &dir, &config).unwrap();
+        let direct = write_target_identity(&json!({"path": "file.txt"}), &dir, &config).unwrap();
+        assert_eq!(linked, direct);
+        assert_eq!(linked, dir.join("file.txt").canonicalize().unwrap());
+
+        // A new file resolves through its nearest existing ancestor, so a
+        // symlinked parent and its real path share one identity.
+        let through_sub =
+            write_target_identity(&json!({"path": "sub/new.txt"}), &dir, &config).unwrap();
+        assert_eq!(
+            through_sub,
+            dir.join("sub").canonicalize().unwrap().join("new.txt")
+        );
+        assert!(write_target_identity(&json!({"path": "dangling.txt"}), &dir, &config).is_none());
+
+        assert!(write_paths_overlap(&dir.join("a"), &dir.join("a/b")));
+        assert!(!write_paths_overlap(
+            &dir.join("a.txt"),
+            &dir.join("a.txt.bak")
+        ));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

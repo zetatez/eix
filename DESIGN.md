@@ -709,7 +709,11 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - 系统提示只保留行为契约：先判断请求类型（回答/诊断/实现/审查/执行），提取显式约束，
   只在真正歧义时问一次；工作流固定为 ground → plan（仅多步）→ act → verify → report。
   不把实现请求降级为计划，不用计划替代实现，不重复无变化的验证，不在请求满足后继续探索。
-  工具批次只并行开头的连续只读前缀，写操作及其后的读取保持顺序，避免读到半应用状态。
+  工具批次按只读段并发：内置读工具和风险分析判定低风险只读、权限放行的 `run_command`
+  可以在段内同时执行；无需审批且目标文件互不重叠的直接 `write_file` / `edit` 也可在
+  写段内并发。同一/重叠目标、`patch`、需要审批或暂存的写入、非只读命令、审批和交互
+  调用作为屏障，写后的读取仍在写入完成后执行，避免读到半应用状态。快照创建/裁剪串行
+  化以保护回滚目录，但实际文件写入仍可并发。结果始终按调用顺序回填。
   内置工具描述保持短句；`tests` 用 token 上限防止提示词和 schema 重新膨胀。
 
 ## 11. 事件与协议（草案）
@@ -915,7 +919,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 一条），system / instructions / workspace / memory 不自动裁剪。`memory` 工具把 workspace
 > 记忆写入 `<data>/memory/<hash>.md`，每次重建上下文都注入 `memory` sector；当前 todo 也作为
 > 固定任务状态注入。自动压缩在 turn 开始和每个工具批次后运行；provider 返回 context-length
-> 错误时强制压缩并重试。只读工具批次并发执行，结果保持调用顺序。
+> 错误时强制压缩并重试。工具批次按只读段和“目标不重叠的直接写入”段并发执行（含已放行
+> 的低风险只读命令），同一/重叠目标、`patch`、审批/暂存写入、非只读命令、审批和交互调用
+> 作为屏障，结果保持调用顺序。
 > Process view 已落地：新增 `start_command {command, cwd?}`（与 `run_command` 共用
 > `command_plan`，同一沙箱与审批门禁）在 daemon 内启动后台进程并立即返回 id，以及只读的
 > `process_output {process_id?, max_bytes?}`（缺省取本 session 最新进程）。进程归属 daemon、
@@ -967,9 +973,12 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > agent session 在 `run_tool_call` 里对写工具
 > 直接拒绝，深度上限 1（child 不能再 spawn）。同一 assistant 批次里的多个 `spawn_agent`
 > 用 `tokio::spawn` 并发跑，默认上限由 `[tools] max_parallel_subagents` 配置（默认 4，支持
-> 2/4/8/16/32/64/128/256）；TUI `/subagents [n]` 通过 `config.subagents` RPC 覆盖运行时值（不写回配置），
-> 其余工具保持顺序，结果按调用顺序回填。纯只读 + `spawn_agent` 批次会先启动 child，再与
-> 读取并行；含写/命令的批次仍先执行写再 spawn，避免 child 观察半写入状态。child 使用精简
+> 2/4/8/16/32/64/128/256）；TUI `/subagents [n]` 通过 `config.subagents` RPC 覆盖运行时值（不写回配置）。
+> 同一批次里连续的只读调用（内置读工具，以及风险分析判定低风险只读、权限决定为 allow 的
+> `run_command`）在段内并发执行；无需审批且目标互不重叠的直接 `write_file` / `edit` 也会
+> 在写段内并发。同一/重叠目标、`patch`、审批或暂存写入、非只读命令、审批和交互调用作为
+> 屏障，结果按调用顺序回填。纯只读 + `spawn_agent` 批次会先启动 child，再与读取并行；含写入或非只读命令
+> 的批次仍先执行它们再 spawn，避免 child 观察半写入状态。child 使用精简
 > 只读 system prompt，而不是重复完整父 prompt；同时复用父 turn 的 instructions/workspace
 > 快照（与父 turn 每轮所用快照一致，文件读取仍读实时内容），避免大规模 fan-out 重复
 > walk/git。child 的完整 turn 写进自己的事件日志，失败作为

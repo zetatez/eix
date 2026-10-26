@@ -66,6 +66,27 @@ impl PermissionDecision {
     }
 }
 
+/// Whether a `run_command` call is a low-risk, read-only command that can run
+/// alongside other reads. This is deliberately stricter than "does not mutate
+/// the workspace": network, git-publish, secret reads and anything the analyzer
+/// cannot prove are left in the sequential path where approval still applies.
+pub fn command_is_parallel_readonly(args: &Value, cwd: &Path) -> bool {
+    let Some(command) = args.get("command").and_then(Value::as_str) else {
+        return false;
+    };
+    if command.trim().is_empty() {
+        return false;
+    }
+    let risk = assess_command(command, cwd);
+    !risk.hard_deny
+        && !risk.mutates_workspace()
+        && risk.level <= RiskLevel::Low
+        && risk
+            .categories
+            .iter()
+            .all(|category| matches!(category, RiskCategory::Read | RiskCategory::ExecSafe))
+}
+
 /// Analyze a tool call before any rule or approval decision. This never
 /// executes anything and is also used to render the approval card.
 pub fn assess_tool(
@@ -778,6 +799,39 @@ mod tests {
                 "{command}: {decision:?}"
             );
             assert!(!decision.risk.hard_deny, "{command}: {decision:?}");
+        }
+    }
+
+    #[test]
+    fn parallel_readonly_commands_are_conservatively_classified() {
+        let cwd = Path::new("/tmp/eix-perm");
+        for command in [
+            "cat Cargo.toml",
+            "ls -la crates",
+            "rg -n TODO crates",
+            "git status --short",
+            "git diff --stat",
+            "cat Cargo.toml | head -20",
+            "echo hi",
+        ] {
+            assert!(
+                command_is_parallel_readonly(&json!({"command": command}), cwd),
+                "{command} should be parallel read-only"
+            );
+        }
+        for command in [
+            "rm -rf target",
+            "sed -i 's/x/y/' Cargo.toml",
+            "git fetch",
+            "curl https://example.com",
+            "cat .env",
+            "sleep 1",
+            "make test",
+        ] {
+            assert!(
+                !command_is_parallel_readonly(&json!({"command": command}), cwd),
+                "{command} should stay sequential"
+            );
         }
     }
 

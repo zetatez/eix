@@ -8207,6 +8207,655 @@ async fn read_only_tool_batch_keeps_call_order() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Provider that asks for a secret `read_file` and an ordinary one in the same
+/// batch. The secret read must still stop for approval instead of joining the
+/// concurrent read segment.
+async fn parallel_secret_read_provider(listener: TcpListener) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let messages = value["messages"].as_array().cloned().unwrap_or_default();
+            let has_tool_results = messages.iter().any(|message| message["role"] == "tool");
+            let chunk = if has_tool_results {
+                json!({
+                    "model": "mock-parallel-secret",
+                    "choices": [{"delta": {"content": "read ok"}, "finish_reason": "stop"}],
+                })
+            } else {
+                json!({
+                    "model": "mock-parallel-secret",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "read_secret",
+                                    "type": "function",
+                                    "function": {"name": "read_file", "arguments": "{\"path\":\".env\"}"},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "read_plain",
+                                    "type": "function",
+                                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn parallel_read_batch_keeps_secret_paths_behind_approval() -> anyhow::Result<()> {
+    let dir = temp_dir("parallel-secret-read");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join(".env"), "PASSWORD=hunter2\n")?;
+    std::fs::write(dir.join("a.txt"), "ordinary\n")?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(parallel_secret_read_provider(listener));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-parallel-secret".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "parallel-secret-read", "cwd": dir}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "read both files"}),
+        )
+        .await?;
+    let turn_id = submitted.turn_id.clone();
+
+    let approval = match tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let notification = client.next_notification().await?;
+            if notification.method == "tool.approval_required"
+                && notification.params["session_id"] == session_id.as_str()
+                && notification.params["turn_id"] == turn_id.as_str()
+            {
+                return Ok::<Value, anyhow::Error>(notification.params.clone());
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            daemon.abort();
+            mock.abort();
+            anyhow::bail!("secret read did not request approval");
+        }
+    };
+    assert_eq!(approval["tool"], "read_file");
+    assert_eq!(approval["arguments"]["path"], ".env");
+    let approval_id = approval["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+    let answered: eix_core::ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "decision": "approve",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+
+    let completed = match tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let notification = client.next_notification().await?;
+            if notification.method == "turn.completed"
+                && notification.params["session_id"] == session_id.as_str()
+                && notification.params["turn_id"] == turn_id.as_str()
+            {
+                return Ok::<Value, anyhow::Error>(notification.params.clone());
+            }
+        }
+    })
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            daemon.abort();
+            mock.abort();
+            anyhow::bail!("turn did not finish after approving the secret read");
+        }
+    };
+    assert!(completed["error"].is_null(), "{completed}");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let reads: Vec<_> = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == "read_file")
+        .collect();
+    assert_eq!(reads.len(), 2);
+    assert!(reads.iter().any(|event| event.payload["output"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("PASSWORD=hunter2")));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// Provider that asks for two independent read-only commands in one batch.
+/// Both `cat` commands read from FIFOs, so the test can prove they were
+/// started concurrently before either could finish.
+async fn parallel_command_provider(listener: TcpListener) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let messages = value["messages"].as_array().cloned().unwrap_or_default();
+            let tool_messages: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            let chunk = if tool_messages.len() >= 2 {
+                let first = tool_messages[tool_messages.len() - 2]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let second = tool_messages[tool_messages.len() - 1]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let answer = if first.contains("AAA") && second.contains("BBB") {
+                    "order ok"
+                } else {
+                    "wrong order"
+                };
+                json!({
+                    "model": "mock-parallel-command",
+                    "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
+                })
+            } else {
+                let a = json!({"command": "cat a.fifo"}).to_string();
+                let b = json!({"command": "cat b.fifo"}).to_string();
+                json!({
+                    "model": "mock-parallel-command",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "command_a",
+                                    "type": "function",
+                                    "function": {"name": "run_command", "arguments": a},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "command_b",
+                                    "type": "function",
+                                    "function": {"name": "run_command", "arguments": b},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn read_only_commands_run_concurrently_and_keep_call_order() -> anyhow::Result<()> {
+    let dir = temp_dir("parallel-command");
+    std::fs::create_dir_all(&dir)?;
+    let fifo_a = dir.join("a.fifo");
+    let fifo_b = dir.join("b.fifo");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo_a)
+        .arg(&fifo_b)
+        .status()?;
+    anyhow::ensure!(status.success(), "mkfifo failed");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(parallel_command_provider(listener));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-parallel-command".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "parallel-command", "cwd": dir}),
+        )
+        .await?;
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "read both fifos"}),
+        )
+        .await?;
+
+    let session_id = created.session.id.clone();
+    let turn_id = submitted.turn_id.clone();
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut started = 0usize;
+        loop {
+            let notification = client.next_notification().await?;
+            match notification.method.as_str() {
+                "tool.started" if notification.params["session_id"] == session_id.as_str() => {
+                    started += 1;
+                    if started == 2 {
+                        let a = fifo_a.clone();
+                        let b = fifo_b.clone();
+                        tokio::spawn(async move {
+                            let _ = tokio::fs::write(a, b"AAA\n").await;
+                        });
+                        tokio::spawn(async move {
+                            let _ = tokio::fs::write(b, b"BBB\n").await;
+                        });
+                    }
+                }
+                "turn.completed"
+                    if notification.params["session_id"] == session_id.as_str()
+                        && notification.params["turn_id"] == turn_id.as_str() =>
+                {
+                    anyhow::ensure!(
+                        started >= 2,
+                        "both read-only commands should start before either finishes"
+                    );
+                    return Ok::<Value, anyhow::Error>(notification.params.clone());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    let completed = match outcome {
+        Ok(result) => result?,
+        Err(_) => {
+            daemon.abort();
+            mock.abort();
+            anyhow::bail!(
+                "timed out waiting for both run_command calls; they likely ran sequentially"
+            );
+        }
+    };
+    assert!(completed["error"].is_null(), "{completed}");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let answer = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .map(|event| {
+            event.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(answer, "order ok");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// Provider that asks for two file writes in one batch. The formatter script
+/// used by these tests blocks until the test creates `release`, so the test can
+/// observe whether both writes started before either finished.
+async fn parallel_write_provider(
+    listener: TcpListener,
+    first: (String, String),
+    second: (String, String),
+) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let first = first.clone();
+        let second = second.clone();
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let messages = value["messages"].as_array().cloned().unwrap_or_default();
+            let tool_messages: Vec<_> = messages
+                .iter()
+                .filter(|message| message["role"] == "tool")
+                .collect();
+            let chunk = if tool_messages.len() >= 2 {
+                let first_output = tool_messages[tool_messages.len() - 2]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let second_output = tool_messages[tool_messages.len() - 1]["content"]
+                    .as_str()
+                    .unwrap_or_default();
+                let answer = if first_output.contains(&first.0) && second_output.contains(&second.0)
+                {
+                    "order ok"
+                } else {
+                    "wrong order"
+                };
+                json!({
+                    "model": "mock-parallel-write",
+                    "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
+                })
+            } else {
+                let a = json!({"path": first.0, "content": first.1}).to_string();
+                let b = json!({"path": second.0, "content": second.1}).to_string();
+                json!({
+                    "model": "mock-parallel-write",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "write_a",
+                                    "type": "function",
+                                    "function": {"name": "write_file", "arguments": a},
+                                },
+                                {
+                                    "index": 1,
+                                    "id": "write_b",
+                                    "type": "function",
+                                    "function": {"name": "write_file", "arguments": b},
+                                }
+                            ]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+fn waiting_formatter_script(dir: &Path) -> PathBuf {
+    let script = dir.join("wait-for-release.sh");
+    std::fs::write(
+        &script,
+        "#!/bin/sh\n\
+         i=0\n\
+         while [ ! -f release ] && [ \"$i\" -lt 1000 ]; do\n\
+           i=$((i + 1))\n\
+           sleep 0.01\n\
+         done\n",
+    )
+    .expect("write formatter script");
+    script
+}
+
+fn waiting_formatter_config(script: &Path) -> FormatterConfig {
+    FormatterConfig {
+        command: Some(format!("sh {}", script.display())),
+        extensions: Vec::new(),
+        timeout_secs: 30,
+    }
+}
+
+#[tokio::test]
+async fn parallel_write_batch_overlaps_independent_files_and_keeps_order() -> anyhow::Result<()> {
+    let dir = temp_dir("parallel-write");
+    std::fs::create_dir_all(&dir)?;
+    let script = waiting_formatter_script(&dir);
+    let release = dir.join("release");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(parallel_write_provider(
+        listener,
+        ("a.txt".to_string(), "AAA\n".to_string()),
+        ("b.txt".to_string(), "BBB\n".to_string()),
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-parallel-write".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+    config.formatter = waiting_formatter_config(&script).into();
+    config.formatter_defaults = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "parallel-write", "cwd": dir}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write both files"}),
+        )
+        .await?;
+    let turn_id = submitted.turn_id.clone();
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut started = 0usize;
+        loop {
+            let notification = client.next_notification().await?;
+            match notification.method.as_str() {
+                "tool.started" if notification.params["session_id"] == session_id.as_str() => {
+                    started += 1;
+                    if started == 2 {
+                        tokio::fs::write(&release, b"go").await?;
+                    }
+                }
+                "turn.completed"
+                    if notification.params["session_id"] == session_id.as_str()
+                        && notification.params["turn_id"] == turn_id.as_str() =>
+                {
+                    anyhow::ensure!(
+                        started >= 2,
+                        "both independent writes should start before either finishes"
+                    );
+                    return Ok::<Value, anyhow::Error>(notification.params.clone());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    let completed = match outcome {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = tokio::fs::write(&release, b"go").await;
+            daemon.abort();
+            mock.abort();
+            anyhow::bail!("timed out waiting for both writes; different files ran sequentially");
+        }
+    };
+    assert!(completed["error"].is_null(), "{completed}");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let answer = attached
+        .events
+        .iter()
+        .rev()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .map(|event| {
+            event.payload["text"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .unwrap_or_default();
+    assert_eq!(answer, "order ok");
+    assert_eq!(std::fs::read_to_string(dir.join("a.txt"))?, "AAA\n");
+    assert_eq!(std::fs::read_to_string(dir.join("b.txt"))?, "BBB\n");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn same_file_writes_stay_serialized() -> anyhow::Result<()> {
+    let dir = temp_dir("serial-write");
+    std::fs::create_dir_all(&dir)?;
+    let script = waiting_formatter_script(&dir);
+    let release = dir.join("release");
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(parallel_write_provider(
+        listener,
+        ("same.txt".to_string(), "AAA\n".to_string()),
+        ("same.txt".to_string(), "BBB\n".to_string()),
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-parallel-write".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    config.context.auto_compact = false;
+    config.formatter = waiting_formatter_config(&script).into();
+    config.formatter_defaults = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "serial-write", "cwd": dir}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write the same file twice"}),
+        )
+        .await?;
+    let turn_id = submitted.turn_id.clone();
+    let release_ready = Arc::new(AtomicBool::new(false));
+
+    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut started = 0usize;
+        let mut overlapped = false;
+        loop {
+            let notification = client.next_notification().await?;
+            match notification.method.as_str() {
+                "tool.started" if notification.params["session_id"] == session_id.as_str() => {
+                    started += 1;
+                    if started > 1 && !release_ready.load(Ordering::SeqCst) {
+                        overlapped = true;
+                    }
+                    if started == 1 {
+                        let release = release.clone();
+                        let ready = Arc::clone(&release_ready);
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            ready.store(true, Ordering::SeqCst);
+                            let _ = tokio::fs::write(release, b"go").await;
+                        });
+                    }
+                }
+                "turn.completed"
+                    if notification.params["session_id"] == session_id.as_str()
+                        && notification.params["turn_id"] == turn_id.as_str() =>
+                {
+                    anyhow::ensure!(!overlapped, "same-file writes overlapped");
+                    anyhow::ensure!(started == 2, "both writes should run");
+                    return Ok::<Value, anyhow::Error>(notification.params.clone());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await;
+
+    let completed = match outcome {
+        Ok(result) => result?,
+        Err(_) => {
+            release_ready.store(true, Ordering::SeqCst);
+            let _ = tokio::fs::write(&release, b"go").await;
+            daemon.abort();
+            mock.abort();
+            anyhow::bail!("timed out waiting for the serialized writes");
+        }
+    };
+    assert!(completed["error"].is_null(), "{completed}");
+    assert_eq!(std::fs::read_to_string(dir.join("same.txt"))?, "BBB\n");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
 /// Provider used by the context-window recovery test. `fail_next` makes the
 /// next request return a real 400 context-length error. After the summary
 /// request, the retried turn answers `recovered`.

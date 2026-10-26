@@ -1006,9 +1006,11 @@ daemon 目前向模型暴露这些工具：
 
 所有路径都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸）；工具输出先按
 `max_output_bytes` 截断，进入 provider 上下文时再按 `context.tool_output_tokens` 做 head/tail
-省略，完整输出仍保留在事件日志。一个工具批次开头的连续只读工具（`read_file` / `list_dir` /
-`grep` / `glob` / `webfetch` / `websearch`）会并发执行，写命令和写后读取保持顺序，结果按
-调用顺序回填。
+省略，完整输出仍保留在事件日志。一个工具批次里连续的只读工具（`read_file` / `list_dir` /
+`grep` / `glob` / `webfetch` / `websearch`）以及风险分析判定为低风险只读且权限已放行的
+`run_command` 会并发执行（上限 8）；无需审批的直接 `write_file` / `edit` 只要目标文件
+互不重叠，也会并发执行（上限 32）。同一文件或父子路径上的写入、`patch`、需要审批/暂存的写入、非只读
+命令、审批和交互调用仍是分段屏障，写后读取在写入完成后执行；结果按调用顺序回填。
 
 `run_command` 使用统一风险分析：shell tokenizer 会拆出每个命令段、输入/输出重定向、
 `sudo`/`env` 等包装器、嵌套 `sh -c` 和命令替换。`git status`、`cat`、`grep`、`ls`、
@@ -1263,9 +1265,11 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 5. **Verify / Report**：运行能证明改动的最小检查（定向测试、类型检查、构建），检查 diff；
    没有变化时不重复跑。回答先给结果，再给验证与剩余风险，满足请求即停止。
 
-工具批次开头的连续只读调用会并发执行（上限 8），写命令及写后读取保持顺序，结果仍按调用
-顺序回填；工具失败后要求模型改变输入或方法，不重复完全相同的调用。`provider_runtime.system_prompt`
-仍可整体替换内置提示词。
+工具批次里连续的只读调用会并发执行（上限 8），包括低风险只读的 `run_command`；无需审批的
+直接 `write_file` / `edit` 在目标文件互不重叠时也会并发（上限 32）。同一/重叠目标、`patch`、
+需要审批或暂存的写入、非只读命令、审批和交互调用作为分段屏障，写后读取保持顺序，结果仍按
+调用顺序回填；工具失败后要求模型改变输入或方法，不重复完全相同的调用。`provider_runtime.system_prompt` 仍可整体替换内置
+提示词。
 
 ### 外部通知
 
@@ -1304,9 +1308,10 @@ notifications:
 任务可以调高到 64/128/256；实际吞吐仍受 provider 速率限制、内存和文件描述符约束。TUI 里可用
 `/subagents [n]` 覆盖当前运行时上限（`/subagents` 不带参数打开 picker）；`/reload` 或
 daemon 重启后回到配置文件默认值。如果批次里只有只读工具和 `spawn_agent`，子 agent
-会先启动并与这些读取并行；批次包含写/命令时仍是先执行它们再启动子 agent，避免 child
-看到半写入状态。纯只读批次会并发执行，其他批次只并行开头的连续只读工具，其余按顺序
-执行；结果按调用顺序回填给父模型。子 agent 使用精简的只读 system prompt，不会为每个
+会先启动并与这些读取并行；批次包含写入或非只读命令时仍是先执行它们再启动子 agent，
+避免 child 看到半写入状态。连续只读调用（包括已放行的低风险只读命令）会分段并发执行；
+无需审批且目标不重叠的直接 `write_file` / `edit` 也会并发，同一/重叠目标、`patch`、审批
+或暂存写入、非只读命令和交互调用作为屏障；结果按调用顺序回填给父模型。子 agent 使用精简的只读 system prompt，不会为每个
 child 重复完整的父 prompt。子 agent 的 turn 完整写进它自己的事件日志，因此
 `eix ls` 能看到、`eix log` 能回放；TUI 在主 agent 的转录区用 subagent 卡片显示，
 点击卡片会在新 pane 打开子 session，子 session 底部点击 `← parent agent` 回到父
