@@ -1693,6 +1693,9 @@ async fn doctor(cli: &Cli) -> Result<()> {
                     "off"
                 }
             );
+            for warning in &config.security_warnings {
+                println!("warning  {warning}");
+            }
         }
         Err(err) => println!("config   ERROR: {err}"),
     }

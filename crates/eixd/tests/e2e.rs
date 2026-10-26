@@ -4600,6 +4600,7 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
     config.default_provider_mut().base_url = "http://127.0.0.1:1/v1".to_string();
     config.server.tcp = Some(addr.clone());
     config.server.token = Some("s3cret".to_string());
+    config.load_cwd = dir.clone();
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
 
@@ -4631,6 +4632,28 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
     assert_eq!(auth.result.expect("auth result")["authenticated"], true);
     let pong = raw.send("ping", Value::Null).await?.expect("response");
     assert_eq!(pong.result.expect("ping result")["pong"], true);
+
+    // The token does not grant local-only execution or a way to escape the
+    // daemon's workspace through bypass mode or an absolute cwd.
+    for (method, params) in [
+        (
+            "shell.run",
+            json!({"session_id": "unknown", "command": "printf tcp-pwn"}),
+        ),
+        (
+            "session.create",
+            json!({"name": "bypass", "cwd": dir.clone(), "mode": "bypass"}),
+        ),
+        ("session.create", json!({"name": "escape", "cwd": "/"})),
+    ] {
+        let denied = raw.send(method, params).await?.expect("response");
+        assert_eq!(
+            denied.error.expect("forbidden error").code,
+            "forbidden",
+            "{method} was not denied"
+        );
+    }
+
     let sessions: eix_core::SessionList = serde_json::from_value(
         raw.send("session.list", Value::Null)
             .await?
@@ -4664,6 +4687,57 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
 
     daemon.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn remote_worktree_cannot_escape_the_workspace() -> anyhow::Result<()> {
+    let root = temp_dir("remote-worktree");
+    let repo = root.join("repo");
+    let workspace = repo.join("workspace");
+    std::fs::create_dir_all(&workspace)?;
+    assert!(git(&repo, &["init", "-q", "-b", "main"]).status.success());
+    std::fs::write(repo.join("README.md"), "base\n")?;
+    assert!(git(&repo, &["add", "README.md"]).status.success());
+    assert!(git(&repo, &["commit", "-q", "-m", "init"]).status.success());
+
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let addr = probe.local_addr()?.to_string();
+    drop(probe);
+
+    let mut config = Config::default();
+    config.server.tcp = Some(addr.clone());
+    config.server.token = Some("worktree-secret".to_string());
+    config.load_cwd = workspace.clone();
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket, root.join("data")));
+
+    let mut raw = RawTcp::connect(&addr).await?;
+    raw.send("auth", json!({"token": "worktree-secret"}))
+        .await?
+        .expect("response");
+    // The workspace is a subdirectory of the repository, so a worktree would
+    // be created outside the directory remote clients may use.
+    let denied = raw
+        .send(
+            "session.create",
+            json!({"name": "escape", "cwd": workspace, "worktree": true}),
+        )
+        .await?
+        .expect("response");
+    assert_eq!(denied.error.expect("forbidden error").code, "forbidden");
+
+    let sessions: eix_core::SessionList = serde_json::from_value(
+        raw.send("session.list", Value::Null)
+            .await?
+            .expect("response")
+            .result
+            .expect("session list"),
+    )?;
+    assert!(sessions.sessions.is_empty());
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
     Ok(())
 }
 
@@ -6773,9 +6847,12 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
     let mut config = Config::default();
     config.server.http = Some(format!("127.0.0.1:{port}"));
     config.server.token = Some("http-secret".to_string());
+    // Remote callers are contained by the directory the config was loaded
+    // from, just as they are for a daemon started with `Config::load`.
+    config.load_cwd = dir.clone();
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-    let _client = connect(&socket).await?;
+    let mut local = connect(&socket).await?;
 
     let base = format!("http://127.0.0.1:{port}");
     let http = reqwest::Client::new();
@@ -6861,6 +6938,152 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
         .as_str()
         .expect("created session id")
         .to_string();
+
+    // Remote clients cannot execute local shell commands, enable bypass, or
+    // point a session outside the daemon's workspace.
+    for (id, method, params) in [
+        (
+            4,
+            "shell.run",
+            json!({"session_id": target.clone(), "command": "printf remote-pwn"}),
+        ),
+        (
+            5,
+            "session.mode",
+            json!({"session_id": target.clone(), "mode": "bypass"}),
+        ),
+        (
+            6,
+            "session.create",
+            json!({"name": "bypass", "cwd": dir.clone(), "mode": "bypass"}),
+        ),
+        (7, "session.create", json!({"name": "escape", "cwd": "/"})),
+        (
+            8,
+            "session.cd",
+            json!({"session_id": target.clone(), "path": "/"}),
+        ),
+    ] {
+        let response = http
+            .post(format!("{base}/rpc"))
+            .bearer_auth("http-secret")
+            .json(&json!({"id": id, "method": method, "params": params}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let response: Value = response.json().await?;
+        assert_eq!(
+            response["error"]["code"], "forbidden",
+            "{method} was not denied: {response}"
+        );
+    }
+
+    // A local bypass session cannot be used as a remote bypass: importing,
+    // forking, or rewinding it is rejected as well.
+    let local_session: SessionResult = local
+        .request(
+            "session.create",
+            json!({"name": "local-bypass", "cwd": dir.clone()}),
+        )
+        .await?;
+    local
+        .request::<Value>(
+            "session.mode",
+            json!({"session_id": local_session.session.id, "mode": "bypass"}),
+        )
+        .await?;
+    let exported: Value = local
+        .request(
+            "session.export",
+            json!({"session_id": local_session.session.id}),
+        )
+        .await?;
+    let export_json = exported["json"].as_str().expect("export json").to_string();
+    for (id, method, params) in [
+        (
+            9,
+            "session.import",
+            json!({"json": export_json, "cwd": dir.clone()}),
+        ),
+        (
+            10,
+            "session.fork",
+            json!({"session_id": local_session.session.id}),
+        ),
+        (
+            11,
+            "session.rewind",
+            json!({"session_id": local_session.session.id}),
+        ),
+        (
+            12,
+            "prompt.submit",
+            json!({"session_id": local_session.session.id, "text": "remote bypass"}),
+        ),
+        (
+            14,
+            "session.ready",
+            json!({"session_id": local_session.session.id}),
+        ),
+        (
+            15,
+            "integration.continue",
+            json!({"session_id": local_session.session.id}),
+        ),
+    ] {
+        let response = http
+            .post(format!("{base}/rpc"))
+            .bearer_auth("http-secret")
+            .json(&json!({"id": id, "method": method, "params": params}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let response: Value = response.json().await?;
+        assert_eq!(
+            response["error"]["code"], "forbidden",
+            "{method} was not denied: {response}"
+        );
+    }
+
+    // A remote client must not be able to run a turn in a local session whose
+    // working directory is outside the exposed workspace.
+    let outside_session: SessionResult = local
+        .request(
+            "session.create",
+            json!({"name": "local-outside", "cwd": "/"}),
+        )
+        .await?;
+    for (id, method, params) in [
+        (
+            13,
+            "prompt.submit",
+            json!({"session_id": outside_session.session.id, "text": "escape"}),
+        ),
+        (
+            16,
+            "session.ready",
+            json!({"session_id": outside_session.session.id}),
+        ),
+        (
+            17,
+            "integration.continue",
+            json!({"session_id": outside_session.session.id}),
+        ),
+    ] {
+        let response = http
+            .post(format!("{base}/rpc"))
+            .bearer_auth("http-secret")
+            .json(&json!({"id": id, "method": method, "params": params}))
+            .send()
+            .await?;
+        assert_eq!(response.status(), 200);
+        let response: Value = response.json().await?;
+        assert_eq!(
+            response["error"]["code"], "forbidden",
+            "{method} escaped the workspace: {response}"
+        );
+    }
+
     let mut seen = String::new();
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
     while tokio::time::Instant::now() < deadline {

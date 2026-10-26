@@ -207,8 +207,9 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `
 1. `~/.config/eix/config.yaml`（或 `EIX_CONFIG` / `--config`，显式路径不再合并项目层）
 2. `<祖先目录>/.eix/config.yaml`，从最外层到最近层依次覆盖
 
-表递归合并，数组整体替换。字符串里支持 `{env:NAME}` 和 `{file:path}`（相对当前配置文件），
-例如 `api_key: "{env:OPENAI_API_KEY}"`。daemon 每 2 秒检查这些文件的 mtime，变化后重新加载；
+表递归合并，数组整体替换。全局层和显式指定的配置支持 `{env:NAME}` 和 `{file:path}`
+（相对当前配置文件），例如 `api_key: "{env:OPENAI_API_KEY}"`；项目层不展开这两个占位符。
+daemon 每 2 秒检查这些文件的 mtime，变化后重新加载；
 解析失败保留旧配置并通过 `config.error` 通知，TUI 里也可以 `/reload`。工具/context/MCP
 设置在下一轮生效，已有 session 的 model 与 mode 不变。
 
@@ -219,7 +220,8 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是，不跟随 `
 { "model": "openai/gpt-5", "agent": "reviewer", "mode": "plan" }
 ```
 
-命令行显式参数优先于 `cli.json`。
+项目层的 `cli.json` 不会展开占位符，且不能把默认模式设为 `bypass`。命令行显式参数优先于
+`cli.json`。
 
 
 协议是 Unix socket 上的 newline-delimited JSON：请求带 `id`/`method`/`params`，
@@ -1120,8 +1122,8 @@ tools:
 - 规则来源优先级为 `session > user > project > builtin`；具体度相同时越靠近当前 session 的
   来源胜出。项目 `.eix/config.yaml` 只能收紧：`sandbox = "off"`、
   `sandbox_network = true`、`external_directory`、`network_allow`、额外
-  sandbox 路径会被忽略，`allow` 规则会降级为 `ask`，并写入 `security_warnings`
-  （`eix doctor` 可见）。
+  sandbox 路径会被忽略，`allow` / `sandbox` 规则会降级为 `ask`，并写入
+  `security_warnings`（`eix doctor` 可见）。
 - 审批卡片上的 `a`（`Always allow`）只在中低风险出现：session scope 只存在内存，user scope
   追加到用户配置；文件工具按路径、shell 按单段 argv 前缀、其它工具按精确参数收窄。`HIGH` /
   `CRITICAL` 不提供 Always，服务端也会拒绝把它升级成持久规则。

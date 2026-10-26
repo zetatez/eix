@@ -734,7 +734,12 @@ impl Daemon {
         }
     }
 
-    async fn ensure_auto_worktree(&self, session_id: &str, text: &str) -> Result<Session> {
+    async fn ensure_auto_worktree(
+        &self,
+        session_id: &str,
+        text: &str,
+        remote: bool,
+    ) -> Result<Session> {
         let session = self.require_session(session_id)?;
         if session.is_agent() || session.has_worktree() {
             return Ok(session);
@@ -770,6 +775,13 @@ impl Daemon {
             let Some(repo) = crate::worktree::main_repo(&session.cwd).await else {
                 return Ok(session);
             };
+            // A remote session may live in a subdirectory of a larger
+            // repository. Its worktree would be created at the repository
+            // root, which can be outside the workspace the daemon exposes.
+            // Keep such sessions in their current directory instead.
+            if remote && !repo.starts_with(self.remote_workspace_root()?) {
+                return Ok(session);
+            }
             // Recorded when the session was created, before the user could
             // switch branches. Legacy rows have no stored base, so resolve it
             // at first prompt.
@@ -827,8 +839,15 @@ impl Daemon {
     /// `session.worktree.create`: attach a worktree to an existing session.
     /// The TUI also checks this before sending, but keep the daemon side
     /// authoritative so another client cannot create a second worktree.
-    async fn create_worktree(&self, params: WorktreeCreateParams) -> Result<Session> {
+    async fn create_worktree(
+        &self,
+        params: WorktreeCreateParams,
+        origin: Origin,
+    ) -> Result<Session> {
         let session = self.require_session(&params.session_id)?;
+        if origin == Origin::Remote {
+            self.validate_remote_cwd(&session.cwd)?;
+        }
         if session.is_agent() {
             return Err(rpc(
                 "invalid_params",
@@ -880,6 +899,9 @@ impl Daemon {
                     format!("{} is not inside a git work tree", session.cwd.display()),
                 ));
             };
+            if origin == Origin::Remote {
+                self.validate_remote_cwd(&repo)?;
+            }
             // A manual worktree follows the branch checked out now. Only
             // auto-created worktrees use the branch recorded at session
             // creation, so switching branches before `/new-worktree` is
@@ -1646,7 +1668,7 @@ impl Daemon {
             text: prompt,
             images: Vec::new(),
         };
-        if let Err(err) = self.submit_inner(params, true).await {
+        if let Err(err) = self.submit_inner(params, true, Origin::Local).await {
             return self.retry_integration(session, repairing, format!("repair turn: {err:#}"));
         }
         Ok(())
@@ -2040,6 +2062,24 @@ enum Transport {
     Tcp,
 }
 
+/// Where an RPC came from. Unix sockets are protected by filesystem
+/// permissions and run with the same trust as the daemon's user. TCP and HTTP
+/// clients only hold a shared token, so they get a narrower RPC surface.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Origin {
+    Local,
+    Remote,
+}
+
+impl Transport {
+    fn origin(self) -> Origin {
+        match self {
+            Self::Unix => Origin::Local,
+            Self::Tcp => Origin::Remote,
+        }
+    }
+}
+
 impl Daemon {
     async fn serve<S>(self: Arc<Self>, stream: S, transport: Transport, token: Option<String>)
     where
@@ -2134,7 +2174,7 @@ impl Daemon {
                 }
                 continue;
             }
-            let response = self.handle(&request).await;
+            let response = self.handle_from(&request, transport.origin()).await;
             if tx.send(ServerMessage::Response(response)).is_err() {
                 break;
             }
@@ -2147,8 +2187,12 @@ impl Daemon {
         let _ = writer.await;
     }
 
-    pub(crate) async fn handle(self: &Arc<Self>, request: &Request) -> Response {
-        match self.dispatch(request).await {
+    pub(crate) async fn handle_remote(self: &Arc<Self>, request: &Request) -> Response {
+        self.handle_from(request, Origin::Remote).await
+    }
+
+    async fn handle_from(self: &Arc<Self>, request: &Request, origin: Origin) -> Response {
+        match self.dispatch(request, origin).await {
             Ok(result) => Response::ok(request.id, result),
             Err(err) => match err.downcast_ref::<RpcError>() {
                 Some(rpc) => Response::err(request.id, rpc.code.clone(), rpc.message.clone()),
@@ -2157,7 +2201,64 @@ impl Daemon {
         }
     }
 
-    async fn dispatch(self: &Arc<Self>, request: &Request) -> Result<Value> {
+    async fn dispatch(self: &Arc<Self>, request: &Request, origin: Origin) -> Result<Value> {
+        if origin == Origin::Remote {
+            match request.method.as_str() {
+                "shell.run" => {
+                    return Err(rpc(
+                        "forbidden",
+                        "shell.run is only available over the local Unix socket",
+                    ))
+                }
+                "session.create" => {
+                    let params: CreateSessionParams = parse_params(request.params.clone())?;
+                    if params.mode == Some(SessionMode::Bypass) {
+                        return Err(rpc(
+                            "forbidden",
+                            "remote clients cannot create bypass sessions",
+                        ));
+                    }
+                }
+                "session.mode" => {
+                    let params: ModeParams = parse_params(request.params.clone())?;
+                    if params.mode == SessionMode::Bypass {
+                        return Err(rpc("forbidden", "remote clients cannot enable bypass mode"));
+                    }
+                }
+                "prompt.submit" => {
+                    let params: SubmitParams = parse_params(request.params.clone())?;
+                    let session = self.require_session(&params.session_id)?;
+                    self.validate_remote_cwd(&session.cwd)?;
+                    if self.session_mode(&session) == SessionMode::Bypass {
+                        return Err(rpc(
+                            "forbidden",
+                            "remote clients cannot run turns in bypass sessions",
+                        ));
+                    }
+                }
+                // Integration can run tests and start an internal agent turn,
+                // so it follows the same workspace and bypass restrictions.
+                "session.ready" | "integration.continue" => {
+                    let params: SessionRef = parse_params(request.params.clone())?;
+                    let session = self.require_session(&params.session_id)?;
+                    self.validate_remote_cwd(&session.cwd)?;
+                    if session.mode == SessionMode::Bypass
+                        || self.session_mode(&session) == SessionMode::Bypass
+                    {
+                        return Err(rpc(
+                            "forbidden",
+                            "remote clients cannot prepare bypass sessions",
+                        ));
+                    }
+                }
+                "session.worktree.remove" => {
+                    let params: WorktreeRemoveParams = parse_params(request.params.clone())?;
+                    let session = self.require_session(&params.session_id)?;
+                    self.validate_remote_cwd(&session.cwd)?;
+                }
+                _ => {}
+            }
+        }
         match request.method.as_str() {
             "hello" => Ok(serde_json::to_value(HelloResult {
                 protocol: PROTOCOL_VERSION,
@@ -2381,7 +2482,19 @@ impl Daemon {
                 if let Some(name) = params.name {
                     session.name = name;
                 }
-                if let Some(cwd) = params.cwd {
+                if origin == Origin::Remote {
+                    // Exported sessions carry their own mode and working
+                    // directory. Do not let an imported document smuggle in
+                    // bypass mode or a path outside the daemon's workspace.
+                    if session.mode == SessionMode::Bypass {
+                        return Err(rpc(
+                            "forbidden",
+                            "remote clients cannot import bypass sessions",
+                        ));
+                    }
+                    let cwd = params.cwd.as_deref().unwrap_or(&session.cwd);
+                    session.cwd = self.validate_remote_cwd(cwd)?;
+                } else if let Some(cwd) = params.cwd {
                     session.cwd = cwd;
                 }
                 let now = eix_core::now_ms();
@@ -2429,7 +2542,7 @@ impl Daemon {
             "session.create" => {
                 let params: CreateSessionParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(SessionResult {
-                    session: self.create_session(params).await?,
+                    session: self.create_session(params, origin).await?,
                 })?)
             }
             "model.list" => {
@@ -2545,6 +2658,19 @@ impl Daemon {
             "session.fork" => {
                 let params: ForkParams = parse_params(request.params.clone())?;
                 let source = self.require_session(&params.session_id)?;
+                if origin == Origin::Remote {
+                    self.validate_remote_cwd(&source.cwd)?;
+                    // A fork copies the persisted mode, so a temporary
+                    // override must not make a bypass session look safe.
+                    if source.mode == SessionMode::Bypass
+                        || self.session_mode(&source) == SessionMode::Bypass
+                    {
+                        return Err(rpc(
+                            "forbidden",
+                            "remote clients cannot fork bypass sessions",
+                        ));
+                    }
+                }
                 if let Some(at) = params.at_seq {
                     let max = self.store.max_seq(&source.id)?;
                     if at < 1 || at > max + 1 {
@@ -2566,6 +2692,10 @@ impl Daemon {
                 // independently. `Some(false)` opts out and shares `cwd`.
                 let want_worktree = match params.worktree {
                     Some(value) => value,
+                    // Remote clients must opt in explicitly: an automatic
+                    // worktree is created at the repository root, which may
+                    // be outside the workspace they are allowed to use.
+                    None if origin == Origin::Remote => false,
                     None => {
                         self.config.load().worktree.auto
                             && crate::worktree::repo_root(&source.cwd).await.is_some()
@@ -2577,6 +2707,9 @@ impl Daemon {
                         .await
                         .or_else(|| Some(source.cwd.clone()))
                         .unwrap_or_else(|| source.cwd.clone());
+                    if origin == Origin::Remote {
+                        self.validate_remote_cwd(&repo)?;
+                    }
                     // A fork of a worktree session should branch from that
                     // session's base branch, not from its temporary `eix/...`
                     // branch. A shared source has no temporary branch, so use
@@ -2630,12 +2763,14 @@ impl Daemon {
             }
             "session.rewind" => {
                 let params: RewindParams = parse_params(request.params.clone())?;
-                Ok(serde_json::to_value(self.rewind_session(params).await?)?)
+                Ok(serde_json::to_value(
+                    self.rewind_session(params, origin).await?,
+                )?)
             }
             "session.worktree.create" => {
                 let params: WorktreeCreateParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(SessionResult {
-                    session: self.create_worktree(params).await?,
+                    session: self.create_worktree(params, origin).await?,
                 })?)
             }
             "session.worktree.remove" => {
@@ -2850,7 +2985,7 @@ impl Daemon {
             "session.cd" => {
                 let params: SessionCdParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(SessionResult {
-                    session: self.set_cwd(params)?,
+                    session: self.set_cwd(params, origin)?,
                 })?)
             }
             "session.btw" => {
@@ -2888,7 +3023,7 @@ impl Daemon {
             }
             "prompt.submit" => {
                 let params: SubmitParams = parse_params(request.params.clone())?;
-                Ok(serde_json::to_value(self.submit(params).await?)?)
+                Ok(serde_json::to_value(self.submit(params, origin).await?)?)
             }
             "prompt.cancel" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
@@ -3154,9 +3289,66 @@ impl Daemon {
         Ok(InputResult { accepted: true })
     }
 
-    async fn create_session(&self, params: CreateSessionParams) -> Result<Session> {
+    /// Root used to contain remote clients. A daemon launched inside a
+    /// project may create sessions in that project, but a holder of the shared
+    /// token must not be able to point a session at `/`, the home directory,
+    /// or another tenant's workspace.
+    fn remote_workspace_root(&self) -> Result<PathBuf> {
+        let configured = self.config.load().load_cwd.clone();
+        let raw = if configured.as_os_str().is_empty() {
+            std::env::current_dir().context("cannot determine daemon working directory")?
+        } else {
+            configured
+        };
+        let root = raw.canonicalize().map_err(|err| {
+            rpc(
+                "invalid_params",
+                format!("cannot resolve daemon workspace {}: {err}", raw.display()),
+            )
+        })?;
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .and_then(|home| home.canonicalize().ok());
+        if root.parent().is_none() || home.as_deref() == Some(root.as_path()) {
+            return Err(rpc(
+                "forbidden",
+                "remote sessions require a daemon workspace below the home directory",
+            ));
+        }
+        Ok(root)
+    }
+
+    fn validate_remote_cwd(&self, path: &Path) -> Result<PathBuf> {
+        let cwd = path.canonicalize().map_err(|err| {
+            rpc(
+                "invalid_params",
+                format!("cannot open {}: {err}", path.display()),
+            )
+        })?;
+        if !cwd.is_dir() {
+            return Err(rpc(
+                "invalid_params",
+                format!("{} is not a directory", cwd.display()),
+            ));
+        }
+        let root = self.remote_workspace_root()?;
+        if !cwd.starts_with(&root) {
+            return Err(rpc(
+                "forbidden",
+                format!(
+                    "remote sessions must stay under the daemon workspace {}",
+                    root.display()
+                ),
+            ));
+        }
+        Ok(cwd)
+    }
+
+    async fn create_session(&self, params: CreateSessionParams, origin: Origin) -> Result<Session> {
         let cwd = match params.cwd {
+            Some(cwd) if origin == Origin::Remote => self.validate_remote_cwd(&cwd)?,
             Some(cwd) => cwd,
+            None if origin == Origin::Remote => self.remote_workspace_root()?,
             None => std::env::current_dir().context("cannot determine current directory")?,
         };
         let name = params
@@ -3191,6 +3383,9 @@ impl Daemon {
                 .await
                 .or_else(|| Some(session.cwd.clone()))
                 .unwrap_or_else(|| session.cwd.clone());
+            if origin == Origin::Remote {
+                self.validate_remote_cwd(&repo)?;
+            }
             let base = self.base_for_session(&session.cwd, &repo).await?;
             let created =
                 crate::worktree::create_from_base(&session.cwd, &session.name, Some(&base)).await?;
@@ -3269,7 +3464,7 @@ impl Daemon {
 
     /// Apply `session.cd`. The new directory becomes the workspace for later
     /// turns; tools and the ledger read it from the session row.
-    fn set_cwd(&self, params: SessionCdParams) -> Result<Session> {
+    fn set_cwd(&self, params: SessionCdParams, origin: Origin) -> Result<Session> {
         let session = self.require_session(&params.session_id)?;
         if session.status.is_busy() {
             return Err(rpc(
@@ -3306,6 +3501,9 @@ impl Daemon {
                 "invalid_params",
                 format!("{} is not a directory", cwd.display()),
             ));
+        }
+        if origin == Origin::Remote {
+            self.validate_remote_cwd(&cwd)?;
         }
         // Keep the worktree marker only while the session stays inside it.
         let worktree = session
@@ -3521,8 +3719,21 @@ impl Daemon {
     ///
     /// Rollback is best-effort: files that were never captured, changes made
     /// outside eix, and failed restores are reported instead of hidden.
-    async fn rewind_session(&self, params: RewindParams) -> Result<RewindResult> {
+    async fn rewind_session(&self, params: RewindParams, origin: Origin) -> Result<RewindResult> {
         let source = self.require_session(&params.session_id)?;
+        if origin == Origin::Remote {
+            self.validate_remote_cwd(&source.cwd)?;
+            // Rewind also forks the persisted mode; check both the effective
+            // and stored mode so a temporary override cannot mask bypass.
+            if source.mode == SessionMode::Bypass
+                || self.session_mode(&source) == SessionMode::Bypass
+            {
+                return Err(rpc(
+                    "forbidden",
+                    "remote clients cannot rewind bypass sessions",
+                ));
+            }
+        }
         if source.status.is_busy() {
             return Err(rpc(
                 "busy",
@@ -3698,8 +3909,12 @@ impl Daemon {
         }
     }
 
-    async fn submit(self: &Arc<Self>, params: SubmitParams) -> Result<SubmitResult> {
-        self.submit_inner(params, false).await
+    async fn submit(
+        self: &Arc<Self>,
+        params: SubmitParams,
+        origin: Origin,
+    ) -> Result<SubmitResult> {
+        self.submit_inner(params, false, origin).await
     }
 
     /// `internal` repair turns keep the integration state in `repairing`
@@ -3708,6 +3923,7 @@ impl Daemon {
         self: &Arc<Self>,
         params: SubmitParams,
         internal: bool,
+        origin: Origin,
     ) -> Result<SubmitResult> {
         let text = params.text.trim().to_string();
         if text.is_empty() && params.images.is_empty() {
@@ -3724,7 +3940,9 @@ impl Daemon {
 
         // Auto worktrees are created lazily: the first prompt is the first
         // point where a meaningful English name can be generated.
-        session = self.ensure_auto_worktree(&session.id, &text).await?;
+        session = self
+            .ensure_auto_worktree(&session.id, &text, origin == Origin::Remote)
+            .await?;
 
         // The queue takes the same lock while it claims an item. Keep the
         // critical section short: a few queries and the turn registration.

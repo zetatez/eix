@@ -165,7 +165,7 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
             .await
         }
     };
-    let response = daemon.handle(&request).await;
+    let response = daemon.handle_remote(&request).await;
     write_json(&mut writer, 200, &response).await
 }
 

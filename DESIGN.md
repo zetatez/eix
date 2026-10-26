@@ -663,7 +663,8 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 
 项目层 `.eix/config.yaml` 只能收紧：`sandbox = "off"`、
 `sandbox_network = true`、`external_directory`、`network_allow`、额外
-sandbox 只读/可写路径会被忽略；项目 `allow` 规则降级为 `ask`；`snapshots = false` 被忽略。
+sandbox 只读/可写路径会被忽略；项目 `allow` / `sandbox` 规则降级为 `ask`；
+`snapshots = false` 被忽略。
 分类器使用固定内置策略，不参与项目配置。`[compations]` 默认全关，
 项目层只能关闭、不能开启其他 agent 的资源加载；所有拒绝都写入 `Config::security_warnings`。
 
