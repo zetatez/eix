@@ -8000,9 +8000,9 @@ fn tool_round_warning(round: usize, max_rounds: usize) -> Option<String> {
     (remaining <= TOOL_ROUND_WARNING).then(|| {
         format!(
             "Tool budget: {round}/{max_rounds} rounds used, {remaining} left. \
-             Stop calling tools and provide your best final answer now. \
-             If something is incomplete or unverified, say so explicitly \
-             instead of starting more exploration."
+             Use the remaining rounds to finish the required work; do not explore side issues. \
+             If you must stop, state exactly which acceptance criteria are incomplete or \
+             unverified and why; never call a partial result complete."
         )
     })
 }
@@ -8676,35 +8676,37 @@ impl Daemon {
 
 const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's terminal. Workspace: `{cwd}`.
 
-## Intent
-- First decide what the user wants: answer, diagnosis, implementation, review, or execution. Do that kind of work; do not answer an implementation request with a plan, or edit when only an answer was asked. Diagnose before fixing; in a review, report findings before editing.
-- Extract explicit constraints (files, behavior, compatibility, tests) and treat them as acceptance criteria.
-- If an ambiguity could change the outcome, use `ask_user` once; otherwise choose the conventional default and state it.
+## Contract
+- Objective: satisfy the request, not merely produce a plan or code.
+- Define success before acting: each explicit requirement/constraint is a criterion. Done iff every criterion is verified. Stop only when Done, or a genuine blocker is stated with remaining work. Never redefine success to fit what was built or change scope silently.
+- Persist end-to-end whenever feasible; don't stop at a plan/partial fix or shrink scope to MVP/80% unless asked.
+- Evidence: a check is evidence only if it could fail; it is not proof. State assumptions and residual risk. Never claim unverified success.
+- Invariants: preserve user work and existing behavior unless the request changes it; never revert unrelated changes, use destructive git commands, or rewrite history unless asked.
 - Reply in the user's language unless code or identifiers require otherwise.
 
-## Workflow
-1. Ground: read the latest request and only the code needed. Search symbols first, then read the narrowest relevant files and call sites. Skip tools when the request is answerable from the conversation or general knowledge.
-2. Plan: use `todo` only for work with several dependent steps. Skip it for a direct answer or a single edit; never substitute a plan for implementation.
-3. Act: make the smallest coherent change and follow existing style. Prefer `edit`/`patch` over rewriting files; do not refactor, reformat, or comment unrelated code. Do not create files, docs, or tests unless needed. Preserve user work and never rewrite git history unless explicitly asked.
-4. Verify: run the narrowest check that proves the change (targeted test, typecheck, build), inspect the diff, and fix failures; never weaken tests or assertions to make a check pass. Expand only for risky or cross-cutting work. Do not rerun a check when nothing changed.
-5. Report: lead with the outcome, then verification and remaining risks. Stop when the request is satisfied.
+## Method
+1. Frame: classify the request (answer, diagnosis, implementation, review, execution) and do that work, not a plan for an implementation request. Diagnose before fixing; in reviews, findings before edits. Bias to action: choose a default; use `ask_user` once only if a wrong assumption would change the outcome.
+2. Ground: search symbols, read the narrowest code and call sites; skip tools if context suffices.
+3. Plan: use `todo` only for dependent steps; close each as done/blocked/cancelled with a reason; identify the next verifiable step.
+4. Act: smallest coherent change in existing style; prefer `edit`/`patch` over rewriting. Fix root causes, reuse helpers, and keep affected surfaces consistent. No placeholders, unneeded files/docs/tests, or unrelated edits unless asked.
+5. Verify: try to falsify the change with the strongest reasonable check; cover edge/error paths, inspect the diff, and don't rerun unchanged checks. Never weaken or edit tests to pass; use independent subagents for complex work.
+6. Report: outcome, evidence, assumptions, residual risk. Recheck the request and every criterion; if blocked or repeated reads/edits make no progress, state what remains and the next step, not completion.
 
 ## Tools
-- Batch independent reads and searches in one tool call. Prefer `read_file`, `grep`, `glob`, and `list_dir` over shell commands.
-- When present, instructions and the workspace summary are already in context; do not re-read them or repeat `ls`/`git status` unless they are stale or you need detail.
-- Read a file before editing it; check affected call sites first.
-- If a tool fails, read the error and change the input or approach. Never repeat an identical call.
-- Use `spawn_agent` only for broad, independent exploration, not work you can finish in one or two reads. Batch independent calls in one response; each prompt must be self-contained (children cannot see this conversation) and non-overlapping. Children are read-only.
-- Approval is handled by eix: call the tool instead of asking for permission in prose. Never claim work you did not verify."#;
+- Batch independent reads/searches; prefer dedicated tools over shell (`read_file`/`grep`/`glob`/`list_dir`). Read before editing and check call sites.
+- Instructions/workspace summary are already in context; don't re-read them or repeat `ls`/`git status` unless stale.
+- If a tool fails, change the input or approach; never repeat an identical call.
+- Use `spawn_agent` for broad exploration or independent verification, not work you can finish in 1-2 reads. Batch calls; prompts must be self-contained and non-overlapping. Children are read-only.
+- Approval is handled by eix: call the tool, don't ask in prose."#;
 
 /// A sub-agent has no parent transcript, no edit tools, and one focused task.
 /// Keep its contract small so fan-out does not repeat the full parent prompt.
 const SUBAGENT_SYSTEM_PROMPT: &str = r#"You are a read-only sub-agent for eix. Workspace: `{cwd}`.
 
-The prompt is your full task; you cannot see the parent conversation. Investigate only that question. Search symbols first, batch independent reads/searches, then read the narrowest relevant files and return concise findings with file:line evidence, the minimum context needed, and any uncertainty. Prefer a short list of concrete findings over narrative. Stop when the question is answered.
+The prompt is your full task; you cannot see the parent conversation. Investigate only that question. Search symbols first, batch independent reads/searches, then read the narrowest relevant files and return concise findings with file:line evidence, the minimum context needed, and any uncertainty. Prefer a short list of concrete findings over narrative. Answer the complete question, not only the easiest part; if evidence is blocked, say exactly what is missing.
 Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process. If a tool fails, change the input instead of repeating it. Follow repository instructions and load a matching skill before work. Answer in the user's language."#;
 
-const SUBAGENT_READONLY_NOTE: &str = "\n\nThe prompt is your full task; you cannot see the parent conversation. You are a read-only sub-agent. Investigate only the assigned question and return concise findings with file:line evidence. Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process.";
+const SUBAGENT_READONLY_NOTE: &str = "\n\nThe prompt is your full task; you cannot see the parent conversation. You are a read-only sub-agent. Investigate only the assigned question, answer it completely rather than only the easiest part, and return concise findings with file:line evidence; if evidence is blocked, say exactly what is missing. Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process.";
 
 fn system_prompt(config: &Config, session: &Session, mode: SessionMode) -> String {
     let is_subagent = session.origin == SessionOrigin::Agent;
@@ -8792,11 +8794,39 @@ mod tests {
         let prompt = system_prompt(&Config::default(), &session, SessionMode::Build);
         assert!(!prompt.contains("{cwd}"));
         for expected in [
-            "First decide what the user wants",
-            "Extract explicit constraints",
+            "Define success before acting",
+            "Done iff every criterion is verified",
+            "Stop only when Done",
+            "Never redefine success to fit what was built",
+            "change scope silently",
+            "Persist end-to-end whenever feasible",
+            "a check is evidence only if it could fail",
+            "State assumptions and residual risk",
+            "Never claim unverified success",
+            "preserve user work and existing behavior",
+            "never revert unrelated changes",
+            "classify the request",
+            "Diagnose before fixing; in reviews, findings before edits",
+            "Bias to action",
+            "use `ask_user` once",
+            "close each as done/blocked/cancelled with a reason",
+            "identify the next verifiable step",
+            "smallest coherent change in existing style",
+            "prefer `edit`/`patch` over rewriting",
+            "Fix root causes, reuse helpers",
+            "keep affected surfaces consistent",
+            "No placeholders, unneeded files/docs/tests, or unrelated edits",
+            "try to falsify",
+            "cover edge/error paths",
+            "Never weaken or edit tests to pass",
+            "use independent subagents for complex work",
+            "outcome, evidence, assumptions, residual risk",
+            "repeated reads/edits make no progress",
+            "state what remains and the next step, not completion",
             "Batch independent reads",
-            "Never repeat an identical call",
-            "Stop when the request is satisfied",
+            "Read before editing and check call sites",
+            "never repeat an identical call",
+            "broad exploration or independent verification",
         ] {
             assert!(prompt.contains(expected), "missing {expected:?}");
         }
@@ -8809,6 +8839,7 @@ mod tests {
         let child = system_prompt(&Config::default(), &child, SessionMode::Build);
         assert!(child.contains("read-only sub-agent"));
         assert!(child.contains("cannot see the parent conversation"));
+        assert!(child.contains("Answer the complete question"));
         assert!(
             !child.contains("## Workflow"),
             "child reused the parent prompt"
@@ -8973,7 +9004,10 @@ mod tests {
         )];
         assert!(tool_round_warning(0, 64).is_none());
         assert!(tool_round_warning(55, 64).is_none());
-        assert!(tool_round_warning(56, 64).is_some());
+        let warning = tool_round_warning(56, 64).expect("warning near the budget");
+        assert!(warning.contains("finish the required work"));
+        assert!(warning.contains("acceptance criteria"));
+        assert!(warning.contains("never call a partial result complete"));
         assert!(tool_round_warning(64, 64).is_some());
 
         assert_eq!(tools_for_round(63, 64, &tools).len(), 1);

@@ -80,9 +80,10 @@ pub fn builtin_agents() -> Vec<AgentSpec> {
         name: "explore".to_string(),
         description: "read-only search and analysis for sub-agents".to_string(),
         prompt:
-            "Investigate one focused question in the workspace. Return findings with file:line \
-                 evidence, the minimum context needed, and any uncertainty. Do not edit files, run \
-                 mutating commands, ask questions, or narrate your process."
+            "Investigate one focused question in the workspace and answer it completely, not just \
+                 the easiest part. Return findings with file:line evidence, the minimum context \
+                 needed, and any uncertainty; if evidence is blocked, say exactly what is missing. \
+                 Do not edit files, run mutating commands, ask questions, or narrate your process."
                 .to_string(),
         role: AgentRole::Subagent,
         model: None,
@@ -238,6 +239,8 @@ mod tests {
         assert_eq!(explore.role, AgentRole::Subagent);
         assert!(!explore.role.can_primary());
         assert!(explore.role.can_subagent());
+        assert!(explore.prompt.contains("answer it completely"));
+        assert!(explore.prompt.contains("not just the easiest part"));
     }
 
     #[test]
