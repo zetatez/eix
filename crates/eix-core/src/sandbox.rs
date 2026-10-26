@@ -23,6 +23,26 @@ pub fn bwrap_available() -> bool {
     env::split_paths(&path).any(|dir| is_executable(&dir.join("bwrap")))
 }
 
+/// Human-readable backend status used by `eix doctor`.
+pub fn status() -> &'static str {
+    if bwrap_available() {
+        "bubblewrap available"
+    } else if cfg!(target_os = "macos") {
+        "unsupported on macOS (bubblewrap is Linux-only)"
+    } else {
+        "bubblewrap missing"
+    }
+}
+
+/// Why `SandboxMode::Required` cannot start a sandboxed command.
+pub fn unavailable_reason() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "the OS sandbox is unavailable on macOS (bubblewrap is Linux-only)"
+    } else {
+        "bwrap is not installed or not executable"
+    }
+}
+
 /// The user's home directory, when it exists.
 pub fn home_dir() -> Option<PathBuf> {
     env::var_os("HOME")

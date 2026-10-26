@@ -1630,11 +1630,7 @@ async fn doctor(cli: &Cli) -> Result<()> {
             println!(
                 "sandbox  {} ({})",
                 config.tools.sandbox.as_str(),
-                if core_sandbox::bwrap_available() {
-                    "bwrap available"
-                } else {
-                    "bwrap missing"
-                }
+                core_sandbox::status()
             );
             println!("input    native (built-in Vim editor)");
             println!(

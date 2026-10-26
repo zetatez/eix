@@ -2325,7 +2325,10 @@ pub fn command_plan(
         SandboxMode::Off => false,
         SandboxMode::Required => {
             if !sandbox::bwrap_available() {
-                bail!("tools.sandbox = \"required\" but bwrap is not installed");
+                bail!(
+                    "tools.sandbox = \"required\" but {}",
+                    sandbox::unavailable_reason()
+                );
             }
             true
         }

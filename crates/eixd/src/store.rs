@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::{bail, Context, Result};
 use eix_core::{
@@ -36,6 +36,15 @@ pub struct StoreStats {
 }
 
 impl Store {
+    /// Recover the connection after a panic instead of poisoning every later
+    /// query. A transaction is rolled back when its guard drops, so the
+    /// recovered connection is still usable.
+    fn conn(&self) -> MutexGuard<'_, Connection> {
+        self.conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -85,6 +94,9 @@ impl Store {
             );
 
             CREATE INDEX IF NOT EXISTS events_session_seq ON events(session_id, seq);
+            -- Timeline only needs user messages; keep that scan at the tail.
+            CREATE INDEX IF NOT EXISTS events_session_kind_seq
+                ON events(session_id, kind, seq);
 
             -- Unsent prompt text, so a reconnecting frontend can restore it.
             CREATE TABLE IF NOT EXISTS drafts (
@@ -150,7 +162,7 @@ impl Store {
     }
 
     pub fn create_session(&self, session: &Session) -> Result<()> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO sessions
                 (id, name, cwd, status, model, parent_id, forked_from_seq, worktree, origin,
@@ -183,7 +195,7 @@ impl Store {
     /// `include_archived = true` is used by name generation and explicit
     /// archived-session pickers; the default session list hides them.
     pub fn list_sessions_including(&self, include_archived: bool) -> Result<Vec<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let sql = if include_archived {
             "SELECT id, name, cwd, status, model, created_at, updated_at,
                     parent_id, forked_from_seq, worktree, origin, mode, agent, archived
@@ -203,7 +215,7 @@ impl Store {
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
@@ -218,7 +230,7 @@ impl Store {
     /// Change a session's persisted execution mode. Returns the updated row,
     /// or `None` when the session does not exist.
     pub fn set_session_mode(&self, id: &str, mode: SessionMode) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE sessions SET mode = ?1, updated_at = ?2 WHERE id = ?3",
             params![mode.as_str(), now_ms(), id],
@@ -239,7 +251,7 @@ impl Store {
 
     /// Change a session's pinned model. `None` restores the daemon default.
     pub fn set_session_model(&self, id: &str, model: Option<&str>) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE sessions SET model = ?1, updated_at = ?2 WHERE id = ?3",
             params![model, now_ms(), id],
@@ -260,7 +272,7 @@ impl Store {
 
     /// Change a session's primary agent. `None` restores the built-in default.
     pub fn set_session_agent(&self, id: &str, agent: Option<&str>) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE sessions SET agent = ?1, updated_at = ?2 WHERE id = ?3",
             params![agent, now_ms(), id],
@@ -281,7 +293,7 @@ impl Store {
 
     /// Hide or restore a session without deleting its event log.
     pub fn set_session_archived(&self, id: &str, archived: bool) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE sessions SET archived = ?1, updated_at = ?2 WHERE id = ?3",
             params![archived as i64, now_ms(), id],
@@ -304,7 +316,7 @@ impl Store {
     /// worktree. The checks and delete run in one statement so a concurrent
     /// prompt or draft save cannot be lost. Undone events still count as input.
     pub fn delete_session_if_unused(&self, id: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "DELETE FROM sessions
              WHERE id = ?1
@@ -330,7 +342,7 @@ impl Store {
     /// Delete a session and (via `ON DELETE CASCADE`) its events and draft.
     /// Returns false when the session did not exist.
     pub fn delete_session(&self, id: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let _ = conn.execute(
             "DELETE FROM session_integrations WHERE session_id = ?1",
             params![id],
@@ -342,7 +354,7 @@ impl Store {
     /// Insert a previously exported event without re-numbering it. Export and
     /// import preserve sequence numbers so compaction ranges keep working.
     pub fn insert_event(&self, event: &Event) -> Result<()> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let payload_text = serde_json::to_string(&event.payload)?;
         tx.execute(
@@ -364,7 +376,7 @@ impl Store {
     /// it) from `events()` and the transcript. Each undo gets its own marker so
     /// repeated undo/redo behaves like a stack.
     pub fn undo_last_turn(&self, id: &str) -> Result<Option<usize>> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let cutoff: Option<i64> = tx
             .query_row(
@@ -398,7 +410,7 @@ impl Store {
 
     /// Restore the most recent undo batch.
     pub fn redo_last_undo(&self, id: &str) -> Result<Option<usize>> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let round: Option<i64> = tx.query_row(
             "SELECT MAX(undone) FROM events WHERE session_id = ?1",
@@ -423,7 +435,7 @@ impl Store {
     /// Highest event sequence in a session, or `None` when the session has no
     /// events (or does not exist).
     pub fn max_seq(&self, id: &str) -> Result<u64> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let max: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
             params![id],
@@ -440,7 +452,7 @@ impl Store {
         cwd: &Path,
         worktree: Option<&Path>,
     ) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE sessions SET cwd = ?1, worktree = ?2, updated_at = ?3 WHERE id = ?4",
             params![
@@ -458,7 +470,7 @@ impl Store {
     }
 
     pub fn session_count(&self) -> Result<usize> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         Ok(count as usize)
     }
@@ -466,7 +478,7 @@ impl Store {
     /// Whether the session has at least one user turn. Used by the idle
     /// auto-ready scanner to avoid queuing a pristine session.
     pub fn has_user_message(&self, session_id: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND kind = 'user_message'",
             params![session_id],
@@ -477,7 +489,7 @@ impl Store {
 
     /// Unsent prompt for a session; `(text, updated_at)` with empty defaults.
     pub fn get_draft(&self, session_id: &str) -> Result<(String, i64)> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         Ok(conn
             .query_row(
                 "SELECT text, updated_at FROM drafts WHERE session_id = ?1",
@@ -492,7 +504,7 @@ impl Store {
     /// `updated_at` (0 for a deletion).
     pub fn set_draft(&self, session_id: &str, text: &str) -> Result<i64> {
         let now = now_ms();
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         if text.is_empty() {
             conn.execute(
                 "DELETE FROM drafts WHERE session_id = ?1",
@@ -523,7 +535,7 @@ impl Store {
         cwd: Option<&Path>,
         worktree: Option<&Path>,
     ) -> Result<Option<Session>> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let source: Option<(String, Option<String>, String, Option<String>)> = tx
             .query_row(
@@ -597,7 +609,7 @@ impl Store {
     }
 
     pub fn rename_session(&self, id: &str, name: &str) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE sessions SET name = ?1, updated_at = ?2 WHERE id = ?3",
             params![name, now_ms(), id],
@@ -610,7 +622,7 @@ impl Store {
     }
 
     pub fn set_status(&self, id: &str, status: SessionStatus) -> Result<Option<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "UPDATE sessions SET status = ?1, updated_at = ?2 WHERE id = ?3",
             params![status.as_str(), now_ms(), id],
@@ -625,7 +637,7 @@ impl Store {
     /// Append one event, assigning the next per-session sequence number. Also
     /// bumps `sessions.updated_at` so list ordering reflects activity.
     pub fn append_event(&self, id: &str, kind: EventKind, payload: Value) -> Result<Event> {
-        let mut conn = self.conn.lock().expect("store mutex poisoned");
+        let mut conn = self.conn();
         let tx = conn.transaction()?;
         let seq: i64 = tx.query_row(
             "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE session_id = ?1",
@@ -681,12 +693,94 @@ impl Store {
     }
 
     pub fn events_after(&self, id: &str, after_seq: u64) -> Result<Vec<Event>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
              WHERE session_id = ?1 AND seq > ?2 AND undone = 0 ORDER BY seq ASC",
         )?;
         let rows = stmt.query_map(params![id, after_seq], |row| {
+            let kind: String = row.get(2)?;
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: id.to_string(),
+                seq: row.get::<_, i64>(0)? as u64,
+                ts: row.get(1)?,
+                kind: kind.parse::<EventKind>().map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("unknown event kind {kind:?}").into(),
+                    )
+                })?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
+    /// Fetch up to `limit` events newer than `after_seq`, in ascending order.
+    /// The boolean is true when newer events were omitted.
+    pub fn events_after_page(
+        &self,
+        id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        let limit = limit.max(1);
+        let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
+        let after_seq = after_seq.min(i64::MAX as u64) as i64;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, ts, kind, payload FROM events
+             WHERE session_id = ?1 AND seq > ?2 AND undone = 0
+             ORDER BY seq ASC LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(params![id, after_seq, fetch], |row| {
+            let kind: String = row.get(2)?;
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: id.to_string(),
+                seq: row.get::<_, i64>(0)? as u64,
+                ts: row.get(1)?,
+                kind: kind.parse::<EventKind>().map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("unknown event kind {kind:?}").into(),
+                    )
+                })?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        let has_more = events.len() > limit;
+        events.truncate(limit);
+        Ok((events, has_more))
+    }
+
+    /// All events of one kind newer than `after_seq`. Used by rewind to find
+    /// snapshots without scanning unrelated messages and tool output.
+    pub fn events_after_kind(
+        &self,
+        id: &str,
+        after_seq: u64,
+        kind: EventKind,
+    ) -> Result<Vec<Event>> {
+        let after_seq = after_seq.min(i64::MAX as u64) as i64;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, ts, kind, payload FROM events
+             WHERE session_id = ?1 AND seq > ?2 AND kind = ?3 AND undone = 0
+             ORDER BY seq ASC",
+        )?;
+        let rows = stmt.query_map(params![id, after_seq, kind.as_str()], |row| {
             let kind: String = row.get(2)?;
             let payload: String = row.get(3)?;
             Ok(Event {
@@ -721,7 +815,7 @@ impl Store {
         let limit = limit.max(1);
         let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let before_seq = before_seq.min(i64::MAX as u64) as i64;
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
              WHERE session_id = ?1 AND seq < ?2 AND undone = 0
@@ -754,10 +848,44 @@ impl Store {
         Ok((events, has_more))
     }
 
+    /// Newest user messages first, capped in SQL. The timeline UI only needs
+    /// this event kind; loading the whole session just to filter it is waste.
+    pub fn recent_user_messages(&self, id: &str, limit: usize) -> Result<Vec<Event>> {
+        let limit = limit.max(1).min(i64::MAX as usize) as i64;
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT seq, ts, kind, payload FROM events
+             WHERE session_id = ?1 AND kind = 'user_message' AND undone = 0
+             ORDER BY seq DESC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![id, limit], |row| {
+            let kind: String = row.get(2)?;
+            let payload: String = row.get(3)?;
+            Ok(Event {
+                session_id: id.to_string(),
+                seq: row.get::<_, i64>(0)? as u64,
+                ts: row.get(1)?,
+                kind: kind.parse::<EventKind>().map_err(|_| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        2,
+                        rusqlite::types::Type::Text,
+                        format!("unknown event kind {kind:?}").into(),
+                    )
+                })?,
+                payload: serde_json::from_str(&payload).unwrap_or(Value::Null),
+            })
+        })?;
+        let mut events = Vec::new();
+        for row in rows {
+            events.push(row?);
+        }
+        Ok(events)
+    }
+
     /// Sessions that were mid-turn when the daemon died. They cannot be resumed
     /// honestly, so the caller marks them as errored.
     pub fn running_sessions(&self) -> Result<Vec<Session>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, cwd, status, model, created_at, updated_at,
                     parent_id, forked_from_seq, worktree, origin, mode, agent, archived
@@ -772,7 +900,7 @@ impl Store {
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let sessions: i64 =
             conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         let archived: i64 = conn.query_row(
@@ -800,7 +928,7 @@ impl Store {
     /// Blob ids referenced by any stored user message, including undone
     /// events (redo can bring them back).
     pub fn referenced_blob_ids(&self) -> Result<HashSet<String>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events
              WHERE kind = 'user_message' AND payload LIKE '%\"blob\"%'",
@@ -823,7 +951,7 @@ impl Store {
 
     /// Read one plugin storage value. Missing keys are `None`, not an error.
     pub fn plugin_kv_get(&self, plugin: &str, scope: &str, key: &str) -> Result<Option<String>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         Ok(conn
             .query_row(
                 "SELECT value FROM plugin_kv
@@ -835,7 +963,7 @@ impl Store {
     }
 
     pub fn plugin_kv_set(&self, plugin: &str, scope: &str, key: &str, value: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let existing_bytes: Option<i64> = conn
             .query_row(
                 "SELECT LENGTH(CAST(value AS BLOB)) FROM plugin_kv
@@ -875,7 +1003,7 @@ impl Store {
     }
 
     pub fn plugin_kv_delete(&self, plugin: &str, scope: &str, key: &str) -> Result<bool> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let changed = conn.execute(
             "DELETE FROM plugin_kv WHERE plugin = ?1 AND scope = ?2 AND key = ?3",
             params![plugin, scope, key],
@@ -886,7 +1014,7 @@ impl Store {
     /// List keys (and values) for one plugin/scope. Values are included so a
     /// plugin can restore a small cursor cache without N round trips.
     pub fn plugin_kv_list(&self, plugin: &str, scope: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT key, value FROM plugin_kv
              WHERE plugin = ?1 AND scope = ?2 ORDER BY key",
@@ -922,7 +1050,7 @@ impl Store {
         base_branch: Option<&str>,
         worktree_disabled: bool,
     ) -> Result<IntegrationState> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let now = now_ms();
         conn.execute(
             "INSERT INTO session_integrations
@@ -939,12 +1067,12 @@ impl Store {
     }
 
     pub fn get_integration(&self, session_id: &str) -> Result<Option<IntegrationState>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         integration_row(&conn, session_id)
     }
 
     pub fn list_integrations(&self) -> Result<Vec<IntegrationState>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT session_id, status, stage, base_branch, error, log_path, ready_at,
                     next_retry_at, attempts, merged_commit, worktree_disabled, updated_at
@@ -960,7 +1088,7 @@ impl Store {
     }
 
     pub fn save_integration(&self, state: &IntegrationState) -> Result<()> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         conn.execute(
             "INSERT INTO session_integrations
                 (session_id, status, stage, base_branch, error, log_path, ready_at,
@@ -999,7 +1127,7 @@ impl Store {
     /// Next queue item whose retry time has arrived. Ready items have no
     /// `next_retry_at` and are always eligible.
     pub fn next_integration(&self, now: i64) -> Result<Option<IntegrationState>> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         Ok(conn
             .query_row(
                 "SELECT session_id, status, stage, base_branch, error, log_path, ready_at,
@@ -1016,7 +1144,7 @@ impl Store {
     }
 
     pub fn delete_integration(&self, session_id: &str) -> Result<()> {
-        let conn = self.conn.lock().expect("store mutex poisoned");
+        let conn = self.conn();
         conn.execute(
             "DELETE FROM session_integrations WHERE session_id = ?1",
             params![session_id],
@@ -1473,6 +1601,86 @@ mod tests {
     }
 
     #[test]
+    fn events_after_page_and_kind_filter_limit_in_sql() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        for kind in [
+            EventKind::UserMessage,
+            EventKind::Snapshot,
+            EventKind::UserMessage,
+            EventKind::Snapshot,
+            EventKind::UserMessage,
+        ] {
+            store
+                .append_event("s1", kind, serde_json::json!({}))
+                .unwrap();
+        }
+
+        let (page, has_more) = store.events_after_page("s1", 0, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(has_more);
+
+        let (page, has_more) = store.events_after_page("s1", 4, 2).unwrap();
+        assert_eq!(
+            page.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![5]
+        );
+        assert!(!has_more);
+
+        let snapshots = store
+            .events_after_kind("s1", 0, EventKind::Snapshot)
+            .unwrap();
+        assert_eq!(
+            snapshots.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![2, 4]
+        );
+        let snapshots = store
+            .events_after_kind("s1", 2, EventKind::Snapshot)
+            .unwrap();
+        assert_eq!(
+            snapshots.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![4]
+        );
+    }
+
+    #[test]
+    fn recent_user_messages_filters_and_limits_in_sql() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        for kind in [
+            EventKind::UserMessage,
+            EventKind::AssistantMessage,
+            EventKind::UserMessage,
+            EventKind::UserMessage,
+        ] {
+            store
+                .append_event("s1", kind, serde_json::json!({"text": "m"}))
+                .unwrap();
+        }
+
+        let newest = store.recent_user_messages("s1", 1).unwrap();
+        assert_eq!(newest.len(), 1);
+        assert_eq!(newest[0].seq, 4);
+
+        store.undo_last_turn("s1").unwrap();
+        let visible = store.recent_user_messages("s1", 10).unwrap();
+        assert_eq!(
+            visible.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+
+        store.redo_last_undo("s1").unwrap();
+        let restored = store.recent_user_messages("s1", 2).unwrap();
+        assert_eq!(
+            restored.iter().map(|event| event.seq).collect::<Vec<_>>(),
+            vec![4, 3]
+        );
+    }
+
+    #[test]
     fn fork_copies_only_the_prefix_and_records_lineage() {
         let store = Store::in_memory().unwrap();
         let mut source = session("s1");
@@ -1604,7 +1812,7 @@ mod tests {
         // Fill the row quota directly so the test does not depend on thousands
         // of individual round trips.
         {
-            let mut conn = store.conn.lock().expect("store mutex poisoned");
+            let mut conn = store.conn();
             let tx = conn.transaction().unwrap();
             for index in 0..MAX_PLUGIN_STORAGE_ROWS {
                 tx.execute(

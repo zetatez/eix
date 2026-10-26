@@ -1290,8 +1290,10 @@ for line in sys.stdin:
 "#,
         )?;
 
-        let mut config = Config::default();
-        config.load_cwd = dir.clone();
+        let mut config = Config {
+            load_cwd: dir.clone(),
+            ..Config::default()
+        };
         config.plugins.insert(
             "kv".to_string(),
             PluginConfig {
@@ -1410,8 +1412,10 @@ if message.get("method") == "initialize":
 "#,
         )?;
 
-        let mut config = Config::default();
-        config.load_cwd = dir.clone();
+        let mut config = Config {
+            load_cwd: dir.clone(),
+            ..Config::default()
+        };
         config.plugins.insert(
             "crash".to_string(),
             PluginConfig {
@@ -1490,8 +1494,10 @@ for line in sys.stdin:
 "#,
         )?;
 
-        let mut config = Config::default();
-        config.load_cwd = dir.clone();
+        let mut config = Config {
+            load_cwd: dir.clone(),
+            ..Config::default()
+        };
         config.plugins.insert(
             "badtool".to_string(),
             PluginConfig {
@@ -1560,8 +1566,10 @@ for line in sys.stdin:
 "#,
         )?;
 
-        let mut config = Config::default();
-        config.load_cwd = dir.clone();
+        let mut config = Config {
+            load_cwd: dir.clone(),
+            ..Config::default()
+        };
         config.plugins.insert(
             "bye".to_string(),
             PluginConfig {

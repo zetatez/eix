@@ -627,10 +627,6 @@ pub struct ToolsConfig {
     pub max_output_bytes: usize,
     /// Wall-clock limit for `run_command`.
     pub command_timeout_secs: u64,
-    /// Hard cap on provider <-> tool round trips for one turn. The last few
-    /// rounds include a "summarize now" reminder, and the final round is sent
-    /// without tool definitions so the model must produce an answer.
-    pub max_tool_rounds: usize,
     /// Default number of `spawn_agent` children that may run concurrently in
     /// one tool batch. The TUI can override this at runtime; config reload or
     /// a daemon restart restores this default.
@@ -726,7 +722,6 @@ impl Default for ToolsConfig {
             auto_apply_workspace_edits: true,
             max_output_bytes: 20_000,
             command_timeout_secs: 60,
-            max_tool_rounds: 64,
             max_parallel_subagents: DEFAULT_MAX_PARALLEL_SUBAGENTS,
             sandbox: SandboxMode::Auto,
             sandbox_network: false,
@@ -1906,11 +1901,6 @@ impl Config {
                 "tools.command_timeout_secs must be > 0".into(),
             ));
         }
-        if self.tools.max_tool_rounds == 0 {
-            return Err(ConfigError::Invalid(
-                "tools.max_tool_rounds must be > 0".into(),
-            ));
-        }
         if !subagent_concurrency_supported(self.tools.max_parallel_subagents) {
             return Err(ConfigError::Invalid(
                 "tools.max_parallel_subagents must be one of 2, 4, 8, 16, 32, 64, 128, 256".into(),
@@ -3005,6 +2995,14 @@ mod tests {
             config.chat_endpoint(),
             "http://localhost:1234/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn shipped_yaml_template_parses() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let path = root.join("config.tmpl.yaml");
+        let config = Config::load_for(Some(&path), &root).expect("parse config.tmpl.yaml");
+        config.validate().expect("config.tmpl.yaml validates");
     }
 
     #[test]
@@ -4118,7 +4116,6 @@ pi = true
             .any(|path| path == "~/.cargo"));
         assert!(default.tools.snapshots);
         assert!(default.tools.auto_apply_workspace_edits);
-        assert_eq!(default.tools.max_tool_rounds, 64);
         assert_eq!(default.tools.max_parallel_subagents, 4);
         assert!(default.integration.auto_commit);
         assert!(!default.integration.auto_ready);
@@ -4128,7 +4125,6 @@ pi = true
             r#"
 [tools]
 auto_apply_workspace_edits = false
-max_tool_rounds = 96
 max_parallel_subagents = 8
 sandbox = "required"
 sandbox_network = true
@@ -4140,7 +4136,6 @@ snapshots = false
         )
         .expect("tools config");
         assert!(!parsed.tools.auto_apply_workspace_edits);
-        assert_eq!(parsed.tools.max_tool_rounds, 96);
         assert_eq!(parsed.tools.max_parallel_subagents, 8);
         assert_eq!(parsed.tools.sandbox, SandboxMode::Required);
         assert!(parsed.tools.sandbox_network);
@@ -4149,13 +4144,6 @@ snapshots = false
         assert!(parsed.tools.network_host_allowed("https://example.com/x"));
         assert!(!parsed.tools.network_host_allowed("https://evil.test/x"));
         assert!(!parsed.tools.snapshots);
-    }
-
-    #[test]
-    fn tool_round_budget_must_be_positive() {
-        let mut config = Config::default();
-        config.tools.max_tool_rounds = 0;
-        assert!(config.validate().is_err());
     }
 
     #[test]

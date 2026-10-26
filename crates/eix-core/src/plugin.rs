@@ -645,9 +645,11 @@ mod tests {
 
     #[test]
     fn tool_filter_is_deny_first() {
-        let mut config = PluginConfig::default();
-        config.allowed_tools = vec!["issue_*".into()];
-        config.denied_tools = vec!["issue_delete".into()];
+        let config = PluginConfig {
+            allowed_tools: vec!["issue_*".into()],
+            denied_tools: vec!["issue_delete".into()],
+            ..Default::default()
+        };
         assert!(config.allows_tool("issue_search"));
         assert!(!config.allows_tool("issue_delete"));
         assert!(!config.allows_tool("deploy"));

@@ -577,6 +577,218 @@ async fn daemon_does_not_retry_an_exhausted_quota() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Answers every request with the same tool call, for a model stuck in a loop.
+async fn repeating_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            bodies.lock().await.push(body);
+            // Identical arguments and a fresh call id every round, which is
+            // what a model that ignores the previous result produces.
+            let chunk = json!({
+                "model": "mock-tools",
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": 0,
+                            "id": format!("call_{}", bodies.lock().await.len()),
+                            "type": "function",
+                            "function": {"name": "read_file", "arguments": "{\"path\":\"notes.txt\"}"},
+                        }]
+                    },
+                    "finish_reason": "tool_calls",
+                }],
+            });
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
+/// Answers the first `rounds` requests with distinct read-only calls (so the
+/// doomloop guard does not fire), then returns a final text answer.
+async fn progressing_tool_provider(
+    listener: TcpListener,
+    bodies: Arc<Mutex<Vec<String>>>,
+    rounds: usize,
+) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let round = {
+                let mut bodies = bodies.lock().await;
+                bodies.push(body);
+                bodies.len() - 1
+            };
+            let chunk = if round < rounds {
+                json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": format!("call_{round}"),
+                                "type": "function",
+                                "function": {
+                                    "name": "list_dir",
+                                    "arguments": format!("{{\"path\":\"d{round}\"}}"),
+                                },
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            } else {
+                json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {"content": "finished"},
+                        "finish_reason": "stop",
+                    }],
+                })
+            };
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
+/// There is no fixed round cap: the model keeps going past the old 64-round
+/// limit and ends the turn by returning a normal answer.
+#[tokio::test]
+async fn daemon_has_no_fixed_tool_round_cap() -> anyhow::Result<()> {
+    let dir = temp_dir("unlimited");
+    std::fs::create_dir_all(&dir)?;
+    const ROUNDS: usize = 70;
+    for round in 0..ROUNDS {
+        std::fs::create_dir_all(dir.join(format!("d{round}")))?;
+    }
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(progressing_tool_provider(
+        listener,
+        Arc::clone(&bodies),
+        ROUNDS,
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "unlimited", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "list every directory"}),
+        )
+        .await?;
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == session_id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break notification.params.clone();
+        }
+    };
+
+    assert!(
+        completed["error"].is_null(),
+        "unexpected error: {}",
+        completed["error"]
+    );
+    // One request per tool round plus the final answer request.
+    assert_eq!(bodies.lock().await.len(), ROUNDS + 1);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// A model that keeps sending the same tool call must be stopped by the
+/// doomloop guard, not allowed to spend the whole round budget on one request.
+#[tokio::test]
+async fn daemon_stops_a_repeating_tool_batch() -> anyhow::Result<()> {
+    let dir = temp_dir("doomloop");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("notes.txt"), "unchanged\n")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(repeating_tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "doomloop", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "read the notes"}),
+        )
+        .await?;
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == session_id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break notification.params.clone();
+        }
+    };
+
+    let error = completed["error"].as_str().unwrap_or_default();
+    assert!(error.contains("identical"), "unexpected error: {error}");
+    // Five identical batches: the guard fired long before the 40-round budget.
+    assert_eq!(bodies.lock().await.len(), 5);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
     let dir = temp_dir("clear");

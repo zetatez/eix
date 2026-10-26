@@ -9,6 +9,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -46,7 +47,7 @@ use eix_core::{
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
@@ -70,6 +71,30 @@ const REPAIR_PENDING_STAGE: &str = "repair pending: ";
 /// Keep integration notes useful without letting a huge test log fill the
 /// transcript. The repair prompt still carries its own (larger) failure tail.
 const INTEGRATION_LOG_CHARS: usize = 8_000;
+
+/// Maximum size of one newline-delimited JSON frame. This is checked while
+/// reading, before authentication, so an oversized request cannot grow the
+/// connection buffer without bound.
+const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+
+/// Per-connection outbound queue. A slow client backpressures the bus task
+/// instead of making the daemon allocate an unbounded number of notifications.
+const SERVER_MESSAGE_QUEUE: usize = 256;
+
+/// A TCP client must send `auth` within this window. Unix clients are trusted
+/// by socket permissions and are not subject to the handshake timeout.
+const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Drop a connection if a single response or notification cannot be written
+/// for this long. Without this, a client that stops reading can pin a task and
+/// its queue forever.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Bound concurrent remote connections for both the TCP and HTTP listeners.
+const MAX_REMOTE_CONNECTIONS: usize = 128;
+
+/// Hard cap for one `session.events` page even when the caller omits `limit`.
+const MAX_EVENTS_PAGE: usize = 5_000;
 
 /// Bound fan-out for one read-only tool batch, including `run_command` calls
 /// that passed the read-only risk check.
@@ -432,7 +457,14 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         let listener = TcpListener::bind(&addr)
             .await
             .with_context(|| format!("cannot bind http {addr}"))?;
-        eprintln!("  http   {} (token required)", listener.local_addr()?);
+        let local = listener.local_addr()?;
+        eprintln!("  http   {local} (token required)");
+        if !local.ip().is_loopback() {
+            eprintln!(
+                "eixd: warning: http {local} is not loopback; traffic is plaintext and \
+                 protected only by the shared token. Use an SSH tunnel or a TLS proxy."
+            );
+        }
         let daemon = Arc::clone(&daemon);
         tokio::spawn(async move {
             crate::http::serve(daemon, listener, token).await;
@@ -465,16 +497,28 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         let tcp = TcpListener::bind(&addr)
             .await
             .with_context(|| format!("cannot bind tcp {addr}"))?;
-        eprintln!("  tcp    {} (token required)", tcp.local_addr()?);
+        let local = tcp.local_addr()?;
+        eprintln!("  tcp    {local} (token required)");
+        if !local.ip().is_loopback() {
+            eprintln!(
+                "eixd: warning: tcp {local} is not loopback; traffic is plaintext and \
+                 protected only by the shared token. Use an SSH tunnel or a TLS proxy."
+            );
+        }
         let daemon = Arc::clone(&daemon);
+        let connections = Arc::new(Semaphore::new(MAX_REMOTE_CONNECTIONS));
         tokio::spawn(async move {
             loop {
+                let Ok(permit) = Arc::clone(&connections).acquire_owned().await else {
+                    break;
+                };
                 let Ok((stream, _)) = tcp.accept().await else {
                     break;
                 };
                 let daemon = Arc::clone(&daemon);
                 let token = token.clone();
                 tokio::spawn(async move {
+                    let _permit = permit;
                     daemon.serve(stream, Transport::Tcp, Some(token)).await;
                 });
             }
@@ -2105,7 +2149,7 @@ impl Daemon {
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         let (read, write) = tokio::io::split(stream);
-        let (tx, rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (tx, rx) = mpsc::channel::<ServerMessage>(SERVER_MESSAGE_QUEUE);
         let writer = tokio::spawn(write_loop(write, rx));
 
         // A Unix connection is trusted by its 0600 permissions, so events are
@@ -2118,26 +2162,78 @@ impl Daemon {
         let mut bus_task = (transport == Transport::Unix)
             .then(|| spawn_bus(self.bus.clone(), tx.clone(), filter.clone()));
 
-        let mut lines = BufReader::new(read).lines();
+        let mut reader = BufReader::new(read);
+        let mut frame = Vec::new();
         // Unix sockets are already protected by filesystem permissions.
         let mut authorized = transport == Transport::Unix;
         loop {
-            let line = match lines.next_line().await {
-                Ok(Some(line)) => line,
-                Ok(None) => break,
+            let read = read_frame(&mut reader, &mut frame, MAX_FRAME_BYTES);
+            let result = if authorized {
+                read.await
+            } else {
+                match tokio::time::timeout(AUTH_TIMEOUT, read).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let _ = tx
+                            .send(ServerMessage::Response(Response::err(
+                                0,
+                                "auth_timeout",
+                                "authentication timed out",
+                            )))
+                            .await;
+                        break;
+                    }
+                }
+            };
+            match result {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(err) if err.kind() == io::ErrorKind::InvalidData => {
+                    let _ = tx
+                        .send(ServerMessage::Response(Response::err(
+                            0,
+                            "frame_too_large",
+                            format!("request frame exceeds {MAX_FRAME_BYTES} bytes"),
+                        )))
+                        .await;
+                    break;
+                }
                 Err(_) => break,
+            }
+            let line = match std::str::from_utf8(&frame) {
+                Ok(line) => line,
+                Err(_) => {
+                    if tx
+                        .send(ServerMessage::Response(Response::err(
+                            0,
+                            "bad_request",
+                            "request is not valid UTF-8",
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    continue;
+                }
             };
             if line.trim().is_empty() {
                 continue;
             }
-            let request = match Request::parse(&line) {
+            let request = match Request::parse(line) {
                 Ok(request) => request,
                 Err(err) => {
-                    let _ = tx.send(ServerMessage::Response(Response::err(
-                        0,
-                        "bad_request",
-                        format!("invalid JSON request: {err}"),
-                    )));
+                    if tx
+                        .send(ServerMessage::Response(Response::err(
+                            0,
+                            "bad_request",
+                            format!("invalid JSON request: {err}"),
+                        )))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
                     continue;
                 }
             };
@@ -2153,21 +2249,29 @@ impl Daemon {
                     false
                 };
                 if !okay {
-                    let _ = tx.send(ServerMessage::Response(Response::err(
-                        request.id,
-                        "unauthorized",
-                        "a valid `auth` request with the server token is required",
-                    )));
+                    let _ = tx
+                        .send(ServerMessage::Response(Response::err(
+                            request.id,
+                            "unauthorized",
+                            "a valid `auth` request with the server token is required",
+                        )))
+                        .await;
                     break;
                 }
                 authorized = true;
                 // From here on this connection sees the same broadcast as a
                 // local client.
                 bus_task = Some(spawn_bus(self.bus.clone(), tx.clone(), filter.clone()));
-                let _ = tx.send(ServerMessage::Response(Response::ok(
-                    request.id,
-                    json!({ "authenticated": true }),
-                )));
+                if tx
+                    .send(ServerMessage::Response(Response::ok(
+                        request.id,
+                        json!({ "authenticated": true }),
+                    )))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
                 continue;
             }
             // Connection-local: narrow which sessions this client hears about.
@@ -2188,13 +2292,13 @@ impl Daemon {
                         }
                         Err(err) => Response::err(request.id, "bad_request", err.to_string()),
                     };
-                if tx.send(ServerMessage::Response(response)).is_err() {
+                if tx.send(ServerMessage::Response(response)).await.is_err() {
                     break;
                 }
                 continue;
             }
             let response = self.handle_from(&request, transport.origin()).await;
-            if tx.send(ServerMessage::Response(response)).is_err() {
+            if tx.send(ServerMessage::Response(response)).await.is_err() {
                 break;
             }
         }
@@ -2462,7 +2566,7 @@ impl Daemon {
             "session.export" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
                 let session = self.require_session(&params.session_id)?;
-                let mut events = self.store.events(&params.session_id)?;
+                let mut events = self.store.events_async(&params.session_id).await?;
                 // Exports must remain portable: inline image bytes even when
                 // this daemon stores them as blobs.
                 for event in &mut events {
@@ -2536,11 +2640,11 @@ impl Daemon {
                     .params
                     .get("limit")
                     .and_then(Value::as_u64)
-                    .unwrap_or(100) as usize;
-                let events = self.store.events(&params.session_id)?;
-                let mut items: Vec<TimelineItem> = events
+                    .unwrap_or(100)
+                    .clamp(1, 1_000) as usize;
+                let events = self.store.recent_user_messages(&params.session_id, limit)?;
+                let items: Vec<TimelineItem> = events
                     .into_iter()
-                    .filter(|event| event.kind == EventKind::UserMessage)
                     .filter_map(|event| {
                         let preview = timeline_preview(event.kind, &event.payload)?;
                         Some(TimelineItem {
@@ -2551,11 +2655,6 @@ impl Daemon {
                         })
                     })
                     .collect();
-                if items.len() > limit {
-                    items.drain(0..items.len() - limit);
-                }
-                // Newest user input first; `limit` still keeps the newest rows.
-                items.reverse();
                 Ok(serde_json::to_value(TimelineResult { items })?)
             }
             "session.create" => {
@@ -2833,7 +2932,7 @@ impl Daemon {
                     Some(tail) => self
                         .store
                         .events_before(&params.session_id, u64::MAX, tail)?,
-                    None => (self.store.events(&params.session_id)?, false),
+                    None => (self.store.events_async(&params.session_id).await?, false),
                 };
                 Ok(serde_json::to_value(AttachResult {
                     session,
@@ -2844,22 +2943,18 @@ impl Daemon {
             "session.events" => {
                 let params: EventsParams = parse_params(request.params.clone())?;
                 self.require_session(&params.session_id)?;
+                let limit = params
+                    .limit
+                    .unwrap_or(MAX_EVENTS_PAGE)
+                    .clamp(1, MAX_EVENTS_PAGE);
                 let (events, has_more) = match params.before_seq {
-                    Some(before_seq) => self.store.events_before(
-                        &params.session_id,
-                        before_seq,
-                        params.limit.unwrap_or(usize::MAX),
-                    )?,
+                    Some(before_seq) => {
+                        self.store
+                            .events_before(&params.session_id, before_seq, limit)?
+                    }
                     None => {
-                        let mut events = self
-                            .store
-                            .events_after(&params.session_id, params.after_seq)?;
-                        let limit = params.limit.map(|limit| limit.max(1));
-                        let has_more = limit.is_some_and(|limit| events.len() > limit);
-                        if let Some(limit) = limit {
-                            events.truncate(limit);
-                        }
-                        (events, has_more)
+                        self.store
+                            .events_after_page(&params.session_id, params.after_seq, limit)?
                     }
                 };
                 Ok(serde_json::to_value(EventsResult { events, has_more })?)
@@ -3781,10 +3876,10 @@ impl Daemon {
         // Collect the snapshots taken at or after the cut before forking: they
         // are exactly the mutations the new branch discards.
         let mut snapshots: Vec<(u64, String, usize)> = Vec::new();
-        for event in self.store.events(&source.id)? {
-            if event.kind != EventKind::Snapshot || event.seq < upto {
-                continue;
-            }
+        for event in
+            self.store
+                .events_after_kind(&source.id, upto.saturating_sub(1), EventKind::Snapshot)?
+        {
             let Ok(snapshot) = serde_json::from_value::<SnapshotPayload>(event.payload) else {
                 continue;
             };
@@ -4412,7 +4507,6 @@ impl Daemon {
         let mut messages = ledger.messages();
         self.emit_context(session_id, &ledger);
         let tools = allowed_tools;
-        let max_tool_rounds = config.tools.max_tool_rounds.max(1);
         let route = config.route(&model);
         let (max_retries, retry_base, retry_max) = (
             config.provider_runtime.retry_attempts,
@@ -4423,8 +4517,16 @@ impl Daemon {
         // provider/model pair cannot loop forever inside one user turn.
         let mut auto_compactions = 0u32;
         let mut context_recoveries = 0u32;
+        // Doomloop guard: a model that keeps re-issuing the same tool batch
+        // burns tokens without learning anything new. It is the main safety
+        // net now that there is no fixed round cap.
+        let mut repeats = RepeatGuard::default();
+        let mut repeat_notice: Option<String> = None;
+        // Cumulative provider tokens for this turn, used in failure
+        // diagnostics.
+        let mut turn_tokens = 0u64;
 
-        for round in 0..=max_tool_rounds {
+        for round in 0usize.. {
             if cancel.load(Ordering::SeqCst) {
                 self.finish_cancelled(session_id, turn_id, "", "", &model)?;
                 return Ok(());
@@ -4465,14 +4567,14 @@ impl Daemon {
                 self.emit_context(session_id, &refreshed);
             }
 
-            // Approaching the budget, tell the model to stop exploring and
-            // answer. The final round omits tool definitions entirely, so the
-            // model cannot spend the whole budget and then fail without a
-            // synthesis.
-            if let Some(warning) = tool_round_warning(round, max_tool_rounds) {
-                messages.push(ChatMessage::system(warning));
+            // The model stops by returning an answer without tool calls, and
+            // the user can interrupt at any time. There is no fixed round cap.
+            // Only the round after the repeat is detected sees this reminder,
+            // because messages are rebuilt from the event log every round.
+            if let Some(notice) = repeat_notice.take() {
+                messages.push(ChatMessage::system(notice));
             }
-            let request_tools = tools_for_round(round, max_tool_rounds, tools);
+            let request_tools = tools;
 
             let provider = self.provider.load_full();
             let mut attempt = 0u32;
@@ -4664,6 +4766,12 @@ impl Daemon {
                 }
             };
 
+            if let Some(usage) = completion.usage.as_ref() {
+                turn_tokens += usage
+                    .total_tokens
+                    .max(usage.prompt_tokens.saturating_add(usage.completion_tokens));
+            }
+
             if completion.tool_calls.is_empty() {
                 if completion.text.trim().is_empty() && completion.reasoning.trim().is_empty() {
                     return Err(anyhow::anyhow!(
@@ -4709,6 +4817,25 @@ impl Daemon {
 
             // The assistant asked for tools; record the message so the context
             // stays honest, then run each call and feed the results back.
+            // Checked before anything is recorded, so an aborted turn leaves no
+            // assistant message whose tool calls never got results.
+            match repeats.observe(&completion.tool_calls) {
+                RepeatVerdict::Abort { count } => bail!(
+                    "stopped after {count} identical `{}` batches in a row (round {round}, \
+                     {turn_tokens} tokens so far): the model kept asking for the same call \
+                     without making progress. Change the approach, narrow the request into \
+                     smaller turns, or run the command yourself",
+                    tool_batch_names(&completion.tool_calls)
+                ),
+                RepeatVerdict::Warn { count } => {
+                    repeat_notice = Some(format!(
+                        "You have issued this exact same tool batch {count} times in a row and \
+                         learned nothing new from it. Do not send it again: change the arguments, \
+                         switch tools, or stop and report what is still unverified."
+                    ));
+                }
+                RepeatVerdict::Fresh => {}
+            }
             let event = self.store.append_event(
                 session_id,
                 EventKind::AssistantMessage,
@@ -4740,13 +4867,6 @@ impl Daemon {
             if cancel.load(Ordering::SeqCst) {
                 self.finish_cancelled(session_id, turn_id, "", "", &model)?;
                 return Ok(());
-            }
-
-            if round == max_tool_rounds {
-                bail!(
-                    "tool loop exceeded {} rounds without a final answer; raise [tools] max_tool_rounds if this task legitimately needs more",
-                    max_tool_rounds
-                );
             }
         }
         Ok(())
@@ -8396,30 +8516,82 @@ async fn sleep_cancellable(delay: Duration, cancel: &AtomicBool) -> bool {
     }
 }
 
-const TOOL_ROUND_WARNING: usize = 8;
+/// How many *consecutive* identical tool batches are tolerated before the model
+/// is nudged, and before the turn is stopped.
+const REPEAT_WARNING_AT: u32 = 3;
+const REPEAT_ABORT_AT: u32 = 5;
 
-/// A system reminder injected near the end of the tool budget. It is not
-/// persisted: the next round rebuilds messages from the event log, so the
-/// reminder is added again only while it still applies.
-fn tool_round_warning(round: usize, max_rounds: usize) -> Option<String> {
-    let remaining = max_rounds.saturating_sub(round);
-    (remaining <= TOOL_ROUND_WARNING).then(|| {
-        format!(
-            "Tool budget: {round}/{max_rounds} rounds used, {remaining} left. \
-             Use the remaining rounds to finish the required work; do not explore side issues. \
-             If you must stop, state exactly which acceptance criteria are incomplete or \
-             unverified and why; never call a partial result complete."
-        )
-    })
+/// Arguments in a stable form, so key order and stray whitespace do not make
+/// two identical calls look different.
+fn canonical_arguments(raw: &str) -> String {
+    match serde_json::from_str::<Value>(raw) {
+        // `serde_json::Value` keeps object keys in a sorted map, so this
+        // normalizes order and spacing.
+        Ok(value) => value.to_string(),
+        Err(_) => raw.trim().to_string(),
+    }
 }
 
-/// The final round deliberately hides tool definitions. At that point the
-/// alternative is a hard failure with no answer, so force a synthesis.
-fn tools_for_round(round: usize, max_rounds: usize, tools: &[ToolDefinition]) -> &[ToolDefinition] {
-    if round >= max_rounds {
-        &[]
-    } else {
-        tools
+/// Identity of one tool batch: names and canonical arguments, in order. Call
+/// ids are excluded because they change every round even for the same request.
+fn tool_batch_signature(calls: &[ToolCall]) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    calls.len().hash(&mut hasher);
+    for call in calls {
+        call.function.name.hash(&mut hasher);
+        canonical_arguments(&call.function.arguments).hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
+/// `read_file, run_command` — enough for a message to name the stalled batch.
+fn tool_batch_names(calls: &[ToolCall]) -> String {
+    let mut names: Vec<&str> = Vec::new();
+    for call in calls {
+        let name = call.function.name.as_str();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    truncate_ui(&names.join(", "), 200)
+}
+
+enum RepeatVerdict {
+    /// A different batch than the previous round, so the streak restarts.
+    Fresh,
+    /// Same batch as the previous round: inject a reminder and carry on.
+    Warn { count: u32 },
+    /// The model is spinning. Stop instead of burning the round budget.
+    Abort { count: u32 },
+}
+
+/// Counts consecutive identical tool batches. A model that re-issues the exact
+/// same calls with nothing in between is not making progress: every round
+/// re-sends the whole prompt for a decision it already made, which costs full
+/// price and yields nothing. With no fixed round cap this is the main guard
+/// against a model that never chooses to stop.
+#[derive(Default)]
+struct RepeatGuard {
+    last: Option<(u64, u32)>,
+}
+
+impl RepeatGuard {
+    /// Record one batch. Only *consecutive* repeats count, so an `edit` between
+    /// two identical `run_command` batches resets the streak.
+    fn observe(&mut self, calls: &[ToolCall]) -> RepeatVerdict {
+        let signature = tool_batch_signature(calls);
+        let count = match self.last {
+            Some((last, count)) if last == signature => count.saturating_add(1),
+            _ => 1,
+        };
+        self.last = Some((signature, count));
+        if count >= REPEAT_ABORT_AT {
+            RepeatVerdict::Abort { count }
+        } else if count >= REPEAT_WARNING_AT {
+            RepeatVerdict::Warn { count }
+        } else {
+            RepeatVerdict::Fresh
+        }
     }
 }
 
@@ -8434,7 +8606,41 @@ fn truncate_ui(text: &str, max: usize) -> String {
     format!("{}…", &text[..end])
 }
 
-async fn write_loop<W>(mut write: W, mut rx: mpsc::UnboundedReceiver<ServerMessage>)
+/// Read one newline-delimited frame into `buf`, without allocating more than
+/// `max` bytes before the delimiter is found. `buf` is reused by the caller.
+async fn read_frame<R>(reader: &mut R, buf: &mut Vec<u8>, max: usize) -> io::Result<bool>
+where
+    R: AsyncBufRead + Unpin,
+{
+    buf.clear();
+    loop {
+        let chunk = reader.fill_buf().await?;
+        if chunk.is_empty() {
+            return Ok(!buf.is_empty());
+        }
+        let (take, newline) = match chunk.iter().position(|byte| *byte == b'\n') {
+            Some(index) => (index + 1, true),
+            None => (chunk.len(), false),
+        };
+        if buf.len().saturating_add(take) > max {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "request frame exceeds the size limit",
+            ));
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if newline {
+            break;
+        }
+    }
+    while matches!(buf.last(), Some(b'\n' | b'\r')) {
+        buf.pop();
+    }
+    Ok(true)
+}
+
+async fn write_loop<W>(mut write: W, mut rx: mpsc::Receiver<ServerMessage>)
 where
     W: AsyncWrite + Unpin,
 {
@@ -8444,10 +8650,11 @@ where
             Err(_) => continue,
         };
         bytes.push(b'\n');
-        if write.write_all(&bytes).await.is_err() {
-            break;
-        }
-        if write.flush().await.is_err() {
+        let write = async {
+            write.write_all(&bytes).await?;
+            write.flush().await
+        };
+        if !matches!(tokio::time::timeout(WRITE_TIMEOUT, write).await, Ok(Ok(()))) {
             break;
         }
     }
@@ -8458,7 +8665,7 @@ where
 /// called from the auth branch.
 fn spawn_bus(
     bus: broadcast::Sender<Notification>,
-    tx: mpsc::UnboundedSender<ServerMessage>,
+    tx: mpsc::Sender<ServerMessage>,
     filter: Arc<RwLock<Option<HashSet<SessionId>>>>,
 ) -> tokio::task::JoinHandle<()> {
     let mut rx = bus.subscribe();
@@ -8477,13 +8684,17 @@ fn spawn_bus(
                     if !allowed {
                         continue;
                     }
-                    if tx.send(ServerMessage::Notification(notification)).is_err() {
+                    if tx
+                        .send(ServerMessage::Notification(notification))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(skipped)) => {
                     let note = Notification::new("stream.lagged", json!({ "skipped": skipped }));
-                    if tx.send(ServerMessage::Notification(note)).is_err() {
+                    if tx.send(ServerMessage::Notification(note)).await.is_err() {
                         break;
                     }
                 }
@@ -9188,6 +9399,132 @@ fn system_prompt(config: &Config, session: &Session, mode: SessionMode) -> Strin
 mod tests {
     use super::*;
 
+    fn tool_call(name: &str, arguments: &str) -> ToolCall {
+        let mut hasher = DefaultHasher::new();
+        name.hash(&mut hasher);
+        arguments.hash(&mut hasher);
+        ToolCall {
+            id: format!("call-{:x}", hasher.finish()),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
+    }
+
+    #[test]
+    fn repeat_guard_warns_then_aborts_on_identical_batches() {
+        let mut guard = RepeatGuard::default();
+        let batch = vec![tool_call("run_command", r#"{"command":["cargo","test"]}"#)];
+
+        // Fresh, fresh, warn, warn, abort.
+        assert!(matches!(guard.observe(&batch), RepeatVerdict::Fresh));
+        assert!(matches!(guard.observe(&batch), RepeatVerdict::Fresh));
+        assert!(matches!(
+            guard.observe(&batch),
+            RepeatVerdict::Warn { count: 3 }
+        ));
+        assert!(matches!(
+            guard.observe(&batch),
+            RepeatVerdict::Warn { count: 4 }
+        ));
+        assert!(matches!(
+            guard.observe(&batch),
+            RepeatVerdict::Abort { count: 5 }
+        ));
+    }
+
+    #[test]
+    fn repeat_guard_resets_on_a_different_batch() {
+        let mut guard = RepeatGuard::default();
+        let test = vec![tool_call("run_command", r#"{"command":["cargo","test"]}"#)];
+        let edit = vec![tool_call("edit", r#"{"path":"src/lib.rs"}"#)];
+
+        assert!(matches!(guard.observe(&test), RepeatVerdict::Fresh));
+        assert!(matches!(guard.observe(&test), RepeatVerdict::Fresh));
+        assert!(matches!(guard.observe(&test), RepeatVerdict::Warn { .. }));
+        // An edit in between is progress, so the streak restarts.
+        assert!(matches!(guard.observe(&edit), RepeatVerdict::Fresh));
+        assert!(matches!(guard.observe(&test), RepeatVerdict::Fresh));
+    }
+
+    #[test]
+    fn repeat_guard_treats_equivalent_arguments_as_the_same_call() {
+        // Same call: different key order, spacing and call id.
+        let first = vec![tool_call("read_file", r#"{"path":"a.rs","limit":10}"#)];
+        let second = vec![tool_call("read_file", r#"{ "limit": 10, "path": "a.rs" }"#)];
+        assert_eq!(tool_batch_signature(&first), tool_batch_signature(&second));
+
+        // A different argument is a different call.
+        let third = vec![tool_call("read_file", r#"{"path":"a.rs","limit":20}"#)];
+        assert_ne!(tool_batch_signature(&first), tool_batch_signature(&third));
+    }
+
+    #[test]
+    fn repeat_guard_distinguishes_batch_order_and_size() {
+        let ab = vec![
+            tool_call("read_file", r#"{"path":"a.rs"}"#),
+            tool_call("read_file", r#"{"path":"b.rs"}"#),
+        ];
+        let ba = vec![
+            tool_call("read_file", r#"{"path":"b.rs"}"#),
+            tool_call("read_file", r#"{"path":"a.rs"}"#),
+        ];
+        let single = vec![tool_call("read_file", r#"{"path":"a.rs"}"#)];
+
+        assert_ne!(tool_batch_signature(&ab), tool_batch_signature(&ba));
+        assert_ne!(tool_batch_signature(&ab), tool_batch_signature(&single));
+        assert_eq!(
+            tool_batch_signature(&ab),
+            tool_batch_signature(&[
+                tool_call("read_file", r#"{"path":"a.rs"}"#),
+                tool_call("read_file", r#"{"path":"b.rs"}"#),
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_batch_names_dedups_and_keeps_order() {
+        let batch = vec![
+            tool_call("grep", "{}"),
+            tool_call("read_file", "{}"),
+            tool_call("grep", "{}"),
+        ];
+        assert_eq!(tool_batch_names(&batch), "grep, read_file");
+    }
+
+    #[tokio::test]
+    async fn frame_reader_handles_crlf_and_eof() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client.write_all(b"{\"a\":1}\r\n{\"b\":2}\n").await.unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(&mut server);
+        let mut frame = Vec::new();
+        assert!(read_frame(&mut reader, &mut frame, 1024).await.unwrap());
+        assert_eq!(std::str::from_utf8(&frame).unwrap(), "{\"a\":1}");
+        assert!(read_frame(&mut reader, &mut frame, 1024).await.unwrap());
+        assert_eq!(std::str::from_utf8(&frame).unwrap(), "{\"b\":2}");
+        assert!(!read_frame(&mut reader, &mut frame, 1024).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn frame_reader_rejects_oversized_lines() {
+        use tokio::io::AsyncWriteExt as _;
+
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        client.write_all(b"123456789").await.unwrap();
+        drop(client);
+
+        let mut reader = BufReader::new(&mut server);
+        let mut frame = Vec::new();
+        let err = read_frame(&mut reader, &mut frame, 4).await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
     #[test]
     fn system_prompt_is_compact_and_covers_the_workflow() {
         // Measure the fixed contract, not installed skills/agents, so the
@@ -9423,25 +9760,6 @@ mod tests {
         assert!(SessionStatus::Running.is_busy());
         assert!(SessionStatus::AwaitingApproval.is_busy());
         assert!(!SessionStatus::Error.is_busy());
-    }
-
-    #[test]
-    fn tool_round_budget_warns_and_forces_the_final_answer() {
-        let tools = vec![ToolDefinition::function(
-            "read_file",
-            "read a file",
-            json!({ "type": "object" }),
-        )];
-        assert!(tool_round_warning(0, 64).is_none());
-        assert!(tool_round_warning(55, 64).is_none());
-        let warning = tool_round_warning(56, 64).expect("warning near the budget");
-        assert!(warning.contains("finish the required work"));
-        assert!(warning.contains("acceptance criteria"));
-        assert!(warning.contains("never call a partial result complete"));
-        assert!(tool_round_warning(64, 64).is_some());
-
-        assert_eq!(tools_for_round(63, 64, &tools).len(), 1);
-        assert!(tools_for_round(64, 64, &tools).is_empty());
     }
 
     #[test]

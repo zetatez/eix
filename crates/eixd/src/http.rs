@@ -16,25 +16,37 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use eix_core::{Notification, Request};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
+use tokio::time::timeout;
 
 use crate::server::Daemon;
 
+const MAX_HEAD: usize = 64 * 1024;
 const MAX_BODY: usize = 8 * 1024 * 1024;
+const MAX_CONNECTIONS: usize = 128;
+const READ_TIMEOUT: Duration = Duration::from_secs(15);
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const CORS: &str = "Access-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: authorization, content-type, x-eix-token\r\nAccess-Control-Max-Age: 86400\r\n";
 
 pub(crate) async fn serve(daemon: Arc<Daemon>, listener: TcpListener, token: String) {
+    let connections = Arc::new(Semaphore::new(MAX_CONNECTIONS));
     loop {
+        let Ok(permit) = Arc::clone(&connections).acquire_owned().await else {
+            break;
+        };
         let Ok((stream, _)) = listener.accept().await else {
             break;
         };
         let daemon = Arc::clone(&daemon);
         let token = token.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             if let Err(err) = handle(daemon, stream, &token).await {
                 eprintln!("http: {err:#}");
             }
@@ -44,21 +56,33 @@ pub(crate) async fn serve(daemon: Arc<Daemon>, listener: TcpListener, token: Str
 
 async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<()> {
     let (mut reader, mut writer) = stream.into_split();
-    let mut head = Vec::new();
+    // Read in chunks, but keep any bytes after the header terminator: they are
+    // the start of the body and must not be discarded.
+    let mut raw = Vec::new();
+    let body_prefix;
+    let mut chunk = [0u8; 4096];
     loop {
-        let mut byte = [0u8; 1];
-        if reader.read_exact(&mut byte).await.is_err() {
+        let read = timeout(READ_TIMEOUT, reader.read(&mut chunk)).await;
+        let n = match read {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) | Err(_) => return Ok(()),
+        };
+        if n == 0 {
             return Ok(());
         }
-        head.push(byte[0]);
-        if head.ends_with(b"\r\n\r\n") || head.ends_with(b"\n\n") {
+        raw.extend_from_slice(&chunk[..n]);
+        if let Some(end) = header_end(&raw) {
+            if end > MAX_HEAD {
+                return write_status(&mut writer, 431, "request headers too large").await;
+            }
+            body_prefix = raw.split_off(end);
             break;
         }
-        if head.len() > 64 * 1024 {
+        if raw.len() > MAX_HEAD {
             return write_status(&mut writer, 431, "request headers too large").await;
         }
     }
-    let head = String::from_utf8_lossy(&head).into_owned();
+    let head = String::from_utf8_lossy(&raw).into_owned();
     let mut lines = head.lines();
     let request_line = lines.next().unwrap_or_default();
     let mut parts = request_line.split_whitespace();
@@ -149,11 +173,16 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
         return write_status(&mut writer, 413, "invalid body size").await;
     }
     if expect_continue {
-        writer.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-        writer.flush().await?;
+        write_bytes(&mut writer, b"HTTP/1.1 100 Continue\r\n\r\n").await?;
     }
     let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body).await?;
+    let prefix_len = body_prefix.len().min(content_length);
+    body[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
+    if prefix_len < content_length {
+        timeout(READ_TIMEOUT, reader.read_exact(&mut body[prefix_len..]))
+            .await
+            .context("body read timed out")??;
+    }
     let request: Request = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
@@ -169,6 +198,33 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
     write_json(&mut writer, 200, &response).await
 }
 
+/// Byte offset just past the first HTTP header terminator in `buf`.
+fn header_end(buf: &[u8]) -> Option<usize> {
+    let crlf = buf
+        .windows(4)
+        .position(|window| window == b"\r\n\r\n")
+        .map(|index| index + 4);
+    let lf = buf
+        .windows(2)
+        .position(|window| window == b"\n\n")
+        .map(|index| index + 2);
+    match (crlf, lf) {
+        (Some(crlf), Some(lf)) => Some(crlf.min(lf)),
+        (Some(end), None) | (None, Some(end)) => Some(end),
+        (None, None) => None,
+    }
+}
+
+async fn write_bytes(writer: &mut tokio::net::tcp::OwnedWriteHalf, bytes: &[u8]) -> Result<()> {
+    timeout(WRITE_TIMEOUT, writer.write_all(bytes))
+        .await
+        .context("write timed out")??;
+    timeout(WRITE_TIMEOUT, writer.flush())
+        .await
+        .context("flush timed out")??;
+    Ok(())
+}
+
 async fn events(
     daemon: Arc<Daemon>,
     mut writer: tokio::net::tcp::OwnedWriteHalf,
@@ -177,16 +233,15 @@ async fn events(
     // Subscribe before the client can observe the response headers; otherwise
     // an event emitted right after the connection opens can be missed.
     let mut rx = daemon.bus.subscribe();
-    writer
-        .write_all(
-            format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{CORS}\r\n"
-            )
-            .as_bytes(),
+    write_bytes(
+        &mut writer,
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n{CORS}\r\n"
         )
-        .await?;
-    writer.write_all(b": connected\n\n").await?;
-    writer.flush().await?;
+        .as_bytes(),
+    )
+    .await?;
+    write_bytes(&mut writer, b": connected\n\n").await?;
     loop {
         match rx.recv().await {
             Ok(notification) => {
@@ -299,11 +354,7 @@ async fn write_event(
     notification: &Notification,
 ) -> Result<()> {
     let json = serde_json::to_string(notification).context("cannot encode notification")?;
-    writer
-        .write_all(format!("data: {json}\n\n").as_bytes())
-        .await?;
-    writer.flush().await?;
-    Ok(())
+    write_bytes(writer, format!("data: {json}\n\n").as_bytes()).await
 }
 
 async fn write_status(
@@ -334,22 +385,19 @@ async fn write_json<T: serde::Serialize>(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{CORS}\r\n",
         body.len()
     );
-    writer.write_all(head.as_bytes()).await?;
-    writer.write_all(&body).await?;
-    writer.flush().await?;
-    Ok(())
+    let mut response = head.into_bytes();
+    response.extend_from_slice(&body);
+    write_bytes(writer, &response).await
 }
 
 async fn write_empty(writer: &mut tokio::net::tcp::OwnedWriteHalf, status: u16) -> Result<()> {
     let reason = if status == 204 { "No Content" } else { "OK" };
-    writer
-        .write_all(
-            format!(
-                "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n{CORS}\r\n"
-            )
-            .as_bytes(),
+    write_bytes(
+        writer,
+        format!(
+            "HTTP/1.1 {status} {reason}\r\nContent-Length: 0\r\nConnection: close\r\n{CORS}\r\n"
         )
-        .await?;
-    writer.flush().await?;
-    Ok(())
+        .as_bytes(),
+    )
+    .await
 }
