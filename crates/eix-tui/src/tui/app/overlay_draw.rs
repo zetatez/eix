@@ -1,0 +1,956 @@
+//! Rendering of cmdline, menus and overlay panels.
+
+use super::*;
+
+impl App {
+    /// Vim-style command line below the status bar. It is always visible when
+    /// the terminal has room, but stays blank until `:` opens it.
+    pub(super) fn draw_cmdline(&self, frame: &mut Frame, area: Rect) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+        let panel = composer_background(self.theme);
+        let background = Style::default().bg(panel);
+        let Some(cmdline) = self.cmdline.as_ref() else {
+            frame.render_widget(Paragraph::new(Line::default()).style(background), area);
+            return;
+        };
+        let line = Line::from(vec![
+            Span::styled(
+                cmdline.prompt.to_string(),
+                Style::default()
+                    .fg(composer_accent(self.theme))
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                cmdline.text.clone(),
+                Style::default().fg(composer_text(self.theme)).bg(panel),
+            ),
+        ]);
+        frame.render_widget(Paragraph::new(line).style(background), area);
+        let cursor = UnicodeWidthStr::width(&cmdline.text[..cmdline.cursor_byte()]) as u16;
+        let max_x = area.x + area.width.saturating_sub(1);
+        let x = (area.x + 1 + cursor).min(max_x);
+        frame.set_cursor_position((x, area.y));
+    }
+
+    /// `/` suggestion menu floated just above the prompt.
+    pub(super) fn draw_command_menu(&mut self, frame: &mut Frame, input_area: Rect) {
+        if input_area.y < 3 {
+            return;
+        }
+        let matches = self.command_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let height = (matches.len() as u16 + 2)
+            .min(15)
+            .min(input_area.y.saturating_sub(1));
+        let visible = height.saturating_sub(2) as usize;
+        if visible == 0 {
+            return;
+        }
+        let cursor = self.command_cursor.min(matches.len() - 1);
+        let start = cursor.saturating_sub(visible.saturating_sub(1));
+        let width = input_area.width.min(88);
+        let rect = Rect::new(input_area.x, input_area.y - height, width, height);
+        frame.render_widget(Clear, rect);
+
+        let panel = composer_background(self.theme);
+        let muted = composer_muted(self.theme);
+        let text = composer_text(self.theme);
+        let accent = composer_accent(self.theme);
+        let inner = width.saturating_sub(2) as usize;
+        let marker_width = 3usize;
+        let name_width = COMMAND_NAME_WIDTH.min(inner.saturating_sub(marker_width + 2));
+        let desc_width = inner
+            .saturating_sub(marker_width + name_width)
+            .saturating_sub(2);
+        let mut lines = Vec::new();
+        for (offset, spec) in matches.iter().skip(start).take(visible).enumerate() {
+            let index = start + offset;
+            let selected = index == cursor;
+            let row_bg = if selected { COMPOSER_SELECTION } else { panel };
+            let marker_style = if selected {
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(muted).bg(row_bg)
+            };
+            let name_style = if selected {
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text).bg(row_bg)
+            };
+            let desc_style = if selected {
+                Style::default().fg(text).bg(row_bg)
+            } else {
+                Style::default().fg(muted).bg(row_bg)
+            };
+            let name = command_label(spec, "/");
+            let name = pad_to(&truncate(&name, name_width), name_width);
+            let description = pad_to(&truncate(&spec.description, desc_width), desc_width);
+            let gap = inner.saturating_sub(marker_width + name_width + desc_width);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", if selected { "❯" } else { " " }),
+                    marker_style,
+                ),
+                Span::styled(name, name_style),
+                Span::styled(" ".repeat(gap), desc_style),
+                Span::styled(description, desc_style),
+            ]));
+        }
+        let title_left = Line::from(Span::styled(
+            " / commands ",
+            Style::default()
+                .fg(accent)
+                .bg(panel)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent).bg(panel))
+            .style(Style::default().bg(panel))
+            .title_style(Style::default().bg(panel))
+            .title_top(title_left);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().fg(text).bg(panel)),
+            rect,
+        );
+    }
+
+    /// Dynamic `:` command list floated just above the command line. Typing
+    /// filters it; Tab completes a match, while Ctrl-J/K and Ctrl-N/P move the
+    /// selection without rewriting the typed prefix.
+    pub(super) fn draw_cmdline_menu(&mut self, frame: &mut Frame, cmdline_area: Rect) {
+        // Keep the statusline visible: the menu grows upward from the row
+        // immediately above the command line.
+        let status_y = cmdline_area.y.saturating_sub(1);
+        if status_y < 3 {
+            return;
+        }
+        let matches = self.cmdline_matches();
+        if matches.is_empty() {
+            return;
+        }
+        let height = (matches.len() as u16 + 2).min(15).min(status_y);
+        let visible = height.saturating_sub(2) as usize;
+        if visible == 0 {
+            return;
+        }
+        let cursor = self.cmdline_menu_cursor.unwrap_or(0).min(matches.len() - 1);
+        let start = cursor.saturating_sub(visible.saturating_sub(1));
+        let width = cmdline_area.width.min(88);
+        let rect = Rect::new(cmdline_area.x, status_y - height, width, height);
+        frame.render_widget(Clear, rect);
+
+        let panel = composer_background(self.theme);
+        let muted = composer_muted(self.theme);
+        let text = composer_text(self.theme);
+        let accent = composer_accent(self.theme);
+        let inner = width.saturating_sub(2) as usize;
+        let marker_width = 3usize;
+        let name_width = COMMAND_NAME_WIDTH.min(inner.saturating_sub(marker_width + 2));
+        let desc_width = inner
+            .saturating_sub(marker_width + name_width)
+            .saturating_sub(2);
+        let mut lines = Vec::new();
+        for (offset, spec) in matches.iter().skip(start).take(visible).enumerate() {
+            let index = start + offset;
+            let selected = index == cursor;
+            let row_bg = if selected { COMPOSER_SELECTION } else { panel };
+            let marker_style = if selected {
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(muted).bg(row_bg)
+            };
+            let name_style = if selected {
+                Style::default()
+                    .fg(accent)
+                    .bg(row_bg)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(text).bg(row_bg)
+            };
+            let desc_style = if selected {
+                Style::default().fg(text).bg(row_bg)
+            } else {
+                Style::default().fg(muted).bg(row_bg)
+            };
+            let name = command_label(spec, ":");
+            let name = pad_to(&truncate(&name, name_width), name_width);
+            let description = pad_to(&truncate(&spec.description, desc_width), desc_width);
+            let gap = inner.saturating_sub(marker_width + name_width + desc_width);
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {} ", if selected { "❯" } else { " " }),
+                    marker_style,
+                ),
+                Span::styled(name, name_style),
+                Span::styled(" ".repeat(gap), desc_style),
+                Span::styled(description, desc_style),
+            ]));
+        }
+        let title_left = Line::from(Span::styled(
+            " : commands ",
+            Style::default()
+                .fg(accent)
+                .bg(panel)
+                .add_modifier(Modifier::BOLD),
+        ));
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(accent).bg(panel))
+            .style(Style::default().bg(panel))
+            .title_style(Style::default().bg(panel))
+            .title_top(title_left);
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().fg(text).bg(panel)),
+            rect,
+        );
+    }
+
+    /// Floating `/btw` answer. It owns the keyboard until dismissed.
+    pub(super) fn draw_btw(&mut self, frame: &mut Frame, area: Rect) {
+        let width = (area.width as u32 * 3 / 4).max(46).min(area.width as u32) as u16;
+        let height = (area.height as u32 * 3 / 5)
+            .clamp(10, 20)
+            .min(area.height as u32) as u16;
+        let rect = centered(area, width, height);
+        let inner_width = width.saturating_sub(4) as usize;
+        let inner_height = height.saturating_sub(2) as usize;
+
+        let dialog_bg = dialog_background(self.theme);
+        let session_name = self
+            .btw
+            .as_ref()
+            .and_then(|btw| {
+                self.views
+                    .iter()
+                    .find(|view| view.session.id == btw.session_id)
+                    .map(|view| view.session.name.clone())
+            })
+            .unwrap_or_else(|| "side question".into());
+        let Some(btw) = self.btw.as_mut() else {
+            return;
+        };
+
+        let mut lines = vec![Line::from(vec![
+            Span::styled("  ? ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                btw.question.clone(),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::ITALIC),
+            ),
+        ])];
+        if let Some(error) = &btw.error {
+            for segment in wrap_text(error, inner_width.saturating_sub(2)) {
+                lines.push(Line::from(Span::styled(
+                    format!("  {segment}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        } else if btw.text.is_empty() {
+            lines.push(Line::from(Span::styled(
+                if btw.done {
+                    "  (no answer)"
+                } else {
+                    "  thinking…"
+                },
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            for segment in wrap_text(&btw.text, inner_width.saturating_sub(2)) {
+                lines.push(Line::from(format!("  {segment}")));
+            }
+        }
+        let max_scroll = lines.len().saturating_sub(inner_height);
+        btw.scroll = btw.scroll.min(max_scroll);
+        let border = if btw.error.is_some() {
+            Color::Red
+        } else if btw.done {
+            Color::Green
+        } else {
+            Color::Cyan
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(border))
+            .style(Style::default().bg(dialog_bg))
+            .title(Span::styled(
+                format!(" btw · {session_name} "),
+                Style::default().fg(border).add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " Esc close · j/k scroll ",
+                Style::default().fg(Color::DarkGray),
+            ));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().bg(dialog_bg))
+                .scroll((btw.scroll.min(u16::MAX as usize) as u16, 0)),
+            rect,
+        );
+    }
+
+    pub(super) fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
+        let theme = self.theme;
+        let dialog_bg = dialog_background(theme);
+        let Some((session_id, scroll, cursor)) = self
+            .diff_view
+            .as_ref()
+            .map(|view| (view.session_id.clone(), view.scroll, view.cursor))
+        else {
+            return;
+        };
+        let Some(approval) = self.approvals.get(&session_id) else {
+            return;
+        };
+        let tool = approval.tool.clone();
+        let path = approval.path.clone().unwrap_or_default();
+        let rows = crate::tui::diff::rows(&approval.hunks, approval.diff.as_deref());
+
+        let rect = centered(
+            area,
+            area.width.saturating_sub(4),
+            area.height.saturating_sub(4),
+        );
+        frame.render_widget(Clear, rect);
+        let inner_width = rect.width.saturating_sub(2) as usize;
+        let inner_height = rect.height.saturating_sub(3) as usize; // borders + hint
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+
+        let interactive = !approval.hunks.is_empty();
+        let side_by_side = (!rows.is_empty())
+            .then(|| {
+                crate::tui::diff::DiffRenderer::new(&rows, inner_width, &path, theme, "", dialog_bg)
+            })
+            .flatten()
+            .map(|mut renderer| renderer.render(&rows, interactive, &approval.selected, cursor));
+        let body: Vec<Line> = match side_by_side {
+            Some(body) => body,
+            None => {
+                // Too narrow for two readable code columns: keep the old
+                // unified view as a fallback.
+                let mut body = Vec::new();
+                if interactive {
+                    for (index, hunk) in approval.hunks.iter().enumerate() {
+                        let selected = approval.selected.get(index).copied().unwrap_or(true);
+                        let focused = index == cursor;
+                        for (line_index, line) in hunk.lines.iter().enumerate() {
+                            if line_index == 0 {
+                                let marker = if focused { "▸ " } else { "  " };
+                                let check = if selected { "[x] " } else { "[ ] " };
+                                let style = if focused {
+                                    Style::default()
+                                        .fg(Color::Yellow)
+                                        .add_modifier(Modifier::BOLD)
+                                } else if selected {
+                                    Style::default().fg(Color::Cyan)
+                                } else {
+                                    Style::default().fg(Color::DarkGray)
+                                };
+                                body.push(Line::from(Span::styled(
+                                    truncate(&format!("{marker}{check}{line}"), inner_width),
+                                    style,
+                                )));
+                            } else {
+                                body.push(Line::from(Span::styled(
+                                    truncate(&format!("    {line}"), inner_width),
+                                    diff_line_style(line, theme),
+                                )));
+                            }
+                        }
+                    }
+                } else {
+                    for line in approval.diff.as_deref().unwrap_or("").lines() {
+                        body.push(Line::from(Span::styled(
+                            truncate(line, inner_width),
+                            diff_line_style(line, theme),
+                        )));
+                    }
+                }
+                body
+            }
+        };
+
+        let total = body.len();
+        let max_scroll = total.saturating_sub(inner_height);
+        let scroll = scroll.min(max_scroll);
+        let mut body: Vec<Line> = body.into_iter().skip(scroll).take(inner_height).collect();
+        let hint = if interactive {
+            " j/k scroll  [ ] hunk  Space toggle  a all  y apply  n deny  Esc close "
+        } else {
+            " j/k scroll  y approve  n deny  Esc close "
+        };
+        body.push(Line::from(Span::styled(
+            hint,
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let title = if path.is_empty() {
+            format!(" diff · {tool} ")
+        } else {
+            format!(" diff · {tool} · {path} ")
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(title);
+        frame.render_widget(
+            Paragraph::new(body)
+                .block(block)
+                .style(Style::default().bg(dialog_bg)),
+            rect,
+        );
+        if let Some(view) = &mut self.diff_view {
+            view.scroll = scroll;
+            view.width = inner_width;
+        }
+    }
+
+    pub(super) fn draw_inbox(&mut self, frame: &mut Frame, area: Rect) {
+        let dialog_bg = dialog_background(self.theme);
+        let Some(inbox) = &self.inbox else {
+            return;
+        };
+        let rows = (inbox.items.len() as u16 + 4).min(area.height.saturating_sub(2).max(5));
+        let rect = centered(area, area.width.saturating_sub(6).max(30), rows);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+        let inner = rect.width.saturating_sub(2) as usize;
+
+        let mut lines: Vec<Line> = Vec::new();
+        for (index, item) in inbox.items.iter().enumerate() {
+            let marker = if index == inbox.cursor { "▸ " } else { "  " };
+            let kind = match item.kind {
+                PendingKind::Tool => "tool",
+                PendingKind::Patch => "patch",
+            };
+            let label = format!(
+                "{marker}{:<20} {:<5} {:<14} {}",
+                truncate(&item.session_name, 20),
+                kind,
+                item.tool,
+                item.summary
+            );
+            let style = if index == inbox.cursor {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(truncate(&label, inner), style)));
+        }
+        lines.push(Line::from(Span::styled(
+            truncate(
+                " Enter open · y approve · n deny · j/k select · Esc close ",
+                inner,
+            ),
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(format!(" approvals · {} ", inbox.items.len()));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().bg(dialog_bg)),
+            rect,
+        );
+    }
+
+    pub(super) fn draw_processes(&mut self, frame: &mut Frame, area: Rect) {
+        let dialog_bg = dialog_background(self.theme);
+        let Some(view) = &mut self.process_view else {
+            return;
+        };
+        // Process inspection is an overlay like the pickers, not a full-screen
+        // mode; keep the same inset instead of covering the terminal.
+        let rect = search_dialog_rect(area);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+        let inner_height = rect.height.saturating_sub(2) as usize;
+        let inner_width = rect.width.saturating_sub(2) as usize;
+        // List on top (bounded), live output below.
+        let list_height = (view.processes.len() + 1)
+            .clamp(2, 10)
+            .min(inner_height.saturating_sub(3).max(3));
+
+        let mut list_lines: Vec<Line> = Vec::new();
+        for (index, process) in view.processes.iter().enumerate() {
+            list_lines.push(process_line(process, index == view.cursor, inner_width));
+        }
+        if view.processes.is_empty() {
+            list_lines.push(Line::from(Span::styled(
+                "  no background processes",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+        let max_scroll = view.processes.len().saturating_sub(list_height);
+        let list_scroll = view
+            .cursor
+            .saturating_sub(list_height.saturating_sub(1))
+            .min(max_scroll);
+
+        let title = match view.selected() {
+            Some(process) => format!(
+                " processes · {} · {} ",
+                short_id(&process.id),
+                process.status.as_str()
+            ),
+            None => format!(" processes · {} ", short_id(&view.session_id)),
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(title)
+            .title_bottom(" j/k select · x kill · r refresh · PgUp/PgDn · Esc close ");
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+
+        let chunks = Layout::vertical([Constraint::Length(list_height as u16), Constraint::Min(1)])
+            .split(inner);
+        frame.render_widget(
+            Paragraph::new(
+                list_lines
+                    .into_iter()
+                    .skip(list_scroll)
+                    .take(list_height)
+                    .collect::<Vec<_>>(),
+            )
+            .style(Style::default().bg(dialog_bg)),
+            chunks[0],
+        );
+
+        let output_block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" output ");
+        let output_inner = output_block.inner(chunks[1]);
+        frame.render_widget(output_block, chunks[1]);
+        let width = output_inner.width as usize;
+        let height = output_inner.height as usize;
+        let lines: Vec<&str> = view.tail.lines().collect();
+        let start = lines.len().saturating_sub(height + view.scroll);
+        let body: Vec<Line> = if lines.is_empty() {
+            vec![Line::from(Span::styled(
+                "(no output yet)",
+                Style::default().fg(Color::DarkGray),
+            ))]
+        } else {
+            lines
+                .iter()
+                .skip(start)
+                .take(height)
+                .map(|line| Line::from(truncate(line, width)))
+                .collect()
+        };
+        frame.render_widget(
+            Paragraph::new(body).style(Style::default().bg(dialog_bg)),
+            output_inner,
+        );
+    }
+
+    pub(super) fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
+        let filtered = self.picker_filtered();
+        let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
+            return;
+        };
+        // Keep the cursor on a real row (the list may have shrunk under it).
+        let selected = {
+            let Some(picker) = &mut self.picker else {
+                return;
+            };
+            if filtered.is_empty() {
+                picker.selected = 0;
+            } else {
+                picker.selected = picker.selected.min(filtered.len() - 1);
+            }
+            picker.selected
+        };
+        let query = self
+            .picker
+            .as_ref()
+            .map(|picker| picker.query.clone())
+            .unwrap_or_default();
+        let loading = self.picker.as_ref().is_some_and(|picker| picker.loading);
+        // Queue a lazy preview whenever the selected row changes. The event
+        // loop sends it after this draw so the UI never blocks on file/history
+        // reads.
+        self.sync_picker_preview(&filtered, selected);
+        // The theme picker previews the highlighted palette immediately, so
+        // its own chrome should follow that palette too (not a fixed cyan).
+        let theme_picker = kind == PickerKind::Themes;
+        let theme = self.theme;
+        let accent = if theme_picker {
+            composer_accent(theme)
+        } else {
+            Color::Cyan
+        };
+        let muted = if theme_picker {
+            composer_muted(theme)
+        } else {
+            Color::DarkGray
+        };
+        let preview_text = if theme_picker {
+            composer_text(theme)
+        } else {
+            Color::Gray
+        };
+        let dialog_bg = dialog_background(theme);
+
+        let rect = search_dialog_rect(area);
+        frame.render_widget(Clear, rect);
+        let title = format!(" {} ({}) ", kind.title(), filtered.len());
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(accent).bg(dialog_bg))
+            .title_style(Style::default().bg(dialog_bg))
+            .style(Style::default().bg(dialog_bg))
+            .title(title)
+            .title_bottom(format!(" {} ", kind.hint()));
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let body = draw_search_field(frame, inner, &query, accent, muted, dialog_bg);
+        let (list_area, preview_area) = if body.width >= 64 {
+            let columns =
+                Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+                    .split(body);
+            (columns[0], Some(columns[1]))
+        } else {
+            (body, None)
+        };
+
+        if filtered.is_empty() {
+            let text = if loading {
+                "loading…"
+            } else if kind == PickerKind::Grep && query.trim().is_empty() {
+                "type to search…"
+            } else {
+                "no matches"
+            };
+            frame.render_widget(
+                Paragraph::new(text).style(Style::default().fg(muted).bg(dialog_bg)),
+                list_area,
+            );
+        } else {
+            let rows = self.picker_rows(kind, &filtered);
+            let list = List::new(rows)
+                .style(Style::default().bg(dialog_bg))
+                .highlight_style(
+                    Style::default()
+                        .bg(Color::DarkGray)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("› ");
+            let mut state = ListState::default().with_selected(Some(selected));
+            frame.render_stateful_widget(list, list_area, &mut state);
+        }
+
+        if let Some(preview_area) = preview_area {
+            let lines = self.picker_preview_lines(&filtered);
+            let width = preview_area.width.saturating_sub(2) as usize;
+            let height = preview_area.height as usize;
+            let mut wrapped: Vec<String> = lines
+                .iter()
+                .flat_map(|line| wrap_text(line, width))
+                .collect();
+            // Session previews are conversations: keep the newest lines in
+            // view instead of showing the oldest part of the fetched window.
+            if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) && wrapped.len() > height
+            {
+                wrapped.drain(..wrapped.len() - height);
+            }
+            let body: Vec<Line> = wrapped.into_iter().take(height).map(Line::from).collect();
+            let preview = Paragraph::new(body)
+                .style(Style::default().fg(preview_text).bg(dialog_bg))
+                .block(
+                    Block::default()
+                        .borders(Borders::LEFT)
+                        .border_style(Style::default().fg(muted).bg(dialog_bg)),
+                );
+            frame.render_widget(preview, preview_area);
+        }
+    }
+
+    /// List rows for the open picker. Session kinds render live session state;
+    /// other kinds render the provider's label and detail.
+    pub(super) fn picker_rows(&self, kind: PickerKind, filtered: &[usize]) -> Vec<ListItem<'_>> {
+        match kind {
+            PickerKind::Sessions | PickerKind::NewPane => {
+                let open_panes: Vec<Option<usize>> = self
+                    .sessions
+                    .iter()
+                    .map(|session| {
+                        self.views
+                            .iter()
+                            .position(|view| view.session.id == session.id)
+                    })
+                    .collect();
+                filtered
+                    .iter()
+                    .map(|&index| {
+                        let session = &self.sessions[index];
+                        let pane = match open_panes[index] {
+                            Some(pane) => Span::styled(
+                                format!("{} ", pane + 1),
+                                Style::default().fg(Color::Cyan),
+                            ),
+                            None => Span::styled("· ", Style::default().fg(Color::DarkGray)),
+                        };
+                        ListItem::new(Line::from(vec![
+                            pane,
+                            Span::styled(
+                                format!("{} ", session.status.symbol()),
+                                Style::default().fg(status_color(session.status)),
+                            ),
+                            Span::styled(
+                                pad_to(&truncate(&session.name, 28), 28),
+                                Style::default().add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(
+                                pad_to(origin_marker(session), 1),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                format!("  {}  ", short_id(&session.id)),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                session.cwd.display().to_string(),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ]))
+                    })
+                    .collect()
+            }
+            _ => {
+                let Some(picker) = &self.picker else {
+                    return Vec::new();
+                };
+                let theme_picker = kind == PickerKind::Themes;
+                let label_style = if theme_picker {
+                    Style::default()
+                        .fg(composer_text(self.theme))
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().add_modifier(Modifier::BOLD)
+                };
+                let detail_color = if theme_picker {
+                    composer_muted(self.theme)
+                } else {
+                    Color::DarkGray
+                };
+                // Keep the second column aligned under the longest label in
+                // the whole picker, not just the currently filtered rows.
+                // Models use a wider separator; commands keep the `/` menu's
+                // fixed command-name width.
+                let model_width = if kind == PickerKind::Models {
+                    picker
+                        .items
+                        .iter()
+                        .map(|item| UnicodeWidthStr::width(item.label.as_str()))
+                        .max()
+                        .unwrap_or(0)
+                        .min(PICKER_LABEL_MAX)
+                } else {
+                    0
+                };
+                let detail_width = if matches!(kind, PickerKind::Models | PickerKind::Commands) {
+                    0
+                } else {
+                    picker
+                        .items
+                        .iter()
+                        .filter(|item| {
+                            item.detail
+                                .as_deref()
+                                .is_some_and(|detail| !detail.is_empty())
+                        })
+                        .map(|item| UnicodeWidthStr::width(item.label.as_str()))
+                        .max()
+                        .unwrap_or(0)
+                        .min(PICKER_LABEL_MAX)
+                };
+                let separator = if kind == PickerKind::Models {
+                    "    "
+                } else {
+                    "  "
+                };
+                filtered
+                    .iter()
+                    .filter_map(|&index| picker.items.get(index))
+                    .map(|item| {
+                        let label = match kind {
+                            PickerKind::Models => {
+                                pad_to(&truncate(&item.label, model_width), model_width)
+                            }
+                            PickerKind::Commands => pad_to(
+                                &truncate(&item.label, COMMAND_NAME_WIDTH),
+                                COMMAND_NAME_WIDTH,
+                            ),
+                            _ if item
+                                .detail
+                                .as_deref()
+                                .is_some_and(|detail| !detail.is_empty()) =>
+                            {
+                                pad_to(&truncate(&item.label, detail_width), detail_width)
+                            }
+                            _ => item.label.clone(),
+                        };
+                        let mut spans = vec![Span::styled(label, label_style)];
+                        if let Some(detail) = &item.detail {
+                            if !detail.is_empty() {
+                                spans.push(Span::styled(
+                                    format!("{separator}{detail}"),
+                                    Style::default().fg(detail_color),
+                                ));
+                            }
+                        }
+                        ListItem::new(Line::from(spans))
+                    })
+                    .collect()
+            }
+        }
+    }
+
+    /// Queue a preview request for the selected file or session row.
+    pub(super) fn sync_picker_preview(&mut self, filtered: &[usize], selected: usize) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let Some(provider) = picker.kind.preview_kind() else {
+            return;
+        };
+        let Some(&index) = filtered.get(selected) else {
+            return;
+        };
+        let value = match picker.kind {
+            PickerKind::Sessions | PickerKind::NewPane => {
+                self.sessions.get(index).map(|session| session.id.clone())
+            }
+            PickerKind::Files => picker.items.get(index).map(|item| item.value.clone()),
+            _ => None,
+        };
+        let Some(value) = value else {
+            return;
+        };
+        if picker.preview.key.as_deref() == Some(value.as_str()) {
+            return;
+        }
+        let session_id = if picker.kind == PickerKind::Files {
+            let Some(session_id) = self.focused_session_id() else {
+                return;
+            };
+            Some(session_id)
+        } else {
+            None
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.preview = PickerPreview {
+                key: Some(value.clone()),
+                text: None,
+                error: None,
+                loading: true,
+            };
+            picker.preview_request = Some((provider.to_string(), session_id, value));
+        }
+    }
+
+    /// Right-pane preview lines for the selected picker row.
+    pub(super) fn picker_preview_lines(&self, filtered: &[usize]) -> Vec<String> {
+        let Some(picker) = &self.picker else {
+            return Vec::new();
+        };
+        let Some(&index) = filtered.get(picker.selected) else {
+            return Vec::new();
+        };
+        match picker.kind {
+            PickerKind::Sessions | PickerKind::NewPane => {
+                if let Some(text) = &picker.preview.text {
+                    return text.lines().map(str::to_string).collect();
+                }
+                let Some(session) = self.sessions.get(index) else {
+                    return Vec::new();
+                };
+                let mut lines = vec![
+                    session.name.clone(),
+                    String::new(),
+                    format!("id          {}", session.id),
+                    format!("status      {}", session.status.as_str()),
+                    format!("cwd         {}", session.cwd.display()),
+                    format!("mode        {}", session.mode.as_str()),
+                ];
+                if let Some(worktree) = &session.worktree {
+                    lines.push(format!("worktree    {}", worktree.display()));
+                }
+                lines.push(format!(
+                    "model       {}",
+                    session.model.as_deref().unwrap_or("(daemon default)")
+                ));
+                if let Some(error) = &picker.preview.error {
+                    lines.push(String::new());
+                    lines.push(format!("conversation preview: {error}"));
+                } else if picker.preview.loading {
+                    lines.push(String::new());
+                    lines.push("loading conversation…".into());
+                }
+                lines
+            }
+            PickerKind::Files => {
+                if let Some(text) = &picker.preview.text {
+                    return text.lines().map(str::to_string).collect();
+                }
+                if let Some(error) = &picker.preview.error {
+                    return vec![format!("preview: {error}")];
+                }
+                if picker.preview.loading {
+                    return vec!["loading file…".into()];
+                }
+                let Some(item) = picker.items.get(index) else {
+                    return Vec::new();
+                };
+                item.preview
+                    .as_ref()
+                    .map(|preview| preview.lines().map(str::to_string).collect())
+                    .unwrap_or_else(|| vec![item.label.clone()])
+            }
+            _ => {
+                let Some(item) = picker.items.get(index) else {
+                    return Vec::new();
+                };
+                if let Some(preview) = &item.preview {
+                    preview.lines().map(str::to_string).collect()
+                } else if let Some(detail) = &item.detail {
+                    vec![item.label.clone(), String::new(), detail.clone()]
+                } else {
+                    vec![item.label.clone()]
+                }
+            }
+        }
+    }
+}

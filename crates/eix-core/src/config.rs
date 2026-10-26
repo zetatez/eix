@@ -2628,8 +2628,51 @@ fn merge_toml(base: &mut toml::Value, overlay: toml::Value) {
 }
 
 /// Expand the two config placeholders. Unknown braces (for example a regex
-/// quantifier) are copied verbatim.
+/// quantifier) are copied verbatim. YAML comments are copied without expansion:
+/// the template documents `{env:...}` / `{file:...}` in a comment, and a comment
+/// must never require an environment variable or read a file.
 fn interpolate(text: &str, base_dir: &Path) -> Result<String, ConfigError> {
+    let mut out = String::with_capacity(text.len());
+    let mut block_scalar_parent_indent = None;
+    for line in text.split_inclusive('\n') {
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        let trimmed = line.trim();
+        if let Some(parent_indent) = block_scalar_parent_indent {
+            // A block scalar's content is literal YAML (including lines that
+            // start with `#`), so expand it without comment stripping until a
+            // line dedents back to the key.
+            if trimmed.is_empty() || indent > parent_indent {
+                out.push_str(&interpolate_fragment(line, base_dir)?);
+                continue;
+            }
+            block_scalar_parent_indent = None;
+        }
+
+        let (body, comment) = split_comment(line);
+        out.push_str(&interpolate_fragment(body, base_dir)?);
+        out.push_str(comment);
+        if is_block_scalar_header(body) {
+            block_scalar_parent_indent = Some(indent);
+        }
+    }
+    Ok(out)
+}
+
+fn is_block_scalar_header(body: &str) -> bool {
+    let Some((_, value)) = body.trim_end().rsplit_once(':') else {
+        return false;
+    };
+    let value = value.trim();
+    let mut chars = value.chars();
+    let Some(indicator) = chars.next() else {
+        return false;
+    };
+    matches!(indicator, '|' | '>') && chars.all(|ch| ch == '+' || ch == '-' || ch.is_ascii_digit())
+}
+
+/// Expand placeholders in a single line. File contents may contain newlines;
+/// they are inserted as-is (apart from a trailing line ending).
+fn interpolate_fragment(text: &str, base_dir: &Path) -> Result<String, ConfigError> {
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find('{') {
@@ -2663,6 +2706,54 @@ fn interpolate(text: &str, base_dir: &Path) -> Result<String, ConfigError> {
     }
     out.push_str(rest);
     Ok(out)
+}
+
+/// Split a YAML line at an inline comment. A `#` starts a comment only at the
+/// start of the line or after whitespace, and never inside a quoted scalar.
+fn split_comment(line: &str) -> (&str, &str) {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut previous_was_space = true;
+    let mut chars = line.char_indices().peekable();
+
+    while let Some((index, ch)) = chars.next() {
+        if let Some(quote_char) = quote {
+            match quote_char {
+                '"' => {
+                    if escaped {
+                        escaped = false;
+                    } else if ch == '\\' {
+                        escaped = true;
+                    } else if ch == '"' {
+                        quote = None;
+                    }
+                }
+                '\'' => {
+                    if ch == '\'' {
+                        // A doubled single quote is an escaped quote, not the end
+                        // of the scalar.
+                        if chars.peek().is_some_and(|(_, next)| *next == '\'') {
+                            chars.next();
+                        } else {
+                            quote = None;
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+            previous_was_space = ch.is_whitespace();
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => quote = Some(ch),
+            '#' if previous_was_space => return (&line[..index], &line[index..]),
+            _ => {}
+        }
+        previous_was_space = ch.is_whitespace();
+    }
+
+    (line, "")
 }
 
 /// Cross-platform config root used by eix's own files.
@@ -3658,6 +3749,30 @@ pi = true
         // Unknown braces (a regex quantifier) are left alone.
         let text = interpolate("^a{2}$ {file:key.txt}", &dir).unwrap();
         assert_eq!(text, "^a{2}$ secret-from-file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn config_placeholders_ignore_yaml_comments() {
+        let dir = config_temp_dir("placeholder-comments");
+        std::fs::write(dir.join("key.txt"), "secret-from-file\n").unwrap();
+        let text = interpolate(
+            "# Placeholders: {env:EIX_TEST_COMMENT_UNSET}, {file:missing}\n\
+             base_url: \"http://127.0.0.1:9/v1\" # {env:EIX_TEST_COMMENT_UNSET}\n\
+             api_key: \"a#b\" # {file:missing}\n",
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(
+            text,
+            "# Placeholders: {env:EIX_TEST_COMMENT_UNSET}, {file:missing}\n\
+             base_url: \"http://127.0.0.1:9/v1\" # {env:EIX_TEST_COMMENT_UNSET}\n\
+             api_key: \"a#b\" # {file:missing}\n"
+        );
+
+        // Block scalars are not comments: a leading `#` is literal content.
+        let text = interpolate("system_prompt: |\n  # keep {file:key.txt}\n", &dir).unwrap();
+        assert_eq!(text, "system_prompt: |\n  # keep secret-from-file\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
