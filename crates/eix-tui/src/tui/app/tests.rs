@@ -2021,6 +2021,39 @@ fn clicking_the_parent_link_returns_to_the_parent_agent() {
     app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 40, 1), &tx);
 
     assert_eq!(app.focused, 0);
+    assert_eq!(app.views.len(), 1, "the child pane should close");
+    assert_eq!(app.views[0].session.id, "parent");
+    assert_eq!(app.status, "parent agent focused");
+}
+
+#[test]
+fn returning_to_parent_closes_a_child_pane_before_the_parent() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    let parent = Session::new("parent", "parent", "/tmp");
+    let mut child = Session::new("child-1", "parent/scout-1", "/tmp");
+    child.origin = eix_core::SessionOrigin::Agent;
+    child.parent_id = Some("parent".into());
+    app.sessions = vec![parent.clone(), child.clone()];
+    let mut child_view = SessionView::new(child, Vec::new());
+    child_view.text_lines = vec!["  ← parent agent · click to return".into()];
+    app.views.push(child_view);
+    app.views.push(SessionView::new(parent, Vec::new()));
+    app.focused = 0;
+    app.pane_areas = vec![Rect::new(0, 0, 30, 10), Rect::new(30, 0, 30, 10)];
+
+    let mouse = |kind, column, row| MouseEvent {
+        kind,
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    app.handle_mouse(mouse(MouseEventKind::Down(MouseButton::Left), 10, 1), &tx);
+    app.handle_mouse(mouse(MouseEventKind::Up(MouseButton::Left), 10, 1), &tx);
+
+    assert_eq!(app.focused, 0);
+    assert_eq!(app.views.len(), 1);
+    assert_eq!(app.views[0].session.id, "parent");
     assert_eq!(app.status, "parent agent focused");
 }
 

@@ -670,8 +670,15 @@ impl App {
             self.status = "subagent has no parent session".into();
             return;
         };
-        if let Some(index) = self.open_session(&parent_id) {
-            self.focus_pane(index);
+        if self.open_session(&parent_id).is_some() {
+            // The child pane is transient: returning to the parent closes it
+            // instead of leaving a finished subagent beside the main session.
+            if self.views.len() > 1 {
+                self.close_focused_pane();
+            }
+            if let Some(index) = self.open_session(&parent_id) {
+                self.focus_pane(index);
+            }
             self.status = "parent agent focused".into();
             return;
         }
