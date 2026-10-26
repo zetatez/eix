@@ -201,7 +201,7 @@ impl App {
         if len == 0 {
             return;
         }
-        pending.cursor = wrap_index(pending.cursor, delta, len);
+        pending.cursor = (pending.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
     /// Answer the focused question with `option_index`.
@@ -236,7 +236,7 @@ impl App {
         if len == 0 {
             return;
         }
-        pending.cursor = wrap_index(pending.cursor, delta, len);
+        pending.cursor = (pending.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
     }
 
     /// Run the action on the focused card's highlighted row (or `index`).

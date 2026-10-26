@@ -96,26 +96,26 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(inbox) = self.inbox.as_mut() {
-                    inbox.cursor = wrap_index(cursor, 1, len);
+                    inbox.cursor = (cursor + 1).min(len.saturating_sub(1));
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(inbox) = self.inbox.as_mut() {
-                    inbox.cursor = wrap_index(cursor, -1, len);
+                    inbox.cursor = cursor.saturating_sub(1);
                 }
             }
             KeyCode::Char('b') | KeyCode::Char('B')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 if let Some(inbox) = self.inbox.as_mut() {
-                    inbox.cursor = wrap_index(cursor, -10, len);
+                    inbox.cursor = cursor.saturating_sub(10);
                 }
             }
             KeyCode::Char('f') | KeyCode::Char('F')
                 if key.modifiers.contains(KeyModifiers::CONTROL) =>
             {
                 if let Some(inbox) = self.inbox.as_mut() {
-                    inbox.cursor = wrap_index(cursor, 10, len);
+                    inbox.cursor = (cursor + 10).min(len.saturating_sub(1));
                 }
             }
             KeyCode::Char('y') | KeyCode::Char('n') => {
@@ -171,14 +171,16 @@ impl App {
         let len = view.processes.len();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                view.cursor = wrap_index(view.cursor, 1, len);
+                if view.cursor + 1 < len {
+                    view.cursor += 1;
+                }
                 if let Some(process) = view.selected() {
                     let process_id = process.id.clone();
                     let _ = tx.send(Command::ProcessOutput { process_id });
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                view.cursor = wrap_index(view.cursor, -1, len);
+                view.cursor = view.cursor.saturating_sub(1);
                 if let Some(process) = view.selected() {
                     let process_id = process.id.clone();
                     let _ = tx.send(Command::ProcessOutput { process_id });
@@ -306,7 +308,8 @@ impl App {
             if len == 0 {
                 picker.selected = 0;
             } else {
-                picker.selected = wrap_index(picker.selected, delta as isize, len);
+                let current = picker.selected.min(len - 1) as i32;
+                picker.selected = (current + delta).clamp(0, len as i32 - 1) as usize;
             }
         }
         self.preview_theme_selection();

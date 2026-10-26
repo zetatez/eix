@@ -71,6 +71,7 @@ impl App {
             self.help_selected = 0;
             return;
         }
-        self.help_selected = wrap_index(self.help_selected, delta, count);
+        let selected = self.help_selected.min(count - 1) as isize;
+        self.help_selected = (selected + delta).clamp(0, count as isize - 1) as usize;
     }
 }

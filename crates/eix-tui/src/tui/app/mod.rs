@@ -2931,16 +2931,6 @@ fn approval_risk(tool: &str) -> (&'static str, Color) {
     }
 }
 
-/// Move a list cursor by `delta`, wrapping at either end. A page-sized jump
-/// wraps too, so every list overlay cycles instead of stopping at an edge.
-fn wrap_index(current: usize, delta: isize, len: usize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    let current = current.min(len - 1) as isize;
-    (current + delta).rem_euclid(len as isize) as usize
-}
-
 /// Map `Ctrl-N`/`Ctrl-P` (and the vim `Ctrl-J`/`Ctrl-K`) onto plain `j`/`k`
 /// for list overlays whose letters already mean next/previous.
 fn next_prev_key(key: KeyEvent) -> KeyEvent {
