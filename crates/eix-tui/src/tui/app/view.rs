@@ -270,10 +270,7 @@ impl App {
             user_lines: _,
         } = {
             let view = &self.views[index];
-            let live = view.stream.as_ref().map(|stream| transcript::Live {
-                reasoning: &stream.reasoning,
-                text: &stream.text,
-            });
+            let live = view.live();
             transcript::render_tail(
                 live,
                 &queued,

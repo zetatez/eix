@@ -778,10 +778,7 @@ fn line_text(line: &Line<'_>) -> String {
 }
 
 fn render_transcript_at(view: &SessionView, width: usize, tick: u64) -> String {
-    let live = view.stream.as_ref().map(|stream| transcript::Live {
-        reasoning: &stream.reasoning,
-        text: &stream.text,
-    });
+    let live = view.live();
     transcript::render_with_subagents(
         &view.events,
         live,
@@ -1831,6 +1828,56 @@ fn waiting_placeholder_cycles_dots_and_yields_to_streamed_text() {
     stream.reasoning = "thinking".into();
     let rendered = render_transcript_at(&view, 40, 4);
     assert!(rendered.contains("Thinking…"), "{rendered}");
+    assert!(
+        !rendered
+            .lines()
+            .any(|line| matches!(line.trim(), "." | ".." | "...")),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn running_turn_keeps_dots_after_a_tool_result() {
+    let mut session = Session::new("s1", "chat", "/tmp");
+    session.status = SessionStatus::Running;
+    let events = vec![
+        SessionEvent::new(
+            "s1",
+            1,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "run_command",
+                "arguments": {"command": "cargo test"},
+            }),
+        ),
+        SessionEvent::new(
+            "s1",
+            2,
+            EventKind::ToolResult,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "run_command",
+                "ok": true,
+                "denied": false,
+                "output": "test result: ok",
+            }),
+        ),
+    ];
+    let mut view = SessionView::new(session, events);
+    // The tool result is stored and the stream was cleared, but the turn is
+    // still running until the next step arrives.
+    assert!(view.stream.is_none());
+    for (tick, dots) in [(0, "."), (2, ".."), (4, "...")] {
+        let rendered = render_transcript_at(&view, 60, tick);
+        assert!(
+            rendered.lines().any(|line| line.trim() == dots),
+            "tick {tick}: {rendered}"
+        );
+    }
+
+    view.session.status = SessionStatus::Idle;
+    let rendered = render_transcript_at(&view, 60, 4);
     assert!(
         !rendered
             .lines()

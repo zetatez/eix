@@ -498,6 +498,23 @@ impl SessionView {
         self.user_lines = cache.user_lines.clone();
     }
 
+    /// What the live tail should render. A running turn with no streamed text
+    /// still needs a placeholder: after a tool result is stored the stream is
+    /// cleared, and the model can spend a while producing the next step.
+    fn live(&self) -> Option<transcript::Live<'_>> {
+        match self.stream.as_ref() {
+            Some(stream) => Some(transcript::Live {
+                reasoning: &stream.reasoning,
+                text: &stream.text,
+            }),
+            None if self.session.status == SessionStatus::Running => Some(transcript::Live {
+                reasoning: "",
+                text: "",
+            }),
+            None => None,
+        }
+    }
+
     fn upsert_subagent(&mut self, agent_id: String, call_id: String, name: String) {
         match self.subagents.get_mut(&agent_id) {
             Some(subagent) => {
