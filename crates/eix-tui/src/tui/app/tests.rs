@@ -1322,6 +1322,119 @@ fn failed_subagent_shows_only_the_error() {
 }
 
 #[test]
+fn subagent_card_shows_streamed_thinking() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(
+        Session::new("parent", "parent", "/tmp"),
+        parent_spawn_events(),
+    ));
+    app.handle_event(
+        Event::Notification(eix_core::Notification::new(
+            "agent.spawned",
+            serde_json::json!({
+                "session_id": "parent",
+                "agent_id": "child-1",
+                "call_id": "call-1",
+                "name": "parent/scout-1",
+            }),
+        )),
+        &tx,
+    );
+    // The child has no pane of its own; its reasoning deltas still belong in
+    // the parent's card.
+    for (method, delta) in [
+        ("reasoning.delta", "reading the parser, "),
+        ("reasoning.delta", "then the lexer"),
+        ("message.delta", "partial answer"),
+    ] {
+        app.handle_event(
+            Event::Notification(eix_core::Notification::new(
+                method,
+                serde_json::json!({
+                    "session_id": "child-1",
+                    "turn_id": "t1",
+                    "delta": delta,
+                }),
+            )),
+            &tx,
+        );
+    }
+    let running = render_transcript(&app.views[0], 60);
+    assert!(running.contains("✳ Thinking…"), "{running}");
+    assert!(running.contains("reading the parser,"), "{running}");
+    assert!(running.contains("then the lexer"), "{running}");
+    // Answer text is not mirrored live; it arrives with the stored event.
+    assert!(!running.contains("partial answer"), "{running}");
+    assert_eq!(running.matches("│ ").count(), 5, "{running}");
+
+    // The stored message carries the same reasoning, so the live copy goes
+    // away instead of showing up twice.
+    app.handle_event(
+        Event::Notification(eix_core::Notification::new(
+            "session.event",
+            serde_json::to_value(SessionEvent::new(
+                "child-1",
+                1,
+                EventKind::AssistantMessage,
+                serde_json::json!({
+                    "text": "done",
+                    "model": "mock",
+                    "reasoning": "reading the parser, then the lexer",
+                }),
+            ))
+            .unwrap(),
+        )),
+        &tx,
+    );
+    let stored = render_transcript(&app.views[0], 60);
+    assert!(!stored.contains("✳ Thinking…"), "{stored}");
+    assert!(
+        stored.contains("✳ reading the parser, then the lexer"),
+        "{stored}"
+    );
+}
+
+#[test]
+fn subagent_thinking_keeps_only_the_visible_tail() {
+    let session = Session::new("parent", "parent", "/tmp");
+    let mut view = SessionView::new(session, parent_spawn_events());
+    view.upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+
+    let mut long = String::from("first thought\n");
+    for _ in 0..80 {
+        long.push_str("middle filler line\n");
+    }
+    long.push_str("newest thought");
+    view.push_subagent_delta("child-1", "t1", true, &long);
+
+    let rendered = render_transcript(&view, 60);
+    assert!(rendered.contains("newest thought"), "{rendered}");
+    assert!(!rendered.contains("first thought"), "{rendered}");
+    assert!(rendered.contains('…'), "{rendered}");
+    assert_eq!(rendered.matches("│ ").count(), 5, "{rendered}");
+
+    // Short multi-line thinking fits whole; the first line is not mistaken for
+    // a truncated head.
+    let mut short = SessionView::new(
+        Session::new("parent", "parent", "/tmp"),
+        parent_spawn_events(),
+    );
+    short.upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+    short.push_subagent_delta("child-1", "t1", true, "first line\nsecond line");
+    let rendered = render_transcript(&short, 60);
+    assert!(rendered.contains("first line"), "{rendered}");
+    assert!(rendered.contains("second line"), "{rendered}");
+
+    // A new turn starts with a clean buffer, and a retry drops the partial
+    // buffer so the re-streamed thinking does not double up.
+    view.push_subagent_delta("child-1", "t2", true, "second turn");
+    assert_eq!(view.subagents["child-1"].reasoning, "second turn");
+    view.clear_subagent_reasoning("child-1", "t2");
+    assert!(view.subagents["child-1"].reasoning.is_empty());
+}
+
+#[test]
 fn expanded_command_omits_redundant_labels_and_gutter() {
     let session = Session::new("s1", "tools", "/tmp");
     let events = vec![

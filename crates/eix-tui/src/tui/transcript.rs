@@ -65,6 +65,12 @@ pub struct Subagent {
     /// The child's latest assistant answer.
     pub result: Option<String>,
     pub error: Option<String>,
+    /// Thinking streamed by the child's current turn. Stored assistant events
+    /// carry the same text, so `push_event` clears this buffer to avoid
+    /// showing it twice in the activity feed.
+    pub reasoning: String,
+    /// Turn that owns [`Subagent::reasoning`]; a new turn starts a new buffer.
+    pub reasoning_turn: String,
 }
 
 impl Subagent {
@@ -76,6 +82,8 @@ impl Subagent {
             events: Vec::new(),
             result: None,
             error: None,
+            reasoning: String::new(),
+            reasoning_turn: String::new(),
         }
     }
 
@@ -86,6 +94,11 @@ impl Subagent {
         match event.kind {
             EventKind::AssistantMessage => {
                 if let Ok(payload) = AssistantMessagePayload::deserialize(&event.payload) {
+                    // The stored message already carries this turn's
+                    // reasoning; drop the live copy so the feed does not
+                    // repeat it.
+                    self.reasoning.clear();
+                    self.reasoning_turn.clear();
                     let text = payload.text.trim();
                     if !text.is_empty() {
                         self.result = Some(text.to_string());
@@ -103,6 +116,8 @@ impl Subagent {
     }
 
     pub fn complete(&mut self, ok: bool, result: Option<String>, error: Option<String>) {
+        self.reasoning.clear();
+        self.reasoning_turn.clear();
         self.status = if ok {
             SubagentStatus::Completed
         } else {
@@ -1337,18 +1352,36 @@ fn subagent_window(
     theme: Theme,
     fold: Fold,
 ) {
-    let mut rows = subagent_activity(subagent);
+    let box_width = width.saturating_sub(BODY_INDENT.len()).max(6);
+    let inner_width = box_width.saturating_sub(4).max(1);
+    // Activity lines are the child's stored events. Its current thinking is
+    // streamed as deltas and stored later, so append the live tail here and
+    // let the window scroll it into view like any other newest row.
+    let mut rows: Vec<(String, bool)> = subagent_activity(subagent)
+        .into_iter()
+        .map(|text| (text, false))
+        .collect();
+    if !subagent.reasoning.trim().is_empty() {
+        rows.push(("✳ Thinking…".to_string(), true));
+        rows.extend(
+            wrapped_tail(
+                &subagent.reasoning,
+                inner_width,
+                SUBAGENT_WINDOW_ROWS.saturating_sub(2),
+            )
+            .into_iter()
+            .map(|line| (line, true)),
+        );
+    }
     if rows.is_empty() {
-        rows.push("waiting for agent…".into());
+        rows.push(("waiting for agent…".to_string(), false));
     }
     if rows.len() > SUBAGENT_WINDOW_ROWS {
         let keep = SUBAGENT_WINDOW_ROWS.saturating_sub(1);
         rows = rows.split_off(rows.len().saturating_sub(keep));
-        rows.insert(0, "…".into());
+        rows.insert(0, ("…".to_string(), false));
     }
 
-    let box_width = width.saturating_sub(BODY_INDENT.len()).max(6);
-    let inner_width = box_width.saturating_sub(4).max(1);
     out.push(
         Line::from(Span::styled(
             format!("{BODY_INDENT}╭{}╮", "─".repeat(box_width.saturating_sub(2))),
@@ -1357,11 +1390,16 @@ fn subagent_window(
         Some(fold),
     );
     for index in 0..SUBAGENT_WINDOW_ROWS {
-        let text = rows.get(index).map(String::as_str).unwrap_or_default();
+        let (text, thinking) = rows
+            .get(index)
+            .map(|(text, thinking)| (text.as_str(), *thinking))
+            .unwrap_or(("", false));
         let text = truncate(text, inner_width);
         let padding = inner_width.saturating_sub(UnicodeWidthStr::width(text.as_str()));
         let style = if text.is_empty() || text == "waiting for agent…" {
             dim(theme)
+        } else if thinking {
+            italic_dim(theme)
         } else {
             Style::default().fg(text_color(theme))
         };
@@ -1383,6 +1421,43 @@ fn subagent_window(
         )),
         Some(fold),
     );
+}
+
+/// Wrap the end of `text` into at most `rows` lines. Thinking grows without
+/// bound while it streams, and only the visible tail is drawn, so keep the
+/// work proportional to the window instead of the whole buffer.
+fn wrapped_tail(text: &str, width: usize, rows: usize) -> Vec<String> {
+    if rows == 0 {
+        return Vec::new();
+    }
+    // Two cells per row of slack: wrapping re-measures the exact lines below.
+    let keep = width
+        .saturating_mul(rows)
+        .saturating_mul(2)
+        .max(width)
+        .max(1);
+    let truncated = text.chars().nth(keep).is_some();
+    let mut chars: Vec<char> = text.chars().rev().take(keep).collect();
+    chars.reverse();
+    let tail: String = chars.into_iter().collect();
+    // A truncated head may start mid-line; drop that partial row so the first
+    // drawn line is whole. Untruncated text keeps every line.
+    let tail = if truncated {
+        match tail.split_once('\n') {
+            Some((_, rest)) => rest,
+            None => tail.as_str(),
+        }
+    } else {
+        tail.as_str()
+    };
+    let mut lines: Vec<String> = tail
+        .lines()
+        .flat_map(|line| wrap_text(line, width))
+        .collect();
+    if lines.len() > rows {
+        lines = lines.split_off(lines.len() - rows);
+    }
+    lines
 }
 
 /// After completion the child's process disappears; only its answer remains.

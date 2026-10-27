@@ -639,6 +639,38 @@ impl SessionView {
         true
     }
 
+    /// Append a streamed child delta to the card. Only thinking is shown
+    /// live; answer text arrives in one piece with the stored assistant
+    /// event, which also clears this buffer.
+    fn push_subagent_delta(&mut self, agent_id: &str, turn_id: &str, reasoning: bool, delta: &str) {
+        if !reasoning {
+            return;
+        }
+        let Some(subagent) = self.subagents.get_mut(agent_id) else {
+            return;
+        };
+        if subagent.reasoning_turn != turn_id {
+            subagent.reasoning.clear();
+            subagent.reasoning_turn.clear();
+            subagent.reasoning_turn.push_str(turn_id);
+        }
+        subagent.reasoning.push_str(delta);
+        self.subagents_rev = self.subagents_rev.wrapping_add(1);
+    }
+
+    /// Drop the live thinking buffer when the turn is reset or retried. A
+    /// retry streams the reasoning again from the start.
+    fn clear_subagent_reasoning(&mut self, agent_id: &str, turn_id: &str) {
+        let Some(subagent) = self.subagents.get_mut(agent_id) else {
+            return;
+        };
+        if subagent.reasoning_turn == turn_id {
+            subagent.reasoning.clear();
+            subagent.reasoning_turn.clear();
+            self.subagents_rev = self.subagents_rev.wrapping_add(1);
+        }
+    }
+
     fn complete_subagent(
         &mut self,
         agent_id: &str,

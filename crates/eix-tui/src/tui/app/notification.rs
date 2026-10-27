@@ -218,6 +218,21 @@ impl App {
             "message.delta" | "reasoning.delta" => {
                 let reasoning = notification.method == "reasoning.delta";
                 if let Ok(delta) = serde_json::from_value::<DeltaParams>(notification.params) {
+                    // Children usually have no pane of their own, but their
+                    // thinking belongs in the parent's card. Fall through so
+                    // an open child pane still updates its own stream.
+                    if let Some(index) = self
+                        .views
+                        .iter()
+                        .position(|view| view.subagents.contains_key(&delta.session_id))
+                    {
+                        self.views[index].push_subagent_delta(
+                            &delta.session_id,
+                            &delta.turn_id,
+                            reasoning,
+                            &delta.delta,
+                        );
+                    }
                     let Some(view) = self
                         .views
                         .iter_mut()
@@ -254,6 +269,14 @@ impl App {
             }
             "message.reset" => {
                 if let Ok(reset) = serde_json::from_value::<TurnRef>(notification.params) {
+                    if let Some(index) = self
+                        .views
+                        .iter()
+                        .position(|view| view.subagents.contains_key(&reset.session_id))
+                    {
+                        self.views[index]
+                            .clear_subagent_reasoning(&reset.session_id, &reset.turn_id);
+                    }
                     if let Some(view) = self
                         .views
                         .iter_mut()
@@ -271,6 +294,14 @@ impl App {
             }
             "turn.retrying" => {
                 if let Ok(retry) = serde_json::from_value::<TurnRetrying>(notification.params) {
+                    if let Some(index) = self
+                        .views
+                        .iter()
+                        .position(|view| view.subagents.contains_key(&retry.session_id))
+                    {
+                        self.views[index]
+                            .clear_subagent_reasoning(&retry.session_id, &retry.turn_id);
+                    }
                     if let Some(view) = self
                         .views
                         .iter_mut()
