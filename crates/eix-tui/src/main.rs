@@ -5,7 +5,6 @@
 //! prompt, stream the answer, inspect the persisted transcript, cancel.
 
 mod client;
-mod nvim_frontend;
 mod tui;
 
 use std::io::{self, IsTerminal, Read, Write};
@@ -103,7 +102,6 @@ async fn main() -> Result<()> {
         Command::Worktree(cmd) => worktree(&cli, cmd).await,
         Command::Ready { session } => ready(&cli, session).await,
         Command::Integrate { action, session } => integrate(&cli, action, session).await,
-        Command::Nvim { session } => nvim(&cli, session).await,
         Command::Processes { session } => processes(&cli, session).await,
         Command::Tail { process } => tail(&cli, &process).await,
         Command::Kill { process } => kill(&cli, &process).await,
@@ -236,9 +234,6 @@ enum Command {
     },
     Integrate {
         action: String,
-        session: Option<String>,
-    },
-    Nvim {
         session: Option<String>,
     },
     Processes {
@@ -603,11 +598,6 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
                 bail!("usage: eix integrate [status | continue SESSION] (got {action:?})");
             }
             Ok(Command::Integrate { action, session })
-        }
-        "nvim" => {
-            let session = take_flag(&mut args, "--session")?;
-            let session = session.or_else(|| args.first().cloned());
-            Ok(Command::Nvim { session })
         }
         "ps" | "processes" => {
             let session = take_flag(&mut args, "--session")?;
@@ -1501,13 +1491,6 @@ async fn worktree(cli: &Cli, cmd: WorktreeCmd) -> Result<()> {
             Ok(())
         }
     }
-}
-
-async fn nvim(cli: &Cli, session: Option<String>) -> Result<()> {
-    // Start the local daemon first; on TCP the plugin connects to the remote
-    // endpoint directly (and `ensure_daemon` is a no-op).
-    ensure_daemon(&cli.endpoint, &cli.data_dir, cli.config_path.as_deref()).await?;
-    crate::nvim_frontend::launch(cli.endpoint.clone(), &cli.data_dir, session).await
 }
 
 async fn processes(cli: &Cli, session: Option<String>) -> Result<()> {
@@ -2413,7 +2396,6 @@ COMMANDS:
     ready [--session ID]       mark the current worktree ready for rebase/test/merge
     integrate [status | continue SESSION]
                                show the integration queue or resume a paused session
-    nvim [--session ID]        open the Neovim frontend against this daemon
     doctor                     diagnose config, paths and daemon
     daemon                     start/attach the daemon and print its status
     help                       show this help

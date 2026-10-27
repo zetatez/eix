@@ -24,7 +24,7 @@
 
 | 决策 | 选择 | 理由 | 代价 |
 |---|---|---|---|
-| 形态 | daemon + TUI 主前端，预留 nvim 前端 | session 需跨终端/崩溃存活；前端可替换 | 协议先行，工程量最大 |
+| 形态 | daemon + TUI/CLI 主前端，编辑器插件走协议 | session 需跨终端/崩溃存活；前端可替换 | 协议先行，工程量最大 |
 | 语言 | Rust | 渲染性能、单二进制、类型化协议 | 开发速度慢于 TS |
 | session | append-only 事件日志，SQLite 持久化 | rewind/fork/审计/搜索都是推论 | 需处理"工作区不可重放" |
 | 多 session | pane 多开 + 全局 fzf picker + dwm 全局跳转 | 同屏并行与秒切并存 | pane 布局与焦点管理 |
@@ -56,7 +56,7 @@
 ```
 
 - daemon 首次调用自动拉起；client 崩溃/退出不影响运行中的 session。
-- 协议传**结构化事件**（message delta、tool call、patch、status），不传渲染文本；为未来的 nvim 前端保留全部信息。
+- 协议传**结构化事件**（message delta、tool call、patch、status），不传渲染文本；为外部前端保留全部信息。
 - 前端能力握手：`protocol: 1` + `capabilities`。
 
 ## 4. Session 模型
@@ -95,7 +95,7 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
   session 参数忽略保存的 pane、焦点与 layout。
 - 同一 session 可被多 client 观察，但**只有一个输入所有者（controller）**。
 - 所有者断开 → 自动转移给最早的 watcher；显式抢占用 `<leader>a C`（claim）。
-- draft 由 daemon 持有，client 的 nvim 只是视图；所有权切换时重新加载 draft。
+- draft 由 daemon 持有，client 只是视图；所有权切换时重新加载 draft。
 - 新建 session 在首次输入前只是空壳：TUI 退出时对本次创建的空 session 调用
   `session.delete_if_empty`，daemon 用单条 SQL 原子检查“无事件、无草稿、无 worktree”后删除，
   避免污染历史列表；有草稿或 worktree 的 session 保留。
@@ -224,7 +224,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - `@`（insert，行首/空白后）打开文件 picker；`<Space>g` / `<Space>h` 在 normal / 转录区打开
   session picker / 用户输入 timeline。
 - picker：`Ctrl-J`/`Ctrl-K`（或 `↑`/`↓`）上下选择。
-- 不再有 `[input] backend` / `minimal` 配置，也没有 nvim 回退路径。
+- 不再有 `[input] backend` / `minimal` 配置，也没有外部编辑器回退路径。
 
 ### 5.2 buffer 与 draft
 
@@ -271,26 +271,16 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 正文左侧留 1 格内边距；不再显示 `❯` 输入槽和占位文案，空输入时只保留光标。
 - 视觉选区逐字符判断并反色渲染；终端光标跟随实际字符位置。
 
-### 5.4 独立 nvim 前端（`eix nvim`）
+### 5.4 Neovim 插件（外部实现）
 
-除了 TUI，也可以让 Neovim 直接当整个前端：
+eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim 插件是普通 daemon client：
+通过 Unix socket（或 TCP + token）说同一套换行 JSON-RPC，自己决定怎么渲染和交互。
 
-- `eix nvim [--session ID]` 用用户的 nvim 打开一个内嵌 Lua 插件（`eix_core::nvim_plugin` 写在
-  `<data-dir>/eix-nvim.lua`，内容变化才重写），插件自己用 `vim.uv`（`vim.loop` 兼容）连 Unix socket
-  或 TCP，说同一套换行 JSON-RPC。
-- 转录渲染进一个 `eix://<id8>` 的 scratch buffer（`botright` 分屏），用户自己的配置、配色和键位都在。
-- `:Eix` 命令：`attach [ID|name]` / `list` / `pick [KIND]`（`KIND` = `sessions`(默认)/`files`/`worktrees`/
-  `branches`/`context`；选中 files/branches/worktree 插入光标处，context 在分屏显示条目详情）/
-  `new [NAME] [worktree]` / `send TEXT` / `prompt`（输入分屏，`<CR>` 发送、`@` 文件 picker）/
-  `fork [SEQ]` / `rewind [SEQ]` / `stop` / `ps` / `mode [MODE]` / `doctor`。
-  eix buffer 里 `<C-g>` 打开 session picker，`<C-g><C-g>` 回到上一个 session；`<leader>a` palette
-  也含 file / worktree / branch / context 入口。
-- 连接和请求都由插件内的 libuv 处理；注意 **libuv 回调是 fast context**，`vim.env` / `vim.fn.*` /
-  `nvim_buf_*` 都必须先 `vim.schedule` 或把环境值在加载时缓存进 `state`（实测坑）。
+- 协议、常用请求/通知、重连补洞和最小 Lua 传输层见 [`docs/nvim.md`](docs/nvim.md)。
+- 插件用 `session.subscribe` 只订阅自己的 session，用 `session.events` 补历史，用
+  `message.delta` 做流式刷新；`stream.lagged` 表示需要补拉。
 - 每个 nvim 进程是独立 client，共享同一 daemon；daemon 串行化同一 session 的 turn，忙时拒绝。
-- 测试：headless e2e 直接跑 `nvim --headless -u NONE --cmd 'lua dofile(...)' -c 'Eix attach ...'`，
-  断言 scratch buffer 里出现 prompt 和回答；`#[tokio::test]` 是 current-thread runtime，阻塞式
-  `Command::output()` 会饿死 daemon，必须放 `spawn_blocking` 里跑。
+- eix 仓库不再包含 `eix nvim` 命令或内嵌 Lua 前端；是否发布独立插件由插件作者决定。
 
 ## 6. 布局与焦点
 
@@ -328,7 +318,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 ## 7. 键位总表
 
 > 内置编辑器与转录区共用一套可配置的全局 / normal / leader 键位；leader 前缀默认 `<Space>`，
-> 可用 `[keys].leader` 修改。`eix nvim` 前端沿用你的 `mapleader`（下表以 `<Space>` 为例）。
+> 可用 `[keys].leader` 修改（下表以 `<Space>` 为例）。
 
 **全局与窗口**
 
@@ -348,22 +338,6 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | `<` / `>` | 转录区 / 输入框 normal：上一个 / 下一个 pane |
 | `Ctrl-W Ctrl-W` | 转录区 / 输入框 normal 模式 1 秒内连按两次：聚焦下一个 pane，最后一个回绕到第一个 |
 | `Ctrl-C` / `Ctrl-D` | 任意模式：保存草稿并退出 |
-
-**`eix nvim` 前端（`:Eix` palette）**
-
-| 键 | 行为 |
-|---|---|
-| `<leader>a s` | session picker |
-| `<leader>a n` | 新建 session |
-| `<leader>a f` | fork 当前 session |
-| `<leader>a a` | attention 队列（下一个待审批/待输入） |
-| `<leader>a p` | 命令面板（搜一切动作） |
-| `<leader>a d` | diff 审阅 |
-| `<leader>a e` | 用真 nvim 编辑当前 draft |
-| `<leader>a x` | 取消当前生成 |
-| `<leader>a r` | 审批收件箱（跨 session） |
-| `<leader>a q` | detach |
-| `<leader>a ?` | 帮助 / cheatsheet（打开后输入即筛选条目，`↑`/`↓` 选择，`Ctrl-U` 清空，`Esc` 关闭） |
 
 **输入条（内置编辑器）**
 
@@ -476,7 +450,7 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 | `<C-f>` | fork |
 | `<C-n>` | 新建 |
 | `<C-y>` | 复制 |
-| `<C-o>` | 在 nvim 中打开 |
+| `<C-o>` | 在 `$EDITOR`（默认 nvim）中打开 |
 | `status:` / `branch:` / `tag:` / `cwd:` | 字段过滤 |
 | `Esc` | 关闭 |
 
@@ -505,8 +479,6 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
   - 动作：files → 在 prompt 光标处插入 `@path`；grep → 插入 `@path:line`；git → 插入 worktree 路径或分支名；sessions → 切换/新 pane；
     commands → 执行（session / files / grep / git /
     processes / approvals / new / fork / cancel / help / quit）。
-  - 独立 nvim 前端：`:Eix pick [sessions|files|worktrees|branches|context]`（`sessions` 为默认），
-    文件/分支/worktree 选中后插入光标处，context 选中后在 scratch 分屏显示条目详情。
 - 仍待做：diff hunks provider、
   多选（多文件插入、多 session 开 pane、多 hunk 审批）、frecency 排序与 `#` 匹配度模式、外挂
   `agent pick`/`fzf`、file 语法高亮预览。
@@ -708,15 +680,16 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
   `kind`，TUI 用简短标签显示原因。
 - 删除/pin 是 session 级策略，可保存为项目默认。
-- 系统提示用 Working agreement + Work loop 组织。Working agreement 约定协作方式：简洁直接、
+- 系统提示用 Working agreement + How to work 组织。Working agreement 约定协作方式：简洁直接、
   先读代码再假设、按显式要求验收、端到端完成且不把实现请求降级为计划、保留用户改动、
   不修无关问题；单条命令能答的简单请求直接执行，只有错误假设会影响结果时才问。
-  Work loop 压缩为 orient → plan → change → verify → report：非平凡任务才计划，跳过最简单
-  四分之一、不做单步计划、每完成一项就更新；改动修根因、复用 helper、保持相关调用面一致；
-  用可失败的最强检查覆盖边界/错误路径并检查 diff，不为通过而改测试；结束前交代结果、证据、
-  假设与残余风险，卡住时说明缺什么，重复读写无进展时停下。Communication 段约束分组工具
-  调用前的简短说明、review 先列 findings、最终答复简洁且不倾倒文件内容；Continuity 段规定
-  新消息以最新为准，resume/压缩后从摘要继续而不是重来。
+  How to work 不写死阶段，而是给判断原则，由模型按任务规模决定展开多少：先读最窄代码和
+  调用点，能靠上下文判断就少用工具；大或模糊的任务才计划，跳过直接任务和单步计划，`todo`
+  逐项完成即更新；改动修根因、复用 helper、保持相关调用面一致；验证以“足以信任结果”为准，
+  跑可能失败的检查、覆盖边界/错误路径、看 diff、不重复未变化的检查、不为通过而改测试，
+  跑不了就说明。Communication 段约束分组工具调用前的简短说明、review 未要求不改代码且先列
+  findings、最终答复简洁且不倾倒文件内容；Continuity 段规定新消息以最新为准，
+  resume/压缩后从摘要继续而不是重来。
   工具批次按只读段并发：内置读工具和风险分析判定低风险只读、权限放行的 `run_command`
   可以在段内同时执行；无需审批且目标文件互不重叠的直接 `write_file` / `edit` 也可在
   写段内并发。同一/重叠目标、`patch`、需要审批或暂存的写入、非只读命令、审批和交互
@@ -757,7 +730,7 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   返回 `{value, label, detail?, preview?}` 行；`grep` 的 value 是 `path:line`；`context` 的 value 是 entry id）
 - `picker.preview {kind, session_id?, value, limit?}`（`files` 读取 workspace 文件内容；`sessions` 读取目标
   session 的最近对话事件；返回 `{kind, value, text}`，供 picker 右侧懒加载）
-- `nvim.claim`（输入所有权；planned）
+- `client.claim`（输入所有权；planned，供任何外部前端使用）
 
 所有事件带 `id`、`session_id`、`seq`、`ts`、`type`、`payload`；协议版本握手。
 
@@ -802,25 +775,21 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 ## 15. 风险
 
-1. **完整 nvim 配置的插件干扰**（浮动窗口裁剪、通知弹窗、状态栏）——最高风险，需要 doctor + minimal 回退。
-2. **linegrid 渲染器**工程量与边界情况。
-3. **按键路由/键盘协议差异**（`S-CR`、`C-j`、IME、bracketed paste）。
-4. **中文 FTS** 的短词问题。
-5. **staging 工作区**与 agent 读视图的一致性。
-6. **上下文质量**决定产品上限，UI 只决定下限。
-7. **rewind 的诚实性**，一次说谎就失去信任。
-8. **范围膨胀**：UI 复杂度吃掉内核打磨时间。
+1. **按键路由/键盘协议差异**（`S-CR`、`C-j`、IME、bracketed paste）。
+2. **中文 FTS** 的短词问题。
+3. **staging 工作区**与 agent 读视图的一致性。
+4. **上下文质量**决定产品上限，UI 只决定下限。
+5. **rewind 的诚实性**，一次说谎就失去信任。
+6. **范围膨胀**：UI 复杂度吃掉内核打磨时间。
 
 ## 16. Roadmap
 
 > 本节保留阶段计划与当时的实现快照，用于追溯设计决策；当前完整实现状态见 §20。
 
-**Spike（2–3 天）**
+**Spike（已弃用）**
 
-- nvim `--embed` + 完整配置 + linegrid 渲染 + 按键转发。
-- `<CR>` 提交守卫（`pumvisible()` / `getcmdtype()`）。
-- `:Agent submit` / draft 同步 / 主题桥接。
-- 验收：中文输入、leader、补全浮窗、Enter 提交、C-j 换行均正常。
+- 早期计划把 Neovim 以 `--embed` 方式嵌入为完整前端（linegrid 渲染、按键转发）。
+- 后来改为内置 TUI + 外部 Neovim 插件走协议，见 §5.4 和 [`docs/nvim.md`](docs/nvim.md)。
 
 **Phase 0（1–2 周）**
 
@@ -948,7 +917,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 **Phase 3**
 
-- rewind/fork、worktree、子 agent、nvim 前端、远程 attach。
+- rewind/fork、worktree、子 agent、编辑器插件接口、远程 attach。
 
 > Fork / rewind 已落地（2026-10-18）：`session.fork {session_id, at_seq?, name?}` 把源
 > session 的 `seq < at_seq`（`None` 表示全部）事件复制到新 session，序号原样保留，因此
@@ -997,12 +966,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 点击卡片会在新 pane 打开 child session；child transcript 底部有可点击的
 > `← parent agent`，点击回到父 agent。
 >
-> 独立 nvim 前端已落地（2026-10-18）：`eix nvim [--session ID]` 把内嵌 Lua 插件写到
-> `<data>/eix-nvim.lua`，用 `EIX_NVIM_SOCKET` / `EIX_NVIM_TCP` / `EIX_NVIM_TOKEN` 连 daemon，
-> 转录渲染进 `eix://<id8>` scratch buffer；`:Eix attach|list|new|send|prompt|fork|rewind|stop|ps`
-> 覆盖主要操作。插件里所有 buffer API 都经 `vim.schedule`（libuv callback 是 fast context），
-> 环境值在加载时缓存。headless e2e 在 `nvim --headless -u NONE` 下验证 prompt/回答出现在
-> buffer；`#[tokio::test]` 的 current-thread runtime 需要 `spawn_blocking` 跑子进程。
+> Neovim 集成不再内置（2026-10-27）：`eix nvim`、内嵌 Lua 前端和 headless e2e 已移除；
+> daemon 继续提供换行 JSON-RPC、`session.subscribe` 和 `session.events`，插件作者按
+> [`docs/nvim.md`](docs/nvim.md) 自行实现前端。
 >
 > 远程 attach 已落地（2026-10-18）：`[server] tcp` / `token`（env `EIX_TCP` / `EIX_TCP_TOKEN`），
 > 设置 `tcp` 时 token 必填（配置校验拒绝空值）。daemon 用泛型 `serve<S: AsyncRead + AsyncWrite>`
@@ -1011,8 +977,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `--tcp` / `--token` 选择 `Endpoint::Tcp`，`ensure_daemon` 对 TCP 端点不自动拉起本地 daemon。
 > 广播过滤已落地（2026-10-18）：连接可发 `session.subscribe {session_ids?}` 把广播收窄到
 > 指定 session（`null` 恢复全部）；`session.updated` 用 `id`、其余事件用 `session_id` 判定归属，
-> 无归属的事件（如 `stream.lagged`）放行。默认（不订阅）仍收到所有 session；`eix nvim`
-> attach 后自动只订阅当前 session。
+> 无归属的事件（如 `stream.lagged`）放行。默认（不订阅）仍收到所有 session；外部 client
+> attach 后应只订阅自己打开的 session。
 >
 >
 > **P0 补齐（2026-10-19）**
@@ -1111,7 +1077,6 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 ## 17. 待定
 
 - 默认模型与具体的 OpenAI 兼容端点。
-- `<leader>a` 命名空间：独立 nvim 前端已用 buffer-local 映射实现动作 palette；若你的全局映射也叫 `<leader>a`，buffer-local 会优先。
 - `@` 触发已定为「行首或空白后」，其余位置插入字面 `@`；暂不转义。
 - 是否启用鼠标。
 - session 自动命名规则（前两轮对话后总结 / 手动重命名优先；名称只保留字母数字和英文词间空格）。
@@ -1819,34 +1784,18 @@ eix --tcp 127.0.0.1:7777 --token "$EIX_TOKEN" tui
 CLI/TUI 的 `--tcp`（或 `EIX_TCP`）会改用 TCP，`--token`（`EIX_TCP_TOKEN`）带上凭证；
 TCP 端点是远端，`eix` 不会尝试在本地拉起 daemon。Unix 连接默认收到所有 session 的广播；
 任何连接（含认证后的 TCP）都可以用 `session.subscribe {session_ids}` 把广播收窄到指定
-session（`null` 恢复全部），`eix nvim` attach 后会自动只订阅当前 session。
+session（`null` 恢复全部）；外部 client attach 后应只订阅自己打开的 session。
 
-### 19.6 nvim 前端命令
+### 19.6 Neovim 插件集成
 
-```sh
-eix nvim [--session ID]      # 也可用 EIX_NVIM 覆盖 nvim 可执行文件
-```
+eix 不提供内置 Neovim 前端。Neovim 插件是普通 daemon client，通过 Unix socket（或 TCP + token）
+使用同一套换行 JSON-RPC；buffer、窗口、键位和 picker 都由插件自己实现。
 
-`eix nvim` 用你的 Neovim 打开一个内嵌 Lua 前端（脚本写在 `<data-dir>/eix-nvim.lua`），
-它自己用 libuv 连 Unix socket（或 TCP + token），说同一套换行 JSON-RPC；转录渲染进一个
-`eix://<id>` 的 scratch buffer。`:Eix` 子命令：
-
-| 命令 | 作用 |
-| --- | --- |
-| `:Eix attach [ID\|name]` | attach（省略则第一个 session，没有就新建） |
-| `:Eix list` / `:Eix pick [KIND]` | 列出 session / picker（`KIND` 省略为 session；可选 `files`/`worktrees`/`branches`/`context`；files/branches/worktree 选中后插入光标处，context 在分屏显示条目详情） |
-| `:Eix new [NAME] [worktree]` | 新建 session（可选独立 worktree） |
-| `:Eix send TEXT` / `:Eix prompt` | 发送 prompt；`prompt` 开一个输入分屏，`<CR>` 发送、`@` 文件 picker |
-| `:Eix fork [SEQ]` / `:Eix rewind [SEQ]` | 分叉 / 回滚并切到新 session |
-| `:Eix stop` | 取消当前 turn |
-| `:Eix ps` | 后台进程 |
-| `:Eix mode [MODE]` / `:Eix doctor` | 执行模式 / 连接与版本诊断 |
-| `<C-g>` / `<C-g><C-g>` | session picker / 回到上一个 session |
-| `<leader>a` | 动作 palette（picker / list / new / worktree / file / branch / prompt / stop / fork / rewind / ps / mode / doctor） |
-
-每个 Neovim 进程是一个独立 client，共享同一个 daemon；daemon 会串行化同一 session 的
-turn，第二个 prompt 在忙时会被拒绝。attach 后前端会发 `session.subscribe`，只接收当前
-session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独立前端互不影响。
+- 传输、认证、消息格式、常用请求/通知和最小 Lua 传输层见 [`docs/nvim.md`](docs/nvim.md)。
+- 插件用 `session.subscribe` 收窄广播，用 `session.events` 补历史，用 `message.delta` 做流式刷新；
+  收到 `stream.lagged` 时应重新拉取缺失的 `seq`。
+- 每个 Neovim 进程是独立 client，共享同一个 daemon；同一 session 的 turn 由 daemon 串行化。
+- HTTP/SSE 也可作为插件传输方式，见 §19.4。
 
 ## 20. 实现状态
 
@@ -1878,16 +1827,16 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] 集成队列（`ready` 工具 / `eix ready`、rebase → 测试 → base ff merge、冲突/测试失败注入修复、退避重试与 `eix integrate`）
 - [x] 子 agent（`spawn_agent`、只读工具集、并发批次、深度上限 1、独立事件日志）
 - [x] `ask_user`（2-6 个选项、首个为推荐项、阻塞式交互选择、`eix answer N` 无头回答）
-- [x] daemon 化的 nvim 前端（内嵌 Lua 插件 + JSON-RPC、`:Eix` 命令、headless 测试）
+- [x] 编辑器插件协议接口（Unix socket / TCP JSON-RPC、`session.subscribe`、`session.events`；见 `docs/nvim.md`）
 - [x] 远程 attach（TCP + 强制 token、首请求 `auth`、CLI `--tcp/--token`）
-- [x] 按连接过滤广播（`session.subscribe`，`null` = 全部；`eix nvim` 只订阅当前 session）
+- [x] 按连接过滤广播（`session.subscribe`，`null` = 全部；client 可只订阅自己打开的 session）
 - [x] 审批增强（`e` 编辑 staged 内容、`o` 打开真实文件、`r` 带理由拒绝、`<Space>a` 跨 session 审批 inbox、风险标签）
 - [x] 审批/提问卡片改为 Markdown checkbox 列表（`Ctrl-J/K` / `j/k` 选择、`Enter` 执行、`1-9` 直选、首项推荐；prompt 聚焦和 `tabby` 布局下按键优先给卡片）
 - [x] `eix pick`（fzf/rofi 友好的按行输出）、`eix status [--json]`、`eix approvals`
 - [x] 输入草稿持久化（`draft.get` / `draft.set`，按 session，重启/重连可恢复）
 - [x] 客户端通知（后台 attention 在底部状态栏居中提示，可选 `bell`，不弹桌面通知）
 - [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）与 provider 上下行可逆脱敏
-- [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 nvim、git 时自动 skip）
+- [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 git 时自动 skip）
 - [x] session 执行模式（`plan` / `build` / `auto` / `bypass`；`session.mode` 支持临时切换并记录事件；旧库从 permission/agent 自动迁移）
 - [x] 显式权限规则（`[[tools.rules]]`：工具名 + 路径 glob + argv 前缀 / 正则 / signature；deny 全局优先、按具体度选择、项目配置只能收紧）
 - [x] 统一风险分析与审计（只读命令分析、硬 deny、network/secret 保护、`permission_evaluated` 事件、审批 scope / risk UX、`external_directory`）
@@ -1904,10 +1853,10 @@ session 的事件。`eix tui` 使用内置的 Vim 风格输入框，与这条独
 - [x] 可配置全局 / TUI / leader 快捷键（`[keys] action = "C-x"` 或 `action = "leader N"`，含命名键/F1-F12；overlay 导航键固定）
 - [x] LSP diagnostics（内置常见语言 server、懒启动 stdio client、写入后附诊断、`lsp_diagnostics`、`lsp.workspace` 全工作区扫描 RPC；可按语言覆盖）
 - [x] prompt `!<cmd>` 直接执行 shell（sandbox + snapshot + 只读拒绝，保留 tool 事件）
-- [x] 独立 Neovim 前端交互：`<C-g>` session picker、`<C-g><C-g>` 回上一个 session、`:Eix pick|doctor`
+- [x] Neovim 插件集成文档（`docs/nvim.md`：传输、消息格式、常用请求/通知、最小 Lua 传输层）
 - [x] 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider）、两次 `Esc` 回转录区、长草稿自动增高（默认 3 行，总高上限 12 行）
 - [x] 草稿镜像（编辑器变更同步到 `draft.set`，切 session 时从 daemon 回填）
-- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / grep / git / worktrees / branches，`o`/`Ctrl-P`/`g`/`s`/`@` 入口；独立前端 `:Eix pick [KIND]`）
+- [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / grep / git / worktrees / branches，`o`/`Ctrl-P`/`g`/`s`/`@` 入口）
 - [x] 工具补齐：`grep` / `glob` / `edit` / `patch`，`read_file` 行号 + `offset`/`limit` 分页（只读工具自动放行）
 - [x] 自定义 Markdown 命令（`~/.config/eix/cmds`、项目 `.eix/cmds`，兼容旧 `commands` 目录；`/name` 快速调用、`$ARGUMENTS` / `$1..$9`、frontmatter `description`/`agent`/`model`）
 - [x] 自定义 Markdown agent（`~/.config/eix/agents`、项目 `.eix/agents`；`role`/`model`，`/agents` 选择 primary、`spawn_agent agent:` 选择 subagent）

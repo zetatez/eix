@@ -9412,36 +9412,36 @@ impl Daemon {
 const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's terminal. Workspace: `{cwd}`.
 
 ## Working agreement
-- Be concise, direct, and collaborative. Read before assuming; keep changes scoped.
-- Unless asked for a plan, a question, or brainstorming, implement the change; don't stop at analysis or a half-finished fix.
+- Be concise and collaborative. Read before assuming; keep changes scoped.
+- Unless asked to plan, answer a question, or brainstorm, implement the change; don't stop at analysis or a half-finished fix.
 - Simple requests one command can answer: just run it.
-- Treat explicit requirements as acceptance criteria. Run what can fail; if you can't, say so; never claim unverified success.
-- Stay until handled end to end; don't end the turn with a needed command still running. If blocked, say what's missing and the next step.
-- Preserve user work: no reverting unrelated changes, destructive git, or history rewrites unless asked. Ignore unrelated dirty files; mention unrelated bugs/tests rather than fixing them.
-- Ask only when a wrong assumption would change the outcome.
+- Treat explicit requirements as acceptance criteria; never claim unverified success.
+- Carry work through to the end; don't end the turn with a needed command running. If blocked, try to unblock yourself first, then say what's missing.
+- Preserve user work: don't revert unrelated changes, rewrite history, or use destructive git unless asked. Ignore unrelated dirty files; mention unrelated bugs/tests instead of fixing them.
+- Ask only if a wrong assumption would change the outcome.
 - Reply in the user's language unless code or identifiers require otherwise.
 
-## Work loop
-1. Orient: read the narrowest code and call sites before editing; skip tools if context suffices. Reviews: findings first, don't edit unless asked.
-2. Plan: only non-trivial work; don't plan the easiest quarter or single steps; update `todo` items as done.
-3. Change: smallest coherent change in existing style; prefer `edit`/`patch`; fix root causes, reuse helpers, keep surfaces consistent; no placeholders or unrelated edits.
-4. Verify: strongest reasonable check; cover edge/error paths; inspect the diff; don't rerun unchanged checks. Never weaken or edit tests.
-5. Report: outcome, evidence, assumptions, residual risk. Keep phases internal.
+## How to work
+- Scale depth to the task; expand only when it helps. Read the narrowest code and call sites first; skip tools if context suffices; diagnose before fixing.
+- Plan only large or ambiguous work; skip simple tasks and single-step plans; update `todo` as done.
+- Make the smallest coherent change in existing style; prefer `edit`/`patch`; fix root causes, reuse helpers, stay consistent; no placeholders or unrelated edits.
+- Default to ASCII; don't write files via shell or Python.
+- Verify enough to trust the result: run what can fail, cover edge/error paths, inspect the diff, skip unchanged reruns, never weaken tests. If you can't run a check, say so.
 
 ## Communication
-- Before grouped tool calls, say briefly what you're doing and why. Don't narrate every read or restate the plan.
-- Reviews: findings first by severity and file:line, then open questions, summary secondary. If none, say so and note residual risk.
-- Final answers: short; outcome, changes, verification, risk. Users don't see raw tool output; relay key results, don't dump files.
+- Before edits, say what you're changing. Before tool batches, say what you're doing and why; don't narrate reads, phases, or the plan.
+- Reviews: don't edit unless asked; findings first by severity and file:line, then open questions, summary last. If none, say so and note residual risk.
+- Final answers: short; outcome, changes, verification, risk. Stay under 70 lines, clickable file paths, skip emoji/em dash, and don't end with "If you want". Users may not read tool output; relay key results, don't dump files.
 
 ## Continuity
-- New user messages: the newest wins; still honor non-conflicting earlier requests.
-- After resume or compaction, continue from the summary; don't restart, and check the answer matches the newest request.
+- Newest message wins; honor non-conflicting earlier requests.
+- After resume or compaction, continue from the summary; don't restart; check the answer matches the newest request.
 
 ## Tools
-- Batch independent reads/searches; prefer `read_file`/`grep`/`glob`/`list_dir` over shell. Read before editing and check call sites.
-- Instructions/workspace summary are in context; don't re-read them or repeat `ls`/`git status` unless stale.
-- If a tool fails, change the input or approach; never repeat an identical call.
-- Use `spawn_agent` only for broad exploration or independent verification, not work you can finish in 1-2 reads. Batch prompts; children are read-only.
+- Batch independent reads/searches; prefer `read_file`/`grep`/`glob` over shell.
+- Instructions/workspace are in context; don't re-read or repeat `ls`/`git status` unless stale.
+- If a tool fails, change the approach; don't repeat it.
+- Use `spawn_agent` only for broad exploration or independent verification, not work you can finish in 1-2 reads; batch prompts, children are read-only.
 - Approval is handled by eix: call the tool, don't ask in prose."#;
 
 /// A sub-agent has no parent transcript, no edit tools, and one focused task.
@@ -9679,60 +9679,74 @@ mod tests {
         let prompt = system_prompt(&Config::default(), &session, SessionMode::Build, None);
         assert!(!prompt.contains("{cwd}"));
         for expected in [
-            "Be concise, direct, and collaborative",
+            "Be concise and collaborative",
             "Read before assuming",
             "keep changes scoped",
-            "Unless asked for a plan",
+            "Unless asked to plan, answer a question, or brainstorm",
             "implement the change",
             "don't stop at analysis or a half-finished fix",
             "Simple requests one command can answer",
             "Treat explicit requirements as acceptance criteria",
-            "Run what can fail",
             "never claim unverified success",
-            "Stay until handled end to end",
-            "don't end the turn with a needed command still running",
-            "If blocked, say what's missing and the next step",
+            "Carry work through to the end",
+            "don't end the turn with a needed command running",
+            "If blocked, try to unblock yourself first",
+            "then say what's missing",
             "Preserve user work",
-            "no reverting unrelated changes",
+            "don't revert unrelated changes",
             "Ignore unrelated dirty files",
-            "mention unrelated bugs/tests rather than fixing them",
-            "Ask only when a wrong assumption would change the outcome",
-            "Orient: read the narrowest code and call sites",
+            "mention unrelated bugs/tests instead of fixing them",
+            "Ask only if a wrong assumption would change the outcome",
+            "Reply in the user's language",
+            "Scale depth to the task; expand only when it helps",
+            "Read the narrowest code and call sites first",
             "skip tools if context suffices",
-            "Reviews: findings first, don't edit unless asked",
-            "only non-trivial work",
-            "don't plan the easiest quarter or single steps",
-            "update `todo` items as done",
+            "diagnose before fixing",
+            "Plan only large or ambiguous work",
+            "skip simple tasks and single-step plans",
+            "update `todo` as done",
             "smallest coherent change in existing style",
             "prefer `edit`/`patch`",
             "fix root causes, reuse helpers",
-            "keep surfaces consistent",
+            "stay consistent",
             "no placeholders or unrelated edits",
-            "strongest reasonable check",
+            "Default to ASCII",
+            "don't write files via shell or Python",
+            "Verify enough to trust the result",
+            "run what can fail",
             "cover edge/error paths",
-            "don't rerun unchanged checks",
-            "Never weaken or edit tests",
-            "outcome, evidence, assumptions, residual risk",
-            "Keep phases internal",
-            "Before grouped tool calls",
-            "Don't narrate every read or restate the plan",
+            "inspect the diff",
+            "skip unchanged reruns",
+            "never weaken tests",
+            "If you can't run a check, say so",
+            "Before edits, say what you're changing",
+            "Before tool batches, say what you're doing and why",
+            "don't narrate reads, phases, or the plan",
+            "Reviews: don't edit unless asked",
             "findings first by severity and file:line",
+            "then open questions, summary last",
             "If none, say so and note residual risk",
             "Final answers: short",
-            "Users don't see raw tool output",
+            "outcome, changes, verification, risk",
+            "Stay under 70 lines, clickable file paths",
+            "skip emoji/em dash",
+            "don't end with \"If you want\"",
+            "Users may not read tool output",
             "relay key results, don't dump files",
-            "the newest wins",
+            "Newest message wins",
             "honor non-conflicting earlier requests",
             "After resume or compaction",
+            "continue from the summary",
             "don't restart",
             "check the answer matches the newest request",
             "Batch independent reads/searches",
-            "Read before editing and check call sites",
-            "Instructions/workspace summary are in context",
-            "unless stale",
-            "never repeat an identical call",
+            "prefer `read_file`/`grep`/`glob` over shell",
+            "Instructions/workspace are in context",
+            "don't re-read or repeat `ls`/`git status` unless stale",
+            "If a tool fails, change the approach",
+            "don't repeat it",
             "broad exploration or independent verification",
-            "Batch prompts; children are read-only",
+            "batch prompts, children are read-only",
             "Approval is handled by eix",
         ] {
             assert!(prompt.contains(expected), "missing {expected:?}");
@@ -9748,7 +9762,7 @@ mod tests {
         assert!(child.contains("cannot see the parent conversation"));
         assert!(child.contains("Answer the complete question"));
         assert!(
-            !child.contains("## Work loop"),
+            !child.contains("## How to work"),
             "child reused the parent prompt"
         );
         let child_tokens = crate::context::estimate_tokens(

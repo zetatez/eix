@@ -1,7 +1,7 @@
 //! Core types shared by the eix daemon and every frontend.
 //!
 //! The daemon is the source of truth for sessions and their append-only event
-//! log. Frontends (CLI/TUI today, Neovim later) only render state and send
+//! log. Frontends (CLI, TUI, editor plugins) only render state and send
 //! commands over the protocol in [`protocol`].
 
 pub mod agents;
@@ -11,7 +11,6 @@ pub mod config;
 pub mod context;
 pub mod event;
 pub mod message;
-pub mod nvim_plugin;
 pub mod picker;
 pub mod plugin;
 pub mod process;

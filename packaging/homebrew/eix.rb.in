@@ -1,5 +1,5 @@
 class @CLASS@ < Formula
-  desc "Coding agent with a multi-session TUI and Neovim frontend"
+  desc "Coding agent with a multi-session TUI and editor plugin support"
   homepage "https://github.com/zetatez/eix"
   url "file://#{File.expand_path("@TARBALL@", __dir__)}"
   sha256 "@SHA256@"

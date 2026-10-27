@@ -1,14 +1,14 @@
 # eix
 
 > 为 vim / dwm / Arch 工作流打造的 coding agent。
-> 持久多 session、Vim 原生输入、多 pane TUI，以及 CLI / HTTP / Neovim 前端。
+> 持久多 session、Vim 原生输入、多 pane TUI，以及 CLI / HTTP / 可替换前端。
 
 `eix` 由常驻 daemon `eixd` 和前端 `eix` 组成。session、事件日志、工具执行、审批和上下文都在
-daemon 中维护；TUI、`eix chat`、`eix send`、HTTP SDK 和 Neovim 只是可替换的前端。关掉终端不会
-中断正在运行的 turn，下次启动或 attach 即可继续。
+daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的前端，Neovim 通过协议接成
+外部插件。关掉终端不会中断正在运行的 turn，下次启动或 attach 即可继续。
 
 [设计文档](./DESIGN.md) · [完整配置模板](./config.tmpl.yaml) · [插件示例](./examples/plugins/echo) ·
-[协议契约](./crates/eix-core/src/protocol.rs)
+[Neovim 集成](./docs/nvim.md) · [协议契约](./crates/eix-core/src/protocol.rs)
 
 ## 为什么是 eix
 
@@ -19,8 +19,8 @@ daemon 中维护；TUI、`eix chat`、`eix send`、HTTP SDK 和 Neovim 只是可
 - **上下文自动管理**：`AGENTS.md`、workspace summary、工具输出预算、自动压缩和跨 session 记忆
   不需要手动维护。
 - **可组合**：OpenAI 兼容多 provider、Skills、Markdown 命令与 agent、MCP、外部插件。
-- **不止 TUI**：同一 daemon 支持 CLI、HTTP JSON-RPC / SSE、Rust SDK、TCP 远程 attach 和
-  Neovim 前端。
+- **不止 TUI**：同一 daemon 支持 CLI、HTTP JSON-RPC / SSE、Rust SDK、TCP 远程 attach，
+  以及给 Neovim 插件用的 JSON-RPC 接口。
 
 ## 功能一览
 
@@ -35,7 +35,7 @@ daemon 中维护；TUI、`eix chat`、`eix send`、HTTP SDK 和 Neovim 只是可
 | 上下文 | sector 预算、AGENTS.md、workspace summary、自动 compact、memory / todo |
 | 扩展 | Skills、Markdown 命令、Markdown agent、MCP stdio、out-of-process 插件 |
 | Provider | 多 OpenAI 兼容 endpoint、自动拉取模型列表、重试/退避、模型切换与 reasoning 强度 |
-| 前端 | TUI、chat/send CLI、HTTP + SSE + `eix-sdk`、TCP、`eix nvim` |
+| 前端 | TUI、chat/send CLI、HTTP + SSE + `eix-sdk`、TCP，以及外部编辑器插件接口 |
 
 ## 快速开始
 
@@ -43,7 +43,7 @@ daemon 中维护；TUI、`eix chat`、`eix send`、HTTP SDK 和 Neovim 只是可
 
 - Rust stable（最低 1.89）与 Cargo
 - Linux 或 macOS；Windows 暂不支持
-- 可选：`bwrap`（bubblewrap）用于命令沙箱，Neovim 用于 `eix nvim`
+- 可选：`bwrap`（bubblewrap）用于命令沙箱
 
 ### 构建
 
@@ -191,7 +191,6 @@ eix tui [--session ID]
 | `eix ps` / `eix tail` / `eix kill` | 后台进程 |
 | `eix status` / `eix approvals` / `eix pick` | 脚本和 dwmblocks / rofi / fzf 集成 |
 | `eix doctor` | 诊断配置、路径、沙箱和 daemon |
-| `eix nvim` | 打开独立 Neovim 前端 |
 
 完整命令和参数见 `eix --help`。
 
@@ -222,15 +221,11 @@ HTTP 提供 `/health`、`/stats`、`POST /rpc` 和 SSE `/events`。Rust 项目�
 [`eix-sdk`](./crates/eix-sdk)。远程端点不会自动拉起本地 daemon；详细认证、事件过滤和 API 说明见
 [DESIGN.md](./DESIGN.md)。
 
-### Neovim 前端
+### Neovim 插件
 
-```sh
-eix nvim [--session ID]
-```
-
-`eix nvim` 用你的 Neovim 打开内嵌 Lua 前端，把转录渲染到 `eix://<id>` scratch buffer。
-`:Eix attach|list|pick|new|send|prompt|fork|rewind|mode|doctor` 覆盖主要操作；每个 Neovim
-进程都是独立 client，共享同一个 daemon。
+eix 不内置 Vim/Neovim 前端。插件通过 daemon 的 JSON-RPC（Unix socket 或 TCP）接入，自己负责
+buffer、窗口、键位和 picker；接口、消息格式、常用方法与最小 Lua 传输层见
+[docs/nvim.md](./docs/nvim.md)。HTTP/SSE 也可以作为插件的传输方式。
 
 ## 配置
 
@@ -286,7 +281,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 ```
 ┌──────────────┐   JSON-RPC / SSE   ┌────────────────────────────┐
 │ eix (TUI/CLI)│ ─────────────────> │ eixd                       │
-│ eix nvim     │ <───────────────── │ sessions / event log       │
+│ 外部前端     │ <───────────────── │ sessions / event log       │
 │ HTTP / SDK   │                    │ agent runtime / tools      │
 └──────────────┘                    │ approvals / context / git  │
                                     └────────────────────────────┘
@@ -331,15 +326,15 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-CI 在 Linux 和 macOS 上跑同一套测试，并用 Rust 1.89 做 MSRV 检查；没有 `nvim` 或 `git` 的
-环境会自动跳过相关测试。协议变更请同时更新 `crates/eix-core/src/protocol.rs` 和
+CI 在 Linux 和 macOS 上跑同一套测试，并用 Rust 1.89 做 MSRV 检查；没有 `git` 的环境会自动
+跳过相关测试。协议变更请同时更新 `crates/eix-core/src/protocol.rs` 和
 [DESIGN.md](./DESIGN.md)。
 
 ## 实现状态
 
 核心闭环已经可用：daemon、SQLite 事件日志、流式 OpenAI 兼容 provider、多 pane TUI、内置 Vim
 编辑器、工具与审批、沙箱/快照/staged 写入、自动上下文、fork/rewind、worktree、集成队列、子 agent、
-MCP、插件、Skills、HTTP/SDK、TCP 远程和 Neovim 前端。完整实现清单见
+MCP、插件、Skills、HTTP/SDK、TCP 远程，以及外部 Neovim 插件所需的协议接口。完整实现清单见
 [DESIGN.md 的实现状态](./DESIGN.md#20-实现状态)。
 
 ## License
