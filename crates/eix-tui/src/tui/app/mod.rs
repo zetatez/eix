@@ -298,8 +298,9 @@ fn prompt_input_height(area_height: u16, area_width: u16, input: &Editor) -> u16
 // the theme canvas (or the terminal background) instead of an opaque composer
 // box.
 const COMPOSER_TEXT: Color = Color::Rgb(220, 223, 228);
-const COMPOSER_MUTED: Color = Color::Rgb(110, 116, 129);
+const COMPOSER_MUTED: Color = Color::Rgb(140, 149, 168);
 const COMPOSER_BORDER: Color = Color::Rgb(74, 88, 120);
+const COMPOSER_INACTIVE_BORDER: Color = Color::Rgb(50, 55, 68);
 const COMPOSER_ACCENT: Color = Color::Rgb(122, 162, 247);
 const COMPOSER_FOCUS: Color = Color::Rgb(154, 202, 255);
 const COMPOSER_SUCCESS: Color = Color::Rgb(126, 199, 149);
@@ -311,7 +312,7 @@ const COMPOSER_BADGE_TEXT_LIGHT: Color = Color::Rgb(248, 250, 252);
 /// Keep accent text/badges legible on themed backgrounds without abandoning
 /// their hue. Bold status text is checked against the WCAG large-text floor.
 const MIN_ACCENT_CONTRAST: f32 = 3.0;
-const COMPOSER_SELECTION: Color = Color::Rgb(54, 60, 76);
+const COMPOSER_SELECTION: Color = Color::Rgb(58, 66, 84);
 
 /// Fine dashed focus ring. Quadruple-dash box drawing keeps the focused pane
 /// visible without the heavier look of the normal solid border.
@@ -2583,6 +2584,7 @@ fn draw_help(
         inner,
         query,
         composer_accent(theme),
+        composer_text(theme),
         composer_muted(theme),
         dialog_bg,
     );
@@ -2606,7 +2608,7 @@ fn draw_help(
     let lines: Vec<Line> = if rows.is_empty() {
         vec![Line::from(Span::styled(
             "no matching key help",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(composer_muted(theme)),
         ))]
     } else {
         rows.iter()
@@ -2623,18 +2625,18 @@ fn draw_help(
                     let mut line = Line::from(vec![
                         Span::styled(
                             if is_selected { "› " } else { "  " },
-                            Style::default().fg(Color::DarkGray),
+                            Style::default().fg(composer_muted(theme)),
                         ),
                         Span::styled(
                             format!("{} ", pad_to(&truncate(entry.key, key_width), key_width)),
                             Style::default()
-                                .fg(Color::Cyan)
+                                .fg(composer_accent(theme))
                                 .add_modifier(Modifier::BOLD),
                         ),
-                        Span::raw(entry.description),
+                        Span::styled(entry.description, Style::default().fg(composer_text(theme))),
                     ]);
                     if is_selected {
-                        line = line.style(Style::default().bg(Color::DarkGray).fg(Color::White));
+                        line = line.style(Style::default().bg(composer_selection(theme)));
                     }
                     line
                 }
@@ -2644,18 +2646,23 @@ fn draw_help(
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .style(Style::default().bg(dialog_bg)),
+            .style(Style::default().fg(composer_text(theme)).bg(dialog_bg)),
         list_area,
     );
 }
 
-fn process_line(process: &ProcessInfo, selected: bool, width: usize) -> Line<'static> {
+fn process_line(
+    process: &ProcessInfo,
+    selected: bool,
+    width: usize,
+    theme: Theme,
+) -> Line<'static> {
     let marker = if selected { "▸" } else { " " };
     let (tag, color) = match process.status {
-        ProcessStatus::Running => ("run ", Color::Green),
-        ProcessStatus::Exited => ("exit", Color::Gray),
-        ProcessStatus::Killed => ("kill", Color::Yellow),
-        ProcessStatus::Failed => ("fail", Color::Red),
+        ProcessStatus::Running => ("run ", composer_success(theme)),
+        ProcessStatus::Exited => ("exit", composer_muted(theme)),
+        ProcessStatus::Killed => ("kill", composer_warn(theme)),
+        ProcessStatus::Failed => ("fail", composer_danger(theme)),
     };
     let code = process
         .exit_code
@@ -2668,7 +2675,7 @@ fn process_line(process: &ProcessInfo, selected: bool, width: usize) -> Line<'st
     );
     let style = if selected {
         Style::default()
-            .bg(Color::DarkGray)
+            .bg(composer_selection(theme))
             .fg(color)
             .add_modifier(Modifier::BOLD)
     } else {
@@ -2910,24 +2917,23 @@ fn run_editor(path: &std::path::Path) -> anyhow::Result<()> {
 
 /// Risk label for an approval card (DESIGN 9.3): shell commands are called
 /// out separately from workspace writes and read-only tools.
-fn risk_level_color(level: &str) -> Color {
+fn risk_level_color(level: &str, theme: Theme) -> Color {
     match level.to_ascii_uppercase().as_str() {
-        "LOW" => Color::Green,
-        "MEDIUM" => Color::Yellow,
-        "HIGH" => Color::LightRed,
-        "CRITICAL" => Color::Red,
-        _ => Color::Yellow,
+        "LOW" => composer_success(theme),
+        "MEDIUM" => composer_warn(theme),
+        "HIGH" | "CRITICAL" => composer_danger(theme),
+        _ => composer_warn(theme),
     }
 }
 
-fn approval_risk(tool: &str) -> (&'static str, Color) {
+fn approval_risk(tool: &str, theme: Theme) -> (&'static str, Color) {
     match tool {
-        "run_command" => ("shell", Color::Red),
+        "run_command" => ("shell", composer_danger(theme)),
         "write_file" | "edit" | "patch" | "edit_file" | "apply_patch" => {
-            ("workspace-write", Color::Yellow)
+            ("workspace-write", composer_warn(theme))
         }
-        "spawn_agent" => ("agent", Color::Magenta),
-        _ => ("read", Color::Green),
+        "spawn_agent" => ("agent", composer_accent(theme)),
+        _ => ("read", composer_success(theme)),
     }
 }
 
@@ -2985,9 +2991,9 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
         .strip_prefix('[')
         .and_then(|rest| rest.split_once("] "))
     {
-        Some((level, body)) => (level, risk_level_color(level), body),
+        Some((level, body)) => (level, risk_level_color(level, theme), body),
         None => {
-            let (risk, color) = approval_risk(&approval.tool);
+            let (risk, color) = approval_risk(&approval.tool, theme);
             (risk, color, approval.summary.as_str())
         }
     };
@@ -3054,17 +3060,23 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
             spans.push(Span::styled(
                 "⚠ ",
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(composer_warn(theme))
                     .add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::styled(summary, Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                summary,
+                Style::default().fg(composer_warn(theme)),
+            ));
             spans.push(Span::styled(
                 risk_label.clone(),
                 Style::default().fg(risk_color),
             ));
         } else {
             spans.push(Span::raw("  "));
-            spans.push(Span::styled(summary, Style::default().fg(Color::Yellow)));
+            spans.push(Span::styled(
+                summary,
+                Style::default().fg(composer_warn(theme)),
+            ));
         }
         lines.push(Line::from(spans));
     }
@@ -3081,12 +3093,13 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
     if truncated {
         lines.push(Line::from(Span::styled(
             "… diff truncated",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(composer_muted(theme)),
         )));
     }
+    let selected_bg = composer_warn(theme);
     let selected_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Yellow)
+        .fg(badge_text_color(selected_bg))
+        .bg(selected_bg)
         .add_modifier(Modifier::BOLD);
     for (index, action) in actions
         .iter()
@@ -3103,7 +3116,7 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
         let style = if index == cursor {
             selected_style
         } else {
-            Style::default().fg(approval_action_color(*action))
+            Style::default().fg(approval_action_color(*action, theme))
         };
         lines.push(Line::from(Span::styled(pad_to(&text, inner), style)));
     }
@@ -3112,12 +3125,12 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
             "Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel",
             inner,
         ),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(composer_muted(theme)),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Yellow))
+        .border_style(Style::default().fg(composer_warn(theme)))
         .title(format!(" approval · {} ", approval.tool));
     frame.render_widget(
         Paragraph::new(lines)
@@ -3127,12 +3140,13 @@ fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval,
     );
 }
 
-fn approval_action_color(action: ApprovalAction) -> Color {
+fn approval_action_color(action: ApprovalAction, theme: Theme) -> Color {
     match action {
-        ApprovalAction::Approve => Color::Green,
-        ApprovalAction::Always => Color::Green,
-        ApprovalAction::Deny | ApprovalAction::Reason => Color::Red,
-        ApprovalAction::Review | ApprovalAction::Open | ApprovalAction::Edit => Color::Cyan,
+        ApprovalAction::Approve | ApprovalAction::Always => composer_success(theme),
+        ApprovalAction::Deny | ApprovalAction::Reason => composer_danger(theme),
+        ApprovalAction::Review | ApprovalAction::Open | ApprovalAction::Edit => {
+            composer_accent(theme)
+        }
     }
 }
 
@@ -3159,17 +3173,18 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
         Span::styled(
             "? ",
             Style::default()
-                .fg(Color::Cyan)
+                .fg(composer_accent(theme))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             truncate(&pending.question, inner.saturating_sub(2)),
-            Style::default().fg(Color::Yellow),
+            Style::default().fg(composer_warn(theme)),
         ),
     ])];
+    let selected_bg = composer_accent(theme);
     let selected_style = Style::default()
-        .fg(Color::Black)
-        .bg(Color::Cyan)
+        .fg(badge_text_color(selected_bg))
+        .bg(selected_bg)
         .add_modifier(Modifier::BOLD);
     // Small panes clip the card; keep the highlighted option visible instead
     // of always rendering the first N rows.
@@ -3194,7 +3209,7 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
         let style = if index == cursor {
             selected_style
         } else if index == 0 {
-            Style::default().fg(Color::Green)
+            Style::default().fg(composer_success(theme))
         } else {
             Style::default()
         };
@@ -3205,12 +3220,12 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
             "Ctrl-J/K or j/k select · Enter answer · 1-9 jump · x cancel",
             inner,
         ),
-        Style::default().fg(Color::DarkGray),
+        Style::default().fg(composer_muted(theme)),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan))
+        .border_style(Style::default().fg(composer_accent(theme)))
         .title(" question ");
     frame.render_widget(
         Paragraph::new(lines)
@@ -3233,15 +3248,15 @@ fn pad_to(text: &str, width: usize) -> String {
 
 fn diff_line_style(line: &str, theme: Theme) -> Style {
     if line.starts_with("@@") {
-        Style::default().fg(theme.function.unwrap_or(Color::Cyan))
+        Style::default().fg(theme.function.unwrap_or(COMPOSER_ACCENT))
     } else if line.starts_with("+++") || line.starts_with("---") {
-        Style::default().fg(theme.comment.unwrap_or(Color::DarkGray))
+        Style::default().fg(theme.comment.unwrap_or(COMPOSER_MUTED))
     } else if line.starts_with('+') {
-        Style::default().fg(theme.diff_add.unwrap_or(Color::Green))
+        Style::default().fg(theme.diff_add.unwrap_or(COMPOSER_SUCCESS))
     } else if line.starts_with('-') {
-        Style::default().fg(theme.diff_delete.unwrap_or(Color::Red))
+        Style::default().fg(theme.diff_delete.unwrap_or(COMPOSER_DANGER))
     } else {
-        Style::default().fg(theme.normal.unwrap_or(Color::Gray))
+        Style::default().fg(theme.normal.unwrap_or(COMPOSER_TEXT))
     }
 }
 
@@ -3252,6 +3267,7 @@ fn draw_search_field(
     area: Rect,
     query: &str,
     accent: Color,
+    text: Color,
     muted: Color,
     dialog_bg: Color,
 ) -> Rect {
@@ -3264,7 +3280,7 @@ fn draw_search_field(
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             Span::styled("❯ ", Style::default().fg(accent)),
-            Span::raw(query.to_string()),
+            Span::styled(query.to_string(), Style::default().fg(text)),
         ]))
         .style(Style::default().bg(dialog_bg)),
         chunks[0],
@@ -3297,27 +3313,18 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     }
 }
 
-fn status_color(status: SessionStatus) -> Color {
-    match status {
-        SessionStatus::Idle => Color::DarkGray,
-        SessionStatus::Running => Color::Green,
-        SessionStatus::AwaitingApproval => Color::Yellow,
-        SessionStatus::AwaitingInput => Color::Cyan,
-        SessionStatus::Error => Color::Red,
-        SessionStatus::Paused => Color::Gray,
-    }
-}
-
 fn short_id(id: &str) -> &str {
     id.get(..8).unwrap_or(id)
 }
 
 /// A prompt run, highlighted while the visual selection covers it.
-fn selection_span(text: String, selected: bool) -> Span<'static> {
+fn selection_span(text: String, selected: bool, theme: Theme) -> Span<'static> {
     if selected {
         Span::styled(
             text,
-            Style::default().fg(COMPOSER_TEXT).bg(COMPOSER_SELECTION),
+            Style::default()
+                .fg(composer_text(theme))
+                .bg(composer_selection(theme)),
         )
     } else {
         Span::raw(text)
@@ -3393,13 +3400,13 @@ fn compact_path(path: &str) -> String {
 
 /// Clickable footer shown at the end of a child agent's transcript.
 fn parent_link_line(theme: Theme) -> Line<'static> {
-    let muted = theme.comment.unwrap_or(Color::DarkGray);
+    let muted = composer_muted(theme);
     Line::from(vec![
         Span::styled("  ← ", Style::default().fg(muted)),
         Span::styled(
             "parent agent",
             Style::default()
-                .fg(theme.function.unwrap_or(Color::Cyan))
+                .fg(composer_accent(theme))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(" · click to return", Style::default().fg(muted)),
@@ -3487,6 +3494,31 @@ fn composer_success(theme: Theme) -> Color {
 
 fn composer_danger(theme: Theme) -> Color {
     theme.error.unwrap_or(COMPOSER_DANGER)
+}
+
+/// Quiet borders for unfocused panes and the blurred prompt. Presets use their
+/// own muted tone; the transparent default stays a low-contrast slate.
+fn composer_inactive_border(theme: Theme) -> Color {
+    theme.comment.unwrap_or(COMPOSER_INACTIVE_BORDER)
+}
+
+/// Selected rows get a low-alpha accent tint so both light and dark presets
+/// stay readable. The default transparent palette keeps its fixed slate.
+fn composer_selection(theme: Theme) -> Color {
+    let Some(base) = theme.panel.or(theme.background) else {
+        return COMPOSER_SELECTION;
+    };
+    blend_color(base, composer_accent(theme), 0.22)
+}
+
+fn blend_color(base: Color, tint: Color, amount: f32) -> Color {
+    let (Color::Rgb(br, bg, bb), Color::Rgb(tr, tg, tb)) = (base, tint) else {
+        return base;
+    };
+    let mix = |from: u8, to: u8| {
+        (f32::from(from) + (f32::from(to) - f32::from(from)) * amount).round() as u8
+    };
+    Color::Rgb(mix(br, tr), mix(bg, tg), mix(bb, tb))
 }
 
 /// Session state on the prompt banner uses the same restrained palette as the

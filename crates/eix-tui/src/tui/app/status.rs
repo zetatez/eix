@@ -105,9 +105,9 @@ impl App {
         let panel = composer_background(self.theme);
         let text = composer_text(self.theme);
         let border_color = if focused {
-            composer_border(self.theme)
+            composer_focus(self.theme)
         } else {
-            Color::Rgb(46, 50, 60)
+            composer_inactive_border(self.theme)
         };
 
         // Deny reasons temporarily replace the top border. Mode, session and

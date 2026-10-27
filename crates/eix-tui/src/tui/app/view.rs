@@ -8,7 +8,7 @@ impl App {
         if area.height < 4 || area.width < 20 {
             let notice = Paragraph::new("terminal too small for eix")
                 .alignment(Alignment::Center)
-                .style(Style::default().fg(Color::Red));
+                .style(Style::default().fg(composer_danger(self.theme)));
             frame.render_widget(notice, area);
             return;
         }
@@ -383,12 +383,13 @@ impl App {
                         continue;
                     }
                     let style = if search.matches.get(search.current) == Some(&absolute) {
+                        let background = composer_warn(theme);
                         Style::default()
-                            .fg(Color::Black)
-                            .bg(Color::Yellow)
+                            .fg(badge_text_color(background))
+                            .bg(background)
                             .add_modifier(Modifier::BOLD)
                     } else {
-                        Style::default().bg(Color::Rgb(74, 68, 34))
+                        Style::default().bg(composer_selection(theme))
                     };
                     for span in &mut line.spans {
                         span.style = span.style.patch(style);
@@ -410,7 +411,7 @@ impl App {
         } else if attention {
             composer_warn(theme)
         } else {
-            Color::Rgb(48, 52, 62)
+            composer_inactive_border(theme)
         };
         let mut border_style = Style::default().fg(border_color);
         let mut title_style = Style::default().fg(border_color);
@@ -471,7 +472,7 @@ impl App {
         } else if self.error.is_some() {
             lines.push(Line::from(Span::styled(
                 "could not load the session",
-                Style::default().fg(Color::Red),
+                Style::default().fg(composer_danger(self.theme)),
             )));
             lines.push(Line::from(""));
             lines.push(Line::from(
@@ -571,13 +572,17 @@ impl App {
                 .input
                 .is_selected(segment.row, segment.start_col + offset);
             if selected != run_selected && !run.is_empty() {
-                spans.push(selection_span(std::mem::take(&mut run), run_selected));
+                spans.push(selection_span(
+                    std::mem::take(&mut run),
+                    run_selected,
+                    self.theme,
+                ));
             }
             run_selected = selected;
             run.push(ch);
         }
         if !run.is_empty() {
-            spans.push(selection_span(run, run_selected));
+            spans.push(selection_span(run, run_selected, self.theme));
         }
         Line::from(spans)
     }

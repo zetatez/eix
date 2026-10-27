@@ -388,7 +388,7 @@ fn focused_pane_border_uses_the_accent_color() {
     );
     assert_eq!(
         inactive.fg,
-        Color::Rgb(48, 52, 62),
+        composer_inactive_border(app.theme),
         "inactive pane border should stay muted"
     );
     assert_eq!(inactive.symbol(), "│");
@@ -5372,6 +5372,34 @@ fn session_mode_colors_stay_distinct_and_readable_in_every_theme() {
 }
 
 #[test]
+fn selection_highlight_keeps_text_readable_in_every_theme() {
+    let mut themes = vec![Theme::default()];
+    themes.extend(THEME_PRESETS.iter().map(|preset| {
+        Theme::from_config(&eix_core::ThemeConfig {
+            preset: Some(preset.name.to_string()),
+            ..Default::default()
+        })
+    }));
+
+    for theme in themes {
+        let background = composer_selection(theme);
+        let text = badge_text_color(background);
+        let (Color::Rgb(br, bg, bb), Color::Rgb(tr, tg, tb)) = (background, text) else {
+            continue;
+        };
+        let ratio = contrast_ratio(
+            relative_luminance(br, bg, bb),
+            relative_luminance(tr, tg, tb),
+        );
+        assert!(
+            ratio >= MIN_ACCENT_CONTRAST,
+            "selection text is too faint for preset {:?}: {ratio}",
+            theme.preset
+        );
+    }
+}
+
+#[test]
 fn prompt_header_uses_icon_for_idle_and_animated_running() {
     let mut app = App::new(None);
     assert_eq!(app.status_glyph(SessionStatus::Idle), "⠶");
@@ -7505,6 +7533,7 @@ fn attention_alerts_render_top_right_without_moving_the_statusline() {
 
 #[test]
 fn default_theme_keeps_the_prompt_transparent() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(session_pane("s1", "one"));
     app.focused = 0;
@@ -7514,19 +7543,39 @@ fn default_theme_keeps_the_prompt_transparent() {
     assert_eq!(composer_background(app.theme), Color::Reset);
     assert_eq!(dialog_background(app.theme), Color::Reset);
 
-    let backend = ratatui::backend::TestBackend::new(80, 20);
+    let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     terminal.draw(|frame| app.draw(frame)).unwrap();
+
+    // The pane interior has no fill of its own: it shows the terminal canvas.
+    let pane = app.pane_areas[0];
     let buffer = terminal.backend().buffer();
-    for y in 0..buffer.area.height {
-        for x in 0..buffer.area.width {
-            assert_ne!(
+    for y in pane.y + 1..pane.y + pane.height - 1 {
+        for x in pane.x + 1..pane.x + pane.width - 1 {
+            assert_eq!(
                 buffer[(x, y)].bg,
-                Color::Rgb(30, 33, 42),
-                "prompt kept an opaque panel at ({x}, {y})"
+                Color::Reset,
+                "pane gained an opaque fill at ({x}, {y})"
             );
         }
     }
+
+    // Floating overlays also stay transparent; only the selected row may carry
+    // a highlight fill.
+    app.open_picker(PickerKind::Themes, &tx);
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let dialog = search_dialog_rect(terminal.backend().buffer().area);
+    let buffer = terminal.backend().buffer();
+    assert_eq!(
+        buffer[(dialog.x + 2, dialog.y + 1)].bg,
+        Color::Reset,
+        "default picker painted an opaque dialog"
+    );
+    assert_eq!(
+        buffer[(pane.x + 2, pane.y + 2)].bg,
+        Color::Reset,
+        "default picker repainted the pane background"
+    );
 }
 
 #[test]

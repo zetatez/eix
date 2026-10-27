@@ -252,11 +252,11 @@ impl App {
         };
 
         let mut lines = vec![Line::from(vec![
-            Span::styled("  ? ", Style::default().fg(Color::Cyan)),
+            Span::styled("  ? ", Style::default().fg(composer_accent(self.theme))),
             Span::styled(
                 btw.question.clone(),
                 Style::default()
-                    .fg(Color::Gray)
+                    .fg(composer_text(self.theme))
                     .add_modifier(Modifier::ITALIC),
             ),
         ])];
@@ -264,7 +264,7 @@ impl App {
             for segment in wrap_text(error, inner_width.saturating_sub(2)) {
                 lines.push(Line::from(Span::styled(
                     format!("  {segment}"),
-                    Style::default().fg(Color::Red),
+                    Style::default().fg(composer_danger(self.theme)),
                 )));
             }
         } else if btw.text.is_empty() {
@@ -274,7 +274,7 @@ impl App {
                 } else {
                     "  thinking…"
                 },
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(composer_muted(self.theme)),
             )));
         } else {
             for segment in wrap_text(&btw.text, inner_width.saturating_sub(2)) {
@@ -284,11 +284,11 @@ impl App {
         let max_scroll = lines.len().saturating_sub(inner_height);
         btw.scroll = btw.scroll.min(max_scroll);
         let border = if btw.error.is_some() {
-            Color::Red
+            composer_danger(self.theme)
         } else if btw.done {
-            Color::Green
+            composer_success(self.theme)
         } else {
-            Color::Cyan
+            composer_accent(self.theme)
         };
         frame.render_widget(Clear, rect);
         frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
@@ -302,7 +302,7 @@ impl App {
             ))
             .title_bottom(Span::styled(
                 " Esc close · j/k scroll ",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(composer_muted(self.theme)),
             ));
         frame.render_widget(
             Paragraph::new(lines)
@@ -363,12 +363,12 @@ impl App {
                                 let check = if selected { "[x] " } else { "[ ] " };
                                 let style = if focused {
                                     Style::default()
-                                        .fg(Color::Yellow)
+                                        .fg(composer_focus(theme))
                                         .add_modifier(Modifier::BOLD)
                                 } else if selected {
-                                    Style::default().fg(Color::Cyan)
+                                    Style::default().fg(composer_accent(theme))
                                 } else {
-                                    Style::default().fg(Color::DarkGray)
+                                    Style::default().fg(composer_muted(theme))
                                 };
                                 body.push(Line::from(Span::styled(
                                     truncate(&format!("{marker}{check}{line}"), inner_width),
@@ -405,7 +405,7 @@ impl App {
         };
         body.push(Line::from(Span::styled(
             hint,
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(composer_muted(theme)),
         )));
 
         let title = if path.is_empty() {
@@ -415,12 +415,12 @@ impl App {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(composer_warn(theme)))
             .title(title);
         frame.render_widget(
             Paragraph::new(body)
                 .block(block)
-                .style(Style::default().bg(dialog_bg)),
+                .style(Style::default().fg(composer_text(theme)).bg(dialog_bg)),
             rect,
         );
         if let Some(view) = &mut self.diff_view {
@@ -456,10 +456,10 @@ impl App {
             );
             let style = if index == inbox.cursor {
                 Style::default()
-                    .fg(Color::Yellow)
+                    .fg(composer_warn(self.theme))
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
+                Style::default().fg(composer_text(self.theme))
             };
             lines.push(Line::from(Span::styled(truncate(&label, inner), style)));
         }
@@ -468,17 +468,17 @@ impl App {
                 " Enter open · y approve · n deny · j/k select · Esc close ",
                 inner,
             ),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(composer_muted(self.theme)),
         )));
 
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Yellow))
+            .border_style(Style::default().fg(composer_warn(self.theme)))
             .title(format!(" approvals · {} ", inbox.items.len()));
         frame.render_widget(
             Paragraph::new(lines)
                 .block(block)
-                .style(Style::default().bg(dialog_bg)),
+                .style(Style::default().fg(composer_text(self.theme)).bg(dialog_bg)),
             rect,
         );
     }
@@ -502,12 +502,17 @@ impl App {
 
         let mut list_lines: Vec<Line> = Vec::new();
         for (index, process) in view.processes.iter().enumerate() {
-            list_lines.push(process_line(process, index == view.cursor, inner_width));
+            list_lines.push(process_line(
+                process,
+                index == view.cursor,
+                inner_width,
+                self.theme,
+            ));
         }
         if view.processes.is_empty() {
             list_lines.push(Line::from(Span::styled(
                 "  no background processes",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(composer_muted(self.theme)),
             )));
         }
         let max_scroll = view.processes.len().saturating_sub(list_height);
@@ -526,7 +531,7 @@ impl App {
         };
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::Cyan))
+            .border_style(Style::default().fg(composer_accent(self.theme)))
             .title(title)
             .title_bottom(" j/k select · x kill · r refresh · PgUp/PgDn · Esc close ");
         let inner = block.inner(rect);
@@ -542,13 +547,13 @@ impl App {
                     .take(list_height)
                     .collect::<Vec<_>>(),
             )
-            .style(Style::default().bg(dialog_bg)),
+            .style(Style::default().fg(composer_text(self.theme)).bg(dialog_bg)),
             chunks[0],
         );
 
         let output_block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(Color::DarkGray))
+            .border_style(Style::default().fg(composer_inactive_border(self.theme)))
             .title(" output ");
         let output_inner = output_block.inner(chunks[1]);
         frame.render_widget(output_block, chunks[1]);
@@ -559,7 +564,7 @@ impl App {
         let body: Vec<Line> = if lines.is_empty() {
             vec![Line::from(Span::styled(
                 "(no output yet)",
-                Style::default().fg(Color::DarkGray),
+                Style::default().fg(composer_muted(self.theme)),
             ))]
         } else {
             lines
@@ -570,7 +575,8 @@ impl App {
                 .collect()
         };
         frame.render_widget(
-            Paragraph::new(body).style(Style::default().bg(dialog_bg)),
+            Paragraph::new(body)
+                .style(Style::default().fg(composer_text(self.theme)).bg(dialog_bg)),
             output_inner,
         );
     }
@@ -602,25 +608,12 @@ impl App {
         // loop sends it after this draw so the UI never blocks on file/history
         // reads.
         self.sync_picker_preview(&filtered, selected);
-        // The theme picker previews the highlighted palette immediately, so
-        // its own chrome should follow that palette too (not a fixed cyan).
-        let theme_picker = kind == PickerKind::Themes;
+        // Every picker follows the active palette; the theme picker previews
+        // its highlighted palette immediately, including its own chrome.
         let theme = self.theme;
-        let accent = if theme_picker {
-            composer_accent(theme)
-        } else {
-            Color::Cyan
-        };
-        let muted = if theme_picker {
-            composer_muted(theme)
-        } else {
-            Color::DarkGray
-        };
-        let preview_text = if theme_picker {
-            composer_text(theme)
-        } else {
-            Color::Gray
-        };
+        let accent = composer_accent(theme);
+        let muted = composer_muted(theme);
+        let preview_text = composer_text(theme);
         let dialog_bg = dialog_background(theme);
 
         let rect = search_dialog_rect(area);
@@ -635,7 +628,7 @@ impl App {
             .title_bottom(format!(" {} ", kind.hint()));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
-        let body = draw_search_field(frame, inner, &query, accent, muted, dialog_bg);
+        let body = draw_search_field(frame, inner, &query, accent, preview_text, muted, dialog_bg);
         let (list_area, preview_area) = if body.width >= 64 {
             let columns =
                 Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
@@ -663,7 +656,7 @@ impl App {
                 .style(Style::default().bg(dialog_bg))
                 .highlight_style(
                     Style::default()
-                        .bg(Color::DarkGray)
+                        .bg(composer_selection(theme))
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("› ");
@@ -718,31 +711,36 @@ impl App {
                         let pane = match open_panes[index] {
                             Some(pane) => Span::styled(
                                 format!("{} ", pane + 1),
-                                Style::default().fg(Color::Cyan),
+                                Style::default().fg(composer_accent(self.theme)),
                             ),
-                            None => Span::styled("· ", Style::default().fg(Color::DarkGray)),
+                            None => {
+                                Span::styled("· ", Style::default().fg(composer_muted(self.theme)))
+                            }
                         };
                         ListItem::new(Line::from(vec![
                             pane,
                             Span::styled(
                                 format!("{} ", session.status.symbol()),
-                                Style::default().fg(status_color(session.status)),
+                                Style::default()
+                                    .fg(composer_status_color(session.status, self.theme)),
                             ),
                             Span::styled(
                                 pad_to(&truncate(&session.name, 28), 28),
-                                Style::default().add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(composer_text(self.theme))
+                                    .add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 pad_to(origin_marker(session), 1),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(composer_muted(self.theme)),
                             ),
                             Span::styled(
                                 format!("  {}  ", short_id(&session.id)),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(composer_muted(self.theme)),
                             ),
                             Span::styled(
                                 session.cwd.display().to_string(),
-                                Style::default().fg(Color::DarkGray),
+                                Style::default().fg(composer_muted(self.theme)),
                             ),
                         ]))
                     })
@@ -752,19 +750,10 @@ impl App {
                 let Some(picker) = &self.picker else {
                     return Vec::new();
                 };
-                let theme_picker = kind == PickerKind::Themes;
-                let label_style = if theme_picker {
-                    Style::default()
-                        .fg(composer_text(self.theme))
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().add_modifier(Modifier::BOLD)
-                };
-                let detail_color = if theme_picker {
-                    composer_muted(self.theme)
-                } else {
-                    Color::DarkGray
-                };
+                let label_style = Style::default()
+                    .fg(composer_text(self.theme))
+                    .add_modifier(Modifier::BOLD);
+                let detail_color = composer_muted(self.theme);
                 // Keep the second column aligned under the longest label in
                 // the whole picker, not just the currently filtered rows.
                 // Models use a wider separator; commands keep the `/` menu's
