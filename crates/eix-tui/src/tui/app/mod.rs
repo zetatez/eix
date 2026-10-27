@@ -406,18 +406,6 @@ fn status_needs_warning(status: &str) -> bool {
         && MARKERS.iter().any(|marker| status.contains(marker))
 }
 
-/// Parsed and wrapped history for one pane. Only the live turn is re-rendered
-/// on each frame; stored events stay here until the log, width, theme or fold
-/// state changes.
-struct HistoryCache {
-    width: usize,
-    theme: Theme,
-    folds: HashMap<FoldId, bool>,
-    events_rev: u64,
-    subagents_rev: u64,
-    lines: Vec<Line<'static>>,
-}
-
 struct SessionView {
     session: Session,
     events: Vec<SessionEvent>,
@@ -427,7 +415,7 @@ struct SessionView {
     subagents: HashMap<String, Subagent>,
     /// Bumped whenever a child agent's state changes.
     subagents_rev: u64,
-    history_cache: Option<HistoryCache>,
+    history_cache: Option<transcript::HistoryCache>,
     /// Older stored events exist before the first loaded event.
     history_has_more: bool,
     /// A history request is in flight.
@@ -477,41 +465,37 @@ impl SessionView {
         }
     }
 
-    /// Rebuild the cached history when its inputs changed. Stored events are
-    /// immutable between pushes, so this is normally a no-op on redraws.
+    /// Rebuild the cached history when its inputs changed. The cache compares
+    /// per-block identities, so a new event or a single fold toggle only
+    /// re-renders the blocks it actually touched.
     fn ensure_history(&mut self, width: usize, theme: Theme) {
         let stale = self.history_cache.as_ref().is_none_or(|cache| {
-            cache.width != width
-                || cache.theme != theme
-                || cache.folds != self.folds
-                || cache.events_rev != self.events_rev
-                || cache.subagents_rev != self.subagents_rev
+            cache.needs_render(
+                width,
+                theme,
+                self.events_rev,
+                self.subagents_rev,
+                &self.folds,
+            )
         });
         if !stale {
             return;
         }
-        let transcript::Transcript {
-            lines,
-            slots,
-            user_lines,
-        } = transcript::render_history_with_subagents(
+        let cache = self
+            .history_cache
+            .get_or_insert_with(transcript::HistoryCache::default);
+        cache.render(
             &self.events,
             &self.folds,
             width,
             theme,
             &self.subagents,
+            self.subagents_rev,
+            self.events_rev,
         );
-        self.slots = slots;
-        self.text_lines = lines.iter().map(text_line).collect();
-        self.user_lines = user_lines;
-        self.history_cache = Some(HistoryCache {
-            width,
-            theme,
-            folds: self.folds.clone(),
-            events_rev: self.events_rev,
-            subagents_rev: self.subagents_rev,
-            lines,
-        });
+        self.slots = cache.slots.clone();
+        self.text_lines = cache.lines.iter().map(text_line).collect();
+        self.user_lines = cache.user_lines.clone();
     }
 
     fn upsert_subagent(&mut self, agent_id: String, call_id: String, name: String) {

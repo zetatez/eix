@@ -1696,30 +1696,29 @@ async fn read_file(args: &Value, cwd: &Path, config: &Config) -> Result<String> 
 
 /// Render a numbered, paginated slice of a text file. `offset` is 1-based.
 pub fn format_read(text: &str, offset: usize, limit: usize, max_bytes: usize) -> String {
-    let lines: Vec<&str> = text.lines().collect();
-    if lines.is_empty() {
+    // Count without materialising a `Vec<&str>` for the whole file: a large
+    // log would otherwise allocate one pointer per line just to slice it.
+    let total = text.lines().count();
+    if total == 0 {
         return "(empty file)".to_string();
     }
-    if offset > lines.len() {
-        return format!(
-            "(offset {offset} is past the end of the file, {} lines)",
-            lines.len()
-        );
+    if offset > total {
+        return format!("(offset {offset} is past the end of the file, {total} lines)");
     }
     let start = offset - 1;
-    let end = (start + limit).min(lines.len());
+    let end = (start + limit).min(total);
     let mut out = String::new();
-    for (index, line) in lines[start..end].iter().enumerate() {
+    for (index, line) in text.lines().skip(start).take(end - start).enumerate() {
         out.push_str(&format!("{}: {line}\n", start + index + 1));
         if out.len() >= max_bytes {
             out.push_str("… [truncated]\n");
             break;
         }
     }
-    if end < lines.len() {
+    if end < total {
         out.push_str(&format!(
             "… [{} more lines; use offset={} to continue]\n",
-            lines.len() - end,
+            total - end,
             end + 1
         ));
     }

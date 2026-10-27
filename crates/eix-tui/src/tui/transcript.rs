@@ -16,6 +16,7 @@ use eix_core::{
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use serde::Deserialize;
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
@@ -84,9 +85,7 @@ impl Subagent {
     pub fn push_event(&mut self, event: SessionEvent) {
         match event.kind {
             EventKind::AssistantMessage => {
-                if let Ok(payload) =
-                    serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
-                {
+                if let Ok(payload) = AssistantMessagePayload::deserialize(&event.payload) {
                     let text = payload.text.trim();
                     if !text.is_empty() {
                         self.result = Some(text.to_string());
@@ -215,6 +214,7 @@ pub fn render_with_subagents(
 
 /// Render only the stored history. The UI caches this and renders the live
 /// tail separately, so streaming deltas do not reparse the whole session.
+#[cfg(test)]
 pub fn render_history_with_subagents(
     events: &[SessionEvent],
     folds: &HashMap<FoldId, bool>,
@@ -248,71 +248,243 @@ pub fn render_tail(
     out
 }
 
+#[cfg(test)]
 fn render_blocks(
-    blocks: Vec<Block>,
+    blocks: Vec<Collected>,
     folds: &HashMap<FoldId, bool>,
     width: usize,
     theme: Theme,
     subagents: &HashMap<String, Subagent>,
 ) -> Transcript {
-    let mut out = Transcript {
-        lines: Vec::new(),
-        slots: Vec::new(),
-        user_lines: Vec::new(),
-    };
-    for block in blocks {
-        match block {
-            Block::User { seq, text, images } => {
-                let line = out.lines.len();
-                user_message(&mut out, &text, &images, width, theme);
-                out.user_lines.push((seq, line));
-            }
-            Block::Assistant {
-                seq,
-                text,
-                reasoning,
-                cancelled,
-            } => {
-                if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.trim().is_empty()) {
-                    thinking(
-                        &mut out,
-                        FoldId::Event(seq),
-                        reasoning,
-                        false,
-                        width,
-                        theme,
-                        folds,
-                    );
-                }
-                if !text.is_empty() {
-                    assistant_message(&mut out, &text, cancelled, width, theme);
-                }
-            }
-            Block::Tool(block) => {
-                let subagent = (block.tool == "spawn_agent")
-                    .then(|| {
-                        subagents
-                            .values()
-                            .find(|subagent| subagent.call_id == block.call_id)
-                    })
-                    .flatten();
-                match subagent {
-                    Some(subagent) => {
-                        subagent_block(&mut out, &block, subagent, width, theme, folds)
-                    }
-                    None => tool_block(&mut out, &block, width, theme, folds),
-                }
-            }
-            Block::Note { text } => note(&mut out, '◇', &text, comment(theme), width),
-            Block::Compaction { messages, summary } => {
-                compaction_summary(&mut out, messages, &summary, width, theme)
-            }
-            Block::Error { text } => {
-                note(&mut out, '!', &text, theme.error.unwrap_or(DANGER), width)
-            }
-        }
+    let mut out = Transcript::new();
+    for collected in blocks {
+        let piece = render_block(&collected.block, folds, width, theme, subagents);
+        append_piece(&mut out, piece);
     }
     out
+}
+
+/// Render one block on its own. Keeping blocks independent is what lets the
+/// UI re-render just the block whose fold state or content changed.
+fn render_block(
+    block: &Block,
+    folds: &HashMap<FoldId, bool>,
+    width: usize,
+    theme: Theme,
+    subagents: &HashMap<String, Subagent>,
+) -> Transcript {
+    let mut out = Transcript::new();
+    match block {
+        Block::User { seq, text, images } => {
+            let line = out.lines.len();
+            user_message(&mut out, text, images, width, theme);
+            out.user_lines.push((*seq, line));
+        }
+        Block::Assistant {
+            seq,
+            text,
+            reasoning,
+            cancelled,
+        } => {
+            if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.trim().is_empty()) {
+                thinking(
+                    &mut out,
+                    FoldId::Event(*seq),
+                    reasoning,
+                    false,
+                    width,
+                    theme,
+                    folds,
+                );
+            }
+            if !text.is_empty() {
+                assistant_message(&mut out, text, *cancelled, width, theme);
+            }
+        }
+        Block::Tool(block) => {
+            let subagent = (block.tool == "spawn_agent")
+                .then(|| {
+                    subagents
+                        .values()
+                        .find(|subagent| subagent.call_id == block.call_id)
+                })
+                .flatten();
+            match subagent {
+                Some(subagent) => subagent_block(&mut out, block, subagent, width, theme, folds),
+                None => tool_block(&mut out, block, width, theme, folds),
+            }
+        }
+        Block::Note { text } => note(&mut out, '◇', text, comment(theme), width),
+        Block::Compaction { messages, summary } => {
+            compaction_summary(&mut out, *messages, summary, width, theme)
+        }
+        Block::Error { text } => note(&mut out, '!', text, theme.error.unwrap_or(DANGER), width),
+    }
+    out
+}
+
+/// Join one rendered block onto another, collapsing the blank line that both
+/// sides may contribute. Rendering blocks separately must not change spacing.
+fn append_piece_parts(
+    lines: &mut Vec<Line<'static>>,
+    slots: &mut Vec<Option<Fold>>,
+    user_lines: &mut Vec<(u64, usize)>,
+    piece: Transcript,
+) {
+    let skip = usize::from(
+        lines.last().is_some_and(|line| line.width() == 0)
+            && piece.lines.first().is_some_and(|line| line.width() == 0),
+    );
+    let base = lines.len();
+    lines.extend(piece.lines.into_iter().skip(skip));
+    slots.extend(piece.slots.into_iter().skip(skip));
+    for (seq, line) in piece.user_lines {
+        user_lines.push((seq, base + line.saturating_sub(skip)));
+    }
+}
+
+#[cfg(test)]
+fn append_piece(dst: &mut Transcript, piece: Transcript) {
+    let mut lines = std::mem::take(&mut dst.lines);
+    let mut slots = std::mem::take(&mut dst.slots);
+    let mut user_lines = std::mem::take(&mut dst.user_lines);
+    append_piece_parts(&mut lines, &mut slots, &mut user_lines, piece);
+    dst.lines = lines;
+    dst.slots = slots;
+    dst.user_lines = user_lines;
+}
+
+/// Identity of a block's rendered output. `rev` changes whenever the block's
+/// source events change, so an unchanged block is never re-parsed or
+/// re-rendered; only the block whose fold state flipped is.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BlockKey {
+    rev: u64,
+    fold: Option<bool>,
+    subagents_rev: u64,
+}
+
+fn block_key(
+    block: &Block,
+    rev: u64,
+    folds: &HashMap<FoldId, bool>,
+    subagents_rev: u64,
+) -> BlockKey {
+    let (seq, foldable) = match block {
+        Block::User { seq, .. } => (*seq, false),
+        Block::Assistant { seq, reasoning, .. } => (
+            *seq,
+            reasoning
+                .as_deref()
+                .is_some_and(|text| !text.trim().is_empty()),
+        ),
+        Block::Tool(tool) => (tool.seq, true),
+        _ => (0, false),
+    };
+    BlockKey {
+        rev,
+        fold: foldable
+            .then(|| folds.get(&FoldId::Event(seq)).copied())
+            .flatten(),
+        subagents_rev: match block {
+            Block::Tool(tool) if tool.tool == "spawn_agent" => subagents_rev,
+            _ => 0,
+        },
+    }
+}
+
+/// Cached history rendering. New events only invalidate the blocks they touch;
+/// fold toggles only invalidate the toggled block, and its suffix is repaired
+/// by re-rendering from that block onward.
+#[derive(Default)]
+pub struct HistoryCache {
+    width: usize,
+    theme: Theme,
+    events_rev: u64,
+    subagents_rev: u64,
+    folds: HashMap<FoldId, bool>,
+    keys: Vec<BlockKey>,
+    starts: Vec<usize>,
+    pub lines: Vec<Line<'static>>,
+    pub slots: Vec<Option<Fold>>,
+    pub user_lines: Vec<(u64, usize)>,
+}
+
+impl HistoryCache {
+    pub fn needs_render(
+        &self,
+        width: usize,
+        theme: Theme,
+        events_rev: u64,
+        subagents_rev: u64,
+        folds: &HashMap<FoldId, bool>,
+    ) -> bool {
+        self.width == 0
+            || self.width != width
+            || self.theme != theme
+            || self.events_rev != events_rev
+            || self.subagents_rev != subagents_rev
+            || self.folds != *folds
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn render(
+        &mut self,
+        events: &[SessionEvent],
+        folds: &HashMap<FoldId, bool>,
+        width: usize,
+        theme: Theme,
+        subagents: &HashMap<String, Subagent>,
+        subagents_rev: u64,
+        events_rev: u64,
+    ) {
+        let blocks = collect(events);
+        let keys: Vec<BlockKey> = blocks
+            .iter()
+            .map(|collected| block_key(&collected.block, collected.rev, folds, subagents_rev))
+            .collect();
+        let mut common = if width != self.width || theme != self.theme {
+            0
+        } else {
+            let mut common = 0;
+            while common < self.keys.len()
+                && common < keys.len()
+                && self.keys[common] == keys[common]
+            {
+                common += 1;
+            }
+            common
+        };
+        // A width/theme change invalidates every block; otherwise reuse the
+        // matching prefix and repair only the suffix.
+        if common > keys.len() {
+            common = keys.len();
+        }
+        if common < self.keys.len() {
+            let cut = self.starts.get(common).copied().unwrap_or(self.lines.len());
+            self.lines.truncate(cut);
+            self.slots.truncate(cut);
+            self.user_lines.retain(|(_, line)| *line < cut);
+            self.keys.truncate(common);
+            self.starts.truncate(common);
+        }
+        for (index, collected) in blocks.iter().enumerate().skip(common) {
+            self.starts.push(self.lines.len());
+            self.keys.push(keys[index]);
+            let piece = render_block(&collected.block, folds, width, theme, subagents);
+            append_piece_parts(
+                &mut self.lines,
+                &mut self.slots,
+                &mut self.user_lines,
+                piece,
+            );
+        }
+        self.width = width;
+        self.theme = theme;
+        self.events_rev = events_rev;
+        self.subagents_rev = subagents_rev;
+        self.folds = folds.clone();
+    }
 }
 
 /// One dot phase every other 200ms tick, so the placeholder cycles `.`, `..`,
@@ -354,60 +526,78 @@ fn append_tail(
     }
 }
 
+/// One collected block plus the event sequence that last changed it. The
+/// sequence is unique per block, so it doubles as a cache key for rendering.
+struct Collected {
+    block: Block,
+    rev: u64,
+}
+
 /// Flatten the event log into ordered blocks, merging tool call/results.
-fn collect(events: &[SessionEvent]) -> Vec<Block> {
-    let mut blocks: Vec<Block> = Vec::new();
+fn collect(events: &[SessionEvent]) -> Vec<Collected> {
+    let mut blocks: Vec<Collected> = Vec::new();
     let mut tool_index: Vec<(String, usize)> = Vec::new();
+
+    macro_rules! push_block {
+        ($rev:expr, $block:expr) => {
+            blocks.push(Collected {
+                block: $block,
+                rev: $rev,
+            })
+        };
+    }
 
     for event in events {
         match event.kind {
             EventKind::UserMessage => {
-                if let Ok(payload) =
-                    serde_json::from_value::<UserMessagePayload>(event.payload.clone())
-                {
-                    blocks.push(Block::User {
-                        seq: event.seq,
-                        text: payload.text,
-                        images: payload.images.into_iter().map(|image| image.path).collect(),
-                    });
+                if let Ok(payload) = UserMessagePayload::deserialize(&event.payload) {
+                    push_block!(
+                        event.seq,
+                        Block::User {
+                            seq: event.seq,
+                            text: payload.text,
+                            images: payload.images.into_iter().map(|image| image.path).collect(),
+                        }
+                    );
                 }
             }
             EventKind::AssistantMessage => {
-                if let Ok(payload) =
-                    serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
-                {
-                    blocks.push(Block::Assistant {
-                        seq: event.seq,
-                        text: payload.text,
-                        reasoning: payload.reasoning,
-                        cancelled: payload.cancelled,
-                    });
+                if let Ok(payload) = AssistantMessagePayload::deserialize(&event.payload) {
+                    push_block!(
+                        event.seq,
+                        Block::Assistant {
+                            seq: event.seq,
+                            text: payload.text,
+                            reasoning: payload.reasoning,
+                            cancelled: payload.cancelled,
+                        }
+                    );
                 }
             }
             EventKind::ToolCall => {
-                if let Ok(payload) =
-                    serde_json::from_value::<ToolCallPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = ToolCallPayload::deserialize(&event.payload) {
                     let slot = blocks.len();
                     tool_index.push((payload.call_id.clone(), slot));
-                    blocks.push(Block::Tool(Box::new(ToolBlock {
-                        seq: event.seq,
-                        call_id: payload.call_id,
-                        tool: payload.tool,
-                        arguments: payload.arguments,
-                        result: None,
-                        approval: None,
-                        patch: None,
-                    })));
+                    push_block!(
+                        event.seq,
+                        Block::Tool(Box::new(ToolBlock {
+                            seq: event.seq,
+                            call_id: payload.call_id,
+                            tool: payload.tool,
+                            arguments: payload.arguments,
+                            result: None,
+                            approval: None,
+                            patch: None,
+                        }))
+                    );
                 }
             }
             EventKind::ApprovalRequired => {
-                if let Ok(payload) =
-                    serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = ApprovalRequiredPayload::deserialize(&event.payload) {
                     match tool_slot(&blocks, &tool_index, &payload.call_id) {
                         Some(slot) => {
-                            if let Block::Tool(block) = &mut blocks[slot] {
+                            blocks[slot].rev = event.seq;
+                            if let Block::Tool(block) = &mut blocks[slot].block {
                                 block.approval = Some(payload);
                             }
                         }
@@ -415,23 +605,24 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                             let call_id = payload.call_id.clone();
                             let arguments = payload.arguments.clone();
                             let tool = payload.tool.clone();
-                            blocks.push(Block::Tool(Box::new(ToolBlock {
-                                seq: event.seq,
-                                call_id,
-                                tool,
-                                arguments,
-                                result: None,
-                                approval: Some(payload),
-                                patch: None,
-                            })))
+                            push_block!(
+                                event.seq,
+                                Block::Tool(Box::new(ToolBlock {
+                                    seq: event.seq,
+                                    call_id,
+                                    tool,
+                                    arguments,
+                                    result: None,
+                                    approval: Some(payload),
+                                    patch: None,
+                                }))
+                            )
                         }
                     }
                 }
             }
             EventKind::PatchProposed => {
-                if let Ok(payload) =
-                    serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = PatchProposedPayload::deserialize(&event.payload) {
                     let patch = PatchBlock {
                         path: payload.path,
                         diff: payload.diff,
@@ -439,26 +630,28 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                     };
                     match tool_slot(&blocks, &tool_index, &payload.call_id) {
                         Some(slot) => {
-                            if let Block::Tool(block) = &mut blocks[slot] {
+                            blocks[slot].rev = event.seq;
+                            if let Block::Tool(block) = &mut blocks[slot].block {
                                 block.patch = Some(patch);
                             }
                         }
-                        None => blocks.push(Block::Tool(Box::new(ToolBlock {
-                            seq: event.seq,
-                            call_id: payload.call_id,
-                            tool: payload.tool,
-                            arguments: Value::Null,
-                            result: None,
-                            approval: None,
-                            patch: Some(patch),
-                        }))),
+                        None => push_block!(
+                            event.seq,
+                            Block::Tool(Box::new(ToolBlock {
+                                seq: event.seq,
+                                call_id: payload.call_id,
+                                tool: payload.tool,
+                                arguments: Value::Null,
+                                result: None,
+                                approval: None,
+                                patch: Some(patch),
+                            }))
+                        ),
                     }
                 }
             }
             EventKind::PatchApplied | EventKind::PatchRejected | EventKind::PatchConflict => {
-                if let Ok(payload) =
-                    serde_json::from_value::<PatchResultPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = PatchResultPayload::deserialize(&event.payload) {
                     let outcome = match event.kind {
                         EventKind::PatchApplied => PatchOutcome::Applied,
                         EventKind::PatchRejected => PatchOutcome::Rejected,
@@ -466,7 +659,8 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                     };
                     match tool_slot(&blocks, &tool_index, &payload.call_id) {
                         Some(slot) => {
-                            if let Block::Tool(block) = &mut blocks[slot] {
+                            blocks[slot].rev = event.seq;
+                            if let Block::Tool(block) = &mut blocks[slot].block {
                                 match &mut block.patch {
                                     Some(patch) => {
                                         patch.outcome = Some(outcome);
@@ -487,41 +681,46 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
                                 }
                             }
                         }
-                        None => blocks.push(Block::Tool(Box::new(ToolBlock {
-                            seq: event.seq,
-                            call_id: payload.call_id,
-                            tool: "write_file".into(),
-                            arguments: Value::Null,
-                            result: None,
-                            approval: None,
-                            patch: Some(PatchBlock {
-                                path: payload.path,
-                                diff: payload.diff,
-                                outcome: Some(outcome),
-                            }),
-                        }))),
+                        None => push_block!(
+                            event.seq,
+                            Block::Tool(Box::new(ToolBlock {
+                                seq: event.seq,
+                                call_id: payload.call_id,
+                                tool: "write_file".into(),
+                                arguments: Value::Null,
+                                result: None,
+                                approval: None,
+                                patch: Some(PatchBlock {
+                                    path: payload.path,
+                                    diff: payload.diff,
+                                    outcome: Some(outcome),
+                                }),
+                            }))
+                        ),
                     }
                 }
             }
             EventKind::ToolResult => {
-                if let Ok(payload) =
-                    serde_json::from_value::<ToolResultPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = ToolResultPayload::deserialize(&event.payload) {
                     match tool_slot(&blocks, &tool_index, &payload.call_id) {
                         Some(slot) => {
-                            if let Block::Tool(block) = &mut blocks[slot] {
+                            blocks[slot].rev = event.seq;
+                            if let Block::Tool(block) = &mut blocks[slot].block {
                                 block.result = Some(payload);
                             }
                         }
-                        None => blocks.push(Block::Tool(Box::new(ToolBlock {
-                            seq: event.seq,
-                            call_id: payload.call_id.clone(),
-                            tool: payload.tool.clone(),
-                            arguments: Value::Null,
-                            result: Some(payload),
-                            approval: None,
-                            patch: None,
-                        }))),
+                        None => push_block!(
+                            event.seq,
+                            Block::Tool(Box::new(ToolBlock {
+                                seq: event.seq,
+                                call_id: payload.call_id.clone(),
+                                tool: payload.tool.clone(),
+                                arguments: Value::Null,
+                                result: Some(payload),
+                                approval: None,
+                                patch: None,
+                            }))
+                        ),
                     }
                 }
             }
@@ -530,50 +729,64 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
             // expose the current mode and its audit trail.
             EventKind::Mode => {}
             EventKind::ContextCompacted => {
-                if let Ok(payload) =
-                    serde_json::from_value::<ContextCompactedPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = ContextCompactedPayload::deserialize(&event.payload) {
                     let summary = payload.summary.trim();
                     // Automatic compactions happen mid-turn and roll previous
                     // summaries forward. Keep those as a short note; only a
                     // manual `/compact` should expand the generated summary in
                     // the conversation.
                     if !payload.rolling && !summary.is_empty() {
-                        blocks.push(Block::Compaction {
-                            messages: payload.messages,
-                            summary: summary.to_string(),
-                        });
+                        push_block!(
+                            event.seq,
+                            Block::Compaction {
+                                messages: payload.messages,
+                                summary: summary.to_string(),
+                            }
+                        );
                     } else {
-                        blocks.push(Block::Note {
-                            text: format!(
-                                "context compacted · {} message(s) replaced by a summary",
-                                payload.messages
-                            ),
-                        });
+                        push_block!(
+                            event.seq,
+                            Block::Note {
+                                text: format!(
+                                    "context compacted · {} message(s) replaced by a summary",
+                                    payload.messages
+                                ),
+                            }
+                        );
                     }
                 }
             }
             EventKind::ContextCleared => {
-                blocks.push(Block::Note {
-                    text: "context cleared · earlier turns stay here but are no longer sent".into(),
-                });
+                push_block!(
+                    event.seq,
+                    Block::Note {
+                        text: "context cleared · earlier turns stay here but are no longer sent"
+                            .into(),
+                    }
+                );
             }
             EventKind::Error => {
-                blocks.push(Block::Error {
-                    text: event
-                        .payload
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error")
-                        .to_string(),
-                });
+                push_block!(
+                    event.seq,
+                    Block::Error {
+                        text: event
+                            .payload
+                            .get("message")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown error")
+                            .to_string(),
+                    }
+                );
             }
             EventKind::Integration => {
                 if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
                     if !text.trim().is_empty() {
-                        blocks.push(Block::Note {
-                            text: text.to_string(),
-                        });
+                        push_block!(
+                            event.seq,
+                            Block::Note {
+                                text: text.to_string(),
+                            }
+                        );
                     }
                 }
             }
@@ -584,16 +797,24 @@ fn collect(events: &[SessionEvent]) -> Vec<Block> {
     blocks
 }
 
-fn tool_slot(blocks: &[Block], index: &[(String, usize)], call_id: &str) -> Option<usize> {
+fn tool_slot(blocks: &[Collected], index: &[(String, usize)], call_id: &str) -> Option<usize> {
     index
         .iter()
         .rev()
         .find(|(id, _)| id == call_id)
         .map(|(_, slot)| *slot)
-        .filter(|slot| matches!(blocks.get(*slot), Some(Block::Tool(_))))
+        .filter(|slot| matches!(blocks.get(*slot).map(|c| &c.block), Some(Block::Tool(_))))
 }
 
 impl Transcript {
+    fn new() -> Self {
+        Self {
+            lines: Vec::new(),
+            slots: Vec::new(),
+            user_lines: Vec::new(),
+        }
+    }
+
     fn push(&mut self, line: Line<'static>, slot: Option<Fold>) {
         self.lines.push(line);
         self.slots.push(slot);
@@ -1200,9 +1421,7 @@ fn subagent_activity(subagent: &Subagent) -> Vec<String> {
     for event in &subagent.events {
         match event.kind {
             EventKind::UserMessage => {
-                if let Ok(payload) =
-                    serde_json::from_value::<UserMessagePayload>(event.payload.clone())
-                {
+                if let Ok(payload) = UserMessagePayload::deserialize(&event.payload) {
                     let text = first_line(&payload.text);
                     if !text.is_empty() {
                         lines.push(format!("▶ {text}"));
@@ -1210,9 +1429,7 @@ fn subagent_activity(subagent: &Subagent) -> Vec<String> {
                 }
             }
             EventKind::AssistantMessage => {
-                if let Ok(payload) =
-                    serde_json::from_value::<AssistantMessagePayload>(event.payload.clone())
-                {
+                if let Ok(payload) = AssistantMessagePayload::deserialize(&event.payload) {
                     if let Some(reasoning) = payload
                         .reasoning
                         .as_deref()
@@ -1227,9 +1444,7 @@ fn subagent_activity(subagent: &Subagent) -> Vec<String> {
                 }
             }
             EventKind::ToolCall => {
-                if let Ok(payload) =
-                    serde_json::from_value::<ToolCallPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = ToolCallPayload::deserialize(&event.payload) {
                     lines.push(format!(
                         "⚙ {}",
                         tool_call_summary(&payload.tool, &payload.arguments)
@@ -1237,9 +1452,7 @@ fn subagent_activity(subagent: &Subagent) -> Vec<String> {
                 }
             }
             EventKind::ToolResult => {
-                if let Ok(payload) =
-                    serde_json::from_value::<ToolResultPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = ToolResultPayload::deserialize(&event.payload) {
                     let marker = if payload.ok && !payload.denied {
                         "✓"
                     } else {
@@ -1254,9 +1467,7 @@ fn subagent_activity(subagent: &Subagent) -> Vec<String> {
                 }
             }
             EventKind::ApprovalRequired => {
-                if let Ok(payload) =
-                    serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
-                {
+                if let Ok(payload) = ApprovalRequiredPayload::deserialize(&event.payload) {
                     lines.push(format!("⚠ approval: {}", first_line(&payload.summary)));
                 }
             }

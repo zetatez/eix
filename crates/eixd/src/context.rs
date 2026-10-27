@@ -78,6 +78,9 @@ struct Entry {
     /// Compaction replacements and synthesized sectors are never trimmed.
     trimmable: bool,
     summary: bool,
+    /// Tokens before the per-model calibration scale. Kept so an incremental
+    /// refresh can re-scale without rebuilding the entry.
+    base_tokens: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -94,10 +97,18 @@ struct Compaction {
 struct Policy {
     pinned: HashSet<String>,
     dropped: HashSet<String>,
+    /// Same entries as `dropped`, but keyed by event sequence so the hot
+    /// `hides_seq` check does not allocate a `format!("e{seq}")` per event.
+    dropped_seqs: HashSet<u64>,
     compactions: Vec<Compaction>,
     /// Messages at or before this sequence are excluded from the provider
     /// context (a `/clear` boundary).
     cleared_seq: Option<u64>,
+}
+
+/// Parse a history entry id (`e12`) back into its event sequence.
+fn entry_seq(id: &str) -> Option<u64> {
+    id.strip_prefix('e')?.parse().ok()
 }
 
 impl Policy {
@@ -107,7 +118,7 @@ impl Policy {
         if self.cleared_seq.is_some_and(|cleared| seq <= cleared) {
             return true;
         }
-        if self.dropped.contains(&format!("e{seq}")) {
+        if self.dropped_seqs.contains(&seq) {
             return true;
         }
         self.compactions
@@ -130,10 +141,17 @@ impl Policy {
                 }
                 EventKind::ContextDropped => {
                     if let Some(value) = decode::<ContextDropPayload>(event) {
+                        let seq = entry_seq(&value.entry);
                         if value.dropped {
                             policy.dropped.insert(value.entry);
+                            if let Some(seq) = seq {
+                                policy.dropped_seqs.insert(seq);
+                            }
                         } else {
                             policy.dropped.remove(&value.entry);
+                            if let Some(seq) = seq {
+                                policy.dropped_seqs.remove(&seq);
+                            }
                         }
                     }
                 }
@@ -285,63 +303,20 @@ impl Ledger {
         token_scale: f64,
     ) -> Self {
         let policy = Policy::from_events(events);
-        let mut entries = Vec::new();
-
-        entries.push(synthesized(
-            "system",
-            Sector::System,
-            "system",
+        let mut entries = fixed_entries(
             system,
-            false,
+            &instructions,
+            workspace.as_deref(),
+            memory,
+            tasks,
+            tools,
             &policy,
-        ));
-        for (label, text) in instructions {
-            entries.push(synthesized(
-                &format!("instructions:{label}"),
-                Sector::Instructions,
-                "instructions",
-                text,
-                true,
-                &policy,
-            ));
-        }
-        if let Some(text) = workspace {
-            entries.push(synthesized(
-                "workspace",
-                Sector::Workspace,
-                "workspace",
-                text,
-                true,
-                &policy,
-            ));
-        }
-        if !tools.is_empty() {
-            entries.push(tool_schema_entry(tools));
-        }
-        if let Some(text) = memory {
-            entries.push(synthesized(
-                "memory",
-                Sector::Memory,
-                "memory",
-                format!("Project memory (persisted across sessions; do not treat as user input):\n{text}"),
-                true,
-                &policy,
-            ));
-        }
-        if let Some(text) = tasks {
-            entries.push(synthesized(
-                "tasks",
-                Sector::Memory,
-                "tasks",
-                text,
-                true,
-                &policy,
-            ));
-        }
-        entries.extend(event_entries(events, &policy, images, tool_output_tokens));
+        );
+        let (event_entries, _) = event_entries_with_claimed(events, images, tool_output_tokens);
+        entries.extend(event_entries);
 
         let mut entries = apply_compactions(entries, &policy.compactions);
-        scale_entries(&mut entries, token_scale);
+        prepare_entries(&mut entries, &policy, token_scale);
         let trimmed = trim(&mut entries, budget_tokens);
         let result = summarize(&entries, budget_tokens, trimmed);
 
@@ -350,6 +325,85 @@ impl Ledger {
             compactions: policy.compactions,
             result,
         }
+    }
+
+    /// Append history entries for events that arrived after the last build and
+    /// refresh the fixed sectors, calibration and trim in place. Returns
+    /// `false` when the batch needs a full rebuild; the caller must then throw
+    /// this ledger away and build a new one.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_extend(
+        &mut self,
+        new_events: &[Event],
+        all_events: &[Event],
+        images: &HashMap<String, ImagePart>,
+        tool_output_tokens: usize,
+        system: String,
+        static_context: &StaticContext,
+        memory: Option<String>,
+        tasks: Option<String>,
+        tools: &[ToolDefinition],
+        token_scale: f64,
+        budget_tokens: usize,
+    ) -> bool {
+        // A compaction rewrites earlier entries; replaying it is the only way
+        // to keep the ledger identical to a fresh build.
+        if new_events
+            .iter()
+            .any(|event| event.kind == EventKind::ContextCompacted)
+        {
+            return false;
+        }
+        let policy = Policy::from_events(all_events);
+        let appended = if new_events.is_empty() {
+            None
+        } else {
+            let (entries, claimed) =
+                event_entries_with_claimed(new_events, images, tool_output_tokens);
+            // An unclaimed result belongs to a tool call from an earlier
+            // round. Only a full rebuild can attach it to that assistant
+            // message; appending it alone would leave a bare tool message.
+            if new_events
+                .iter()
+                .any(|event| event.kind == EventKind::ToolResult && !claimed.contains(&event.seq))
+            {
+                return false;
+            }
+            Some(entries)
+        };
+
+        let budget_tokens = budget_tokens.max(1);
+        let system = cap_system(system, budget_tokens);
+        // Move the event-derived entries out so they can be recombined with a
+        // freshly built fixed sector without cloning message contents. Old
+        // summaries are dropped and regenerated by `apply_compactions` so the
+        // result matches a full build, including entry order.
+        let previous = std::mem::take(&mut self.entries);
+        let mut history: Vec<Entry> = previous
+            .into_iter()
+            .filter(|entry| entry.seq.is_some() && !entry.summary)
+            .collect();
+        if let Some(mut appended) = appended {
+            history.append(&mut appended);
+        }
+
+        let mut entries = fixed_entries(
+            system,
+            &static_context.instructions,
+            static_context.workspace.as_deref(),
+            memory,
+            tasks,
+            tools,
+            &policy,
+        );
+        entries.extend(history);
+        let mut entries = apply_compactions(entries, &policy.compactions);
+        prepare_entries(&mut entries, &policy, token_scale);
+        let trimmed = trim(&mut entries, budget_tokens);
+        self.result = summarize(&entries, budget_tokens, trimmed);
+        self.entries = entries;
+        self.compactions = policy.compactions;
+        true
     }
 
     /// Active compaction summaries, used as the starting point for the next
@@ -524,6 +578,76 @@ impl Ledger {
     }
 }
 
+/// Build the fixed sectors (system, instructions, workspace, tools, memory and
+/// tasks). These do not depend on the event log, so an incremental refresh can
+/// rebuild them without touching history entries.
+#[allow(clippy::too_many_arguments)]
+fn fixed_entries(
+    system: String,
+    instructions: &[(String, String)],
+    workspace: Option<&str>,
+    memory: Option<String>,
+    tasks: Option<String>,
+    tools: &[ToolDefinition],
+    policy: &Policy,
+) -> Vec<Entry> {
+    let mut entries = Vec::new();
+    entries.push(synthesized(
+        "system",
+        Sector::System,
+        "system",
+        system,
+        false,
+        policy,
+    ));
+    for (label, text) in instructions {
+        entries.push(synthesized(
+            &format!("instructions:{label}"),
+            Sector::Instructions,
+            "instructions",
+            text.clone(),
+            true,
+            policy,
+        ));
+    }
+    if let Some(text) = workspace {
+        entries.push(synthesized(
+            "workspace",
+            Sector::Workspace,
+            "workspace",
+            text.to_string(),
+            true,
+            policy,
+        ));
+    }
+    if !tools.is_empty() {
+        entries.push(tool_schema_entry(tools));
+    }
+    if let Some(text) = memory {
+        entries.push(synthesized(
+            "memory",
+            Sector::Memory,
+            "memory",
+            format!(
+                "Project memory (persisted across sessions; do not treat as user input):\n{text}"
+            ),
+            true,
+            policy,
+        ));
+    }
+    if let Some(text) = tasks {
+        entries.push(synthesized(
+            "tasks",
+            Sector::Memory,
+            "tasks",
+            text,
+            true,
+            policy,
+        ));
+    }
+    entries
+}
+
 fn tool_schema_entry(tools: &[ToolDefinition]) -> Entry {
     let tokens = estimate_tool_schema_tokens(tools);
     let mut entry = make_entry(
@@ -535,6 +659,7 @@ fn tool_schema_entry(tools: &[ToolDefinition]) -> Entry {
         false,
     );
     entry.info.tokens = tokens;
+    entry.base_tokens = tokens;
     entry.info.preview = format!("{} tool definitions", tools.len());
     entry.info.detail = format!(
         "Tool JSON schemas are sent with every request ({} tools).",
@@ -565,7 +690,10 @@ fn synthesized(
     entry
 }
 
-async fn load_images(events: &[Event], blobs: Option<&BlobStore>) -> HashMap<String, ImagePart> {
+pub(crate) async fn load_images(
+    events: &[Event],
+    blobs: Option<&BlobStore>,
+) -> HashMap<String, ImagePart> {
     let Some(blobs) = blobs else {
         return HashMap::new();
     };
@@ -597,12 +725,15 @@ async fn load_images(events: &[Event], blobs: Option<&BlobStore>) -> HashMap<Str
     loaded
 }
 
-fn event_entries(
+/// Decode history entries from `events`, also returning the sequences of tool
+/// results that were attached to an assistant message in the same batch. An
+/// incremental refresh uses the set to detect results whose call lives in an
+/// earlier batch and therefore needs a full rebuild.
+fn event_entries_with_claimed(
     events: &[Event],
-    policy: &Policy,
     blob_images: &HashMap<String, ImagePart>,
     tool_output_tokens: usize,
-) -> Vec<Entry> {
+) -> (Vec<Entry>, HashSet<u64>) {
     // Tool results are matched to the assistant message that requested them so
     // a dropped or compacted step never produces a `tool` message without its
     // preceding `tool_calls`. Keep every result for a call id: some providers
@@ -659,7 +790,7 @@ fn event_entries(
                     true,
                 );
                 entry.info.preview = snippet(&first_line(&payload.text), MAX_PREVIEW_CHARS);
-                entries.push(with_policy(entry, policy));
+                entries.push(entry);
             }
             EventKind::AssistantMessage => {
                 let Some(payload) = decode::<AssistantMessagePayload>(event) else {
@@ -709,7 +840,7 @@ fn event_entries(
                         true,
                     );
                     entry.info.preview = snippet(&preview, MAX_PREVIEW_CHARS);
-                    entries.push(with_policy(entry, policy));
+                    entries.push(entry);
                 } else {
                     // Never emit a bare `tool_calls` block without results.
                     if payload.text.trim().is_empty() {
@@ -724,7 +855,7 @@ fn event_entries(
                         true,
                     );
                     entry.info.preview = snippet(&first_line(&payload.text), MAX_PREVIEW_CHARS);
-                    entries.push(with_policy(entry, policy));
+                    entries.push(entry);
                 }
             }
             EventKind::ToolResult => {
@@ -750,25 +881,12 @@ fn event_entries(
                     &format!("{}: {}", payload.tool, first_line(&payload.output)),
                     MAX_PREVIEW_CHARS,
                 );
-                entries.push(with_policy(entry, policy));
+                entries.push(entry);
             }
             _ => {}
         }
     }
-    if let Some(cleared) = policy.cleared_seq {
-        for entry in &mut entries {
-            if entry.seq.is_some_and(|seq| seq <= cleared) {
-                entry.info.dropped = true;
-            }
-        }
-    }
-    entries
-}
-
-fn with_policy(mut entry: Entry, policy: &Policy) -> Entry {
-    entry.info.pinned = policy.pinned.contains(&entry.info.id);
-    entry.info.dropped = policy.dropped.contains(&entry.info.id);
-    entry
+    (entries, claimed)
 }
 
 /// Estimate one provider message, including tool-call arguments and images.
@@ -829,12 +947,20 @@ fn scale_tokens(tokens: usize, scale: f64) -> usize {
     (tokens as f64 * scale).ceil() as usize
 }
 
-fn scale_entries(entries: &mut [Entry], scale: f64) {
-    if !scale.is_finite() || (scale - 1.0).abs() <= f64::EPSILON {
-        return;
-    }
+/// Re-apply model calibration, pin/drop policy and the `/clear` boundary to a
+/// set of entries. Automatic drops from a previous round are cleared so the
+/// trimmers can make a fresh decision against the current budget; compaction
+/// flags are left alone because only a full rebuild replays those events.
+fn prepare_entries(entries: &mut [Entry], policy: &Policy, scale: f64) {
+    let cleared = policy.cleared_seq;
     for entry in entries {
-        entry.info.tokens = scale_tokens(entry.info.tokens, scale);
+        entry.info.tokens = scale_tokens(entry.base_tokens, scale);
+        entry.info.auto = false;
+        entry.info.pinned = policy.pinned.contains(&entry.info.id);
+        entry.info.dropped = policy.dropped.contains(&entry.info.id)
+            || entry
+                .seq
+                .is_some_and(|seq| cleared.is_some_and(|cleared| seq <= cleared));
     }
 }
 
@@ -848,16 +974,40 @@ fn make_entry(
 ) -> Entry {
     let mut tokens = 0;
     let mut chars = 0;
-    let mut parts = Vec::new();
+    let mut detail = String::new();
+    let mut detail_chars = 0usize;
+    let mut preview = String::new();
     for message in &messages {
         tokens += estimate_message_tokens(message);
         chars += message.content.chars().count();
-        if !message.content.is_empty() {
-            parts.push(message.content.clone());
+        if message.content.is_empty() {
+            continue;
         }
+        if preview.is_empty() {
+            preview = first_line(&message.content);
+        }
+        // Build the detail inline instead of cloning every message into a
+        // `parts` vector and joining it twice. Tool outputs are the bulk of a
+        // long history, so the extra copies were paid on every rebuild.
+        if detail_chars >= MAX_DETAIL_CHARS {
+            continue;
+        }
+        if !detail.is_empty() {
+            detail.push_str("\n\n");
+            detail_chars += 2;
+        }
+        let room = MAX_DETAIL_CHARS.saturating_sub(detail_chars);
+        let text = &message.content;
+        let end = text
+            .char_indices()
+            .nth(room)
+            .map(|(index, _)| index)
+            .unwrap_or(text.len());
+        detail.push_str(&text[..end]);
+        detail_chars += text[..end].chars().count();
     }
-    let detail = snippet(&parts.join("\n\n"), MAX_DETAIL_CHARS);
-    let preview = snippet(&first_line(&parts.join("\n")), MAX_PREVIEW_CHARS);
+    let detail = snippet(&detail, MAX_DETAIL_CHARS);
+    let preview = snippet(&preview, MAX_PREVIEW_CHARS);
     let trimmable = editable && matches!(sector, Sector::History | Sector::Tools);
     Entry {
         info: ContextEntryInfo {
@@ -874,6 +1024,7 @@ fn make_entry(
             auto: false,
             editable,
         },
+        base_tokens: tokens,
         messages,
         seq,
         trimmable,
@@ -993,11 +1144,10 @@ fn trim_sector(entries: &mut [Entry], sector: Sector, cap: usize) {
     }
 }
 
-/// Trim once more against the total budget, alternating sectors. This only
-/// matters when the fixed sectors (system/instructions/workspace) are large.
-fn drop_oldest(entries: &mut [Entry], sector: Sector) -> bool {
-    let latest_user = latest_user_seq(entries);
-    let candidates: Vec<usize> = entries
+/// Entries the global trim may drop, oldest first. Computing this once keeps
+/// `trim` linear instead of rescanning the whole ledger for every drop.
+fn trimmable_candidates(entries: &[Entry], sector: Sector, latest_user: Option<u64>) -> Vec<usize> {
+    entries
         .iter()
         .enumerate()
         .filter(|(_, entry)| {
@@ -1009,33 +1159,38 @@ fn drop_oldest(entries: &mut [Entry], sector: Sector) -> bool {
                 && !(entry.info.kind == "user" && entry.seq == latest_user)
         })
         .map(|(index, _)| index)
-        .collect();
-    if candidates.len() <= KEEP_NEWEST {
-        return false;
-    }
-    let index = candidates[0];
+        .collect()
+}
+
+fn active_tokens(entries: &[Entry]) -> usize {
+    entries
+        .iter()
+        .filter(|entry| !entry.info.dropped && !entry.info.compacted)
+        .map(|entry| entry.info.tokens)
+        .sum()
+}
+
+fn drop_at(entries: &mut [Entry], index: usize, total: &mut usize) {
     entries[index].info.dropped = true;
     entries[index].info.auto = true;
-    true
+    *total = total.saturating_sub(entries[index].info.tokens);
 }
 
 /// Drop the oldest entry from a normally-fixed sector. These entries are not
 /// part of the normal tool/history budget, but when instructions or workspace
 /// alone exceed the request budget the alternative is a guaranteed provider
 /// context-length error. The `auto` flag makes the loss visible in the ledger.
-fn drop_fixed(entries: &mut [Entry], sector: Sector) -> bool {
-    let Some(index) = entries.iter().position(|entry| {
+fn drop_fixed(entries: &mut [Entry], sector: Sector) -> Option<usize> {
+    let index = entries.iter().position(|entry| {
         entry.info.sector == sector
             && !entry.info.dropped
             && !entry.info.compacted
             && !entry.info.pinned
             && !entry.summary
-    }) else {
-        return false;
-    };
+    })?;
     entries[index].info.dropped = true;
     entries[index].info.auto = true;
-    true
+    Some(entries[index].info.tokens)
 }
 
 fn trim(entries: &mut [Entry], budget: usize) -> usize {
@@ -1050,27 +1205,26 @@ fn trim(entries: &mut [Entry], budget: usize) -> usize {
         (budget as f64 * Sector::History.budget_percent()) as usize,
     );
 
-    let mut total: usize = entries
-        .iter()
-        .filter(|entry| !entry.info.dropped && !entry.info.compacted)
-        .map(|entry| entry.info.tokens)
-        .sum();
-    let mut guard = 0;
-    while total > budget && guard < entries.len() * 2 {
-        guard += 1;
-        let dropped = if drop_oldest(entries, Sector::Tools) {
-            true
-        } else {
-            drop_oldest(entries, Sector::History)
-        };
-        if !dropped {
-            break;
+    let mut total = active_tokens(entries);
+    if total > budget {
+        // Drop the oldest tool entries first, then history, keeping the newest
+        // `KEEP_NEWEST` in each sector. Candidates are computed once and the
+        // running total is decremented in place, so this is O(entries) rather
+        // than re-scanning the ledger for every drop.
+        let latest_user = latest_user_seq(entries);
+        for sector in [Sector::Tools, Sector::History] {
+            let candidates = trimmable_candidates(entries, sector, latest_user);
+            let droppable = candidates.len().saturating_sub(KEEP_NEWEST);
+            for &index in &candidates[..droppable] {
+                if total <= budget {
+                    break;
+                }
+                drop_at(entries, index, &mut total);
+            }
+            if total <= budget {
+                break;
+            }
         }
-        total = entries
-            .iter()
-            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
-            .map(|entry| entry.info.tokens)
-            .sum();
     }
 
     // The normal pass protects the newest four entries so the model does not
@@ -1079,24 +1233,18 @@ fn trim(entries: &mut [Entry], budget: usize) -> usize {
     // drop older tool/history entries. Without this, a single noisy turn could
     // make every later provider request fail with a context-length error.
     if total > budget {
-        emergency_trim(entries, budget, total);
-        total = entries
-            .iter()
-            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
-            .map(|entry| entry.info.tokens)
-            .sum();
+        emergency_trim(entries, budget, &mut total);
     }
 
     // Fixed sectors are normally protected, but a huge instruction file or
     // workspace summary must not defeat the budget entirely. Drop them
     // oldest-first and mark them `auto` so the UI can explain the loss.
     for sector in [Sector::Instructions, Sector::Workspace, Sector::Memory] {
-        while total > budget && drop_fixed(entries, sector) {
-            total = entries
-                .iter()
-                .filter(|entry| !entry.info.dropped && !entry.info.compacted)
-                .map(|entry| entry.info.tokens)
-                .sum();
+        while total > budget {
+            let Some(dropped) = drop_fixed(entries, sector) else {
+                break;
+            };
+            total = total.saturating_sub(dropped);
         }
         if total <= budget {
             break;
@@ -1114,16 +1262,16 @@ fn latest_user_seq(entries: &[Entry]) -> Option<u64> {
         .max()
 }
 
-fn emergency_trim(entries: &mut [Entry], budget: usize, mut total: usize) {
+fn emergency_trim(entries: &mut [Entry], budget: usize, total: &mut usize) {
     let latest_user = latest_user_seq(entries);
     let newest_active = entries
         .iter()
         .rposition(|entry| entry.trimmable && !entry.info.dropped && !entry.info.compacted);
-
-    let mut guard = 0;
-    while total > budget && guard < entries.len() {
-        guard += 1;
-        let candidate = entries.iter().enumerate().find(|(index, entry)| {
+    // Same candidate order the old repeated `find` produced, but built once.
+    let candidates: Vec<usize> = entries
+        .iter()
+        .enumerate()
+        .filter(|(index, entry)| {
             entry.trimmable
                 && !entry.summary
                 && !entry.info.pinned
@@ -1131,13 +1279,14 @@ fn emergency_trim(entries: &mut [Entry], budget: usize, mut total: usize) {
                 && !entry.info.compacted
                 && Some(*index) != newest_active
                 && !(entry.info.kind == "user" && entry.seq == latest_user)
-        });
-        let Some((index, _)) = candidate else {
+        })
+        .map(|(index, _)| index)
+        .collect();
+    for index in candidates {
+        if *total <= budget {
             break;
-        };
-        entries[index].info.dropped = true;
-        entries[index].info.auto = true;
-        total = total.saturating_sub(entries[index].info.tokens);
+        }
+        drop_at(entries, index, total);
     }
 }
 
@@ -1356,6 +1505,11 @@ async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
 /// wide scripts are close to one token per character. Deliberately cheap: the
 /// ledger only needs to be directionally right.
 pub fn estimate_tokens(text: &str) -> usize {
+    // Most prompt text is ASCII; byte length is an exact answer there and
+    // avoids decoding and range-checking every character.
+    if text.is_ascii() {
+        return text.len().div_ceil(4);
+    }
     let mut wide = 0usize;
     let mut narrow = 0usize;
     for ch in text.chars() {
@@ -1465,7 +1619,9 @@ fn first_line(text: &str) -> String {
 }
 
 fn decode<T: DeserializeOwned>(event: &Event) -> Option<T> {
-    serde_json::from_value(event.payload.clone()).ok()
+    // `&Value` is a deserializer, so decoding borrows the payload instead of
+    // deep-cloning it first. History entries are decoded on every rebuild.
+    T::deserialize(&event.payload).ok()
 }
 
 #[cfg(test)]
@@ -1995,6 +2151,82 @@ mod tests {
                 duration_ms: None,
             }),
         )
+    }
+
+    /// Helper for the incremental tests: extend with an empty static context
+    /// and no images/tools, mirroring what `Daemon::extend_ledger` does at its
+    /// simplest.
+    fn extend_in_place(ledger: &mut Ledger, all: &[Event], new: &[Event]) -> bool {
+        let static_context = StaticContext::default();
+        ledger.try_extend(
+            new,
+            all,
+            &HashMap::new(),
+            DEFAULT_TOOL_OUTPUT_TOKENS,
+            "sys".into(),
+            &static_context,
+            None,
+            None,
+            &[],
+            1.0,
+            10_000,
+        )
+    }
+
+    fn entry_summary(ledger: &Ledger) -> Vec<(String, usize, bool)> {
+        ledger
+            .info()
+            .entries
+            .into_iter()
+            .map(|entry| (entry.id, entry.tokens, entry.compacted))
+            .collect()
+    }
+
+    #[test]
+    fn incremental_extend_matches_a_full_build() {
+        let first = vec![user(1, "read it")];
+        let mut ledger = Ledger::assemble("sys".into(), vec![], None, &first, 10_000);
+        let all = vec![
+            user(1, "read it"),
+            tool_step(2, "", vec![call("call_1")]),
+            tool_result(3, "call_1", "fn main() {}"),
+            assistant(4, "done"),
+        ];
+        assert!(extend_in_place(&mut ledger, &all, &all[1..]));
+        let full = Ledger::assemble("sys".into(), vec![], None, &all, 10_000);
+        assert_eq!(ledger.messages(), full.messages());
+        assert_eq!(entry_summary(&ledger), entry_summary(&full));
+    }
+
+    #[test]
+    fn incremental_extend_refuses_a_cross_batch_tool_result() {
+        let first = vec![user(1, "read it"), tool_step(2, "", vec![call("call_1")])];
+        let mut ledger = Ledger::assemble("sys".into(), vec![], None, &first, 10_000);
+        let mut all = first.clone();
+        all.push(tool_result(3, "call_1", "fn main() {}"));
+        // The assistant call was built into the ledger by an earlier batch, so
+        // the result cannot be attached without a full rebuild.
+        assert!(!extend_in_place(&mut ledger, &all, &all[2..]));
+    }
+
+    #[test]
+    fn incremental_extend_refuses_a_compaction() {
+        let first = vec![user(1, "read it"), assistant(2, "done")];
+        let mut ledger = Ledger::assemble("sys".into(), vec![], None, &first, 10_000);
+        let mut all = first.clone();
+        all.push(event(
+            3,
+            EventKind::ContextCompacted,
+            payload(&ContextCompactedPayload {
+                from_seq: 1,
+                to_seq: 1,
+                messages: 1,
+                tokens: 1,
+                summary: "one".into(),
+                rolling: false,
+            }),
+        ));
+        assert!(!extend_in_place(&mut ledger, &all, &all[2..]));
     }
 
     #[test]

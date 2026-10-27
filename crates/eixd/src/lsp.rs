@@ -282,6 +282,10 @@ impl Client {
 pub struct LspSet {
     clients: HashMap<(String, PathBuf), Client>,
     failures: HashMap<(String, PathBuf), String>,
+    /// Recent workspace walks, keyed by root and file cap. Diagnostics are
+    /// usually requested in bursts; re-walking a large repo each time is pure
+    /// overhead. Cleared on config reload along with the servers.
+    files: HashMap<(PathBuf, usize), (Instant, Vec<PathBuf>, usize)>,
 }
 
 impl LspSet {
@@ -385,6 +389,37 @@ impl LspSet {
             .collect()
     }
 
+    /// Walk candidates off the runtime thread and reuse the result for a short
+    /// while. `workspace_files` is synchronous directory I/O; on a large repo
+    /// it used to stall every other session for the length of the walk.
+    async fn workspace_file_list(
+        &mut self,
+        root: &Path,
+        config: &Config,
+        max: usize,
+    ) -> Result<(Vec<PathBuf>, usize)> {
+        const TTL: Duration = Duration::from_secs(30);
+        const MAX_CACHED: usize = 8;
+        let key = (root.to_path_buf(), max);
+        if let Some((at, files, skipped)) = self.files.get(&key) {
+            if at.elapsed() < TTL {
+                return Ok((files.clone(), *skipped));
+            }
+        }
+        let root = root.to_path_buf();
+        let config = config.clone();
+        let (files, skipped) =
+            tokio::task::spawn_blocking(move || workspace_files(&root, &config, max))
+                .await
+                .context("lsp workspace scan failed")?;
+        if self.files.len() >= MAX_CACHED {
+            self.files.clear();
+        }
+        self.files
+            .insert(key, (Instant::now(), files.clone(), skipped));
+        Ok((files, skipped))
+    }
+
     /// Open every source file under `cwd` that a configured server claims and
     /// aggregate published diagnostics. This is intentionally on-demand: some
     /// language servers are expensive to warm up.
@@ -395,7 +430,7 @@ impl LspSet {
         max_files: usize,
     ) -> Result<LspWorkspaceResult> {
         let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
-        let (files, skipped) = workspace_files(&root, config, max_files);
+        let (files, skipped) = self.workspace_file_list(&root, config, max_files).await?;
         if files.is_empty() {
             return Ok(LspWorkspaceResult {
                 skipped,

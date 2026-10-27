@@ -52,7 +52,10 @@ use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
-use crate::context::{estimate_request_tokens, estimate_tool_schema_tokens, Ledger, StaticContext};
+use crate::context::{
+    estimate_messages_tokens, estimate_tool_schema_tokens, load_images as load_event_images,
+    Ledger, StaticContext,
+};
 use crate::permissions::{
     command_is_parallel_readonly, decide as permission_decide, PermissionDecision,
 };
@@ -4582,24 +4585,28 @@ impl Daemon {
             .build_ledger_from_events(session_id, allowed_tools, &events, &static_context)
             .await?;
         let keep_turns = config.context.auto_compact_keep_turns;
-        let (ledger, _) = if config.context.auto_compact && session.origin != SessionOrigin::Agent {
-            self.auto_compact_if_needed(
-                session_id,
-                ledger,
-                false,
-                keep_turns,
-                allowed_tools,
-                &mut events,
-                &mut last_seq,
-                &static_context,
-            )
-            .await
-        } else {
-            (ledger, false)
-        };
+        let (mut ledger, _) =
+            if config.context.auto_compact && session.origin != SessionOrigin::Agent {
+                self.auto_compact_if_needed(
+                    session_id,
+                    ledger,
+                    false,
+                    keep_turns,
+                    allowed_tools,
+                    &mut events,
+                    &mut last_seq,
+                    &static_context,
+                )
+                .await
+            } else {
+                (ledger, false)
+            };
         let mut messages = ledger.messages();
         self.emit_context(session_id, &ledger);
         let tools = allowed_tools;
+        // Tool schemas are fixed for the whole turn. Serializing them for the
+        // token estimate once avoids repeating it on every round and retry.
+        let tool_schema_tokens = estimate_tool_schema_tokens(tools);
         let route = config.route(&model);
         let (max_retries, retry_base, retry_max) = (
             config.provider_runtime.retry_attempts,
@@ -4625,23 +4632,42 @@ impl Daemon {
                 return Ok(());
             }
 
-            // Rebuild from the event log after every tool batch. This applies
-            // budget trimming to the newly added outputs, picks up todo/memory
-            // updates, and lets auto-compaction run mid-turn instead of only
-            // before the first request.
+            // Refresh the ledger after every tool batch. Appending entries for
+            // the new events avoids re-decoding the whole history on each
+            // round; the fixed sectors, budget trimming and todo/memory
+            // updates are still refreshed, and auto-compaction can run
+            // mid-turn instead of only before the first request.
             if round > 0 {
+                let before = events.len();
                 self.refresh_turn_events(session_id, &mut events, &mut last_seq)
                     .await?;
-                let refreshed = self
-                    .build_ledger_from_events(session_id, allowed_tools, &events, &static_context)
+                let extended = self
+                    .extend_ledger(
+                        session_id,
+                        allowed_tools,
+                        &events,
+                        &events[before..],
+                        &static_context,
+                        &mut ledger,
+                    )
                     .await?;
+                if !extended {
+                    ledger = self
+                        .build_ledger_from_events(
+                            session_id,
+                            allowed_tools,
+                            &events,
+                            &static_context,
+                        )
+                        .await?;
+                }
                 let auto_compact = self.config.load().context.auto_compact
                     && session.origin != SessionOrigin::Agent;
                 let keep = self.config.load().context.auto_compact_keep_turns;
                 let (refreshed, compacted) = if auto_compact && auto_compactions < 2 {
                     self.auto_compact_if_needed(
                         session_id,
-                        refreshed,
+                        ledger,
                         false,
                         keep,
                         allowed_tools,
@@ -4651,13 +4677,14 @@ impl Daemon {
                     )
                     .await
                 } else {
-                    (refreshed, false)
+                    (ledger, false)
                 };
+                ledger = refreshed;
                 if compacted {
                     auto_compactions += 1;
                 }
-                messages = refreshed.messages();
-                self.emit_context(session_id, &refreshed);
+                messages = ledger.messages();
+                self.emit_context(session_id, &ledger);
             }
 
             // The model stops by returning an answer without tool calls, and
@@ -4677,7 +4704,7 @@ impl Daemon {
                 let tid = turn_id.to_string();
                 let mut streamed = String::new();
                 let mut streamed_reasoning = String::new();
-                let estimated_prompt = estimate_request_tokens(&messages, request_tools);
+                let estimated_prompt = estimate_messages_tokens(&messages) + tool_schema_tokens;
                 let outcome = provider
                     .stream_chat(&messages, &route, request_tools, cancel.as_ref(), |delta| {
                         match delta {
@@ -6809,6 +6836,57 @@ impl Daemon {
             budget,
         )
         .await)
+    }
+
+    /// Extend an existing ledger with events written since the last round.
+    /// Returns `false` when the batch needs the slower full rebuild (a
+    /// compaction or a tool result that belongs to an earlier assistant
+    /// message). The fixed sectors, calibration and trim are always refreshed,
+    /// so todo/memory updates take effect even when no event was appended.
+    #[allow(clippy::too_many_arguments)]
+    async fn extend_ledger(
+        &self,
+        session_id: &str,
+        tools: &[ToolDefinition],
+        all_events: &[Event],
+        new_events: &[Event],
+        static_context: &StaticContext,
+        ledger: &mut Ledger,
+    ) -> Result<bool> {
+        let session = self.require_session(session_id)?;
+        let config = self.config.load_full();
+        let mode = self.session_mode(&session);
+        let todos = self
+            .todos
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default();
+        let tasks = (!todos.is_empty()).then(|| todo_context(&todos));
+        let memory = self.memory.read(&session.cwd).await;
+        let model = session
+            .model
+            .clone()
+            .unwrap_or_else(|| config.default_model().to_string());
+        let route = config.route(&model);
+        let budget = config.context.effective_budget_tokens(route.context_tokens);
+        let resources = self.prompt_resources(&config, &session.cwd).await;
+        // Only the new events can contribute images to appended entries.
+        let images = load_event_images(new_events, Some(&self.blobs)).await;
+        Ok(ledger.try_extend(
+            new_events,
+            all_events,
+            &images,
+            config.context.tool_output_tokens,
+            system_prompt(&config, &session, mode, Some(&resources)),
+            static_context,
+            memory,
+            tasks,
+            tools,
+            self.token_scale(&model),
+            budget,
+        ))
     }
 
     /// Append events written since the last snapshot. Compaction events and

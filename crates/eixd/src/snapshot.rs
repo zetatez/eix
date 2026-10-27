@@ -203,6 +203,36 @@ impl Snapshotter {
     }
 }
 
+/// Copy `src` to `dst`, preferring a copy-on-write reflink. A `run_command`
+/// snapshots the whole workspace, and a regular copy of every file is the
+/// slowest part of the command. btrfs/XFS reflinks make it metadata-only; other
+/// filesystems fall back to `std::fs::copy`.
+fn copy_file(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // FICLONE = _IOW(0x94, 9, int) on Linux.
+        const FICLONE: libc::c_ulong = 0x4004_9409;
+        if let Ok(input) = std::fs::File::open(src) {
+            if let Ok(output) = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(dst)
+            {
+                let rc = unsafe { libc::ioctl(output.as_raw_fd(), FICLONE, input.as_raw_fd()) };
+                if rc == 0 {
+                    return std::fs::metadata(dst).map(|meta| meta.len());
+                }
+                // The reflink was rejected; drop the empty file so the
+                // fallback starts from a clean destination.
+                drop(output);
+                let _ = std::fs::remove_file(dst);
+            }
+        }
+    }
+    std::fs::copy(src, dst)
+}
+
 fn capture_file_blocking(
     root: &Path,
     session_id: &str,
@@ -243,7 +273,7 @@ fn capture_file_blocking(
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            match std::fs::copy(path, &target) {
+            match copy_file(path, &target) {
                 Ok(_) => {
                     files = 1;
                     bytes = meta.len();
@@ -371,7 +401,7 @@ fn capture_tree_blocking(
                 skipped += 1;
                 continue;
             }
-            match std::fs::copy(&path, &target) {
+            match copy_file(&path, &target) {
                 Ok(_) => {
                     files += 1;
                     bytes += size;
