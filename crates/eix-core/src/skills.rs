@@ -35,9 +35,65 @@ pub struct Skill {
     pub source: PathBuf,
 }
 
+const FRONTEND_SKILL: &str = r#"# Frontend
+
+Use when building or restyling a UI. Follow the existing design system and framework conventions first.
+
+- Start from the audience and domain: operational tools should feel quiet, dense, and scannable; games and editorial pages can be more expressive.
+- Use purposeful typography; avoid default stacks (Inter, Roboto, Arial, system) unless the project already uses them.
+- Set a clear visual direction with CSS variables; avoid purple-on-white defaults and a default dark theme.
+- Build atmosphere with gradients, shapes, or subtle patterns instead of flat single-color backgrounds.
+- Use a few meaningful animations (page load, staggered reveal); avoid generic micro-motion everywhere.
+- Avoid boilerplate hero sections, interchangeable card grids, and marketing layouts for tools.
+- Keep navigation predictable and common workflows ergonomic; make dense information easy to scan and compare.
+- Ensure the page works on desktop and mobile, with accessible contrast, focus states, and reduced-motion support.
+"#;
+
+const ENGINEERING_SKILL: &str = r#"# Engineering judgment
+
+Use for refactors, data-model changes, or work where structure, abstraction, or test scope matters.
+
+- Prefer the repo's existing patterns, frameworks, and helper APIs over inventing a new abstraction.
+- Use structured parsers and serializers for structured data instead of ad hoc string manipulation.
+- Add an abstraction only when it removes real complexity, reduces meaningful duplication, or matches an established local pattern.
+- Keep edits inside the modules and ownership boundaries implied by the request; leave unrelated refactors and metadata churn alone.
+- Scale tests with risk and blast radius: focused for narrow changes, broader for shared behavior, cross-module contracts, and user-facing flows.
+- Handle errors explicitly; don't swallow failures or turn them into silent fallbacks.
+- Check call sites and invariants before changing a shared API; migrate all callers instead of leaving compatibility shims unless asked.
+"#;
+
+/// Skills every installation has. User and project skills with the same name
+/// override them.
+pub fn builtin_skills() -> Vec<Skill> {
+    [
+        (
+            "frontend",
+            "UI design guidance: typography, color, layout, motion, and responsive behavior.",
+            FRONTEND_SKILL,
+        ),
+        (
+            "engineering",
+            "Deeper judgment for refactors, data models, abstractions, and test scope.",
+            ENGINEERING_SKILL,
+        ),
+    ]
+    .into_iter()
+    .map(|(name, description, body)| Skill {
+        name: name.to_string(),
+        description: description.to_string(),
+        body: body.trim().to_string(),
+        allowed_tools: Vec::new(),
+        source: PathBuf::from(format!("<builtin>/{name}/SKILL.md")),
+    })
+    .collect()
+}
+
 /// Skills visible from `cwd`, sorted by name.
 pub fn load_skills(cwd: &Path, compat: &CompatConfig) -> Vec<Skill> {
-    let mut by_name: BTreeMap<String, Skill> = BTreeMap::new();
+    let mut by_name: BTreeMap<String, Skill> = builtin_skills()
+        .into_iter()
+        .map(|skill| (skill.name.clone(), skill))
+        .collect();
     for source in crate::compat::skill_sources(cwd, compat) {
         collect_from(&source, &mut by_name);
     }
@@ -259,6 +315,34 @@ mod tests {
         let prompt = available_prompt(&skills);
         assert!(prompt.contains("<name>review</name>"));
         assert!(prompt.contains("use_skill"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn builtin_skills_are_listed_and_project_skills_override_them() {
+        let builtins = builtin_skills();
+        for name in ["frontend", "engineering"] {
+            let skill = builtins
+                .iter()
+                .find(|skill| skill.name == name)
+                .unwrap_or_else(|| panic!("missing builtin {name}"));
+            assert!(!skill.body.is_empty());
+            assert!(skill.source.starts_with("<builtin>"));
+        }
+        let prompt = available_prompt(&builtins);
+        assert!(prompt.contains("<name>frontend</name>"));
+        assert!(prompt.contains("<name>engineering</name>"));
+
+        let root = temp_dir("builtin");
+        std::fs::create_dir_all(root.join(".eix/skills/frontend")).unwrap();
+        std::fs::write(
+            root.join(".eix/skills/frontend/SKILL.md"),
+            "---\nname: frontend\ndescription: local frontend\n---\nLocal body\n",
+        )
+        .unwrap();
+        let frontend = find_skill(&root, "frontend", &CompatConfig::default()).expect("frontend");
+        assert_eq!(frontend.description, "local frontend");
+        assert_eq!(frontend.body, "Local body");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -689,7 +689,8 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   跑可能失败的检查、覆盖边界/错误路径、看 diff、不重复未变化的检查、不为通过而改测试，
   跑不了就说明。Communication 段约束分组工具调用前的简短说明、review 未要求不改代码且先列
   findings、最终答复简洁且不倾倒文件内容；Continuity 段规定新消息以最新为准，
-  resume/压缩后从摘要继续而不是重来。
+  resume/压缩后从摘要继续而不是重来。前端设计和更细的工程判断不放进基座，改为内置
+  `frontend` / `engineering` skill，由模型按任务需要加载。
   工具批次按只读段并发：内置读工具和风险分析判定低风险只读、权限放行的 `run_command`
   可以在段内同时执行；无需审批且目标文件互不重叠的直接 `write_file` / `edit` 也可在
   写段内并发。同一/重叠目标、`patch`、需要审批或暂存的写入、非只读命令、审批和交互
@@ -1040,9 +1041,10 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI
 > 的 `eix export` / `eix import`。
 >
-> Skills：`eix-core/src/skills.rs` 始终加载原生 `.eix`，再按 `[compations]` 开关加载 Claude Code /
-> OpenCode / Codex CLI / Gemini CLI / Pi 的 `<name>/SKILL.md`（`.agents/skills` 由 Gemini 或
-> Pi 开关启用；同目录原生 `.eix` 优先）。system prompt 只放 `<available_skills>` 摘要，模型用
+> Skills：`eix-core/src/skills.rs` 始终加载内置 `frontend` / `engineering` 和原生 `.eix`，再按
+> `[compations]` 开关加载 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 的
+> `<name>/SKILL.md`（`.agents/skills` 由 Gemini 或 Pi 开关启用；同目录原生 `.eix` 优先）。
+> system prompt 只放 `<available_skills>` 摘要，模型用
 > 只读 `use_skill {name, arguments}` 按需取正文，正文展开 `$ARGUMENTS` / `$1..$9`。
 > `allowed-tools` 支持通配，加载后在本 turn 内限制工具（并集，`use_skill` 始终可用，下一条
 > user prompt 清空）；Claude 风格工具名映射到 eix 名称。TUI `/skills` 是带正文预览的 picker。
@@ -1278,7 +1280,7 @@ daemon 向模型暴露这些工具。下表的“默认审批”按默认配置�
 | `list_dir` | 列出 session cwd 内的目录 | 自动放行 |
 | `grep` | 在工作区内按正则/字面量搜索，支持 `include`、忽略大小写、结果上限 | 自动放行 |
 | `glob` | 按 glob 查找工作区路径（`**/*.rs`），可含隐藏文件 | 自动放行 |
-| `use_skill` | 按名字加载 `.eix/skills` 里的 Markdown skill 正文 | 自动放行 |
+| `use_skill` | 按名字加载内置或 `.eix/skills` 里的 Markdown skill 正文 | 自动放行 |
 | `todo` | 整表替换当前 session 的任务列表（pending / in_progress / completed / cancelled） | 自动放行 |
 | `memory` | 读写当前 workspace 的跨 session 记忆（`add` / `replace` / `clear`） | 自动放行（只改 daemon 数据目录） |
 | `lsp_diagnostics` | 查询某个文件的语言服务器 diagnostics（未配置对应扩展时返回 no-op） | 自动放行 |
@@ -1542,10 +1544,11 @@ $CODEX_HOME/skills/**/SKILL.md                 # codex_cli
 <project>/.agents/skills/**/SKILL.md
 ```
 
-frontmatter 支持 `name`、`description`、`allowed-tools`；正文是完整指令，可使用
-`$ARGUMENTS`（全部参数）和 `$1`..`$9`（最高位占位符吃掉剩余参数）。daemon 在 system prompt
-里只列名字和描述，模型需要时调用 `use_skill {name, arguments}` 取正文，所以 skill 库很大
-也不会占用上下文。
+内置 `frontend`（UI 设计指导）和 `engineering`（重构、数据模型、抽象边界、测试范围）两个
+skill；用户或项目里的同名 skill 会覆盖它们。frontmatter 支持 `name`、`description`、
+`allowed-tools`；正文是完整指令，可使用 `$ARGUMENTS`（全部参数）和 `$1`..`$9`（最高位
+占位符吃掉剩余参数）。daemon 在 system prompt 里只列名字和描述，模型需要时调用
+`use_skill {name, arguments}` 取正文，所以 skill 库很大也不会占用上下文。
 
 `allowed-tools` 用逗号或空格分隔，支持 `*` / `?` 通配；加载该 skill 后，本 turn 内只允许
 这些工具（多个 skill 的允许列表取并集，`use_skill` 自身始终可用）。Claude 风格的工具名
