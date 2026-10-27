@@ -12,9 +12,15 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::process::Command;
+
+/// Hard ceiling for one git invocation. `fetch`, `pull`, `push` and `rebase`
+/// talk to a remote or can wait on a stale lock; without this the integration
+/// loop could stall forever. Local commands finish in milliseconds.
+const GIT_TIMEOUT: Duration = Duration::from_secs(300);
 
 #[derive(Debug, Clone)]
 pub struct Created {
@@ -582,14 +588,22 @@ async fn run_git_log(dir: &Path, args: &[&str]) -> Result<CommandLog> {
 }
 
 async fn run_git_capture(dir: &Path, args: &[&str]) -> Result<CommandOutput> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .output()
-        .await
-        .with_context(|| format!("cannot run git {}", args.join(" ")))?;
+        // A dropped future kills the child instead of leaving it running.
+        .kill_on_drop(true);
+    let output = match tokio::time::timeout(GIT_TIMEOUT, command.output()).await {
+        Ok(output) => output.with_context(|| format!("cannot run git {}", args.join(" ")))?,
+        Err(_) => bail!(
+            "git {} timed out after {}s",
+            args.join(" "),
+            GIT_TIMEOUT.as_secs()
+        ),
+    };
     Ok(CommandOutput {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).to_string(),
@@ -598,13 +612,16 @@ async fn run_git_capture(dir: &Path, args: &[&str]) -> Result<CommandOutput> {
 }
 
 async fn git_stdout(dir: &Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .args(args)
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0")
         .stdin(Stdio::null())
-        .output()
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(GIT_TIMEOUT, command.output())
         .await
+        .ok()?
         .ok()?;
     output
         .status

@@ -1082,7 +1082,7 @@ pub async fn execute_in(
         "read_file" => read_file(args, cwd, config).await,
         "list_dir" => list_dir(args, cwd, config).await,
         "grep" => grep(args, cwd, config).await,
-        "glob" => glob_files(args, cwd, config),
+        "glob" => glob_files(args, cwd, config).await,
         "use_skill" => use_skill(args, cwd, config),
         "webfetch" => webfetch(args).await,
         "websearch" => websearch(args).await,
@@ -1800,7 +1800,9 @@ async fn grep(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
         .and_then(Value::as_u64)
         .unwrap_or(100)
         .max(1) as usize;
-    let include = optional_string(args, "include").map(str::to_string);
+    let include = optional_string(args, "include")
+        .map(|raw| glob::Pattern::new(raw).with_context(|| format!("invalid include glob {raw:?}")))
+        .transpose()?;
     let expression = if literal {
         regex::escape(pattern)
     } else {
@@ -1812,13 +1814,37 @@ async fn grep(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
         .with_context(|| format!("invalid pattern {pattern:?}"))?;
 
     let root = root.canonicalize().unwrap_or(root);
-    let files = walk_files(&root, false, 20_000);
+    let cwd = cwd.to_path_buf();
+    let max_output_bytes = config.tools.max_output_bytes;
+    // Walking and reading up to 20k files is blocking I/O. Run it on the
+    // blocking pool so a large search cannot stall other sessions' RPCs.
+    tokio::task::spawn_blocking(move || {
+        grep_blocking(
+            &root,
+            &cwd,
+            &regex,
+            include.as_ref(),
+            limit,
+            max_output_bytes,
+        )
+    })
+    .await
+    .context("grep task failed")?
+}
+
+fn grep_blocking(
+    root: &Path,
+    cwd: &Path,
+    regex: &Regex,
+    include: Option<&glob::Pattern>,
+    limit: usize,
+    max_output_bytes: usize,
+) -> Result<String> {
+    let files = walk_files(root, false, 20_000);
     let mut matches = Vec::new();
     for path in files {
         let label = relative_label(&path, cwd);
-        if let Some(include) = &include {
-            let pattern = glob::Pattern::new(include)
-                .with_context(|| format!("invalid include glob {include:?}"))?;
+        if let Some(pattern) = include {
             if !pattern.matches(&label)
                 && !path
                     .file_name()
@@ -1850,13 +1876,10 @@ async fn grep(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
     if matches.is_empty() {
         return Ok("(no matches)".to_string());
     }
-    Ok(cap_output(
-        matches.join("\n"),
-        config.tools.max_output_bytes,
-    ))
+    Ok(cap_output(matches.join("\n"), max_output_bytes))
 }
 
-fn glob_files(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
+async fn glob_files(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
     let pattern = required_string(args, "pattern")?;
     if pattern.is_empty() {
         bail!("pattern must not be empty");
@@ -1873,6 +1896,25 @@ fn glob_files(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
         .unwrap_or(100)
         .max(1) as usize;
     let root = root.canonicalize().unwrap_or(root);
+    let pattern = pattern.to_string();
+    let cwd = cwd.to_path_buf();
+    let max_output_bytes = config.tools.max_output_bytes;
+    // `glob` walks the filesystem synchronously, so keep it off the runtime.
+    tokio::task::spawn_blocking(move || {
+        glob_blocking(&root, &cwd, &pattern, hidden, limit, max_output_bytes)
+    })
+    .await
+    .context("glob task failed")?
+}
+
+fn glob_blocking(
+    root: &Path,
+    cwd: &Path,
+    pattern: &str,
+    hidden: bool,
+    limit: usize,
+    max_output_bytes: usize,
+) -> Result<String> {
     let joined = root.join(pattern);
     let options = glob::MatchOptions {
         case_sensitive: true,
@@ -1886,7 +1928,7 @@ fn glob_files(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
         let Ok(real) = entry.canonicalize() else {
             continue;
         };
-        if !real.starts_with(&root) {
+        if !real.starts_with(root) {
             continue;
         }
         if !hidden
@@ -1905,7 +1947,7 @@ fn glob_files(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
     if out.is_empty() {
         return Ok("(no matches)".to_string());
     }
-    Ok(cap_output(out.join("\n"), config.tools.max_output_bytes))
+    Ok(cap_output(out.join("\n"), max_output_bytes))
 }
 
 async fn edit(args: &Value, cwd: &Path, config: &Config) -> Result<String> {

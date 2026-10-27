@@ -6,16 +6,22 @@
 //! The store also implements retention: only blobs that no event references
 //! may be deleted, so replaying history never loses an image.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{bail, Context, Result};
-use eix_core::ImagesConfig;
+use base64::Engine as _;
+use eix_core::{ImagePart, ImagesConfig};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
+
+/// Base64 payloads are kept in memory so a long turn does not re-read and
+/// re-encode the same images on every tool round. Bound it so a huge history
+/// cannot pin an unbounded amount of memory.
+const IMAGE_CACHE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Default)]
 pub struct BlobGc {
@@ -25,10 +31,19 @@ pub struct BlobGc {
     pub kept_bytes: u64,
 }
 
+#[derive(Debug, Default)]
+struct ImageCache {
+    entries: HashMap<String, Arc<ImagePart>>,
+    /// Insertion order, used to evict the oldest entry once the byte cap is hit.
+    order: VecDeque<String>,
+    bytes: usize,
+}
+
 #[derive(Debug)]
 pub struct BlobStore {
     root: PathBuf,
     config: arc_swap::ArcSwap<ImagesConfig>,
+    images: Mutex<ImageCache>,
 }
 
 impl BlobStore {
@@ -36,6 +51,7 @@ impl BlobStore {
         Self {
             root: root.into(),
             config: arc_swap::ArcSwap::from_pointee(config),
+            images: Mutex::new(ImageCache::default()),
         }
     }
 
@@ -97,14 +113,53 @@ impl BlobStore {
             .with_context(|| format!("cannot read image blob {id}"))
     }
 
-    pub async fn load_many(&self, ids: &HashSet<String>) -> HashMap<String, Vec<u8>> {
-        let mut loaded = HashMap::new();
-        for id in ids {
-            if let Ok(bytes) = self.get(id).await {
-                loaded.insert(id.clone(), bytes);
+    /// Load one prompt image with its base64 payload. Blob content is
+    /// immutable, so the encoded result is cached across tool rounds and turns.
+    pub async fn image_part(&self, id: &str, mime: &str) -> Result<ImagePart> {
+        if let Some(part) = self.cached_image(id) {
+            return Ok((*part).clone());
+        }
+        let bytes = self.get(id).await?;
+        let part = ImagePart {
+            mime: mime.to_string(),
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+        };
+        self.cache_image(id, &part);
+        Ok(part)
+    }
+
+    fn cached_image(&self, id: &str) -> Option<Arc<ImagePart>> {
+        let cache = self.images.lock().unwrap_or_else(|p| p.into_inner());
+        cache.entries.get(id).cloned()
+    }
+
+    fn cache_image(&self, id: &str, part: &ImagePart) {
+        if part.data.len() > IMAGE_CACHE_BYTES {
+            return;
+        }
+        let mut cache = self.images.lock().unwrap_or_else(|p| p.into_inner());
+        if cache.entries.contains_key(id) {
+            return;
+        }
+        cache.bytes = cache.bytes.saturating_add(part.data.len());
+        cache.order.push_back(id.to_string());
+        cache.entries.insert(id.to_string(), Arc::new(part.clone()));
+        while cache.bytes > IMAGE_CACHE_BYTES {
+            let Some(oldest) = cache.order.pop_front() else {
+                break;
+            };
+            if let Some(old) = cache.entries.remove(&oldest) {
+                cache.bytes = cache.bytes.saturating_sub(old.data.len());
             }
         }
-        loaded
+    }
+
+    fn evict_image(&self, id: &str) {
+        let mut cache = self.images.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(old) = cache.entries.remove(id) {
+            cache.bytes = cache.bytes.saturating_sub(old.data.len());
+            cache.order.retain(|entry| entry != id);
+        }
     }
 
     /// Remove unreferenced blobs. `retention_days` protects recently orphaned
@@ -128,6 +183,7 @@ impl BlobStore {
         let mut removed = 0usize;
         let mut removed_bytes = 0u64;
         let mut remaining = total;
+        let collected = files.len();
         for file in files {
             if used.contains(&file.id) {
                 continue;
@@ -143,6 +199,7 @@ impl BlobStore {
                 continue;
             }
             if tokio::fs::remove_file(&file.path).await.is_ok() {
+                self.evict_image(&file.id);
                 removed += 1;
                 removed_bytes = removed_bytes.saturating_add(file.bytes);
                 remaining = remaining.saturating_sub(file.bytes);
@@ -151,7 +208,9 @@ impl BlobStore {
         Ok(BlobGc {
             removed,
             removed_bytes,
-            kept: files_len(&self.root).await?.0.saturating_sub(removed),
+            // `files` was collected once above; re-walking the directory here
+            // used to double the GC's I/O for a value we already had.
+            kept: collected.saturating_sub(removed),
             kept_bytes: total.saturating_sub(removed_bytes),
         })
     }
@@ -214,12 +273,6 @@ async fn collect_files(dir: &Path, out: &mut Vec<BlobFile>) -> Result<()> {
         });
     }
     Ok(())
-}
-
-async fn files_len(dir: &Path) -> Result<(usize, u64)> {
-    let mut files = Vec::new();
-    collect_files(dir, &mut files).await?;
-    Ok((files.len(), files.iter().map(|file| file.bytes).sum()))
 }
 
 fn hex_digest(bytes: &[u8]) -> String {

@@ -8,13 +8,14 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use eix_core::{
     now_ms, Event, EventKind, IntegrationState, IntegrationStatus, Session, SessionMode,
     SessionStatus,
 };
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde_json::Value;
 
 /// Per-plugin storage is bounded so a buggy or untrusted plugin cannot fill
@@ -24,6 +25,11 @@ pub const MAX_PLUGIN_STORAGE_BYTES: i64 = 16 * 1024 * 1024;
 
 pub struct Store {
     conn: Mutex<Connection>,
+    /// Dedicated read-only connection. WAL lets it observe committed writes
+    /// without waiting for the writer lock, so a long SELECT no longer blocks
+    /// `append_event` for every other session. `None` for in-memory test
+    /// databases, which are private to one connection.
+    reader: Option<Mutex<Connection>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -45,6 +51,16 @@ impl Store {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    /// Read-only queries. Falls back to the writer for in-memory databases.
+    fn read_conn(&self) -> MutexGuard<'_, Connection> {
+        match &self.reader {
+            Some(reader) => reader
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+            None => self.conn(),
+        }
+    }
+
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
@@ -52,7 +68,15 @@ impl Store {
         }
         let conn = Connection::open(path)
             .with_context(|| format!("cannot open database {}", path.display()))?;
-        Self::init(conn)
+        let mut store = Self::init(conn)?;
+        // Opened after `init` so the schema/WAL settings already exist. Read
+        // only: a SELECT that accidentally writes fails loudly instead of
+        // silently racing the writer.
+        let reader = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_context(|| format!("cannot open database for reading {}", path.display()))?;
+        reader.busy_timeout(Duration::from_secs(5))?;
+        store.reader = Some(Mutex::new(reader));
+        Ok(store)
     }
 
     #[cfg(test)]
@@ -158,6 +182,7 @@ impl Store {
         drop_legacy_search_index(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
+            reader: None,
         })
     }
 
@@ -195,7 +220,7 @@ impl Store {
     /// `include_archived = true` is used by name generation and explicit
     /// archived-session pickers; the default session list hides them.
     pub fn list_sessions_including(&self, include_archived: bool) -> Result<Vec<Session>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let sql = if include_archived {
             "SELECT id, name, cwd, status, model, created_at, updated_at,
                     parent_id, forked_from_seq, worktree, origin, mode, agent, archived
@@ -215,7 +240,7 @@ impl Store {
     }
 
     pub fn get_session(&self, id: &str) -> Result<Option<Session>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
@@ -435,7 +460,7 @@ impl Store {
     /// Highest event sequence in a session, or `None` when the session has no
     /// events (or does not exist).
     pub fn max_seq(&self, id: &str) -> Result<u64> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let max: i64 = conn.query_row(
             "SELECT COALESCE(MAX(seq), 0) FROM events WHERE session_id = ?1",
             params![id],
@@ -470,7 +495,7 @@ impl Store {
     }
 
     pub fn session_count(&self) -> Result<usize> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let count: i64 = conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         Ok(count as usize)
     }
@@ -478,7 +503,7 @@ impl Store {
     /// Whether the session has at least one user turn. Used by the idle
     /// auto-ready scanner to avoid queuing a pristine session.
     pub fn has_user_message(&self, session_id: &str) -> Result<bool> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let count: i64 = conn.query_row(
             "SELECT COUNT(*) FROM events WHERE session_id = ?1 AND kind = 'user_message'",
             params![session_id],
@@ -489,7 +514,7 @@ impl Store {
 
     /// Unsent prompt for a session; `(text, updated_at)` with empty defaults.
     pub fn get_draft(&self, session_id: &str) -> Result<(String, i64)> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         Ok(conn
             .query_row(
                 "SELECT text, updated_at FROM drafts WHERE session_id = ?1",
@@ -692,8 +717,80 @@ impl Store {
             .context("event query task failed")?
     }
 
+    /// Async wrapper for backwards history pages. The TUI asks for these while
+    /// scrolling, and a large page would otherwise run on a runtime thread.
+    pub async fn events_before_async(
+        self: &Arc<Self>,
+        id: &str,
+        before_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        let store = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.events_before(&id, before_seq, limit))
+            .await
+            .context("event query task failed")?
+    }
+
+    /// Async wrapper for forward history pages.
+    pub async fn events_after_page_async(
+        self: &Arc<Self>,
+        id: &str,
+        after_seq: u64,
+        limit: usize,
+    ) -> Result<(Vec<Event>, bool)> {
+        let store = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.events_after_page(&id, after_seq, limit))
+            .await
+            .context("event query task failed")?
+    }
+
+    /// Async wrapper for kind-filtered reads (rewind scans snapshot events).
+    pub async fn events_after_kind_async(
+        self: &Arc<Self>,
+        id: &str,
+        after_seq: u64,
+        kind: EventKind,
+    ) -> Result<Vec<Event>> {
+        let store = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.events_after_kind(&id, after_seq, kind))
+            .await
+            .context("event query task failed")?
+    }
+
+    pub async fn recent_user_messages_async(
+        self: &Arc<Self>,
+        id: &str,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        let store = Arc::clone(self);
+        let id = id.to_string();
+        tokio::task::spawn_blocking(move || store.recent_user_messages(&id, limit))
+            .await
+            .context("event query task failed")?
+    }
+
+    /// Async wrapper for daemon counters: the event `COUNT(*)` grows with the
+    /// log, and `/stats` must not block a runtime thread.
+    pub async fn stats_async(self: &Arc<Self>) -> Result<StoreStats> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.stats())
+            .await
+            .context("stats query task failed")?
+    }
+
+    /// Async wrapper for the blob-reference scan used by GC.
+    pub async fn referenced_blob_ids_async(self: &Arc<Self>) -> Result<HashSet<String>> {
+        let store = Arc::clone(self);
+        tokio::task::spawn_blocking(move || store.referenced_blob_ids())
+            .await
+            .context("blob reference query task failed")?
+    }
+
     pub fn events_after(&self, id: &str, after_seq: u64) -> Result<Vec<Event>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
              WHERE session_id = ?1 AND seq > ?2 AND undone = 0 ORDER BY seq ASC",
@@ -733,7 +830,7 @@ impl Store {
         let limit = limit.max(1);
         let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let after_seq = after_seq.min(i64::MAX as u64) as i64;
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
              WHERE session_id = ?1 AND seq > ?2 AND undone = 0
@@ -774,7 +871,7 @@ impl Store {
         kind: EventKind,
     ) -> Result<Vec<Event>> {
         let after_seq = after_seq.min(i64::MAX as u64) as i64;
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
              WHERE session_id = ?1 AND seq > ?2 AND kind = ?3 AND undone = 0
@@ -815,7 +912,7 @@ impl Store {
         let limit = limit.max(1);
         let fetch = limit.saturating_add(1).min(i64::MAX as usize) as i64;
         let before_seq = before_seq.min(i64::MAX as u64) as i64;
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
              WHERE session_id = ?1 AND seq < ?2 AND undone = 0
@@ -852,7 +949,7 @@ impl Store {
     /// this event kind; loading the whole session just to filter it is waste.
     pub fn recent_user_messages(&self, id: &str, limit: usize) -> Result<Vec<Event>> {
         let limit = limit.max(1).min(i64::MAX as usize) as i64;
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT seq, ts, kind, payload FROM events
              WHERE session_id = ?1 AND kind = 'user_message' AND undone = 0
@@ -885,7 +982,7 @@ impl Store {
     /// Sessions that were mid-turn when the daemon died. They cannot be resumed
     /// honestly, so the caller marks them as errored.
     pub fn running_sessions(&self) -> Result<Vec<Session>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, cwd, status, model, created_at, updated_at,
                     parent_id, forked_from_seq, worktree, origin, mode, agent, archived
@@ -900,7 +997,7 @@ impl Store {
     }
 
     pub fn stats(&self) -> Result<StoreStats> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let sessions: i64 =
             conn.query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))?;
         let archived: i64 = conn.query_row(
@@ -928,7 +1025,7 @@ impl Store {
     /// Blob ids referenced by any stored user message, including undone
     /// events (redo can bring them back).
     pub fn referenced_blob_ids(&self) -> Result<HashSet<String>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events
              WHERE kind = 'user_message' AND payload LIKE '%\"blob\"%'",
@@ -951,7 +1048,7 @@ impl Store {
 
     /// Read one plugin storage value. Missing keys are `None`, not an error.
     pub fn plugin_kv_get(&self, plugin: &str, scope: &str, key: &str) -> Result<Option<String>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         Ok(conn
             .query_row(
                 "SELECT value FROM plugin_kv
@@ -1014,7 +1111,7 @@ impl Store {
     /// List keys (and values) for one plugin/scope. Values are included so a
     /// plugin can restore a small cursor cache without N round trips.
     pub fn plugin_kv_list(&self, plugin: &str, scope: &str) -> Result<Vec<(String, String)>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT key, value FROM plugin_kv
              WHERE plugin = ?1 AND scope = ?2 ORDER BY key",
@@ -1067,12 +1164,12 @@ impl Store {
     }
 
     pub fn get_integration(&self, session_id: &str) -> Result<Option<IntegrationState>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         integration_row(&conn, session_id)
     }
 
     pub fn list_integrations(&self) -> Result<Vec<IntegrationState>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT session_id, status, stage, base_branch, error, log_path, ready_at,
                     next_retry_at, attempts, merged_commit, worktree_disabled, updated_at
@@ -1127,7 +1224,7 @@ impl Store {
     /// Next queue item whose retry time has arrived. Ready items have no
     /// `next_retry_at` and are always eligible.
     pub fn next_integration(&self, now: i64) -> Result<Option<IntegrationState>> {
-        let conn = self.conn();
+        let conn = self.read_conn();
         Ok(conn
             .query_row(
                 "SELECT session_id, status, stage, base_branch, error, log_path, ready_at,
@@ -1328,6 +1425,51 @@ mod tests {
 
     fn session(id: &str) -> Session {
         Session::new(id, "test", "/tmp")
+    }
+
+    #[test]
+    fn file_store_reads_committed_writes_through_reader() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("eix-store-reader-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Store::open(&dir.join("eix.sqlite3")).unwrap();
+        assert!(store.reader.is_some(), "file stores should use a reader");
+
+        store.create_session(&session("s1")).unwrap();
+        store
+            .append_event(
+                "s1",
+                EventKind::UserMessage,
+                serde_json::json!({ "text": "hi" }),
+            )
+            .unwrap();
+
+        // Both go through the read-only connection.
+        assert!(store.get_session("s1").unwrap().is_some());
+        assert_eq!(store.events("s1").unwrap().len(), 1);
+
+        // A write on the reader must fail rather than race the writer.
+        {
+            let reader = store.reader.as_ref().unwrap();
+            let guard = reader.lock().unwrap();
+            assert!(guard.execute("DELETE FROM sessions", []).is_err());
+        }
+
+        // The writer remains usable after the reader observed the committed row.
+        store
+            .append_event(
+                "s1",
+                EventKind::UserMessage,
+                serde_json::json!({ "text": "again" }),
+            )
+            .unwrap();
+        assert_eq!(store.events("s1").unwrap().len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

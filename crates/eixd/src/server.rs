@@ -318,6 +318,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         subagent_concurrency: AtomicUsize::new(subagent_concurrency),
         bus,
         blobs,
+        blob_gc_running: AtomicBool::new(false),
         memory: MemoryStore::new(data_dir.join("memory")),
         started: Instant::now(),
         snapshots,
@@ -341,6 +342,8 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         token_scales: std::sync::Mutex::new(HashMap::new()),
         model_catalog: Mutex::new(ModelCatalogCache::default()),
         classifier_cache: Mutex::new(HashMap::new()),
+        prompt_cache: Mutex::new(PromptCache::default()),
+        config_rev: AtomicUsize::new(0),
     });
     let restored = daemon.staging.load();
     if restored > 0 {
@@ -578,6 +581,10 @@ pub(crate) struct Daemon {
     pub(crate) bus: broadcast::Sender<Notification>,
     /// Prompt images, content-addressed on disk.
     blobs: BlobStore,
+    /// Set while a background blob GC is running. Deletions arrive in bursts
+    /// (one per session) and a second concurrent sweep would rescan the event
+    /// table for the same result.
+    blob_gc_running: AtomicBool,
     /// Cross-session project notes, injected as a fixed context sector.
     memory: MemoryStore,
     started: Instant,
@@ -635,7 +642,45 @@ pub(crate) struct Daemon {
     /// Recent `allow` verdicts for identical tool calls + intent. Asking again
     /// should not pay for another classifier request.
     classifier_cache: Mutex<HashMap<String, CachedClassifier>>,
+    /// Rendered skills + loaded agents per workspace. `system_prompt` used to
+    /// rescan those directories on every tool round.
+    prompt_cache: Mutex<PromptCache>,
+    /// Incremented on every successful config reload so the prompt cache cannot
+    /// keep serving a previous `[compat]` / skill configuration.
+    config_rev: AtomicUsize,
 }
+
+/// The on-disk parts of the system prompt. They only change when the user edits
+/// a skill/agent file or reloads the config.
+struct PromptResources {
+    agents: Vec<eix_core::AgentSpec>,
+    skills: String,
+    skill_count: usize,
+}
+
+impl PromptResources {
+    fn load(config: &Config, cwd: &Path) -> Self {
+        let skills = eix_core::load_skills(cwd, &config.compations);
+        Self {
+            skill_count: skills.len(),
+            skills: eix_core::available_skills_prompt(&skills),
+            agents: eix_core::load_agents(cwd, &config.compations),
+        }
+    }
+}
+
+#[derive(Default)]
+struct PromptCache {
+    rev: usize,
+    loaded_at: Option<Instant>,
+    resources: HashMap<PathBuf, Arc<PromptResources>>,
+}
+
+/// Skill/agent edits apply within this window even without a config reload.
+/// Long enough to cover a multi-round tool loop, short enough to feel live.
+const PROMPT_CACHE_TTL: Duration = Duration::from_secs(30);
+/// Worktree-heavy setups can have many workspaces; keep the cache bounded.
+const PROMPT_CACHE_MAX_WORKSPACES: usize = 64;
 
 struct CachedClassifier {
     verdict: crate::classifier::ClassifierVerdict,
@@ -2426,7 +2471,7 @@ impl Daemon {
                     "session.deleted",
                     json!({ "session_id": params.session_id }),
                 );
-                let _ = self.gc_blobs().await;
+                self.gc_blobs_in_background();
                 Ok(json!({ "deleted": true }))
             }
             // Frontends open a session before the first prompt so they can
@@ -2447,7 +2492,7 @@ impl Daemon {
                         "session.deleted",
                         json!({ "session_id": params.session_id }),
                     );
-                    let _ = self.gc_blobs().await;
+                    self.gc_blobs_in_background();
                 }
                 Ok(json!({ "deleted": deleted }))
             }
@@ -2642,7 +2687,10 @@ impl Daemon {
                     .and_then(Value::as_u64)
                     .unwrap_or(100)
                     .clamp(1, 1_000) as usize;
-                let events = self.store.recent_user_messages(&params.session_id, limit)?;
+                let events = self
+                    .store
+                    .recent_user_messages_async(&params.session_id, limit)
+                    .await?;
                 let items: Vec<TimelineItem> = events
                     .into_iter()
                     .filter_map(|event| {
@@ -2929,9 +2977,11 @@ impl Daemon {
                 let params: AttachParams = parse_params(request.params.clone())?;
                 let session = self.require_session(&params.session_id)?;
                 let (events, has_more) = match params.tail {
-                    Some(tail) => self
-                        .store
-                        .events_before(&params.session_id, u64::MAX, tail)?,
+                    Some(tail) => {
+                        self.store
+                            .events_before_async(&params.session_id, u64::MAX, tail)
+                            .await?
+                    }
                     None => (self.store.events_async(&params.session_id).await?, false),
                 };
                 Ok(serde_json::to_value(AttachResult {
@@ -2950,11 +3000,13 @@ impl Daemon {
                 let (events, has_more) = match params.before_seq {
                     Some(before_seq) => {
                         self.store
-                            .events_before(&params.session_id, before_seq, limit)?
+                            .events_before_async(&params.session_id, before_seq, limit)
+                            .await?
                     }
                     None => {
                         self.store
-                            .events_after_page(&params.session_id, params.after_seq, limit)?
+                            .events_after_page_async(&params.session_id, params.after_seq, limit)
+                            .await?
                     }
                 };
                 Ok(serde_json::to_value(EventsResult { events, has_more })?)
@@ -3034,8 +3086,10 @@ impl Daemon {
                         // preview still finds recent user/assistant turns.
                         let wanted = params.limit.unwrap_or(120).clamp(1, 500);
                         let fetch = wanted.saturating_mul(4).min(2_000);
-                        let (events, _) =
-                            self.store.events_before(&params.value, u64::MAX, fetch)?;
+                        let (events, _) = self
+                            .store
+                            .events_before_async(&params.value, u64::MAX, fetch)
+                            .await?;
                         crate::picker::session_preview(&params.value, &events, Some(wanted))
                     }
                     other => {
@@ -3712,11 +3766,13 @@ impl Daemon {
     ) -> Result<String> {
         let session = self.require_session(session_id)?;
         let mode = self.session_mode(&session);
+        let config = self.config.load();
+        let resources = self.prompt_resources(&config, &session.cwd).await;
         let system = format!(
             "{}\n\nThis is a one-off side question from the user. Answer it directly and \
              concisely. It is not part of the main conversation, so do not call tools and do \
              not refer to it as a new task.",
-            system_prompt(&self.config.load(), &session, mode)
+            system_prompt(&config, &session, mode, Some(&resources))
         );
         let messages = vec![
             ChatMessage::system(system),
@@ -3876,9 +3932,10 @@ impl Daemon {
         // Collect the snapshots taken at or after the cut before forking: they
         // are exactly the mutations the new branch discards.
         let mut snapshots: Vec<(u64, String, usize)> = Vec::new();
-        for event in
-            self.store
-                .events_after_kind(&source.id, upto.saturating_sub(1), EventKind::Snapshot)?
+        for event in self
+            .store
+            .events_after_kind_async(&source.id, upto.saturating_sub(1), EventKind::Snapshot)
+            .await?
         {
             let Ok(snapshot) = serde_json::from_value::<SnapshotPayload>(event.payload) else {
                 continue;
@@ -4215,7 +4272,43 @@ impl Daemon {
         self.plugins.load(&next).await;
         self.lsp.lock().await.clear();
         self.config.store(Arc::new(next));
+        // Invalidate rendered prompts before the next request can use them.
+        self.config_rev.fetch_add(1, Ordering::Relaxed);
         Ok(paths)
+    }
+
+    /// Load the skills/agents rendered into the system prompt, reusing the
+    /// previous scan for this workspace while it is still fresh.
+    async fn prompt_resources(&self, config: &Config, cwd: &Path) -> Arc<PromptResources> {
+        let rev = self.config_rev.load(Ordering::Relaxed);
+        {
+            let cache = self.prompt_cache.lock().await;
+            let fresh = cache.rev == rev
+                && cache
+                    .loaded_at
+                    .is_some_and(|at| at.elapsed() < PROMPT_CACHE_TTL);
+            if fresh {
+                if let Some(resources) = cache.resources.get(cwd) {
+                    return Arc::clone(resources);
+                }
+            }
+        }
+        // Directory scans are synchronous; keep them outside the lock so a
+        // lookup for another workspace does not wait behind them.
+        let resources = Arc::new(PromptResources::load(config, cwd));
+        let mut cache = self.prompt_cache.lock().await;
+        if cache.rev != rev {
+            cache.rev = rev;
+            cache.resources.clear();
+        }
+        cache.loaded_at = Some(Instant::now());
+        if cache.resources.len() >= PROMPT_CACHE_MAX_WORKSPACES {
+            cache.resources.clear();
+        }
+        cache
+            .resources
+            .insert(cwd.to_path_buf(), Arc::clone(&resources));
+        resources
     }
 
     fn require_session(&self, id: &str) -> Result<Session> {
@@ -6494,9 +6587,10 @@ impl Daemon {
 
     /// Aggregate daemon counters for `GET /stats` and the `stats` RPC.
     pub(crate) async fn stats(&self) -> Result<StatsResult> {
-        let store = self.store.stats()?;
+        let store = self.store.stats_async().await?;
         let (blob_count, blob_bytes) = self.blobs.stats().await.unwrap_or((0, 0));
         let config = self.config.load();
+        let resources = self.prompt_resources(&config, &config.load_cwd).await;
         Ok(StatsResult {
             version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_secs: self.started.elapsed().as_secs(),
@@ -6507,7 +6601,7 @@ impl Daemon {
             db_bytes: store.db_bytes,
             blob_count,
             blob_bytes,
-            skills: eix_core::load_skills(&config.load_cwd, &config.compations).len(),
+            skills: resources.skill_count,
             mcp_servers: config.mcp.servers.len(),
             default_model: config.default_model().to_string(),
         })
@@ -6516,8 +6610,31 @@ impl Daemon {
     /// Delete image blobs no event references. Referenced images are always
     /// retained so history stays replayable.
     async fn gc_blobs(&self) -> Result<crate::blob::BlobGc> {
-        let used = self.store.referenced_blob_ids()?;
+        let used = self.store.referenced_blob_ids_async().await?;
         self.blobs.gc(&used, SystemTime::now()).await
+    }
+
+    /// Sweep orphaned image blobs without making the caller wait for a full
+    /// event-table scan and directory walk. Session deletion used to run this
+    /// inline, adding that cost to the RPC.
+    fn gc_blobs_in_background(self: &Arc<Self>) {
+        if self.blob_gc_running.swap(true, Ordering::AcqRel) {
+            // A sweep is already in flight and will see this deletion; the
+            // six-hourly pass catches anything it raced with.
+            return;
+        }
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            match daemon.gc_blobs().await {
+                Ok(report) if report.removed > 0 => eprintln!(
+                    "eixd: removed {} orphaned image blob(s), {} bytes",
+                    report.removed, report.removed_bytes
+                ),
+                Ok(_) => {}
+                Err(err) => eprintln!("eixd: image blob gc failed: {err:#}"),
+            }
+            daemon.blob_gc_running.store(false, Ordering::Release);
+        });
     }
 
     /// Inline blob-backed image bytes before exporting a session.
@@ -6678,9 +6795,10 @@ impl Daemon {
             .unwrap_or_else(|| config.default_model().to_string());
         let route = config.route(&model);
         let budget = config.context.effective_budget_tokens(route.context_tokens);
+        let resources = self.prompt_resources(&config, &session.cwd).await;
         Ok(Ledger::build_with_state_and_static(
             &config,
-            system_prompt(&config, &session, mode),
+            system_prompt(&config, &session, mode, Some(&resources)),
             static_context,
             events,
             Some(&self.blobs),
@@ -9293,27 +9411,37 @@ impl Daemon {
 
 const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's terminal. Workspace: `{cwd}`.
 
-## Contract
-- Objective: satisfy the request, not merely produce a plan or code.
-- Define success before acting: each explicit requirement/constraint is a criterion. Done iff every criterion is verified. Stop only when Done, or a genuine blocker is stated with remaining work. Never redefine success to fit what was built or change scope silently.
-- Persist end-to-end whenever feasible; don't stop at a plan/partial fix or shrink scope to MVP/80% unless asked.
-- Evidence: a check is evidence only if it could fail; it is not proof. State assumptions and residual risk. Never claim unverified success.
-- Invariants: preserve user work and existing behavior unless the request changes it; never revert unrelated changes, use destructive git commands, or rewrite history unless asked.
+## Working agreement
+- Be concise, direct, and collaborative. Read before assuming; keep changes scoped.
+- Unless asked for a plan, a question, or brainstorming, implement the change; don't stop at analysis or a half-finished fix.
+- Simple requests one command can answer: just run it.
+- Treat explicit requirements as acceptance criteria. Run what can fail; if you can't, say so; never claim unverified success.
+- Stay until handled end to end; don't end the turn with a needed command still running. If blocked, say what's missing and the next step.
+- Preserve user work: no reverting unrelated changes, destructive git, or history rewrites unless asked. Ignore unrelated dirty files; mention unrelated bugs/tests rather than fixing them.
+- Ask only when a wrong assumption would change the outcome.
 - Reply in the user's language unless code or identifiers require otherwise.
 
-## Method
-1. Frame: classify the request (answer, diagnosis, implementation, review, execution) and do that work, not a plan for an implementation request. Diagnose before fixing; in reviews, findings before edits. Bias to action: choose a default; use `ask_user` once only if a wrong assumption would change the outcome.
-2. Ground: search symbols, read the narrowest code and call sites; skip tools if context suffices.
-3. Plan: use `todo` only for dependent steps; close each as done/blocked/cancelled with a reason; identify the next verifiable step.
-4. Act: smallest coherent change in existing style; prefer `edit`/`patch` over rewriting. Fix root causes, reuse helpers, and keep affected surfaces consistent. No placeholders, unneeded files/docs/tests, or unrelated edits unless asked.
-5. Verify: try to falsify the change with the strongest reasonable check; cover edge/error paths, inspect the diff, and don't rerun unchanged checks. Never weaken or edit tests to pass; use independent subagents for complex work.
-6. Report: outcome, evidence, assumptions, residual risk. Recheck the request and every criterion; if blocked or repeated reads/edits make no progress, state what remains and the next step, not completion.
+## Work loop
+1. Orient: read the narrowest code and call sites before editing; skip tools if context suffices. Reviews: findings first, don't edit unless asked.
+2. Plan: only non-trivial work; don't plan the easiest quarter or single steps; update `todo` items as done.
+3. Change: smallest coherent change in existing style; prefer `edit`/`patch`; fix root causes, reuse helpers, keep surfaces consistent; no placeholders or unrelated edits.
+4. Verify: strongest reasonable check; cover edge/error paths; inspect the diff; don't rerun unchanged checks. Never weaken or edit tests.
+5. Report: outcome, evidence, assumptions, residual risk. Keep phases internal.
+
+## Communication
+- Before grouped tool calls, say briefly what you're doing and why. Don't narrate every read or restate the plan.
+- Reviews: findings first by severity and file:line, then open questions, summary secondary. If none, say so and note residual risk.
+- Final answers: short; outcome, changes, verification, risk. Users don't see raw tool output; relay key results, don't dump files.
+
+## Continuity
+- New user messages: the newest wins; still honor non-conflicting earlier requests.
+- After resume or compaction, continue from the summary; don't restart, and check the answer matches the newest request.
 
 ## Tools
-- Batch independent reads/searches; prefer dedicated tools over shell (`read_file`/`grep`/`glob`/`list_dir`). Read before editing and check call sites.
-- Instructions/workspace summary are already in context; don't re-read them or repeat `ls`/`git status` unless stale.
+- Batch independent reads/searches; prefer `read_file`/`grep`/`glob`/`list_dir` over shell. Read before editing and check call sites.
+- Instructions/workspace summary are in context; don't re-read them or repeat `ls`/`git status` unless stale.
 - If a tool fails, change the input or approach; never repeat an identical call.
-- Use `spawn_agent` for broad exploration or independent verification, not work you can finish in 1-2 reads. Batch calls; prompts must be self-contained and non-overlapping. Children are read-only.
+- Use `spawn_agent` only for broad exploration or independent verification, not work you can finish in 1-2 reads. Batch prompts; children are read-only.
 - Approval is handled by eix: call the tool, don't ask in prose."#;
 
 /// A sub-agent has no parent transcript, no edit tools, and one focused task.
@@ -9325,7 +9453,12 @@ Do not edit files, run mutating commands, ask questions, spawn agents, or narrat
 
 const SUBAGENT_READONLY_NOTE: &str = "\n\nThe prompt is your full task; you cannot see the parent conversation. You are a read-only sub-agent. Investigate only the assigned question, answer it completely rather than only the easiest part, and return concise findings with file:line evidence; if evidence is blocked, say exactly what is missing. Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process.";
 
-fn system_prompt(config: &Config, session: &Session, mode: SessionMode) -> String {
+fn system_prompt(
+    config: &Config,
+    session: &Session,
+    mode: SessionMode,
+    resources: Option<&PromptResources>,
+) -> String {
     let is_subagent = session.origin == SessionOrigin::Agent;
     let custom = config.provider_runtime.system_prompt.as_deref();
     let workspace = session.cwd.display().to_string();
@@ -9356,7 +9489,17 @@ fn system_prompt(config: &Config, session: &Session, mode: SessionMode) -> Strin
     if is_subagent && custom.is_some() {
         prompt.push_str(SUBAGENT_READONLY_NOTE);
     }
-    let agents = eix_core::load_agents(&session.cwd, &config.compations);
+    // Callers on the turn hot path pass a cached bundle; one-off callers (for
+    // example tests) fall back to reading the sources directly.
+    let loaded;
+    let resources = match resources {
+        Some(resources) => resources,
+        None => {
+            loaded = PromptResources::load(config, &session.cwd);
+            &loaded
+        }
+    };
+    let agents = &resources.agents;
     if let Some(name) = session.agent.as_deref() {
         if let Some(agent) = agents.iter().find(|agent| agent.name == name) {
             let instructions = agent.prompt.trim();
@@ -9390,8 +9533,7 @@ fn system_prompt(config: &Config, session: &Session, mode: SessionMode) -> Strin
              `ready` again.",
         );
     }
-    let skills = eix_core::load_skills(&session.cwd, &config.compations);
-    prompt.push_str(&eix_core::available_skills_prompt(&skills));
+    prompt.push_str(&resources.skills);
     prompt
 }
 
@@ -9527,64 +9669,86 @@ mod tests {
 
     #[test]
     fn system_prompt_is_compact_and_covers_the_workflow() {
-        // Measure the fixed contract, not installed skills/agents, so the
+        // Measure the fixed prompt, not installed skills/agents, so the
         // budget does not depend on the machine running the test.
         let base = BASE_SYSTEM_PROMPT.replace("{cwd}", "/home/me/eix");
         let tokens = crate::context::estimate_tokens(&base);
         assert!(tokens < 700, "base system prompt is {tokens} tokens");
 
         let session = Session::new("id", "eix", "/home/me/eix");
-        let prompt = system_prompt(&Config::default(), &session, SessionMode::Build);
+        let prompt = system_prompt(&Config::default(), &session, SessionMode::Build, None);
         assert!(!prompt.contains("{cwd}"));
         for expected in [
-            "Define success before acting",
-            "Done iff every criterion is verified",
-            "Stop only when Done",
-            "Never redefine success to fit what was built",
-            "change scope silently",
-            "Persist end-to-end whenever feasible",
-            "a check is evidence only if it could fail",
-            "State assumptions and residual risk",
-            "Never claim unverified success",
-            "preserve user work and existing behavior",
-            "never revert unrelated changes",
-            "classify the request",
-            "Diagnose before fixing; in reviews, findings before edits",
-            "Bias to action",
-            "use `ask_user` once",
-            "close each as done/blocked/cancelled with a reason",
-            "identify the next verifiable step",
+            "Be concise, direct, and collaborative",
+            "Read before assuming",
+            "keep changes scoped",
+            "Unless asked for a plan",
+            "implement the change",
+            "don't stop at analysis or a half-finished fix",
+            "Simple requests one command can answer",
+            "Treat explicit requirements as acceptance criteria",
+            "Run what can fail",
+            "never claim unverified success",
+            "Stay until handled end to end",
+            "don't end the turn with a needed command still running",
+            "If blocked, say what's missing and the next step",
+            "Preserve user work",
+            "no reverting unrelated changes",
+            "Ignore unrelated dirty files",
+            "mention unrelated bugs/tests rather than fixing them",
+            "Ask only when a wrong assumption would change the outcome",
+            "Orient: read the narrowest code and call sites",
+            "skip tools if context suffices",
+            "Reviews: findings first, don't edit unless asked",
+            "only non-trivial work",
+            "don't plan the easiest quarter or single steps",
+            "update `todo` items as done",
             "smallest coherent change in existing style",
-            "prefer `edit`/`patch` over rewriting",
-            "Fix root causes, reuse helpers",
-            "keep affected surfaces consistent",
-            "No placeholders, unneeded files/docs/tests, or unrelated edits",
-            "try to falsify",
+            "prefer `edit`/`patch`",
+            "fix root causes, reuse helpers",
+            "keep surfaces consistent",
+            "no placeholders or unrelated edits",
+            "strongest reasonable check",
             "cover edge/error paths",
-            "Never weaken or edit tests to pass",
-            "use independent subagents for complex work",
+            "don't rerun unchanged checks",
+            "Never weaken or edit tests",
             "outcome, evidence, assumptions, residual risk",
-            "repeated reads/edits make no progress",
-            "state what remains and the next step, not completion",
-            "Batch independent reads",
+            "Keep phases internal",
+            "Before grouped tool calls",
+            "Don't narrate every read or restate the plan",
+            "findings first by severity and file:line",
+            "If none, say so and note residual risk",
+            "Final answers: short",
+            "Users don't see raw tool output",
+            "relay key results, don't dump files",
+            "the newest wins",
+            "honor non-conflicting earlier requests",
+            "After resume or compaction",
+            "don't restart",
+            "check the answer matches the newest request",
+            "Batch independent reads/searches",
             "Read before editing and check call sites",
+            "Instructions/workspace summary are in context",
+            "unless stale",
             "never repeat an identical call",
             "broad exploration or independent verification",
+            "Batch prompts; children are read-only",
+            "Approval is handled by eix",
         ] {
             assert!(prompt.contains(expected), "missing {expected:?}");
         }
 
-        let plan = system_prompt(&Config::default(), &session, SessionMode::Plan);
+        let plan = system_prompt(&Config::default(), &session, SessionMode::Plan, None);
         assert!(plan.contains("Plan (read-only)"));
 
         let mut child = Session::new("child", "explore", "/home/me/eix");
         child.origin = SessionOrigin::Agent;
-        let child = system_prompt(&Config::default(), &child, SessionMode::Build);
+        let child = system_prompt(&Config::default(), &child, SessionMode::Build, None);
         assert!(child.contains("read-only sub-agent"));
         assert!(child.contains("cannot see the parent conversation"));
         assert!(child.contains("Answer the complete question"));
         assert!(
-            !child.contains("## Workflow"),
+            !child.contains("## Work loop"),
             "child reused the parent prompt"
         );
         let child_tokens = crate::context::estimate_tokens(
@@ -9599,7 +9763,7 @@ mod tests {
         custom.provider_runtime.system_prompt = Some("Custom parent prompt.".to_string());
         let mut child = Session::new("child", "explore", "/home/me/eix");
         child.origin = SessionOrigin::Agent;
-        let child = system_prompt(&custom, &child, SessionMode::Build);
+        let child = system_prompt(&custom, &child, SessionMode::Build, None);
         assert!(child.contains("Custom parent prompt."));
         assert!(child.contains("cannot see the parent conversation"));
         assert!(child.contains("read-only sub-agent"));

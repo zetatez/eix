@@ -566,7 +566,6 @@ fn synthesized(
 }
 
 async fn load_images(events: &[Event], blobs: Option<&BlobStore>) -> HashMap<String, ImagePart> {
-    use base64::Engine;
     let Some(blobs) = blobs else {
         return HashMap::new();
     };
@@ -588,21 +587,14 @@ async fn load_images(events: &[Event], blobs: Option<&BlobStore>) -> HashMap<Str
             }
         }
     }
-    let ids: HashSet<String> = mimes.keys().cloned().collect();
-    let bytes = blobs.load_many(&ids).await;
-    bytes
-        .into_iter()
-        .filter_map(|(id, data)| {
-            let mime = mimes.remove(&id)?;
-            Some((
-                id,
-                ImagePart {
-                    mime,
-                    data: base64::engine::general_purpose::STANDARD.encode(data),
-                },
-            ))
-        })
-        .collect()
+    let mut loaded = HashMap::with_capacity(mimes.len());
+    for (id, mime) in mimes {
+        // `image_part` caches the base64 payload; a miss reads and encodes once.
+        if let Ok(part) = blobs.image_part(&id, &mime).await {
+            loaded.insert(id, part);
+        }
+    }
+    loaded
 }
 
 fn event_entries(
