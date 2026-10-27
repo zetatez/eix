@@ -1107,7 +1107,7 @@ impl App {
             if available {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/g/s · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
+                self.status = "leader: f/g/s · i subagents · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
                     .into();
             }
             return true;
@@ -1416,6 +1416,7 @@ impl App {
             KeyAction::Palette => self.run_action("commands", tx),
             KeyAction::Files => self.run_action("files", tx),
             KeyAction::Grep => self.run_action("grep", tx),
+            KeyAction::Subagents => self.open_subagents(tx),
             KeyAction::Models => self.run_action("model", tx),
             KeyAction::Git => self.run_action("git", tx),
             KeyAction::Processes => self.run_action("processes", tx),

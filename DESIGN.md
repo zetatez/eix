@@ -200,7 +200,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `n` 新建 session 并开新 pane（当前 session 有 worktree 时复用）、`W` 当前 session 移入 worktree、
   `o` 打开 session picker（已有 session 放进新 pane；只列普通/worktree session，
   不列子 agent）、`c` 关闭 pane、`f` 文件、
-  `s` 文件内容（类似 rg）、`g` session picker、`h` 用户输入 timeline、`G` git（worktrees + branches）、
+  `s` 文件内容（类似 rg）、`i` subagents（有子 agent 时实时监控，否则并发上限）、`g` session picker、`h` 用户输入 timeline、`G` git（worktrees + branches）、
   `p` 进程、`a` 审批 inbox、`x` 取消、`m` 完整执行模式 picker、
   `v`/`t`/`r`/`l` 布局。单字母默认留给 vim；转录区裸
   `q` 关闭当前 pane（最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、
@@ -359,7 +359,7 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `Tab` | normal 模式下正向循环 Plan → Build → Auto → Bypass（命令面板的 `cycle execution mode` 同义） |
 | `Shift-Tab` | normal 模式下反向循环 Build → Plan → Bypass → Auto |
 | `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
-| `<Space>n/W/o/f/s/g/p/c/a/x/m/v/t/r/l` | TUI 动作（见 5.1）；可用 `[keys]` 覆盖 |
+| `<Space>n/W/o/f/s/i/g/p/c/a/x/m/v/t/r/l` | TUI 动作（见 5.1）；可用 `[keys]` 覆盖 |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
 | `d c y` + motion / `dd cc yy` / `iw aw` | 操作符 |
 | `v V` + `d x y c p ~ o` | visual |
@@ -464,14 +464,14 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     session 的预览会随选中项通过 `picker.preview` 拉取最近对话（you / assistant / tool / error）；
     session picker 只列普通 session 和 worktree session，`origin = agent` 的子 session 不进入列表，
     只能从父 transcript 的 subagent 卡片打开；child transcript 底部提供可点击的
-    `← parent agent`；`/subagents` 在父 session 有子 agent 时打开实时 subagent picker
+    `← parent agent`；`/subagents` 或 `<Space>i` 在父 session 有子 agent 时打开实时 subagent picker
     （按名字搜索，右侧预览 child 事件、工具调用/结果、流式 thinking 和 answer，`Enter` 在
     pane 中打开 child session），没有子 agent 时回退到并发上限 picker；worktree 标记 `⑂` 单独占一列，
     紧跟 session id 前；
     files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
     grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
   - 入口：`<Space>g`（sessions，切换 pane）、`<Space>h`（timeline）、`<Space>o`（sessions，新 pane）、
-    `<Space>f`（files）、`<Space>s`（grep，文件内容）、`Ctrl-P`（commands，命令面板；转录区与输入框
+    `<Space>f`（files）、`<Space>s`（grep，文件内容）、`<Space>i`（subagents，实时活动）、`Ctrl-P`（commands，命令面板；转录区与输入框
     normal 模式都可用）、`<Space>G`（git，统一列出 worktrees 和 branches；没有 linked worktree 时
     省略仓库主路径）、prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
   - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`grep`
@@ -1178,6 +1178,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 | `Space m` | 完整执行模式 picker |
 | `Space f` | 文件 picker |
 | `Space s` | 搜索文件内容并插入 `@path:line` |
+| `Space i` | subagents 实时 picker：有子 agent 时监控并搜索 child，否则打开并发上限 picker |
 | `Space g` | session picker（切换聚焦 pane） |
 | `Space h` | 用户输入 timeline picker |
 | `Space G` | git picker（worktrees + branches） |

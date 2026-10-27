@@ -2555,6 +2555,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt & transcript: search file contents and insert @path:line",
             },
             HelpEntry {
+                key: "Space i",
+                description: "prompt & transcript: monitor live sub-agents (children first, else the concurrency limit)",
+            },
+            HelpEntry {
                 key: "Space p",
                 description: "prompt & transcript: processes",
             },

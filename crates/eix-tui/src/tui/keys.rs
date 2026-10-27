@@ -19,6 +19,7 @@ pub enum KeyAction {
     Palette,
     Files,
     Grep,
+    Subagents,
     Models,
     Git,
     Processes,
@@ -70,6 +71,7 @@ impl KeyAction {
             "palette" | "commands" => Self::Palette,
             "files" => Self::Files,
             "grep" => Self::Grep,
+            "subagents" | "subagent" => Self::Subagents,
             "model" | "models" => Self::Models,
             "git" | "worktrees" | "branches" => Self::Git,
             "processes" | "ps" => Self::Processes,
@@ -281,6 +283,7 @@ fn default_bindings() -> Vec<Binding> {
         (KeyAction::NewPane, "o"),
         (KeyAction::Files, "f"),
         (KeyAction::Grep, "s"),
+        (KeyAction::Subagents, "i"),
         (KeyAction::Sessions, "g"),
         (KeyAction::Timeline, "h"),
         (KeyAction::Git, "G"),
@@ -544,6 +547,14 @@ mod tests {
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('g'), KeyModifiers::NONE)),
             Some(KeyAction::Sessions)
+        );
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('s'), KeyModifiers::NONE)),
+            Some(KeyAction::Grep)
+        );
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('i'), KeyModifiers::NONE)),
+            Some(KeyAction::Subagents)
         );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('h'), KeyModifiers::NONE)),

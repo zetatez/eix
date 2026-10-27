@@ -301,6 +301,7 @@ theme:
 #   new_pane          Space o
 #   files             Space f
 #   grep              Space s
+#   subagents         Space i
 #   git               Space G
 #   processes         Space p
 #   inbox             Space a

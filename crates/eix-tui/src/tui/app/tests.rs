@@ -1467,6 +1467,31 @@ fn subagents_command_opens_the_live_child_picker() {
 }
 
 #[test]
+fn leader_i_opens_the_subagent_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["parent"]);
+    app.focus = Focus::Transcript;
+
+    // Without children the shortcut falls back to the concurrency picker.
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Subagents)
+    );
+    assert!(!app.pending_leader);
+    app.picker = None;
+
+    app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::SubagentActivity)
+    );
+}
+
+#[test]
 fn subagents_without_children_falls_back_to_the_limit_picker() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["parent"]);
