@@ -969,7 +969,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > （`read_file` / `list_dir` / `grep` / `glob` / `lsp_diagnostics` / `process_output` 等）；
 > agent session 在 `run_tool_call` 里对写工具
 > 直接拒绝，深度上限 1（child 不能再 spawn）。同一 assistant 批次里的多个 `spawn_agent`
-> 用 `tokio::spawn` 并发跑，默认上限由 `[tools] max_parallel_subagents` 配置（默认 8，支持
+> 用 `tokio::spawn` 并发跑，默认上限由 `[tools] max_parallel_subagents` 配置（默认 32，支持
 > 2/4/8/16/32/64/128/256）；TUI `/subagents` 在有子 agent 时打开实时活动 picker，
 > `/subagents limit` 或 `/subagents <n>` 调整并发上限并通过 `config.subagents` RPC 覆盖运行时值（不写回配置）。
 > 同一批次里连续的只读调用（内置读工具，以及风险分析判定低风险只读、权限决定为 allow 的
@@ -1266,7 +1266,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/attention` / `/cancel` | 跳到下一个需要 attention 的 pane / 取消运行 |
 | `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `providers.*` 自动拉取的 `/models` 和 `models:`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
-| `/subagents [n|limit]` | 有子 agent 时打开实时 picker（搜索 child，右侧预览事件/工具调用/流式 thinking 与 answer，`Enter` 在新 pane 打开）；`limit` 或 `<n>` 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 8，可选 2/4/8/16/32/64/128/256，仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
+| `/subagents [n|limit]` | 有子 agent 时打开实时 picker（搜索 child，右侧预览事件/工具调用/流式 thinking 与 answer，`Enter` 在新 pane 打开）；`limit` 或 `<n>` 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 32，可选 2/4/8/16/32/64/128/256，仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
 | `/reload` | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC），并重新加载自定义 Markdown 命令 |
 | `/colorscheme` | 打开 colorscheme picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原配色 |
@@ -1378,7 +1378,7 @@ echo "$f"; done | sort | head` 可直接放行。
 tools:
   max_output_bytes: 20000
   command_timeout_secs: 60
-  max_parallel_subagents: 8  # 2/4/8/16/32/64/128/256；大规模任务可按需调高
+  max_parallel_subagents: 32  # 2/4/8/16/32/64/128/256；大规模任务可按需调高
   sandbox: auto            # auto / required / off
   sandbox_network: false
   sandbox_read_paths: ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]
