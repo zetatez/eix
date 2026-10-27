@@ -647,9 +647,15 @@ impl App {
         frame.render_widget(block, rect);
         let body = draw_search_field(frame, inner, &query, accent, preview_text, muted, dialog_bg);
         let (list_area, preview_area) = if body.width >= 64 {
-            let columns =
-                Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
-                    .split(body);
+            // The sub-agent picker is a live console: keep the child list a
+            // narrow rail and let the activity preview take the rest.
+            let list_width = if kind == PickerKind::SubagentActivity {
+                (body.width / 3).clamp(30, 34)
+            } else {
+                body.width * 58 / 100
+            };
+            let columns = Layout::horizontal([Constraint::Length(list_width), Constraint::Min(0)])
+                .split(body);
             (columns[0], Some(columns[1]))
         } else {
             (body, None)
@@ -691,7 +697,7 @@ impl App {
                 }
                 (start, (start + height).min(filtered.len()))
             };
-            let rows = self.picker_rows(kind, &filtered[start..end]);
+            let rows = self.picker_rows(kind, &filtered[start..end], list_area.width as usize);
             let list = List::new(rows)
                 .style(Style::default().bg(dialog_bg))
                 .highlight_style(
@@ -736,13 +742,22 @@ impl App {
 
     /// List rows for the open picker. Session kinds render live session state;
     /// other kinds render the provider's label and detail.
-    pub(super) fn picker_rows(&self, kind: PickerKind, filtered: &[usize]) -> Vec<ListItem<'_>> {
+    pub(super) fn picker_rows(
+        &self,
+        kind: PickerKind,
+        filtered: &[usize],
+        width: usize,
+    ) -> Vec<ListItem<'_>> {
         match kind {
             PickerKind::SubagentActivity => {
                 let Some(view) = self.focused_view() else {
                     return Vec::new();
                 };
                 let agents = view.subagents_sorted();
+                // Dot, status label, padding and the highlight symbol claim 14
+                // cells; the name gets what the narrow rail leaves so the
+                // status stays visible.
+                let name_width = width.saturating_sub(14).max(8);
                 filtered
                     .iter()
                     .filter_map(|&index| agents.get(index))
@@ -775,7 +790,7 @@ impl App {
                         ListItem::new(Line::from(vec![
                             Span::styled(format!("{dot} "), Style::default().fg(color)),
                             Span::styled(
-                                pad_to(&truncate(&agent.name, 28), 28),
+                                pad_to(&truncate(&agent.name, name_width), name_width),
                                 Style::default()
                                     .fg(composer_text(self.theme))
                                     .add_modifier(Modifier::BOLD),

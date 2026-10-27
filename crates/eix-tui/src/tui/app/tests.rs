@@ -1563,6 +1563,37 @@ fn subagent_picker_previews_live_activity() {
 }
 
 #[test]
+fn subagent_picker_keeps_the_list_narrow_and_the_preview_wide() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["parent"]);
+    app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/review-2".into());
+    app.views[0].push_subagent_event(
+        "child-1",
+        SessionEvent::new(
+            "child-1",
+            1,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "exec_command",
+                "arguments": {"cmd": "rg 0123456789012345678901 src"},
+            }),
+        ),
+    );
+    app.open_picker(PickerKind::SubagentActivity, &tx);
+    let rendered = render_text(&mut app, 100, 30);
+    // The preview owns most of the dialog, so the command stays on one line;
+    // the old 42% pane wrapped it.
+    assert!(
+        rendered.contains("rg 0123456789012345678901 src"),
+        "{rendered}"
+    );
+    // The narrow list still shows the whole child name and its status.
+    assert!(rendered.contains("parent/review-2"), "{rendered}");
+    assert!(rendered.contains("running"), "{rendered}");
+}
+
+#[test]
 fn subagent_picker_enter_opens_the_child_pane() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["parent"]);
