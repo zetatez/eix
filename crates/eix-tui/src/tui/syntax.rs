@@ -124,7 +124,7 @@ fn theme_for(theme: Theme, themes: &ThemeSet) -> &SyntectTheme {
         .expect("syntect ships at least one default theme")
 }
 
-fn light_background(theme: Theme) -> bool {
+pub(super) fn light_background(theme: Theme) -> bool {
     if let Some(background) = theme.background {
         return luminance(background) > 0.6;
     }

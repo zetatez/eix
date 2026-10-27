@@ -16,13 +16,17 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::math;
-use super::syntax::CodeHighlighter;
+use super::syntax::{light_background, CodeHighlighter};
 use super::theme::Theme;
 
 const MUTED: Color = Color::Rgb(110, 116, 129);
-const PANEL: Color = Color::Rgb(38, 41, 51);
 const ACCENT: Color = Color::Rgb(122, 162, 247);
 const SUCCESS: Color = Color::Rgb(126, 199, 149);
+/// Inline code borrows dwm's default bar blue (#005577). On a dark terminal the
+/// same hue is lifted just enough to stay readable against a transparent
+/// background; neither variant paints a fill.
+const INLINE_CODE_LIGHT: Color = Color::Rgb(0, 85, 119);
+const INLINE_CODE_DARK: Color = Color::Rgb(81, 168, 216);
 
 /// Render a transcript message. Lines are indented by two cells, matching the
 /// transcript's left gutter.
@@ -125,9 +129,7 @@ impl Renderer {
             Event::End(tag) => self.end(tag),
             Event::Text(text) => self.text(&text),
             Event::Code(text) => {
-                let style = Style::default()
-                    .fg(self.theme.string.unwrap_or(ACCENT))
-                    .bg(panel(self.theme));
+                let style = Style::default().fg(inline_code(self.theme));
                 self.append_styled(&text, style);
                 self.capture(&text);
             }
@@ -967,8 +969,12 @@ fn accent(theme: Theme) -> Color {
     theme.function.unwrap_or(ACCENT)
 }
 
-fn panel(theme: Theme) -> Color {
-    theme.panel.unwrap_or(PANEL)
+fn inline_code(theme: Theme) -> Color {
+    if light_background(theme) {
+        INLINE_CODE_LIGHT
+    } else {
+        INLINE_CODE_DARK
+    }
 }
 
 fn dim(theme: Theme) -> Style {
@@ -1523,6 +1529,36 @@ mod tests {
         assert!(output.contains("rust"));
         assert!(output.contains("fn main() {"));
         assert!(output.contains("    println!(\"hi\");"));
+    }
+
+    #[test]
+    fn inline_code_is_blue_without_a_background() {
+        let code_span = |theme| {
+            let rendered = render("Run `git commit` first.", 60, theme);
+            rendered
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.as_ref() == "git commit")
+                .cloned()
+                .expect("inline code span")
+        };
+
+        let dark = code_span(Theme::default());
+        assert_eq!(dark.style.fg, Some(INLINE_CODE_DARK));
+        assert_eq!(dark.style.bg, None, "inline code must stay transparent");
+        assert!(
+            matches!(dark.style.fg, Some(Color::Rgb(r, g, b)) if b > r && b > g),
+            "inline code should be blue, got {:?}",
+            dark.style.fg
+        );
+
+        let light = Theme {
+            background: Some(Color::Rgb(250, 250, 250)),
+            ..Theme::default()
+        };
+        let light = code_span(light);
+        assert_eq!(light.style.fg, Some(INLINE_CODE_LIGHT));
+        assert_eq!(light.style.bg, None, "inline code must stay transparent");
     }
 
     #[test]
