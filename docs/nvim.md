@@ -35,7 +35,9 @@ TCP 连接的第一个请求必须是：
 {"id":1,"method":"auth","params":{"token":"..."}}
 ```
 
-认证成功后才返回其它响应和事件；失败返回 `unauthorized` 并断开。HTTP/SSE 是另一条可选的
+认证成功后才返回其它响应和事件；失败返回 `unauthorized` 并断开。token 可以是配置里的
+`server.token`，也可以是用 `eix pair` 生成的一次性码兑换来的客户端 token（daemon 只保存其
+SHA-256，`eix pair list` / `revoke` 管理）。HTTP/SSE 是另一条可选的
 集成路径，见 [DESIGN.md §19](../DESIGN.md#196-neovim-插件集成)。
 
 ## 消息格式

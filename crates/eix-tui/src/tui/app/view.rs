@@ -21,7 +21,9 @@ impl App {
         let show_cmdline = self.cmdline.is_some() || area.height >= 7;
         let status_height = u16::from(area.height >= 7);
         let cmdline_height = u16::from(show_cmdline);
-        let input_height = prompt_input_height(area.height, area.width, &self.input);
+        let inner_width = area.width.saturating_sub(4).max(1) as usize;
+        let input_layout = self.input.wrap(inner_width);
+        let input_height = prompt_input_height_for_rows(area.height, input_layout.segments.len());
         let chunks = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(input_height),
@@ -31,7 +33,7 @@ impl App {
         .split(area);
 
         self.draw_body(frame, chunks[0]);
-        self.draw_input(frame, chunks[1]);
+        self.draw_input(frame, chunks[1], input_layout);
         self.draw_status_bar(frame, chunks[2]);
         self.draw_cmdline(frame, chunks[3]);
         if self.cmdline_menu_open() {
@@ -228,16 +230,6 @@ impl App {
         }
         let focused = index == self.focused;
         let session_id = self.views[index].session.id.clone();
-        let approval = if focused {
-            self.approvals.get(&session_id).cloned()
-        } else {
-            None
-        };
-        let pending_input = if focused {
-            self.inputs.get(&session_id).cloned()
-        } else {
-            None
-        };
         let attention = !focused
             && (self.views[index].session.status.needs_attention()
                 || self.approvals.contains_key(&session_id)
@@ -264,32 +256,13 @@ impl App {
             .get(&session_id)
             .map(|queue| queue.iter().cloned().collect())
             .unwrap_or_default();
-        let transcript::Transcript {
-            lines: mut tail_lines,
-            slots: mut tail_slots,
-            user_lines: _,
-        } = {
-            let view = &self.views[index];
-            let live = view.live();
-            transcript::render_tail(
-                live,
-                &queued,
-                &view.folds,
-                inner_width.max(1),
-                theme,
-                self.tick,
-            )
-        };
-        let view = &self.views[index];
-        if view.session.is_agent() && view.session.parent_id.is_some() {
-            tail_lines.push(parent_link_line(theme));
-            tail_slots.push(None);
-        }
+        self.views[index].ensure_tail(inner_width.max(1), theme, self.tick, &queued);
         let history_len = self.views[index]
             .history_cache
             .as_ref()
             .map(|cache| cache.lines.len())
             .unwrap_or(0);
+        let tail_len = self.views[index].tail.lines.len();
         {
             let view = &mut self.views[index];
             if let Some((old_len, old_scroll)) = view.history_anchor.take() {
@@ -305,15 +278,11 @@ impl App {
                     }
                 }
             }
-        }
-        {
-            let view = &mut self.views[index];
+            view.line_count = history_len + tail_len;
             view.slots.truncate(history_len);
-            view.slots.extend(tail_slots);
-            view.text_lines.truncate(history_len);
-            view.text_lines.extend(tail_lines.iter().map(text_line));
+            view.slots.extend_from_slice(&view.tail.slots);
         }
-        let total = history_len + tail_lines.len();
+        let total = history_len + tail_len;
         let max_scroll = total.saturating_sub(inner_height);
         {
             let view = &mut self.views[index];
@@ -367,7 +336,7 @@ impl App {
         }
         if end > history_len {
             let tail_start = scroll.saturating_sub(history_len);
-            lines.extend_from_slice(&tail_lines[tail_start..end - history_len]);
+            lines.extend_from_slice(&self.views[index].tail.lines[tail_start..end - history_len]);
         }
         if let Some(selection) = self.views[index].selection {
             highlight_selection_window(&mut lines, &selection, scroll);
@@ -445,11 +414,11 @@ impl App {
         }
         frame.render_widget(paragraph, area);
 
-        if let Some(approval) = approval {
-            draw_approval_card(frame, area, &approval, theme);
-        }
-        if let Some(pending) = pending_input {
-            draw_input_card(frame, area, &pending, theme);
+        if focused {
+            self.draw_approval_card(frame, area, &session_id);
+            if let Some(pending) = self.inputs.get(&session_id) {
+                draw_input_card(frame, area, pending, theme);
+            }
         }
     }
 

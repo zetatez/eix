@@ -2,8 +2,8 @@
 //!
 //! Before a mutating tool runs, copy what it can change into
 //! `<data>/snapshots/<session>/<snapshot>/` so a later rewind has something to
-//! restore. `write_file` snapshots its single target; `run_command` snapshots
-//! the whole workspace, because a shell command can touch anything.
+//! restore. `apply_patch` snapshots only the files it names; `exec_command`
+//! snapshots the whole workspace, because a shell command can touch anything.
 //!
 //! Snapshots are a safety net, not a guarantee. Files over the per-file cap,
 //! symlinks, and everything under the excluded directories are counted as
@@ -162,6 +162,28 @@ impl Snapshotter {
         .context("snapshot task panicked")?
     }
 
+    /// Copy the files an `apply_patch` call is about to change.
+    pub async fn capture_files(
+        &self,
+        session_id: &str,
+        tool: &str,
+        call_id: &str,
+        cwd: &Path,
+        paths: &[PathBuf],
+    ) -> Result<Snapshot> {
+        let root = self.root.clone();
+        let session_id = session_id.to_string();
+        let tool = tool.to_string();
+        let call_id = call_id.to_string();
+        let cwd = cwd.to_path_buf();
+        let paths = paths.to_vec();
+        tokio::task::spawn_blocking(move || {
+            capture_files_blocking(&root, &session_id, &tool, &call_id, &cwd, &paths)
+        })
+        .await
+        .context("snapshot task panicked")?
+    }
+
     /// Copy the whole workspace before a `run_command`.
     pub async fn capture_tree(
         &self,
@@ -241,48 +263,72 @@ fn capture_file_blocking(
     cwd: &Path,
     path: &Path,
 ) -> Result<Snapshot> {
-    let cwd = cwd.to_path_buf();
-    // `resolve_path` returns a canonicalized path for existing files but a
-    // lexically normalized one for new files, so match against both the given
-    // cwd and its canonical form (they differ when the session lives behind a
-    // symlink).
-    let rel = match path.strip_prefix(&cwd) {
-        Ok(rel) => rel.to_path_buf(),
-        Err(_) => {
-            let canon = canonical(&cwd);
-            path.strip_prefix(&canon)
-                .with_context(|| format!("{} is outside {}", path.display(), canon.display()))?
-                .to_path_buf()
-        }
-    };
+    let path = path.to_path_buf();
+    capture_files_blocking(
+        root,
+        session_id,
+        tool,
+        call_id,
+        cwd,
+        std::slice::from_ref(&path),
+    )
+}
 
+fn capture_files_blocking(
+    root: &Path,
+    session_id: &str,
+    tool: &str,
+    call_id: &str,
+    cwd: &Path,
+    paths: &[PathBuf],
+) -> Result<Snapshot> {
+    let cwd = cwd.to_path_buf();
+    let canon = canonical(&cwd);
     let id = Uuid::new_v4().to_string();
     let dir = root.join(session_id).join(&id);
     let files_dir = dir.join("files");
     std::fs::create_dir_all(&files_dir)
         .with_context(|| format!("cannot create {}", files_dir.display()))?;
 
-    let metadata = std::fs::metadata(path).ok();
-    let existed = metadata.is_some();
+    let mut entries = Vec::new();
     let mut files = 0;
     let mut bytes = 0;
     let mut skipped = 0;
-    match metadata {
-        Some(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {
-            let target = files_dir.join(&rel);
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            match copy_file(path, &target) {
-                Ok(_) => {
-                    files = 1;
-                    bytes = meta.len();
+    for path in paths {
+        // `resolve_path` returns a canonicalized path for existing files but a
+        // lexically normalized one for new files, so match against both the
+        // given cwd and its canonical form (they differ when the session lives
+        // behind a symlink).
+        let rel = match path.strip_prefix(&cwd) {
+            Ok(rel) => rel.to_path_buf(),
+            Err(_) => path
+                .strip_prefix(&canon)
+                .with_context(|| format!("{} is outside {}", path.display(), canon.display()))?
+                .to_path_buf(),
+        };
+        let metadata = std::fs::metadata(path).ok();
+        let existed = metadata.is_some();
+        entries.push(Entry {
+            path: rel.clone(),
+            existed,
+        });
+        match metadata {
+            Some(meta) if meta.is_file() && meta.len() <= MAX_FILE_BYTES => {
+                let target = files_dir.join(&rel);
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
                 }
-                Err(_) => skipped = 1,
+                match copy_file(path, &target) {
+                    Ok(_) => {
+                        files += 1;
+                        bytes += meta.len();
+                    }
+                    Err(_) => skipped += 1,
+                }
             }
+            Some(_) => skipped += 1,
+            None => {}
         }
-        Some(_) => skipped = 1,
-        None => {}
     }
 
     let manifest = Manifest {
@@ -299,7 +345,7 @@ fn capture_file_blocking(
         files,
         bytes,
         skipped,
-        entries: vec![Entry { path: rel, existed }],
+        entries,
     };
     write_manifest(&dir, &manifest)?;
     prune_dir(root, session_id, KEEP_PER_SESSION);

@@ -325,17 +325,20 @@ impl App {
                         self.focus = Focus::Transcript;
                     }
                     self.status = format!("approval needed: {}", params.summary);
-                    let mut summary =
-                        if matches!(params.tool.as_str(), "run_command" | "start_command") {
-                            params
-                                .arguments
-                                .get("command")
-                                .and_then(serde_json::Value::as_str)
-                                .map(|command| format!("$ {command}"))
-                                .unwrap_or(params.summary)
-                        } else {
-                            params.summary
-                        };
+                    let mut summary = if matches!(
+                        params.tool.as_str(),
+                        "exec_command" | "run_command" | "start_command"
+                    ) {
+                        params
+                            .arguments
+                            .get("cmd")
+                            .or_else(|| params.arguments.get("command"))
+                            .and_then(serde_json::Value::as_str)
+                            .map(|command| format!("$ {command}"))
+                            .unwrap_or(params.summary)
+                    } else {
+                        params.summary
+                    };
                     let risk = params.risk.to_ascii_uppercase();
                     if !risk.is_empty() {
                         summary = format!("[{risk}] {summary}");
@@ -358,6 +361,7 @@ impl App {
                     if !params.allow_always {
                         summary.push_str(NO_ALWAYS_MARKER);
                     }
+                    self.approval_rev = self.approval_rev.wrapping_add(1);
                     self.approvals.insert(
                         params.session_id,
                         PendingApproval {
@@ -421,6 +425,16 @@ impl App {
                     }
                     self.status = format!("patch staged: {}", params.path);
                     self.reload_pending(&params.session_id);
+                }
+            }
+            "model.updated" => {
+                if let Some(model) = notification.params["model"].as_str() {
+                    if let Some(hello) = self.hello.as_mut() {
+                        hello.model = model.to_string();
+                    }
+                    let message = format!("default model → {model}");
+                    self.status = message.clone();
+                    self.push_toast(message, ToastTone::Success, RELOAD_TOAST_DISPLAY);
                 }
             }
             "config.reloaded" => {

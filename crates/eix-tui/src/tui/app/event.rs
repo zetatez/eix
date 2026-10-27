@@ -133,6 +133,7 @@ impl App {
                 let mut clicked = None;
                 {
                     let view = &mut self.views[index];
+                    view.ensure_text_lines();
                     let Some(selection) = view.selection.as_mut() else {
                         return;
                     };
@@ -239,6 +240,7 @@ impl App {
         }
 
         let view = &mut self.views[index];
+        view.ensure_text_lines();
         if dragging {
             let inner_height = rect
                 .height
@@ -252,7 +254,7 @@ impl App {
                     view.follow = false;
                 }
             } else if y >= bottom {
-                let max_scroll = view.text_lines.len().saturating_sub(inner_height);
+                let max_scroll = view.line_count.saturating_sub(inner_height);
                 if view.scroll < max_scroll {
                     view.scroll += 1;
                     view.follow = false;
@@ -395,7 +397,7 @@ impl App {
                 }
                 let count = items.len();
                 let grep = kind == eix_core::KIND_GREP;
-                picker.items = items;
+                picker.set_items(items);
                 picker.selected = 0;
                 picker.loading = false;
                 if grep {
@@ -426,7 +428,24 @@ impl App {
                     }
                 }
             }
-            Event::Models { models, warnings } => {
+            Event::DefaultModel(model) => {
+                if let Some(hello) = self.hello.as_mut() {
+                    hello.model = model.clone();
+                }
+                let message = format!("default model → {model}");
+                self.status = message.clone();
+                self.push_toast(message, ToastTone::Success, RELOAD_TOAST_DISPLAY);
+            }
+            Event::Models {
+                models,
+                warnings,
+                default_model,
+            } => {
+                if !default_model.is_empty() {
+                    if let Some(hello) = self.hello.as_mut() {
+                        hello.model = default_model;
+                    }
+                }
                 let count = models.len();
                 self.models = models;
                 let current = self
@@ -449,7 +468,7 @@ impl App {
                     .unwrap_or(0);
                 if let Some(picker) = &mut self.picker {
                     if picker.kind == PickerKind::Models {
-                        picker.items = items;
+                        picker.set_items(items);
                         picker.selected = selected;
                         picker.loading = false;
                     }
@@ -462,7 +481,7 @@ impl App {
             Event::Agents(agents) => {
                 if let Some(picker) = &mut self.picker {
                     if picker.kind == PickerKind::Agents {
-                        picker.items = agent_picker_items(&agents);
+                        picker.set_items(agent_picker_items(&agents));
                         picker.selected = 0;
                         picker.loading = false;
                     }
@@ -472,7 +491,7 @@ impl App {
             Event::Mcp(servers) => {
                 if let Some(picker) = &mut self.picker {
                     if picker.kind == PickerKind::Mcp {
-                        picker.items = mcp_picker_items(&servers);
+                        picker.set_items(mcp_picker_items(&servers));
                         picker.selected = 0;
                         picker.loading = false;
                     }
@@ -580,7 +599,7 @@ impl App {
             Event::Todos(items) => {
                 if let Some(picker) = &mut self.picker {
                     if picker.kind == PickerKind::Todos {
-                        picker.items = todo_picker_items(&items);
+                        picker.set_items(todo_picker_items(&items));
                         picker.selected = 0;
                         picker.loading = false;
                     }

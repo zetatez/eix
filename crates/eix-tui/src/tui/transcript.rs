@@ -405,6 +405,13 @@ pub struct HistoryCache {
     folds: HashMap<FoldId, bool>,
     keys: Vec<BlockKey>,
     starts: Vec<usize>,
+    /// Collected blocks, kept between renders so appended events only pay for
+    /// themselves instead of re-deserializing the whole session.
+    blocks: Vec<Collected>,
+    tool_index: Vec<(String, usize)>,
+    consumed: usize,
+    first_seq: Option<u64>,
+    last_seq: Option<u64>,
     pub lines: Vec<Line<'static>>,
     pub slots: Vec<Option<Fold>>,
     pub user_lines: Vec<(u64, usize)>,
@@ -438,8 +445,30 @@ impl HistoryCache {
         subagents_rev: u64,
         events_rev: u64,
     ) {
-        let blocks = collect(events);
-        let keys: Vec<BlockKey> = blocks
+        // Reuse collected blocks when the event log only grew. A history page
+        // prepended at the front or a fork/truncation changes the prefix, so
+        // those fall back to a full collect.
+        let appendable = self.consumed <= events.len()
+            && self.consumed > 0
+            && events.first().map(|event| event.seq) == self.first_seq
+            && events.get(self.consumed - 1).map(|event| event.seq) == self.last_seq;
+        if !appendable {
+            self.blocks.clear();
+            self.tool_index.clear();
+            collect_into(events, &mut self.blocks, &mut self.tool_index);
+            self.consumed = events.len();
+        } else if self.consumed < events.len() {
+            collect_into(
+                &events[self.consumed..],
+                &mut self.blocks,
+                &mut self.tool_index,
+            );
+            self.consumed = events.len();
+        }
+        self.first_seq = events.first().map(|event| event.seq);
+        self.last_seq = events.last().map(|event| event.seq);
+        let keys: Vec<BlockKey> = self
+            .blocks
             .iter()
             .map(|collected| block_key(&collected.block, collected.rev, folds, subagents_rev))
             .collect();
@@ -468,7 +497,7 @@ impl HistoryCache {
             self.keys.truncate(common);
             self.starts.truncate(common);
         }
-        for (index, collected) in blocks.iter().enumerate().skip(common) {
+        for (index, collected) in self.blocks.iter().enumerate().skip(common) {
             self.starts.push(self.lines.len());
             self.keys.push(keys[index]);
             let piece = render_block(&collected.block, folds, width, theme, subagents);
@@ -491,7 +520,7 @@ impl HistoryCache {
 /// `...` at a readable pace instead of flickering on every redraw.
 const WAITING_DOT_TICKS: u64 = 2;
 
-fn waiting_dots(tick: u64) -> &'static str {
+pub(crate) fn waiting_dots(tick: u64) -> &'static str {
     match (tick / WAITING_DOT_TICKS) % 3 {
         0 => ".",
         1 => "..",
@@ -533,11 +562,23 @@ struct Collected {
     rev: u64,
 }
 
-/// Flatten the event log into ordered blocks, merging tool call/results.
+/// Flatten the whole event log. Used by tests; the UI appends incrementally.
+#[cfg(test)]
 fn collect(events: &[SessionEvent]) -> Vec<Collected> {
-    let mut blocks: Vec<Collected> = Vec::new();
-    let mut tool_index: Vec<(String, usize)> = Vec::new();
+    let mut blocks = Vec::new();
+    let mut tool_index = Vec::new();
+    collect_into(events, &mut blocks, &mut tool_index);
+    blocks
+}
 
+/// Apply a slice of events to an existing block list, merging tool
+/// call/results. Appending to a cache avoids re-deserializing the whole log for
+/// every new event.
+fn collect_into(
+    events: &[SessionEvent],
+    blocks: &mut Vec<Collected>,
+    tool_index: &mut Vec<(String, usize)>,
+) {
     macro_rules! push_block {
         ($rev:expr, $block:expr) => {
             blocks.push(Collected {
@@ -594,7 +635,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Collected> {
             }
             EventKind::ApprovalRequired => {
                 if let Ok(payload) = ApprovalRequiredPayload::deserialize(&event.payload) {
-                    match tool_slot(&blocks, &tool_index, &payload.call_id) {
+                    match tool_slot(blocks, tool_index, &payload.call_id) {
                         Some(slot) => {
                             blocks[slot].rev = event.seq;
                             if let Block::Tool(block) = &mut blocks[slot].block {
@@ -628,7 +669,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Collected> {
                         diff: payload.diff,
                         outcome: None,
                     };
-                    match tool_slot(&blocks, &tool_index, &payload.call_id) {
+                    match tool_slot(blocks, tool_index, &payload.call_id) {
                         Some(slot) => {
                             blocks[slot].rev = event.seq;
                             if let Block::Tool(block) = &mut blocks[slot].block {
@@ -657,7 +698,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Collected> {
                         EventKind::PatchRejected => PatchOutcome::Rejected,
                         _ => PatchOutcome::Conflict,
                     };
-                    match tool_slot(&blocks, &tool_index, &payload.call_id) {
+                    match tool_slot(blocks, tool_index, &payload.call_id) {
                         Some(slot) => {
                             blocks[slot].rev = event.seq;
                             if let Block::Tool(block) = &mut blocks[slot].block {
@@ -702,7 +743,7 @@ fn collect(events: &[SessionEvent]) -> Vec<Collected> {
             }
             EventKind::ToolResult => {
                 if let Ok(payload) = ToolResultPayload::deserialize(&event.payload) {
-                    match tool_slot(&blocks, &tool_index, &payload.call_id) {
+                    match tool_slot(blocks, tool_index, &payload.call_id) {
                         Some(slot) => {
                             blocks[slot].rev = event.seq;
                             if let Block::Tool(block) = &mut blocks[slot].block {
@@ -793,8 +834,6 @@ fn collect(events: &[SessionEvent]) -> Vec<Collected> {
             _ => {}
         }
     }
-
-    blocks
 }
 
 fn tool_slot(blocks: &[Collected], index: &[(String, usize)], call_id: &str) -> Option<usize> {
@@ -807,7 +846,7 @@ fn tool_slot(blocks: &[Collected], index: &[(String, usize)], call_id: &str) -> 
 }
 
 impl Transcript {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             lines: Vec::new(),
             slots: Vec::new(),
@@ -1589,13 +1628,13 @@ fn status_color(block: &ToolBlock, theme: Theme) -> Color {
 const BODY_INDENT: &str = "    ";
 
 fn is_command_tool(tool: &str) -> bool {
-    matches!(tool, "run_command" | "start_command")
+    matches!(tool, "exec_command" | "run_command" | "start_command")
 }
 
 /// Tools whose result is a reviewable file change. Their compact card already
 /// prints the path, so the expanded body is just the side-by-side diff.
 pub(super) fn is_file_change_tool(tool: &str) -> bool {
-    matches!(tool, "write_file" | "edit" | "patch")
+    matches!(tool, "write_file" | "edit" | "patch" | "apply_patch")
 }
 
 /// The expanded argument detail, tailored to the tool. The header already
@@ -1609,8 +1648,9 @@ fn detail_text(block: &ToolBlock) -> String {
             .unwrap_or_default()
     };
     match block.tool.as_str() {
-        "run_command" | "start_command" => {
-            let cwd = string("cwd");
+        "exec_command" | "run_command" | "start_command" => {
+            let cwd = string("workdir");
+            let cwd = if cwd.is_empty() { string("cwd") } else { cwd };
             if cwd.is_empty() {
                 String::new()
             } else {
@@ -1619,7 +1659,8 @@ fn detail_text(block: &ToolBlock) -> String {
         }
         // The diff preview carries the change; raw old/new strings or
         // `patchText` would only duplicate it.
-        "read_file" | "list_dir" | "write_file" | "edit" | "patch" => String::new(),
+        "read_file" | "list_dir" | "write_file" | "edit" | "patch" | "apply_patch"
+        | "view_image" => String::new(),
         "spawn_agent" => {
             let name = string("name");
             let prompt = string("prompt");

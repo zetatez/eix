@@ -1692,6 +1692,7 @@ fn history_page_prepends_older_events_and_keeps_scroll() {
         app.views[0].scroll > 4,
         "viewport should move by the prepended line count"
     );
+    app.views[0].ensure_text_lines();
     assert!(app.views[0]
         .text_lines
         .iter()
@@ -3059,6 +3060,9 @@ fn file_picker_inserts_at_path_into_the_native_prompt() {
         query: String::new(),
         selected: 0,
         items: vec![PickerItem::new("src/main.rs"), PickerItem::new("README.md")],
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
         loading: false,
         preview: PickerPreview::default(),
         preview_request: None,
@@ -3160,6 +3164,9 @@ fn file_picker_preview_requests_the_selected_file() {
         query: String::new(),
         selected: 0,
         items: vec![PickerItem::new("src/a.rs"), PickerItem::new("src/b.rs")],
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
         loading: false,
         preview: PickerPreview::default(),
         preview_request: None,
@@ -3199,7 +3206,7 @@ fn file_picker_preview_requests_the_selected_file() {
         &tx,
     );
     assert_eq!(
-        app.picker_preview_lines(&filtered),
+        app.picker_preview_lines(&filtered, usize::MAX),
         vec!["fn b() {}".to_string()]
     );
 }
@@ -3212,6 +3219,9 @@ fn file_picker_draws_the_lazy_preview_on_the_right() {
         query: String::new(),
         selected: 0,
         items: vec![PickerItem::new("src/a.rs")],
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
         loading: false,
         preview: PickerPreview {
             key: Some("src/a.rs".into()),
@@ -3239,6 +3249,9 @@ fn session_picker_preview_requests_the_selected_session_history() {
         query: String::new(),
         selected: 0,
         items: Vec::new(),
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
         loading: false,
         preview: PickerPreview::default(),
         preview_request: None,
@@ -3261,7 +3274,7 @@ fn session_picker_preview_requests_the_selected_session_history() {
         &tx,
     );
     assert_eq!(
-        app.picker_preview_lines(&filtered),
+        app.picker_preview_lines(&filtered, usize::MAX),
         vec!["you:".to_string(), "  hello".to_string()]
     );
 }
@@ -3553,6 +3566,9 @@ fn command_palette_aligns_descriptions() {
         query: String::new(),
         selected: 0,
         items: command_items(&commands),
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
         loading: false,
         preview: PickerPreview::default(),
         preview_request: None,
@@ -3607,6 +3623,9 @@ fn picker_detail_columns_align_for_every_kind() {
                     .with_label("a-very-long-label-that-exceeds-the-cap")
                     .with_detail("third"),
             ],
+            items_rev: 0,
+            filter: PickerFilterCache::default(),
+            scroll: 0,
             loading: false,
             preview: PickerPreview::default(),
             preview_request: None,
@@ -3640,6 +3659,9 @@ fn session_picker_metadata_columns_align() {
         query: String::new(),
         selected: 0,
         items: Vec::new(),
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
         loading: false,
         preview: PickerPreview::default(),
         preview_request: None,
@@ -4931,8 +4953,7 @@ fn prompt_normal_mode_ctrl_b_f_page_the_transcript() {
     app.input.enter_normal();
     let _ = render_text(&mut app, 80, 12);
     let max = app.views[0]
-        .text_lines
-        .len()
+        .line_count
         .saturating_sub(app.pane_areas[0].height.saturating_sub(1) as usize);
     app.views[0].follow = true;
 
@@ -4978,8 +4999,7 @@ fn scrolling_near_the_tail_resumes_following() {
     app.connected = true;
     let _ = render_text(&mut app, 80, 12);
     let max = app.views[0]
-        .text_lines
-        .len()
+        .line_count
         .saturating_sub(app.pane_areas[0].height.saturating_sub(1) as usize);
 
     // A wheel-up from the tail pauses exactly one line above it.
@@ -6573,6 +6593,7 @@ fn model_command_opens_the_picker_and_preselects_the_current_model() {
                 },
             ],
             warnings: vec!["local: HTTP 401".into()],
+            default_model: "gpt-4o".into(),
         },
         &tx,
     );
@@ -6863,6 +6884,26 @@ fn slash_commands_dispatch_requests_and_clear_the_prompt() {
         }
     }
     assert!(!submitted, "/init only stages a prompt");
+
+    app.input.set_text("/model global openai/gpt-5");
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    let mut global = None;
+    while let Ok(command) = rx.try_recv() {
+        if let Command::UseModel { model } = command {
+            global = Some(model);
+        }
+    }
+    assert_eq!(global, Some(Some("openai/gpt-5".to_string())));
+
+    app.input.set_text("/model global default");
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    let mut cleared = false;
+    while let Ok(command) = rx.try_recv() {
+        if let Command::UseModel { model } = command {
+            cleared = model.is_none();
+        }
+    }
+    assert!(cleared, "/model global default clears the override");
 }
 
 #[test]

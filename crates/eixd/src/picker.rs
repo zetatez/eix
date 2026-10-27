@@ -736,8 +736,8 @@ mod tests {
                 EventKind::ToolCall,
                 serde_json::json!({
                     "call_id": "c1",
-                    "tool": "read_file",
-                    "arguments": { "path": "src/a.rs" }
+                    "tool": "exec_command",
+                    "arguments": { "cmd": "cat src/a.rs" }
                 }),
             ),
         ];
@@ -751,7 +751,7 @@ mod tests {
             preview.text
         );
         assert!(
-            preview.text.contains("tool:\n  read_file src/a.rs"),
+            preview.text.contains("tool:\n  exec_command: cat src/a.rs"),
             "{}",
             preview.text
         );
@@ -759,7 +759,7 @@ mod tests {
         let recent = session_preview("s1", &events, Some(1));
         assert!(!recent.text.contains("you:\n  hello"), "{}", recent.text);
         assert!(
-            recent.text.contains("tool:\n  read_file src/a.rs"),
+            recent.text.contains("tool:\n  exec_command: cat src/a.rs"),
             "{}",
             recent.text
         );

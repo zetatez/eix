@@ -8,6 +8,7 @@
 use std::env;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Host paths mounted read-only inside the sandbox. Missing paths are skipped
 /// (`--ro-bind-try`), which keeps this portable across distro layouts.
@@ -15,12 +16,17 @@ const READ_ONLY_PATHS: &[&str] = &[
     "/bin", "/etc", "/lib", "/lib32", "/lib64", "/opt", "/run", "/sbin", "/usr", "/var",
 ];
 
-/// True when an executable `bwrap` is on `PATH`.
+/// True when an executable `bwrap` is on `PATH`. Cached because permission
+/// checks call this for every sandboxed command, while installing or removing
+/// bwrap during a daemon's lifetime is not a supported workflow.
 pub fn bwrap_available() -> bool {
-    let Some(path) = env::var_os("PATH") else {
-        return false;
-    };
-    env::split_paths(&path).any(|dir| is_executable(&dir.join("bwrap")))
+    static AVAILABLE: OnceLock<bool> = OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        let Some(path) = env::var_os("PATH") else {
+            return false;
+        };
+        env::split_paths(&path).any(|dir| is_executable(&dir.join("bwrap")))
+    })
 }
 
 /// Human-readable backend status used by `eix doctor`.

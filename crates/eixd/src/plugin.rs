@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -436,6 +437,11 @@ pub struct PluginManager {
     commands: Mutex<Vec<PluginCommandRef>>,
     statuses: Mutex<BTreeMap<String, PluginStatus>>,
     event_tx: mpsc::Sender<PluginEvent>,
+    /// False when no running plugin subscribed to any event. `publish` is
+    /// called for every daemon notification, so this keeps the common case
+    /// (no plugins, or plugins that only expose tools) from cloning payloads
+    /// and waking the delivery task.
+    has_event_subscribers: AtomicBool,
 }
 
 impl PluginManager {
@@ -480,12 +486,14 @@ impl PluginManager {
             commands: Mutex::new(Vec::new()),
             statuses: Mutex::new(BTreeMap::new()),
             event_tx,
+            has_event_subscribers: AtomicBool::new(false),
         })
     }
 
     /// Stop every plugin and start the enabled set from `config`. Safe to call
     /// on hot reload; a broken plugin is reported and skipped, never fatal.
     pub async fn load(&self, config: &Config) {
+        self.has_event_subscribers.store(false, Ordering::Relaxed);
         self.clients.lock().await.clear();
         self.tools.lock().await.clear();
         self.commands.lock().await.clear();
@@ -616,6 +624,9 @@ impl PluginManager {
         self.tools.lock().await.extend(tools.iter().cloned());
         self.commands.lock().await.extend(commands.iter().cloned());
         self.clients.lock().await.insert(spec.name.clone(), client);
+        if !events.is_empty() {
+            self.has_event_subscribers.store(true, Ordering::Relaxed);
+        }
         self.statuses.lock().await.insert(
             spec.name.clone(),
             PluginStatus {
@@ -912,6 +923,9 @@ impl PluginManager {
     /// Fire-and-forget event delivery. A slow or crashed plugin must never
     /// block the daemon's turn loop or event bus.
     pub fn publish(&self, method: &str, params: &Value) {
+        if !self.has_event_subscribers.load(Ordering::Relaxed) {
+            return;
+        }
         let _ = self.event_tx.try_send(PluginEvent {
             method: method.to_string(),
             params: params.clone(),
@@ -919,6 +933,7 @@ impl PluginManager {
     }
 
     pub async fn shutdown(&self) {
+        self.has_event_subscribers.store(false, Ordering::Relaxed);
         // Give idle plugins a chance to flush their own state. A busy client
         // is skipped; dropping the client kills it, which is acceptable during
         // daemon shutdown and avoids waiting for a long tool timeout.

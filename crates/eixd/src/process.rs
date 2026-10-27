@@ -1,10 +1,11 @@
-//! Registry of background processes started by `start_command`.
+//! Registry of processes started by `exec_command`.
 //!
 //! Processes belong to the daemon, so a frontend can disconnect without
 //! stopping a dev server. Output is streamed as `process.output`
 //! notifications and mirrored to `<data>/processes/<session>/<id>.log`; only
 //! `ProcessStarted` / `ProcessExited` are persisted as events, so a chatty
-//! process cannot flood the event log.
+//! process cannot flood the event log. `write_stdin` writes to the child and
+//! drains output produced since the previous poll.
 //!
 //! Lifecycle: a process is spawned in its own process group so a kill reaches
 //! its children too. It dies with the daemon (`kill_all` on shutdown, plus
@@ -53,6 +54,10 @@ struct Entry {
     info: Mutex<ProcessInfo>,
     /// Last [`TAIL_BYTES`] of stdout + stderr.
     tail: Mutex<String>,
+    /// Bytes produced since the last `write_stdin` poll.
+    pending: Mutex<String>,
+    /// Stdin of the child; `None` once it closed or exited.
+    stdin: AsyncMutex<Option<tokio::process::ChildStdin>>,
     /// Consumed by the monitor to switch it into kill mode.
     killer: Mutex<Option<oneshot::Sender<()>>>,
     log_file: AsyncMutex<tokio::fs::File>,
@@ -76,7 +81,7 @@ impl ProcessRegistry {
         plan: CommandPlan,
     ) -> Result<ProcessInfo> {
         let mut cmd = plan.command();
-        cmd.stdin(std::process::Stdio::null())
+        cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
@@ -85,6 +90,7 @@ impl ProcessRegistry {
         let mut child = cmd
             .spawn()
             .with_context(|| format!("cannot start command in {}", plan.cwd.display()))?;
+        let stdin = child.stdin.take();
 
         let pid = child.id().unwrap_or(0);
         let id = uuid::Uuid::new_v4().to_string();
@@ -119,6 +125,8 @@ impl ProcessRegistry {
         let entry = Arc::new(Entry {
             info: Mutex::new(info.clone()),
             tail: Mutex::new(String::new()),
+            pending: Mutex::new(String::new()),
+            stdin: AsyncMutex::new(stdin),
             killer: Mutex::new(None),
             log_file: AsyncMutex::new(file),
         });
@@ -224,6 +232,79 @@ impl ProcessRegistry {
         }
     }
 
+    /// Wait up to `wait` for the process to exit. Returns immediately when it
+    /// is already finished.
+    pub async fn wait_for_exit(
+        &self,
+        session_id: &str,
+        needle: &str,
+        wait: Duration,
+    ) -> Result<()> {
+        let entry = self.resolve_in(session_id, needle)?;
+        let deadline = Instant::now() + wait;
+        loop {
+            if !entry
+                .info
+                .lock()
+                .expect("process mutex poisoned")
+                .status
+                .is_running()
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// Write stdin and return the output produced since the previous poll.
+    /// `chars` may be empty to poll without writing. Waits up to `wait` for new
+    /// output or process exit.
+    pub async fn write_stdin(
+        &self,
+        session_id: &str,
+        needle: &str,
+        chars: &str,
+        wait: Duration,
+        max_bytes: usize,
+    ) -> Result<ProcessOutput> {
+        let entry = self.resolve_in(session_id, needle)?;
+        if !chars.is_empty() {
+            let mut stdin = entry.stdin.lock().await;
+            let Some(stdin) = stdin.as_mut() else {
+                bail!("process stdin is closed");
+            };
+            stdin
+                .write_all(chars.as_bytes())
+                .await
+                .context("cannot write process stdin")?;
+            stdin.flush().await.context("cannot flush process stdin")?;
+        }
+        let deadline = Instant::now() + wait;
+        loop {
+            let has_output = !entry
+                .pending
+                .lock()
+                .expect("process mutex poisoned")
+                .is_empty();
+            if has_output
+                || !entry
+                    .info
+                    .lock()
+                    .expect("process mutex poisoned")
+                    .status
+                    .is_running()
+                || Instant::now() >= deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok(entry_pending(&entry, max_bytes))
+    }
+
     /// Ask a process to stop. Returns `false` if it is not running.
     pub fn kill(&self, needle: &str) -> Result<bool> {
         let entry = self.resolve(needle)?;
@@ -304,6 +385,22 @@ impl ProcessRegistry {
             1 => Ok(matches.pop().expect("checked len")),
             n => bail!("process id {needle:?} is ambiguous ({n} matches)"),
         }
+    }
+
+    /// Resolve an id and prove it belongs to `session_id`. A model cannot use
+    /// `write_stdin` to drive another session's process.
+    fn resolve_in(&self, session_id: &str, needle: &str) -> Result<Arc<Entry>> {
+        let entry = self.resolve(needle)?;
+        let owner = entry
+            .info
+            .lock()
+            .expect("process mutex poisoned")
+            .session_id
+            .clone();
+        if owner != session_id {
+            bail!("unknown process {needle:?}");
+        }
+        Ok(entry)
     }
 
     fn newest(&self, session_id: &str) -> Result<Arc<Entry>> {
@@ -393,13 +490,12 @@ async fn pump<R: AsyncRead + Unpin>(
         {
             let mut tail = entry.tail.lock().expect("process mutex poisoned");
             tail.push_str(&chunk);
-            if tail.len() > TAIL_BYTES {
-                let mut cut = tail.len() - TAIL_BYTES;
-                while !tail.is_char_boundary(cut) {
-                    cut += 1;
-                }
-                *tail = tail.split_off(cut);
-            }
+            trim_front(&mut tail, TAIL_BYTES);
+        }
+        {
+            let mut pending = entry.pending.lock().expect("process mutex poisoned");
+            pending.push_str(&chunk);
+            trim_front(&mut pending, TAIL_BYTES);
         }
         if bytes <= LOG_CAP_BYTES {
             let mut file = entry.log_file.lock().await;
@@ -488,6 +584,52 @@ async fn monitor(
             "duration_ms": duration_ms,
         }),
     ));
+}
+
+/// Keep at most `cap` bytes, cutting on a UTF-8 boundary.
+fn trim_front(text: &mut String, cap: usize) {
+    if text.len() <= cap {
+        return;
+    }
+    let mut cut = text.len() - cap;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    *text = text.split_off(cut);
+}
+
+/// Drain the output produced since the previous poll.
+fn entry_pending(entry: &Arc<Entry>, max_bytes: usize) -> ProcessOutput {
+    let info = entry.info.lock().expect("process mutex poisoned").clone();
+    let pending = {
+        let mut pending = entry.pending.lock().expect("process mutex poisoned");
+        std::mem::take(&mut *pending)
+    };
+    let mut text = pending;
+    let mut truncated = info.truncated;
+    if text.len() > max_bytes {
+        trimmed_tail(&mut text, max_bytes);
+        truncated = true;
+    }
+    ProcessOutput {
+        process_id: info.id.clone(),
+        truncated,
+        text,
+        bytes: info.bytes,
+        status: info.status,
+        exit_code: info.exit_code,
+    }
+}
+
+fn trimmed_tail(text: &mut String, max_bytes: usize) {
+    if text.len() <= max_bytes {
+        return;
+    }
+    let mut cut = text.len() - max_bytes;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    *text = text.split_off(cut);
 }
 
 fn entry_output(entry: &Arc<Entry>, max_bytes: usize) -> ProcessOutput {

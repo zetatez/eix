@@ -39,14 +39,30 @@ const FRONTEND_SKILL: &str = r#"# Frontend
 
 Use when building or restyling a UI. Follow the existing design system and framework conventions first.
 
+## Direction
+
 - Start from the audience and domain: operational tools should feel quiet, dense, and scannable; games and editorial pages can be more expressive.
 - Use purposeful typography; avoid default stacks (Inter, Roboto, Arial, system) unless the project already uses them.
-- Set a clear visual direction with CSS variables; avoid purple-on-white defaults and a default dark theme.
-- Build atmosphere with gradients, shapes, or subtle patterns instead of flat single-color backgrounds.
+- Set a clear visual direction with CSS variables; vary palettes and type across projects; avoid purple-on-white defaults, a default dark theme, and one-note palettes dominated by a single hue family.
+- Build atmosphere with gradients, shapes, or subtle patterns instead of flat backgrounds; no floating orbs, bokeh blobs, or purely atmospheric media where the user needs to inspect the real thing.
 - Use a few meaningful animations (page load, staggered reveal); avoid generic micro-motion everywhere.
-- Avoid boilerplate hero sections, interchangeable card grids, and marketing layouts for tools.
+- Avoid boilerplate hero sections, nested cards, and marketing layouts for tools. When a landing page needs a hero, carry it with a relevant real or generated image, not a gradient or SVG illustration, and leave a hint of the next section visible.
 - Keep navigation predictable and common workflows ergonomic; make dense information easy to scan and compare.
-- Ensure the page works on desktop and mobile, with accessible contrast, focus states, and reduced-motion support.
+
+## Controls and layout
+
+- Use familiar controls: icons for tools, swatches for color, segmented controls for modes, toggles for binary settings, sliders or steppers for numbers, tabs for views, and text buttons only for clear commands.
+- Prefer lucide or the project's icon library over hand-drawn SVG; add tooltips naming unfamiliar icons.
+- Build the states a real user expects: empty, loading, error, disabled, and long-content cases.
+- Reserve hero-scale type for heroes; keep headings small inside panels, cards, sidebars, and dashboards. Define fixed-format elements with aspect-ratio, grid tracks, or min/max sizing so hover states, labels, and icons cannot shift the layout.
+- Ensure text fits its container at every viewport without overlapping other content; do not scale font size with viewport width; letter spacing stays 0.
+- For 3D, use Three.js and make the primary scene full-bleed rather than a decorative card.
+
+## Verify
+
+- Run the app, not just the build. Start the dev server for anything that needs one, use another port if it is taken, and give the user the URL. For a plain HTML page, give the file path instead.
+- Check desktop and mobile viewports. For visual or 3D work, verify with Playwright screenshots and canvas-pixel checks that the scene is nonblank, correctly framed, interactive, and that assets render without overlap.
+- Check accessible contrast, focus states, keyboard paths, and reduced-motion support.
 "#;
 
 const ENGINEERING_SKILL: &str = r#"# Engineering judgment
@@ -68,7 +84,7 @@ pub fn builtin_skills() -> Vec<Skill> {
     [
         (
             "frontend",
-            "UI design guidance: typography, color, layout, motion, and responsive behavior.",
+            "UI design guidance: typography, color, layout, motion, responsiveness, and browser verification.",
             FRONTEND_SKILL,
         ),
         (
@@ -139,15 +155,15 @@ pub fn available_prompt(skills: &[Skill]) -> String {
 fn normalize_tool_name(name: &str) -> String {
     let lower = name.trim().to_ascii_lowercase();
     match lower.as_str() {
-        "read" => "read_file".to_string(),
-        "write" => "write_file".to_string(),
-        "multiedit" => "edit".to_string(),
-        "bash" | "shell" => "run_command".to_string(),
-        "ls" => "list_dir".to_string(),
+        "read" | "ls" | "grep" | "glob" | "bash" | "shell" | "read_file" | "list_dir"
+        | "run_command" => "exec_command".to_string(),
+        "write" | "multiedit" | "edit" | "patch" | "write_file" => "apply_patch".to_string(),
+        "webfetch" => "web_fetch".to_string(),
+        "websearch" => "web_search".to_string(),
         "task" => "spawn_agent".to_string(),
         "todowrite" => "todo".to_string(),
         "askuserquestion" => "ask_user".to_string(),
-        "bashoutput" => "process_output".to_string(),
+        "bashoutput" => "write_stdin".to_string(),
         // eix tool names (and exposed MCP names) are lowercase.
         _ => lower,
     }
@@ -223,7 +239,12 @@ fn insert_skill(skill_path: &Path, out: &mut BTreeMap<String, Skill>) {
                 .map(str::trim)
                 .filter(|tool| !tool.is_empty())
                 .map(normalize_tool_name)
-                .collect()
+                .fold(Vec::new(), |mut tools: Vec<String>, tool| {
+                    if !tools.contains(&tool) {
+                        tools.push(tool);
+                    }
+                    tools
+                })
         })
         .unwrap_or_default();
     out.insert(
@@ -309,7 +330,7 @@ mod tests {
         let deploy = find_skill(&project, "deploy", &compat).expect("deploy");
         assert_eq!(deploy.description, "Ship it.");
         let audit = find_skill(&project, "audit", &compat).expect("audit");
-        assert_eq!(audit.allowed_tools, vec!["read_file", "grep"]);
+        assert_eq!(audit.allowed_tools, vec!["exec_command"]);
         let lint = find_skill(&project, "lint", &compat).expect("nested Pi skill");
         assert_eq!(lint.description, "nested Pi skill");
         let prompt = available_prompt(&skills);
@@ -328,6 +349,22 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing builtin {name}"));
             assert!(!skill.body.is_empty());
             assert!(skill.source.starts_with("<builtin>"));
+        }
+        let frontend = builtins
+            .iter()
+            .find(|skill| skill.name == "frontend")
+            .expect("frontend");
+        for expected in [
+            "dev server",
+            "Playwright",
+            "lucide",
+            "Three.js",
+            "aspect-ratio",
+        ] {
+            assert!(
+                frontend.body.contains(expected),
+                "frontend skill is missing {expected:?}"
+            );
         }
         let prompt = available_prompt(&builtins);
         assert!(prompt.contains("<name>frontend</name>"));

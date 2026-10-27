@@ -53,7 +53,7 @@ pub struct ClassifierInput<'a> {
 
 /// True when a remaining `ask` is eligible for classifier review.
 ///
-/// File tools are deliberately excluded: `write_file`/`edit` already have an
+/// File tools are deliberately excluded: `apply_patch` already has an
 /// auto-apply path, and secret/forced file writes must stay manual. Hard
 /// denials and capabilities that can exfiltrate secrets or escalate privilege
 /// never reach the model.
@@ -61,9 +61,9 @@ pub fn eligible(tool: &str, risk: &RiskAssessment, max_risk: RiskLevel) -> bool 
     if risk.hard_deny || risk.level > max_risk {
         return false;
     }
-    // `patch` can write arbitrary paths; `write_file`/`edit` are handled by
-    // the staging/auto-apply path.
-    if matches!(tool, "write_file" | "edit" | "patch") {
+    // `apply_patch` can write arbitrary paths and is handled by the
+    // approval/auto-apply path.
+    if matches!(tool, "apply_patch") {
         return false;
     }
     !risk.categories.iter().any(|category| {
@@ -304,18 +304,18 @@ mod tests {
     #[test]
     fn file_tools_and_secret_categories_are_not_eligible() {
         let commit = risk("git commit -m test");
-        assert!(eligible("run_command", &commit, RiskLevel::High));
+        assert!(eligible("exec_command", &commit, RiskLevel::High));
 
         let secret = risk("cat .env");
-        assert!(!eligible("run_command", &secret, RiskLevel::High));
+        assert!(!eligible("exec_command", &secret, RiskLevel::High));
 
         let write = risk("echo x > out.txt");
-        assert!(eligible("run_command", &write, RiskLevel::High));
-        assert!(!eligible("write_file", &write, RiskLevel::High));
+        assert!(eligible("exec_command", &write, RiskLevel::High));
+        assert!(!eligible("apply_patch", &write, RiskLevel::High));
 
         let push = risk("git push");
-        assert!(eligible("run_command", &push, RiskLevel::High));
-        assert!(!eligible("run_command", &push, RiskLevel::Medium));
+        assert!(eligible("exec_command", &push, RiskLevel::High));
+        assert!(!eligible("exec_command", &push, RiskLevel::Medium));
 
         // Plugin tools are always manual: the classifier cannot approve code
         // the host has no visibility into.

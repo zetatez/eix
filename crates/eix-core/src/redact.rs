@@ -16,7 +16,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -37,12 +37,36 @@ const SENSITIVE: &[&str] = &[
 
 /// Scrub known secret shapes from `text`.
 pub fn redact(text: &str) -> String {
+    if !scrub_could_change(text) {
+        return text.to_string();
+    }
     let mut out = scrub_bearer(text);
     out = scrub_sk(&out);
     for key in SENSITIVE {
         out = scrub_key(&out, key);
     }
     out
+}
+
+/// True when one of the [lossy scrubbers](scrub_bearer) could change `text`.
+/// The three scans below are exactly the shapes `redact` handles, so a miss
+/// here means the result would be byte-identical.
+fn scrub_could_change(text: &str) -> bool {
+    if text.len() < 4 {
+        return false;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("bearer ")
+        || lower.contains("sk-")
+        || SENSITIVE.iter().any(|key| lower.contains(key))
+}
+
+/// Cheap prefilter for [`SecretRedactor::redact_text`]: most messages carry no
+/// credential at all, while each capture pass allocates a replacement string.
+/// `RegexSet` scans every pattern in one automaton, so a miss costs one pass
+/// instead of ten and can never disagree with the capture passes.
+fn may_contain_secret(text: &str) -> bool {
+    patterns().any.is_match(text)
 }
 
 fn scrub_bearer(text: &str) -> String {
@@ -302,6 +326,9 @@ impl SecretRedactor {
     }
 
     fn redact_text(&mut self, text: &str) -> String {
+        if self.to_placeholder.is_empty() && !may_contain_secret(text) {
+            return text.to_string();
+        }
         let patterns = patterns();
         // Once a secret is known, scrub it everywhere in later messages too.
         // This catches a model copying a bare password into `write_file`
@@ -753,6 +780,78 @@ fn is_sensitive_key(key: &str) -> bool {
     .any(|needle| normalized.contains(needle))
 }
 
+const PEM_PATTERN: &str =
+    r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----";
+const AUTHORIZATION_PATTERN: &str =
+    r#"(?x)(?P<prefix>\b(?i:authorization)\b\s*[:=]\s*)(?P<secret>[^\r\n"']+)"#;
+const URL_CREDENTIALS_PATTERN: &str =
+    r"(?x)(?P<prefix>\b[a-z][a-z0-9+.-]*://[^\s/:@]+:)(?P<secret>[^\s/@]+)(?P<suffix>@)";
+const CLI_SECRET_PATTERN: &str = r#"(?x)(?P<prefix>(?:^|\s)--?(?i:password|passphrase|passwd|token|api[\x20\t_-]?key|secret)(?:=|\s+)["']?)(?P<secret>[^\s,;}\]"'<>{]+)(?P<suffix>["']?)"#;
+// Scoped `(?i:...)` keeps the sensitive key names case-insensitive without
+// asking regex to Unicode-fold the surrounding ASCII classes (which makes the
+// compiled automaton enormous).
+const QUOTED_ASSIGNMENT_PATTERN: &str = r#"(?x)
+    (?P<prefix>
+        ["']?
+        [A-Za-z0-9_.-]*?
+        (?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|apikey|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret|authorization|credential|cookie)
+        [A-Za-z0-9_.-]*
+        ["']?
+        \s*[:=]\s*
+        ["']
+    )
+    (?P<secret>(?:\\[^\r\n]|[^"'\\\r\n])+)
+    (?P<suffix>["'])
+    "#;
+const ASSIGNMENT_PATTERN: &str = r#"(?x)
+    (?P<prefix>
+        \b
+        [A-Za-z0-9_.-]*?
+        (?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|apikey|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret|authorization|credential|cookie)
+        [A-Za-z0-9_.-]*
+        \s*[:=]\s*
+    )
+    (?P<secret>[^\s,;}\]"'<>{]+)
+    "#;
+const PROSE_QUOTED_PATTERN: &str = r#"(?x)(?P<prefix>\b(?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret)\s+(?:is|was|equals)\s+["'`])(?P<secret>[^"'`\r\n]+)(?P<suffix>["'`])"#;
+const PROSE_SECRET_PATTERN: &str = r#"(?x)(?P<prefix>\b(?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret)\s+(?:is|was|equals)\s+)(?P<secret>[^\s,;}\]"'`<>{]+)"#;
+const BEARER_PATTERN: &str = r"(?x)(?P<prefix>\b(?i:bearer)\s+)(?P<secret>[A-Za-z0-9._~+/=-]{8,})";
+const TOKENS_PATTERN: &str = r#"(?x)
+    \b(?:
+        sk-(?:ant-)?[A-Za-z0-9_-]{8,}
+      | sk_(?:live|test)_[A-Za-z0-9]{16,}
+      | rk_(?:live|test)_[A-Za-z0-9]{16,}
+      | whsec_[A-Za-z0-9]{16,}
+      | SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}
+      | ya29\.[A-Za-z0-9_-]{20,}
+      | shpat_[A-Za-z0-9]{20,}
+      | xapp-[A-Za-z0-9-]{10,}
+      | gh[pousr]_[A-Za-z0-9_]{20,}
+      | github_pat_[A-Za-z0-9_]{20,}
+      | xox[baprs]-[A-Za-z0-9-]{10,}
+      | (?:AKIA|ASIA)[0-9A-Z]{16}
+      | AIza[0-9A-Za-z_-]{35}
+      | glpat-[A-Za-z0-9_-]{20,}
+      | npm_[A-Za-z0-9]{20,}
+      | hf_[A-Za-z0-9]{20,}
+      | pypi-[A-Za-z0-9_-]{20,}
+      | eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
+    )
+    "#;
+
+const SECRET_PATTERNS: [&str; 10] = [
+    PEM_PATTERN,
+    AUTHORIZATION_PATTERN,
+    URL_CREDENTIALS_PATTERN,
+    CLI_SECRET_PATTERN,
+    QUOTED_ASSIGNMENT_PATTERN,
+    ASSIGNMENT_PATTERN,
+    PROSE_QUOTED_PATTERN,
+    PROSE_SECRET_PATTERN,
+    BEARER_PATTERN,
+    TOKENS_PATTERN,
+];
+
 struct SecretPatterns {
     pem: Regex,
     authorization: Regex,
@@ -764,102 +863,35 @@ struct SecretPatterns {
     prose_secret: Regex,
     bearer: Regex,
     tokens: Regex,
+    /// The same sources compiled as one automaton. `redact_text` scans with
+    /// this first: a miss means no capture pass can match, which is the common
+    /// case for tool output and avoids building a replacement string per
+    /// pattern.
+    any: RegexSet,
 }
 
 fn patterns() -> &'static SecretPatterns {
     static PATTERNS: OnceLock<SecretPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| SecretPatterns {
-        pem: Regex::new(
-            r"(?is)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----",
-        )
-        .expect("valid PEM secret pattern"),
-        authorization: Regex::new(
-            r#"(?x)(?P<prefix>\b(?i:authorization)\b\s*[:=]\s*)(?P<secret>[^\r\n"']+)"#,
-        )
-        .expect("valid authorization secret pattern"),
-        url_credentials: Regex::new(
-            r"(?x)(?P<prefix>\b[a-z][a-z0-9+.-]*://[^\s/:@]+:)(?P<secret>[^\s/@]+)(?P<suffix>@)",
-        )
-        .expect("valid URL credential pattern"),
-        cli_secret: Regex::new(
-            r#"(?x)(?P<prefix>(?:^|\s)--?(?i:password|passphrase|passwd|token|api[\x20\t_-]?key|secret)(?:=|\s+)["']?)(?P<secret>[^\s,;}\]"'<>{]+)(?P<suffix>["']?)"#,
-        )
-        .expect("valid CLI secret pattern"),
-        // Scoped `(?i:...)` keeps the sensitive key names case-insensitive
-        // without asking regex to Unicode-fold the surrounding ASCII classes
-        // (which makes the compiled automaton enormous).
-        quoted_assignment: Regex::new(
-            r#"(?x)
-            (?P<prefix>
-                ["']?
-                [A-Za-z0-9_.-]*?
-                (?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|apikey|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret|authorization|credential|cookie)
-                [A-Za-z0-9_.-]*
-                ["']?
-                \s*[:=]\s*
-                ["']
-            )
-            (?P<secret>(?:\\[^\r\n]|[^"'\\\r\n])+)
-            (?P<suffix>["'])
-            "#,
-        )
-        .expect("valid quoted assignment pattern"),
-        assignment: Regex::new(
-            r#"(?x)
-            (?P<prefix>
-                \b
-                [A-Za-z0-9_.-]*?
-                (?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|apikey|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret|authorization|credential|cookie)
-                [A-Za-z0-9_.-]*
-                \s*[:=]\s*
-            )
-            (?P<secret>[^\s,;}\]"'<>{]+)
-            "#,
-        )
-        .expect("valid assignment pattern"),
-        prose_quoted: Regex::new(
-            r#"(?x)(?P<prefix>\b(?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret)\s+(?:is|was|equals)\s+["'`])(?P<secret>[^"'`\r\n]+)(?P<suffix>["'`])"#,
-        )
-        .expect("valid quoted prose secret pattern"),
-        prose_secret: Regex::new(
-            r#"(?x)(?P<prefix>\b(?i:password|passphrase|passwd|pwd|secret|token|api[\x20\t_-]?key|access[\x20\t_-]?key|private[\x20\t_-]?key|client[\x20\t_-]?secret)\s+(?:is|was|equals)\s+)(?P<secret>[^\s,;}\]"'`<>{]+)"#,
-        )
-        .expect("valid prose secret pattern"),
-        bearer: Regex::new(
-            r"(?x)(?P<prefix>\b(?i:bearer)\s+)(?P<secret>[A-Za-z0-9._~+/=-]{8,})",
-        )
-        .expect("valid bearer pattern"),
-        tokens: Regex::new(
-            r"(?x)
-            \b(?:
-                sk-(?:ant-)?[A-Za-z0-9_-]{8,}
-              | sk_(?:live|test)_[A-Za-z0-9]{16,}
-              | rk_(?:live|test)_[A-Za-z0-9]{16,}
-              | whsec_[A-Za-z0-9]{16,}
-              | SG\.[A-Za-z0-9_-]{16,}\.[A-Za-z0-9_-]{16,}
-              | ya29\.[A-Za-z0-9_-]{20,}
-              | shpat_[A-Za-z0-9]{20,}
-              | xapp-[A-Za-z0-9-]{10,}
-              | gh[pousr]_[A-Za-z0-9_]{20,}
-              | github_pat_[A-Za-z0-9_]{20,}
-              | xox[baprs]-[A-Za-z0-9-]{10,}
-              | (?:AKIA|ASIA)[0-9A-Z]{16}
-              | AIza[0-9A-Za-z_-]{35}
-              | glpat-[A-Za-z0-9_-]{20,}
-              | npm_[A-Za-z0-9]{20,}
-              | hf_[A-Za-z0-9]{20,}
-              | pypi-[A-Za-z0-9_-]{20,}
-              | eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}
-            )
-            ",
-        )
-        .expect("valid token pattern"),
+        pem: Regex::new(PEM_PATTERN).expect("valid PEM secret pattern"),
+        authorization: Regex::new(AUTHORIZATION_PATTERN)
+            .expect("valid authorization secret pattern"),
+        url_credentials: Regex::new(URL_CREDENTIALS_PATTERN).expect("valid URL credential pattern"),
+        cli_secret: Regex::new(CLI_SECRET_PATTERN).expect("valid CLI secret pattern"),
+        quoted_assignment: Regex::new(QUOTED_ASSIGNMENT_PATTERN)
+            .expect("valid quoted assignment pattern"),
+        assignment: Regex::new(ASSIGNMENT_PATTERN).expect("valid assignment pattern"),
+        prose_quoted: Regex::new(PROSE_QUOTED_PATTERN).expect("valid quoted prose secret pattern"),
+        prose_secret: Regex::new(PROSE_SECRET_PATTERN).expect("valid prose secret pattern"),
+        bearer: Regex::new(BEARER_PATTERN).expect("valid bearer pattern"),
+        tokens: Regex::new(TOKENS_PATTERN).expect("valid token pattern"),
+        any: RegexSet::new(SECRET_PATTERNS).expect("valid secret pattern set"),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{redact, SecretRedactor};
+    use super::{may_contain_secret, redact, SecretRedactor};
     use crate::{ChatMessage, FunctionCall, ToolCall};
     use serde_json::{json, Value};
 
@@ -1025,6 +1057,52 @@ MIIEowIBAAKCAQEAsecretkeymaterial
         ] {
             assert_eq!(redactor.redact(text), text);
         }
+    }
+
+    #[test]
+    fn prefilter_covers_every_secret_pattern() {
+        // `may_contain_secret` is the fast path for `redact_text`; a false
+        // negative would silently ship a secret to the provider, so every
+        // pattern needs at least one sample it accepts.
+        let samples = [
+            "-----BEGIN RSA PRIVATE KEY-----\nabc\n-----END RSA PRIVATE KEY-----",
+            "authorization: Basic abcdef",
+            "postgres://user:hunter2@db/app",
+            "--password=hunter2",
+            "password=\"hunter2\"",
+            "token=abc123",
+            "the password is \"hunter2\"",
+            "the password is hunter2",
+            "bearer abcdefgh",
+            "sk-ant-abcdefgh1234",
+            "sk_live_abcdefghijklmnop",
+            "rk_live_abcdefghijklmnop",
+            "whsec_abcdefghijklmnop",
+            "SG.abcdefghijklmnop.qrstuvwxyz012345",
+            "ya29.abcdefghijklmnopqrstu",
+            "shpat_abcdefghijklmnopqrstu",
+            "xapp-abcdefghij",
+            "ghp_abcdefghijklmnopqrstu",
+            "github_pat_abcdefghijklmnopqrstu",
+            "xoxb-abcdefghij",
+            "AKIAABCDEFGHIJKLMNOP",
+            "AIzaabcdefghijklmnopqrstuvwxyz012345678",
+            "glpat-abcdefghijklmnopqrstu",
+            "npm_abcdefghijklmnopqrstu",
+            "hf_abcdefghijklmnopqrstu",
+            "pypi-abcdefghijklmnopqrstu",
+            "eyJabcdefghij.abcdefghij.abcdefghij",
+        ];
+        for sample in samples {
+            assert!(may_contain_secret(sample), "prefilter missed {sample:?}");
+            let mut redactor = SecretRedactor::new("test-salt");
+            assert_ne!(
+                redactor.redact_text(sample),
+                sample,
+                "not redacted: {sample:?}"
+            );
+        }
+        assert!(!may_contain_secret("just a normal status line"));
     }
 
     #[test]

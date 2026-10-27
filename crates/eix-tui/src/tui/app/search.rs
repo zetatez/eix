@@ -19,6 +19,9 @@ impl App {
             self.status = "no previous search".into();
             return;
         }
+        if let Some(view) = self.focused_view_mut() {
+            view.ensure_text_lines();
+        }
         let Some(view) = self.focused_view() else {
             self.status = "no session to search".into();
             return;

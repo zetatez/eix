@@ -189,6 +189,15 @@ impl App {
             "model" => {
                 if args.is_empty() {
                     self.open_picker(PickerKind::Models, tx);
+                } else if let Some(global) = args
+                    .strip_prefix("global")
+                    .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                {
+                    let model = global.trim();
+                    let model =
+                        (!model.is_empty() && model != "default").then(|| model.to_string());
+                    let _ = tx.send(Command::UseModel { model });
+                    self.status = "switching the daemon default model…".into();
                 } else if let Some(session_id) = self.focused_session_id() {
                     let model = (args != "default").then(|| args.to_string());
                     let _ = tx.send(Command::SetModel { session_id, model });

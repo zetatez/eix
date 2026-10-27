@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -343,7 +344,7 @@ impl Default for NotificationsConfig {
     }
 }
 
-/// How `run_command` / `start_command` are isolated from the host.
+/// How `exec_command` is isolated from the host.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SandboxMode {
@@ -421,7 +422,7 @@ impl RuleSource {
 pub struct PermissionRule {
     /// Stable identifier used in approval payloads and audit logs.
     pub id: String,
-    /// Tool name (`write_file`, `run_command`, `mcp__*`, ...) or `"*"`.
+    /// Tool name (`apply_patch`, `exec_command`, `mcp__*`, ...) or `"*"`.
     pub tool: String,
     /// Workspace-relative glob matched against the `path` argument.
     pub path: Option<String>,
@@ -437,6 +438,11 @@ pub struct PermissionRule {
     /// Set by the config loader; never trusted from TOML.
     #[serde(skip)]
     pub source: RuleSource,
+    /// Compiled lazily so a rule is validated and compiled once per config
+    /// rather than once per tool call. Public so callers can keep using
+    /// `..PermissionRule::default()` when building rules in tests.
+    #[serde(skip)]
+    pub compiled_regex: OnceLock<Option<Regex>>,
 }
 
 impl PermissionRule {
@@ -446,7 +452,7 @@ impl PermissionRule {
             return false;
         }
         if let Some(glob) = self.path.as_deref() {
-            if tool == "webfetch" {
+            if tool == "web_fetch" {
                 let Some(url) = args.get("url").and_then(Value::as_str) else {
                     return false;
                 };
@@ -454,11 +460,7 @@ impl PermissionRule {
                     return false;
                 }
             } else {
-                let Some(path) = args
-                    .get("path")
-                    .and_then(Value::as_str)
-                    .and_then(normalize_workspace_path)
-                else {
+                let Some(path) = rule_path(args) else {
                     return false;
                 };
                 if !glob_match(glob, &path) {
@@ -467,7 +469,7 @@ impl PermissionRule {
             }
         }
         if let Some(prefix) = self.command.as_deref() {
-            let Some(command) = args.get("command").and_then(Value::as_str) else {
+            let Some(command) = rule_command(args) else {
                 return false;
             };
             if !command_starts_with(command, prefix, self.action == PermissionAction::Deny) {
@@ -475,10 +477,14 @@ impl PermissionRule {
             }
         }
         if let Some(pattern) = self.command_regex.as_deref() {
-            let Some(command) = args.get("command").and_then(Value::as_str) else {
+            let Some(command) = rule_command(args) else {
                 return false;
             };
-            let Ok(regex) = Regex::new(pattern) else {
+            let Some(regex) = self
+                .compiled_regex
+                .get_or_init(|| Regex::new(pattern).ok())
+                .as_ref()
+            else {
                 return false;
             };
             if !regex.is_match(command) {
@@ -533,6 +539,38 @@ fn command_starts_with(command: &str, prefix: &[String], any_segment: bool) -> b
 /// Normalize a tool `path` argument to a workspace-relative path, or `None`
 /// when it is absolute or escapes the workspace. This is what keeps a
 /// `tests/**` rule from matching `tests/../src/main.rs`.
+/// The command argument used by shell tools (`exec_command` accepts `cmd`).
+fn rule_command(args: &Value) -> Option<&str> {
+    args.get("command")
+        .or_else(|| args.get("cmd"))
+        .and_then(Value::as_str)
+}
+
+/// The single workspace path a tool call targets. `apply_patch` carries its
+/// targets in the patch document instead of a `path` argument.
+fn rule_path(args: &Value) -> Option<String> {
+    if let Some(path) = args.get("path").and_then(Value::as_str) {
+        return normalize_workspace_path(path);
+    }
+    let text = args
+        .get("patchText")
+        .or_else(|| args.get("patch"))
+        .or_else(|| args.get("input"))
+        .and_then(Value::as_str)?;
+    let mut paths = text.lines().filter_map(|line| {
+        line.strip_prefix("*** Add File: ")
+            .or_else(|| line.strip_prefix("*** Update File: "))
+            .or_else(|| line.strip_prefix("*** Delete File: "))
+            .map(str::trim)
+            .filter(|path| !path.is_empty())
+    });
+    let path = paths.next()?;
+    if paths.next().is_some() {
+        return None;
+    }
+    normalize_workspace_path(path)
+}
+
 fn normalize_workspace_path(path: &str) -> Option<String> {
     if Path::new(path).is_absolute() {
         return None;
@@ -625,13 +663,13 @@ pub struct ToolsConfig {
     pub auto_apply_workspace_edits: bool,
     /// Tool output is truncated to this many bytes before it enters the log.
     pub max_output_bytes: usize,
-    /// Wall-clock limit for `run_command`.
+    /// Wall-clock limit for the synchronous `shell.run` path.
     pub command_timeout_secs: u64,
     /// Default number of `spawn_agent` children that may run concurrently in
     /// one tool batch. The TUI can override this at runtime; config reload or
     /// a daemon restart restores this default.
     pub max_parallel_subagents: usize,
-    /// Filesystem isolation for `run_command` / `start_command`.
+    /// Filesystem isolation for `exec_command`.
     pub sandbox: SandboxMode,
     /// Allow network access inside the sandbox.
     pub sandbox_network: bool,
@@ -649,8 +687,8 @@ pub struct ToolsConfig {
     /// Absolute paths (or `~`-prefixed) that file tools may touch outside the
     /// session workspace. A plain path allows its whole subtree.
     pub external_directory: Vec<String>,
-    /// Optional allowlist for read-only network tools. Empty means `webfetch`
-    /// and `websearch` are allowed; a non-empty list restricts them to the
+    /// Optional allowlist for read-only network tools. Empty means `web_fetch`
+    /// and `web_search` are allowed; a non-empty list restricts them to the
     /// matching hosts.
     pub network_allow: Vec<String>,
 }
@@ -1205,6 +1243,117 @@ impl ContextConfig {
     }
 }
 
+/// Wire protocol used by a provider.
+///
+/// `openai` covers OpenAI and every clone that speaks
+/// `POST /chat/completions`; the other variants use the vendor-native
+/// streaming APIs (Anthropic Messages, Gemini `streamGenerateContent`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderKind {
+    #[default]
+    #[serde(
+        alias = "openai-compatible",
+        alias = "compatible",
+        alias = "ollama",
+        alias = "vllm",
+        alias = "lmstudio",
+        alias = "openrouter"
+    )]
+    OpenAi,
+    #[serde(alias = "claude")]
+    Anthropic,
+    #[serde(alias = "google")]
+    Gemini,
+}
+
+impl ProviderKind {
+    /// Short label used in diagnostics and `model.list`.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenAi => "openai",
+            Self::Anthropic => "anthropic",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    /// Full chat URL for this protocol. Gemini builds the URL per model, so it
+    /// returns the service root; callers must append the model path.
+    pub fn chat_endpoint(self, base_url: &str) -> String {
+        let base = base_url.trim_end_matches('/');
+        match self {
+            Self::OpenAi => chat_endpoint(base),
+            Self::Anthropic => {
+                if base.ends_with("/messages") {
+                    base.to_string()
+                } else if base.ends_with("/v1") {
+                    format!("{base}/messages")
+                } else {
+                    format!("{base}/v1/messages")
+                }
+            }
+            Self::Gemini => gemini_root(base),
+        }
+    }
+
+    /// Catalog URL for this protocol. Gemini returns the service root; the
+    /// caller appends `/models`.
+    pub fn models_endpoint(self, base_url: &str) -> String {
+        match self {
+            Self::OpenAi => models_endpoint(base_url),
+            Self::Anthropic => {
+                let base = base_url.trim_end_matches('/');
+                if base.ends_with("/models") {
+                    base.to_string()
+                } else if let Some(base) = base.strip_suffix("/messages") {
+                    format!("{base}/models")
+                } else if base.ends_with("/v1") {
+                    format!("{base}/models")
+                } else {
+                    format!("{base}/v1/models")
+                }
+            }
+            Self::Gemini => format!("{}/models", gemini_root(base_url.trim_end_matches('/'))),
+        }
+    }
+}
+
+/// Strip an explicit Gemini method suffix so callers can append their own.
+fn gemini_root(base: &str) -> String {
+    if let Some((root, _)) = base.split_once(":streamGenerateContent") {
+        return root.trim_end_matches('/').to_string();
+    }
+    if let Some((root, _)) = base.split_once(":generateContent") {
+        return root.trim_end_matches('/').to_string();
+    }
+    if base.ends_with("/v1beta") || base.ends_with("/v1") {
+        base.to_string()
+    } else {
+        format!("{base}/v1beta")
+    }
+}
+
+/// OAuth client settings for a provider. `eix auth login <provider>` uses these
+/// endpoints with PKCE and a loopback redirect. API-key providers do not need
+/// this block.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderOAuthConfig {
+    pub authorization_endpoint: String,
+    pub token_endpoint: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    /// Requested scopes; joined with spaces.
+    pub scopes: Vec<String>,
+    /// Redirect URI registered with the provider. Defaults to an ephemeral
+    /// `http://127.0.0.1:<port>/callback`.
+    pub redirect_uri: Option<String>,
+    /// Extra query parameters for the authorization request.
+    pub extra_authorize_params: BTreeMap<String, String>,
+    /// Extra form fields for the token request.
+    pub extra_token_params: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ProviderConfig {
@@ -1212,7 +1361,9 @@ pub struct ProviderConfig {
     pub name: Option<String>,
     /// The fallback provider. Exactly one configured provider must set this.
     pub default: bool,
-    /// Base URL of an OpenAI-compatible API, e.g. `https://api.openai.com/v1`.
+    /// Wire protocol. Defaults to `openai` (OpenAI-compatible).
+    pub kind: ProviderKind,
+    /// Base URL of the provider API, e.g. `https://api.openai.com/v1`.
     pub base_url: String,
     /// Default model for this provider. Only the default provider's model is
     /// used as the global fallback; named providers use explicit model ids.
@@ -1221,6 +1372,8 @@ pub struct ProviderConfig {
     pub api_key: Option<String>,
     /// Environment variable holding the key. Empty means no authentication.
     pub api_key_env: String,
+    /// Optional OAuth endpoints, used by `eix auth login <provider>`.
+    pub oauth: Option<ProviderOAuthConfig>,
 }
 
 /// Global provider runtime knobs. Kept separate from endpoint/model tables so
@@ -1238,6 +1391,9 @@ pub struct ProviderRuntimeConfig {
     pub retry_base_ms: u64,
     /// Upper bound for a single retry delay.
     pub retry_max_secs: u64,
+    /// Completion budget for protocols that require it (Anthropic, Gemini).
+    /// OpenAI-compatible servers use their own default when it is unset.
+    pub max_output_tokens: u32,
     /// Optional replacement for the built-in system prompt.
     pub system_prompt: Option<String>,
 }
@@ -1250,6 +1406,7 @@ impl Default for ProviderRuntimeConfig {
             retry_attempts: 8,
             retry_base_ms: 250,
             retry_max_secs: 60,
+            max_output_tokens: 8_192,
             system_prompt: None,
         }
     }
@@ -1303,6 +1460,8 @@ pub struct ModelConfig {
     /// Named provider from `[providers.*]`. When set, `base_url` is optional
     /// and the provider's endpoint/key are used.
     pub provider: Option<String>,
+    /// Override the provider's wire protocol for this model.
+    pub kind: Option<ProviderKind>,
     pub base_url: String,
     pub api_key: Option<String>,
     pub api_key_env: Option<String>,
@@ -1324,8 +1483,9 @@ pub struct McpConfig {
     pub servers: BTreeMap<String, McpServerConfig>,
 }
 
-/// One stdio MCP server. `command` is spawned directly (no shell), so put any
-/// arguments in `args`.
+/// One MCP server. Local servers set `command` and are spawned directly (no
+/// shell), so put any arguments in `args`. Remote servers set `url` and speak
+/// the Streamable HTTP transport.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct McpServerConfig {
@@ -1333,6 +1493,15 @@ pub struct McpServerConfig {
     pub args: Vec<String>,
     /// Extra environment variables for the child process.
     pub env: BTreeMap<String, String>,
+    /// Streamable HTTP endpoint. Mutually exclusive with `command`.
+    pub url: Option<String>,
+    /// Extra HTTP headers for a remote server, for example
+    /// `Authorization = "Bearer {env:TOKEN}"`. Values support the same
+    /// `{env:NAME}` / `{file:path}` placeholders as the rest of the config.
+    pub headers: BTreeMap<String, String>,
+    /// OAuth client settings for a remote server. Run `eix mcp auth <name>` to
+    /// complete the browser flow; the token is stored under the data dir.
+    pub oauth: Option<McpOAuthConfig>,
     /// Set false to keep the entry but ignore it.
     pub enabled: bool,
     /// Per-request timeout for `tools/list` and `tools/call`.
@@ -1350,6 +1519,9 @@ impl Default for McpServerConfig {
             command: String::new(),
             args: Vec::new(),
             env: BTreeMap::new(),
+            url: None,
+            headers: BTreeMap::new(),
+            oauth: None,
             enabled: true,
             timeout_secs: 30,
             allowed_tools: Vec::new(),
@@ -1359,6 +1531,21 @@ impl Default for McpServerConfig {
 }
 
 impl McpServerConfig {
+    /// Whether this entry uses the remote Streamable HTTP transport.
+    pub fn is_remote(&self) -> bool {
+        self.url
+            .as_deref()
+            .is_some_and(|url| !url.trim().is_empty())
+    }
+
+    /// Endpoint shown in pickers and `mcp.list`.
+    pub fn endpoint(&self) -> &str {
+        self.url
+            .as_deref()
+            .filter(|url| !url.trim().is_empty())
+            .unwrap_or(&self.command)
+    }
+
     /// Whether one tool from this server may be exposed to the model.
     pub fn allows_tool(&self, name: &str) -> bool {
         if self
@@ -1374,6 +1561,21 @@ impl McpServerConfig {
                 .iter()
                 .any(|pattern| tool_pattern(pattern, name))
     }
+}
+
+/// Optional pre-registered OAuth client for a remote MCP server. Without it,
+/// `eix mcp auth` uses dynamic client registration when the authorization
+/// server advertises it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpOAuthConfig {
+    /// Known client id. When empty, the client is registered dynamically.
+    pub client_id: Option<String>,
+    /// Client secret for confidential clients. Public clients omit it.
+    pub client_secret: Option<String>,
+    /// Scopes to request. When empty, the server's `WWW-Authenticate` scope is
+    /// used, and otherwise no scope parameter is sent.
+    pub scopes: Vec<String>,
 }
 
 /// Tool names are not paths, so `*` and `?` match every character (including
@@ -1591,6 +1793,7 @@ impl ModelInfo {
 pub struct ProviderSource {
     pub key: String,
     pub name: String,
+    pub kind: ProviderKind,
     pub base_url: String,
     pub api_key: Option<String>,
     pub default: bool,
@@ -1600,6 +1803,10 @@ pub struct ProviderSource {
 /// model id.
 #[derive(Debug, Clone)]
 pub struct ModelRoute {
+    /// Provider table key, used to look up stored credentials.
+    pub provider: String,
+    /// Wire protocol selected by the model/provider configuration.
+    pub kind: ProviderKind,
     pub model: String,
     pub endpoint: String,
     pub api_key: Option<String>,
@@ -1884,6 +2091,34 @@ impl Config {
                 "provider_runtime.retry_max_secs must be > 0".into(),
             ));
         }
+        if self.provider_runtime.max_output_tokens == 0 {
+            return Err(ConfigError::Invalid(
+                "provider_runtime.max_output_tokens must be > 0".into(),
+            ));
+        }
+        for (name, provider) in &self.providers {
+            let Some(oauth) = &provider.oauth else {
+                continue;
+            };
+            for (field, value) in [
+                (
+                    "authorization_endpoint",
+                    oauth.authorization_endpoint.as_str(),
+                ),
+                ("token_endpoint", oauth.token_endpoint.as_str()),
+            ] {
+                if !(value.starts_with("http://") || value.starts_with("https://")) {
+                    return Err(ConfigError::Invalid(format!(
+                        "providers.{name}.oauth.{field} must start with http:// or https://"
+                    )));
+                }
+            }
+            if oauth.client_id.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "providers.{name}.oauth.client_id is empty"
+                )));
+            }
+        }
         if self.provider_runtime.retry_max_secs.saturating_mul(1_000)
             < self.provider_runtime.retry_base_ms
         {
@@ -2108,9 +2343,45 @@ impl Config {
             if !server.enabled {
                 continue;
             }
-            if server.command.trim().is_empty() {
+            let remote = server.is_remote();
+            if remote && !server.command.trim().is_empty() {
                 return Err(ConfigError::Invalid(format!(
-                    "mcp.servers.{name}.command is empty"
+                    "mcp.servers.{name} sets both command and url"
+                )));
+            }
+            if !remote && server.command.trim().is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name} needs command or url"
+                )));
+            }
+            if remote {
+                let url = server.url.as_deref().unwrap_or_default().trim();
+                if !(url.starts_with("http://") || url.starts_with("https://")) {
+                    return Err(ConfigError::Invalid(format!(
+                        "mcp.servers.{name}.url must start with http:// or https://"
+                    )));
+                }
+                if let Some(oauth) = &server.oauth {
+                    if oauth.client_secret.is_some()
+                        && oauth
+                            .client_id
+                            .as_deref()
+                            .unwrap_or_default()
+                            .trim()
+                            .is_empty()
+                    {
+                        return Err(ConfigError::Invalid(format!(
+                            "mcp.servers.{name}.oauth.client_secret requires client_id"
+                        )));
+                    }
+                }
+            } else if !server.headers.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.headers is only valid with url"
+                )));
+            } else if server.oauth.is_some() {
+                return Err(ConfigError::Invalid(format!(
+                    "mcp.servers.{name}.oauth is only valid with url"
                 )));
             }
             if server.timeout_secs == 0 {
@@ -2214,6 +2485,7 @@ impl Config {
                     .filter(|name| !name.is_empty())
                     .unwrap_or(key)
                     .to_string(),
+                kind: provider.kind,
                 base_url: provider.base_url.clone(),
                 api_key: provider.api_key(),
                 default: provider.default,
@@ -2290,109 +2562,138 @@ impl Config {
             }
             _ => (selection, None),
         };
+        struct Resolved {
+            provider: String,
+            kind: ProviderKind,
+            base_url: String,
+            api_key: Option<String>,
+            model: String,
+            input_cost: Option<f64>,
+            output_cost: Option<f64>,
+            context_tokens: Option<usize>,
+        }
+
         let configured = self.models.iter().find(|model| model.id.trim() == base_id);
         let default = self.default_provider();
+        let default_key = self.default_provider_key().to_string();
         let default_id = default.model.trim();
 
-        let (base_url, api_key, api_model, input_cost, output_cost, provider_context) =
-            if let Some(model) = configured {
-                let explicit_provider = model
-                    .provider
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty());
-                let inferred_provider = base_id
-                    .split_once('/')
-                    .map(|(provider, _)| provider)
-                    .filter(|provider| self.providers.contains_key(*provider));
-                let provider_key = explicit_provider.or(inferred_provider);
-                let provider = provider_key.and_then(|name| self.providers.get(name));
-                let base_url = if !model.base_url.trim().is_empty() {
-                    model.base_url.clone()
-                } else if let Some(provider) = provider {
-                    provider.base_url.clone()
-                } else {
-                    default.base_url.clone()
-                };
-                let api_key = model
-                    .api_key
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|key| !key.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| model.api_key_env.as_deref().and_then(env_var))
-                    .or_else(|| provider.and_then(ProviderConfig::api_key))
-                    .or_else(|| default.api_key());
-                let api_model = model
-                    .model
-                    .as_deref()
-                    .map(str::trim)
-                    .filter(|model| !model.is_empty())
-                    .map(str::to_string)
-                    .or_else(|| base_id.split_once('/').map(|(_, model)| model.to_string()))
-                    .unwrap_or_else(|| base_id.to_string());
-                (
-                    base_url,
-                    api_key,
-                    api_model,
-                    model.input_cost,
-                    model.output_cost,
-                    model.context_tokens,
-                )
-            } else if !base_id.is_empty() && base_id == default_id {
-                (
-                    default.base_url.clone(),
-                    default.api_key(),
-                    base_id.to_string(),
-                    None,
-                    None,
-                    self.provider_runtime.context_tokens,
-                )
-            } else if let Some((provider_key, model_id)) = base_id.split_once('/') {
-                if provider_key == "default" && !self.providers.contains_key("default") {
-                    (
-                        default.base_url.clone(),
-                        default.api_key(),
-                        model_id.to_string(),
-                        None,
-                        None,
-                        self.provider_runtime.context_tokens,
-                    )
-                } else if let Some(provider) = self.providers.get(provider_key) {
-                    (
-                        provider.base_url.clone(),
-                        provider.api_key(),
-                        model_id.to_string(),
-                        None,
-                        None,
-                        None,
-                    )
-                } else {
-                    // Unknown ids keep the old behavior: send them verbatim to
-                    // the default endpoint.
-                    (
-                        default.base_url.clone(),
-                        default.api_key(),
-                        base_id.to_string(),
-                        None,
-                        None,
-                        self.provider_runtime.context_tokens,
-                    )
+        let resolved = if let Some(model) = configured {
+            let explicit_provider = model
+                .provider
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty());
+            let inferred_provider = base_id
+                .split_once('/')
+                .map(|(provider, _)| provider)
+                .filter(|provider| self.providers.contains_key(*provider));
+            let provider_key = explicit_provider
+                .or(inferred_provider)
+                .unwrap_or(default_key.as_str())
+                .to_string();
+            let provider = self.providers.get(&provider_key);
+            let base_url = if !model.base_url.trim().is_empty() {
+                model.base_url.clone()
+            } else if let Some(provider) = provider {
+                provider.base_url.clone()
+            } else {
+                default.base_url.clone()
+            };
+            let api_key = model
+                .api_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|key| !key.is_empty())
+                .map(str::to_string)
+                .or_else(|| model.api_key_env.as_deref().and_then(env_var))
+                .or_else(|| provider.and_then(ProviderConfig::api_key))
+                .or_else(|| default.api_key());
+            let api_model = model
+                .model
+                .as_deref()
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_string)
+                .or_else(|| base_id.split_once('/').map(|(_, model)| model.to_string()))
+                .unwrap_or_else(|| base_id.to_string());
+            Resolved {
+                kind: model
+                    .kind
+                    .or_else(|| provider.map(|provider| provider.kind))
+                    .unwrap_or(default.kind),
+                provider: provider_key,
+                base_url,
+                api_key,
+                model: api_model,
+                input_cost: model.input_cost,
+                output_cost: model.output_cost,
+                context_tokens: model.context_tokens,
+            }
+        } else if !base_id.is_empty() && base_id == default_id {
+            Resolved {
+                provider: default_key.clone(),
+                kind: default.kind,
+                base_url: default.base_url.clone(),
+                api_key: default.api_key(),
+                model: base_id.to_string(),
+                input_cost: None,
+                output_cost: None,
+                context_tokens: self.provider_runtime.context_tokens,
+            }
+        } else if let Some((provider_key, model_id)) = base_id.split_once('/') {
+            if provider_key == "default" && !self.providers.contains_key("default") {
+                Resolved {
+                    provider: default_key.clone(),
+                    kind: default.kind,
+                    base_url: default.base_url.clone(),
+                    api_key: default.api_key(),
+                    model: model_id.to_string(),
+                    input_cost: None,
+                    output_cost: None,
+                    context_tokens: self.provider_runtime.context_tokens,
+                }
+            } else if let Some(provider) = self.providers.get(provider_key) {
+                Resolved {
+                    provider: provider_key.to_string(),
+                    kind: provider.kind,
+                    base_url: provider.base_url.clone(),
+                    api_key: provider.api_key(),
+                    model: model_id.to_string(),
+                    input_cost: None,
+                    output_cost: None,
+                    context_tokens: None,
                 }
             } else {
-                (
-                    default.base_url.clone(),
-                    default.api_key(),
-                    if base_id.is_empty() {
-                        default.model.clone()
-                    } else {
-                        base_id.to_string()
-                    },
-                    None,
-                    None,
-                    self.provider_runtime.context_tokens,
-                )
-            };
+                // Unknown ids keep the old behavior: send them verbatim to
+                // the default endpoint.
+                Resolved {
+                    provider: default_key.clone(),
+                    kind: default.kind,
+                    base_url: default.base_url.clone(),
+                    api_key: default.api_key(),
+                    model: base_id.to_string(),
+                    input_cost: None,
+                    output_cost: None,
+                    context_tokens: self.provider_runtime.context_tokens,
+                }
+            }
+        } else {
+            Resolved {
+                provider: default_key.clone(),
+                kind: default.kind,
+                base_url: default.base_url.clone(),
+                api_key: default.api_key(),
+                model: if base_id.is_empty() {
+                    default.model.clone()
+                } else {
+                    base_id.to_string()
+                },
+                input_cost: None,
+                output_cost: None,
+                context_tokens: self.provider_runtime.context_tokens,
+            }
+        };
 
         // Reasoning defaults to medium. The TUI uses the reserved `#none`
         // variant to mean "do not send reasoning_effort at all", which keeps
@@ -2404,15 +2705,17 @@ impl Config {
         };
 
         ModelRoute {
-            model: api_model,
-            endpoint: chat_endpoint(&base_url),
-            api_key,
+            provider: resolved.provider,
+            kind: resolved.kind,
+            model: resolved.model,
+            endpoint: resolved.kind.chat_endpoint(&resolved.base_url),
+            api_key: resolved.api_key,
             // Most OpenAI-compatible servers accept this for reasoning models;
             // it is ignored by the others.
             reasoning_effort,
-            input_cost,
-            output_cost,
-            context_tokens: provider_context,
+            input_cost: resolved.input_cost,
+            output_cost: resolved.output_cost,
+            context_tokens: resolved.context_tokens,
         }
     }
 
@@ -3345,6 +3648,52 @@ base_url = "http://127.0.0.1:11434/v1"
     }
 
     #[test]
+    fn routes_native_provider_protocols() {
+        let config: Config = toml::from_str(
+            r#"
+[providers.claude]
+default = true
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4"
+
+[providers.google]
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+model = "gemini-2.5-pro"
+"#,
+        )
+        .unwrap();
+        let default = config.route("claude-sonnet-4");
+        assert_eq!(default.kind, ProviderKind::Anthropic);
+        assert_eq!(default.provider, "claude");
+        assert_eq!(default.endpoint, "https://api.anthropic.com/v1/messages");
+
+        let google = config.route("google/gemini-2.5-pro#high");
+        assert_eq!(google.kind, ProviderKind::Gemini);
+        assert_eq!(google.provider, "google");
+        assert_eq!(google.model, "gemini-2.5-pro");
+        assert_eq!(
+            google.endpoint,
+            "https://generativelanguage.googleapis.com/v1beta"
+        );
+        assert_eq!(google.reasoning_effort.as_deref(), Some("high"));
+
+        assert_eq!(
+            ProviderKind::Anthropic.chat_endpoint("https://api.anthropic.com/v1"),
+            "https://api.anthropic.com/v1/messages"
+        );
+        assert_eq!(
+            ProviderKind::Anthropic.models_endpoint("https://api.anthropic.com/v1/messages"),
+            "https://api.anthropic.com/v1/models"
+        );
+        assert_eq!(
+            ProviderKind::Gemini.models_endpoint("https://example.test"),
+            "https://example.test/v1beta/models"
+        );
+    }
+
+    #[test]
     fn invalid_providers_are_rejected() {
         let bad_url = Config {
             providers: BTreeMap::from([(
@@ -4261,12 +4610,12 @@ snapshots = false
     }
 
     #[test]
-    fn webfetch_path_rules_match_urls() {
+    fn web_fetch_path_rules_match_urls() {
         let parsed: Config = toml::from_str(
             r#"
 [[tools.rules]]
 id = "docs"
-tool = "webfetch"
+tool = "web_fetch"
 path = "https://docs.rs/**"
 action = "allow"
 "#,
@@ -4276,7 +4625,7 @@ action = "allow"
             parsed
                 .tools
                 .matching_rules(
-                    "webfetch",
+                    "web_fetch",
                     &json!({"url": "https://docs.rs/serde/latest/serde/"})
                 )
                 .len(),
@@ -4284,7 +4633,7 @@ action = "allow"
         );
         assert!(parsed
             .tools
-            .matching_rules("webfetch", &json!({"url": "https://evil.example/docs.rs"}))
+            .matching_rules("web_fetch", &json!({"url": "https://evil.example/docs.rs"}))
             .is_empty());
     }
 
@@ -4402,6 +4751,91 @@ extensions = ["zig"]
         config.server.tcp = Some("127.0.0.1:0".into());
         config.server.token = None;
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn mcp_remote_and_stdio_transports_are_validated() {
+        let mut config = Config::default();
+        config.mcp.servers.insert(
+            "remote".into(),
+            McpServerConfig {
+                url: Some("https://example.com/mcp".into()),
+                ..McpServerConfig::default()
+            },
+        );
+        config.validate().unwrap();
+        assert!(config.mcp.servers["remote"].is_remote());
+        assert_eq!(
+            config.mcp.servers["remote"].endpoint(),
+            "https://example.com/mcp"
+        );
+
+        // A remote entry must not also spawn a child.
+        config.mcp.servers.get_mut("remote").unwrap().command = "npx".into();
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("both command and url"), "{error}");
+
+        config
+            .mcp
+            .servers
+            .get_mut("remote")
+            .unwrap()
+            .command
+            .clear();
+        config.mcp.servers.get_mut("remote").unwrap().url = Some("ftp://example.com".into());
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("http:// or https://"), "{error}");
+
+        // Headers are meaningless for a stdio child.
+        config.mcp.servers.insert(
+            "local".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                headers: BTreeMap::from([("Authorization".into(), "Bearer x".into())]),
+                ..McpServerConfig::default()
+            },
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("only valid with url"), "{error}");
+    }
+
+    #[test]
+    fn mcp_oauth_settings_follow_the_remote_transport() {
+        let mut config = Config::default();
+        let oauth = McpOAuthConfig {
+            client_id: Some("client".into()),
+            client_secret: Some("secret".into()),
+            scopes: vec!["read".into()],
+        };
+        config.mcp.servers.insert(
+            "remote".into(),
+            McpServerConfig {
+                url: Some("https://example.com/mcp".into()),
+                oauth: Some(oauth.clone()),
+                ..McpServerConfig::default()
+            },
+        );
+        config.validate().unwrap();
+
+        // A secret is only meaningful with a pre-registered client id.
+        config.mcp.servers.get_mut("remote").unwrap().oauth = Some(McpOAuthConfig {
+            client_secret: Some("secret".into()),
+            ..McpOAuthConfig::default()
+        });
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("requires client_id"), "{error}");
+
+        // Stdio servers cannot use the browser flow.
+        config.mcp.servers.insert(
+            "local".into(),
+            McpServerConfig {
+                command: "npx".into(),
+                oauth: Some(oauth),
+                ..McpServerConfig::default()
+            },
+        );
+        let error = config.validate().unwrap_err().to_string();
+        assert!(error.contains("oauth is only valid with url"), "{error}");
     }
 
     #[test]

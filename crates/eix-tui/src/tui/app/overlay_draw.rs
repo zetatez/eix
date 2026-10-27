@@ -316,19 +316,18 @@ impl App {
     pub(super) fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         let dialog_bg = dialog_background(theme);
-        let Some((session_id, scroll, cursor)) = self
-            .diff_view
-            .as_ref()
-            .map(|view| (view.session_id.clone(), view.scroll, view.cursor))
-        else {
+        let Some(session_id) = self.diff_view.as_ref().map(|view| view.session_id.clone()) else {
             return;
         };
+        self.ensure_diff_rows(&session_id);
         let Some(approval) = self.approvals.get(&session_id) else {
             return;
         };
-        let tool = approval.tool.clone();
-        let path = approval.path.clone().unwrap_or_default();
-        let rows = crate::tui::diff::rows(&approval.hunks, approval.diff.as_deref());
+        let Some(rows) = self.diff_rows.as_ref().map(|cache| cache.rows.as_slice()) else {
+            return;
+        };
+        let tool = approval.tool.as_str();
+        let path = approval.path.as_deref().unwrap_or("");
 
         let rect = centered(
             area,
@@ -341,69 +340,65 @@ impl App {
         frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
 
         let interactive = !approval.hunks.is_empty();
-        let side_by_side = (!rows.is_empty())
-            .then(|| {
-                crate::tui::diff::DiffRenderer::new(&rows, inner_width, &path, theme, "", dialog_bg)
-            })
-            .flatten()
-            .map(|mut renderer| renderer.render(&rows, interactive, &approval.selected, cursor));
-        let body: Vec<Line> = match side_by_side {
-            Some(body) => body,
-            None => {
-                // Too narrow for two readable code columns: keep the old
-                // unified view as a fallback.
-                let mut body = Vec::new();
-                if interactive {
-                    for (index, hunk) in approval.hunks.iter().enumerate() {
-                        let selected = approval.selected.get(index).copied().unwrap_or(true);
-                        let focused = index == cursor;
-                        for (line_index, line) in hunk.lines.iter().enumerate() {
-                            if line_index == 0 {
-                                let marker = if focused { "▸ " } else { "  " };
-                                let check = if selected { "[x] " } else { "[ ] " };
-                                let style = if focused {
-                                    Style::default()
-                                        .fg(composer_focus(theme))
-                                        .add_modifier(Modifier::BOLD)
-                                } else if selected {
-                                    Style::default().fg(composer_accent(theme))
-                                } else {
-                                    Style::default().fg(composer_muted(theme))
-                                };
-                                body.push(Line::from(Span::styled(
-                                    truncate(&format!("{marker}{check}{line}"), inner_width),
-                                    style,
-                                )));
-                            } else {
-                                body.push(Line::from(Span::styled(
-                                    truncate(&format!("    {line}"), inner_width),
-                                    diff_line_style(line, theme),
-                                )));
-                            }
-                        }
+        let (scroll, cursor) = self
+            .diff_view
+            .as_ref()
+            .map(|view| (view.scroll, view.cursor))
+            .unwrap_or((0, 0));
+        let body_hit = self.diff_body.as_ref().is_some_and(|cache| {
+            cache.rev == self.approval_rev
+                && cache.session == session_id
+                && cache.width == inner_width
+                && cache.theme == theme
+                && cache.interactive == interactive
+                && cache.cursor == cursor
+                && cache.selected.as_slice() == approval.selected.as_slice()
+        });
+        if !body_hit {
+            let body = if !rows.is_empty() {
+                match crate::tui::diff::DiffRenderer::new(
+                    rows,
+                    inner_width,
+                    path,
+                    theme,
+                    "",
+                    dialog_bg,
+                ) {
+                    Some(mut renderer) => {
+                        renderer.render(rows, interactive, &approval.selected, cursor)
                     }
-                } else {
-                    for line in approval.diff.as_deref().unwrap_or("").lines() {
-                        body.push(Line::from(Span::styled(
-                            truncate(line, inner_width),
-                            diff_line_style(line, theme),
-                        )));
-                    }
+                    None => unified_review_body(approval, theme, inner_width, interactive, cursor),
                 }
-                body
-            }
-        };
-
+            } else {
+                unified_review_body(approval, theme, inner_width, interactive, cursor)
+            };
+            self.diff_body = Some(DiffBodyCache {
+                rev: self.approval_rev,
+                session: session_id.clone(),
+                width: inner_width,
+                theme,
+                interactive,
+                selected: approval.selected.clone(),
+                cursor,
+                lines: body,
+            });
+        }
+        let body = &self.diff_body.as_ref().expect("diff body").lines;
         let total = body.len();
         let max_scroll = total.saturating_sub(inner_height);
         let scroll = scroll.min(max_scroll);
-        let mut body: Vec<Line> = body.into_iter().skip(scroll).take(inner_height).collect();
+        let mut window: Vec<Line> = body
+            .iter()
+            .skip(scroll)
+            .take(inner_height)
+            .cloned()
+            .collect();
         let hint = if interactive {
             " j/k scroll  [ ] hunk  Space toggle  a all  y apply  n deny  Esc close "
         } else {
             " j/k scroll  y approve  n deny  Esc close "
         };
-        body.push(Line::from(Span::styled(
+        window.push(Line::from(Span::styled(
             hint,
             Style::default().fg(composer_muted(theme)),
         )));
@@ -418,7 +413,7 @@ impl App {
             .border_style(Style::default().fg(composer_warn(theme)))
             .title(title);
         frame.render_widget(
-            Paragraph::new(body)
+            Paragraph::new(window)
                 .block(block)
                 .style(Style::default().fg(composer_text(theme)).bg(dialog_bg)),
             rect,
@@ -427,6 +422,28 @@ impl App {
             view.scroll = scroll;
             view.width = inner_width;
         }
+    }
+
+    /// Parse the focused approval's diff once. The rows are immutable for a
+    /// given approval revision, so the card and the review share them.
+    pub(super) fn ensure_diff_rows(&mut self, session_id: &str) {
+        if self
+            .diff_rows
+            .as_ref()
+            .is_some_and(|cache| cache.rev == self.approval_rev && cache.session == session_id)
+        {
+            return;
+        }
+        let Some(approval) = self.approvals.get(session_id) else {
+            self.diff_rows = None;
+            return;
+        };
+        let rows = crate::tui::diff::rows(&approval.hunks, approval.diff.as_deref());
+        self.diff_rows = Some(DiffRowsCache {
+            rev: self.approval_rev,
+            session: session_id.to_string(),
+            rows,
+        });
     }
 
     pub(super) fn draw_inbox(&mut self, frame: &mut Frame, area: Rect) {
@@ -651,7 +668,30 @@ impl App {
                 list_area,
             );
         } else {
-            let rows = self.picker_rows(kind, &filtered);
+            // Build rows only for the visible window. A file picker can hold
+            // thousands of rows, and every idle frame used to rebuild them all
+            // just for ratatui to clip the overflow.
+            let height = list_area.height as usize;
+            let (start, end) = if height == 0 {
+                (0, 0)
+            } else {
+                let max_start = filtered.len().saturating_sub(height);
+                let mut start = self
+                    .picker
+                    .as_ref()
+                    .map(|picker| picker.scroll.min(max_start))
+                    .unwrap_or(0);
+                if selected < start {
+                    start = selected;
+                } else if selected >= start + height {
+                    start = selected + 1 - height;
+                }
+                if let Some(picker) = &mut self.picker {
+                    picker.scroll = start;
+                }
+                (start, (start + height).min(filtered.len()))
+            };
+            let rows = self.picker_rows(kind, &filtered[start..end]);
             let list = List::new(rows)
                 .style(Style::default().bg(dialog_bg))
                 .highlight_style(
@@ -660,14 +700,14 @@ impl App {
                         .add_modifier(Modifier::BOLD),
                 )
                 .highlight_symbol("› ");
-            let mut state = ListState::default().with_selected(Some(selected));
+            let mut state = ListState::default().with_selected(Some(selected - start));
             frame.render_stateful_widget(list, list_area, &mut state);
         }
 
         if let Some(preview_area) = preview_area {
-            let lines = self.picker_preview_lines(&filtered);
             let width = preview_area.width.saturating_sub(2) as usize;
             let height = preview_area.height as usize;
+            let lines = self.picker_preview_lines(&filtered, height);
             let mut wrapped: Vec<String> = lines
                 .iter()
                 .flat_map(|line| wrap_text(line, width))
@@ -870,8 +910,9 @@ impl App {
         }
     }
 
-    /// Right-pane preview lines for the selected picker row.
-    pub(super) fn picker_preview_lines(&self, filtered: &[usize]) -> Vec<String> {
+    /// Right-pane preview lines for the selected picker row. `height` bounds how
+    /// much of a fetched file is copied; the draw path only needs one screen.
+    pub(super) fn picker_preview_lines(&self, filtered: &[usize], height: usize) -> Vec<String> {
         let Some(picker) = &self.picker else {
             return Vec::new();
         };
@@ -881,7 +922,7 @@ impl App {
         match picker.kind {
             PickerKind::Sessions | PickerKind::NewPane => {
                 if let Some(text) = &picker.preview.text {
-                    return text.lines().map(str::to_string).collect();
+                    return preview_tail(text, height);
                 }
                 let Some(session) = self.sessions.get(index) else {
                     return Vec::new();
@@ -912,7 +953,7 @@ impl App {
             }
             PickerKind::Files => {
                 if let Some(text) = &picker.preview.text {
-                    return text.lines().map(str::to_string).collect();
+                    return preview_head(text, height);
                 }
                 if let Some(error) = &picker.preview.error {
                     return vec![format!("preview: {error}")];
@@ -925,7 +966,7 @@ impl App {
                 };
                 item.preview
                     .as_ref()
-                    .map(|preview| preview.lines().map(str::to_string).collect())
+                    .map(|preview| preview_head(preview, height))
                     .unwrap_or_else(|| vec![item.label.clone()])
             }
             _ => {
@@ -933,7 +974,7 @@ impl App {
                     return Vec::new();
                 };
                 if let Some(preview) = &item.preview {
-                    preview.lines().map(str::to_string).collect()
+                    preview_head(preview, height)
                 } else if let Some(detail) = &item.detail {
                     vec![item.label.clone(), String::new(), detail.clone()]
                 } else {
@@ -942,4 +983,73 @@ impl App {
             }
         }
     }
+}
+
+/// First `height` source lines. Each source line wraps to at least one display
+/// line, so this is enough to fill a preview pane.
+fn preview_head(text: &str, height: usize) -> Vec<String> {
+    text.lines()
+        .take(height.max(1))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Last `height` source lines, used for conversations where the newest output
+/// matters more than the oldest.
+fn preview_tail(text: &str, height: usize) -> Vec<String> {
+    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let keep = height.max(1);
+    if lines.len() > keep {
+        lines.drain(..lines.len() - keep);
+    }
+    lines
+}
+
+/// Unified fallback used when the pane is too narrow for two code columns.
+fn unified_review_body(
+    approval: &PendingApproval,
+    theme: Theme,
+    width: usize,
+    interactive: bool,
+    cursor: usize,
+) -> Vec<Line<'static>> {
+    let mut body = Vec::new();
+    if interactive {
+        for (index, hunk) in approval.hunks.iter().enumerate() {
+            let selected = approval.selected.get(index).copied().unwrap_or(true);
+            let focused = index == cursor;
+            for (line_index, line) in hunk.lines.iter().enumerate() {
+                if line_index == 0 {
+                    let marker = if focused { "▸ " } else { "  " };
+                    let check = if selected { "[x] " } else { "[ ] " };
+                    let style = if focused {
+                        Style::default()
+                            .fg(composer_focus(theme))
+                            .add_modifier(Modifier::BOLD)
+                    } else if selected {
+                        Style::default().fg(composer_accent(theme))
+                    } else {
+                        Style::default().fg(composer_muted(theme))
+                    };
+                    body.push(Line::from(Span::styled(
+                        truncate(&format!("{marker}{check}{line}"), width),
+                        style,
+                    )));
+                } else {
+                    body.push(Line::from(Span::styled(
+                        truncate(&format!("    {line}"), width),
+                        diff_line_style(line, theme),
+                    )));
+                }
+            }
+        }
+    } else {
+        for line in approval.diff.as_deref().unwrap_or("").lines() {
+            body.push(Line::from(Span::styled(
+                truncate(line, width),
+                diff_line_style(line, theme),
+            )));
+        }
+    }
+    body
 }

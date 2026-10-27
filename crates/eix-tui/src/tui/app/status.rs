@@ -100,7 +100,12 @@ impl App {
         }
     }
 
-    pub(super) fn draw_input(&mut self, frame: &mut Frame, area: Rect) {
+    pub(super) fn draw_input(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        mut layout: crate::tui::editor::Layout,
+    ) {
         let focused = self.focus == Focus::Input;
         let panel = composer_background(self.theme);
         let text = composer_text(self.theme);
@@ -149,7 +154,7 @@ impl App {
         // cell on the right mirrors it.
         let inner_width = area.width.saturating_sub(4).max(1) as usize;
         let inner_height = area.height.saturating_sub(2).max(1) as usize;
-        let layout = self.input.layout(inner_width, inner_height);
+        self.input.fit(&mut layout, inner_height);
         let lines: Vec<Line> = layout
             .segments
             .iter()

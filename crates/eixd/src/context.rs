@@ -424,7 +424,15 @@ impl Ledger {
 
     /// Provider messages for everything still in the context.
     pub fn messages(&self) -> Vec<ChatMessage> {
-        let mut messages = Vec::new();
+        // Reserve up front: the turn loop rebuilds this vector after every
+        // tool round, and repeated growth copied the whole history each time.
+        let capacity = self
+            .entries
+            .iter()
+            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
+            .map(|entry| entry.messages.len())
+            .sum();
+        let mut messages = Vec::with_capacity(capacity);
         for entry in &self.entries {
             if entry.info.dropped || entry.info.compacted {
                 continue;
@@ -493,7 +501,19 @@ impl Ledger {
     /// Messages inside an inclusive source range, skipping dropped and already
     /// compacted entries.
     pub fn messages_in_range(&self, from_seq: u64, to_seq: u64) -> Vec<ChatMessage> {
-        let mut messages = Vec::new();
+        let capacity = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                !entry.info.dropped
+                    && !entry.info.compacted
+                    && entry
+                        .seq
+                        .is_some_and(|seq| from_seq <= seq && seq <= to_seq)
+            })
+            .map(|entry| entry.messages.len())
+            .sum();
+        let mut messages = Vec::with_capacity(capacity);
         for entry in &self.entries {
             if entry.info.dropped || entry.info.compacted {
                 continue;

@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use eix_core::redact::SecretRedactor;
-use eix_core::{ChatMessage, Config, FunctionCall, ModelRoute, ToolCall, ToolDefinition, Usage};
+use eix_core::{
+    ChatMessage, Config, FunctionCall, ModelRoute, ProviderKind, Role, ToolCall, ToolDefinition,
+    Usage,
+};
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -138,6 +141,10 @@ pub enum StreamDelta<'a> {
 pub struct Provider {
     client: reqwest::Client,
     model: String,
+    /// Completion budget for protocols that require one.
+    max_output_tokens: u32,
+    /// API keys and OAuth tokens stored with `eix auth login`.
+    credentials: crate::auth::Store,
     /// Random per-provider salt for reversible secret placeholders. It never
     /// leaves this process; without it the hashed ids cannot be dictionary
     /// attacked for low-entropy passwords.
@@ -145,7 +152,14 @@ pub struct Provider {
 }
 
 impl Provider {
-    pub fn new(config: &Config) -> Result<Self, ProviderError> {
+    pub fn new(config: &Config, data_dir: &std::path::Path) -> Result<Self, ProviderError> {
+        Self::with_store(config, crate::auth::Store::under_data_dir(data_dir))
+    }
+
+    pub fn with_store(
+        config: &Config,
+        credentials: crate::auth::Store,
+    ) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .user_agent(format!("eix/{}", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(15))
@@ -155,6 +169,8 @@ impl Provider {
         Ok(Self {
             client,
             model: config.default_model().to_string(),
+            max_output_tokens: config.provider_runtime.max_output_tokens,
+            credentials,
             redaction_salt: uuid::Uuid::new_v4().to_string(),
         })
     }
@@ -181,9 +197,20 @@ impl Provider {
     {
         let mut redactor = SecretRedactor::new(self.redaction_salt.clone());
         let sanitized = redactor.redact_messages(messages);
-        let mut result = self
-            .stream_chat_inner(&sanitized, route, tools, cancel, &mut on_delta)
-            .await;
+        let mut result = match route.kind {
+            ProviderKind::OpenAi => {
+                self.stream_openai(&sanitized, route, tools, cancel, &mut on_delta)
+                    .await
+            }
+            ProviderKind::Anthropic => {
+                self.stream_anthropic(&sanitized, route, tools, cancel, &mut on_delta)
+                    .await
+            }
+            ProviderKind::Gemini => {
+                self.stream_gemini(&sanitized, route, tools, cancel, &mut on_delta)
+                    .await
+            }
+        };
         if let Ok(completion) = &mut result {
             completion.text = redactor.restore(&completion.text);
             completion.reasoning = redactor.restore(&completion.reasoning);
@@ -196,7 +223,7 @@ impl Provider {
         result
     }
 
-    async fn stream_chat_inner<F>(
+    async fn stream_openai<F>(
         &self,
         messages: &[ChatMessage],
         route: &ModelRoute,
@@ -231,38 +258,10 @@ impl Provider {
             .post(&route.endpoint)
             .header(reqwest::header::ACCEPT, "text/event-stream")
             .json(&body);
-        if let Some(key) = &route.api_key {
-            request = request.bearer_auth(key);
+        if let Some(secret) = self.auth_secret(route).await {
+            request = apply_auth(request, route.kind, secret);
         }
-
-        // Waiting for the first byte can outlast the user's patience. Poll the
-        // turn flag and drop the request future on cancel; reqwest then closes
-        // the connection instead of leaving the turn stuck in `sending`.
-        let response = tokio::select! {
-            result = request.send() => result.map_err(|e| {
-                if cancel.load(Ordering::Relaxed) {
-                    ProviderError::Cancelled
-                } else {
-                    ProviderError::Http(e.to_string())
-                }
-            })?,
-            _ = async {
-                while !cancel.load(Ordering::Relaxed) {
-                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                }
-            } => return Err(ProviderError::Cancelled),
-        };
-
-        let status = response.status();
-        if !status.is_success() {
-            let retry_after_secs = parse_retry_after(response.headers());
-            let body = response.text().await.unwrap_or_default();
-            return Err(ProviderError::Api {
-                status: status.as_u16(),
-                body: truncate(&body, 2048),
-                retry_after_secs,
-            });
-        }
+        let response = send_request(request, cancel).await?;
 
         let is_sse = response
             .headers()
@@ -381,6 +380,259 @@ impl Provider {
             tool_calls,
         })
     }
+
+    /// Resolve the credential for one request: config/env first, then the
+    /// owner-only credential store.
+    async fn auth_secret(&self, route: &ModelRoute) -> Option<crate::auth::Secret> {
+        if let Some(key) = route
+            .api_key
+            .as_deref()
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+        {
+            return Some(crate::auth::Secret::ApiKey(key.to_string()));
+        }
+        self.credentials.secret(&route.provider).await
+    }
+
+    async fn stream_anthropic<F>(
+        &self,
+        messages: &[ChatMessage],
+        route: &ModelRoute,
+        tools: &[ToolDefinition],
+        cancel: &AtomicBool,
+        mut on_delta: F,
+    ) -> Result<Completion, ProviderError>
+    where
+        F: FnMut(StreamDelta<'_>) + Send,
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ProviderError::Cancelled);
+        }
+        let model = route.model.as_str();
+        let body = anthropic_body(messages, model, tools, self.max_output_tokens)?;
+        let mut request = self
+            .client
+            .post(&route.endpoint)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .header("anthropic-version", "2023-06-01")
+            .json(&body);
+        if let Some(secret) = self.auth_secret(route).await {
+            request = apply_auth(request, route.kind, secret);
+        }
+        let response = send_request(request, cancel).await?;
+
+        let is_sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+        if !is_sse {
+            let value = response_json(response, cancel).await?;
+            let mut acc = AnthropicAccumulator::new(model);
+            apply_anthropic_message(&value, &mut acc, &mut on_delta)?;
+            acc.done = true;
+            return Ok(acc.finish());
+        }
+
+        let mut decoder = SseDecoder::new();
+        let mut acc = AnthropicAccumulator::new(model);
+        let mut stream = response.bytes_stream();
+        loop {
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = wait_for_cancel(cancel) => return Err(ProviderError::Cancelled),
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ProviderError::Cancelled);
+            }
+            let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
+            for data in decoder.feed(&chunk) {
+                if apply_anthropic_event(&data, &mut acc, &mut on_delta)? {
+                    return Ok(acc.finish());
+                }
+            }
+        }
+        for data in decoder.finish() {
+            if apply_anthropic_event(&data, &mut acc, &mut on_delta)? {
+                return Ok(acc.finish());
+            }
+        }
+        if !acc.saw_event {
+            return Err(ProviderError::Decode(
+                "stream ended without any events".to_string(),
+            ));
+        }
+        if !acc.done && acc.finish_reason.is_none() {
+            return Err(ProviderError::Decode(
+                "stream ended before a stop reason".to_string(),
+            ));
+        }
+        Ok(acc.finish())
+    }
+
+    async fn stream_gemini<F>(
+        &self,
+        messages: &[ChatMessage],
+        route: &ModelRoute,
+        tools: &[ToolDefinition],
+        cancel: &AtomicBool,
+        mut on_delta: F,
+    ) -> Result<Completion, ProviderError>
+    where
+        F: FnMut(StreamDelta<'_>) + Send,
+    {
+        if cancel.load(Ordering::Relaxed) {
+            return Err(ProviderError::Cancelled);
+        }
+        let model = route.model.as_str();
+        let body = gemini_body(
+            messages,
+            model,
+            tools,
+            self.max_output_tokens,
+            route.reasoning_effort.as_deref(),
+        )?;
+        let url = gemini_stream_endpoint(&route.endpoint, model);
+        let mut request = self
+            .client
+            .post(&url)
+            .header(reqwest::header::ACCEPT, "text/event-stream")
+            .json(&body);
+        if let Some(secret) = self.auth_secret(route).await {
+            request = apply_auth(request, route.kind, secret);
+        }
+        let response = send_request(request, cancel).await?;
+
+        let is_sse = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.contains("text/event-stream"))
+            .unwrap_or(false);
+        if !is_sse {
+            let value = response_json(response, cancel).await?;
+            let mut acc = GeminiAccumulator::new(model);
+            match &value {
+                Value::Array(items) => {
+                    for item in items {
+                        apply_gemini_event_value(item, &mut acc, &mut on_delta)?;
+                    }
+                }
+                item => apply_gemini_event_value(item, &mut acc, &mut on_delta)?,
+            }
+            return Ok(acc.finish());
+        }
+
+        let mut decoder = SseDecoder::new();
+        let mut acc = GeminiAccumulator::new(model);
+        let mut stream = response.bytes_stream();
+        loop {
+            let next = tokio::select! {
+                next = stream.next() => next,
+                _ = wait_for_cancel(cancel) => return Err(ProviderError::Cancelled),
+            };
+            let Some(chunk) = next else {
+                break;
+            };
+            if cancel.load(Ordering::Relaxed) {
+                return Err(ProviderError::Cancelled);
+            }
+            let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
+            for data in decoder.feed(&chunk) {
+                if apply_gemini_event(&data, &mut acc, &mut on_delta)? {
+                    return Ok(acc.finish());
+                }
+            }
+        }
+        for data in decoder.finish() {
+            if apply_gemini_event(&data, &mut acc, &mut on_delta)? {
+                return Ok(acc.finish());
+            }
+        }
+        if !acc.saw_event {
+            return Err(ProviderError::Decode(
+                "stream ended without any events".to_string(),
+            ));
+        }
+        if acc.finish_reason.is_none() {
+            return Err(ProviderError::Decode(
+                "stream ended before a finish reason".to_string(),
+            ));
+        }
+        Ok(acc.finish())
+    }
+}
+
+/// Send with cancellation and map non-2xx responses to `ProviderError::Api`.
+async fn send_request(
+    request: reqwest::RequestBuilder,
+    cancel: &AtomicBool,
+) -> Result<reqwest::Response, ProviderError> {
+    // Waiting for the first byte can outlast the user's patience. Poll the
+    // turn flag and drop the request future on cancel; reqwest then closes
+    // the connection instead of leaving the turn stuck in `sending`.
+    let response = tokio::select! {
+        result = request.send() => result.map_err(|e| {
+            if cancel.load(Ordering::Relaxed) {
+                ProviderError::Cancelled
+            } else {
+                ProviderError::Http(e.to_string())
+            }
+        })?,
+        _ = wait_for_cancel(cancel) => return Err(ProviderError::Cancelled),
+    };
+    let status = response.status();
+    if !status.is_success() {
+        let retry_after_secs = parse_retry_after(response.headers());
+        let body = response.text().await.unwrap_or_default();
+        return Err(ProviderError::Api {
+            status: status.as_u16(),
+            body: truncate(&body, 2048),
+            retry_after_secs,
+        });
+    }
+    Ok(response)
+}
+
+/// Attach a provider-specific credential header.
+fn apply_auth(
+    request: reqwest::RequestBuilder,
+    kind: ProviderKind,
+    secret: crate::auth::Secret,
+) -> reqwest::RequestBuilder {
+    use crate::auth::Secret;
+    match (kind, secret) {
+        (ProviderKind::Anthropic, Secret::ApiKey(key)) => request
+            .header("x-api-key", key)
+            .header("anthropic-version", "2023-06-01"),
+        (ProviderKind::Gemini, Secret::ApiKey(key)) => request.header("x-goog-api-key", key),
+        (_, Secret::ApiKey(key)) | (_, Secret::Bearer(key)) => request.bearer_auth(key),
+    }
+}
+
+async fn response_json(
+    response: reqwest::Response,
+    cancel: &AtomicBool,
+) -> Result<Value, ProviderError> {
+    let text = tokio::select! {
+        text = response.text() => text.map_err(|e| ProviderError::Http(e.to_string()))?,
+        _ = wait_for_cancel(cancel) => return Err(ProviderError::Cancelled),
+    };
+    let value: Value = serde_json::from_str(&text)
+        .map_err(|e| ProviderError::Decode(format!("non-streaming response: {e}")))?;
+    if let Some(error) = value.get("error") {
+        return Err(ProviderError::Api {
+            status: 200,
+            body: error_message(error),
+            retry_after_secs: None,
+        });
+    }
+    Ok(value)
 }
 
 struct Accumulator {
@@ -446,6 +698,711 @@ impl Accumulator {
             tool_calls,
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Anthropic Messages API
+// ---------------------------------------------------------------------------
+
+/// Convert the provider-agnostic transcript into an Anthropic Messages body.
+fn anthropic_body(
+    messages: &[ChatMessage],
+    model: &str,
+    tools: &[ToolDefinition],
+    max_tokens: u32,
+) -> Result<Value, ProviderError> {
+    let mut system = Vec::new();
+    let mut wire: Vec<Value> = Vec::new();
+    for message in messages {
+        match message.role {
+            Role::System => {
+                if !message.content.trim().is_empty() {
+                    system.push(message.content.clone());
+                }
+            }
+            Role::User => {
+                let mut blocks = Vec::new();
+                if !message.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": message.content}));
+                }
+                for image in &message.images {
+                    blocks.push(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": image.mime,
+                            "data": image.data,
+                        }
+                    }));
+                }
+                push_anthropic(&mut wire, "user", blocks);
+            }
+            Role::Assistant => {
+                let mut blocks = Vec::new();
+                if !message.content.is_empty() {
+                    blocks.push(json!({"type": "text", "text": message.content}));
+                }
+                for call in message.tool_calls.iter().flatten() {
+                    let input = serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| json!({}));
+                    blocks.push(json!({
+                        "type": "tool_use",
+                        "id": call.id,
+                        "name": call.function.name,
+                        "input": input,
+                    }));
+                }
+                // Anthropic rejects an assistant turn with no blocks.
+                if blocks.is_empty() {
+                    blocks.push(json!({"type": "text", "text": ""}));
+                }
+                push_anthropic(&mut wire, "assistant", blocks);
+            }
+            Role::Tool => {
+                let block = json!({
+                    "type": "tool_result",
+                    "tool_use_id": message.tool_call_id.clone().unwrap_or_default(),
+                    "content": message.content,
+                });
+                push_anthropic(&mut wire, "user", vec![block]);
+            }
+        }
+    }
+
+    let mut body = json!({
+        "model": model,
+        "max_tokens": max_tokens,
+        "messages": wire,
+        "stream": true,
+    });
+    if !system.is_empty() {
+        body["system"] = json!(system.join("\n\n"));
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools
+            .iter()
+            .map(|tool| json!({
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "input_schema": tool.function.parameters,
+            }))
+            .collect::<Vec<_>>());
+        body["tool_choice"] = json!({"type": "auto"});
+    }
+    Ok(body)
+}
+
+/// Append blocks, merging consecutive messages with the same role. Anthropic
+/// requires every `tool_result` for one assistant turn to share a user message.
+fn push_anthropic(wire: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
+    if blocks.is_empty() {
+        return;
+    }
+    if let Some(last) = wire.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some(role) {
+            if let Some(content) = last.get_mut("content").and_then(Value::as_array_mut) {
+                content.extend(blocks);
+                return;
+            }
+        }
+    }
+    wire.push(json!({"role": role, "content": blocks}));
+}
+
+struct AnthropicAccumulator {
+    text: String,
+    reasoning: String,
+    model: String,
+    input_tokens: u64,
+    output_tokens: u64,
+    finish_reason: Option<String>,
+    saw_event: bool,
+    done: bool,
+    tool_calls: Vec<PartialToolCall>,
+}
+
+impl AnthropicAccumulator {
+    fn new(model: &str) -> Self {
+        Self {
+            text: String::new(),
+            reasoning: String::new(),
+            model: model.to_string(),
+            input_tokens: 0,
+            output_tokens: 0,
+            finish_reason: None,
+            saw_event: false,
+            done: false,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn set_usage(&mut self, usage: &Value) {
+        if let Some(tokens) = usage.get("input_tokens").and_then(Value::as_u64) {
+            self.input_tokens = tokens;
+        }
+        if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
+            self.output_tokens = tokens;
+        }
+    }
+
+    fn finish(self) -> Completion {
+        let tool_calls = finish_tool_calls(self.tool_calls);
+        let usage = (self.input_tokens > 0 || self.output_tokens > 0).then_some(Usage {
+            prompt_tokens: self.input_tokens,
+            completion_tokens: self.output_tokens,
+            total_tokens: self.input_tokens.saturating_add(self.output_tokens),
+        });
+        Completion {
+            text: self.text,
+            reasoning: self.reasoning,
+            model: self.model,
+            usage,
+            finish_reason: self.finish_reason,
+            tool_calls,
+        }
+    }
+}
+
+fn anthropic_stop_reason(reason: &str) -> String {
+    match reason {
+        "end_turn" | "stop_sequence" => "stop".to_string(),
+        "max_tokens" => "length".to_string(),
+        "tool_use" => "tool_calls".to_string(),
+        "refusal" => "content_filter".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn apply_anthropic_event<F>(
+    data: &str,
+    acc: &mut AnthropicAccumulator,
+    on_delta: &mut F,
+) -> Result<bool, ProviderError>
+where
+    F: FnMut(StreamDelta<'_>),
+{
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(false);
+    }
+    let value: Value = serde_json::from_str(data)
+        .map_err(|e| ProviderError::Decode(format!("{e}: {}", truncate(data, 512))))?;
+    acc.saw_event = true;
+
+    match value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
+        "error" => {
+            let error = value.get("error").unwrap_or(&value);
+            return Err(ProviderError::Api {
+                status: 200,
+                body: error_message(error),
+                retry_after_secs: None,
+            });
+        }
+        "message_start" => {
+            if let Some(message) = value.get("message") {
+                if let Some(model) = message.get("model").and_then(Value::as_str) {
+                    acc.model = model.to_string();
+                }
+                if let Some(usage) = message.get("usage") {
+                    acc.set_usage(usage);
+                }
+            }
+        }
+        "content_block_start" => {
+            let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let block = value.get("content_block").unwrap_or(&Value::Null);
+            if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+                ensure_tool_slot(acc, index);
+                let slot = &mut acc.tool_calls[index];
+                slot.id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                slot.kind = "function".to_string();
+                slot.name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+            }
+        }
+        "content_block_delta" => {
+            let index = value.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let delta = value.get("delta").unwrap_or(&Value::Null);
+            match delta
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
+                "text_delta" => {
+                    if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            acc.text.push_str(text);
+                            on_delta(StreamDelta::Content(text));
+                        }
+                    }
+                }
+                "thinking_delta" => {
+                    if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                        if !text.is_empty() {
+                            acc.reasoning.push_str(text);
+                            on_delta(StreamDelta::Reasoning(text));
+                        }
+                    }
+                }
+                "input_json_delta" => {
+                    if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
+                        ensure_tool_slot(acc, index);
+                        acc.tool_calls[index].arguments.push_str(partial);
+                    }
+                }
+                _ => {}
+            }
+        }
+        "message_delta" => {
+            if let Some(usage) = value.get("usage") {
+                acc.set_usage(usage);
+            }
+            if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                acc.finish_reason = Some(anthropic_stop_reason(reason));
+            }
+        }
+        "message_stop" => {
+            acc.done = true;
+            return Ok(true);
+        }
+        _ => {}
+    }
+    Ok(false)
+}
+
+/// Apply a complete (non-streaming) Anthropic response.
+fn apply_anthropic_message<F>(
+    value: &Value,
+    acc: &mut AnthropicAccumulator,
+    on_delta: &mut F,
+) -> Result<(), ProviderError>
+where
+    F: FnMut(StreamDelta<'_>),
+{
+    if let Some(model) = value.get("model").and_then(Value::as_str) {
+        acc.model = model.to_string();
+    }
+    if let Some(usage) = value.get("usage") {
+        acc.set_usage(usage);
+    }
+    for block in value
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        match block
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+        {
+            "text" => {
+                if let Some(text) = block.get("text").and_then(Value::as_str) {
+                    acc.text.push_str(text);
+                    on_delta(StreamDelta::Content(text));
+                }
+            }
+            "thinking" => {
+                if let Some(text) = block.get("thinking").and_then(Value::as_str) {
+                    acc.reasoning.push_str(text);
+                    on_delta(StreamDelta::Reasoning(text));
+                }
+            }
+            "tool_use" => {
+                let index = acc.tool_calls.len();
+                ensure_tool_slot(acc, index);
+                let slot = &mut acc.tool_calls[index];
+                slot.id = block
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                slot.kind = "function".to_string();
+                slot.name = block
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                slot.arguments = block
+                    .get("input")
+                    .map(|input| input.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+            }
+            _ => {}
+        }
+    }
+    if let Some(reason) = value.get("stop_reason").and_then(Value::as_str) {
+        acc.finish_reason = Some(anthropic_stop_reason(reason));
+    }
+    Ok(())
+}
+
+fn ensure_tool_slot(acc: &mut AnthropicAccumulator, index: usize) {
+    if acc.tool_calls.len() <= index {
+        acc.tool_calls
+            .resize_with(index + 1, PartialToolCall::default);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gemini generateContent API
+// ---------------------------------------------------------------------------
+
+fn gemini_stream_endpoint(base: &str, model: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if base.contains(":streamGenerateContent") {
+        let separator = if base.contains('?') { '&' } else { '?' };
+        format!("{base}{separator}alt=sse")
+    } else {
+        format!("{base}/models/{model}:streamGenerateContent?alt=sse")
+    }
+}
+
+fn gemini_body(
+    messages: &[ChatMessage],
+    model: &str,
+    tools: &[ToolDefinition],
+    max_tokens: u32,
+    reasoning_effort: Option<&str>,
+) -> Result<Value, ProviderError> {
+    let mut system = Vec::new();
+    let mut contents: Vec<Value> = Vec::new();
+    let mut tool_names = std::collections::HashMap::new();
+    for message in messages {
+        match message.role {
+            Role::System => {
+                if !message.content.trim().is_empty() {
+                    system.push(message.content.clone());
+                }
+            }
+            Role::User => {
+                let mut parts = Vec::new();
+                if !message.content.is_empty() {
+                    parts.push(json!({"text": message.content}));
+                }
+                for image in &message.images {
+                    parts.push(json!({
+                        "inlineData": {"mimeType": image.mime, "data": image.data}
+                    }));
+                }
+                push_gemini(&mut contents, "user", parts);
+            }
+            Role::Assistant => {
+                let mut parts = Vec::new();
+                if !message.content.is_empty() {
+                    parts.push(json!({"text": message.content}));
+                }
+                for call in message.tool_calls.iter().flatten() {
+                    tool_names.insert(call.id.clone(), call.function.name.clone());
+                    let args = serde_json::from_str(&call.function.arguments)
+                        .unwrap_or_else(|_| json!({"_raw": call.function.arguments}));
+                    parts.push(json!({
+                        "functionCall": {"name": call.function.name, "args": args}
+                    }));
+                }
+                push_gemini(&mut contents, "model", parts);
+            }
+            Role::Tool => {
+                let name = message
+                    .tool_call_id
+                    .as_deref()
+                    .and_then(|id| tool_names.get(id))
+                    .cloned()
+                    .unwrap_or_else(|| "tool".to_string());
+                let part = json!({
+                    "functionResponse": {
+                        "name": name,
+                        "response": {"result": message.content},
+                    }
+                });
+                push_gemini(&mut contents, "user", vec![part]);
+            }
+        }
+    }
+
+    let mut body = json!({
+        "contents": contents,
+        "generationConfig": {"maxOutputTokens": max_tokens},
+    });
+    if !system.is_empty() {
+        body["systemInstruction"] = json!({"parts": [{"text": system.join("\n\n")}]});
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!([{
+            "functionDeclarations": tools.iter().map(|tool| json!({
+                "name": tool.function.name,
+                "description": tool.function.description,
+                "parameters": gemini_schema(&tool.function.parameters),
+            })).collect::<Vec<_>>()
+        }]);
+    }
+    if model.contains("2.5") || model.to_ascii_lowercase().contains("thinking") {
+        let budget = match reasoning_effort {
+            Some("none") => Some(0),
+            Some("low") => Some(1_024),
+            Some("high") => Some(8_192),
+            Some("medium") | Some(_) => Some(4_096),
+            None => None,
+        };
+        if let Some(budget) = budget {
+            body["generationConfig"]["thinkingConfig"] = json!({"thinkingBudget": budget});
+        }
+    }
+    Ok(body)
+}
+
+fn push_gemini(contents: &mut Vec<Value>, role: &str, parts: Vec<Value>) {
+    if parts.is_empty() {
+        return;
+    }
+    if let Some(last) = contents.last_mut() {
+        if last.get("role").and_then(Value::as_str) == Some(role) {
+            if let Some(existing) = last.get_mut("parts").and_then(Value::as_array_mut) {
+                existing.extend(parts);
+                return;
+            }
+        }
+    }
+    contents.push(json!({"role": role, "parts": parts}));
+}
+
+/// Gemini accepts an OpenAPI subset; drop JSON Schema keywords it rejects.
+fn gemini_schema(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut out = serde_json::Map::new();
+            for (key, value) in map {
+                if matches!(
+                    key.as_str(),
+                    "additionalProperties" | "$schema" | "$defs" | "definitions" | "strict"
+                ) {
+                    continue;
+                }
+                out.insert(key.clone(), gemini_schema(value));
+            }
+            Value::Object(out)
+        }
+        Value::Array(items) => Value::Array(items.iter().map(gemini_schema).collect()),
+        other => other.clone(),
+    }
+}
+
+struct GeminiAccumulator {
+    text: String,
+    reasoning: String,
+    model: String,
+    usage: Option<Usage>,
+    finish_reason: Option<String>,
+    saw_event: bool,
+    tool_calls: Vec<PartialToolCall>,
+}
+
+impl GeminiAccumulator {
+    fn new(model: &str) -> Self {
+        Self {
+            text: String::new(),
+            reasoning: String::new(),
+            model: model.to_string(),
+            usage: None,
+            finish_reason: None,
+            saw_event: false,
+            tool_calls: Vec::new(),
+        }
+    }
+
+    fn set_usage(&mut self, usage: &Value) {
+        let prompt = usage
+            .get("promptTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let completion = usage
+            .get("candidatesTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let total = usage
+            .get("totalTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or(prompt.saturating_add(completion));
+        if prompt > 0 || completion > 0 || total > 0 {
+            self.usage = Some(Usage {
+                prompt_tokens: prompt,
+                completion_tokens: completion,
+                total_tokens: total,
+            });
+        }
+    }
+
+    fn finish(self) -> Completion {
+        Completion {
+            text: self.text,
+            reasoning: self.reasoning,
+            model: self.model,
+            usage: self.usage,
+            finish_reason: self.finish_reason,
+            tool_calls: finish_tool_calls(self.tool_calls),
+        }
+    }
+}
+
+fn gemini_finish_reason(reason: &str) -> String {
+    match reason {
+        "STOP" => "stop".to_string(),
+        "MAX_TOKENS" => "length".to_string(),
+        "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" => {
+            "content_filter".to_string()
+        }
+        "MALFORMED_FUNCTION_CALL" => "tool_calls".to_string(),
+        other => other.to_ascii_lowercase(),
+    }
+}
+
+fn apply_gemini_event<F>(
+    data: &str,
+    acc: &mut GeminiAccumulator,
+    on_delta: &mut F,
+) -> Result<bool, ProviderError>
+where
+    F: FnMut(StreamDelta<'_>),
+{
+    let data = data.trim();
+    if data.is_empty() {
+        return Ok(false);
+    }
+    if data == "[DONE]" {
+        return Ok(true);
+    }
+    let value: Value = serde_json::from_str(data)
+        .map_err(|e| ProviderError::Decode(format!("{e}: {}", truncate(data, 512))))?;
+    apply_gemini_event_value(&value, acc, on_delta)?;
+    Ok(false)
+}
+
+fn apply_gemini_event_value<F>(
+    value: &Value,
+    acc: &mut GeminiAccumulator,
+    on_delta: &mut F,
+) -> Result<(), ProviderError>
+where
+    F: FnMut(StreamDelta<'_>),
+{
+    if value.is_null() {
+        return Ok(());
+    }
+    acc.saw_event = true;
+    if let Some(error) = value.get("error") {
+        return Err(ProviderError::Api {
+            status: 200,
+            body: error_message(error),
+            retry_after_secs: None,
+        });
+    }
+    if let Some(model) = value.get("modelVersion").and_then(Value::as_str) {
+        acc.model = model.to_string();
+    }
+    if let Some(usage) = value.get("usageMetadata") {
+        acc.set_usage(usage);
+    }
+    if let Some(block) = value
+        .get("promptFeedback")
+        .and_then(|v| v.get("blockReason"))
+    {
+        acc.finish_reason = Some("content_filter".to_string());
+        return Err(ProviderError::Api {
+            status: 200,
+            body: format!("blocked by provider: {block}"),
+            retry_after_secs: None,
+        });
+    }
+    let Some(candidate) = value
+        .get("candidates")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    else {
+        return Ok(());
+    };
+    if let Some(parts) = candidate
+        .pointer("/content/parts")
+        .and_then(Value::as_array)
+    {
+        for part in parts {
+            if let Some(call) = part.get("functionCall") {
+                let name = call
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                let arguments = call
+                    .get("args")
+                    .map(|args| args.to_string())
+                    .unwrap_or_else(|| "{}".to_string());
+                let index = acc.tool_calls.len();
+                acc.tool_calls.push(PartialToolCall {
+                    id: format!("call_{index}"),
+                    kind: "function".to_string(),
+                    name,
+                    arguments,
+                });
+            }
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                if text.is_empty() {
+                    continue;
+                }
+                if part
+                    .get("thought")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    acc.reasoning.push_str(text);
+                    on_delta(StreamDelta::Reasoning(text));
+                } else {
+                    acc.text.push_str(text);
+                    on_delta(StreamDelta::Content(text));
+                }
+            }
+        }
+    }
+    if let Some(reason) = candidate.get("finishReason").and_then(Value::as_str) {
+        acc.finish_reason = Some(gemini_finish_reason(reason));
+    }
+    Ok(())
+}
+
+fn finish_tool_calls(calls: Vec<PartialToolCall>) -> Vec<ToolCall> {
+    calls
+        .into_iter()
+        .filter(|call| !call.name.is_empty())
+        .enumerate()
+        .map(|(index, call)| ToolCall {
+            id: if call.id.is_empty() {
+                format!("call_{index}")
+            } else {
+                call.id
+            },
+            kind: if call.kind.is_empty() {
+                "function".to_string()
+            } else {
+                call.kind
+            },
+            function: FunctionCall {
+                name: call.name,
+                arguments: call.arguments,
+            },
+        })
+        .collect()
 }
 
 /// Apply one SSE `data:` payload. Returns `true` when the stream is done.
@@ -741,14 +1698,9 @@ async fn wait_for_cancel(cancel: &AtomicBool) {
 fn restore_tool_arguments(tool: &str) -> bool {
     matches!(
         tool,
-        "read_file"
-            | "list_dir"
-            | "grep"
-            | "glob"
+        "apply_patch"
+            | "view_image"
             | "lsp_diagnostics"
-            | "write_file"
-            | "edit"
-            | "patch"
             | "todo"
             | "memory"
             | "ask_user"
@@ -965,18 +1917,221 @@ mod tests {
 
     #[test]
     fn secrets_are_only_restored_for_local_tool_arguments() {
-        for tool in ["read_file", "write_file", "edit", "patch", "grep"] {
+        for tool in [
+            "apply_patch",
+            "view_image",
+            "lsp_diagnostics",
+            "todo",
+            "memory",
+            "ask_user",
+            "use_skill",
+        ] {
             assert!(restore_tool_arguments(tool), "{tool}");
         }
         for tool in [
-            "run_command",
-            "start_command",
-            "webfetch",
-            "websearch",
+            "exec_command",
+            "write_stdin",
+            "web_fetch",
+            "web_search",
             "spawn_agent",
             "mcp__github__create_issue",
         ] {
             assert!(!restore_tool_arguments(tool), "{tool}");
         }
+    }
+
+    fn tool_definition() -> ToolDefinition {
+        ToolDefinition::function(
+            "read_file",
+            "Read a file",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+                "additionalProperties": false,
+            }),
+        )
+    }
+
+    #[test]
+    fn anthropic_body_splits_system_and_merges_tool_results() {
+        let call = ToolCall {
+            id: "toolu_1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            },
+        };
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("read it"),
+            ChatMessage::assistant_with_tools("", vec![call]),
+            ChatMessage::tool("toolu_1", "contents"),
+            ChatMessage::tool("toolu_2", "more"),
+        ];
+        let body = anthropic_body(&messages, "claude-sonnet", &[tool_definition()], 4096).unwrap();
+        assert_eq!(body["system"], "be brief");
+        assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(body["messages"][0]["role"], "user");
+        assert_eq!(body["messages"][1]["role"], "assistant");
+        assert_eq!(
+            body["messages"][1]["content"][0]["type"],
+            Value::String("tool_use".into())
+        );
+        assert_eq!(body["messages"][1]["content"][0]["input"]["path"], "a.rs");
+        // Consecutive tool results become one user message with two blocks.
+        let results = body["messages"][2]["content"].as_array().unwrap();
+        assert_eq!(body["messages"].as_array().unwrap().len(), 3);
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0]["type"], "tool_result");
+        assert_eq!(results[1]["tool_use_id"], "toolu_2");
+        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
+    }
+
+    #[test]
+    fn applies_anthropic_stream_events() {
+        let mut acc = AnthropicAccumulator::new("fallback");
+        let mut seen = String::new();
+        let mut on_delta = |delta: StreamDelta<'_>| {
+            if let StreamDelta::Content(text) = delta {
+                seen.push_str(text);
+            }
+        };
+        let events = [
+            r#"{"type":"message_start","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":1}}}"#,
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#,
+            r#"{"type":"message_stop"}"#,
+        ];
+        let mut done = false;
+        for event in events {
+            done = apply_anthropic_event(event, &mut acc, &mut on_delta).unwrap();
+        }
+        assert!(done);
+        let completion = acc.finish();
+        assert_eq!(seen, "Hi");
+        assert_eq!(completion.text, "Hi");
+        assert_eq!(completion.model, "claude-sonnet");
+        assert_eq!(completion.finish_reason.as_deref(), Some("tool_calls"));
+        assert_eq!(completion.tool_calls.len(), 1);
+        assert_eq!(completion.tool_calls[0].id, "toolu_1");
+        assert_eq!(
+            completion.tool_calls[0].function.arguments,
+            r#"{"path":"a.rs"}"#
+        );
+        let usage = completion.usage.unwrap();
+        assert_eq!(usage.prompt_tokens, 10);
+        assert_eq!(usage.completion_tokens, 7);
+        assert_eq!(usage.total_tokens, 17);
+    }
+
+    #[test]
+    fn applies_anthropic_non_streaming_blocks() {
+        let mut acc = AnthropicAccumulator::new("m");
+        let mut on_delta = |_: StreamDelta<'_>| {};
+        apply_anthropic_message(
+            &json!({
+                "model": "claude",
+                "content": [
+                    {"type": "thinking", "thinking": "plan"},
+                    {"type": "text", "text": "answer"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.rs"}}
+                ],
+                "stop_reason": "tool_use",
+                "usage": {"input_tokens": 2, "output_tokens": 3}
+            }),
+            &mut acc,
+            &mut on_delta,
+        )
+        .unwrap();
+        let completion = acc.finish();
+        assert_eq!(completion.reasoning, "plan");
+        assert_eq!(completion.text, "answer");
+        assert_eq!(completion.tool_calls[0].function.name, "read_file");
+        assert_eq!(completion.usage.unwrap().total_tokens, 5);
+    }
+
+    #[test]
+    fn gemini_body_converts_roles_tools_and_schema() {
+        let call = ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            },
+        };
+        let messages = vec![
+            ChatMessage::system("be brief"),
+            ChatMessage::user("read it"),
+            ChatMessage::assistant_with_tools("", vec![call]),
+            ChatMessage::tool("call_1", "contents"),
+        ];
+        let body = gemini_body(
+            &messages,
+            "gemini-2.5-pro",
+            &[tool_definition()],
+            2048,
+            Some("low"),
+        )
+        .unwrap();
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "be brief");
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][1]["role"], "model");
+        assert_eq!(
+            body["contents"][1]["parts"][0]["functionCall"]["name"],
+            "read_file"
+        );
+        assert_eq!(body["contents"][2]["role"], "user");
+        assert_eq!(
+            body["contents"][2]["parts"][0]["functionResponse"]["name"],
+            "read_file"
+        );
+        let parameters = &body["tools"][0]["functionDeclarations"][0]["parameters"];
+        assert_eq!(parameters["type"], "object");
+        assert!(parameters.get("additionalProperties").is_none());
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], 2048);
+        assert_eq!(
+            body["generationConfig"]["thinkingConfig"]["thinkingBudget"],
+            1024
+        );
+    }
+
+    #[test]
+    fn applies_gemini_stream_events() {
+        let mut acc = GeminiAccumulator::new("fallback");
+        let mut seen = String::new();
+        let mut on_delta = |delta: StreamDelta<'_>| match delta {
+            StreamDelta::Content(text) => seen.push_str(text),
+            StreamDelta::Reasoning(_) => {}
+        };
+        let first = r#"{"candidates":[{"content":{"parts":[{"text":"think","thought":true},{"text":"Hel"}]},"index":0}],"modelVersion":"gemini-2.5-pro"}"#;
+        let second = r#"{"candidates":[{"content":{"parts":[{"text":"lo"},{"functionCall":{"name":"read_file","args":{"path":"a.rs"}}}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7}}"#;
+        apply_gemini_event(first, &mut acc, &mut on_delta).unwrap();
+        apply_gemini_event(second, &mut acc, &mut on_delta).unwrap();
+        let completion = acc.finish();
+        assert_eq!(seen, "Hello");
+        assert_eq!(completion.reasoning, "think");
+        assert_eq!(completion.model, "gemini-2.5-pro");
+        assert_eq!(completion.finish_reason.as_deref(), Some("stop"));
+        assert_eq!(completion.tool_calls.len(), 1);
+        assert_eq!(completion.tool_calls[0].function.name, "read_file");
+        assert_eq!(
+            completion.tool_calls[0].function.arguments,
+            r#"{"path":"a.rs"}"#
+        );
+        assert_eq!(completion.usage.unwrap().total_tokens, 7);
+    }
+
+    #[test]
+    fn gemini_maps_blocked_and_length_finish_reasons() {
+        assert_eq!(gemini_finish_reason("MAX_TOKENS"), "length");
+        assert_eq!(gemini_finish_reason("SAFETY"), "content_filter");
+        assert_eq!(gemini_finish_reason("STOP"), "stop");
     }
 }

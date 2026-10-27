@@ -208,10 +208,12 @@ impl Client {
                     return None;
                 }
                 loop {
-                    if let Some((event, rest)) = split_event(&buffer) {
-                        buffer = rest;
-                        let event = String::from_utf8_lossy(&event);
-                        return match parse_event(&event) {
+                    if let Some((end, width)) = split_event(&buffer) {
+                        let event = String::from_utf8_lossy(&buffer[..end]);
+                        let parsed = parse_event(&event);
+                        drop(event);
+                        buffer.drain(..end + width);
+                        return match parsed {
                             Ok(Some(notification)) => {
                                 Some((Ok(notification), (bytes, buffer, false)))
                             }
@@ -285,26 +287,21 @@ impl std::fmt::Debug for EventStream {
     }
 }
 
-fn split_event(buffer: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
-    let find = |needle: &[u8]| {
-        buffer
-            .windows(needle.len())
-            .position(|window| window == needle)
-    };
-    let lf = find(b"\n\n").map(|index| (index, 2));
-    let crlf = find(b"\r\n\r\n").map(|index| (index, 4));
-    let (index, width) = match (lf, crlf) {
-        (Some(lf), Some(crlf)) => {
-            if lf.0 <= crlf.0 {
-                lf
-            } else {
-                crlf
-            }
+/// Locate the end of the next SSE event. Returns the byte offset just before
+/// the blank line and the separator width, so the caller can parse the borrowed
+/// slice and drain the buffer once instead of copying both halves per event.
+fn split_event(buffer: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0;
+    while index + 1 < buffer.len() {
+        if buffer[index] == b'\n' && buffer[index + 1] == b'\n' {
+            return Some((index, 2));
         }
-        (Some(found), None) | (None, Some(found)) => found,
-        (None, None) => return None,
-    };
-    Some((buffer[..index].to_vec(), buffer[index + width..].to_vec()))
+        if index + 3 < buffer.len() && &buffer[index..index + 4] == b"\r\n\r\n" {
+            return Some((index, 4));
+        }
+        index += 1;
+    }
+    None
 }
 
 fn parse_event(event: &str) -> Result<Option<Notification>> {
@@ -341,12 +338,13 @@ mod tests {
     #[test]
     fn sse_events_split_and_ignore_comments() {
         let buffer = b": connected\n\ndata: {\"method\":\"x\",\"params\":{}}\n\n";
-        let (first, rest) = split_event(buffer).expect("first event");
-        assert!(parse_event(&String::from_utf8_lossy(&first))
+        let (first, first_width) = split_event(buffer).expect("first event");
+        assert!(parse_event(&String::from_utf8_lossy(&buffer[..first]))
             .unwrap()
             .is_none());
-        let (second, _) = split_event(&rest).expect("second event");
-        let notification = parse_event(&String::from_utf8_lossy(&second))
+        let rest = &buffer[first + first_width..];
+        let (second, _) = split_event(rest).expect("second event");
+        let notification = parse_event(&String::from_utf8_lossy(&rest[..second]))
             .unwrap()
             .unwrap();
         assert_eq!(notification.method, "x");

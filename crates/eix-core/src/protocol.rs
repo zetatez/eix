@@ -131,9 +131,16 @@ pub struct Notification {
 
 impl Notification {
     pub fn new<T: Serialize>(method: impl Into<String>, params: T) -> Self {
+        Self::from_value(method, serde_json::to_value(params).unwrap_or(Value::Null))
+    }
+
+    /// Build a notification from an already encoded payload. Streaming deltas
+    /// and forwarded events are Values already, so this skips a serialization
+    /// round-trip on the daemon's hot path.
+    pub fn from_value(method: impl Into<String>, params: Value) -> Self {
         Self {
             method: method.into(),
-            params: serde_json::to_value(params).unwrap_or(Value::Null),
+            params,
         }
     }
 }
@@ -337,6 +344,7 @@ pub struct SubagentConcurrencyResult {
     pub max_parallel_subagents: usize,
 }
 
+/// `model.list`: configured models plus a provider auth summary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelListResult {
     pub models: Vec<crate::ModelInfo>,
@@ -344,6 +352,38 @@ pub struct ModelListResult {
     /// still present in `models`.
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Active daemon fallback model (config or `model.use` override).
+    #[serde(default)]
+    pub default_model: String,
+    /// One row per configured provider, so frontends can explain why a model
+    /// will fail before the user sends a prompt.
+    #[serde(default)]
+    pub providers: Vec<ProviderAuthInfo>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAuthInfo {
+    pub key: String,
+    pub name: String,
+    /// `openai`, `anthropic` or `gemini`.
+    pub kind: String,
+    pub authenticated: bool,
+    /// Where the credential comes from: `config`, `env:NAME`,
+    /// `store:api-key`, `store:oauth`, or `missing`.
+    pub source: String,
+}
+
+/// `model.use`: switch the daemon's fallback model at runtime.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUseParams {
+    /// `None`, empty or `default` restores the configured default.
+    #[serde(default)]
+    pub model: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelUseResult {
+    pub model: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -66,12 +66,16 @@ impl PermissionDecision {
     }
 }
 
-/// Whether a `run_command` call is a low-risk, read-only command that can run
+/// Whether a `exec_command` call is a low-risk, read-only command that can run
 /// alongside other reads. This is deliberately stricter than "does not mutate
 /// the workspace": network, git-publish, secret reads and anything the analyzer
 /// cannot prove are left in the sequential path where approval still applies.
 pub fn command_is_parallel_readonly(args: &Value, cwd: &Path) -> bool {
-    let Some(command) = args.get("command").and_then(Value::as_str) else {
+    let Some(command) = args
+        .get("cmd")
+        .or_else(|| args.get("command"))
+        .and_then(Value::as_str)
+    else {
         return false;
     };
     if command.trim().is_empty() {
@@ -97,7 +101,7 @@ pub fn assess_tool(
     mcp_known: bool,
 ) -> RiskAssessment {
     match tool {
-        "read_file" | "list_dir" | "grep" | "glob" | "lsp_diagnostics" => {
+        "lsp_diagnostics" | "view_image" => {
             let raw = args
                 .get("path")
                 .and_then(Value::as_str)
@@ -108,18 +112,11 @@ pub fn assess_tool(
                 .is_some_and(|path| config.tools.external_path_allowed(&path));
             assess_read_path(raw, cwd, allowed)
         }
-        "write_file" | "edit" => {
-            let raw = args.get("path").and_then(Value::as_str).unwrap_or_default();
-            let allowed = crate::tools::resolve_path_in(cwd, raw, config)
-                .ok()
-                .is_some_and(|path| config.tools.external_path_allowed(&path));
-            assess_write_path(raw, cwd, allowed)
-        }
-        "patch" => {
+        "apply_patch" => {
             let mut risk = RiskAssessment::new();
-            let text = args
-                .get("patchText")
-                .and_then(Value::as_str)
+            let text = ["patchText", "patch", "input", "text"]
+                .iter()
+                .find_map(|key| args.get(*key).and_then(Value::as_str))
                 .unwrap_or_default();
             let mut found = false;
             for line in text.lines() {
@@ -139,14 +136,15 @@ pub fn assess_tool(
                 risk.add(
                     RiskCategory::WriteLocal,
                     RiskLevel::Medium,
-                    "patch changes workspace files".to_string(),
+                    "apply_patch changes workspace files".to_string(),
                 );
             }
             risk
         }
-        "run_command" | "start_command" => {
+        "exec_command" => {
             let command = args
-                .get("command")
+                .get("cmd")
+                .or_else(|| args.get("command"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             let mut risk = assess_command(command, cwd);
@@ -160,7 +158,16 @@ pub fn assess_tool(
             }
             risk
         }
-        "webfetch" => {
+        "write_stdin" => {
+            let mut risk = RiskAssessment::new();
+            risk.add(
+                RiskCategory::ExecUnknown,
+                RiskLevel::Low,
+                "writes to an already-approved process".to_string(),
+            );
+            risk
+        }
+        "web_fetch" => {
             let url = args.get("url").and_then(Value::as_str).unwrap_or_default();
             let mut risk = RiskAssessment::new();
             if eix_core::redact::contains_placeholder(url) {
@@ -197,7 +204,7 @@ pub fn assess_tool(
             }
             risk
         }
-        "websearch" => {
+        "web_search" => {
             let query = args
                 .get("query")
                 .and_then(Value::as_str)
@@ -220,13 +227,13 @@ pub fn assess_tool(
                 risk.add(
                     RiskCategory::Network,
                     RiskLevel::Low,
-                    "websearch is on the network allowlist".to_string(),
+                    "web_search is on the network allowlist".to_string(),
                 );
             } else {
                 risk.add(
                     RiskCategory::Network,
                     RiskLevel::High,
-                    "websearch is not on the configured network allowlist".to_string(),
+                    "web_search is not on the configured network allowlist".to_string(),
                 );
             }
             risk
@@ -376,11 +383,7 @@ pub fn decide(
         risk.level = RiskLevel::High;
     }
 
-    let capability_denial = read_only_denial(
-        capability,
-        &risk,
-        matches!(tool, "run_command" | "start_command"),
-    );
+    let capability_denial = read_only_denial(capability, &risk, matches!(tool, "exec_command"));
     if let Some(reason) = capability_denial {
         return PermissionDecision {
             action: PermissionAction::Deny,
@@ -448,16 +451,12 @@ pub fn decide(
                 true,
                 format!("rule {} requires approval", rule_label(&rule)),
             ),
-            PermissionAction::Sandbox
-                if sandbox_available && matches!(tool, "run_command" | "start_command") =>
-            {
-                (
-                    PermissionAction::Sandbox,
-                    false,
-                    format!("rule {} requires the sandbox", rule_label(&rule)),
-                )
-            }
-            PermissionAction::Sandbox if matches!(tool, "run_command" | "start_command") => (
+            PermissionAction::Sandbox if sandbox_available && matches!(tool, "exec_command") => (
+                PermissionAction::Sandbox,
+                false,
+                format!("rule {} requires the sandbox", rule_label(&rule)),
+            ),
+            PermissionAction::Sandbox if matches!(tool, "exec_command") => (
                 PermissionAction::Ask,
                 true,
                 format!(
@@ -491,7 +490,7 @@ pub fn decide(
     // higher-risk writes continue to ask or deny.
     let workspace_edit = config.tools.auto_apply_workspace_edits
         && mode.applies_workspace_edits()
-        && matches!(tool, "write_file" | "edit")
+        && matches!(tool, "apply_patch")
         && default == PermissionAction::Ask
         && !risk.hard_deny
         && risk.level <= RiskLevel::Medium;
@@ -657,12 +656,21 @@ mod tests {
         Path::new("/tmp")
     }
 
+    /// A one-file `apply_patch` document, the only write tool now.
+    fn patch(path: &str) -> serde_json::Value {
+        json!({
+            "patchText": format!(
+                "*** Begin Patch\n*** Update File: {path}\n@@\n-x\n+y\n*** End Patch\n"
+            )
+        })
+    }
+
     #[test]
     fn read_only_rejects_writes_but_allows_reads() {
         let config = config();
         let read = decide(
-            "read_file",
-            &json!({"path": "src/main.rs"}),
+            "exec_command",
+            &json!({"cmd": "cat src/main.rs"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Plan,
@@ -671,8 +679,8 @@ mod tests {
         );
         assert_eq!(read.action, PermissionAction::Allow);
         let write = decide(
-            "write_file",
-            &json!({"path": "src/main.rs", "content": "x"}),
+            "apply_patch",
+            &patch("src/main.rs"),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Plan,
@@ -681,8 +689,8 @@ mod tests {
         );
         assert_eq!(write.action, PermissionAction::Deny);
         let network = decide(
-            "run_command",
-            &json!({"command": "git fetch"}),
+            "exec_command",
+            &json!({"cmd": "git fetch"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Plan,
@@ -695,28 +703,22 @@ mod tests {
     #[test]
     fn workspace_write_applies_in_workspace_edits() {
         let config = config();
-        for tool in ["write_file", "edit"] {
-            let decision = decide(
-                tool,
-                &json!({"path": "src/main.rs", "content": "x"}),
-                Path::new("/tmp/eix-perm"),
-                &config,
-                SessionMode::Build,
-                &[],
-                false,
-            );
-            assert_eq!(
-                decision.action,
-                PermissionAction::Allow,
-                "{tool}: {decision:?}"
-            );
-            assert!(decision.risk.categories.contains(&RiskCategory::WriteLocal));
-        }
+        let decision = decide(
+            "apply_patch",
+            &patch("src/main.rs"),
+            Path::new("/tmp/eix-perm"),
+            &config,
+            SessionMode::Build,
+            &[],
+            false,
+        );
+        assert_eq!(decision.action, PermissionAction::Allow, "{decision:?}");
+        assert!(decision.risk.categories.contains(&RiskCategory::WriteLocal));
 
         // Secret and external paths keep their existing guardrails.
         let secret = decide(
-            "write_file",
-            &json!({"path": ".env", "content": "x"}),
+            "apply_patch",
+            &patch(".env"),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Build,
@@ -725,8 +727,8 @@ mod tests {
         );
         assert_eq!(secret.action, PermissionAction::Ask, "{secret:?}");
         let external = decide(
-            "write_file",
-            &json!({"path": "/etc/passwd", "content": "x"}),
+            "apply_patch",
+            &patch("/etc/passwd"),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Build,
@@ -738,8 +740,8 @@ mod tests {
 
         // Read-only sessions still reject edits.
         let read_only = decide(
-            "write_file",
-            &json!({"path": "src/main.rs", "content": "x"}),
+            "apply_patch",
+            &patch("src/main.rs"),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Plan,
@@ -753,8 +755,8 @@ mod tests {
         let mut manual = config;
         manual.tools.auto_apply_workspace_edits = false;
         let staged = decide(
-            "write_file",
-            &json!({"path": "src/main.rs", "content": "x"}),
+            "apply_patch",
+            &patch("src/main.rs"),
             Path::new("/tmp/eix-perm"),
             &manual,
             SessionMode::Build,
@@ -785,8 +787,8 @@ mod tests {
             "env FOO=1 timeout 5 ls crates",
         ] {
             let decision = decide(
-                "run_command",
-                &json!({"command": command}),
+                "exec_command",
+                &json!({"cmd": command}),
                 Path::new("/tmp/eix-perm"),
                 &config,
                 SessionMode::Build,
@@ -815,7 +817,7 @@ mod tests {
             "echo hi",
         ] {
             assert!(
-                command_is_parallel_readonly(&json!({"command": command}), cwd),
+                command_is_parallel_readonly(&json!({"cmd": command}), cwd),
                 "{command} should be parallel read-only"
             );
         }
@@ -829,7 +831,7 @@ mod tests {
             "make test",
         ] {
             assert!(
-                !command_is_parallel_readonly(&json!({"command": command}), cwd),
+                !command_is_parallel_readonly(&json!({"cmd": command}), cwd),
                 "{command} should stay sequential"
             );
         }
@@ -847,8 +849,8 @@ mod tests {
             "cd /tmp && cat passwd",
         ] {
             let decision = decide(
-                "run_command",
-                &json!({"command": command}),
+                "exec_command",
+                &json!({"cmd": command}),
                 Path::new("/tmp/eix-perm"),
                 &config,
                 SessionMode::Build,
@@ -867,14 +869,14 @@ mod tests {
     fn full_does_not_bypass_hard_deny_or_rules() {
         let mut config = config();
         config.tools.rules = vec![PermissionRule {
-            tool: "run_command".into(),
+            tool: "exec_command".into(),
             command: Some(vec!["echo".into()]),
             action: PermissionAction::Deny,
             ..PermissionRule::default()
         }];
         let denied = decide(
-            "run_command",
-            &json!({"command": "echo hi"}),
+            "exec_command",
+            &json!({"cmd": "echo hi"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Bypass,
@@ -883,8 +885,8 @@ mod tests {
         );
         assert_eq!(denied.action, PermissionAction::Deny);
         let hard = decide(
-            "run_command",
-            &json!({"command": "rm -rf /"}),
+            "exec_command",
+            &json!({"cmd": "rm -rf /"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Bypass,
@@ -898,13 +900,10 @@ mod tests {
     fn bypass_mode_allows_unruled_asks_and_external_writes() {
         let config = config();
         for (tool, args) in [
-            ("write_file", json!({"path": "out.txt", "content": "x"})),
-            (
-                "write_file",
-                json!({"path": "/tmp/eix-perm-outside.txt", "content": "x"}),
-            ),
-            ("run_command", json!({"command": "git push"})),
-            ("run_command", json!({"command": "rm -f build/out"})),
+            ("apply_patch", patch("out.txt")),
+            ("apply_patch", patch("/tmp/eix-perm-outside.txt")),
+            ("exec_command", json!({"cmd": "git push"})),
+            ("exec_command", json!({"cmd": "rm -f build/out"})),
         ] {
             let decision = decide(
                 tool,
@@ -925,14 +924,14 @@ mod tests {
         // Explicit ask rules still win over the bypass mode.
         let mut config = config;
         config.tools.rules = vec![PermissionRule {
-            tool: "run_command".into(),
+            tool: "exec_command".into(),
             command: Some(vec!["git".into(), "push".into()]),
             action: PermissionAction::Ask,
             ..PermissionRule::default()
         }];
         let explicit = decide(
-            "run_command",
-            &json!({"command": "git push"}),
+            "exec_command",
+            &json!({"cmd": "git push"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Bypass,
@@ -947,8 +946,8 @@ mod tests {
     fn auto_mode_defers_unruled_asks_to_the_classifier() {
         let config = config();
         let edit = decide(
-            "write_file",
-            &json!({"path": "out.txt", "content": "x"}),
+            "apply_patch",
+            &patch("out.txt"),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Auto,
@@ -958,8 +957,8 @@ mod tests {
         assert_eq!(edit.action, PermissionAction::Allow, "{edit:?}");
 
         for (tool, args) in [
-            ("run_command", json!({"command": "git push"})),
-            ("run_command", json!({"command": "rm -f build/out"})),
+            ("exec_command", json!({"cmd": "git push"})),
+            ("exec_command", json!({"cmd": "rm -f build/out"})),
         ] {
             let decision = decide(
                 tool,
@@ -982,8 +981,8 @@ mod tests {
         // Auto is workspace-write, not bypass: external file writes stay
         // blocked by the hard path guard.
         let external = decide(
-            "write_file",
-            &json!({"path": "/tmp/eix-perm-outside.txt", "content": "x"}),
+            "apply_patch",
+            &patch("/tmp/eix-perm-outside.txt"),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Auto,
@@ -998,8 +997,8 @@ mod tests {
     fn build_mode_asks_for_unruled_risky_calls() {
         let config = config();
         let decision = decide(
-            "run_command",
-            &json!({"command": "git push"}),
+            "exec_command",
+            &json!({"cmd": "git push"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Build,
@@ -1010,8 +1009,8 @@ mod tests {
         assert!(!decision.force_ask);
 
         let external = decide(
-            "write_file",
-            &json!({"path": "/tmp/eix-perm-outside.txt", "content": "x"}),
+            "apply_patch",
+            &patch("/tmp/eix-perm-outside.txt"),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Build,
@@ -1026,8 +1025,8 @@ mod tests {
         let mut config = config();
         config.tools.sandbox = eix_core::SandboxMode::Off;
         let decision = decide(
-            "run_command",
-            &json!({"command": "cargo test"}),
+            "exec_command",
+            &json!({"cmd": "cargo test"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Bypass,
@@ -1042,14 +1041,14 @@ mod tests {
         let mut config = config();
         config.tools.rules = vec![PermissionRule {
             id: "ask-push".into(),
-            tool: "run_command".into(),
+            tool: "exec_command".into(),
             command: Some(vec!["git".into(), "push".into()]),
             action: PermissionAction::Ask,
             ..PermissionRule::default()
         }];
         let decision = decide(
-            "run_command",
-            &json!({"command": "git push"}),
+            "exec_command",
+            &json!({"cmd": "git push"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Auto,
@@ -1065,20 +1064,20 @@ mod tests {
         let mut config = config();
         config.tools.rules = vec![
             PermissionRule {
-                tool: "run_command".into(),
+                tool: "exec_command".into(),
                 action: PermissionAction::Ask,
                 ..PermissionRule::default()
             },
             PermissionRule {
-                tool: "run_command".into(),
+                tool: "exec_command".into(),
                 command: Some(vec!["cargo".into(), "test".into()]),
                 action: PermissionAction::Allow,
                 ..PermissionRule::default()
             },
         ];
         let decision = decide(
-            "run_command",
-            &json!({"command": "cargo test"}),
+            "exec_command",
+            &json!({"cmd": "cargo test"}),
             Path::new("/tmp/eix-perm"),
             &config,
             SessionMode::Build,
@@ -1097,8 +1096,8 @@ mod tests {
             ..Default::default()
         }];
         let decision = decide(
-            "run_command",
-            &json!({"command": "rm -rf /"}),
+            "exec_command",
+            &json!({"cmd": "rm -rf /"}),
             cwd(),
             &config,
             SessionMode::Bypass,
@@ -1115,22 +1114,22 @@ mod tests {
         config.tools.rules = vec![
             PermissionRule {
                 id: "allow-git".to_string(),
-                tool: "run_command".to_string(),
+                tool: "exec_command".to_string(),
                 command: Some(vec!["git".to_string(), "status".to_string()]),
                 action: PermissionAction::Allow,
                 ..Default::default()
             },
             PermissionRule {
                 id: "deny-shell".to_string(),
-                tool: "run_command".to_string(),
+                tool: "exec_command".to_string(),
                 action: PermissionAction::Deny,
                 source: RuleSource::Project,
                 ..Default::default()
             },
         ];
         let decision = decide(
-            "run_command",
-            &json!({"command": "git status"}),
+            "exec_command",
+            &json!({"cmd": "git status"}),
             cwd(),
             &config,
             SessionMode::Bypass,
@@ -1145,13 +1144,13 @@ mod tests {
     fn read_only_capability_wins_over_an_allow_rule() {
         let mut config = config();
         config.tools.rules = vec![PermissionRule {
-            tool: "write_file".to_string(),
+            tool: "apply_patch".to_string(),
             action: PermissionAction::Allow,
             ..Default::default()
         }];
         let decision = decide(
-            "write_file",
-            &json!({"path": "out.txt", "content": "x"}),
+            "apply_patch",
+            &patch("out.txt"),
             cwd(),
             &config,
             SessionMode::Plan,
@@ -1166,7 +1165,7 @@ mod tests {
     fn network_tools_allow_read_only_requests_and_honour_an_opt_in_allowlist() {
         let mut config = config();
         let decision = decide(
-            "webfetch",
+            "web_fetch",
             &json!({"url": "https://example.com/docs?token=secret"}),
             cwd(),
             &config,
@@ -1189,7 +1188,7 @@ mod tests {
         // every GET-style fetch.
         config.tools.network_allow = vec!["example.com".to_string()];
         let allowed = decide(
-            "webfetch",
+            "web_fetch",
             &json!({"url": "https://example.com/docs"}),
             cwd(),
             &config,
@@ -1201,7 +1200,7 @@ mod tests {
         assert_eq!(allowed.risk.level, RiskLevel::Low);
 
         let blocked = decide(
-            "webfetch",
+            "web_fetch",
             &json!({"url": "https://other.example/docs"}),
             cwd(),
             &config,
@@ -1272,11 +1271,11 @@ mod tests {
     }
 
     #[test]
-    fn websearch_can_be_allowed_by_the_network_allowlist() {
+    fn web_search_can_be_allowed_by_the_network_allowlist() {
         let mut config = config();
         config.tools.network_allow = vec!["duckduckgo.com".to_string()];
         let decision = decide(
-            "websearch",
+            "web_search",
             &json!({"query": "rust ownership"}),
             cwd(),
             &config,
@@ -1294,13 +1293,13 @@ mod tests {
         let placeholder = "{{eix_secret_deadbeef}}";
         for (tool, args) in [
             (
-                "webfetch",
+                "web_fetch",
                 json!({"url": format!("https://example.com/?q={placeholder}")}),
             ),
-            ("websearch", json!({"query": placeholder})),
+            ("web_search", json!({"query": placeholder})),
             (
-                "run_command",
-                json!({"command": format!("curl https://example.com/{placeholder}")}),
+                "exec_command",
+                json!({"cmd": format!("curl https://example.com/{placeholder}")}),
             ),
             (
                 "mcp__server__send",
@@ -1318,8 +1317,8 @@ mod tests {
         let mut config = config();
         config.tools.sandbox = SandboxMode::Off;
         let decision = decide(
-            "run_command",
-            &json!({"command": "cargo test"}),
+            "exec_command",
+            &json!({"cmd": "cargo test"}),
             cwd(),
             &config,
             SessionMode::Auto,

@@ -16,7 +16,9 @@ use eix_core::{
     SessionStatus,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use serde::Serialize;
 use serde_json::Value;
+use uuid::Uuid;
 
 /// Per-plugin storage is bounded so a buggy or untrusted plugin cannot fill
 /// the daemon's database. Row and byte limits are enforced by `plugin_kv_set`.
@@ -39,6 +41,17 @@ pub struct StoreStats {
     pub running_sessions: usize,
     pub events: usize,
     pub db_bytes: u64,
+}
+
+/// A long-lived credential minted by pairing. Only the hash is stored; the
+/// plaintext token is shown once and then lives with the client.
+#[derive(Debug, Clone, Serialize)]
+pub struct ClientToken {
+    pub id: String,
+    pub name: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked: bool,
 }
 
 impl Store {
@@ -87,6 +100,10 @@ impl Store {
     fn init(conn: Connection) -> Result<Self> {
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
+        // WAL + NORMAL avoids an fsync per appended event. A power loss can
+        // drop the newest transaction, but the database stays consistent and
+        // the daemon can rebuild any unflushed runtime state from the log.
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "foreign_keys", "ON")?;
         conn.execute_batch(
             r#"
@@ -166,6 +183,17 @@ impl Store {
                 value      TEXT NOT NULL,
                 updated_at INTEGER NOT NULL,
                 PRIMARY KEY (plugin, scope, key)
+            );
+
+            -- Paired remote clients. The token itself is never stored, only
+            -- its SHA-256 hash; `revoked_at` keeps an audit trail.
+            CREATE TABLE IF NOT EXISTS client_tokens (
+                id           TEXT PRIMARY KEY,
+                name         TEXT NOT NULL,
+                token_hash   TEXT NOT NULL UNIQUE,
+                created_at   INTEGER NOT NULL,
+                last_used_at INTEGER,
+                revoked_at   INTEGER
             );
             "#,
         )?;
@@ -1248,6 +1276,98 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Register a paired client. `token_hash` is the SHA-256 of the plaintext
+    /// token, which the caller shows to the client exactly once.
+    pub fn create_client_token(&self, name: &str, token_hash: &str) -> Result<ClientToken> {
+        let id = format!("ct_{}", &Uuid::new_v4().simple().to_string()[..12]);
+        let now = now_ms();
+        self.conn().execute(
+            "INSERT INTO client_tokens (id, name, token_hash, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, name, token_hash, now],
+        )?;
+        Ok(ClientToken {
+            id,
+            name: name.to_string(),
+            created_at: now,
+            last_used_at: None,
+            revoked: false,
+        })
+    }
+
+    /// Resolve an active token by hash and record its use. `None` means the
+    /// token is unknown or revoked.
+    pub fn use_client_token(&self, token_hash: &str) -> Result<Option<ClientToken>> {
+        let conn = self.conn();
+        let row = conn
+            .query_row(
+                "SELECT id, name, created_at, last_used_at, revoked_at
+                 FROM client_tokens WHERE token_hash = ?1",
+                params![token_hash],
+                row_to_client_token,
+            )
+            .optional()?;
+        let Some(token) = row else {
+            return Ok(None);
+        };
+        if token.revoked {
+            return Ok(None);
+        }
+        let now = now_ms();
+        // HTTP authenticates on every request; do not turn that into a write
+        // per request. A minute of granularity is enough for `pair list`.
+        let recent = token
+            .last_used_at
+            .is_some_and(|last| now.saturating_sub(last) < 60_000);
+        if !recent {
+            conn.execute(
+                "UPDATE client_tokens SET last_used_at = ?1 WHERE id = ?2",
+                params![now, token.id],
+            )?;
+        }
+        Ok(Some(ClientToken {
+            last_used_at: Some(if recent {
+                token.last_used_at.unwrap_or(now)
+            } else {
+                now
+            }),
+            ..token
+        }))
+    }
+
+    pub fn list_client_tokens(&self) -> Result<Vec<ClientToken>> {
+        let conn = self.conn();
+        let mut statement = conn.prepare(
+            "SELECT id, name, created_at, last_used_at, revoked_at
+             FROM client_tokens ORDER BY created_at DESC",
+        )?;
+        let rows = statement.query_map([], row_to_client_token)?;
+        let mut tokens = Vec::new();
+        for row in rows {
+            tokens.push(row?);
+        }
+        Ok(tokens)
+    }
+
+    pub fn revoke_client_token(&self, id: &str) -> Result<bool> {
+        let changed = self.conn().execute(
+            "UPDATE client_tokens SET revoked_at = ?1
+             WHERE id = ?2 AND revoked_at IS NULL",
+            params![now_ms(), id],
+        )?;
+        Ok(changed > 0)
+    }
+}
+
+fn row_to_client_token(row: &Row<'_>) -> rusqlite::Result<ClientToken> {
+    Ok(ClientToken {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        created_at: row.get(2)?,
+        last_used_at: row.get(3)?,
+        revoked: row.get::<_, Option<i64>>(4)?.is_some(),
+    })
 }
 
 fn integration_row(conn: &Connection, session_id: &str) -> Result<Option<IntegrationState>> {
@@ -1991,5 +2111,55 @@ mod tests {
         store
             .plugin_kv_set("bytes", "global", "k0", &chunk)
             .expect("same-size update stays within quota");
+    }
+
+    #[test]
+    fn client_tokens_are_hashed_and_revocable() {
+        let store = Store::in_memory().unwrap();
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+
+        let first = store.create_client_token("laptop", &hash_a).unwrap();
+        let second = store.create_client_token("phone", &hash_b).unwrap();
+        assert!(first.id.starts_with("ct_"));
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.name, "laptop");
+        assert!(!first.revoked);
+        assert!(first.last_used_at.is_none());
+
+        // The plaintext never touches the DB: unknown hashes do not resolve.
+        assert!(store.use_client_token("not-a-hash").unwrap().is_none());
+        let used = store.use_client_token(&hash_a).unwrap().unwrap();
+        assert_eq!(used.id, first.id);
+        assert!(used.last_used_at.is_some());
+
+        let listed = store.list_client_tokens().unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(
+            listed.iter().filter(|token| !token.revoked).count(),
+            2,
+            "new tokens start active"
+        );
+
+        assert!(store.revoke_client_token(&first.id).unwrap());
+        assert!(
+            !store.revoke_client_token(&first.id).unwrap(),
+            "revoking twice is a no-op"
+        );
+        assert!(store.use_client_token(&hash_a).unwrap().is_none());
+        assert!(store.use_client_token(&hash_b).unwrap().is_some());
+        let listed = store.list_client_tokens().unwrap();
+        assert!(
+            listed
+                .iter()
+                .find(|token| token.id == first.id)
+                .unwrap()
+                .revoked
+        );
+        // A revoked row keeps its audit trail rather than disappearing.
+        assert_eq!(listed.len(), 2);
+
+        // Hash uniqueness is enforced by the schema.
+        assert!(store.create_client_token("dupe", &hash_b).is_err());
     }
 }

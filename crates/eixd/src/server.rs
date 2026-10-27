@@ -27,26 +27,28 @@ use eix_core::{
     ChatMessage, ClassifierAuditPayload, Config, ContextClearParams, ContextClearedPayload,
     ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DraftParams, DraftResult,
     ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
-    HelloResult, InputAnsweredPayload, InputOption, InputRequiredPayload, InputRespondParams,
-    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
-    IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo,
-    ModeParams, ModelListResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
-    PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
-    PermissionAction, PermissionRule, PickerParams, PickerPreviewParams, PickerPreviewResult,
-    PluginCommandList, PluginListResult, ProcessKillParams, ProcessKillResult, ProcessList,
-    ProcessListParams, ProcessOutputParams, RenameParams, Request, Response, RewindParams,
-    RewindResult, RuleSource, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
-    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
-    SessionList, SessionMode, SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef,
-    SessionResult, SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
+    HelloResult, ImagePart, InputAnsweredPayload, InputOption, InputRequiredPayload,
+    InputRespondParams, InputResult, IntegrationContinueParams, IntegrationListParams,
+    IntegrationListResult, IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult,
+    McpServerInfo, ModeParams, ModelListResult, ModelUseParams, ModelUseResult, Notification,
+    PatchApplyParams, PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams,
+    PatchResult, PatchResultPayload, PatchReviseParams, PermissionAction, PermissionRule,
+    PickerParams, PickerPreviewParams, PickerPreviewResult, PluginCommandList, PluginListResult,
+    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
+    ProviderAuthInfo, RenameParams, Request, Response, RewindParams, RewindResult, RuleSource,
+    ServerMessage, Session, SessionAgentParams, SessionArchiveParams, SessionCdParams,
+    SessionExport, SessionExportResult, SessionId, SessionImportParams, SessionList, SessionMode,
+    SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef, SessionResult,
+    SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
     StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
     SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
     ToolResultPayload, UserMessagePayload, WorktreeCreateParams, WorktreeRemoveParams,
     WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, UnixListener};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
@@ -107,6 +109,13 @@ const PARALLEL_TOOL_CONCURRENCY: usize = 8;
 /// I/O-bound, so they can tolerate more overlap than reads.
 const PARALLEL_WRITE_CONCURRENCY: usize = 32;
 
+/// Coalesce provider fragments before they reach the notification bus. A fast
+/// model emits hundreds of tiny deltas per second; sending each one allocates a
+/// JSON value and wakes every subscriber. Flush on size, or after this interval
+/// so the first tokens still appear promptly.
+const STREAM_DELTA_BATCH_BYTES: usize = 8 * 1024;
+const STREAM_DELTA_BATCH_INTERVAL: Duration = Duration::from_millis(50);
+
 /// A call that may join a concurrent tool-batch segment. The permission
 /// decision is computed before the segment starts so every parallel call
 /// records exactly the decision that admitted it.
@@ -127,6 +136,72 @@ struct PendingWrite {
     paths: Vec<PathBuf>,
 }
 
+/// Buffers streamed content and reasoning until a size or time threshold.
+/// `finish_cancelled` and the stored assistant event already keep the full
+/// text, so the bus only needs a coarse-grained view for live rendering.
+struct DeltaBatcher<'a> {
+    bus: &'a broadcast::Sender<Notification>,
+    session_id: &'a str,
+    turn_id: &'a str,
+    content: String,
+    reasoning: String,
+    /// `None` until the first fragment is sent, which always flushes at once so
+    /// the user sees the first token without waiting for the batch interval.
+    last_flush: Option<Instant>,
+}
+
+impl<'a> DeltaBatcher<'a> {
+    fn new(
+        bus: &'a broadcast::Sender<Notification>,
+        session_id: &'a str,
+        turn_id: &'a str,
+    ) -> Self {
+        Self {
+            bus,
+            session_id,
+            turn_id,
+            content: String::new(),
+            reasoning: String::new(),
+            last_flush: None,
+        }
+    }
+
+    fn push(&mut self, delta: crate::provider::StreamDelta<'_>) {
+        match delta {
+            crate::provider::StreamDelta::Content(text) => self.content.push_str(text),
+            crate::provider::StreamDelta::Reasoning(text) => self.reasoning.push_str(text),
+        }
+        if self.content.len() + self.reasoning.len() >= STREAM_DELTA_BATCH_BYTES
+            || self
+                .last_flush
+                .is_none_or(|at| at.elapsed() >= STREAM_DELTA_BATCH_INTERVAL)
+        {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        if !self.content.is_empty() {
+            self.send("message.delta", &self.content);
+            self.content.clear();
+        }
+        if !self.reasoning.is_empty() {
+            self.send("reasoning.delta", &self.reasoning);
+            self.reasoning.clear();
+        }
+        self.last_flush = Some(Instant::now());
+    }
+
+    fn send(&self, method: &str, delta: &str) {
+        let params = json!({
+            "session_id": self.session_id,
+            "turn_id": self.turn_id,
+            "delta": delta,
+        });
+        let _ = self.bus.send(Notification::from_value(method, params));
+    }
+}
+
 enum WriteCallOutcome {
     /// The call failed before execution or was denied; its result is already
     /// recorded.
@@ -140,12 +215,60 @@ fn call_is_parallel_readonly(call: &ToolCall, cwd: &Path) -> bool {
     if tools::parallel_safe(&call.function.name) {
         return true;
     }
-    if call.function.name != "run_command" {
+    if call.function.name != "exec_command" {
         return false;
     }
     serde_json::from_str::<Value>(&call.function.arguments)
         .ok()
         .is_some_and(|args| command_is_parallel_readonly(&args, cwd))
+}
+
+/// Codex-style yield window: how long `exec_command` waits before handing back
+/// a session id. Kept inside the range the tool schema advertises.
+fn yield_time(args: &Value, default_ms: u64) -> Duration {
+    let ms = args
+        .get("yield_time_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(default_ms)
+        .clamp(250, 30_000);
+    Duration::from_millis(ms)
+}
+
+/// `max_output_tokens` is approximate; four bytes per token matches the
+/// context estimator and keeps the daemon's byte cap authoritative.
+fn output_cap(args: &Value, default_bytes: usize) -> usize {
+    args.get("max_output_tokens")
+        .and_then(Value::as_u64)
+        .map(|tokens| (tokens as usize).saturating_mul(4))
+        .unwrap_or(default_bytes)
+        .clamp(1, default_bytes)
+}
+
+fn format_process_output(output: &eix_core::ProcessOutput) -> String {
+    let mut text = output.text.clone();
+    if text.is_empty() {
+        text = if output.status.is_running() {
+            "(no new output yet)".to_string()
+        } else {
+            "(no output)".to_string()
+        };
+    }
+    if output.status.is_running() {
+        let id = &output.process_id;
+        text.push_str(&format!(
+            "\n\n[session {id} is still running; use write_stdin with session_id {id:?} to poll or send input]"
+        ));
+    } else {
+        let code = output
+            .exit_code
+            .map(|code| code.to_string())
+            .unwrap_or_else(|| "signal".to_string());
+        text.push_str(&format!("\n\nexit code: {code}"));
+    }
+    if output.truncated {
+        text.push_str("\n[output truncated]");
+    }
+    text
 }
 
 /// Index of the last call that can change the workspace or daemon state.
@@ -300,7 +423,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     let store = Arc::new(Store::open(&db_path)?);
     Store::set_permissions(&db_path)?;
     let provider = arc_swap::ArcSwap::from_pointee(
-        Provider::new(&config).map_err(|e| anyhow::anyhow!("{e}"))?,
+        Provider::new(&config, &data_dir).map_err(|e| anyhow::anyhow!("{e}"))?,
     );
     let (bus, _) = broadcast::channel(2048);
     let snapshots = Snapshotter::new(data_dir.join("snapshots"));
@@ -318,6 +441,8 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         store,
         provider,
         config: arc_swap::ArcSwap::from_pointee(config),
+        model_override: arc_swap::ArcSwap::from_pointee(None),
+        auth: crate::auth::Store::under_data_dir(&data_dir),
         subagent_concurrency: AtomicUsize::new(subagent_concurrency),
         bus,
         blobs,
@@ -328,7 +453,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         snapshot_lock: Mutex::new(()),
         staging,
         processes,
-        mcp: Mutex::new(crate::mcp::McpSet::new()),
+        mcp: Mutex::new(crate::mcp::McpSet::new(data_dir.join("oauth").join("mcp"))),
         plugins,
         lsp: Mutex::new(crate::lsp::LspSet::new()),
         todos: Mutex::new(HashMap::new()),
@@ -347,6 +472,8 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         classifier_cache: Mutex::new(HashMap::new()),
         prompt_cache: Mutex::new(PromptCache::default()),
         config_rev: AtomicUsize::new(0),
+        pairing: std::sync::Mutex::new(HashMap::new()),
+        pairing_failures: std::sync::Mutex::new(PairingFailures::default()),
     });
     let restored = daemon.staging.load();
     if restored > 0 {
@@ -431,7 +558,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         env!("CARGO_PKG_VERSION"),
         socket.display()
     );
-    eprintln!("  model  {}", daemon.config.load().default_model());
+    eprintln!("  model  {}", daemon.default_model());
     eprintln!(
         "  api    {}",
         redact(&daemon.config.load().default_provider().base_url)
@@ -573,10 +700,23 @@ fn prepare_socket(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// What a mutating call is about to change. `apply_patch` carries its targets
+/// in the patch document, so the caller resolves them before the snapshot.
+enum SnapshotTargets<'a> {
+    None,
+    Plan(&'a tools::WritePlan),
+    Patch(&'a [tools::PatchOp]),
+}
+
 pub(crate) struct Daemon {
     store: Arc<Store>,
     provider: arc_swap::ArcSwap<Provider>,
     config: arc_swap::ArcSwap<Config>,
+    /// Runtime default model set with `model.use`. `None` follows the config;
+    /// sessions with their own pinned model ignore this either way.
+    model_override: arc_swap::ArcSwap<Option<String>>,
+    /// API keys and OAuth tokens written by `eix auth login`.
+    auth: crate::auth::Store,
     /// Runtime cap for concurrent `spawn_agent` calls. Initialized from
     /// `[tools] max_parallel_subagents` and reset by config reload; the TUI can
     /// override it until the next reload or daemon restart.
@@ -651,6 +791,25 @@ pub(crate) struct Daemon {
     /// Incremented on every successful config reload so the prompt cache cannot
     /// keep serving a previous `[compat]` / skill configuration.
     config_rev: AtomicUsize,
+    /// One-time pairing codes created by `pair.create`, keyed by the
+    /// canonical (lowercase, dash-free) code. Redeemed codes are removed.
+    pairing: std::sync::Mutex<HashMap<String, PairingCode>>,
+    /// Failed redemptions in the current window, so guessing stays expensive.
+    pairing_failures: std::sync::Mutex<PairingFailures>,
+}
+
+#[derive(Debug, Clone)]
+struct PairingCode {
+    expires_at: i64,
+    /// Optional label chosen by `eix pair --name`, used when the redeemer does
+    /// not send one.
+    name: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PairingFailures {
+    window: Option<Instant>,
+    count: u32,
 }
 
 /// The on-disk parts of the system prompt. They only change when the user edits
@@ -730,15 +889,47 @@ struct ApprovalReply {
 }
 
 impl Daemon {
+    /// Current daemon fallback model: runtime override, else config default.
+    fn default_model(&self) -> String {
+        if let Some(model) = self.model_override.load().as_ref() {
+            if !model.trim().is_empty() {
+                return model.clone();
+            }
+        }
+        self.config.load().default_model().to_string()
+    }
+
+    /// Change the runtime default model. `None`, an empty string or `default`
+    /// restores the config default. Sessions with a pinned model are unaffected.
+    fn use_model(&self, model: Option<String>) -> Result<String> {
+        let config = self.config.load();
+        let model = model
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty() && model != "default");
+        if let Some(model) = &model {
+            let base = model.split('#').next().unwrap_or(model.as_str()).trim();
+            let known = config.models().iter().any(|item| item.id == base)
+                || base == config.default_model()
+                || base
+                    .split_once('/')
+                    .is_some_and(|(provider, _)| config.providers.contains_key(provider));
+            if !known {
+                return Err(rpc("invalid_params", format!("unknown model {model:?}")));
+            }
+        }
+        self.model_override.store(Arc::new(model.clone()));
+        Ok(model.unwrap_or_else(|| self.default_model()))
+    }
+
     fn emit<T: Serialize>(&self, method: &str, params: &T) {
         let value = serde_json::to_value(params).unwrap_or(Value::Null);
         self.plugins.publish(method, &value);
-        let _ = self.bus.send(Notification::new(method, value));
+        let _ = self.bus.send(Notification::from_value(method, value));
     }
 
     fn emit_value(&self, method: &str, params: Value) {
         self.plugins.publish(method, &params);
-        let _ = self.bus.send(Notification::new(method, params));
+        let _ = self.bus.send(Notification::from_value(method, params));
     }
 
     fn emit_event(&self, event: &Event) {
@@ -816,7 +1007,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         let route = config.route(&model);
         let messages = vec![
             ChatMessage::system(
@@ -2289,10 +2480,7 @@ impl Daemon {
                 let okay = if request.method == "auth" {
                     serde_json::from_value::<AuthParams>(request.params.clone())
                         .ok()
-                        .map(|params| params.token)
-                        .as_deref()
-                        .zip(token.as_deref())
-                        .is_some_and(|(given, expected)| secret_eq(given, expected))
+                        .is_some_and(|params| self.accepts_token(&params.token, token.as_deref()))
                 } else {
                     false
                 };
@@ -2356,6 +2544,112 @@ impl Daemon {
         }
         drop(tx);
         let _ = writer.await;
+    }
+
+    /// Accept the configured server token or an active paired-client token.
+    /// Paired tokens are hashed before lookup; the plaintext never touches the
+    /// database.
+    pub(crate) fn accepts_token(&self, given: &str, configured: Option<&str>) -> bool {
+        if configured.is_some_and(|expected| secret_eq(given, expected)) {
+            return true;
+        }
+        if given.trim().is_empty() {
+            return false;
+        }
+        match self.store.use_client_token(&hash_token(given)) {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(err) => {
+                eprintln!("eixd: cannot verify a paired client token: {err:#}");
+                false
+            }
+        }
+    }
+
+    /// Mint a one-time pairing code. Codes are short-lived and single use; the
+    /// client redeems one over HTTP for a durable token.
+    fn create_pairing_code(&self, name: Option<String>) -> (String, i64) {
+        let code = new_pairing_code();
+        let expires_at = now_ms().saturating_add(PAIRING_TTL_MS);
+        let name = name
+            .map(|name| name.trim().chars().take(64).collect::<String>())
+            .filter(|name| !name.is_empty());
+        let mut codes = self
+            .pairing
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = now_ms();
+        codes.retain(|_, entry| entry.expires_at > now);
+        codes.insert(
+            canonical_pairing_code(&code),
+            PairingCode { expires_at, name },
+        );
+        (code, expires_at)
+    }
+
+    fn redeem_pairing_code(&self, code: &str) -> Result<Option<String>> {
+        {
+            let mut failures = self
+                .pairing_failures
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let now = Instant::now();
+            if failures
+                .window
+                .is_none_or(|start| now.duration_since(start) > PAIRING_WINDOW)
+            {
+                failures.window = Some(now);
+                failures.count = 0;
+            }
+            if failures.count >= PAIRING_MAX_FAILURES {
+                return Err(rpc(
+                    "rate_limited",
+                    "too many pairing attempts; wait a minute and try again",
+                ));
+            }
+        }
+
+        let canonical = canonical_pairing_code(code);
+        let matched = {
+            let mut codes = self
+                .pairing
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            codes.remove(&canonical)
+        };
+        let valid = matched
+            .as_ref()
+            .is_some_and(|entry| entry.expires_at > now_ms());
+        let mut failures = self
+            .pairing_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if valid {
+            failures.count = 0;
+            Ok(matched.and_then(|entry| entry.name))
+        } else {
+            failures.count = failures.count.saturating_add(1);
+            Err(rpc("unauthorized", "invalid or expired pairing code"))
+        }
+    }
+
+    /// Redeem a pairing code and return the plaintext token plus its metadata.
+    /// The caller must show the token once; only the hash is stored.
+    pub(crate) fn pair_client(
+        &self,
+        code: &str,
+        name: &str,
+    ) -> Result<(String, crate::store::ClientToken)> {
+        let stored_name = self.redeem_pairing_code(code)?;
+        let name: String = name.trim().chars().take(64).collect();
+        let name = if name.is_empty() {
+            stored_name.unwrap_or_else(|| "paired client".to_string())
+        } else {
+            name
+        };
+        let token = random_token();
+        let client = self.store.create_client_token(&name, &hash_token(&token))?;
+        Ok((token, client))
     }
 
     pub(crate) async fn handle_remote(self: &Arc<Self>, request: &Request) -> Response {
@@ -2427,6 +2721,14 @@ impl Daemon {
                     let session = self.require_session(&params.session_id)?;
                     self.validate_remote_cwd(&session.cwd)?;
                 }
+                // Minting or revoking credentials stays a local operation; a
+                // paired client must not be able to enlist another one.
+                "pair.create" | "pair.list" | "pair.revoke" => {
+                    return Err(rpc(
+                        "forbidden",
+                        "pairing is only available over the local Unix socket",
+                    ))
+                }
                 _ => {}
             }
         }
@@ -2435,7 +2737,7 @@ impl Daemon {
                 protocol: PROTOCOL_VERSION,
                 version: env!("CARGO_PKG_VERSION").to_string(),
                 pid: std::process::id(),
-                model: self.config.load().default_model().to_string(),
+                model: self.default_model(),
                 base_url: self.config.load().default_provider().base_url.clone(),
                 sessions: self.store.session_count()?,
                 max_parallel_subagents: self.subagent_concurrency.load(Ordering::Relaxed),
@@ -2529,8 +2831,8 @@ impl Daemon {
                 let decision = {
                     let config = self.config.load();
                     permission_decide(
-                        "run_command",
-                        &json!({ "command": command }),
+                        "exec_command",
+                        &json!({ "cmd": command }),
                         &cwd,
                         &config,
                         mode,
@@ -2542,7 +2844,7 @@ impl Daemon {
                 self.record_permission(
                     &params.session_id,
                     &call_id,
-                    "run_command",
+                    "exec_command",
                     &decision,
                     None,
                 )?;
@@ -2555,7 +2857,7 @@ impl Daemon {
                     id: call_id.clone(),
                     kind: "function".to_string(),
                     function: FunctionCall {
-                        name: "run_command".to_string(),
+                        name: "exec_command".to_string(),
                         arguments: arguments.to_string(),
                     },
                 };
@@ -2564,7 +2866,7 @@ impl Daemon {
                     EventKind::ToolCall,
                     payload(&ToolCallPayload {
                         call_id: call_id.clone(),
-                        tool: "run_command".to_string(),
+                        tool: "exec_command".to_string(),
                         arguments: arguments.clone(),
                     }),
                 )?;
@@ -2572,21 +2874,25 @@ impl Daemon {
                 if self.config.load().tools.snapshots && mutating {
                     let result = self
                         .snapshots
-                        .capture_tree(&params.session_id, "run_command", &call_id, &cwd)
+                        .capture_tree(&params.session_id, "exec_command", &call_id, &cwd)
                         .await;
                     let _ = self
                         .record_snapshot(
                             &params.session_id,
-                            "run_command",
+                            "exec_command",
                             &call_id,
                             Scope::Tree,
                             result,
                         )
                         .await?;
                 }
-                let outcome =
-                    tools::execute("run_command", &arguments, &cwd, self.config.load().as_ref())
-                        .await;
+                let outcome = tools::execute(
+                    "exec_command",
+                    &arguments,
+                    &cwd,
+                    self.config.load().as_ref(),
+                )
+                .await;
                 self.record_tool_result(
                     &params.session_id,
                     &call,
@@ -2716,7 +3022,18 @@ impl Daemon {
             }
             "model.list" => {
                 let (models, warnings) = self.model_catalog().await;
-                Ok(serde_json::to_value(ModelListResult { models, warnings })?)
+                Ok(serde_json::to_value(ModelListResult {
+                    models,
+                    warnings,
+                    default_model: self.default_model(),
+                    providers: self.provider_auth_info(),
+                })?)
+            }
+            "model.use" => {
+                let params: ModelUseParams = parse_params(request.params.clone())?;
+                let model = self.use_model(params.model)?;
+                self.emit_value("model.updated", json!({ "model": model, "default": true }));
+                Ok(serde_json::to_value(ModelUseResult { model })?)
             }
             "config.reload" => {
                 let paths = self.reload_config().await?;
@@ -2769,7 +3086,7 @@ impl Daemon {
                         McpServerInfo {
                             name: name.clone(),
                             enabled: server.enabled,
-                            command: server.command.clone(),
+                            command: server.endpoint().to_string(),
                             tools: status.map(|status| status.tools).unwrap_or(0),
                             resources: status.map(|status| status.resources).unwrap_or(0),
                             prompts: status.map(|status| status.prompts).unwrap_or(0),
@@ -2778,6 +3095,45 @@ impl Daemon {
                     })
                     .collect();
                 Ok(serde_json::to_value(McpListResult { servers })?)
+            }
+            "mcp.reload" => {
+                // Drop cached connections so a new token (or a config edit)
+                // takes effect without restarting the daemon.
+                self.mcp.lock().await.clear();
+                Ok(json!({ "ok": true }))
+            }
+            "pair.create" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::to_string);
+                let (code, expires_at) = self.create_pairing_code(name);
+                let http = self
+                    .config
+                    .load()
+                    .server
+                    .http
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|addr| !addr.is_empty())
+                    .map(|addr| format!("http://{addr}/pair"));
+                Ok(json!({
+                    "code": code,
+                    "expires_at": expires_at,
+                    "http": http,
+                }))
+            }
+            "pair.list" => Ok(json!({
+                "clients": self.store.list_client_tokens()?,
+            })),
+            "pair.revoke" => {
+                let id = request
+                    .params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "pair.revoke needs `id`"))?;
+                Ok(json!({ "revoked": self.store.revoke_client_token(id)? }))
             }
             "plugin.list" => {
                 let list: PluginListResult = self.plugins.list().await;
@@ -3712,7 +4068,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| self.config.load().default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         tokio::spawn(async move {
             daemon.run_btw(session_id, id, question, model).await;
         });
@@ -3791,7 +4147,7 @@ impl Daemon {
             .stream_chat(&messages, &route, &[], cancel, |delta| {
                 if let crate::provider::StreamDelta::Content(chunk) = delta {
                     text.push_str(chunk);
-                    let _ = bus.send(Notification::new(
+                    let _ = bus.send(Notification::from_value(
                         "btw.delta",
                         json!({
                             "session_id": sid,
@@ -4189,7 +4545,7 @@ impl Daemon {
             json!({
                 "session_id": session.id.clone(),
                 "turn_id": turn_id.clone(),
-                "model": session.model.clone().unwrap_or_else(|| self.config.load().default_model().to_string()),
+                "model": session.model.clone().unwrap_or_else(|| self.default_model()),
             }),
         );
 
@@ -4219,6 +4575,60 @@ impl Daemon {
     /// Merged static catalog plus provider `/models` results. Fetch failures
     /// are warnings, never hard errors: a local or offline provider must not
     /// hide the models that are configured explicitly.
+    /// Summarize where each provider's credential comes from. Secrets are
+    /// never included; only the source label.
+    fn provider_auth_info(&self) -> Vec<ProviderAuthInfo> {
+        let config = self.config.load();
+        config
+            .providers
+            .iter()
+            .map(|(key, provider)| {
+                let (authenticated, source) = if provider
+                    .api_key
+                    .as_deref()
+                    .is_some_and(|key| !key.trim().is_empty())
+                {
+                    (true, "config".to_string())
+                } else if !provider.api_key_env.trim().is_empty()
+                    && std::env::var(provider.api_key_env.trim())
+                        .ok()
+                        .is_some_and(|key| !key.trim().is_empty())
+                {
+                    (true, format!("env:{}", provider.api_key_env.trim()))
+                } else {
+                    match self.auth.load(key) {
+                        Ok(Some(credential)) if credential.available() => (
+                            true,
+                            match credential.kind {
+                                crate::auth::CredentialKind::ApiKey => "store:api-key",
+                                crate::auth::CredentialKind::OAuth => "store:oauth",
+                            }
+                            .to_string(),
+                        ),
+                        Ok(Some(credential)) => {
+                            (false, format!("store:{} (unusable)", credential.summary()))
+                        }
+                        Ok(None) => (false, "missing".to_string()),
+                        Err(err) => (false, format!("store error: {err}")),
+                    }
+                };
+                ProviderAuthInfo {
+                    key: key.clone(),
+                    name: provider
+                        .name
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .unwrap_or(key)
+                        .to_string(),
+                    kind: provider.kind.label().to_string(),
+                    authenticated,
+                    source,
+                }
+            })
+            .collect()
+    }
+
     async fn model_catalog(&self) -> (Vec<eix_core::ModelInfo>, Vec<String>) {
         const CACHE_TTL: Duration = Duration::from_secs(300);
         const FAILED_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -4241,7 +4651,7 @@ impl Daemon {
 
         let config = self.config.load_full();
         let configured = config.models();
-        let (fetched, warnings) = crate::model_catalog::fetch_all(&config).await;
+        let (fetched, warnings) = crate::model_catalog::fetch_all(&config, &self.auth).await;
         let models = crate::model_catalog::merge(configured, fetched);
         let mut cache = self.model_catalog.lock().await;
         cache.fetched_at = Some(Instant::now());
@@ -4259,7 +4669,8 @@ impl Daemon {
             .load()
             .reload()
             .context("cannot reload config")?;
-        let provider = Provider::new(&next).context("cannot rebuild provider")?;
+        let provider =
+            Provider::with_store(&next, self.auth.clone()).context("cannot rebuild provider")?;
         let paths = next
             .watch_paths
             .iter()
@@ -4568,7 +4979,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         let turn_started = Instant::now();
         // A sub-agent reuses the parent turn's snapshot. The parent itself
         // keeps this snapshot for every round, so parent and child agree on
@@ -4704,35 +5115,20 @@ impl Daemon {
                 let tid = turn_id.to_string();
                 let mut streamed = String::new();
                 let mut streamed_reasoning = String::new();
+                let mut batcher = DeltaBatcher::new(&bus, &sid, &tid);
                 let estimated_prompt = estimate_messages_tokens(&messages) + tool_schema_tokens;
                 let outcome = provider
                     .stream_chat(&messages, &route, request_tools, cancel.as_ref(), |delta| {
                         match delta {
-                            crate::provider::StreamDelta::Content(text) => {
-                                streamed.push_str(text);
-                                let _ = bus.send(Notification::new(
-                                    "message.delta",
-                                    json!({
-                                        "session_id": sid,
-                                        "turn_id": tid,
-                                        "delta": text,
-                                    }),
-                                ));
-                            }
+                            crate::provider::StreamDelta::Content(text) => streamed.push_str(text),
                             crate::provider::StreamDelta::Reasoning(text) => {
                                 streamed_reasoning.push_str(text);
-                                let _ = bus.send(Notification::new(
-                                    "reasoning.delta",
-                                    json!({
-                                        "session_id": sid,
-                                        "turn_id": tid,
-                                        "delta": text,
-                                    }),
-                                ));
                             }
                         }
+                        batcher.push(delta);
                     })
                     .await;
+                batcher.flush();
 
                 if cancel.load(Ordering::SeqCst) {
                     self.finish_cancelled(
@@ -5260,8 +5656,8 @@ impl Daemon {
             .unwrap_or_default();
         let config = self.config.load();
 
-        if tools::parallel_safe(tool) || tool == "run_command" {
-            if tool == "run_command" && !command_is_parallel_readonly(&args, &session.cwd) {
+        if tools::parallel_safe(tool) || tool == "exec_command" {
+            if tool == "exec_command" && !command_is_parallel_readonly(&args, &session.cwd) {
                 return None;
             }
             let decision = permission_decide(
@@ -5624,7 +6020,9 @@ impl Daemon {
                 call,
                 args,
                 &decision.risk,
-                auto_plan.as_ref(),
+                auto_plan
+                    .as_ref()
+                    .map_or(SnapshotTargets::None, SnapshotTargets::Plan),
             )
             .await?;
 
@@ -5998,7 +6396,7 @@ impl Daemon {
                 "model": child
                     .model
                     .clone()
-                    .unwrap_or_else(|| self.config.load().default_model().to_string()),
+                    .unwrap_or_else(|| self.default_model()),
             }),
         );
         if let Err(err) = self
@@ -6291,6 +6689,22 @@ impl Daemon {
             return Ok(());
         }
 
+        // Images are read-only, but a tool result cannot carry an image on every
+        // provider. Send the tool result, then a user message with the image.
+        if tool == "view_image" {
+            let (ok, output, images) = self.view_image(&session, &args).await;
+            self.record_tool_result(session_id, call, ok, false, &output, 0)?;
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            if !images.is_empty() {
+                let path = args.get("path").and_then(Value::as_str).unwrap_or("image");
+                messages.push(ChatMessage::user_with_images(
+                    format!("Image loaded by view_image: {path}"),
+                    images,
+                ));
+            }
+            return Ok(());
+        }
+
         // Direct file writes share the execution path used by parallel write
         // segments. Approval-gated writes and staged proposals stay below.
         if decision.action != PermissionAction::Ask && matches!(tool, "write_file" | "edit") {
@@ -6344,10 +6758,12 @@ impl Daemon {
 
         let denied = denial.is_some();
         let direct_write = !denied && decision.action != PermissionAction::Ask;
-        let auto_patch_ops = if direct_write && tool == "patch" {
+        let auto_patch_ops = if direct_write && tool == "apply_patch" {
             let session = self.require_session(session_id)?;
             let patch_text = args
                 .get("patchText")
+                .or_else(|| args.get("patch"))
+                .or_else(|| args.get("input"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             tools::patch_ops(patch_text, &session.cwd, &self.config.load())
@@ -6356,11 +6772,27 @@ impl Daemon {
         } else {
             Vec::new()
         };
+        let snapshot_ops = patch_ops
+            .as_deref()
+            .filter(|ops| !ops.is_empty())
+            .or_else(|| (!auto_patch_ops.is_empty()).then_some(auto_patch_ops.as_slice()));
+        let snapshot_targets = match (&plan, snapshot_ops) {
+            (Some(plan), _) => SnapshotTargets::Plan(plan),
+            (None, Some(ops)) => SnapshotTargets::Patch(ops),
+            (None, None) => SnapshotTargets::None,
+        };
         let snapshot_warning = if denied {
             None
         } else {
-            self.capture_snapshot(session_id, tool, call, &args, &decision.risk, plan.as_ref())
-                .await?
+            self.capture_snapshot(
+                session_id,
+                tool,
+                call,
+                &args,
+                &decision.risk,
+                snapshot_targets,
+            )
+            .await?
         };
         let (ok, mut output, duration_ms) = match denial {
             Some(reason) => (false, reason, 0),
@@ -6384,10 +6816,8 @@ impl Daemon {
                     None if patch_ops.is_some() => {
                         tools::apply_patch_ops(patch_ops.as_deref().unwrap_or_default()).await
                     }
-                    None if tool == "start_command" => {
-                        self.start_background(session_id, &args).await
-                    }
-                    None if tool == "process_output" => self.read_process(session_id, &args),
+                    None if tool == "exec_command" => self.exec_command(session_id, &args).await,
+                    None if tool == "write_stdin" => self.write_stdin(session_id, &args).await,
                     None if is_mcp_meta(tool) => self.call_mcp_meta(tool, &args).await,
                     None if mcp_known => self.call_mcp(tool, &args).await,
                     None if plugin_known => {
@@ -6432,7 +6862,7 @@ impl Daemon {
         if let Some(warning) = snapshot_warning {
             output.push_str(&format!("\n[snapshot failed: {warning}]"));
         }
-        if ok && matches!(tool, "write_file" | "edit" | "patch") {
+        if ok && matches!(tool, "write_file" | "edit" | "patch" | "apply_patch") {
             let session = self.require_session(session_id)?;
             let config = self.config.load();
             let paths = written_paths(tool, &args, &session.cwd, &config);
@@ -6454,8 +6884,8 @@ impl Daemon {
         } else {
             None
         };
-        let record_change =
-            matches!(tool, "write_file" | "edit") || (tool == "patch" && auto_diff.is_some());
+        let record_change = matches!(tool, "write_file" | "edit")
+            || (matches!(tool, "patch" | "apply_patch") && auto_diff.is_some());
         if ok && record_change {
             let path = plan
                 .as_ref()
@@ -6630,7 +7060,7 @@ impl Daemon {
             blob_bytes,
             skills: resources.skill_count,
             mcp_servers: config.mcp.servers.len(),
-            default_model: config.default_model().to_string(),
+            default_model: self.default_model(),
         })
     }
 
@@ -6819,7 +7249,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         let route = config.route(&model);
         let budget = config.context.effective_budget_tokens(route.context_tokens);
         let resources = self.prompt_resources(&config, &session.cwd).await;
@@ -6868,7 +7298,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         let route = config.route(&model);
         let budget = config.context.effective_budget_tokens(route.context_tokens);
         let resources = self.prompt_resources(&config, &session.cwd).await;
@@ -7077,7 +7507,7 @@ impl Daemon {
         let model = self
             .require_session(session_id)?
             .model
-            .unwrap_or_else(|| config.default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         let cancel = AtomicBool::new(false);
         let route = config.route(&model);
         let provider = self.provider.load_full();
@@ -7604,14 +8034,104 @@ impl Daemon {
         }
     }
 
-    /// Start a background process on behalf of `start_command`.
-    async fn start_background(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
+    /// Load one raster image from the workspace and base64-encode it for the
+    /// provider. SVG and files over 10 MiB are rejected so a tool call cannot
+    /// balloon the transcript.
+    async fn view_image(&self, session: &Session, args: &Value) -> (bool, String, Vec<ImagePart>) {
+        const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
+        let config = self.config.load();
+        let raw = args.get("path").and_then(Value::as_str).unwrap_or_default();
+        let path = match tools::resolve_path_in(&session.cwd, raw, &config) {
+            Ok(path) => path,
+            Err(err) => return (false, format!("{err:#}"), Vec::new()),
+        };
+        let mime = match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("png") => "image/png",
+            Some("jpg" | "jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("bmp") => "image/bmp",
+            Some(other) => {
+                return (
+                    false,
+                    format!(
+                        "unsupported image extension {other:?}; use png, jpg, gif, webp or bmp"
+                    ),
+                    Vec::new(),
+                )
+            }
+            None => {
+                return (
+                    false,
+                    format!("{} has no image extension", path.display()),
+                    Vec::new(),
+                )
+            }
+        };
+        let size = match tokio::fs::metadata(&path).await {
+            Ok(meta) => meta.len(),
+            Err(err) => {
+                return (
+                    false,
+                    format!("cannot read {}: {err}", path.display()),
+                    Vec::new(),
+                )
+            }
+        };
+        if size > MAX_IMAGE_BYTES {
+            return (
+                false,
+                format!(
+                    "{} is {size} bytes; the image limit is {MAX_IMAGE_BYTES}",
+                    path.display()
+                ),
+                Vec::new(),
+            );
+        }
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                return (
+                    false,
+                    format!("cannot read {}: {err}", path.display()),
+                    Vec::new(),
+                )
+            }
+        };
+        let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+        let detail = args.get("detail").and_then(Value::as_str).unwrap_or("high");
+        (
+            true,
+            format!(
+                "loaded {} ({} bytes, {detail} detail)",
+                path.strip_prefix(&session.cwd).unwrap_or(&path).display(),
+                size
+            ),
+            vec![ImagePart {
+                mime: mime.to_string(),
+                data,
+            }],
+        )
+    }
+
+    /// `exec_command`: start a command, wait up to `yield_time_ms`, and return
+    /// its output or a session id for `write_stdin`.
+    async fn exec_command(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
         let started = Instant::now();
-        let command = args.get("command").and_then(Value::as_str).unwrap_or("");
+        let command = args
+            .get("cmd")
+            .or_else(|| args.get("command"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         if command.trim().is_empty() {
             return tools::ToolOutcome {
                 ok: false,
-                output: "command must not be empty".to_string(),
+                output: "cmd must not be empty".to_string(),
                 duration_ms: started.elapsed().as_millis() as u64,
             };
         }
@@ -7625,7 +8145,10 @@ impl Daemon {
                 }
             }
         };
-        let cwd = args.get("cwd").and_then(Value::as_str);
+        let cwd = args
+            .get("workdir")
+            .or_else(|| args.get("cwd"))
+            .and_then(Value::as_str);
         let plan = match tools::command_plan(
             command,
             cwd,
@@ -7642,58 +8165,79 @@ impl Daemon {
                 }
             }
         };
-        match self.processes.start(session_id, command, plan).await {
-            Ok(info) => tools::ToolOutcome {
-                ok: true,
-                output: format!(
-                    "started process {} (pid {}) in {}\nlog: {}\nUse process_output to read its output.",
-                    info.id, info.pid, info.cwd, info.log
-                ),
-                duration_ms: started.elapsed().as_millis() as u64,
-            },
-            Err(err) => tools::ToolOutcome {
+        let info = match self.processes.start(session_id, command, plan).await {
+            Ok(info) => info,
+            Err(err) => {
+                return tools::ToolOutcome {
+                    ok: false,
+                    output: format!("{err:#}"),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+        };
+        let wait = yield_time(args, 10_000);
+        let max_bytes = output_cap(args, self.config.load().tools.max_output_bytes);
+        if let Err(err) = self
+            .processes
+            .wait_for_exit(session_id, &info.id, wait)
+            .await
+        {
+            return tools::ToolOutcome {
                 ok: false,
                 output: format!("{err:#}"),
                 duration_ms: started.elapsed().as_millis() as u64,
-            },
+            };
+        }
+        let output = match self
+            .processes
+            .write_stdin(session_id, &info.id, "", Duration::ZERO, max_bytes)
+            .await
+        {
+            Ok(output) => output,
+            Err(err) => {
+                return tools::ToolOutcome {
+                    ok: false,
+                    output: format!("{err:#}"),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                }
+            }
+        };
+        let text = format_process_output(&output);
+        tools::ToolOutcome {
+            ok: true,
+            output: tools::cap_output(text, self.config.load().tools.max_output_bytes),
+            duration_ms: started.elapsed().as_millis() as u64,
         }
     }
 
-    /// `process_output`: read-only tail of a background process.
-    fn read_process(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
+    /// `write_stdin`: write to a running session and return new output.
+    async fn write_stdin(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
         let started = Instant::now();
-        let process_id = args
-            .get("process_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty());
-        let max_bytes = args
-            .get("max_bytes")
-            .and_then(Value::as_u64)
-            .map(|value| value as usize)
-            .unwrap_or(8000)
-            .clamp(1, 512 * 1024);
+        let Some(id) = args.get("session_id").and_then(|value| {
+            value
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| value.as_u64().map(|id| id.to_string()))
+        }) else {
+            return tools::ToolOutcome {
+                ok: false,
+                output: "write_stdin needs session_id".to_string(),
+                duration_ms: started.elapsed().as_millis() as u64,
+            };
+        };
+        let chars = args.get("chars").and_then(Value::as_str).unwrap_or("");
+        let wait = yield_time(args, 1_000);
+        let max_bytes = output_cap(args, self.config.load().tools.max_output_bytes);
         match self
             .processes
-            .output_for_session(session_id, process_id, max_bytes)
+            .write_stdin(session_id, &id, chars, wait, max_bytes)
+            .await
         {
             Ok(output) => {
-                let mut text = format!(
-                    "process {} · {} · {} bytes",
-                    output.process_id,
-                    output.status.as_str(),
-                    output.bytes
-                );
-                if let Some(code) = output.exit_code {
-                    text.push_str(&format!(" · exit {code}"));
-                }
-                if output.truncated {
-                    text.push_str(" · tail");
-                }
-                text.push('\n');
-                text.push_str(&output.text);
+                let text = format_process_output(&output);
                 tools::ToolOutcome {
                     ok: true,
-                    output: text,
+                    output: tools::cap_output(text, self.config.load().tools.max_output_bytes),
                     duration_ms: started.elapsed().as_millis() as u64,
                 }
             }
@@ -7766,7 +8310,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         let route = config.route(&model);
         let key = classifier_cache_key(session, tool, args, decision, &intent, &model);
         let now = Instant::now();
@@ -8092,11 +8636,16 @@ impl Daemon {
         call: &ToolCall,
         args: &Value,
         risk: &eix_core::RiskAssessment,
-        plan: Option<&tools::WritePlan>,
+        targets: SnapshotTargets<'_>,
     ) -> Result<Option<String>> {
         let is_mcp = tool.starts_with(crate::mcp::PREFIX);
         let mcp_mutating = is_mcp && risk.categories.contains(&eix_core::RiskCategory::McpWrite);
         if !(risk.mutates_workspace() || mcp_mutating) || !self.config.load().tools.snapshots {
+            return Ok(None);
+        }
+        // Rewriting identical bytes cannot change the workspace, so there is
+        // nothing for a snapshot to protect.
+        if matches!(targets, SnapshotTargets::Plan(plan) if !plan.changes()) {
             return Ok(None);
         }
         // Snapshot directories are pruned after each capture. Serializing just
@@ -8104,7 +8653,17 @@ impl Daemon {
         // each other's fresh snapshot while still letting the writes overlap.
         let _snapshot_guard = self.snapshot_lock.lock().await;
         let cwd = self.require_session(session_id)?.cwd;
-        let scope = if matches!(tool, "write_file" | "edit") {
+        // `apply_patch` names its targets, so capture only those files instead
+        // of the whole tree; a shell command can touch anything and still needs
+        // the tree.
+        let patch_targets: Option<Vec<PathBuf>> = match targets {
+            SnapshotTargets::Patch(ops) => {
+                let paths: Vec<PathBuf> = ops.iter().map(|op| op.path.clone()).collect();
+                (!paths.is_empty()).then_some(paths)
+            }
+            _ => None,
+        };
+        let scope = if matches!(tool, "write_file" | "edit") || patch_targets.is_some() {
             Scope::File
         } else {
             Scope::Tree
@@ -8121,6 +8680,10 @@ impl Daemon {
         }
         let result = match tool {
             "write_file" | "edit" => {
+                let plan = match targets {
+                    SnapshotTargets::Plan(plan) => Some(plan),
+                    _ => None,
+                };
                 let path = plan
                     .map(|plan| plan.path().to_path_buf())
                     .or_else(|| tools::write_target(args, &cwd, self.config.load().as_ref()));
@@ -8133,7 +8696,19 @@ impl Daemon {
                     None => Err(anyhow::anyhow!("cannot resolve the write target")),
                 }
             }
-            "patch" | "run_command" => {
+            "patch" | "apply_patch" => match patch_targets {
+                Some(paths) => {
+                    self.snapshots
+                        .capture_files(session_id, tool, &call.id, &cwd, &paths)
+                        .await
+                }
+                None => {
+                    self.snapshots
+                        .capture_tree(session_id, tool, &call.id, &cwd)
+                        .await
+                }
+            },
+            "run_command" | "exec_command" => {
                 self.snapshots
                     .capture_tree(session_id, tool, &call.id, &cwd)
                     .await
@@ -8451,9 +9026,11 @@ impl Daemon {
         let mut patch_ops = None;
         let diff = match &plan {
             Some(plan) => Some(plan.diff().to_string()),
-            None if tool == "patch" => {
+            None if tool == "apply_patch" => {
                 let patch_text = args
                     .get("patchText")
+                    .or_else(|| args.get("patch"))
+                    .or_else(|| args.get("input"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 match tools::patch_ops(patch_text, &cwd, &config).await {
@@ -8918,9 +9495,9 @@ fn parse_params<T: DeserializeOwned>(params: Value) -> Result<T> {
 
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]
-struct RpcError {
-    code: String,
-    message: String,
+pub(crate) struct RpcError {
+    pub(crate) code: String,
+    pub(crate) message: String,
 }
 
 fn rpc(code: impl Into<String>, message: impl Into<String>) -> anyhow::Error {
@@ -8939,6 +9516,52 @@ pub(crate) fn secret_eq(a: &str, b: &str) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Pairing codes live for five minutes and are single use.
+const PAIRING_TTL_MS: i64 = 5 * 60 * 1000;
+const PAIRING_WINDOW: Duration = Duration::from_secs(60);
+const PAIRING_MAX_FAILURES: u32 = 20;
+
+/// Codes are displayed grouped, but stored and compared without dashes or
+/// case, so users can retype them loosely.
+fn canonical_pairing_code(code: &str) -> String {
+    code.chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn new_pairing_code() -> String {
+    let bytes = random_bytes();
+    let hex: String = bytes[..8]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    hex.as_bytes()
+        .chunks(4)
+        .map(|chunk| std::str::from_utf8(chunk).unwrap_or_default())
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// 32 random bytes, base64url without padding: 43 URL-safe characters.
+fn random_token() -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(random_bytes())
+}
+
+fn random_bytes() -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes
+}
+
+fn hash_token(token: &str) -> String {
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// First eight bytes of a session id, for human-facing messages.
@@ -9233,11 +9856,12 @@ fn written_paths(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Vec<P
     if matches!(tool, "write_file" | "edit") {
         return tools::write_target(args, cwd, config).into_iter().collect();
     }
-    if tool != "patch" {
+    if !matches!(tool, "patch" | "apply_patch") {
         return Vec::new();
     }
-    args.get("patchText")
-        .and_then(Value::as_str)
+    ["patchText", "patch", "input"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str))
         .map(|text| {
             text.lines()
                 .filter_map(|line| {
@@ -9251,12 +9875,37 @@ fn written_paths(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Vec<P
 }
 
 fn build_always_rule(tool: &str, args: &Value, source: RuleSource) -> PermissionRule {
+    // A patch carries its targets in the document rather than a `path`
+    // argument. When it touches exactly one file, key the rule on that file so
+    // a later patch to the same path is not asked again just because its
+    // content changed.
+    let patch_paths: Vec<&str> = args
+        .get("patchText")
+        .or_else(|| args.get("patch"))
+        .or_else(|| args.get("input"))
+        .and_then(Value::as_str)
+        .map(|text| {
+            text.lines()
+                .filter_map(|line| {
+                    line.strip_prefix("*** Add File: ")
+                        .or_else(|| line.strip_prefix("*** Update File: "))
+                        .or_else(|| line.strip_prefix("*** Delete File: "))
+                        .map(str::trim)
+                        .filter(|path| !path.is_empty())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let path = args
         .get("path")
         .and_then(Value::as_str)
         .filter(|path| !path.is_empty())
-        .map(str::to_string);
-    let command = args.get("command").and_then(Value::as_str);
+        .map(str::to_string)
+        .or_else(|| (patch_paths.len() == 1).then(|| patch_paths[0].to_string()));
+    let command = args
+        .get("cmd")
+        .or_else(|| args.get("command"))
+        .and_then(Value::as_str);
     let (command, signature) = match command {
         Some(command) => {
             let analysis = eix_core::risk::analyze_command(command);
@@ -9293,8 +9942,9 @@ fn toml_string(value: &str) -> String {
 
 fn auto_name(text: &str) -> String {
     let first = text.lines().next().unwrap_or("").trim();
-    let mut name: String = first.chars().take(48).collect();
-    if first.chars().count() > 48 {
+    let mut chars = first.chars();
+    let mut name: String = chars.by_ref().take(48).collect();
+    if chars.next().is_some() {
         name.push('…');
     }
     if name.is_empty() {
@@ -9389,9 +10039,7 @@ impl Daemon {
         for event in &events {
             match event.kind {
                 EventKind::UserMessage => {
-                    let Ok(message) =
-                        serde_json::from_value::<UserMessagePayload>(event.payload.clone())
-                    else {
+                    let Ok(message) = UserMessagePayload::deserialize(&event.payload) else {
                         continue;
                     };
                     user_count += 1;
@@ -9412,9 +10060,9 @@ impl Daemon {
                     if user_count == 0 || user_count > 2 {
                         continue;
                     }
-                    let Ok(message) = serde_json::from_value::<eix_core::AssistantMessagePayload>(
-                        event.payload.clone(),
-                    ) else {
+                    let Ok(message) =
+                        eix_core::AssistantMessagePayload::deserialize(&event.payload)
+                    else {
                         continue;
                     };
                     if message.text.trim().is_empty() {
@@ -9466,7 +10114,7 @@ impl Daemon {
         let model = session
             .model
             .clone()
-            .unwrap_or_else(|| config.default_model().to_string());
+            .unwrap_or_else(|| self.default_model());
         let route = config.route(&model);
         let messages = vec![
             ChatMessage::system(
@@ -9490,43 +10138,44 @@ impl Daemon {
 const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's terminal. Workspace: `{cwd}`.
 
 ## Working agreement
-- Be concise and collaborative. Read before assuming; keep changes scoped.
-- Unless asked to plan, answer a question, or brainstorm, implement the change; don't stop at analysis or a half-finished fix.
-- Simple requests one command can answer: just run it.
+- Be concise and collaborative; read first, keep changes scoped.
+- Unless asked to plan, answer a question, or brainstorm, implement; don't stop at analysis.
+- Simple requests one command can answer.
 - Treat explicit requirements as acceptance criteria; never claim unverified success.
-- Carry work through to the end; don't end the turn with a needed command running. If blocked, try to unblock yourself first, then say what's missing.
-- Preserve user work: don't revert unrelated changes, rewrite history, or use destructive git unless asked. Ignore unrelated dirty files; mention unrelated bugs/tests instead of fixing them.
+- Don't end a turn with a needed command running; if blocked, unblock yourself first, then say what's missing.
+- Preserve user work: no reverting unrelated changes, history rewrites, or destructive git. Assume changes you didn't make are the user's; build on them, ask only if they block the task. Mention unrelated bugs/tests instead of fixing them.
 - Ask only if a wrong assumption would change the outcome.
-- Reply in the user's language unless code or identifiers require otherwise.
+- Reply in the user's language unless code requires it.
 
 ## How to work
-- Scale depth to the task; expand only when it helps. Read the narrowest code and call sites first; skip tools if context suffices; diagnose before fixing.
-- Plan only large or ambiguous work; skip simple tasks and single-step plans; update `todo` as done.
-- Make the smallest coherent change in existing style; prefer `edit`/`patch`; fix root causes, reuse helpers, stay consistent; no placeholders or unrelated edits.
-- Default to ASCII; don't write files via shell or Python.
-- Verify enough to trust the result: run what can fail, cover edge/error paths, inspect the diff, skip unchanged reruns, never weaken tests. If you can't run a check, say so.
+- Scale depth to the task; expand only when it helps. Read the narrowest code and call sites; skip tools if context suffices; diagnose first.
+- Plan only large or ambiguous work; skip simple tasks and one-step plans; update `todo` as done.
+- Smallest coherent change in existing style; default to ASCII; fix root causes, reuse helpers; no placeholders.
+- Verify enough to trust it: run what can fail, cover edge/error paths, inspect the diff, skip unchanged reruns, never weaken tests; if you can't, say so.
 
 ## Communication
-- Before edits, say what you're changing. Before tool batches, say what you're doing and why; don't narrate reads, phases, or the plan.
+- Before edits, say what you're changing. Before tool batches, say what you're doing and why; on long turns, post short updates every ~30s. Don't narrate reads, phases, or the plan, or praise your plan against a worse alternative.
 - Reviews: don't edit unless asked; findings first by severity and file:line, then open questions, summary last. If none, say so and note residual risk.
-- Final answers: short; outcome, changes, verification, risk. Stay under 70 lines, clickable file paths, skip emoji/em dash, and don't end with "If you want". Users may not read tool output; relay key results, don't dump files.
+- Final answers: short; outcome, changes, verification, risk. Under 70 lines, clickable file paths, no emoji/em dash, no "Summary" opener, no "If you want" ending; number options. Users may not read tool output; relay key results, don't dump files.
 
 ## Continuity
 - Newest message wins; honor non-conflicting earlier requests.
-- After resume or compaction, continue from the summary; don't restart; check the answer matches the newest request.
+- After resume or compaction, continue from the summary; don't restart; answer the newest request.
 
 ## Tools
-- Batch independent reads/searches; prefer `read_file`/`grep`/`glob` over shell.
-- Instructions/workspace are in context; don't re-read or repeat `ls`/`git status` unless stale.
-- If a tool fails, change the approach; don't repeat it.
-- Use `spawn_agent` only for broad exploration or independent verification, not work you can finish in 1-2 reads; batch prompts, children are read-only.
-- Approval is handled by eix: call the tool, don't ask in prose."#;
+- Files: `cat`, `sed -n`, `awk`, `nl`, `rg`/`rg --files`, `fd`, `ls`; batch independent commands in `exec_command`.
+- Edits: `apply_patch`; shell/Python for bulk rewrites, generated files, analysis. `view_image` for visual checks.
+- Use `write_stdin` for long or interactive work.
+- Instructions/workspace are in context; don't repeat `ls`/`git status` unless stale.
+- If a tool fails, change the approach.
+- Use `spawn_agent` only for broad or independent verification, not 1-2 reads; batch prompts, children are read-only.
+- Approval is handled by eix: call the tool, don't ask."#;
 
 /// A sub-agent has no parent transcript, no edit tools, and one focused task.
 /// Keep its contract small so fan-out does not repeat the full parent prompt.
 const SUBAGENT_SYSTEM_PROMPT: &str = r#"You are a read-only sub-agent for eix. Workspace: `{cwd}`.
 
-The prompt is your full task; you cannot see the parent conversation. Investigate only that question. Search symbols first, batch independent reads/searches, then read the narrowest relevant files and return concise findings with file:line evidence, the minimum context needed, and any uncertainty. Prefer a short list of concrete findings over narrative. Answer the complete question, not only the easiest part; if evidence is blocked, say exactly what is missing.
+The prompt is your full task; you cannot see the parent conversation. Investigate only that question. Search with `rg` and read the narrowest files with `cat`/`sed -n`/`nl`, batching independent `exec_command` calls. Return concise findings with file:line evidence, the minimum context needed, and any uncertainty. Prefer a short list of concrete findings over narrative. Answer the complete question, not only the easiest part; if evidence is blocked, say exactly what is missing.
 Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process. If a tool fails, change the input instead of repeating it. Follow repository instructions and load a matching skill before work. Answer in the user's language."#;
 
 const SUBAGENT_READONLY_NOTE: &str = "\n\nThe prompt is your full task; you cannot see the parent conversation. You are a read-only sub-agent. Investigate only the assigned question, answer it completely rather than only the easiest part, and return concise findings with file:line evidence; if evidence is blocked, say exactly what is missing. Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process.";
@@ -9758,57 +10407,56 @@ mod tests {
         assert!(!prompt.contains("{cwd}"));
         for expected in [
             "Be concise and collaborative",
-            "Read before assuming",
-            "keep changes scoped",
+            "read first, keep changes scoped",
             "Unless asked to plan, answer a question, or brainstorm",
-            "implement the change",
-            "don't stop at analysis or a half-finished fix",
+            "implement; don't stop at analysis",
             "Simple requests one command can answer",
             "Treat explicit requirements as acceptance criteria",
             "never claim unverified success",
-            "Carry work through to the end",
-            "don't end the turn with a needed command running",
-            "If blocked, try to unblock yourself first",
+            "Don't end a turn with a needed command running",
+            "if blocked, unblock yourself first",
             "then say what's missing",
             "Preserve user work",
-            "don't revert unrelated changes",
-            "Ignore unrelated dirty files",
-            "mention unrelated bugs/tests instead of fixing them",
+            "no reverting unrelated changes",
+            "Assume changes you didn't make are the user's",
+            "build on them, ask only if they block the task",
+            "Mention unrelated bugs/tests instead of fixing them",
             "Ask only if a wrong assumption would change the outcome",
             "Reply in the user's language",
             "Scale depth to the task; expand only when it helps",
-            "Read the narrowest code and call sites first",
+            "Read the narrowest code and call sites",
             "skip tools if context suffices",
-            "diagnose before fixing",
+            "diagnose first",
             "Plan only large or ambiguous work",
-            "skip simple tasks and single-step plans",
+            "skip simple tasks and one-step plans",
             "update `todo` as done",
-            "smallest coherent change in existing style",
-            "prefer `edit`/`patch`",
+            "Smallest coherent change in existing style",
+            "default to ASCII",
             "fix root causes, reuse helpers",
-            "stay consistent",
-            "no placeholders or unrelated edits",
-            "Default to ASCII",
-            "don't write files via shell or Python",
-            "Verify enough to trust the result",
+            "no placeholders",
+            "Verify enough to trust it",
             "run what can fail",
             "cover edge/error paths",
             "inspect the diff",
             "skip unchanged reruns",
             "never weaken tests",
-            "If you can't run a check, say so",
+            "if you can't, say so",
             "Before edits, say what you're changing",
             "Before tool batches, say what you're doing and why",
-            "don't narrate reads, phases, or the plan",
+            "post short updates every ~30s",
+            "Don't narrate reads, phases, or the plan",
+            "praise your plan against a worse alternative",
             "Reviews: don't edit unless asked",
             "findings first by severity and file:line",
             "then open questions, summary last",
             "If none, say so and note residual risk",
             "Final answers: short",
             "outcome, changes, verification, risk",
-            "Stay under 70 lines, clickable file paths",
-            "skip emoji/em dash",
-            "don't end with \"If you want\"",
+            "Under 70 lines, clickable file paths",
+            "no emoji/em dash",
+            "no \"Summary\" opener",
+            "no \"If you want\" ending",
+            "number options",
             "Users may not read tool output",
             "relay key results, don't dump files",
             "Newest message wins",
@@ -9816,14 +10464,17 @@ mod tests {
             "After resume or compaction",
             "continue from the summary",
             "don't restart",
-            "check the answer matches the newest request",
-            "Batch independent reads/searches",
-            "prefer `read_file`/`grep`/`glob` over shell",
+            "answer the newest request",
+            "Files: `cat`, `sed -n`, `awk`, `nl`",
+            "`rg`/`rg --files`, `fd`, `ls`",
+            "Edits: `apply_patch`",
+            "shell/Python for bulk rewrites, generated files, analysis",
+            "`view_image` for visual checks",
+            "Use `write_stdin` for long or interactive work",
             "Instructions/workspace are in context",
-            "don't re-read or repeat `ls`/`git status` unless stale",
+            "don't repeat `ls`/`git status` unless stale",
             "If a tool fails, change the approach",
-            "don't repeat it",
-            "broad exploration or independent verification",
+            "broad or independent verification, not 1-2 reads",
             "batch prompts, children are read-only",
             "Approval is handled by eix",
         ] {
@@ -9878,9 +10529,9 @@ mod tests {
         assert_eq!(
             last_agent_barrier(
                 &[
-                    call("read_file", "{}"),
+                    call("exec_command", r#"{"cmd":"cat a.rs"}"#),
                     call("spawn_agent", "{}"),
-                    call("grep", "{}"),
+                    call("exec_command", r#"{"cmd":"rg TODO"}"#),
                 ],
                 cwd,
             ),
@@ -9891,23 +10542,32 @@ mod tests {
             last_agent_barrier(
                 &[
                     call("spawn_agent", "{}"),
-                    call("run_command", r#"{"command":"git status --short"}"#),
+                    call("exec_command", r#"{"cmd":"git status --short"}"#),
                 ],
                 cwd,
             ),
             None
         );
         assert_eq!(
-            last_agent_barrier(&[call("read_file", "{}"), call("grep", "{}")], cwd),
+            last_agent_barrier(
+                &[
+                    call("exec_command", r#"{"cmd":"cat a.rs"}"#),
+                    call("exec_command", r#"{"cmd":"rg TODO"}"#),
+                ],
+                cwd,
+            ),
             None
         );
         // A write before the child still lets a trailing read overlap.
         assert_eq!(
             last_agent_barrier(
                 &[
-                    call("write_file", "{}"),
+                    call(
+                        "apply_patch",
+                        r#"{"patchText":"*** Begin Patch\n*** End Patch\n"}"#
+                    ),
                     call("spawn_agent", "{}"),
-                    call("read_file", "{}"),
+                    call("exec_command", r#"{"cmd":"cat a.rs"}"#),
                 ],
                 cwd,
             ),
@@ -9916,9 +10576,12 @@ mod tests {
         assert_eq!(
             last_agent_barrier(
                 &[
-                    call("read_file", "{}"),
+                    call("exec_command", r#"{"cmd":"cat a.rs"}"#),
                     call("spawn_agent", "{}"),
-                    call("write_file", "{}"),
+                    call(
+                        "apply_patch",
+                        r#"{"patchText":"*** Begin Patch\n*** End Patch\n"}"#
+                    ),
                 ],
                 cwd,
             ),
@@ -9928,7 +10591,7 @@ mod tests {
             last_agent_barrier(
                 &[
                     call("spawn_agent", "{}"),
-                    call("run_command", r#"{"command":"rm -rf target"}"#),
+                    call("exec_command", r#"{"cmd":"rm -rf target"}"#),
                 ],
                 cwd,
             ),
@@ -10157,5 +10820,42 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn pairing_codes_are_grouped_and_compared_loosely() {
+        let code = new_pairing_code();
+        assert_eq!(code.len(), 19, "code should be 4x4 hex groups: {code}");
+        assert_eq!(code.split('-').count(), 4);
+        assert!(code.chars().all(|ch| ch.is_ascii_hexdigit() || ch == '-'));
+
+        let canonical = canonical_pairing_code(&code);
+        assert_eq!(canonical.len(), 16);
+        assert_eq!(
+            canonical,
+            canonical_pairing_code(&code.to_uppercase()),
+            "case must not matter"
+        );
+        assert_eq!(
+            canonical,
+            canonical_pairing_code(&canonical),
+            "dashes must not matter"
+        );
+        assert_ne!(canonical_pairing_code(&new_pairing_code()), canonical);
+    }
+
+    #[test]
+    fn paired_tokens_are_unique_and_hashed() {
+        let first = random_token();
+        let second = random_token();
+        assert_eq!(first.len(), 43);
+        assert_ne!(first, second);
+        assert!(first
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-' || ch == '_'));
+        let hash = hash_token(&first);
+        assert_eq!(hash.len(), 64);
+        assert_eq!(hash, hash_token(&first));
+        assert_ne!(hash, hash_token(&second));
     }
 }

@@ -6,3 +6,5 @@
 
 # Packaging artifacts
 /dist/
+clients/ts/dist/
+node_modules/

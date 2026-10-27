@@ -4,6 +4,8 @@
 //! HTTP surface for tools and SDKs:
 //!
 //! - `GET /health` (no auth) returns a small liveness document.
+//! - `GET /openapi.json` (no auth) describes this surface as OpenAPI 3.1.
+//! - `POST /pair` (no auth, but needs a one-time code) mints a client token.
 //! - `GET /stats` returns the daemon's `stats` RPC result.
 //! - `POST /rpc` takes one JSON-RPC request and returns one response.
 //! - `GET /events` streams daemon notifications as Server-Sent Events.
@@ -11,8 +13,10 @@
 //!   notifications; global notifications are always delivered.
 //!
 //! Authentication is a bearer token (`Authorization: Bearer ...` or
-//! `X-Eix-Token`). Every route except `/health` and CORS preflight requires it.
-//! Responses carry permissive CORS headers so browser tools can use the API.
+//! `X-Eix-Token`): either the configured `server.token` or a token minted by
+//! pairing. Every route except `/health`, `/openapi.json`, `/pair` and CORS
+//! preflight requires it. Responses carry permissive CORS headers so browser
+//! tools can use the API.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -20,6 +24,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use eix_core::{Notification, Request};
+use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
@@ -134,9 +139,69 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
         .await;
     }
 
+    if path == "/openapi.json" && method == "GET" {
+        return write_json(&mut writer, 200, &openapi_document()).await;
+    }
+
+    // Pairing is deliberately unauthenticated: the one-time code *is* the
+    // credential. Read the body before any auth check so a client never has to
+    // send its token here.
+    if path == "/pair" && method == "POST" {
+        let Some(body) = read_body(
+            &mut reader,
+            &mut writer,
+            &body_prefix,
+            content_length,
+            expect_continue,
+        )
+        .await?
+        else {
+            return Ok(());
+        };
+        let params: Value = match serde_json::from_slice(&body) {
+            Ok(params) => params,
+            Err(err) => {
+                return write_json(
+                    &mut writer,
+                    400,
+                    &serde_json::json!({ "error": format!("invalid JSON body: {err}") }),
+                )
+                .await
+            }
+        };
+        let code = params
+            .get("code")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let name = params
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        return match daemon.pair_client(code, name) {
+            Ok((paired, client)) => {
+                write_json(
+                    &mut writer,
+                    200,
+                    &serde_json::json!({ "token": paired, "client": client }),
+                )
+                .await
+            }
+            Err(err) => {
+                let (status, code) = pair_error(&err);
+                eprintln!("http: pair rejected: {err:#}");
+                write_json(
+                    &mut writer,
+                    status,
+                    &serde_json::json!({ "error": code, "message": format!("{err:#}") }),
+                )
+                .await
+            }
+        };
+    }
+
     if !auth
         .as_deref()
-        .is_some_and(|given| crate::server::secret_eq(given, token))
+        .is_some_and(|given| daemon.accepts_token(given, Some(token)))
     {
         return write_json(
             &mut writer,
@@ -169,20 +234,17 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
     if path != "/rpc" || method != "POST" {
         return write_status(&mut writer, 404, "not found").await;
     }
-    if content_length == 0 || content_length > MAX_BODY {
-        return write_status(&mut writer, 413, "invalid body size").await;
-    }
-    if expect_continue {
-        write_bytes(&mut writer, b"HTTP/1.1 100 Continue\r\n\r\n").await?;
-    }
-    let mut body = vec![0u8; content_length];
-    let prefix_len = body_prefix.len().min(content_length);
-    body[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
-    if prefix_len < content_length {
-        timeout(READ_TIMEOUT, reader.read_exact(&mut body[prefix_len..]))
-            .await
-            .context("body read timed out")??;
-    }
+    let Some(body) = read_body(
+        &mut reader,
+        &mut writer,
+        &body_prefix,
+        content_length,
+        expect_continue,
+    )
+    .await?
+    else {
+        return Ok(());
+    };
     let request: Request = match serde_json::from_slice(&body) {
         Ok(request) => request,
         Err(err) => {
@@ -196,6 +258,43 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
     };
     let response = daemon.handle_remote(&request).await;
     write_json(&mut writer, 200, &response).await
+}
+
+/// Read the request body, or write a 413 and return `None` when the declared
+/// size is missing or too large.
+async fn read_body(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    writer: &mut tokio::net::tcp::OwnedWriteHalf,
+    body_prefix: &[u8],
+    content_length: usize,
+    expect_continue: bool,
+) -> Result<Option<Vec<u8>>> {
+    if content_length == 0 || content_length > MAX_BODY {
+        write_status(writer, 413, "invalid body size").await?;
+        return Ok(None);
+    }
+    if expect_continue {
+        write_bytes(writer, b"HTTP/1.1 100 Continue\r\n\r\n").await?;
+    }
+    let mut body = vec![0u8; content_length];
+    let prefix_len = body_prefix.len().min(content_length);
+    body[..prefix_len].copy_from_slice(&body_prefix[..prefix_len]);
+    if prefix_len < content_length {
+        timeout(READ_TIMEOUT, reader.read_exact(&mut body[prefix_len..]))
+            .await
+            .context("body read timed out")??;
+    }
+    Ok(Some(body))
+}
+
+/// Map a pairing failure to an HTTP status. Anything we do not recognise is a
+/// server-side problem, so the message is logged but not echoed.
+fn pair_error(err: &anyhow::Error) -> (u16, &'static str) {
+    match err.downcast_ref::<crate::server::RpcError>() {
+        Some(rpc) if rpc.code == "rate_limited" => (429, "rate_limited"),
+        Some(rpc) if rpc.code == "unauthorized" => (401, "unauthorized"),
+        _ => (500, "internal"),
+    }
 }
 
 /// Byte offset just past the first HTTP header terminator in `buf`.
@@ -353,8 +452,229 @@ async fn write_event(
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
     notification: &Notification,
 ) -> Result<()> {
-    let json = serde_json::to_string(notification).context("cannot encode notification")?;
-    write_bytes(writer, format!("data: {json}\n\n").as_bytes()).await
+    // Encode the whole SSE frame into one buffer: the previous version built a
+    // JSON String and then formatted it into another String, doubling the
+    // allocation for every streamed token.
+    let mut frame = Vec::with_capacity(256);
+    frame.extend_from_slice(b"data: ");
+    serde_json::to_writer(&mut frame, notification).context("cannot encode notification")?;
+    frame.extend_from_slice(b"\n\n");
+    write_bytes(writer, &frame).await
+}
+
+/// Well-known code for the HTTP surface. Generated by hand so the document
+/// stays dependency-free; keep it in sync with the routes above.
+fn openapi_document() -> Value {
+    let secured = json!([{ "bearer": [] }, { "eixToken": [] }]);
+    json!({
+        "openapi": "3.1.0",
+        "info": {
+            "title": "eix daemon HTTP API",
+            "version": env!("CARGO_PKG_VERSION"),
+            "description": "JSON-RPC over HTTP plus SSE notifications. \
+                `POST /rpc` carries the same methods as the Unix socket protocol. \
+                Authenticate with `Authorization: Bearer <token>` or `X-Eix-Token`.",
+        },
+        "servers": [{ "url": "/" }],
+        "components": {
+            "securitySchemes": {
+                "bearer": { "type": "http", "scheme": "bearer" },
+                "eixToken": { "type": "apiKey", "in": "header", "name": "X-Eix-Token" }
+            },
+            "schemas": {
+                "Error": {
+                    "type": "object",
+                    "required": ["error"],
+                    "properties": {
+                        "error": { "type": "string" },
+                        "message": { "type": "string" }
+                    }
+                },
+                "Health": {
+                    "type": "object",
+                    "required": ["ok", "version"],
+                    "properties": {
+                        "ok": { "type": "boolean" },
+                        "version": { "type": "string" }
+                    }
+                },
+                "PairRequest": {
+                    "type": "object",
+                    "required": ["code"],
+                    "properties": {
+                        "code": {
+                            "type": "string",
+                            "description": "One-time code from `eix pair`. Dashes and case are ignored."
+                        },
+                        "name": {
+                            "type": "string",
+                            "description": "Label stored with the token (default: `paired client`)."
+                        }
+                    }
+                },
+                "ClientToken": {
+                    "type": "object",
+                    "required": ["id", "name", "created_at", "revoked"],
+                    "properties": {
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "created_at": { "type": "integer" },
+                        "last_used_at": { "type": ["integer", "null"] },
+                        "revoked": { "type": "boolean" }
+                    }
+                },
+                "PairResponse": {
+                    "type": "object",
+                    "required": ["token", "client"],
+                    "properties": {
+                        "token": {
+                            "type": "string",
+                            "description": "Shown once; the daemon stores only its SHA-256 hash."
+                        },
+                        "client": { "$ref": "#/components/schemas/ClientToken" }
+                    }
+                },
+                "RpcRequest": {
+                    "type": "object",
+                    "required": ["id", "method"],
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "method": { "type": "string" },
+                        "params": {}
+                    }
+                },
+                "RpcResponse": {
+                    "type": "object",
+                    "required": ["id"],
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "result": {},
+                        "error": {
+                            "type": "object",
+                            "required": ["code", "message"],
+                            "properties": {
+                                "code": { "type": "string" },
+                                "message": { "type": "string" }
+                            }
+                        }
+                    }
+                },
+                "Stats": { "type": "object", "additionalProperties": true },
+                "Notification": {
+                    "type": "object",
+                    "required": ["method"],
+                    "properties": {
+                        "method": { "type": "string" },
+                        "params": {}
+                    }
+                }
+            }
+        },
+        "paths": {
+            "/health": {
+                "get": {
+                    "summary": "Liveness probe",
+                    "security": [],
+                    "responses": {
+                        "200": {
+                            "description": "Daemon is up",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Health" } } }
+                        }
+                    }
+                }
+            },
+            "/openapi.json": {
+                "get": {
+                    "summary": "This document",
+                    "security": [],
+                    "responses": { "200": { "description": "OpenAPI 3.1 document" } }
+                }
+            },
+            "/pair": {
+                "post": {
+                    "summary": "Redeem a one-time pairing code for a durable token",
+                    "security": [],
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/PairRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "Token minted",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/PairResponse" } } }
+                        },
+                        "400": { "description": "Malformed body", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+                        "401": { "description": "Invalid or expired code", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } },
+                        "429": { "description": "Too many attempts in the current window", "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } } }
+                    }
+                }
+            },
+            "/stats": {
+                "get": {
+                    "summary": "Daemon statistics",
+                    "security": secured,
+                    "responses": {
+                        "200": {
+                            "description": "Stats document",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Stats" } } }
+                        },
+                        "401": { "description": "Missing or invalid token" }
+                    }
+                }
+            },
+            "/rpc": {
+                "post": {
+                    "summary": "One JSON-RPC request",
+                    "security": secured,
+                    "requestBody": {
+                        "required": true,
+                        "content": {
+                            "application/json": { "schema": { "$ref": "#/components/schemas/RpcRequest" } }
+                        }
+                    },
+                    "responses": {
+                        "200": {
+                            "description": "JSON-RPC response",
+                            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/RpcResponse" } } }
+                        },
+                        "400": { "description": "Malformed JSON" },
+                        "401": { "description": "Missing or invalid token" }
+                    }
+                }
+            },
+            "/events": {
+                "get": {
+                    "summary": "Server-Sent Events stream of daemon notifications",
+                    "security": secured,
+                    "parameters": [
+                        {
+                            "name": "session_id",
+                            "in": "query",
+                            "required": false,
+                            "description": "Repeatable or comma-separated session filter. Global notifications are always delivered.",
+                            "schema": { "type": "string" }
+                        },
+                        {
+                            "name": "all",
+                            "in": "query",
+                            "required": false,
+                            "description": "`1` disables filtering.",
+                            "schema": { "type": "string" }
+                        }
+                    ],
+                    "responses": {
+                        "200": {
+                            "description": "SSE stream; each frame's data is a Notification",
+                            "content": { "text/event-stream": { "schema": { "$ref": "#/components/schemas/Notification" } } }
+                        },
+                        "401": { "description": "Missing or invalid token" }
+                    }
+                }
+            }
+        }
+    })
 }
 
 async fn write_status(
@@ -377,6 +697,7 @@ async fn write_json<T: serde::Serialize>(
         401 => "Unauthorized",
         404 => "Not Found",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         431 => "Request Header Fields Too Large",
         500 => "Internal Server Error",
         _ => "Error",
@@ -400,4 +721,84 @@ async fn write_empty(writer: &mut tokio::net::tcp::OwnedWriteHalf, status: u16) 
         .as_bytes(),
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn openapi_document_describes_every_route() {
+        let doc = openapi_document();
+        assert_eq!(doc["openapi"], "3.1.0");
+        for path in [
+            "/health",
+            "/openapi.json",
+            "/pair",
+            "/stats",
+            "/rpc",
+            "/events",
+        ] {
+            assert!(doc["paths"].get(path).is_some(), "missing {path}");
+        }
+        // The unauthenticated routes must not inherit the global requirement.
+        for path in ["/health", "/openapi.json", "/pair"] {
+            let method = if path == "/pair" { "post" } else { "get" };
+            assert_eq!(doc["paths"][path][method]["security"], json!([]));
+        }
+        assert!(doc["components"]["securitySchemes"]["bearer"].is_object());
+        assert_eq!(
+            doc["paths"]["/rpc"]["post"]["security"],
+            json!([{ "bearer": [] }, { "eixToken": [] }])
+        );
+        // Every $ref must resolve, otherwise generated clients break.
+        let mut refs = Vec::new();
+        collect_refs(&doc, &mut refs);
+        for reference in refs {
+            let Some(name) = reference.strip_prefix("#/components/schemas/") else {
+                panic!("unsupported $ref {reference}");
+            };
+            assert!(
+                doc["components"]["schemas"].get(name).is_some(),
+                "dangling $ref {reference}"
+            );
+        }
+    }
+
+    #[test]
+    fn pair_errors_map_to_http_status() {
+        let limited = anyhow::Error::new(crate::server::RpcError {
+            code: "rate_limited".into(),
+            message: "slow down".into(),
+        });
+        assert_eq!(pair_error(&limited).0, 429);
+        let unauthorized = anyhow::Error::new(crate::server::RpcError {
+            code: "unauthorized".into(),
+            message: "bad code".into(),
+        });
+        assert_eq!(pair_error(&unauthorized).0, 401);
+        assert_eq!(pair_error(&anyhow::anyhow!("database is on fire")).0, 500);
+    }
+
+    fn collect_refs(value: &Value, out: &mut Vec<String>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map {
+                    if key == "$ref" {
+                        if let Some(reference) = child.as_str() {
+                            out.push(reference.to_string());
+                        }
+                    } else {
+                        collect_refs(child, out);
+                    }
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    collect_refs(item, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }

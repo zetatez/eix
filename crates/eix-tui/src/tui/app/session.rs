@@ -757,7 +757,7 @@ impl App {
         let Some(view) = self.focused_view_mut() else {
             return;
         };
-        let max_scroll = view.text_lines.len().saturating_sub(inner_height);
+        let max_scroll = view.line_count.saturating_sub(inner_height);
         if amount < 0 {
             // Nothing above the tail to pause on: keep following so the next
             // streamed line still scrolls into view.

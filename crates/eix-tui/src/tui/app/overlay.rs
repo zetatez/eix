@@ -18,7 +18,7 @@ impl App {
         let query = picker.query.trim().to_string();
         if query.is_empty() {
             if let Some(picker) = &mut self.picker {
-                picker.items.clear();
+                picker.clear_items();
                 picker.selected = 0;
                 picker.loading = false;
             }
@@ -296,7 +296,7 @@ impl App {
         }
         self.picker_query_due = true;
         if let Some(picker) = &mut self.picker {
-            picker.items.clear();
+            picker.clear_items();
             picker.selected = 0;
             picker.loading = !picker.query.trim().is_empty();
         }
@@ -372,12 +372,60 @@ impl App {
         self.picker = None;
     }
 
-    /// Rows for the open picker: session indices or item indices.
-    pub(super) fn picker_filtered(&self) -> Vec<usize> {
-        match self.picker.as_ref().map(|picker| picker.kind) {
-            Some(PickerKind::Sessions | PickerKind::NewPane) => self.filtered_sessions(),
-            _ => self.filtered_items(),
+    /// Rows for the open picker: session indices or item indices. The result is
+    /// cached until the query or the source rows change, because both the draw
+    /// path and key handling ask for it more than once per keystroke.
+    pub(super) fn picker_filtered(&mut self) -> Vec<usize> {
+        let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
+            return Vec::new();
+        };
+        let sessions_rev = if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) {
+            self.sessions_fingerprint()
+        } else {
+            0
+        };
+        {
+            let Some(picker) = self.picker.as_ref() else {
+                return Vec::new();
+            };
+            let filter = &picker.filter;
+            if filter.valid
+                && filter.kind == Some(kind)
+                && filter.query == picker.query
+                && filter.items_rev == picker.items_rev
+                && filter.sessions_rev == sessions_rev
+            {
+                return filter.rows.clone();
+            }
         }
+        let rows = match kind {
+            PickerKind::Sessions | PickerKind::NewPane => self.filtered_sessions(),
+            _ => self.filtered_items(),
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.filter = PickerFilterCache {
+                kind: Some(kind),
+                query: picker.query.clone(),
+                items_rev: picker.items_rev,
+                sessions_rev,
+                rows: rows.clone(),
+                valid: true,
+            };
+        }
+        rows
+    }
+
+    /// Cheap fingerprint of the fields the session filter reads. Session rows
+    /// also show live status, but that does not change the matched order.
+    fn sessions_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for session in self.sessions.iter().filter(|session| !session.is_agent()) {
+            session.id.hash(&mut hasher);
+            session.name.hash(&mut hasher);
+            session.cwd.hash(&mut hasher);
+        }
+        hasher.finish()
     }
 
     pub(super) fn filtered_items(&self) -> Vec<usize> {
@@ -552,6 +600,9 @@ impl App {
             query: String::new(),
             selected: 0,
             items: Vec::new(),
+            items_rev: 0,
+            filter: PickerFilterCache::default(),
+            scroll: 0,
             loading: false,
             preview: PickerPreview::default(),
             preview_request: None,
@@ -578,7 +629,7 @@ impl App {
                 query: None,
             });
         } else if kind == PickerKind::Commands {
-            picker.items = command_items(&self.commands);
+            picker.set_items(command_items(&self.commands));
         } else if kind == PickerKind::Models {
             picker.loading = true;
             self.status = "model: loading provider catalogs…".into();
@@ -593,7 +644,7 @@ impl App {
             let _ = tx.send(Command::ListAgents { session_id });
         } else if kind == PickerKind::Subagents {
             let current = self.subagent_concurrency;
-            picker.items = subagent_picker_items(current);
+            picker.set_items(subagent_picker_items(current));
             picker.selected = picker
                 .items
                 .iter()
@@ -605,7 +656,7 @@ impl App {
                 self.status = "attach a session first".into();
                 return;
             };
-            picker.items = mode_picker_items(current);
+            picker.set_items(mode_picker_items(current));
             picker.selected = picker
                 .items
                 .iter()
@@ -625,14 +676,17 @@ impl App {
                 self.status = "attach a session first".into();
                 return;
             };
-            picker.items = timeline_picker_items(&view.events);
+            picker.set_items(timeline_picker_items(&view.events));
             self.status = format!("timeline: {} user message(s)", picker.items.len());
         } else if kind == PickerKind::Skills {
             let cwd = self
                 .focused_view()
                 .map(|view| view.session.cwd.clone())
                 .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-            picker.items = skill_picker_items(&eix_core::load_skills(&cwd, &self.compat));
+            picker.set_items(skill_picker_items(&eix_core::load_skills(
+                &cwd,
+                &self.compat,
+            )));
             self.status = format!("{} skill(s)", picker.items.len());
         } else if kind == PickerKind::Mcp {
             picker.loading = true;
@@ -647,7 +701,7 @@ impl App {
             self.status = "todos: loading…".into();
             let _ = tx.send(Command::ListTodos { session_id });
         } else if kind == PickerKind::Themes {
-            picker.items = theme_picker_items();
+            picker.set_items(theme_picker_items());
             let current = self.theme.preset.unwrap_or(THEME_DEFAULT_VALUE);
             picker.selected = picker
                 .items

@@ -141,6 +141,7 @@ impl App {
             });
         let Some(mut next) = next else {
             self.approvals.remove(session_id);
+            self.approval_rev = self.approval_rev.wrapping_add(1);
             self.close_diff_view_for(session_id);
             return;
         };
@@ -156,6 +157,7 @@ impl App {
             next.cursor = cursor.min(next.actions().len().saturating_sub(1));
         }
         self.approvals.insert(session_id.to_string(), next);
+        self.approval_rev = self.approval_rev.wrapping_add(1);
     }
 
     /// Recompute the cached question for a session from its replayable log.
@@ -442,9 +444,14 @@ impl App {
         }) else {
             return;
         };
+        self.ensure_diff_rows(&session_id);
         let Some((total, offsets)) = self.approvals.get(&session_id).map(|approval| {
-            let rows = crate::tui::diff::rows(&approval.hunks, approval.diff.as_deref());
-            if crate::tui::diff::DiffRenderer::can_render(&rows, width, "") {
+            let rows = self
+                .diff_rows
+                .as_ref()
+                .map(|cache| cache.rows.as_slice())
+                .unwrap_or(&[]);
+            if crate::tui::diff::DiffRenderer::can_render(rows, width, "") {
                 (rows.len(), crate::tui::diff::hunk_offsets(&approval.hunks))
             } else {
                 (

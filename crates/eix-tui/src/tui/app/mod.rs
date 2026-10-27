@@ -4,6 +4,7 @@
 //! there is no embedded editor process.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -13,9 +14,8 @@ use eix_core::{
     theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
     Event as SessionEvent, EventKind, HelloResult, HunkInfo, InputAnsweredPayload, InputOption,
     InputRequiredPayload, IntegrationState, IntegrationStatus, ModelInfo, PatchProposedPayload,
-    PatchResultPayload, PickerItem, ProcessInfo, ProcessList, ProcessOutput, ProcessStatus,
-    Session, SessionMode, SessionStatus, SubmitResult, TodoItem, ToolResultPayload,
-    UserMessagePayload, THEME_PRESETS,
+    PickerItem, ProcessInfo, ProcessList, ProcessOutput, ProcessStatus, Session, SessionMode,
+    SessionStatus, SubmitResult, TodoItem, ToolResultPayload, UserMessagePayload, THEME_PRESETS,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -31,6 +31,7 @@ use tokio::sync::mpsc::UnboundedSender;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::controller::{Command, Event};
+use super::diff::DiffRow;
 use super::editor::{Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
 use super::theme::Theme;
@@ -285,11 +286,16 @@ fn merge_commands(
 /// Prompt height: at least [`super::editor::PROMPT_ROWS`] content rows plus the
 /// two borders. Long drafts grow the box up to twelve total rows before the
 /// editor starts scrolling, and short terminals always keep transcript rows.
+#[cfg(test)]
 fn prompt_input_height(area_height: u16, area_width: u16, input: &Editor) -> u16 {
+    let inner_width = area_width.saturating_sub(4).max(1) as usize;
+    let rows = input.wrap(inner_width).segments.len();
+    prompt_input_height_for_rows(area_height, rows)
+}
+
+fn prompt_input_height_for_rows(area_height: u16, rows: usize) -> u16 {
     // Ten editor rows + two borders = twelve rows total.
     const PROMPT_MAX_ROWS: usize = 10;
-    let inner_width = area_width.saturating_sub(4).max(1) as usize;
-    let rows = input.layout(inner_width, 1).segments.len();
     let visible = rows.clamp(super::editor::PROMPT_ROWS as usize, PROMPT_MAX_ROWS) as u16;
     (visible + 2).min(area_height.saturating_sub(5).max(4))
 }
@@ -406,6 +412,21 @@ fn status_needs_warning(status: &str) -> bool {
         && MARKERS.iter().any(|marker| status.contains(marker))
 }
 
+/// Inputs of the live tail render. Streaming text only grows, so lengths plus
+/// the reasoning fold and queued prompts are enough to know the cached tail is
+/// still current.
+struct TailKey {
+    width: usize,
+    theme: Theme,
+    text_len: usize,
+    reasoning_len: usize,
+    reasoning_open: Option<bool>,
+    queued: Vec<String>,
+    /// Waiting dots advance with the 200 ms tick and only matter while the
+    /// model has produced nothing yet.
+    dots: Option<&'static str>,
+}
+
 struct SessionView {
     session: Session,
     events: Vec<SessionEvent>,
@@ -416,6 +437,15 @@ struct SessionView {
     /// Bumped whenever a child agent's state changes.
     subagents_rev: u64,
     history_cache: Option<transcript::HistoryCache>,
+    /// Cached live tail (streaming text, reasoning and queued prompts).
+    tail: transcript::Transcript,
+    tail_key: Option<TailKey>,
+    /// Total rendered lines (history + tail), used for scroll bounds without
+    /// materialising the text of every line.
+    line_count: usize,
+    /// Whether `text_lines` matches the current history and tail. It is rebuilt
+    /// lazily for search, copy and click-to-fold.
+    text_lines_valid: bool,
     /// Older stored events exist before the first loaded event.
     history_has_more: bool,
     /// A history request is in flight.
@@ -450,6 +480,10 @@ impl SessionView {
             subagents: HashMap::new(),
             subagents_rev: 0,
             history_cache: None,
+            tail: transcript::Transcript::new(),
+            tail_key: None,
+            line_count: 0,
+            text_lines_valid: true,
             history_has_more: false,
             history_loading: false,
             history_armed: true,
@@ -494,8 +528,8 @@ impl SessionView {
             self.events_rev,
         );
         self.slots = cache.slots.clone();
-        self.text_lines = cache.lines.iter().map(text_line).collect();
         self.user_lines = cache.user_lines.clone();
+        self.text_lines_valid = false;
     }
 
     /// What the live tail should render. A running turn with no streamed text
@@ -513,6 +547,69 @@ impl SessionView {
             }),
             None => None,
         }
+    }
+
+    /// Render the in-flight turn only when its inputs changed. A 200 ms tick or
+    /// an unrelated notification no longer re-parses a streaming message.
+    fn ensure_tail(&mut self, width: usize, theme: Theme, tick: u64, queued: &[String]) {
+        let (text_len, reasoning_len) = self
+            .stream
+            .as_ref()
+            .map(|stream| (stream.text.len(), stream.reasoning.len()))
+            .unwrap_or((0, 0));
+        let dots = if self
+            .live()
+            .is_some_and(|live| live.text.is_empty() && live.reasoning.is_empty())
+        {
+            Some(transcript::waiting_dots(tick))
+        } else {
+            None
+        };
+        let reasoning_open = self.folds.get(&FoldId::Live).copied();
+        if let Some(key) = self.tail_key.as_ref() {
+            if key.width == width
+                && key.theme == theme
+                && key.text_len == text_len
+                && key.reasoning_len == reasoning_len
+                && key.reasoning_open == reasoning_open
+                && key.dots == dots
+                && key.queued.as_slice() == queued
+            {
+                return;
+            }
+        }
+        let live = self.live();
+        let mut tail = transcript::render_tail(live, queued, &self.folds, width, theme, tick);
+        if self.session.is_agent() && self.session.parent_id.is_some() {
+            tail.lines.push(parent_link_line(theme));
+            tail.slots.push(None);
+        }
+        self.tail = tail;
+        self.tail_key = Some(TailKey {
+            width,
+            theme,
+            text_len,
+            reasoning_len,
+            reasoning_open,
+            queued: queued.to_vec(),
+            dots,
+        });
+        self.text_lines_valid = false;
+    }
+
+    /// Plain text for search/copy/fold clicks. Building it on demand keeps the
+    /// per-event path free of a `String` per rendered line.
+    fn ensure_text_lines(&mut self) {
+        if self.text_lines_valid {
+            return;
+        }
+        let mut lines = Vec::with_capacity(self.line_count);
+        if let Some(cache) = self.history_cache.as_ref() {
+            lines.extend(cache.lines.iter().map(text_line));
+        }
+        lines.extend(self.tail.lines.iter().map(text_line));
+        self.text_lines = lines;
+        self.text_lines_valid = true;
     }
 
     fn upsert_subagent(&mut self, agent_id: String, call_id: String, name: String) {
@@ -609,17 +706,15 @@ impl SessionView {
         for event in &self.events {
             match event.kind {
                 EventKind::ToolResult => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<ToolResultPayload>(event.payload.clone())
-                    {
-                        resolved_calls.insert(payload.call_id);
+                    // Only the id is needed here; reading it from the payload
+                    // avoids cloning the (possibly large) tool output.
+                    if let Some(call_id) = event.payload.get("call_id").and_then(Value::as_str) {
+                        resolved_calls.insert(call_id.to_string());
                     }
                 }
                 EventKind::PatchApplied | EventKind::PatchRejected | EventKind::PatchConflict => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<PatchResultPayload>(event.payload.clone())
-                    {
-                        resolved_patches.insert(payload.patch_id);
+                    if let Some(patch_id) = event.payload.get("patch_id").and_then(Value::as_str) {
+                        resolved_patches.insert(patch_id.to_string());
                     }
                 }
                 _ => {}
@@ -630,26 +725,26 @@ impl SessionView {
         for event in &self.events {
             match event.kind {
                 EventKind::ApprovalRequired if tool.is_none() => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<ApprovalRequiredPayload>(event.payload.clone())
-                    {
+                    if let Ok(payload) = ApprovalRequiredPayload::deserialize(&event.payload) {
                         if !resolved_calls.contains(&payload.call_id) {
                             // Shell approvals carry a deliberately short
                             // daemon summary. Keep the real command line so the
                             // card can show it in full instead of approving a
                             // truncated command.
-                            let mut summary =
-                                if matches!(payload.tool.as_str(), "run_command" | "start_command")
-                                {
-                                    payload
-                                        .arguments
-                                        .get("command")
-                                        .and_then(serde_json::Value::as_str)
-                                        .map(|command| format!("$ {command}"))
-                                        .unwrap_or(payload.summary)
-                                } else {
-                                    payload.summary
-                                };
+                            let mut summary = if matches!(
+                                payload.tool.as_str(),
+                                "exec_command" | "run_command" | "start_command"
+                            ) {
+                                payload
+                                    .arguments
+                                    .get("cmd")
+                                    .or_else(|| payload.arguments.get("command"))
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(|command| format!("$ {command}"))
+                                    .unwrap_or(payload.summary)
+                            } else {
+                                payload.summary
+                            };
                             let risk = payload.risk.to_ascii_uppercase();
                             if !risk.is_empty() {
                                 summary = format!("[{risk}] {summary}");
@@ -698,9 +793,7 @@ impl SessionView {
                     }
                 }
                 EventKind::PatchProposed => {
-                    if let Ok(payload) =
-                        serde_json::from_value::<PatchProposedPayload>(event.payload.clone())
-                    {
+                    if let Ok(payload) = PatchProposedPayload::deserialize(&event.payload) {
                         if !resolved_patches.contains(&payload.patch_id) {
                             // A later proposal for the same patch (an edit
                             // before approval) supersedes the earlier one.
@@ -732,9 +825,7 @@ impl SessionView {
             if event.kind != EventKind::InputAnswered {
                 continue;
             }
-            if let Ok(payload) =
-                serde_json::from_value::<InputAnsweredPayload>(event.payload.clone())
-            {
+            if let Ok(payload) = InputAnsweredPayload::deserialize(&event.payload) {
                 answered.insert(payload.input_id);
             }
         }
@@ -743,9 +834,7 @@ impl SessionView {
             if event.kind != EventKind::InputRequired {
                 continue;
             }
-            if let Ok(payload) =
-                serde_json::from_value::<InputRequiredPayload>(event.payload.clone())
-            {
+            if let Ok(payload) = InputRequiredPayload::deserialize(&event.payload) {
                 if !answered.contains(&payload.input_id) {
                     pending = Some(PendingInput {
                         input_id: payload.input_id,
@@ -892,6 +981,18 @@ struct PickerPreview {
     loading: bool,
 }
 
+/// Filtered row indices, recomputed only when the query or the source rows
+/// change. Fuzzy matching over a large file list used to run on every frame.
+#[derive(Default)]
+struct PickerFilterCache {
+    kind: Option<PickerKind>,
+    query: String,
+    items_rev: u64,
+    sessions_rev: u64,
+    rows: Vec<usize>,
+    valid: bool,
+}
+
 struct Picker {
     kind: PickerKind,
     query: String,
@@ -899,6 +1000,11 @@ struct Picker {
     /// Rows for data providers and the command palette. Session kinds read
     /// `App::sessions` directly so live status changes show through.
     items: Vec<PickerItem>,
+    /// Bumped on every row replacement so the filter cache can notice it.
+    items_rev: u64,
+    filter: PickerFilterCache,
+    /// First visible row of the list window.
+    scroll: usize,
     /// True until the daemon answers a data kind, so the overlay can say
     /// "loading" instead of "no matches".
     loading: bool,
@@ -906,6 +1012,17 @@ struct Picker {
     preview: PickerPreview,
     /// Request queued by the last draw; the event loop sends it after drawing.
     preview_request: Option<(String, Option<String>, String)>,
+}
+
+impl Picker {
+    fn set_items(&mut self, items: Vec<PickerItem>) {
+        self.items = items;
+        self.items_rev = self.items_rev.wrapping_add(1);
+    }
+
+    fn clear_items(&mut self) {
+        self.set_items(Vec::new());
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1174,6 +1291,37 @@ struct InboxItem {
     kind: PendingKind,
 }
 
+/// Parsed diff rows for the newest approval render. Parsing a large unified
+/// diff allocates a row per line, so keep it until the approval changes.
+struct DiffRowsCache {
+    rev: u64,
+    session: String,
+    rows: Vec<DiffRow>,
+}
+
+/// Rendered side-by-side body for the approval card.
+struct CardDiffCache {
+    rev: u64,
+    session: String,
+    width: usize,
+    theme: Theme,
+    shown: usize,
+    lines: Vec<Line<'static>>,
+}
+
+/// Rendered interactive diff for the full-screen review. Scrolling does not
+/// invalidate it; only the hunk cursor, selection or width do.
+struct DiffBodyCache {
+    rev: u64,
+    session: String,
+    width: usize,
+    theme: Theme,
+    interactive: bool,
+    selected: Vec<bool>,
+    cursor: usize,
+    lines: Vec<Line<'static>>,
+}
+
 /// Full-screen review of an approval's diff, opened with `d`.
 struct DiffView {
     session_id: String,
@@ -1410,6 +1558,12 @@ pub struct App {
     integrations: HashMap<String, IntegrationState>,
     /// Tool calls waiting on a decision, keyed by session id.
     approvals: HashMap<String, PendingApproval>,
+    /// Bumped whenever the pending approval set is replaced.
+    approval_rev: u64,
+    /// Rows/body caches shared by the card and the full-screen diff review.
+    diff_rows: Option<DiffRowsCache>,
+    card_diff: Option<CardDiffCache>,
+    diff_body: Option<DiffBodyCache>,
     /// `ask_user` questions waiting on an answer, keyed by session id.
     inputs: HashMap<String, PendingInput>,
     /// Full-screen diff review, when open.
@@ -1471,6 +1625,10 @@ pub struct App {
     /// Draft captured when history browsing started, restored by Ctrl-J past
     /// the newest entry.
     history_draft: String,
+    /// Submitted prompts for the focused session, keyed by `(session id,
+    /// events revision)` so browsing does not rescan the whole event log on
+    /// every Ctrl-J/Ctrl-K.
+    history_entries: Option<(String, u64, Rc<Vec<String>>)>,
     /// Prompts submitted while their session was busy, keyed by session id.
     /// `tick` drains one at a time as sessions go idle.
     queues: HashMap<String, VecDeque<String>>,
@@ -1580,8 +1738,7 @@ fn timeline_picker_items(events: &[SessionEvent]) -> Vec<PickerItem> {
         .rev()
         .filter(|event| event.kind == EventKind::UserMessage)
         .filter_map(|event| {
-            let payload =
-                serde_json::from_value::<UserMessagePayload>(event.payload.clone()).ok()?;
+            let payload = UserMessagePayload::deserialize(&event.payload).ok()?;
             let text = payload.text.trim();
             let preview = if text.is_empty() {
                 "[image]".to_string()
@@ -2015,7 +2172,15 @@ pub(super) fn tool_call_summary(tool: &str, arguments: &Value) -> String {
             .unwrap_or_default()
     };
     match tool {
-        "run_command" | "start_command" => format!("$ {}", string("command")),
+        "exec_command" | "run_command" | "start_command" => {
+            let command = arguments
+                .get("cmd")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| string("command"));
+            format!("$ {command}")
+        }
+        "write_stdin" => format!("stdin {}", truncate(string("session_id"), 12)),
+        "view_image" => format!("image {}", string("path")),
         "read_file" => format!("read {}", string("path")),
         "list_dir" => {
             let path = string("path");
@@ -2030,15 +2195,24 @@ pub(super) fn tool_call_summary(tool: &str, arguments: &Value) -> String {
             let new = string("newString").len();
             format!("edit {} (-{old} +{new} bytes)", string("path"))
         }
-        "patch" => {
-            let files = string("patchText")
+        "patch" | "apply_patch" => {
+            let text = ["patchText", "patch", "input"]
+                .iter()
+                .find_map(|key| arguments.get(*key).and_then(Value::as_str))
+                .unwrap_or_default();
+            let files: Vec<&str> = text
                 .lines()
-                .filter(|line| line.starts_with("+++ "))
-                .count();
-            match files {
-                0 => "patch".to_string(),
-                1 => "patch (1 file)".to_string(),
-                count => format!("patch ({count} files)"),
+                .filter_map(|line| {
+                    line.strip_prefix("*** Add File: ")
+                        .or_else(|| line.strip_prefix("*** Update File: "))
+                        .or_else(|| line.strip_prefix("*** Delete File: "))
+                        .map(str::trim)
+                })
+                .collect();
+            match files.as_slice() {
+                [] => "patch".to_string(),
+                [file] => format!("patch {file}"),
+                files => format!("patch ({} files)", files.len()),
             }
         }
         "process_output" => {
@@ -2955,190 +3129,223 @@ fn next_prev_key(key: KeyEvent) -> KeyEvent {
     }
 }
 
-fn draw_approval_card(frame: &mut Frame, area: Rect, approval: &PendingApproval, theme: Theme) {
-    let dialog_bg = dialog_background(theme);
-    if area.width < 24 || area.height < 6 {
-        return;
-    }
-    let file_change = transcript::is_file_change_tool(&approval.tool);
-    let actions = approval.actions();
-    let cursor = approval.cursor.min(actions.len().saturating_sub(1));
-    let diff_lines: Vec<&str> = approval.diff.as_deref().unwrap_or("").lines().collect();
-    let inner = area.width.saturating_sub(4) as usize;
-    let rows = super::diff::rows(&approval.hunks, approval.diff.as_deref());
-    let side_by_side = (!rows.is_empty())
-        .then(|| {
-            super::diff::DiffRenderer::new(
-                &rows,
-                inner,
-                approval.path.as_deref().unwrap_or(""),
-                theme,
-                "",
-                dialog_bg,
-            )
-        })
-        .flatten();
-    let diff_len = if side_by_side.is_some() {
-        rows.len()
-    } else {
-        diff_lines.len()
-    };
-    // The summary can be a full shell command. Wrap it instead of cutting it
-    // off, but keep the action list and hint on screen. The daemon prefixes
-    // new approvals with `[RISK]`; older/restored cards fall back to the tool
-    // heuristic.
-    let (risk, risk_color, body) = match approval
-        .summary
-        .strip_prefix('[')
-        .and_then(|rest| rest.split_once("] "))
-    {
-        Some((level, body)) => (level, risk_level_color(level, theme), body),
-        None => {
-            let (risk, color) = approval_risk(&approval.tool, theme);
-            (risk, color, approval.summary.as_str())
+impl App {
+    fn draw_approval_card(&mut self, frame: &mut Frame, area: Rect, session_id: &str) {
+        let theme = self.theme;
+        let dialog_bg = dialog_background(theme);
+        if area.width < 24 || area.height < 6 {
+            return;
         }
-    };
-    let risk_label = format!("  [{risk}]");
-    let prefix_width = 2; // "⚠ "
-    let body_width = inner
-        .saturating_sub(prefix_width + UnicodeWidthStr::width(risk_label.as_str()))
-        .max(8);
-    let mut summary_lines = wrap_text(body, body_width);
-    let max_height = area.height.saturating_sub(1) as usize;
-    let capacity = max_height.saturating_sub(2); // rows inside the borders
-    let hint_rows = 1;
-    // The summary can be a full shell command. Wrap it, but never let it push
-    // the action list or hint off the card.
-    let summary_cap = capacity.saturating_sub(actions.len() + hint_rows).max(1);
-    if summary_lines.len() > summary_cap {
-        summary_lines.truncate(summary_cap.saturating_sub(1));
-        summary_lines.push("…".to_string());
-    }
-    let summary_rows = summary_lines.len();
-    // On a short pane, scroll the action list instead of clipping the
-    // highlighted row. The diff only gets space after all actions fit.
-    let action_rows = actions
-        .len()
-        .min(capacity.saturating_sub(summary_rows + hint_rows))
-        .max(1);
-    let action_start = if action_rows >= actions.len() {
-        0
-    } else {
-        cursor
-            .saturating_sub(action_rows.saturating_sub(1))
-            .min(actions.len().saturating_sub(action_rows))
-    };
-    let diff_budget = capacity.saturating_sub(summary_rows + action_rows + hint_rows);
-    let diff_reserve = usize::from(diff_len > 0 && diff_budget > 0);
-    // File changes use the whole review budget: the card is the primary
-    // vimdiff-style view for write_file / edit / patch. Other tools keep the
-    // compact 8-row preview so a long command result does not take over.
-    let max_diff = diff_budget.saturating_sub(diff_reserve);
-    let max_diff = if file_change {
-        max_diff
-    } else {
-        max_diff.min(8)
-    };
-    let shown = diff_len.min(max_diff);
-    let truncated = diff_len > shown && diff_budget > 0;
-    // Leave the pane's title row visible and never underflow `y` on a pane
-    // that starts at the top of the screen.
-    let content_rows = summary_rows + action_rows + shown + usize::from(truncated) + hint_rows;
-    let height = (content_rows + 2).min(max_height).max(3) as u16;
-    let rect = Rect {
-        x: area.x + 1,
-        y: area.y + area.height - height - 1,
-        width: area.width.saturating_sub(2),
-        height,
-    };
-    frame.render_widget(Clear, rect);
-    frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
-
-    let mut lines = Vec::with_capacity(content_rows);
-    for (index, summary) in summary_lines.into_iter().enumerate() {
-        let mut spans = Vec::new();
-        if index == 0 {
-            spans.push(Span::styled(
-                "⚠ ",
-                Style::default()
-                    .fg(composer_warn(theme))
-                    .add_modifier(Modifier::BOLD),
-            ));
-            spans.push(Span::styled(
-                summary,
-                Style::default().fg(composer_warn(theme)),
-            ));
-            spans.push(Span::styled(
-                risk_label.clone(),
-                Style::default().fg(risk_color),
-            ));
+        if !self.approvals.contains_key(session_id) {
+            return;
+        }
+        self.ensure_diff_rows(session_id);
+        let Some(approval) = self.approvals.get(session_id) else {
+            return;
+        };
+        let rows = self
+            .diff_rows
+            .as_ref()
+            .map(|cache| cache.rows.as_slice())
+            .unwrap_or(&[]);
+        let file_change = transcript::is_file_change_tool(&approval.tool);
+        let actions = approval.actions();
+        let cursor = approval.cursor.min(actions.len().saturating_sub(1));
+        let inner = area.width.saturating_sub(4) as usize;
+        let side_by_side = (!rows.is_empty())
+            .then(|| {
+                super::diff::DiffRenderer::new(
+                    rows,
+                    inner,
+                    approval.path.as_deref().unwrap_or(""),
+                    theme,
+                    "",
+                    dialog_bg,
+                )
+            })
+            .flatten();
+        let diff_len = if side_by_side.is_some() {
+            rows.len()
         } else {
-            spans.push(Span::raw("  "));
-            spans.push(Span::styled(
-                summary,
-                Style::default().fg(composer_warn(theme)),
-            ));
+            approval.diff.as_deref().unwrap_or("").lines().count()
+        };
+        // The summary can be a full shell command. Wrap it instead of cutting it
+        // off, but keep the action list and hint on screen. The daemon prefixes
+        // new approvals with `[RISK]`; older/restored cards fall back to the tool
+        // heuristic.
+        let (risk, risk_color, body) = match approval
+            .summary
+            .strip_prefix('[')
+            .and_then(|rest| rest.split_once("] "))
+        {
+            Some((level, body)) => (level, risk_level_color(level, theme), body),
+            None => {
+                let (risk, color) = approval_risk(&approval.tool, theme);
+                (risk, color, approval.summary.as_str())
+            }
+        };
+        let risk_label = format!("  [{risk}]");
+        let prefix_width = 2; // "⚠ "
+        let body_width = inner
+            .saturating_sub(prefix_width + UnicodeWidthStr::width(risk_label.as_str()))
+            .max(8);
+        let mut summary_lines = wrap_text(body, body_width);
+        let max_height = area.height.saturating_sub(1) as usize;
+        let capacity = max_height.saturating_sub(2); // rows inside the borders
+        let hint_rows = 1;
+        // The summary can be a full shell command. Wrap it, but never let it push
+        // the action list or hint off the card.
+        let summary_cap = capacity.saturating_sub(actions.len() + hint_rows).max(1);
+        if summary_lines.len() > summary_cap {
+            summary_lines.truncate(summary_cap.saturating_sub(1));
+            summary_lines.push("…".to_string());
         }
-        lines.push(Line::from(spans));
-    }
-    if let Some(mut renderer) = side_by_side {
-        lines.extend(renderer.render(&rows[..rows.len().min(shown)], false, &[], 0));
-    } else {
-        for line in diff_lines.iter().take(shown) {
+        let summary_rows = summary_lines.len();
+        // On a short pane, scroll the action list instead of clipping the
+        // highlighted row. The diff only gets space after all actions fit.
+        let action_rows = actions
+            .len()
+            .min(capacity.saturating_sub(summary_rows + hint_rows))
+            .max(1);
+        let action_start = if action_rows >= actions.len() {
+            0
+        } else {
+            cursor
+                .saturating_sub(action_rows.saturating_sub(1))
+                .min(actions.len().saturating_sub(action_rows))
+        };
+        let diff_budget = capacity.saturating_sub(summary_rows + action_rows + hint_rows);
+        let diff_reserve = usize::from(diff_len > 0 && diff_budget > 0);
+        // File changes use the whole review budget: the card is the primary
+        // vimdiff-style view for write_file / edit / patch. Other tools keep the
+        // compact 8-row preview so a long command result does not take over.
+        let max_diff = diff_budget.saturating_sub(diff_reserve);
+        let max_diff = if file_change {
+            max_diff
+        } else {
+            max_diff.min(8)
+        };
+        let shown = diff_len.min(max_diff);
+        let truncated = diff_len > shown && diff_budget > 0;
+        // Leave the pane's title row visible and never underflow `y` on a pane
+        // that starts at the top of the screen.
+        let content_rows = summary_rows + action_rows + shown + usize::from(truncated) + hint_rows;
+        let height = (content_rows + 2).min(max_height).max(3) as u16;
+        let rect = Rect {
+            x: area.x + 1,
+            y: area.y + area.height - height - 1,
+            width: area.width.saturating_sub(2),
+            height,
+        };
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+
+        let mut lines = Vec::with_capacity(content_rows);
+        for (index, summary) in summary_lines.into_iter().enumerate() {
+            let mut spans = Vec::new();
+            if index == 0 {
+                spans.push(Span::styled(
+                    "⚠ ",
+                    Style::default()
+                        .fg(composer_warn(theme))
+                        .add_modifier(Modifier::BOLD),
+                ));
+                spans.push(Span::styled(
+                    summary,
+                    Style::default().fg(composer_warn(theme)),
+                ));
+                spans.push(Span::styled(
+                    risk_label.clone(),
+                    Style::default().fg(risk_color),
+                ));
+            } else {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    summary,
+                    Style::default().fg(composer_warn(theme)),
+                ));
+            }
+            lines.push(Line::from(spans));
+        }
+        if let Some(mut renderer) = side_by_side {
+            let cache_hit = self.card_diff.as_ref().is_some_and(|cache| {
+                cache.rev == self.approval_rev
+                    && cache.session == session_id
+                    && cache.width == inner
+                    && cache.theme == theme
+                    && cache.shown == shown
+            });
+            if !cache_hit {
+                let rendered = renderer.render(&rows[..rows.len().min(shown)], false, &[], 0);
+                self.card_diff = Some(CardDiffCache {
+                    rev: self.approval_rev,
+                    session: session_id.to_string(),
+                    width: inner,
+                    theme,
+                    shown,
+                    lines: rendered,
+                });
+            }
+            if let Some(cache) = self.card_diff.as_ref() {
+                lines.extend(cache.lines.iter().cloned());
+            }
+        } else {
+            for line in approval.diff.as_deref().unwrap_or("").lines().take(shown) {
+                lines.push(Line::from(Span::styled(
+                    truncate(line, inner),
+                    diff_line_style(line, theme),
+                )));
+            }
+        }
+        if truncated {
             lines.push(Line::from(Span::styled(
-                truncate(line, inner),
-                diff_line_style(line, theme),
+                "… diff truncated",
+                Style::default().fg(composer_muted(theme)),
             )));
         }
-    }
-    if truncated {
+        let selected_bg = composer_warn(theme);
+        let selected_style = Style::default()
+            .fg(badge_text_color(selected_bg))
+            .bg(selected_bg)
+            .add_modifier(Modifier::BOLD);
+        for (index, action) in actions
+            .iter()
+            .enumerate()
+            .skip(action_start)
+            .take(action_rows)
+        {
+            let check = if index == cursor { "x" } else { " " };
+            let mut text = format!("- [{check}] {}", approval.action_label(*action));
+            if index == 0 {
+                text.push_str("  ★ recommended");
+            }
+            let text = truncate(&text, inner);
+            let style = if index == cursor {
+                selected_style
+            } else {
+                Style::default().fg(approval_action_color(*action, theme))
+            };
+            lines.push(Line::from(Span::styled(pad_to(&text, inner), style)));
+        }
         lines.push(Line::from(Span::styled(
-            "… diff truncated",
+            truncate(
+                "Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel",
+                inner,
+            ),
             Style::default().fg(composer_muted(theme)),
         )));
-    }
-    let selected_bg = composer_warn(theme);
-    let selected_style = Style::default()
-        .fg(badge_text_color(selected_bg))
-        .bg(selected_bg)
-        .add_modifier(Modifier::BOLD);
-    for (index, action) in actions
-        .iter()
-        .enumerate()
-        .skip(action_start)
-        .take(action_rows)
-    {
-        let check = if index == cursor { "x" } else { " " };
-        let mut text = format!("- [{check}] {}", approval.action_label(*action));
-        if index == 0 {
-            text.push_str("  ★ recommended");
-        }
-        let text = truncate(&text, inner);
-        let style = if index == cursor {
-            selected_style
-        } else {
-            Style::default().fg(approval_action_color(*action, theme))
-        };
-        lines.push(Line::from(Span::styled(pad_to(&text, inner), style)));
-    }
-    lines.push(Line::from(Span::styled(
-        truncate(
-            "Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel",
-            inner,
-        ),
-        Style::default().fg(composer_muted(theme)),
-    )));
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(composer_warn(theme)))
-        .title(format!(" approval · {} ", approval.tool));
-    frame.render_widget(
-        Paragraph::new(lines)
-            .block(block)
-            .style(Style::default().bg(dialog_bg)),
-        rect,
-    );
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(composer_warn(theme)))
+            .title(format!(" approval · {} ", approval.tool));
+        frame.render_widget(
+            Paragraph::new(lines)
+                .block(block)
+                .style(Style::default().bg(dialog_bg)),
+            rect,
+        );
+    }
 }
 
 fn approval_action_color(action: ApprovalAction, theme: Theme) -> Color {

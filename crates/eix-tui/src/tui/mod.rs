@@ -10,7 +10,7 @@ mod editor;
 mod keys;
 mod markdown;
 mod math;
-mod net;
+pub(crate) mod net;
 mod syntax;
 mod theme;
 mod transcript;
@@ -128,6 +128,19 @@ pub async fn run(
             maybe = ev_rx.recv() => match maybe {
                 Some(event) => {
                     app.handle_event(event, &cmd_tx);
+                    // A streaming turn produces a notification per delta.
+                    // Draining the queue renders one frame for the whole burst
+                    // instead of one frame per token.
+                    let mut drained = 0;
+                    while drained < 512 {
+                        match ev_rx.try_recv() {
+                            Ok(event) => {
+                                app.handle_event(event, &cmd_tx);
+                                drained += 1;
+                            }
+                            Err(_) => break,
+                        }
+                    }
                     // Attention alerts render as top-right toasts; no desktop
                     // notification popups or terminal-title changes.
                     if app.take_ring() {

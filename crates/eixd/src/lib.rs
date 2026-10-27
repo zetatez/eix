@@ -3,6 +3,7 @@
 //! It owns sessions, the SQLite event log and the provider turn loop. Frontends
 //! talk to it over a Unix socket using the protocol in `eix-core`.
 
+pub mod auth;
 pub mod blob;
 pub mod classifier;
 pub mod context;
@@ -12,6 +13,7 @@ pub mod lsp;
 pub mod mcp;
 pub mod memory;
 pub mod model_catalog;
+pub mod oauth;
 pub mod permissions;
 pub mod picker;
 pub mod plugin;

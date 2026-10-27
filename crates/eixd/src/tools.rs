@@ -1,21 +1,19 @@
 //! Built-in tools and the workspace sandbox.
 //!
 //! Tools receive JSON arguments from the model, never a pre-rendered command.
-//! `read_file` / `list_dir` are read-only; `write_file` / `run_command` mutate
-//! the workspace and therefore pass through the approval gate in `server`.
-//!
-//! Phase 2a executes approved writes directly. The staged shadow workspace
-//! described in DESIGN.md is a later step; until then the approval card is the
-//! safety boundary.
+//! Reading, searching and listing go through `exec_command`; edits go through
+//! `apply_patch`. Both mutate the workspace only after the approval gate in
+//! `server` allows the concrete call.
 
 use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use eix_core::{sandbox, Config, HunkInfo, SandboxMode, ToolDefinition};
-use regex::{Regex, RegexBuilder};
+use regex::Regex;
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
 
@@ -40,7 +38,24 @@ struct ToolSpec {
 
 const TOOL_SPECS: &[ToolSpec] = &[
     ToolSpec {
-        name: "read_file",
+        name: "apply_patch",
+        subagent_allowed: false,
+        parallel_safe: false,
+    },
+    ToolSpec {
+        name: "exec_command",
+        // A child may run proved read-only commands; the permission engine
+        // still refuses anything that would mutate the workspace.
+        subagent_allowed: true,
+        parallel_safe: false,
+    },
+    ToolSpec {
+        name: "write_stdin",
+        subagent_allowed: false,
+        parallel_safe: false,
+    },
+    ToolSpec {
+        name: "view_image",
         subagent_allowed: true,
         parallel_safe: true,
     },
@@ -65,62 +80,17 @@ const TOOL_SPECS: &[ToolSpec] = &[
         parallel_safe: false,
     },
     ToolSpec {
-        name: "webfetch",
+        name: "web_fetch",
         subagent_allowed: true,
         parallel_safe: true,
     },
     ToolSpec {
-        name: "websearch",
-        subagent_allowed: true,
-        parallel_safe: true,
-    },
-    ToolSpec {
-        name: "list_dir",
-        subagent_allowed: true,
-        parallel_safe: true,
-    },
-    ToolSpec {
-        name: "grep",
-        subagent_allowed: true,
-        parallel_safe: true,
-    },
-    ToolSpec {
-        name: "glob",
+        name: "web_search",
         subagent_allowed: true,
         parallel_safe: true,
     },
     ToolSpec {
         name: "lsp_diagnostics",
-        subagent_allowed: true,
-        parallel_safe: false,
-    },
-    ToolSpec {
-        name: "write_file",
-        subagent_allowed: false,
-        parallel_safe: false,
-    },
-    ToolSpec {
-        name: "edit",
-        subagent_allowed: false,
-        parallel_safe: false,
-    },
-    ToolSpec {
-        name: "patch",
-        subagent_allowed: false,
-        parallel_safe: false,
-    },
-    ToolSpec {
-        name: "run_command",
-        subagent_allowed: false,
-        parallel_safe: false,
-    },
-    ToolSpec {
-        name: "start_command",
-        subagent_allowed: false,
-        parallel_safe: false,
-    },
-    ToolSpec {
-        name: "process_output",
         subagent_allowed: true,
         parallel_safe: false,
     },
@@ -161,18 +131,61 @@ fn spec(tool: &str) -> Option<&'static ToolSpec> {
 }
 
 /// Tool definitions sent to the provider. Keep descriptions short: they are
-/// paid for on every request.
+/// paid for on every request. The schemas are built once and cloned, so a turn
+/// with several tool rounds does not re-run the JSON macros each time.
 pub fn definitions() -> Vec<ToolDefinition> {
+    static DEFINITIONS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+    DEFINITIONS.get_or_init(build_definitions).clone()
+}
+
+fn build_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
-            "read_file",
-            "Read a UTF-8 file in the workspace. Returns numbered lines; use offset/limit for large files.",
+            "apply_patch",
+            "Edit files with a patch. Use *** Begin Patch, Add/Update/Delete File hunks, then *** End Patch. Requires approval.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative path."},
-                    "offset": {"type": "integer", "description": "First line (1-based, default 1)."},
-                    "limit": {"type": "integer", "description": "Max lines (default 2000)."}
+                    "patchText": {"type": "string", "description": "*** Begin Patch ... *** End Patch."}
+                },
+                "required": ["patchText"]
+            }),
+        ),
+        ToolDefinition::function(
+            "exec_command",
+            "Run a shell command in the workspace. Returns output, or a session id when it is still running. Use cat, sed, awk, nl, rg, fd and ls for files.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string", "description": "Shell command to execute."},
+                    "workdir": {"type": "string", "description": "Workspace-relative directory (default: session cwd)."},
+                    "yield_time_ms": {"type": "integer", "description": "Wait for output before returning a session id (default 10000, max 30000)."},
+                    "max_output_tokens": {"type": "integer", "description": "Approximate output cap (default: config limit)."}
+                },
+                "required": ["cmd"]
+            }),
+        ),
+        ToolDefinition::function(
+            "write_stdin",
+            "Write stdin to a running exec_command session, or poll its new output. Use an empty chars to poll.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string", "description": "Session id returned by exec_command."},
+                    "chars": {"type": "string", "description": "Bytes to write; empty to only poll."},
+                    "yield_time_ms": {"type": "integer", "description": "Wait for output (default 1000, max 30000)."}
+                },
+                "required": ["session_id"]
+            }),
+        ),
+        ToolDefinition::function(
+            "view_image",
+            "Load a workspace image so you can inspect it visually.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Workspace-relative image path."},
+                    "detail": {"type": "string", "enum": ["high", "original"], "description": "Image detail (default high)."}
                 },
                 "required": ["path"]
             }),
@@ -231,7 +244,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::function(
-            "webfetch",
+            "web_fetch",
             "Fetch an http(s) URL as readable text (about 100 KB max).",
             json!({
                 "type": "object",
@@ -242,7 +255,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::function(
-            "websearch",
+            "web_search",
             "Search the web and return result titles and URLs.",
             json!({
                 "type": "object",
@@ -254,46 +267,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::function(
-            "list_dir",
-            "List a workspace directory.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string", "description": "Workspace-relative directory (default .)."}
-                }
-            }),
-        ),
-        ToolDefinition::function(
-            "grep",
-            "Search file contents in the workspace. Returns path:line: preview.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Regex, or literal text."},
-                    "path": {"type": "string", "description": "Directory to search (default .)."},
-                    "include": {"type": "string", "description": "Only paths matching this glob."},
-                    "literal": {"type": "boolean", "description": "Match literal text (default false)."},
-                    "caseSensitive": {"type": "boolean", "description": "Case-sensitive (default true)."},
-                    "limit": {"type": "integer", "description": "Max matching lines (default 100)."}
-                },
-                "required": ["pattern"]
-            }),
-        ),
-        ToolDefinition::function(
-            "glob",
-            "Find workspace paths matching a glob.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "pattern": {"type": "string", "description": "Glob relative to path, e.g. **/*.ts."},
-                    "path": {"type": "string", "description": "Directory to search (default .)."},
-                    "hidden": {"type": "boolean", "description": "Include hidden entries (default false)."},
-                    "limit": {"type": "integer", "description": "Max paths (default 100)."}
-                },
-                "required": ["pattern"]
-            }),
-        ),
-        ToolDefinition::function(
             "lsp_diagnostics",
             "Return LSP diagnostics for one file.",
             json!({
@@ -302,78 +275,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "path": {"type": "string", "description": "File to check."}
                 },
                 "required": ["path"]
-            }),
-        ),
-        ToolDefinition::function(
-            "write_file",
-            "Create or overwrite a workspace file. Requires approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            }),
-        ),
-        ToolDefinition::function(
-            "edit",
-            "Replace exact text in a workspace file. Requires approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "oldString": {"type": "string", "description": "Exact text; must match once unless replaceAll."},
-                    "newString": {"type": "string", "description": "Replacement; must differ."},
-                    "replaceAll": {"type": "boolean", "description": "Replace every match (default false)."}
-                },
-                "required": ["path", "oldString", "newString"]
-            }),
-        ),
-        ToolDefinition::function(
-            "patch",
-            "Apply a multi-file apply_patch. Requires approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "patchText": {"type": "string", "description": "*** Begin Patch ... *** End Patch."}
-                },
-                "required": ["patchText"]
-            }),
-        ),
-        ToolDefinition::function(
-            "run_command",
-            "Run a shell command in the workspace. Requires approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "cwd": {"type": "string", "description": "Workspace-relative directory."}
-                },
-                "required": ["command"]
-            }),
-        ),
-        ToolDefinition::function(
-            "start_command",
-            "Start a background command and return its process id. Requires approval.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"},
-                    "cwd": {"type": "string", "description": "Workspace-relative directory."}
-                },
-                "required": ["command"]
-            }),
-        ),
-        ToolDefinition::function(
-            "process_output",
-            "Read recent output from a background process.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "process_id": {"type": "string", "description": "Process id (default: newest)."},
-                    "max_bytes": {"type": "integer", "description": "Trailing bytes (default 8000)."}
-                }
             }),
         ),
         ToolDefinition::function(
@@ -484,38 +385,19 @@ pub fn parallel_safe(tool: &str) -> bool {
 }
 
 /// Tools that always mutate and are therefore hidden from read-only sessions.
-/// `run_command` is deliberately not here: read-only shell commands such as
+/// `exec_command` is deliberately not here: read-only shell commands such as
 /// `git status` are useful, and the permission engine rejects mutating ones.
 pub fn hard_mutating(tool: &str) -> bool {
-    matches!(tool, "write_file" | "edit" | "patch" | "start_command")
+    matches!(tool, "apply_patch" | "write_stdin")
 }
 
 /// One-line description shown in the approval card / notification.
 pub fn summarize(tool: &str, args: &Value) -> String {
     match tool {
-        "read_file" => format!("read_file {}", string_arg(args, "path")),
-        "list_dir" => {
-            let path = optional_string(args, "path").unwrap_or(".");
-            format!("list_dir {path}")
-        }
-        "grep" => {
-            let pattern = string_arg(args, "pattern");
-            let path = optional_string(args, "path").unwrap_or(".");
-            format!("grep {:?} in {path}", truncate(&pattern, 80))
-        }
-        "glob" => {
-            let pattern = string_arg(args, "pattern");
-            let path = optional_string(args, "path").unwrap_or(".");
-            format!("glob {:?} in {path}", truncate(&pattern, 80))
-        }
         "lsp_diagnostics" => format!("lsp_diagnostics {}", string_arg(args, "path")),
-        "edit" => {
-            let path = string_arg(args, "path");
-            let old = string_arg(args, "oldString");
-            format!("edit {path} ({})", truncate(&old, 60))
-        }
-        "patch" => {
-            let text = string_arg(args, "patchText");
+        "view_image" => format!("view_image {}", string_arg(args, "path")),
+        "apply_patch" => {
+            let text = patch_text(args).unwrap_or_default();
             let files = text
                 .lines()
                 .filter(|line| {
@@ -524,28 +406,31 @@ pub fn summarize(tool: &str, args: &Value) -> String {
                         || line.starts_with("*** Delete File:")
                 })
                 .count();
-            format!("patch ({files} file{})", if files == 1 { "" } else { "s" })
+            format!(
+                "apply_patch ({files} file{})",
+                if files == 1 { "" } else { "s" }
+            )
         }
-        "write_file" => {
-            let bytes = args
-                .get("content")
+        "exec_command" => {
+            let command = args
+                .get("cmd")
+                .or_else(|| args.get("command"))
                 .and_then(Value::as_str)
-                .map(str::len)
-                .unwrap_or(0);
-            format!("write_file {} (+{bytes} bytes)", string_arg(args, "path"))
+                .unwrap_or_default();
+            format!("exec_command: {}", truncate(command, 120))
         }
-        "run_command" => {
-            let command = string_arg(args, "command");
-            format!("run_command: {}", truncate(&command, 120))
+        "write_stdin" => {
+            let id = args
+                .get("session_id")
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_string)
+                        .or_else(|| value.as_u64().map(|id| id.to_string()))
+                })
+                .unwrap_or_default();
+            format!("write_stdin {}", truncate(&id, 12))
         }
-        "start_command" => {
-            let command = string_arg(args, "command");
-            format!("start_command: {}", truncate(&command, 120))
-        }
-        "process_output" => match optional_string(args, "process_id") {
-            Some(id) => format!("process_output {}", truncate(id, 12)),
-            None => "process_output latest".to_string(),
-        },
         "spawn_agent" => {
             let name = optional_string(args, "name").unwrap_or("agent");
             format!("spawn_agent {name}")
@@ -658,6 +543,11 @@ impl WritePlan {
     /// Contents the plan will write.
     pub fn new_content(&self) -> &str {
         &self.new
+    }
+
+    /// False when applying the plan would rewrite identical bytes.
+    pub fn changes(&self) -> bool {
+        self.old != self.new
     }
 
     /// Whether `new_content` has already been formatted for this preview.
@@ -1079,21 +969,16 @@ pub async fn execute_in(
 ) -> ToolOutcome {
     let started = Instant::now();
     let result = match tool {
-        "read_file" => read_file(args, cwd, config).await,
-        "list_dir" => list_dir(args, cwd, config).await,
-        "grep" => grep(args, cwd, config).await,
-        "glob" => glob_files(args, cwd, config).await,
         "use_skill" => use_skill(args, cwd, config),
-        "webfetch" => webfetch(args).await,
-        "websearch" => websearch(args).await,
+        "web_fetch" => webfetch(args).await,
+        "web_search" => websearch(args).await,
         "todo" => Err(anyhow::anyhow!("todo is handled by the daemon")),
-        "write_file" => write_file(args, cwd, config).await,
-        "edit" => edit(args, cwd, config).await,
-        "patch" => patch(args, cwd, config).await,
-        "run_command" => run_command(args, cwd, config, cancel, sandbox_root).await,
-        "start_command" | "process_output" => {
-            Err(anyhow::anyhow!("{tool} is handled by the daemon"))
-        }
+        "apply_patch" => patch(args, cwd, config).await,
+        // The daemon routes model `exec_command` calls through the process
+        // registry. This synchronous path serves `shell.run` and other host
+        // callers that want a bounded command.
+        "exec_command" => run_command(args, cwd, config, cancel, sandbox_root).await,
+        "write_stdin" | "view_image" => Err(anyhow::anyhow!("{tool} is handled by the daemon")),
         "mcp_list_resources" | "mcp_read_resource" | "mcp_list_prompts" | "mcp_get_prompt" => {
             Err(anyhow::anyhow!("{tool} is handled by the daemon"))
         }
@@ -1495,10 +1380,13 @@ pub async fn format_content(
 
 /// Minimal HTML -> text conversion for `webfetch` / `websearch`.
 fn html_to_text(html: &str) -> String {
-    let scripts =
-        Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>").expect("static regex");
+    static SCRIPTS: OnceLock<Regex> = OnceLock::new();
+    static TAGS: OnceLock<Regex> = OnceLock::new();
+    let scripts = SCRIPTS.get_or_init(|| {
+        Regex::new(r"(?is)<(script|style)[^>]*>.*?</(script|style)>").expect("static regex")
+    });
     let without_scripts = scripts.replace_all(html, " ");
-    let tags = Regex::new(r"(?s)<[^>]+>").expect("static regex");
+    let tags = TAGS.get_or_init(|| Regex::new(r"(?s)<[^>]+>").expect("static regex"));
     let text = tags.replace_all(&without_scripts, " ");
     let text = text
         .replace("&amp;", "&")
@@ -1542,12 +1430,20 @@ fn percent_decode(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-async fn web_client() -> Result<reqwest::Client> {
-    reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .user_agent(concat!("eix/", env!("CARGO_PKG_VERSION")))
-        .build()
-        .context("cannot build HTTP client")
+fn web_client() -> Result<reqwest::Client> {
+    // The client pools connections and owns a TLS backend; rebuilding it for
+    // every fetch paid setup cost and prevented keep-alive between calls.
+    static CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .timeout(Duration::from_secs(20))
+                .user_agent(concat!("eix/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|err| format!("cannot build HTTP client: {err}"))
+        })
+        .clone()
+        .map_err(|err| anyhow!(err))
 }
 
 async fn webfetch(args: &Value) -> Result<String> {
@@ -1555,8 +1451,7 @@ async fn webfetch(args: &Value) -> Result<String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         bail!("url must start with http:// or https://");
     }
-    let response = web_client()
-        .await?
+    let response = web_client()?
         .get(url)
         .send()
         .await
@@ -1594,8 +1489,7 @@ async fn websearch(args: &Value) -> Result<String> {
         "https://html.duckduckgo.com/html/?q={}",
         percent_encode(query)
     );
-    let response = web_client()
-        .await?
+    let response = web_client()?
         .get(&url)
         .send()
         .await
@@ -1607,9 +1501,11 @@ async fn websearch(args: &Value) -> Result<String> {
         .text()
         .await
         .context("cannot read websearch results")?;
-    let link =
+    static LINK: OnceLock<Regex> = OnceLock::new();
+    let link = LINK.get_or_init(|| {
         Regex::new(r#"(?is)<a[^>]*class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>"#)
-            .expect("static regex");
+            .expect("static regex")
+    });
     let mut out = String::new();
     let mut count = 0;
     for capture in link.captures_iter(&body) {
@@ -1669,31 +1565,6 @@ fn use_skill(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
     }
 }
 
-async fn read_file(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let raw = required_string(args, "path")?;
-    let path = resolve_path_in(cwd, raw, config)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("cannot read {}", display(&path, cwd)))?;
-    let text = String::from_utf8_lossy(&bytes);
-    let offset = args
-        .get("offset")
-        .and_then(Value::as_u64)
-        .unwrap_or(1)
-        .max(1) as usize;
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(2000)
-        .max(1) as usize;
-    Ok(format_read(
-        &text,
-        offset,
-        limit,
-        config.tools.max_output_bytes,
-    ))
-}
-
 /// Render a numbered, paginated slice of a text file. `offset` is 1-based.
 pub fn format_read(text: &str, offset: usize, limit: usize, max_bytes: usize) -> String {
     // Count without materialising a `Vec<&str>` for the whole file: a large
@@ -1723,254 +1594,6 @@ pub fn format_read(text: &str, offset: usize, limit: usize, max_bytes: usize) ->
         ));
     }
     cap_output(out, max_bytes)
-}
-
-/// Recursively collect files below `root`, skipping VCS/build directories.
-fn walk_files(root: &Path, hidden: bool, max_files: usize) -> Vec<PathBuf> {
-    const SKIP: &[&str] = &[
-        ".git",
-        "target",
-        "node_modules",
-        ".worktrees",
-        ".hg",
-        ".svn",
-    ];
-    let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        let mut entries: Vec<_> = entries.flatten().collect();
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name.starts_with('.') && !hidden {
-                continue;
-            }
-            if SKIP.contains(&name.as_ref()) {
-                continue;
-            }
-            let Ok(kind) = entry.file_type() else {
-                continue;
-            };
-            let path = entry.path();
-            if kind.is_dir() {
-                stack.push(path);
-            } else if kind.is_file() {
-                out.push(path);
-                if out.len() >= max_files {
-                    return out;
-                }
-            }
-        }
-        if out.len() >= max_files {
-            break;
-        }
-    }
-    out
-}
-
-fn relative_label(path: &Path, cwd: &Path) -> String {
-    path.strip_prefix(cwd).unwrap_or(path).display().to_string()
-}
-
-async fn grep(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let pattern = required_string(args, "pattern")?;
-    if pattern.is_empty() {
-        bail!("pattern must not be empty");
-    }
-    let raw = optional_string(args, "path").unwrap_or(".");
-    let root = resolve_path_in(cwd, raw, config)?;
-    if !root.is_dir() {
-        bail!("{} is not a directory", display(&root, cwd));
-    }
-    let literal = args
-        .get("literal")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let case_sensitive = args
-        .get("caseSensitive")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(100)
-        .max(1) as usize;
-    let include = optional_string(args, "include")
-        .map(|raw| glob::Pattern::new(raw).with_context(|| format!("invalid include glob {raw:?}")))
-        .transpose()?;
-    let expression = if literal {
-        regex::escape(pattern)
-    } else {
-        pattern.to_string()
-    };
-    let regex = RegexBuilder::new(&expression)
-        .case_insensitive(!case_sensitive)
-        .build()
-        .with_context(|| format!("invalid pattern {pattern:?}"))?;
-
-    let root = root.canonicalize().unwrap_or(root);
-    let cwd = cwd.to_path_buf();
-    let max_output_bytes = config.tools.max_output_bytes;
-    // Walking and reading up to 20k files is blocking I/O. Run it on the
-    // blocking pool so a large search cannot stall other sessions' RPCs.
-    tokio::task::spawn_blocking(move || {
-        grep_blocking(
-            &root,
-            &cwd,
-            &regex,
-            include.as_ref(),
-            limit,
-            max_output_bytes,
-        )
-    })
-    .await
-    .context("grep task failed")?
-}
-
-fn grep_blocking(
-    root: &Path,
-    cwd: &Path,
-    regex: &Regex,
-    include: Option<&glob::Pattern>,
-    limit: usize,
-    max_output_bytes: usize,
-) -> Result<String> {
-    let files = walk_files(root, false, 20_000);
-    let mut matches = Vec::new();
-    for path in files {
-        let label = relative_label(&path, cwd);
-        if let Some(pattern) = include {
-            if !pattern.matches(&label)
-                && !path
-                    .file_name()
-                    .map(|name| pattern.matches(&name.to_string_lossy()))
-                    .unwrap_or(false)
-            {
-                continue;
-            }
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
-            continue;
-        };
-        if bytes.iter().take(8_000).any(|byte| *byte == 0) {
-            continue;
-        }
-        let text = String::from_utf8_lossy(&bytes);
-        for (index, line) in text.lines().enumerate() {
-            if regex.is_match(line) {
-                matches.push(format!("{label}:{}: {}", index + 1, truncate(line, 300)));
-                if matches.len() >= limit {
-                    break;
-                }
-            }
-        }
-        if matches.len() >= limit {
-            break;
-        }
-    }
-    if matches.is_empty() {
-        return Ok("(no matches)".to_string());
-    }
-    Ok(cap_output(matches.join("\n"), max_output_bytes))
-}
-
-async fn glob_files(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let pattern = required_string(args, "pattern")?;
-    if pattern.is_empty() {
-        bail!("pattern must not be empty");
-    }
-    let raw = optional_string(args, "path").unwrap_or(".");
-    let root = resolve_path_in(cwd, raw, config)?;
-    if !root.is_dir() {
-        bail!("{} is not a directory", display(&root, cwd));
-    }
-    let hidden = args.get("hidden").and_then(Value::as_bool).unwrap_or(false);
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(100)
-        .max(1) as usize;
-    let root = root.canonicalize().unwrap_or(root);
-    let pattern = pattern.to_string();
-    let cwd = cwd.to_path_buf();
-    let max_output_bytes = config.tools.max_output_bytes;
-    // `glob` walks the filesystem synchronously, so keep it off the runtime.
-    tokio::task::spawn_blocking(move || {
-        glob_blocking(&root, &cwd, &pattern, hidden, limit, max_output_bytes)
-    })
-    .await
-    .context("glob task failed")?
-}
-
-fn glob_blocking(
-    root: &Path,
-    cwd: &Path,
-    pattern: &str,
-    hidden: bool,
-    limit: usize,
-    max_output_bytes: usize,
-) -> Result<String> {
-    let joined = root.join(pattern);
-    let options = glob::MatchOptions {
-        case_sensitive: true,
-        require_literal_separator: false,
-        require_literal_leading_dot: !hidden,
-    };
-    let mut out = Vec::new();
-    let entries = glob::glob_with(&joined.to_string_lossy(), options)
-        .with_context(|| format!("invalid glob {pattern:?}"))?;
-    for entry in entries.flatten() {
-        let Ok(real) = entry.canonicalize() else {
-            continue;
-        };
-        if !real.starts_with(root) {
-            continue;
-        }
-        if !hidden
-            && real
-                .components()
-                .any(|component| component.as_os_str().to_string_lossy().starts_with('.'))
-        {
-            continue;
-        }
-        out.push(relative_label(&real, cwd));
-        if out.len() >= limit {
-            break;
-        }
-    }
-    out.sort();
-    if out.is_empty() {
-        return Ok("(no matches)".to_string());
-    }
-    Ok(cap_output(out.join("\n"), max_output_bytes))
-}
-
-async fn edit(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let raw = required_string(args, "path")?;
-    let old_string = required_string(args, "oldString")?;
-    let new_string = required_string(args, "newString")?;
-    let replace_all = args
-        .get("replaceAll")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let path = resolve_path_in(cwd, raw, config)?;
-    let bytes = tokio::fs::read(&path)
-        .await
-        .with_context(|| format!("cannot read {}", display(&path, cwd)))?;
-    let old = String::from_utf8_lossy(&bytes);
-    let new = apply_edit(&old, old_string, new_string, replace_all)?;
-    tokio::fs::write(&path, new.as_bytes())
-        .await
-        .with_context(|| format!("cannot write {}", display(&path, cwd)))?;
-    let mut message = format!("edited {} ({} bytes)", display(&path, cwd), new.len());
-    if let Some(note) = format_file(config, cwd, &path).await {
-        message.push_str(&note);
-    }
-    Ok(message)
 }
 
 /// One file operation parsed from a `patch` call.
@@ -2236,8 +1859,8 @@ async fn write_patch_ops(ops: &[PatchOp]) -> Result<(usize, usize)> {
 }
 
 async fn patch(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let patch_text = required_string(args, "patchText")?;
-    let ops = patch_ops(patch_text, cwd, config).await?;
+    let patch_text = patch_text(args).context("apply_patch needs patchText")?;
+    let ops = patch_ops(&patch_text, cwd, config).await?;
     let (written, deleted) = write_patch_ops(&ops).await?;
     let mut message = format!("patched {written} file(s), deleted {deleted} file(s)");
     for op in &ops {
@@ -2247,54 +1870,6 @@ async fn patch(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
         if let Some(note) = format_file(config, cwd, &op.path).await {
             message.push_str(&note);
         }
-    }
-    Ok(message)
-}
-
-async fn list_dir(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let raw = optional_string(args, "path").unwrap_or(".");
-    let path = resolve_path_in(cwd, raw, config)?;
-    let mut entries = Vec::new();
-    let mut dir = tokio::fs::read_dir(&path)
-        .await
-        .with_context(|| format!("cannot list {}", display(&path, cwd)))?;
-    while let Some(entry) = dir.next_entry().await? {
-        let name = entry.file_name().to_string_lossy().into_owned();
-        let suffix = match entry.file_type().await {
-            Ok(kind) if kind.is_dir() => "/",
-            _ => "",
-        };
-        entries.push(format!("{name}{suffix}"));
-        if entries.len() >= 500 {
-            entries.push("… (more entries omitted)".to_string());
-            break;
-        }
-    }
-    entries.sort();
-    if entries.is_empty() {
-        return Ok("(empty directory)".to_string());
-    }
-    Ok(cap_output(
-        entries.join("\n"),
-        config.tools.max_output_bytes,
-    ))
-}
-
-async fn write_file(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let raw = required_string(args, "path")?;
-    let content = required_string(args, "content")?;
-    let path = resolve_path_in(cwd, raw, config)?;
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .with_context(|| format!("cannot create {}", display(parent, cwd)))?;
-    }
-    tokio::fs::write(&path, content.as_bytes())
-        .await
-        .with_context(|| format!("cannot write {}", display(&path, cwd)))?;
-    let mut message = format!("wrote {} bytes to {}", content.len(), display(&path, cwd));
-    if let Some(note) = format_file(config, cwd, &path).await {
-        message.push_str(&note);
     }
     Ok(message)
 }
@@ -2435,10 +2010,14 @@ async fn run_command(
     cancel: Option<&AtomicBool>,
     sandbox_root: Option<&Path>,
 ) -> Result<String> {
-    let command = required_string(args, "command")?;
+    let command = args
+        .get("cmd")
+        .or_else(|| args.get("command"))
+        .and_then(Value::as_str)
+        .context("cmd is required")?;
     let plan = command_plan(
         command,
-        optional_string(args, "cwd"),
+        optional_string(args, "workdir").or_else(|| optional_string(args, "cwd")),
         cwd,
         sandbox_root,
         config,
@@ -2580,6 +2159,16 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// `apply_patch` is a JSON function in eix, but models often reuse Codex's
+/// freeform field names. Accept the common aliases rather than failing a call
+/// whose patch is otherwise valid.
+fn patch_text(args: &Value) -> Option<String> {
+    ["patchText", "patch", "input", "text"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str))
+        .map(str::to_string)
+}
+
 fn required_string<'a>(args: &'a Value, key: &str) -> Result<&'a str> {
     args.get(key)
         .and_then(Value::as_str)
@@ -2665,7 +2254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn webfetch_reads_html_from_a_local_server() {
+    async fn web_fetch_reads_html_from_a_local_server() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2683,7 +2272,7 @@ mod tests {
             }
         });
         let output = execute(
-            "webfetch",
+            "web_fetch",
             &json!({"url": format!("http://{addr}/")}),
             Path::new("."),
             &Config::default(),
@@ -2708,8 +2297,8 @@ mod tests {
             ..Config::default()
         };
         let outcome = execute(
-            "write_file",
-            &json!({"path": "note.txt", "content": "hello"}),
+            "apply_patch",
+            &json!({"patchText": "*** Begin Patch\n*** Add File: note.txt\n+hello\n*** End Patch\n"}),
             &cwd,
             &config,
         )
@@ -2717,12 +2306,12 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.output);
         assert_eq!(
             std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
-            "HELLO"
+            "HELLO\n"
         );
 
         let outcome = execute(
-            "write_file",
-            &json!({"path": "note.md", "content": "hello"}),
+            "apply_patch",
+            &json!({"patchText": "*** Begin Patch\n*** Add File: note.md\n+hello\n*** End Patch\n"}),
             &cwd,
             &config,
         )
@@ -2730,7 +2319,7 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.output);
         assert_eq!(
             std::fs::read_to_string(cwd.join("note.md")).unwrap(),
-            "hello"
+            "hello\n"
         );
         let _ = std::fs::remove_dir_all(&cwd);
     }
@@ -2784,7 +2373,7 @@ mod tests {
         let plan = write_plan("write_file", &args, &cwd, &config)
             .await
             .expect("pre-write plan");
-        assert!(execute("write_file", &args, &cwd, &config).await.ok);
+        assert!(apply_plan(&plan, None, &cwd, &config).await.ok);
         assert_eq!(
             std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
             "HELLO"
@@ -2889,8 +2478,8 @@ mod tests {
         };
 
         let outcome = execute(
-            "write_file",
-            &json!({"path": "note.txt", "content": "hello"}),
+            "apply_patch",
+            &json!({"patchText": "*** Begin Patch\n*** Add File: note.txt\n+hello\n*** End Patch\n"}),
             &cwd,
             &config,
         )
@@ -2898,12 +2487,12 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.output);
         assert_eq!(
             std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
-            "FIRST"
+            "FIRST\n"
         );
 
         let outcome = execute(
-            "write_file",
-            &json!({"path": "note.md", "content": "world"}),
+            "apply_patch",
+            &json!({"patchText": "*** Begin Patch\n*** Add File: note.md\n+world\n*** End Patch\n"}),
             &cwd,
             &config,
         )
@@ -2911,7 +2500,7 @@ mod tests {
         assert!(outcome.ok, "{}", outcome.output);
         assert_eq!(
             std::fs::read_to_string(cwd.join("note.md")).unwrap(),
-            "WORLD"
+            "WORLD\n"
         );
 
         let _ = std::fs::remove_dir_all(&cwd);
@@ -2961,22 +2550,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn read_list_and_write() {
+    async fn apply_patch_writes_and_rejects_escapes() {
         let cwd = temp_cwd("rw");
-        std::fs::write(cwd.join("a.txt"), "hello").unwrap();
         let config = Config::default();
 
-        let read = execute("read_file", &json!({"path": "a.txt"}), &cwd, &config).await;
-        assert!(read.ok);
-        assert_eq!(read.output, "1: hello\n");
-
-        let listed = execute("list_dir", &json!({}), &cwd, &config).await;
-        assert!(listed.ok);
-        assert!(listed.output.contains("a.txt"));
-
         let wrote = execute(
-            "write_file",
-            &json!({"path": "sub/b.txt", "content": "hi"}),
+            "apply_patch",
+            &json!({"patchText": "*** Begin Patch\n*** Add File: sub/b.txt\n+hi\n*** End Patch\n"}),
             &cwd,
             &config,
         )
@@ -2984,12 +2564,12 @@ mod tests {
         assert!(wrote.ok, "{}", wrote.output);
         assert_eq!(
             std::fs::read_to_string(cwd.join("sub/b.txt")).unwrap(),
-            "hi"
+            "hi\n"
         );
 
         let escaped = execute(
-            "write_file",
-            &json!({"path": "../nope.txt", "content": "x"}),
+            "apply_patch",
+            &json!({"patchText": "*** Begin Patch\n*** Add File: ../nope.txt\n+x\n*** End Patch\n"}),
             &cwd,
             &config,
         )
@@ -3032,7 +2612,7 @@ mod tests {
         assert!(added.diff().contains("+hello"), "{}", added.diff());
 
         assert!(
-            write_plan("run_command", &json!({"command": "true"}), &cwd, &config)
+            write_plan("exec_command", &json!({"command": "true"}), &cwd, &config)
                 .await
                 .is_none()
         );
@@ -3089,7 +2669,7 @@ mod tests {
         assert!(plan.verify_unchanged().await.is_err());
 
         assert!(
-            write_plan("run_command", &json!({"command": "true"}), &cwd, &config)
+            write_plan("exec_command", &json!({"command": "true"}), &cwd, &config)
                 .await
                 .is_none()
         );
@@ -3101,7 +2681,7 @@ mod tests {
         let cwd = temp_cwd("cmd");
         let config = Config::default();
         let ok = execute(
-            "run_command",
+            "exec_command",
             &json!({"command": "printf hi"}),
             &cwd,
             &config,
@@ -3111,7 +2691,7 @@ mod tests {
         assert_eq!(ok.output, "hi");
 
         let failed = execute(
-            "run_command",
+            "exec_command",
             &json!({"command": "echo oops >&2; exit 3"}),
             &cwd,
             &config,
@@ -3129,7 +2709,7 @@ mod tests {
         let mut config = Config::default();
         config.tools.sandbox = SandboxMode::Off;
         let out = execute(
-            "run_command",
+            "exec_command",
             &json!({"command": "printf hi"}),
             &cwd,
             &config,
@@ -3151,7 +2731,7 @@ mod tests {
         let _ = std::fs::remove_file(&marker);
 
         let inside = execute(
-            "run_command",
+            "exec_command",
             &json!({"command": "touch inside.txt"}),
             &cwd,
             &config,
@@ -3163,7 +2743,7 @@ mod tests {
         // Inside the sandbox `/tmp` is a private tmpfs, so this write must not
         // reach the host even though the command appears to succeed.
         let outside = execute(
-            "run_command",
+            "exec_command",
             &json!({"command": format!("touch {}", marker.display())}),
             &cwd,
             &config,
@@ -3184,7 +2764,7 @@ mod tests {
         std::fs::create_dir_all(cwd.join("sub")).unwrap();
         std::fs::write(cwd.join("sub/marker.txt"), "x").unwrap();
         let out = execute(
-            "run_command",
+            "exec_command",
             &json!({"command": "cat marker.txt", "cwd": "sub"}),
             &cwd,
             &Config::default(),
@@ -3297,7 +2877,7 @@ mod tests {
         std::fs::create_dir_all(&sub).unwrap();
 
         let out = execute_in(
-            "run_command",
+            "exec_command",
             &json!({"command": "git status --short"}),
             &sub,
             &Config::default(),
@@ -3352,7 +2932,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_command_cancellation_kills_the_process() {
+    async fn exec_command_cancellation_kills_the_process() {
         let cwd = temp_cwd("cancel-command");
         let cancel = Arc::new(AtomicBool::new(false));
         let task = {
@@ -3367,7 +2947,7 @@ mod tests {
                     ..Config::default()
                 };
                 execute_with_cancel(
-                    "run_command",
+                    "exec_command",
                     &json!({"command": "sleep 30"}),
                     &cwd,
                     &config,
@@ -3390,21 +2970,26 @@ mod tests {
     #[test]
     fn summaries_name_the_target() {
         assert_eq!(
-            summarize("read_file", &json!({"path": "src/a.rs"})),
-            "read_file src/a.rs"
+            summarize("view_image", &json!({"path": "docs/a.png"})),
+            "view_image docs/a.png"
         );
-        assert!(summarize("run_command", &json!({"command": "ls"})).starts_with("run_command:"));
+        assert!(summarize("exec_command", &json!({"cmd": "rg TODO"})).starts_with("exec_command:"));
+        assert_eq!(
+            summarize(
+                "apply_patch",
+                &json!({"patchText": "*** Begin Patch\n*** Update File: a.rs\n*** End Patch"})
+            ),
+            "apply_patch (1 file)"
+        );
         assert!(
             summarize("plugin__acme__deploy", &json!({"env": "prod"})).contains("\"env\":\"prod\"")
         );
         assert!(is_known("ask_user"));
-        assert!(is_known("grep"));
-        assert!(hard_mutating("write_file"));
-        assert!(hard_mutating("edit"));
-        assert!(hard_mutating("patch"));
-        assert!(!hard_mutating("read_file"));
-        assert!(!hard_mutating("grep"));
-        assert!(!hard_mutating("glob"));
+        assert!(is_known("apply_patch"));
+        assert!(hard_mutating("apply_patch"));
+        assert!(hard_mutating("write_stdin"));
+        assert!(!hard_mutating("exec_command"));
+        assert!(!hard_mutating("view_image"));
     }
 
     #[test]
@@ -3432,139 +3017,21 @@ mod tests {
         assert!(ask_user_args(&json!({"question": "q", "options": seven})).is_err());
     }
 
-    #[tokio::test]
-    async fn read_file_pages_with_line_numbers() {
-        let cwd = temp_cwd("read-page");
-        std::fs::write(cwd.join("a.txt"), "a\nb\nc\nd\ne\n").unwrap();
-        let config = Config::default();
+    #[test]
+    fn format_read_pages_with_line_numbers() {
+        let text = "a\nb\nc\nd\ne\n";
+        let page = format_read(text, 2, 2, 4096);
+        assert!(page.contains("2: b"), "{page}");
+        assert!(page.contains("3: c"), "{page}");
+        assert!(!page.contains("1: a"), "{page}");
+        assert!(page.contains("2 more lines"), "{page}");
 
-        let page = execute(
-            "read_file",
-            &json!({"path": "a.txt", "offset": 2, "limit": 2}),
-            &cwd,
-            &config,
-        )
-        .await;
-        assert!(page.ok, "{}", page.output);
-        assert!(page.output.contains("2: b"), "{}", page.output);
-        assert!(page.output.contains("3: c"), "{}", page.output);
-        assert!(!page.output.contains("1: a"), "{}", page.output);
-        assert!(page.output.contains("2 more lines"), "{}", page.output);
-
-        let past = execute(
-            "read_file",
-            &json!({"path": "a.txt", "offset": 99}),
-            &cwd,
-            &config,
-        )
-        .await;
-        assert!(past.ok);
-        assert!(past.output.contains("past the end"), "{}", past.output);
-        let _ = std::fs::remove_dir_all(&cwd);
+        let past = format_read(text, 99, 2, 4096);
+        assert!(past.contains("past the end"), "{past}");
     }
 
     #[tokio::test]
-    async fn grep_searches_contents_with_include_and_literal() {
-        let cwd = temp_cwd("grep");
-        std::fs::create_dir_all(cwd.join("src")).unwrap();
-        std::fs::write(cwd.join("src/a.rs"), "fn main() {}\n// TODO: later\n").unwrap();
-        std::fs::write(cwd.join("src/b.txt"), "TODO not rust\n").unwrap();
-        let config = Config::default();
-
-        let found = execute(
-            "grep",
-            &json!({"pattern": "TODO", "include": "*.rs"}),
-            &cwd,
-            &config,
-        )
-        .await;
-        assert!(found.ok, "{}", found.output);
-        assert!(found.output.contains("src/a.rs:2"), "{}", found.output);
-        assert!(!found.output.contains("b.txt"), "{}", found.output);
-
-        let literal = execute(
-            "grep",
-            &json!({"pattern": "fn main()", "literal": true, "caseSensitive": false}),
-            &cwd,
-            &config,
-        )
-        .await;
-        assert!(literal.ok, "{}", literal.output);
-        assert!(literal.output.contains("src/a.rs:1"), "{}", literal.output);
-
-        let none = execute("grep", &json!({"pattern": "zzz"}), &cwd, &config).await;
-        assert_eq!(none.output, "(no matches)");
-        let _ = std::fs::remove_dir_all(&cwd);
-    }
-
-    #[tokio::test]
-    async fn glob_finds_matching_paths_inside_the_workspace() {
-        let cwd = temp_cwd("glob");
-        std::fs::create_dir_all(cwd.join("src/nested")).unwrap();
-        std::fs::write(cwd.join("src/a.rs"), "").unwrap();
-        std::fs::write(cwd.join("src/nested/b.rs"), "").unwrap();
-        std::fs::write(cwd.join("src/c.txt"), "").unwrap();
-        let config = Config::default();
-
-        let out = execute("glob", &json!({"pattern": "**/*.rs"}), &cwd, &config).await;
-        assert!(out.ok, "{}", out.output);
-        assert!(out.output.contains("src/a.rs"), "{}", out.output);
-        assert!(out.output.contains("src/nested/b.rs"), "{}", out.output);
-        assert!(!out.output.contains("c.txt"), "{}", out.output);
-
-        let escaped = execute("glob", &json!({"pattern": "../*.rs"}), &cwd, &config).await;
-        assert!(!escaped.output.contains(".."), "{}", escaped.output);
-        let _ = std::fs::remove_dir_all(&cwd);
-    }
-
-    #[tokio::test]
-    async fn edit_replaces_text_and_rejects_ambiguous_matches() {
-        let cwd = temp_cwd("edit");
-        std::fs::write(cwd.join("a.txt"), "one two one\n").unwrap();
-        let config = Config::default();
-
-        let ambiguous = execute(
-            "edit",
-            &json!({"path": "a.txt", "oldString": "one", "newString": "ONE"}),
-            &cwd,
-            &config,
-        )
-        .await;
-        assert!(!ambiguous.ok);
-        assert!(
-            ambiguous.output.contains("matched 2 times"),
-            "{}",
-            ambiguous.output
-        );
-
-        let all = execute(
-            "edit",
-            &json!({"path": "a.txt", "oldString": "one", "newString": "ONE", "replaceAll": true}),
-            &cwd,
-            &config,
-        )
-        .await;
-        assert!(all.ok, "{}", all.output);
-        assert_eq!(
-            std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
-            "ONE two ONE\n"
-        );
-
-        let plan = write_plan(
-            "edit",
-            &json!({"path": "a.txt", "oldString": "two", "newString": "TWO"}),
-            &cwd,
-            &config,
-        )
-        .await
-        .expect("edit plan");
-        assert!(plan.diff().contains("-ONE two ONE"), "{}", plan.diff());
-        assert!(plan.diff().contains("+ONE TWO ONE"), "{}", plan.diff());
-        let _ = std::fs::remove_dir_all(&cwd);
-    }
-
-    #[tokio::test]
-    async fn patch_adds_and_updates_multiple_files() {
+    async fn apply_patch_adds_and_updates_multiple_files() {
         let cwd = temp_cwd("patch");
         std::fs::write(cwd.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         let config = Config::default();
@@ -3585,7 +3052,7 @@ mod tests {
         assert!(preview.contains("+TWO"), "{preview}");
         assert!(preview.contains("+hello"), "{preview}");
 
-        let applied = execute("patch", &json!({"patchText": text}), &cwd, &config).await;
+        let applied = execute("apply_patch", &json!({"patchText": text}), &cwd, &config).await;
         assert!(applied.ok, "{}", applied.output);
         assert_eq!(
             std::fs::read_to_string(cwd.join("a.txt")).unwrap(),
@@ -3597,7 +3064,7 @@ mod tests {
         );
 
         let missing = execute(
-            "patch",
+            "apply_patch",
             &json!({"patchText": "*** Begin Patch\n*** Update File: a.txt\n@@\n-nope\n+x\n*** End Patch\n"}),
             &cwd,
             &config,

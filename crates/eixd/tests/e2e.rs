@@ -7,8 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
     AgentRole, ApprovalResult, AttachResult, Config, EventKind, EventsResult, FormatterConfig,
-    HelloResult, LspServerConfig, ModelConfig, PermissionAction, PermissionRule, ProviderConfig,
-    Request, Response, ServerMessage, SessionMode, SessionResult, SubmitResult, PROTOCOL_VERSION,
+    HelloResult, ModelConfig, PermissionAction, PermissionRule, ProviderConfig, Request, Response,
+    ServerMessage, SessionMode, SessionResult, SubmitResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -599,7 +599,10 @@ async fn repeating_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<St
                             "index": 0,
                             "id": format!("call_{}", bodies.lock().await.len()),
                             "type": "function",
-                            "function": {"name": "read_file", "arguments": "{\"path\":\"notes.txt\"}"},
+                            "function": {
+                                "name": "exec_command",
+                                "arguments": "{\"cmd\":\"cat notes.txt\"}",
+                            },
                         }]
                     },
                     "finish_reason": "tool_calls",
@@ -641,8 +644,8 @@ async fn progressing_tool_provider(
                                 "id": format!("call_{round}"),
                                 "type": "function",
                                 "function": {
-                                    "name": "list_dir",
-                                    "arguments": format!("{{\"path\":\"d{round}\"}}"),
+                                    "name": "exec_command",
+                                    "arguments": format!("{{\"cmd\":\"ls d{round}\"}}"),
                                 },
                             }]
                         },
@@ -1063,6 +1066,28 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
     assert_eq!(models.models[4].id, "remote/mock-auto");
     assert_eq!(models.models[4].provider, "Remote");
     assert_eq!(models.models[5].id, "remote/mock-other");
+    assert_eq!(models.default_model, "mock-model");
+    assert!(models
+        .providers
+        .iter()
+        .any(|provider| provider.key == "openai"));
+
+    // `model.use` changes the daemon fallback without touching the session or
+    // the config; `default` restores the configured value.
+    let switched: eix_core::ModelUseResult = client
+        .request("model.use", json!({"model": "mock/second"}))
+        .await?;
+    assert_eq!(switched.model, "mock/second");
+    let after_use: eix_core::ModelListResult = client.request("model.list", Value::Null).await?;
+    assert_eq!(after_use.default_model, "mock/second");
+    let restored: eix_core::ModelUseResult = client
+        .request("model.use", json!({"model": "default"}))
+        .await?;
+    assert_eq!(restored.model, "mock-model");
+    let unknown = client
+        .request_error("model.use", json!({"model": "nope/missing"}))
+        .await?;
+    assert_eq!(unknown, "invalid_params");
 
     let pinned: SessionResult = client
         .request(
@@ -1137,6 +1162,57 @@ async fn models_agents_and_custom_commands_round_trip() -> anyhow::Result<()> {
         eix_core::expand_command(&review.template, "src/lib.rs"),
         "Review src/lib.rs carefully."
     );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn stored_api_key_authorizes_provider_requests() -> anyhow::Result<()> {
+    let dir = temp_dir("auth-store");
+    std::fs::create_dir_all(&dir)?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let headers = Arc::new(Mutex::new(Vec::new()));
+    let mock = tokio::spawn(header_capturing_provider(listener, Arc::clone(&headers)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".into();
+    config.default_provider_mut().api_key = None;
+    config.default_provider_mut().api_key_env = String::new();
+
+    // Written before the daemon starts; `eix auth login` uses the same path.
+    let data = dir.join("data");
+    eixd::auth::Store::under_data_dir(&data).save_api_key("openai", "sk-from-store")?;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), data));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "auth", "cwd": dir}))
+        .await?;
+    let _: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "hi"}),
+        )
+        .await?;
+    assert_eq!(wait_turn(&mut client).await?, "ok");
+
+    let captured = headers.lock().await;
+    assert_eq!(captured.len(), 1, "{captured:?}");
+    assert!(
+        captured[0]
+            .to_ascii_lowercase()
+            .contains("authorization: bearer sk-from-store"),
+        "{}",
+        captured[0]
+    );
+    drop(captured);
 
     daemon.abort();
     mock.abort();
@@ -1678,278 +1754,12 @@ async fn cancel_keeps_the_partial_answer_and_returns_to_idle() -> anyhow::Result
     Ok(())
 }
 
-#[tokio::test]
-async fn staged_write_is_applied_after_approval() -> anyhow::Result<()> {
-    let dir = temp_dir("approve");
-    std::fs::create_dir_all(&dir)?;
-    // Pre-existing content so the snapshot has something to roll back to.
-    std::fs::write(dir.join("out.txt"), "before")?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
-
-    let mut config = Config::default();
-    config.tools.auto_apply_workspace_edits = false;
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "approve", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-
-    let submitted: SubmitResult = client
-        .request(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write out.txt"}),
-        )
-        .await?;
-    assert!(!submitted.turn_id.is_empty());
-
-    let patch = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "patch.proposed" {
-            break notification.params.clone();
-        }
-    };
-    assert_eq!(patch["tool"], "write_file");
-    assert_eq!(patch["call_id"], "call_1");
-    let diff = patch["diff"].as_str().expect("diff preview");
-    assert!(diff.contains("+++ b/out.txt"), "diff was: {diff}");
-    assert!(diff.contains("+hello"), "diff was: {diff}");
-    let hunks = patch["hunks"].as_array().expect("hunk preview");
-    assert_eq!(hunks.len(), 1, "hunks were: {hunks:?}");
-    assert_eq!(hunks[0]["index"], 0);
-    assert!(
-        hunks[0]["lines"]
-            .as_array()
-            .is_some_and(|lines| lines.iter().any(|line| line == "+hello")),
-        "hunk was: {:?}",
-        hunks[0]
-    );
-    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
-    // Staging does not touch the workspace.
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
-
-    let mut saw_attention = false;
-    let completed = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "session.attention" {
-            assert_eq!(notification.params["status"], "awaiting_approval");
-            saw_attention = true;
-        }
-        if notification.method == "turn.completed" {
-            break notification.params.clone();
-        }
-    };
-    assert!(saw_attention);
-    assert!(completed["error"].is_null());
-
-    let staged: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    assert_eq!(staged.session.status, eix_core::SessionStatus::Idle);
-    assert!(staged
-        .events
-        .iter()
-        .any(|e| e.kind == EventKind::PatchProposed));
-    assert!(
-        !staged
-            .events
-            .iter()
-            .any(|e| e.kind == EventKind::ApprovalRequired),
-        "staged writes do not block on an approval event"
-    );
-    assert!(
-        !staged.events.iter().any(|e| e.kind == EventKind::Snapshot),
-        "the snapshot is taken when the patch is applied"
-    );
-    let result = staged
-        .events
-        .iter()
-        .find(|e| e.kind == EventKind::ToolResult)
-        .expect("tool result event");
-    assert_eq!(result.payload["ok"], true);
-    assert_eq!(result.payload["denied"], false);
-
-    let applied: eix_core::PatchResult = client
-        .request(
-            "patch.apply",
-            json!({"session_id": session_id, "patch_id": patch_id}),
-        )
-        .await?;
-    assert!(applied.accepted);
-    assert!(applied.applied);
-    assert!(!applied.conflict);
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    assert!(attached
-        .events
-        .iter()
-        .any(|e| e.kind == EventKind::PatchApplied));
-    let snapshot = attached
-        .events
-        .iter()
-        .find(|e| e.kind == EventKind::Snapshot)
-        .expect("snapshot event");
-    assert_eq!(snapshot.payload["ok"], true);
-    assert_eq!(snapshot.payload["tool"], "write_file");
-    assert_eq!(snapshot.payload["scope"], "file");
-    assert_eq!(
-        snapshot.payload["files"], 1,
-        "snapshot was: {}",
-        snapshot.payload
-    );
-    let snapshot_id = snapshot.payload["snapshot_id"].as_str().unwrap();
-    let saved = dir
-        .join("data/snapshots")
-        .join(&session_id)
-        .join(snapshot_id)
-        .join("files/out.txt");
-    assert_eq!(std::fs::read_to_string(&saved)?, "before");
-    let assistant = attached
-        .events
-        .iter()
-        .rfind(|e| e.kind == EventKind::AssistantMessage)
-        .expect("final assistant event");
-    assert_eq!(assistant.payload["text"], "done");
-
-    let bodies = bodies.lock().await;
-    assert_eq!(bodies.len(), 2);
-    let first: Value = serde_json::from_str(&bodies[0])?;
-    assert_eq!(first["tool_choice"], "auto");
-    assert_eq!(first["tools"][0]["function"]["name"], "read_file");
-    let second: Value = serde_json::from_str(&bodies[1])?;
-    let content = second["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["role"] == "tool")
-        .and_then(|m| m["content"].as_str())
-        .unwrap_or_default();
-    assert!(
-        content.starts_with("staged out.txt as patch "),
-        "tool content was: {content}"
-    );
-    assert!(content.contains("not written yet"), "{content}");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[allow(clippy::field_reassign_with_default)]
-#[tokio::test]
-async fn staged_write_preview_is_formatted_and_applied_once() -> anyhow::Result<()> {
-    let dir = temp_dir("staged-formatted");
-    std::fs::create_dir_all(&dir)?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
-
-    let mut config = Config::default();
-    config.tools.auto_apply_workspace_edits = false;
-    // Non-idempotent on purpose: the approval preview must be the formatted
-    // content, and applying it must not run the formatter a second time.
-    config.formatter = FormatterConfig {
-        command: Some("sed -i 's/$/X/'".into()),
-        extensions: vec!["txt".into()],
-        timeout_secs: 30,
-    }
-    .into();
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request(
-            "session.create",
-            json!({"name": "staged-formatted", "cwd": dir}),
-        )
-        .await?;
-    let session_id = created.session.id.clone();
-
-    let submitted: SubmitResult = client
-        .request(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write out.txt"}),
-        )
-        .await?;
-    let patch = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "patch.proposed" {
-            break notification.params.clone();
-        }
-    };
-    let diff = patch["diff"].as_str().expect("diff preview");
-    assert!(diff.contains("+helloX"), "diff was: {diff}");
-    assert!(!diff.contains("+helloXX"), "diff was: {diff}");
-    assert!(!diff.contains("+hello\n"), "diff was: {diff}");
-    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
-
-    loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "turn.completed"
-            && notification.params["turn_id"] == submitted.turn_id.as_str()
-        {
-            assert!(notification.params["error"].is_null());
-            break;
-        }
-    }
-
-    let applied: eix_core::PatchResult = client
-        .request(
-            "patch.apply",
-            json!({"session_id": session_id, "patch_id": patch_id}),
-        )
-        .await?;
-    assert!(applied.accepted);
-    assert!(applied.applied);
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "helloX");
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    let applied_event = attached
-        .events
-        .iter()
-        .find(|event| event.kind == EventKind::PatchApplied)
-        .expect("patch applied event");
-    let applied_diff = applied_event.payload["diff"]
-        .as_str()
-        .expect("applied diff");
-    assert!(applied_diff.contains("+helloX"), "{applied_diff}");
-    assert!(!applied_diff.contains("+helloXX"), "{applied_diff}");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
 #[allow(clippy::field_reassign_with_default)]
 #[tokio::test]
 async fn auto_applied_write_records_its_diff() -> anyhow::Result<()> {
     let dir = temp_dir("auto-diff");
     std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "before")?;
 
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2027,6 +1837,7 @@ async fn auto_applied_write_records_its_diff() -> anyhow::Result<()> {
 async fn plan_mode_refuses_writes_and_mode_is_logged() -> anyhow::Result<()> {
     let dir = temp_dir("read-only");
     std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "before")?;
 
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2093,28 +1904,26 @@ async fn plan_mode_refuses_writes_and_mode_is_logged() -> anyhow::Result<()> {
         "tool output was: {}",
         result.payload
     );
-    assert!(!dir.join("out.txt").exists());
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
     // The provider never got a directly mutating tool in its advertised
-    // list. `run_command` stays visible so harmless commands like `git
+    // list. `exec_command` stays visible so harmless commands like `git
     // status` work; the permission engine rejects anything that writes.
     let first: Value = serde_json::from_str(&bodies.lock().await[0])?;
     assert!(
         first["tools"]
             .as_array()
-            .is_some_and(|tools| tools.iter().all(|tool| {
-                !matches!(
-                    tool["function"]["name"].as_str(),
-                    Some("write_file" | "edit" | "patch" | "start_command")
-                )
-            })),
+            .is_some_and(|tools| tools.iter().all(|tool| !matches!(
+                tool["function"]["name"].as_str(),
+                Some("apply_patch" | "write_stdin")
+            ))),
         "read-only tools were: {}",
         first["tools"]
     );
     assert!(
         first["tools"].as_array().is_some_and(|tools| tools
             .iter()
-            .any(|tool| tool["function"]["name"] == "run_command")),
-        "run_command should remain available for read-only inspection"
+            .any(|tool| tool["function"]["name"] == "exec_command")),
+        "exec_command should remain available for read-only inspection"
     );
 
     // Persisted change: row + mode event.
@@ -2176,97 +1985,6 @@ async fn plan_mode_refuses_writes_and_mode_is_logged() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn staged_write_can_be_revised_before_approval() -> anyhow::Result<()> {
-    let dir = temp_dir("revise");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("out.txt"), "before")?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
-
-    let mut config = Config::default();
-    config.tools.auto_apply_workspace_edits = false;
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "revise", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write out.txt"}),
-        )
-        .await?;
-
-    let patch = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "patch.proposed" {
-            break notification.params.clone();
-        }
-    };
-    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
-
-    let staged: eix_core::PatchGetResult = client
-        .request(
-            "patch.get",
-            json!({"session_id": session_id, "patch_id": patch_id}),
-        )
-        .await?;
-    assert_eq!(staged.text, "hello");
-    assert_eq!(staged.path, "out.txt");
-
-    let revised: eix_core::PatchResult = client
-        .request(
-            "patch.revise",
-            json!({
-                "session_id": session_id,
-                "patch_id": patch_id,
-                "text": "edited before approval\n",
-            }),
-        )
-        .await?;
-    assert!(revised.accepted);
-    assert_eq!(revised.message.as_deref(), Some("patch updated"));
-
-    let staged: eix_core::PatchGetResult = client
-        .request(
-            "patch.get",
-            json!({"session_id": session_id, "patch_id": patch_id}),
-        )
-        .await?;
-    assert_eq!(staged.text, "edited before approval\n");
-    // Nothing has touched the workspace yet.
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
-
-    let applied: eix_core::PatchResult = client
-        .request(
-            "patch.apply",
-            json!({"session_id": session_id, "patch_id": patch_id}),
-        )
-        .await?;
-    assert!(applied.applied);
-    assert_eq!(
-        std::fs::read_to_string(dir.join("out.txt"))?,
-        "edited before approval\n"
-    );
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> {
     let dir = temp_dir("command-snapshot");
     std::fs::create_dir_all(dir.join("src"))?;
@@ -2307,7 +2025,7 @@ async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> 
             break notification.params.clone();
         }
     };
-    assert_eq!(approval["tool"], "run_command");
+    assert_eq!(approval["tool"], "exec_command");
     let approval_id = approval["approval_id"].as_str().unwrap().to_string();
 
     let answered: eix_core::ApprovalResult = client
@@ -2339,7 +2057,7 @@ async fn command_snapshots_the_workspace_before_running() -> anyhow::Result<()> 
         .find(|e| e.kind == EventKind::Snapshot)
         .expect("snapshot event");
     assert_eq!(snapshot.payload["ok"], true);
-    assert_eq!(snapshot.payload["tool"], "run_command");
+    assert_eq!(snapshot.payload["tool"], "exec_command");
     assert_eq!(snapshot.payload["scope"], "tree");
     assert!(
         snapshot.payload["files"].as_u64().unwrap_or(0) >= 1,
@@ -2432,22 +2150,28 @@ async fn read_only_commands_run_without_approval_and_secrets_stay_local() -> any
     assert_eq!(assistant.payload["text"], "captured hunter2");
     assert!(attached.events.iter().any(|event| {
         event.kind == EventKind::ToolResult
-            && event.payload["tool"] == "run_command"
+            && event.payload["tool"] == "exec_command"
             && event.payload["ok"] == true
     }));
     assert!(
         !attached.events.iter().any(|event| {
-            event.kind == EventKind::Snapshot && event.payload["tool"] == "run_command"
+            event.kind == EventKind::Snapshot && event.payload["tool"] == "exec_command"
         }),
         "read-only commands must not capture a workspace snapshot"
     );
     let write_call = attached
         .events
         .iter()
-        .find(|event| event.kind == EventKind::ToolCall && event.payload["tool"] == "write_file")
-        .expect("write_file call");
-    assert_eq!(write_call.payload["arguments"]["content"], "hunter2");
-    assert_eq!(write_call.payload["arguments"]["path"], "out.txt");
+        .find(|event| event.kind == EventKind::ToolCall && event.payload["tool"] == "apply_patch")
+        .expect("apply_patch call");
+    assert!(
+        write_call.payload["arguments"]["patchText"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("+hunter2"),
+        "arguments were: {}",
+        write_call.payload["arguments"]
+    );
 
     let bodies = bodies.lock().await;
     assert!(bodies.len() >= 3, "expected three provider requests");
@@ -2492,7 +2216,7 @@ async fn permission_rule_skips_the_prompt() -> anyhow::Result<()> {
     config.provider_runtime.timeout_secs = 30;
     config.tools.sandbox = eix_core::SandboxMode::Off;
     config.tools.rules = vec![PermissionRule {
-        tool: "run_command".to_string(),
+        tool: "exec_command".to_string(),
         command: Some(vec!["sed".to_string()]),
         action: PermissionAction::Allow,
         ..Default::default()
@@ -2537,7 +2261,7 @@ async fn permission_rule_skips_the_prompt() -> anyhow::Result<()> {
         .iter()
         .find(|e| e.kind == EventKind::Snapshot)
         .expect("auto-approved runs are snapshotted");
-    assert_eq!(snapshot.payload["tool"], "run_command");
+    assert_eq!(snapshot.payload["tool"], "exec_command");
     let result = attached
         .events
         .iter()
@@ -2716,7 +2440,7 @@ async fn auto_classifier_invalid_output_falls_back_to_approval() -> anyhow::Resu
             break notification.params.clone();
         }
     };
-    assert_eq!(approval["tool"], "run_command");
+    assert_eq!(approval["tool"], "exec_command");
     assert!(
         approval["reasons"]
             .as_array()
@@ -2847,98 +2571,10 @@ async fn permission_rule_cannot_bypass_a_read_only_session() -> anyhow::Result<(
 }
 
 #[tokio::test]
-async fn staged_write_applies_only_the_selected_hunks() -> anyhow::Result<()> {
-    let dir = temp_dir("hunks");
-    std::fs::create_dir_all(&dir)?;
-    let original = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty\n";
-    let edited = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nEIGHTEEN\nnineteen\ntwenty\n";
-    std::fs::write(dir.join("out.txt"), original)?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(tool_provider_with_content(
-        listener,
-        Arc::clone(&bodies),
-        edited.to_string(),
-    ));
-
-    let mut config = Config::default();
-    config.tools.auto_apply_workspace_edits = false;
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "hunks", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "edit out.txt"}),
-        )
-        .await?;
-
-    let patch = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "patch.proposed" {
-            break notification.params.clone();
-        }
-    };
-    let hunks = patch["hunks"].as_array().expect("hunk preview");
-    assert_eq!(hunks.len(), 2, "hunks were: {hunks:?}");
-    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
-
-    loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "turn.completed" {
-            break;
-        }
-    }
-
-    // Apply only the first hunk; the second edit must not be written.
-    let answered: eix_core::PatchResult = client
-        .request(
-            "patch.apply",
-            json!({
-                "session_id": session_id,
-                "patch_id": patch_id,
-                "hunks": [0],
-            }),
-        )
-        .await?;
-    assert!(answered.accepted);
-    assert!(answered.applied);
-
-    let expected = original.replacen("two\n", "TWO\n", 1);
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, expected);
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    let applied = attached
-        .events
-        .iter()
-        .find(|e| e.kind == EventKind::PatchApplied)
-        .expect("patch applied event");
-    assert_eq!(applied.payload["hunks"], json!([0]));
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
 async fn attention_runs_the_notification_command() -> anyhow::Result<()> {
     let dir = temp_dir("notify");
     std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "before")?;
 
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -2983,241 +2619,6 @@ async fn attention_runs_the_notification_command() -> anyhow::Result<()> {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_eq!(notified, "notify awaiting_approval");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn staged_write_can_be_rejected_and_keeps_the_workspace_untouched() -> anyhow::Result<()> {
-    let dir = temp_dir("deny");
-    std::fs::create_dir_all(&dir)?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
-
-    let mut config = Config::default();
-    config.tools.auto_apply_workspace_edits = false;
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "deny", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write out.txt"}),
-        )
-        .await?;
-
-    let patch = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "patch.proposed" {
-            break notification.params.clone();
-        }
-    };
-    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
-
-    loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "turn.completed" {
-            break;
-        }
-    }
-
-    let answered: eix_core::PatchResult = client
-        .request(
-            "patch.reject",
-            json!({
-                "session_id": session_id,
-                "patch_id": patch_id,
-                "reason": "not this time",
-            }),
-        )
-        .await?;
-    assert!(answered.accepted);
-    assert!(!answered.applied);
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    let rejected = attached
-        .events
-        .iter()
-        .find(|e| e.kind == EventKind::PatchRejected)
-        .expect("patch rejected event");
-    assert_eq!(rejected.payload["message"], "not this time");
-    assert!(!dir.join("out.txt").exists());
-
-    let bodies = bodies.lock().await;
-    let second: Value = serde_json::from_str(&bodies[1])?;
-    let content = second["messages"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|m| m["role"] == "tool")
-        .and_then(|m| m["content"].as_str())
-        .unwrap_or_default();
-    assert!(content.contains("staged out.txt"), "{content}");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn staged_write_reports_a_conflict_when_the_file_changed() -> anyhow::Result<()> {
-    let dir = temp_dir("conflict");
-    std::fs::create_dir_all(&dir)?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
-
-    let mut config = Config::default();
-    config.tools.auto_apply_workspace_edits = false;
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "conflict", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write out.txt"}),
-        )
-        .await?;
-
-    let patch = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "patch.proposed" {
-            break notification.params.clone();
-        }
-    };
-    assert_eq!(patch["tool"], "write_file");
-    let patch_id = patch["patch_id"].as_str().unwrap().to_string();
-
-    loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "turn.completed" {
-            break;
-        }
-    }
-
-    // The file changes after the diff was generated but before the decision.
-    std::fs::write(dir.join("out.txt"), "external")?;
-
-    let answered: eix_core::PatchResult = client
-        .request(
-            "patch.apply",
-            json!({"session_id": session_id, "patch_id": patch_id}),
-        )
-        .await?;
-    assert!(answered.accepted);
-    assert!(!answered.applied);
-    assert!(answered.conflict);
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    let conflict = attached
-        .events
-        .iter()
-        .find(|event| event.kind == EventKind::PatchConflict)
-        .expect("patch conflict event");
-    let output = conflict.payload["message"].as_str().unwrap_or_default();
-    assert!(output.contains("changed after the diff"), "{output}");
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "external");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn staged_writes_are_visible_to_reads() -> anyhow::Result<()> {
-    let dir = temp_dir("shadow");
-    std::fs::create_dir_all(&dir)?;
-    std::fs::write(dir.join("out.txt"), "on disk")?;
-
-    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(staging_read_provider(listener, Arc::clone(&bodies)));
-
-    let mut config = Config::default();
-    config.tools.auto_apply_workspace_edits = false;
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-model".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request("session.create", json!({"name": "shadow", "cwd": dir}))
-        .await?;
-    let session_id = created.session.id.clone();
-    client
-        .request::<SubmitResult>(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write then read"}),
-        )
-        .await?;
-
-    let completed = loop {
-        let notification = client.next_notification().await?;
-        if notification.method == "turn.completed" {
-            break notification.params.clone();
-        }
-    };
-    assert!(completed["error"].is_null());
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    let results: Vec<_> = attached
-        .events
-        .iter()
-        .filter(|event| event.kind == EventKind::ToolResult)
-        .collect();
-    assert_eq!(results.len(), 2, "events were: {:?}", attached.events);
-    assert_eq!(results[1].payload["tool"], "read_file");
-    assert_eq!(
-        results[1].payload["output"], "1: staged\n",
-        "reads must see the shadow workspace"
-    );
-    // The patch is still waiting and the real file is untouched.
-    assert!(attached
-        .events
-        .iter()
-        .any(|event| event.kind == EventKind::PatchProposed));
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "on disk");
 
     daemon.abort();
     mock.abort();
@@ -3281,13 +2682,11 @@ async fn background_process_streams_output_and_can_be_killed() -> anyhow::Result
             .iter()
             .filter(|message| message["role"] == "tool")
             .collect();
-        assert!(tools[0]["content"]
-            .as_str()
-            .unwrap()
-            .contains("started process"));
+        let started = tools[0]["content"].as_str().unwrap();
+        assert!(started.contains("e2e-process"), "output was: {started:?}");
+        assert!(started.contains("still running"), "output was: {started:?}");
         let output = tools[1]["content"].as_str().unwrap();
-        assert!(output.starts_with("process "), "output was: {output:?}");
-        assert!(output.contains("running"), "output was: {output:?}");
+        assert!(output.contains("still running"), "output was: {output:?}");
     }
 
     let list: eix_core::ProcessList = client
@@ -4807,10 +4206,14 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
     let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
     let addr = probe.local_addr()?.to_string();
     drop(probe);
+    let probe = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let http_port = probe.local_addr()?.port();
+    drop(probe);
 
     let mut config = Config::default();
     config.default_provider_mut().base_url = "http://127.0.0.1:1/v1".to_string();
     config.server.tcp = Some(addr.clone());
+    config.server.http = Some(format!("127.0.0.1:{http_port}"));
     config.server.token = Some("s3cret".to_string());
     config.load_cwd = dir.clone();
     let socket = dir.join("eix.sock");
@@ -4834,6 +4237,61 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
         .await?
         .expect("response");
     assert_eq!(denied.error.expect("unauthorized").code, "unauthorized");
+
+    // A token minted by pairing works over TCP too, and revoking it is
+    // immediate for the next connection.
+    let base = format!("http://127.0.0.1:{http_port}");
+    let http = reqwest::Client::new();
+    let mut http_ready = false;
+    for _ in 0..100 {
+        if let Ok(response) = http.get(format!("{base}/health")).send().await {
+            if response.status().is_success() {
+                http_ready = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(http_ready, "http listener did not start");
+    let pairing: Value = unix
+        .request("pair.create", json!({"name": "tcp-laptop"}))
+        .await?;
+    let code = pairing["code"].as_str().expect("pairing code").to_string();
+    let paired: Value = http
+        .post(format!("{base}/pair"))
+        .json(&json!({"code": code}))
+        .send()
+        .await?
+        .json()
+        .await?;
+    let paired_token = paired["token"].as_str().expect("paired token").to_string();
+    let mut raw = RawTcp::connect(&addr).await?;
+    let auth = raw
+        .send("auth", json!({"token": paired_token}))
+        .await?
+        .expect("response");
+    assert_eq!(
+        auth.result.expect("auth result")["authenticated"],
+        true,
+        "a paired token must authenticate over TCP"
+    );
+    let pong = raw.send("ping", Value::Null).await?.expect("response");
+    assert_eq!(pong.result.expect("ping result")["pong"], true);
+
+    let client_id = paired["client"]["id"]
+        .as_str()
+        .expect("client id")
+        .to_string();
+    let revoked: Value = unix
+        .request("pair.revoke", json!({"id": client_id}))
+        .await?;
+    assert_eq!(revoked["revoked"], true);
+    let mut raw = RawTcp::connect(&addr).await?;
+    let denied = raw
+        .send("auth", json!({"token": paired_token}))
+        .await?
+        .expect("response");
+    assert_eq!(denied.error.expect("revoked token").code, "unauthorized");
 
     // The right token unlocks the normal protocol.
     let mut raw = RawTcp::connect(&addr).await?;
@@ -5208,8 +4666,10 @@ async fn spawn_agent_runs_a_readonly_child_and_returns_its_answer() -> anyhow::R
     let listed = parent_events
         .events
         .iter()
-        .find(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == "list_dir")
-        .expect("list_dir result");
+        .find(|event| {
+            event.kind == EventKind::ToolResult && event.payload["tool"] == "exec_command"
+        })
+        .expect("exec_command result");
     assert_eq!(listed.payload["ok"], true);
 
     daemon.abort();
@@ -5901,6 +5361,57 @@ async fn mock_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
     }
 }
 
+/// Like `mock_provider`, but records the raw request headers so tests can
+/// assert on provider authentication.
+async fn header_capturing_provider(listener: TcpListener, headers: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let headers = Arc::clone(&headers);
+        tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0u8; 1024];
+                let Ok(n) = socket.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(pos) = find_header_end(&buf) {
+                    break pos;
+                }
+            };
+            let raw = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let lower = raw.to_ascii_lowercase();
+            let length: usize = lower
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .and_then(|value| value.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + length {
+                let mut chunk = [0u8; 1024];
+                let Ok(n) = socket.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+            }
+            headers.lock().await.push(raw);
+            let events = concat!(
+                "data: {\"model\":\"mock-1\",\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            write_sse(&mut socket, events).await;
+        });
+    }
+}
+
 async fn flaky_provider(listener: TcpListener, failures: usize, bodies: Arc<Mutex<Vec<String>>>) {
     let remaining = Arc::new(Mutex::new(failures));
     loop {
@@ -6143,7 +5654,11 @@ async fn tool_provider_with_content(
                 });
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else {
-                let arguments = json!({"path": "out.txt", "content": content}).to_string();
+                let added: String = content.lines().map(|line| format!("+{line}\n")).collect();
+                let patch = format!(
+                    "*** Begin Patch\n*** Update File: out.txt\n@@\n-before\n{added}*** End Patch\n"
+                );
+                let arguments = json!({"patchText": patch}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{
@@ -6152,7 +5667,7 @@ async fn tool_provider_with_content(
                                 "index": 0,
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "write_file", "arguments": arguments},
+                                "function": {"name": "apply_patch", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",
@@ -6227,7 +5742,7 @@ async fn skills_are_listed_in_the_prompt_and_loadable_with_use_skill() -> anyhow
     assert!(bodies[0].contains("<available_skills>"));
     assert!(bodies[0].contains("deploy checklist"));
     assert!(bodies[0].contains("Claude-compatible audit"));
-    assert!(bodies[0].contains("<allowed_tools>read_file</allowed_tools>"));
+    assert!(bodies[0].contains("<allowed_tools>exec_command</allowed_tools>"));
     assert!(bodies[1].contains("Run the deploy checklist before shipping."));
 
     daemon.abort();
@@ -6297,8 +5812,8 @@ async fn skills_expand_arguments_and_enforce_allowed_tools() -> anyhow::Result<(
     assert!(output.contains("Allowed tools"), "{output}");
     let write = results
         .iter()
-        .find(|event| event.payload["tool"] == "write_file")
-        .expect("blocked write result");
+        .find(|event| event.payload["tool"] == "apply_patch")
+        .expect("blocked patch result");
     assert_eq!(write.payload["ok"], false);
     assert_eq!(write.payload["denied"], true);
     assert!(
@@ -6345,8 +5860,11 @@ async fn skill_guard_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Strin
                     String::new(),
                 ),
                 1 => (
-                    "write_file",
-                    json!({"path": "x.txt", "content": "blocked"}).to_string(),
+                    "apply_patch",
+                    json!({
+                        "patchText": "*** Begin Patch\n*** Add File: x.txt\n+blocked\n*** End Patch\n"
+                    })
+                    .to_string(),
                     String::new(),
                 ),
                 _ => ("", String::new(), "done".to_string()),
@@ -6639,7 +6157,20 @@ async fn repeat_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Strin
                 });
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else {
-                let arguments = json!({"path": "out.txt", "content": "hello"}).to_string();
+                let again = value["messages"].as_array().is_some_and(|messages| {
+                    messages.iter().any(|message| {
+                        message["role"] == "user"
+                            && message["content"]
+                                .as_str()
+                                .is_some_and(|text| text.contains("write it again"))
+                    })
+                });
+                let patch = if again {
+                    "*** Begin Patch\n*** Update File: out.txt\n@@\n-hello\n+again\n*** End Patch\n"
+                } else {
+                    "*** Begin Patch\n*** Update File: out.txt\n@@\n-before\n+hello\n*** End Patch\n"
+                };
+                let arguments = json!({"patchText": patch}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{
@@ -6648,7 +6179,7 @@ async fn repeat_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Strin
                                 "index": 0,
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "write_file", "arguments": arguments},
+                                "function": {"name": "apply_patch", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",
@@ -7364,6 +6895,114 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
         .any(|session| session.id == target));
     assert!(sdk.stats().await?.sessions >= 2);
 
+    // The OpenAPI document is public and describes the pairing route too.
+    let openapi = http.get(format!("{base}/openapi.json")).send().await?;
+    assert_eq!(openapi.status(), 200);
+    let openapi: Value = openapi.json().await?;
+    assert_eq!(openapi["openapi"], "3.1.0");
+    assert_eq!(openapi["info"]["version"], env!("CARGO_PKG_VERSION"));
+    for path in ["/health", "/stats", "/rpc", "/events", "/pair"] {
+        assert!(
+            openapi["paths"].get(path).is_some(),
+            "openapi is missing {path}"
+        );
+    }
+
+    // Pairing: the local owner mints a one-time code; the client redeems it
+    // over unauthenticated HTTP for a durable token.
+    let pairing: Value = local
+        .request("pair.create", json!({"name": "laptop"}))
+        .await?;
+    let code = pairing["code"].as_str().expect("pairing code").to_string();
+    assert_eq!(code.len(), 19);
+    assert!(pairing["http"]
+        .as_str()
+        .unwrap_or_default()
+        .ends_with("/pair"));
+
+    // Codes are case- and dash-insensitive.
+    let loose = code.replace('-', "").to_uppercase();
+    let exchanged = http
+        .post(format!("{base}/pair"))
+        .json(&json!({"code": loose}))
+        .send()
+        .await?;
+    assert_eq!(exchanged.status(), 200, "pairing failed");
+    let exchanged: Value = exchanged.json().await?;
+    let paired = exchanged["token"]
+        .as_str()
+        .expect("paired token")
+        .to_string();
+    assert_eq!(exchanged["client"]["name"], "laptop");
+    assert!(exchanged["client"]["id"]
+        .as_str()
+        .unwrap_or_default()
+        .starts_with("ct_"));
+
+    // The minted token opens the same remote surface as the configured one.
+    let stats = http
+        .get(format!("{base}/stats"))
+        .header("x-eix-token", &paired)
+        .send()
+        .await?;
+    assert_eq!(stats.status(), 200);
+    let hello = http
+        .post(format!("{base}/rpc"))
+        .bearer_auth(&paired)
+        .json(&json!({"id": 90, "method": "hello", "params": null}))
+        .send()
+        .await?;
+    assert_eq!(hello.status(), 200);
+    let hello: Value = hello.json().await?;
+    assert_eq!(hello["result"]["protocol"], PROTOCOL_VERSION);
+
+    // A paired client cannot mint or revoke other clients.
+    let denied = http
+        .post(format!("{base}/rpc"))
+        .bearer_auth(&paired)
+        .json(&json!({"id": 91, "method": "pair.create", "params": {}}))
+        .send()
+        .await?;
+    let denied: Value = denied.json().await?;
+    assert_eq!(denied["error"]["code"], "forbidden");
+
+    let listed: Value = local.request("pair.list", json!({})).await?;
+    let clients = listed["clients"].as_array().expect("client list");
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0]["name"], "laptop");
+    assert_eq!(clients[0]["revoked"], false);
+    assert!(clients[0]["last_used_at"].as_i64().is_some());
+    let client_id = clients[0]["id"].as_str().expect("client id").to_string();
+
+    // Codes are single use.
+    let reused = http
+        .post(format!("{base}/pair"))
+        .json(&json!({"code": code}))
+        .send()
+        .await?;
+    assert_eq!(reused.status(), 401);
+
+    // Revocation takes effect immediately for both HTTP and the token check.
+    let revoked: Value = local
+        .request("pair.revoke", json!({"id": client_id}))
+        .await?;
+    assert_eq!(revoked["revoked"], true);
+    let after = http
+        .get(format!("{base}/stats"))
+        .bearer_auth(&paired)
+        .send()
+        .await?;
+    assert_eq!(after.status(), 401);
+    assert_eq!(
+        http.get(format!("{base}/stats"))
+            .bearer_auth("http-secret")
+            .send()
+            .await?
+            .status(),
+        200,
+        "revoking one client must not disable the configured token"
+    );
+
     daemon.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
@@ -7399,13 +7038,13 @@ async fn user_shell_commands_are_recorded_and_read_only_sessions_only_allow_safe
         .events
         .iter()
         .any(|event| event.kind == EventKind::ToolCall
-            && event.payload["tool"] == "run_command"
+            && event.payload["tool"] == "exec_command"
             && event.payload["arguments"]["command"] == "printf shell-ok"));
     assert!(attached
         .events
         .iter()
         .any(|event| event.kind == EventKind::ToolResult
-            && event.payload["tool"] == "run_command"
+            && event.payload["tool"] == "exec_command"
             && event.payload["ok"] == true));
 
     let readonly: SessionResult = client
@@ -7530,9 +7169,10 @@ async fn undo_and_redo_toggle_the_newest_turn() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::Result<()> {
+async fn always_allow_skips_later_patches_for_the_same_path() -> anyhow::Result<()> {
     let dir = temp_dir("always");
     std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "before")?;
 
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -7562,23 +7202,22 @@ async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::R
         .await?;
     let proposed = loop {
         let notification = client.next_notification().await?;
-        if notification.method == "patch.proposed" {
+        if notification.method == "tool.approval_required" {
             break notification.params.clone();
         }
     };
-    let patch_id = proposed["patch_id"].as_str().unwrap().to_string();
+    let approval_id = proposed["approval_id"].as_str().unwrap().to_string();
     let answered: eix_core::ApprovalResult = client
         .request(
             "approval.respond",
             json!({
                 "session_id": session_id,
-                "approval_id": patch_id,
+                "approval_id": approval_id,
                 "decision": "always",
             }),
         )
         .await?;
     assert!(answered.accepted);
-    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
     loop {
         let notification = client.next_notification().await?;
         if notification.method == "turn.completed"
@@ -7588,6 +7227,7 @@ async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::R
             break;
         }
     }
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
 
     let submitted: SubmitResult = client
         .request(
@@ -7638,7 +7278,7 @@ async fn always_allow_skips_later_staged_writes_for_the_same_path() -> anyhow::R
     assert!(
         allowed.payload["rule"]
             .as_str()
-            .is_some_and(|rule| rule.starts_with("always-write_file-")),
+            .is_some_and(|rule| rule.starts_with("always-apply_patch-")),
         "unexpected rule audit: {}",
         allowed.payload
     );
@@ -7797,7 +7437,10 @@ async fn early_agent_provider(
                 .unwrap_or(false);
 
             let chunk = if can_spawn && tool_messages == 0 {
-                let write = json!({"path": "early.txt", "content": "written\n"}).to_string();
+                let write = json!({
+                    "patchText": "*** Begin Patch\n*** Add File: early.txt\n+written\n*** End Patch\n"
+                })
+                .to_string();
                 let spawn = json!({"prompt": "investigate", "name": "scout"}).to_string();
                 let fetch = json!({"url": read_url}).to_string();
                 json!({
@@ -7809,7 +7452,7 @@ async fn early_agent_provider(
                                     "index": 0,
                                     "id": "call_write",
                                     "type": "function",
-                                    "function": {"name": "write_file", "arguments": write},
+                                    "function": {"name": "apply_patch", "arguments": write},
                                 },
                                 {
                                     "index": 1,
@@ -7821,7 +7464,7 @@ async fn early_agent_provider(
                                     "index": 2,
                                     "id": "call_read",
                                     "type": "function",
-                                    "function": {"name": "webfetch", "arguments": fetch},
+                                    "function": {"name": "web_fetch", "arguments": fetch},
                                 }
                             ]
                         },
@@ -7897,7 +7540,7 @@ async fn agent_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
                                     "index": 1,
                                     "id": "call_list",
                                     "type": "function",
-                                    "function": {"name": "list_dir", "arguments": "{}"},
+                                    "function": {"name": "exec_command", "arguments": "{\"cmd\":\"ls\"}"},
                                 },
                             ]
                         },
@@ -7993,18 +7636,13 @@ async fn secret_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>)
                 })
                 .unwrap_or(0);
             let events = match tool_results {
-                0 => tool_call_event(
-                    json!({"command": "cat secret.txt"}),
-                    "run_command",
-                    "call_1",
-                ),
+                0 => tool_call_event(json!({"cmd": "cat secret.txt"}), "exec_command", "call_1"),
                 1 => {
                     let placeholder = first_placeholder(&value).unwrap_or_default();
-                    tool_call_event(
-                        json!({"path": "out.txt", "content": placeholder}),
-                        "write_file",
-                        "call_2",
-                    )
+                    let patch = format!(
+                        "*** Begin Patch\n*** Add File: out.txt\n+{placeholder}\n*** End Patch\n"
+                    );
+                    tool_call_event(json!({"patchText": patch}), "apply_patch", "call_2")
                 }
                 _ => {
                     let placeholder = first_placeholder(&value).unwrap_or_default();
@@ -8069,8 +7707,7 @@ async fn command_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>
                 });
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else {
-                let arguments =
-                    json!({"command": "sed -i 's/before/after/' src/keep.txt"}).to_string();
+                let arguments = json!({"cmd": "sed -i 's/before/after/' src/keep.txt"}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{
@@ -8079,7 +7716,7 @@ async fn command_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>
                                 "index": 0,
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "run_command", "arguments": arguments},
+                                "function": {"name": "exec_command", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",
@@ -8137,8 +7774,7 @@ async fn classifier_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String
             let events = match tool_results {
                 0 | 1 => {
                     let arguments =
-                        json!({"command": "git commit --allow-empty -m auto-classified"})
-                            .to_string();
+                        json!({"cmd": "git commit --allow-empty -m auto-classified"}).to_string();
                     let chunk = json!({
                         "model": "mock-tools",
                         "choices": [{
@@ -8147,7 +7783,7 @@ async fn classifier_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String
                                     "index": 0,
                                     "id": format!("call_{}", tool_results + 1),
                                     "type": "function",
-                                    "function": {"name": "run_command", "arguments": arguments},
+                                    "function": {"name": "exec_command", "arguments": arguments},
                                 }]
                             },
                             "finish_reason": "tool_calls",
@@ -8209,7 +7845,7 @@ async fn invalid_classifier_provider(listener: TcpListener) {
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else {
                 let arguments =
-                    json!({"command": "git commit --allow-empty -m fallback-approved"}).to_string();
+                    json!({"cmd": "git commit --allow-empty -m fallback-approved"}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{
@@ -8218,59 +7854,13 @@ async fn invalid_classifier_provider(listener: TcpListener) {
                                 "index": 0,
                                 "id": "call_fallback",
                                 "type": "function",
-                                "function": {"name": "run_command", "arguments": arguments},
+                                "function": {"name": "exec_command", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",
                     }],
                 });
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
-            };
-            write_sse(&mut socket, &events).await;
-        });
-    }
-}
-
-/// A provider that stages a write, then reads the same file back, then stops.
-async fn staging_read_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
-    loop {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let bodies = Arc::clone(&bodies);
-        tokio::spawn(async move {
-            let Some(body) = read_http_body(&mut socket).await else {
-                return;
-            };
-            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            bodies.lock().await.push(body);
-            let tool_messages = value["messages"]
-                .as_array()
-                .map(|messages| {
-                    messages
-                        .iter()
-                        .filter(|message| message["role"] == "tool")
-                        .count()
-                })
-                .unwrap_or(0);
-            let events = match tool_messages {
-                0 => tool_call_events(
-                    "call_1",
-                    "write_file",
-                    &json!({"path": "out.txt", "content": "staged"}).to_string(),
-                ),
-                1 => tool_call_events(
-                    "call_2",
-                    "read_file",
-                    &json!({"path": "out.txt"}).to_string(),
-                ),
-                _ => {
-                    let chunk = json!({
-                        "model": "mock-tools",
-                        "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
-                    });
-                    format!("data: {chunk}\n\ndata: [DONE]\n\n")
-                }
             };
             write_sse(&mut socket, &events).await;
         });
@@ -8358,7 +7948,11 @@ async fn start_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
                 })
                 .unwrap_or(0);
             let events = if tool_results == 0 {
-                let arguments = json!({"command": "echo e2e-process && sleep 30"}).to_string();
+                let arguments = json!({
+                    "cmd": "echo e2e-process && sleep 30",
+                    "yield_time_ms": 200
+                })
+                .to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{
@@ -8367,7 +7961,7 @@ async fn start_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
                                 "index": 0,
                                 "id": "call_1",
                                 "type": "function",
-                                "function": {"name": "start_command", "arguments": arguments},
+                                "function": {"name": "exec_command", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",
@@ -8375,8 +7969,21 @@ async fn start_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
                 });
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else if tool_results == 1 {
-                // Read the newest process without naming it.
-                let arguments = json!({"max_bytes": 200}).to_string();
+                // The first result names the still-running session; poll it.
+                let session = value["messages"]
+                    .as_array()
+                    .and_then(|messages| {
+                        messages
+                            .iter()
+                            .rev()
+                            .find(|message| message["role"] == "tool")
+                    })
+                    .and_then(|message| message["content"].as_str())
+                    .and_then(|text| text.split_once("session "))
+                    .map(|(_, rest)| rest.split([' ', ';']).next().unwrap_or_default())
+                    .unwrap_or_default()
+                    .to_string();
+                let arguments = json!({"session_id": session, "chars": ""}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{
@@ -8385,7 +7992,7 @@ async fn start_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
                                 "index": 0,
                                 "id": "call_2",
                                 "type": "function",
-                                "function": {"name": "process_output", "arguments": arguments},
+                                "function": {"name": "write_stdin", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",
@@ -8652,13 +8259,13 @@ async fn parallel_read_provider(listener: TcpListener) {
                                     "index": 0,
                                     "id": "read_a",
                                     "type": "function",
-                                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+                                    "function": {"name": "exec_command", "arguments": "{\"cmd\":\"cat a.txt\"}"},
                                 },
                                 {
                                     "index": 1,
                                     "id": "read_b",
                                     "type": "function",
-                                    "function": {"name": "read_file", "arguments": "{\"path\":\"b.txt\"}"},
+                                    "function": {"name": "exec_command", "arguments": "{\"cmd\":\"cat b.txt\"}"},
                                 }
                             ]
                         },
@@ -8736,7 +8343,7 @@ async fn read_only_tool_batch_keeps_call_order() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Provider that asks for a secret `read_file` and an ordinary one in the same
+/// Provider that asks for a secret `cat` and an ordinary one in the same
 /// batch. The secret read must still stop for approval instead of joining the
 /// concurrent read segment.
 async fn parallel_secret_read_provider(listener: TcpListener) {
@@ -8766,13 +8373,13 @@ async fn parallel_secret_read_provider(listener: TcpListener) {
                                     "index": 0,
                                     "id": "read_secret",
                                     "type": "function",
-                                    "function": {"name": "read_file", "arguments": "{\"path\":\".env\"}"},
+                                    "function": {"name": "exec_command", "arguments": "{\"cmd\":\"cat .env\"}"},
                                 },
                                 {
                                     "index": 1,
                                     "id": "read_plain",
                                     "type": "function",
-                                    "function": {"name": "read_file", "arguments": "{\"path\":\"a.txt\"}"},
+                                    "function": {"name": "exec_command", "arguments": "{\"cmd\":\"cat a.txt\"}"},
                                 }
                             ]
                         },
@@ -8844,8 +8451,8 @@ async fn parallel_read_batch_keeps_secret_paths_behind_approval() -> anyhow::Res
             anyhow::bail!("secret read did not request approval");
         }
     };
-    assert_eq!(approval["tool"], "read_file");
-    assert_eq!(approval["arguments"]["path"], ".env");
+    assert_eq!(approval["tool"], "exec_command");
+    assert_eq!(approval["arguments"]["cmd"], "cat .env");
     let approval_id = approval["approval_id"]
         .as_str()
         .expect("approval id")
@@ -8890,7 +8497,9 @@ async fn parallel_read_batch_keeps_secret_paths_behind_approval() -> anyhow::Res
     let reads: Vec<_> = attached
         .events
         .iter()
-        .filter(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == "read_file")
+        .filter(|event| {
+            event.kind == EventKind::ToolResult && event.payload["tool"] == "exec_command"
+        })
         .collect();
     assert_eq!(reads.len(), 2);
     assert!(reads.iter().any(|event| event.payload["output"]
@@ -8939,8 +8548,8 @@ async fn parallel_command_provider(listener: TcpListener) {
                     "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
                 })
             } else {
-                let a = json!({"command": "cat a.fifo"}).to_string();
-                let b = json!({"command": "cat b.fifo"}).to_string();
+                let a = json!({"cmd": "cat a.fifo"}).to_string();
+                let b = json!({"cmd": "cat b.fifo"}).to_string();
                 json!({
                     "model": "mock-parallel-command",
                     "choices": [{
@@ -8950,13 +8559,13 @@ async fn parallel_command_provider(listener: TcpListener) {
                                     "index": 0,
                                     "id": "command_a",
                                     "type": "function",
-                                    "function": {"name": "run_command", "arguments": a},
+                                    "function": {"name": "exec_command", "arguments": a},
                                 },
                                 {
                                     "index": 1,
                                     "id": "command_b",
                                     "type": "function",
-                                    "function": {"name": "run_command", "arguments": b},
+                                    "function": {"name": "exec_command", "arguments": b},
                                 }
                             ]
                         },
@@ -9054,7 +8663,7 @@ async fn read_only_commands_run_concurrently_and_keep_call_order() -> anyhow::Re
             daemon.abort();
             mock.abort();
             anyhow::bail!(
-                "timed out waiting for both run_command calls; they likely ran sequentially"
+                "timed out waiting for both exec_command calls; they likely ran sequentially"
             );
         }
     };
@@ -9076,522 +8685,6 @@ async fn read_only_commands_run_concurrently_and_keep_call_order() -> anyhow::Re
         })
         .unwrap_or_default();
     assert_eq!(answer, "order ok");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-/// Provider that asks for two file writes in one batch. The formatter script
-/// used by these tests blocks until the test creates `release`, so the test can
-/// observe whether both writes started before either finished.
-async fn parallel_write_provider(
-    listener: TcpListener,
-    first: (String, String),
-    second: (String, String),
-) {
-    loop {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        let first = first.clone();
-        let second = second.clone();
-        tokio::spawn(async move {
-            let Some(body) = read_http_body(&mut socket).await else {
-                return;
-            };
-            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let messages = value["messages"].as_array().cloned().unwrap_or_default();
-            let tool_messages: Vec<_> = messages
-                .iter()
-                .filter(|message| message["role"] == "tool")
-                .collect();
-            let chunk = if tool_messages.len() >= 2 {
-                let first_output = tool_messages[tool_messages.len() - 2]["content"]
-                    .as_str()
-                    .unwrap_or_default();
-                let second_output = tool_messages[tool_messages.len() - 1]["content"]
-                    .as_str()
-                    .unwrap_or_default();
-                let answer = if first_output.contains(&first.0) && second_output.contains(&second.0)
-                {
-                    "order ok"
-                } else {
-                    "wrong order"
-                };
-                json!({
-                    "model": "mock-parallel-write",
-                    "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
-                })
-            } else {
-                let a = json!({"path": first.0, "content": first.1}).to_string();
-                let b = json!({"path": second.0, "content": second.1}).to_string();
-                json!({
-                    "model": "mock-parallel-write",
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "write_a",
-                                    "type": "function",
-                                    "function": {"name": "write_file", "arguments": a},
-                                },
-                                {
-                                    "index": 1,
-                                    "id": "write_b",
-                                    "type": "function",
-                                    "function": {"name": "write_file", "arguments": b},
-                                }
-                            ]
-                        },
-                        "finish_reason": "tool_calls",
-                    }],
-                })
-            };
-            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
-            write_sse(&mut socket, &events).await;
-        });
-    }
-}
-
-/// Provider that asks for two writes and only accepts an answer when both tool
-/// results contain the batched LSP diagnostics.
-async fn parallel_write_diagnostics_provider(listener: TcpListener) {
-    loop {
-        let Ok((mut socket, _)) = listener.accept().await else {
-            return;
-        };
-        tokio::spawn(async move {
-            let Some(body) = read_http_body(&mut socket).await else {
-                return;
-            };
-            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
-            let messages = value["messages"].as_array().cloned().unwrap_or_default();
-            let tool_messages: Vec<_> = messages
-                .iter()
-                .filter(|message| message["role"] == "tool")
-                .collect();
-            let chunk = if tool_messages.len() >= 2 {
-                let first = tool_messages[tool_messages.len() - 2]["content"]
-                    .as_str()
-                    .unwrap_or_default();
-                let second = tool_messages[tool_messages.len() - 1]["content"]
-                    .as_str()
-                    .unwrap_or_default();
-                let answer =
-                    if first.contains("LSP diagnostics") && second.contains("LSP diagnostics") {
-                        "diagnostics ok"
-                    } else {
-                        "missing diagnostics"
-                    };
-                json!({
-                    "model": "mock-parallel-diagnostics",
-                    "choices": [{"delta": {"content": answer}, "finish_reason": "stop"}],
-                })
-            } else {
-                let a = json!({"path": "a.rs", "content": "fn a() {}\n"}).to_string();
-                let b = json!({"path": "b.rs", "content": "fn b() {}\n"}).to_string();
-                json!({
-                    "model": "mock-parallel-diagnostics",
-                    "choices": [{
-                        "delta": {
-                            "tool_calls": [
-                                {
-                                    "index": 0,
-                                    "id": "write_a",
-                                    "type": "function",
-                                    "function": {"name": "write_file", "arguments": a},
-                                },
-                                {
-                                    "index": 1,
-                                    "id": "write_b",
-                                    "type": "function",
-                                    "function": {"name": "write_file", "arguments": b},
-                                }
-                            ]
-                        },
-                        "finish_reason": "tool_calls",
-                    }],
-                })
-            };
-            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
-        });
-    }
-}
-
-fn batch_diagnostics_script(dir: &Path) -> PathBuf {
-    let script = dir.join("batch-lsp.py");
-    std::fs::write(
-        &script,
-        r#"
-import sys, json
-
-def read():
-    headers = {}
-    line = sys.stdin.buffer.readline()
-    if not line:
-        return None
-    while line not in (b"\r\n", b"\n"):
-        key, value = line.split(b":", 1)
-        headers[key.strip().lower()] = value.strip()
-        line = sys.stdin.buffer.readline()
-    return json.loads(sys.stdin.buffer.read(int(headers[b"content-length"])))
-
-def send(value):
-    body = json.dumps(value).encode()
-    sys.stdout.buffer.write(b"Content-Length: %d\r\n\r\n" % len(body) + body)
-    sys.stdout.buffer.flush()
-
-opened = []
-while True:
-    message = read()
-    if message is None:
-        break
-    method = message.get("method")
-    if method == "initialize":
-        send({"jsonrpc": "2.0", "id": message["id"], "result": {"capabilities": {}}})
-    elif method == "textDocument/didOpen":
-        uri = message["params"]["textDocument"]["uri"]
-        opened.append(uri)
-        if len(opened) == 2:
-            for index, uri in enumerate(opened):
-                send({"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics", "params": {
-                    "uri": uri, "diagnostics": [{"range": {"start": {"line": 0, "character": 0}},
-                    "severity": 2, "message": "batch %d" % index}]}})
-"#,
-    )
-    .expect("write batch LSP script");
-    script
-}
-
-fn waiting_formatter_script(dir: &Path) -> PathBuf {
-    let script = dir.join("wait-for-release.sh");
-    std::fs::write(
-        &script,
-        "#!/bin/sh\n\
-         i=0\n\
-         while [ ! -f release ] && [ \"$i\" -lt 1000 ]; do\n\
-           i=$((i + 1))\n\
-           sleep 0.01\n\
-         done\n",
-    )
-    .expect("write formatter script");
-    script
-}
-
-fn waiting_formatter_config(script: &Path) -> FormatterConfig {
-    FormatterConfig {
-        command: Some(format!("sh {}", script.display())),
-        extensions: Vec::new(),
-        timeout_secs: 30,
-    }
-}
-
-#[tokio::test]
-async fn parallel_write_batch_overlaps_independent_files_and_keeps_order() -> anyhow::Result<()> {
-    let dir = temp_dir("parallel-write");
-    std::fs::create_dir_all(&dir)?;
-    let script = waiting_formatter_script(&dir);
-    let release = dir.join("release");
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(parallel_write_provider(
-        listener,
-        ("a.txt".to_string(), "AAA\n".to_string()),
-        ("b.txt".to_string(), "BBB\n".to_string()),
-    ));
-
-    let mut config = Config::default();
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-parallel-write".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-    config.context.instructions_files = Vec::new();
-    config.context.workspace_summary = false;
-    config.context.auto_compact = false;
-    config.formatter = waiting_formatter_config(&script).into();
-    config.formatter_defaults = false;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request(
-            "session.create",
-            json!({"name": "parallel-write", "cwd": dir}),
-        )
-        .await?;
-    let session_id = created.session.id.clone();
-    let submitted: SubmitResult = client
-        .request(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write both files"}),
-        )
-        .await?;
-    let turn_id = submitted.turn_id.clone();
-
-    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut started = 0usize;
-        loop {
-            let notification = client.next_notification().await?;
-            match notification.method.as_str() {
-                "tool.started" if notification.params["session_id"] == session_id.as_str() => {
-                    started += 1;
-                    if started == 2 {
-                        tokio::fs::write(&release, b"go").await?;
-                    }
-                }
-                "turn.completed"
-                    if notification.params["session_id"] == session_id.as_str()
-                        && notification.params["turn_id"] == turn_id.as_str() =>
-                {
-                    anyhow::ensure!(
-                        started >= 2,
-                        "both independent writes should start before either finishes"
-                    );
-                    return Ok::<Value, anyhow::Error>(notification.params.clone());
-                }
-                _ => {}
-            }
-        }
-    })
-    .await;
-
-    let completed = match outcome {
-        Ok(result) => result?,
-        Err(_) => {
-            let _ = tokio::fs::write(&release, b"go").await;
-            daemon.abort();
-            mock.abort();
-            anyhow::bail!("timed out waiting for both writes; different files ran sequentially");
-        }
-    };
-    assert!(completed["error"].is_null(), "{completed}");
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    let answer = attached
-        .events
-        .iter()
-        .rev()
-        .find(|event| event.kind == EventKind::AssistantMessage)
-        .map(|event| {
-            event.payload["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .unwrap_or_default();
-    assert_eq!(answer, "order ok");
-    assert_eq!(std::fs::read_to_string(dir.join("a.txt"))?, "AAA\n");
-    assert_eq!(std::fs::read_to_string(dir.join("b.txt"))?, "BBB\n");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn parallel_write_batch_collects_diagnostics_once() -> anyhow::Result<()> {
-    if std::process::Command::new("python3")
-        .arg("--version")
-        .output()
-        .is_err()
-    {
-        eprintln!("python3 unavailable; skipping parallel LSP test");
-        return Ok(());
-    }
-    let dir = temp_dir("parallel-lsp");
-    std::fs::create_dir_all(&dir)?;
-    let script = batch_diagnostics_script(&dir);
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(parallel_write_diagnostics_provider(listener));
-
-    let mut config = Config::default();
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-parallel-diagnostics".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-    config.context.instructions_files = Vec::new();
-    config.context.workspace_summary = false;
-    config.context.auto_compact = false;
-    config.lsp.servers.clear();
-    config.lsp.servers.insert(
-        "fake".into(),
-        LspServerConfig {
-            command: "python3".into(),
-            args: vec![script.display().to_string()],
-            extensions: vec!["rs".into()],
-            timeout_secs: 5,
-            ..Default::default()
-        },
-    );
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request(
-            "session.create",
-            json!({"name": "parallel-lsp", "cwd": dir}),
-        )
-        .await?;
-    let session_id = created.session.id.clone();
-    let submitted: SubmitResult = client
-        .request(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write both files"}),
-        )
-        .await?;
-    let turn_id = submitted.turn_id.clone();
-
-    let completed = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let notification = client.next_notification().await?;
-            if notification.method == "turn.completed"
-                && notification.params["session_id"] == session_id.as_str()
-                && notification.params["turn_id"] == turn_id.as_str()
-            {
-                return Ok::<Value, anyhow::Error>(notification.params.clone());
-            }
-        }
-    })
-    .await;
-
-    let completed = match completed {
-        Ok(result) => result?,
-        Err(_) => {
-            daemon.abort();
-            mock.abort();
-            anyhow::bail!("timed out waiting for the parallel LSP write turn");
-        }
-    };
-    assert!(completed["error"].is_null(), "{completed}");
-
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": session_id}))
-        .await?;
-    let answer = attached
-        .events
-        .iter()
-        .rev()
-        .find(|event| event.kind == EventKind::AssistantMessage)
-        .map(|event| {
-            event.payload["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string()
-        })
-        .unwrap_or_default();
-    assert_eq!(answer, "diagnostics ok");
-    assert_eq!(std::fs::read_to_string(dir.join("a.rs"))?, "fn a() {}\n");
-    assert_eq!(std::fs::read_to_string(dir.join("b.rs"))?, "fn b() {}\n");
-
-    daemon.abort();
-    mock.abort();
-    let _ = tokio::fs::remove_dir_all(&dir).await;
-    Ok(())
-}
-
-#[tokio::test]
-async fn same_file_writes_stay_serialized() -> anyhow::Result<()> {
-    let dir = temp_dir("serial-write");
-    std::fs::create_dir_all(&dir)?;
-    let script = waiting_formatter_script(&dir);
-    let release = dir.join("release");
-
-    let listener = TcpListener::bind("127.0.0.1:0").await?;
-    let addr = listener.local_addr()?;
-    let mock = tokio::spawn(parallel_write_provider(
-        listener,
-        ("same.txt".to_string(), "AAA\n".to_string()),
-        ("same.txt".to_string(), "BBB\n".to_string()),
-    ));
-
-    let mut config = Config::default();
-    config.default_provider_mut().base_url = format!("http://{addr}/v1");
-    config.default_provider_mut().model = "mock-parallel-write".to_string();
-    config.default_provider_mut().api_key = None;
-    config.provider_runtime.timeout_secs = 30;
-    config.context.instructions_files = Vec::new();
-    config.context.workspace_summary = false;
-    config.context.auto_compact = false;
-    config.formatter = waiting_formatter_config(&script).into();
-    config.formatter_defaults = false;
-
-    let socket = dir.join("eix.sock");
-    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
-    let mut client = connect(&socket).await?;
-    let created: SessionResult = client
-        .request(
-            "session.create",
-            json!({"name": "serial-write", "cwd": dir}),
-        )
-        .await?;
-    let session_id = created.session.id.clone();
-    let submitted: SubmitResult = client
-        .request(
-            "prompt.submit",
-            json!({"session_id": session_id, "text": "write the same file twice"}),
-        )
-        .await?;
-    let turn_id = submitted.turn_id.clone();
-    let release_ready = Arc::new(AtomicBool::new(false));
-
-    let outcome = tokio::time::timeout(Duration::from_secs(10), async {
-        let mut started = 0usize;
-        let mut overlapped = false;
-        loop {
-            let notification = client.next_notification().await?;
-            match notification.method.as_str() {
-                "tool.started" if notification.params["session_id"] == session_id.as_str() => {
-                    started += 1;
-                    if started > 1 && !release_ready.load(Ordering::SeqCst) {
-                        overlapped = true;
-                    }
-                    if started == 1 {
-                        let release = release.clone();
-                        let ready = Arc::clone(&release_ready);
-                        tokio::spawn(async move {
-                            tokio::time::sleep(Duration::from_millis(300)).await;
-                            ready.store(true, Ordering::SeqCst);
-                            let _ = tokio::fs::write(release, b"go").await;
-                        });
-                    }
-                }
-                "turn.completed"
-                    if notification.params["session_id"] == session_id.as_str()
-                        && notification.params["turn_id"] == turn_id.as_str() =>
-                {
-                    anyhow::ensure!(!overlapped, "same-file writes overlapped");
-                    anyhow::ensure!(started == 2, "both writes should run");
-                    return Ok::<Value, anyhow::Error>(notification.params.clone());
-                }
-                _ => {}
-            }
-        }
-    })
-    .await;
-
-    let completed = match outcome {
-        Ok(result) => result?,
-        Err(_) => {
-            release_ready.store(true, Ordering::SeqCst);
-            let _ = tokio::fs::write(&release, b"go").await;
-            daemon.abort();
-            mock.abort();
-            anyhow::bail!("timed out waiting for the serialized writes");
-        }
-    };
-    assert!(completed["error"].is_null(), "{completed}");
-    assert_eq!(std::fs::read_to_string(dir.join("same.txt"))?, "BBB\n");
 
     daemon.abort();
     mock.abort();

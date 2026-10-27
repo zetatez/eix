@@ -4,6 +4,7 @@
 //! Phase 0 commands are intentionally small: create/list sessions, send a
 //! prompt, stream the answer, inspect the persisted transcript, cancel.
 
+mod acp;
 mod client;
 mod tui;
 
@@ -39,6 +40,18 @@ async fn main() -> Result<()> {
         }
         Command::Daemon => daemon(&cli).await,
         Command::Doctor => doctor(&cli).await,
+        Command::Mcp(cmd) => mcp_command(&cli, cmd).await,
+        Command::Auth(cmd) => auth_command(&cli, cmd).await,
+        Command::Model(cmd) => model_command(&cli, cmd).await,
+        Command::Pair(cmd) => pair_command(&cli, cmd).await,
+        Command::Acp => {
+            acp::run(
+                cli.endpoint.clone(),
+                cli.data_dir.clone(),
+                cli.config_path.clone(),
+            )
+            .await
+        }
         Command::Sessions { archived } => sessions(&cli, archived).await,
         Command::New {
             name,
@@ -245,9 +258,55 @@ enum Command {
     Kill {
         process: String,
     },
+    Mcp(McpCmd),
+    Auth(AuthCmd),
+    Model(ModelCmd),
+    Pair(PairCmd),
+    Acp,
     Doctor,
     Daemon,
     Help,
+}
+
+#[derive(Clone)]
+enum McpCmd {
+    /// Run the OAuth browser flow for a remote server.
+    Auth { server: String, no_browser: bool },
+    /// Forget a stored OAuth token.
+    Logout { server: String },
+}
+
+#[derive(Clone)]
+enum AuthCmd {
+    /// Store an API key, or start the provider's OAuth flow.
+    Login {
+        provider: String,
+        api_key: Option<String>,
+        stdin: bool,
+        no_browser: bool,
+    },
+    /// Show configured providers and whether a credential is available.
+    List { json: bool },
+    /// Remove the stored credential for a provider.
+    Logout { provider: String },
+}
+
+#[derive(Clone)]
+enum ModelCmd {
+    /// Show the daemon's current default model and provider auth state.
+    Show { json: bool, all: bool },
+    /// Switch the daemon's runtime default model.
+    Use { model: Option<String> },
+}
+
+#[derive(Clone)]
+enum PairCmd {
+    /// Mint a short-lived one-time code for a new client.
+    Create { name: Option<String> },
+    /// Show paired clients.
+    List { json: bool },
+    /// Revoke a client token by id.
+    Revoke { id: String },
 }
 
 #[derive(Clone)]
@@ -358,6 +417,7 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let session = session.or_else(|| args.first().cloned());
             Ok(Command::Tui { session })
         }
+        "acp" => Ok(Command::Acp),
         "chat" => {
             let session = take_flag(&mut args, "--session")?;
             let session = session.or_else(|| args.first().cloned());
@@ -618,7 +678,127 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             Ok(Command::Kill { process })
         }
         "doctor" => Ok(Command::Doctor),
+        "auth" => {
+            let sub = if args.first().is_some_and(|arg| !arg.starts_with('-')) {
+                args.remove(0)
+            } else {
+                "list".to_string()
+            };
+            let api_key = take_flag(&mut args, "--api-key")?;
+            let stdin = take_switch(&mut args, "--stdin");
+            let no_browser = take_switch(&mut args, "--no-browser");
+            match sub.as_str() {
+                "login" | "add" => {
+                    let provider = args
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("usage: eix auth login <provider>"))?;
+                    Ok(Command::Auth(AuthCmd::Login {
+                        provider,
+                        api_key,
+                        stdin,
+                        no_browser,
+                    }))
+                }
+                "list" | "ls" | "status" => {
+                    let json = take_switch(&mut args, "--json");
+                    Ok(Command::Auth(AuthCmd::List { json }))
+                }
+                "logout" | "remove" | "rm" => {
+                    let provider = args
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("usage: eix auth logout <provider>"))?;
+                    Ok(Command::Auth(AuthCmd::Logout { provider }))
+                }
+                // `eix auth openai` is shorthand for `eix auth login openai`.
+                other => Ok(Command::Auth(AuthCmd::Login {
+                    provider: other.to_string(),
+                    api_key,
+                    stdin,
+                    no_browser,
+                })),
+            }
+        }
+        "model" => {
+            let json = take_switch(&mut args, "--json");
+            let all = take_switch(&mut args, "--all");
+            let first = args.first().cloned();
+            match first.as_deref() {
+                None | Some("show") | Some("list") | Some("ls") => {
+                    if !args.is_empty() {
+                        args.remove(0);
+                    }
+                    Ok(Command::Model(ModelCmd::Show { json, all }))
+                }
+                Some("default") | Some("reset") => {
+                    Ok(Command::Model(ModelCmd::Use { model: None }))
+                }
+                Some("use") | Some("set") => {
+                    args.remove(0);
+                    let model = args.first().cloned();
+                    Ok(Command::Model(ModelCmd::Use { model }))
+                }
+                Some(other) if !other.starts_with('-') => Ok(Command::Model(ModelCmd::Use {
+                    model: Some(other.to_string()),
+                })),
+                Some(other) => bail!(
+                    "usage: eix model [show | use <provider/model> | default] (got {other:?})"
+                ),
+            }
+        }
+        "mcp" => {
+            let sub = args
+                .first()
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("usage: eix mcp auth <server> [--no-browser]"))?;
+            args.remove(0);
+            match sub.as_str() {
+                "auth" | "login" => {
+                    let no_browser = take_switch(&mut args, "--no-browser");
+                    let server = args.first().cloned().ok_or_else(|| {
+                        anyhow::anyhow!("usage: eix mcp auth <server> [--no-browser]")
+                    })?;
+                    Ok(Command::Mcp(McpCmd::Auth { server, no_browser }))
+                }
+                "logout" => {
+                    let server = args
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("usage: eix mcp logout <server>"))?;
+                    Ok(Command::Mcp(McpCmd::Logout { server }))
+                }
+                other => bail!("usage: eix mcp auth <server> | logout <server> (got {other:?})"),
+            }
+        }
         "daemon" | "up" => Ok(Command::Daemon),
+        "pair" => {
+            let sub = if args.first().is_some_and(|arg| !arg.starts_with('-')) {
+                args.remove(0)
+            } else {
+                "create".to_string()
+            };
+            match sub.as_str() {
+                "create" | "new" | "code" => {
+                    let name = take_flag(&mut args, "--name")?;
+                    Ok(Command::Pair(PairCmd::Create { name }))
+                }
+                "list" | "ls" => {
+                    let json = take_switch(&mut args, "--json");
+                    Ok(Command::Pair(PairCmd::List { json }))
+                }
+                "revoke" | "rm" => {
+                    let id = args
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("usage: eix pair revoke <client-id>"))?;
+                    Ok(Command::Pair(PairCmd::Revoke { id }))
+                }
+                other => {
+                    bail!("usage: eix pair [--name LABEL] | list | revoke <id> (got {other:?})")
+                }
+            }
+        }
         "help" => Ok(Command::Help),
         other => bail!("unknown command {other:?} (try `eix help`)"),
     }
@@ -1566,6 +1746,395 @@ async fn kill(cli: &Cli, process: &str) -> Result<()> {
     Ok(())
 }
 
+async fn mcp_command(cli: &Cli, cmd: McpCmd) -> Result<()> {
+    let store = eixd::oauth::Store::new(cli.data_dir.join("oauth").join("mcp"));
+    match cmd {
+        McpCmd::Auth { server, no_browser } => {
+            let config = Config::load(cli.config_path.as_deref())?;
+            let spec = config.mcp.servers.get(&server).with_context(|| {
+                format!("mcp server {server:?} is not configured under mcp.servers")
+            })?;
+            if !spec.is_remote() {
+                bail!(
+                    "mcp server {server:?} uses stdio; OAuth applies to remote servers with `url`"
+                );
+            }
+            let token = store
+                .authorize(&server, spec, eixd::oauth::AuthOptions { no_browser })
+                .await?;
+            println!(
+                "authorized {server}; token saved to {}",
+                store.token_path(&server).display()
+            );
+            if token.refresh_token.is_none() {
+                println!(
+                    "note: no refresh token was issued; rerun `eix mcp auth {server}` when it expires"
+                );
+            }
+            reload_mcp(cli).await;
+            Ok(())
+        }
+        McpCmd::Logout { server } => {
+            store.remove(&server)?;
+            println!("removed the stored OAuth token for {server}");
+            reload_mcp(cli).await;
+            Ok(())
+        }
+    }
+}
+
+/// Store an API key or run OAuth for one provider, and inspect credentials.
+/// The daemon reads the credential files on demand, so no reload is required.
+async fn auth_command(cli: &Cli, cmd: AuthCmd) -> Result<()> {
+    let store = eixd::auth::Store::under_data_dir(&cli.data_dir);
+    let config = Config::load(cli.config_path.as_deref())?;
+    match cmd {
+        AuthCmd::Login {
+            provider,
+            api_key,
+            stdin,
+            no_browser,
+        } => {
+            let spec = config.providers.get(&provider).with_context(|| {
+                format!("provider {provider:?} is not configured under [providers]")
+            })?;
+            let key = match api_key {
+                Some(key) => Some(key),
+                None if stdin || !io::stdin().is_terminal() => Some(read_stdin_secret()?),
+                None if spec.oauth.is_some() => None,
+                None => Some(prompt_secret(&format!("API key for {provider}: "))?),
+            };
+            if let Some(key) = key {
+                store.save_api_key(&provider, &key)?;
+                println!(
+                    "saved the API key for {provider} to {}",
+                    store.token_path(&provider).display()
+                );
+                return Ok(());
+            }
+            let oauth = spec.oauth.as_ref().with_context(|| {
+                format!(
+                    "provider {provider:?} has no [providers.{provider}.oauth] block; \
+                     pass --api-key or --stdin"
+                )
+            })?;
+            let credential = store.authorize_oauth(&provider, oauth, no_browser).await?;
+            println!(
+                "authorized {provider} ({}); saved to {}",
+                credential.summary(),
+                store.token_path(&provider).display()
+            );
+            if credential.refresh_token.is_none() {
+                println!(
+                    "note: no refresh token was issued; run `eix auth login {provider}` again \
+                     when it expires"
+                );
+            }
+            Ok(())
+        }
+        AuthCmd::List { json } => {
+            let mut rows = Vec::new();
+            for (key, spec) in &config.providers {
+                let (authenticated, source) = credential_source(&store, key, spec);
+                rows.push(json!({
+                    "provider": key,
+                    "name": spec.name.as_deref().unwrap_or(key),
+                    "kind": spec.kind.label(),
+                    "model": spec.model.clone(),
+                    "default": spec.default,
+                    "authenticated": authenticated,
+                    "source": source,
+                }));
+            }
+            if json {
+                println!("{}", serde_json::to_string_pretty(&rows)?);
+                return Ok(());
+            }
+            println!(
+                "{:<16} {:<10} {:<9} {:<28} AUTH",
+                "PROVIDER", "KIND", "DEFAULT", "MODEL"
+            );
+            for row in &rows {
+                println!(
+                    "{:<16} {:<10} {:<9} {:<28} {}",
+                    row["provider"].as_str().unwrap_or_default(),
+                    row["kind"].as_str().unwrap_or_default(),
+                    if row["default"].as_bool().unwrap_or(false) {
+                        "yes"
+                    } else {
+                        "-"
+                    },
+                    truncate(row["model"].as_str().unwrap_or_default(), 28),
+                    row["source"].as_str().unwrap_or_default(),
+                );
+            }
+            Ok(())
+        }
+        AuthCmd::Logout { provider } => {
+            if store.remove(&provider)? {
+                println!("removed the stored credential for {provider}");
+            } else {
+                println!("no stored credential for {provider}");
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Same precedence as the daemon: inline key, environment, then the store.
+fn credential_source(
+    store: &eixd::auth::Store,
+    key: &str,
+    spec: &eix_core::ProviderConfig,
+) -> (bool, String) {
+    if spec
+        .api_key
+        .as_deref()
+        .is_some_and(|key| !key.trim().is_empty())
+    {
+        return (true, "config".to_string());
+    }
+    if !spec.api_key_env.trim().is_empty()
+        && std::env::var(spec.api_key_env.trim())
+            .ok()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        return (true, format!("env:{}", spec.api_key_env.trim()));
+    }
+    match store.load(key) {
+        Ok(Some(credential)) if credential.available() => (
+            true,
+            match credential.kind {
+                eixd::auth::CredentialKind::ApiKey => "store:api-key",
+                eixd::auth::CredentialKind::OAuth => "store:oauth",
+            }
+            .to_string(),
+        ),
+        Ok(Some(credential)) => (false, format!("store:{} (unusable)", credential.summary())),
+        Ok(None) => (false, "missing".to_string()),
+        Err(err) => (false, format!("store error: {err}")),
+    }
+}
+
+fn read_stdin_secret() -> Result<String> {
+    let mut text = String::new();
+    io::stdin()
+        .read_to_string(&mut text)
+        .context("cannot read the credential from stdin")?;
+    let text = text.trim().to_string();
+    if text.is_empty() {
+        bail!("no credential was provided on stdin");
+    }
+    Ok(text)
+}
+
+fn prompt_secret(prompt: &str) -> Result<String> {
+    print!("{prompt}");
+    io::stdout().flush().ok();
+    #[cfg(unix)]
+    let _echo = EchoGuard::disable();
+    let mut line = String::new();
+    let read = io::stdin().read_line(&mut line);
+    #[cfg(unix)]
+    drop(_echo);
+    println!();
+    read.context("cannot read the credential")?;
+    let line = line.trim().to_string();
+    if line.is_empty() {
+        bail!("no credential was provided");
+    }
+    Ok(line)
+}
+
+/// Restore terminal echo when `eix auth login` reads an API key interactively.
+#[cfg(unix)]
+struct EchoGuard {
+    original: libc::termios,
+    active: bool,
+}
+
+#[cfg(unix)]
+impl EchoGuard {
+    fn disable() -> Self {
+        // SAFETY: fd 0 is the terminal we just prompted on; `termios` is a
+        // plain C struct and `tcgetattr`/`tcsetattr` only touch it.
+        unsafe {
+            let mut term = std::mem::zeroed::<libc::termios>();
+            if libc::tcgetattr(0, &mut term) != 0 {
+                return Self {
+                    original: term,
+                    active: false,
+                };
+            }
+            let original = term;
+            term.c_lflag &= !libc::ECHO;
+            Self {
+                original,
+                active: libc::tcsetattr(0, libc::TCSANOW, &term) == 0,
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for EchoGuard {
+    fn drop(&mut self) {
+        if self.active {
+            // SAFETY: restoring the exact settings captured in `disable`.
+            unsafe {
+                libc::tcsetattr(0, libc::TCSANOW, &self.original);
+            }
+        }
+    }
+}
+
+/// Inspect or switch the daemon's runtime default model. Switching does not
+/// persist to config; sessions with a pinned model keep their choice.
+async fn model_command(cli: &Cli, cmd: ModelCmd) -> Result<()> {
+    let mut client = cli.connect().await?;
+    match cmd {
+        ModelCmd::Show { json, all } => {
+            let value = client.request("model.list", Value::Null).await?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+                return Ok(());
+            }
+            let result: eix_core::ModelListResult = serde_json::from_value(value)?;
+            println!("default  {}", result.default_model);
+            if !result.providers.is_empty() {
+                println!();
+                println!("{:<16} {:<10} AUTH", "PROVIDER", "KIND");
+                for provider in &result.providers {
+                    println!(
+                        "{:<16} {:<10} {}{}",
+                        provider.key,
+                        provider.kind,
+                        if provider.authenticated {
+                            ""
+                        } else {
+                            "missing · "
+                        },
+                        provider.source,
+                    );
+                }
+            }
+            if all {
+                println!();
+                println!("{:<44} {:<16} CONTEXT", "MODEL", "PROVIDER");
+                for model in &result.models {
+                    println!(
+                        "{:<44} {:<16} {}",
+                        truncate(&model.id, 44),
+                        truncate(&model.provider, 16),
+                        model
+                            .context_tokens
+                            .map(|tokens| tokens.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                    );
+                }
+            }
+            Ok(())
+        }
+        ModelCmd::Use { model } => {
+            let value = client
+                .request("model.use", json!({ "model": model }))
+                .await?;
+            let result: eix_core::ModelUseResult = serde_json::from_value(value)?;
+            println!("default model: {}", result.model);
+            Ok(())
+        }
+    }
+}
+
+/// Ask an already-running daemon to reconnect MCP servers. Auth works without
+/// a daemon, so a missing daemon is not an error.
+async fn reload_mcp(cli: &Cli) {
+    if let Ok(mut client) = Client::connect(&cli.endpoint).await {
+        let _ = client.request("mcp.reload", json!({})).await;
+    }
+}
+
+/// Create, list and revoke paired remote clients. Pairing codes are minted by
+/// the local daemon and redeemed over HTTP (or another transport) for a durable
+/// token; only the token's hash is stored.
+async fn pair_command(cli: &Cli, cmd: PairCmd) -> Result<()> {
+    let mut client = cli.connect().await?;
+    match cmd {
+        PairCmd::Create { name } => {
+            let params = match name {
+                Some(name) => json!({ "name": name }),
+                None => json!({}),
+            };
+            let result = client.request("pair.create", params).await?;
+            let code = result["code"].as_str().unwrap_or_default();
+            let expires_at = result["expires_at"].as_i64().unwrap_or_default();
+            let expires = chrono::DateTime::from_timestamp_millis(expires_at)
+                .map(|dt| {
+                    dt.with_timezone(&chrono::Local)
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| expires_at.to_string());
+            println!("pairing code: {code}");
+            println!("expires: {expires} (5 minutes, single use)");
+            match result["http"].as_str() {
+                Some(url) => println!(
+                    "redeem:\n  curl -s {url} -H 'content-type: application/json' \\\n    -d '{{\"code\":\"{code}\"}}'"
+                ),
+                None => println!(
+                    "enable `server.http` to redeem this code over HTTP; the code can also be \
+                     submitted to POST /pair on any HTTP listener"
+                ),
+            }
+            Ok(())
+        }
+        PairCmd::List { json } => {
+            let result = client.request("pair.list", json!({})).await?;
+            let clients = result["clients"].as_array().cloned().unwrap_or_default();
+            if json {
+                println!("{}", serde_json::to_string_pretty(&clients)?);
+                return Ok(());
+            }
+            if clients.is_empty() {
+                println!("no paired clients");
+                return Ok(());
+            }
+            println!(
+                "{:<16} {:<24} {:<11} {:<11} STATUS",
+                "ID", "NAME", "CREATED", "LAST USED"
+            );
+            for entry in clients {
+                let last_used = entry["last_used_at"]
+                    .as_i64()
+                    .map(format_ts)
+                    .unwrap_or_else(|| "-".to_string());
+                println!(
+                    "{:<16} {:<24} {:<11} {:<11} {}",
+                    entry["id"].as_str().unwrap_or_default(),
+                    truncate(entry["name"].as_str().unwrap_or_default(), 24),
+                    format_ts(entry["created_at"].as_i64().unwrap_or_default()),
+                    last_used,
+                    if entry["revoked"].as_bool().unwrap_or(false) {
+                        "revoked"
+                    } else {
+                        "active"
+                    },
+                );
+            }
+            Ok(())
+        }
+        PairCmd::Revoke { id } => {
+            let result = client.request("pair.revoke", json!({ "id": id })).await?;
+            if result["revoked"].as_bool().unwrap_or(false) {
+                println!("revoked {id}");
+            } else {
+                bail!("no active paired client with id {id}");
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn daemon(cli: &Cli) -> Result<()> {
     let mut client = cli.connect().await?;
     let hello: HelloResult = serde_json::from_value(client.request("hello", Value::Null).await?)?;
@@ -1619,7 +2188,7 @@ async fn doctor(cli: &Cli) -> Result<()> {
             println!(
                 "snapshot {}",
                 if config.tools.snapshots {
-                    "on (before write_file/run_command)"
+                    "on (before apply_patch/exec_command)"
                 } else {
                     "off"
                 }
@@ -2280,10 +2849,39 @@ fn tool_call_summary(tool: &str, arguments: &Value) -> String {
             let bytes = string("content").len();
             format!("write_file {} (+{bytes} bytes)", string("path"))
         }
-        "run_command" => format!("run_command: {}", string("command")),
-        "read_file" | "list_dir" => {
-            let path = string("path");
-            format!("{tool} {}", if path.is_empty() { "." } else { path })
+        "apply_patch" => {
+            let patch = string("patchText");
+            let target = patch
+                .lines()
+                .find_map(|line| {
+                    line.strip_prefix("*** Add File: ")
+                        .or_else(|| line.strip_prefix("*** Update File: "))
+                        .or_else(|| line.strip_prefix("*** Delete File: "))
+                        .map(str::trim)
+                })
+                .unwrap_or_default();
+            if target.is_empty() {
+                "apply_patch".to_string()
+            } else {
+                format!("apply_patch {target}")
+            }
+        }
+        "exec_command" | "run_command" => {
+            let command = arguments
+                .get("cmd")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| string("command"));
+            format!("{tool}: {command}")
+        }
+        "write_stdin" => format!("write_stdin {}", string("session_id")),
+        "view_image" => format!("view_image {}", string("path")),
+        "read_file" | "list_dir" | "web_fetch" | "web_search" => {
+            let detail = if tool.starts_with("web_") {
+                string("url")
+            } else {
+                string("path")
+            };
+            format!("{tool} {}", if detail.is_empty() { "." } else { detail })
         }
         _ => {
             let compact = serde_json::to_string(arguments).unwrap_or_default();
@@ -2396,6 +2994,21 @@ COMMANDS:
     ready [--session ID]       mark the current worktree ready for rebase/test/merge
     integrate [status | continue SESSION]
                                show the integration queue or resume a paused session
+    mcp auth <server> [--no-browser]
+                               authorize a remote MCP server with OAuth (PKCE)
+    mcp logout <server>        forget a remote MCP server's OAuth token
+    auth login PROVIDER [--api-key KEY | --stdin] [--no-browser]
+                               store an API key or run the provider's OAuth flow
+    auth list [--json]         show providers and where each credential comes from
+    auth logout PROVIDER       remove a stored provider credential
+    model [show] [--all] [--json]
+                               show the daemon default and provider auth state
+    model use PROVIDER/MODEL   switch the daemon default at runtime
+    model default              restore the configured default model
+    pair [--name LABEL]        mint a one-time code for a new remote client
+    pair list [--json]         list paired clients
+    pair revoke <id>           revoke a paired client
+    acp                        run the Agent Client Protocol adapter on stdio
     doctor                     diagnose config, paths and daemon
     daemon                     start/attach the daemon and print its status
     help                       show this help
@@ -2447,6 +3060,197 @@ mod tests {
         assert!(parse_hunks("0,,1").is_err());
         assert!(parse_hunks("x").is_err());
         assert!(parse_hunks("-1").is_err());
+    }
+
+    #[test]
+    fn mcp_auth_takes_a_server_and_never_defaults_it() {
+        match parse_command(
+            "mcp".to_string(),
+            vec![
+                "auth".to_string(),
+                "docs".to_string(),
+                "--no-browser".to_string(),
+            ],
+        )
+        .unwrap()
+        {
+            Command::Mcp(McpCmd::Auth { server, no_browser }) => {
+                assert_eq!(server, "docs");
+                assert!(no_browser);
+            }
+            _ => panic!("expected mcp auth"),
+        }
+        assert!(parse_command("mcp".to_string(), vec!["auth".to_string()]).is_err());
+        assert!(parse_command("mcp".to_string(), Vec::new()).is_err());
+        match parse_command(
+            "mcp".to_string(),
+            vec!["logout".to_string(), "docs".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Mcp(McpCmd::Logout { server }) => assert_eq!(server, "docs"),
+            _ => panic!("expected mcp logout"),
+        }
+    }
+
+    #[test]
+    fn auth_parses_login_list_and_logout() {
+        match parse_command(
+            "auth".to_string(),
+            vec![
+                "login".to_string(),
+                "openai".to_string(),
+                "--stdin".to_string(),
+            ],
+        )
+        .unwrap()
+        {
+            Command::Auth(AuthCmd::Login {
+                provider,
+                api_key,
+                stdin,
+                no_browser,
+            }) => {
+                assert_eq!(provider, "openai");
+                assert!(api_key.is_none());
+                assert!(stdin);
+                assert!(!no_browser);
+            }
+            _ => panic!("expected auth login"),
+        }
+        match parse_command(
+            "auth".to_string(),
+            vec![
+                "login".to_string(),
+                "claude".to_string(),
+                "--api-key".to_string(),
+                "sk-test".to_string(),
+                "--no-browser".to_string(),
+            ],
+        )
+        .unwrap()
+        {
+            Command::Auth(AuthCmd::Login {
+                provider, api_key, ..
+            }) => {
+                assert_eq!(provider, "claude");
+                assert_eq!(api_key.as_deref(), Some("sk-test"));
+            }
+            _ => panic!("expected auth login --api-key"),
+        }
+        // Bare `eix auth openai` is shorthand for login.
+        match parse_command("auth".to_string(), vec!["openai".to_string()]).unwrap() {
+            Command::Auth(AuthCmd::Login { provider, .. }) => assert_eq!(provider, "openai"),
+            _ => panic!("expected auth login shorthand"),
+        }
+        match parse_command(
+            "auth".to_string(),
+            vec!["list".to_string(), "--json".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Auth(AuthCmd::List { json }) => assert!(json),
+            _ => panic!("expected auth list"),
+        }
+        match parse_command(
+            "auth".to_string(),
+            vec!["logout".to_string(), "openai".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Auth(AuthCmd::Logout { provider }) => assert_eq!(provider, "openai"),
+            _ => panic!("expected auth logout"),
+        }
+        assert!(parse_command("auth".to_string(), vec!["login".to_string()]).is_err());
+    }
+
+    #[test]
+    fn model_parses_show_and_runtime_switch() {
+        match parse_command("model".to_string(), Vec::new()).unwrap() {
+            Command::Model(ModelCmd::Show { json, all }) => {
+                assert!(!json);
+                assert!(!all);
+            }
+            _ => panic!("expected model show"),
+        }
+        match parse_command(
+            "model".to_string(),
+            vec![
+                "show".to_string(),
+                "--all".to_string(),
+                "--json".to_string(),
+            ],
+        )
+        .unwrap()
+        {
+            Command::Model(ModelCmd::Show { json, all }) => {
+                assert!(json);
+                assert!(all);
+            }
+            _ => panic!("expected model show --all"),
+        }
+        match parse_command(
+            "model".to_string(),
+            vec!["use".to_string(), "openai/gpt-5".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Model(ModelCmd::Use { model }) => {
+                assert_eq!(model.as_deref(), Some("openai/gpt-5"))
+            }
+            _ => panic!("expected model use"),
+        }
+        match parse_command("model".to_string(), vec!["openai/gpt-5".to_string()]).unwrap() {
+            Command::Model(ModelCmd::Use { model }) => {
+                assert_eq!(model.as_deref(), Some("openai/gpt-5"))
+            }
+            _ => panic!("expected model shorthand"),
+        }
+        match parse_command("model".to_string(), vec!["default".to_string()]).unwrap() {
+            Command::Model(ModelCmd::Use { model }) => assert!(model.is_none()),
+            _ => panic!("expected model default"),
+        }
+    }
+
+    #[test]
+    fn pair_defaults_to_create_and_parses_management_subcommands() {
+        match parse_command("pair".to_string(), Vec::new()).unwrap() {
+            Command::Pair(PairCmd::Create { name }) => assert!(name.is_none()),
+            _ => panic!("expected pair create"),
+        }
+        match parse_command(
+            "pair".to_string(),
+            vec!["--name".to_string(), "laptop".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Pair(PairCmd::Create { name }) => assert_eq!(name.as_deref(), Some("laptop")),
+            _ => panic!("expected pair create with a name"),
+        }
+        match parse_command("pair".to_string(), vec!["list".to_string()]).unwrap() {
+            Command::Pair(PairCmd::List { json }) => assert!(!json),
+            _ => panic!("expected pair list"),
+        }
+        match parse_command(
+            "pair".to_string(),
+            vec!["list".to_string(), "--json".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Pair(PairCmd::List { json }) => assert!(json),
+            _ => panic!("expected pair list --json"),
+        }
+        match parse_command(
+            "pair".to_string(),
+            vec!["revoke".to_string(), "ct_123".to_string()],
+        )
+        .unwrap()
+        {
+            Command::Pair(PairCmd::Revoke { id }) => assert_eq!(id, "ct_123"),
+            _ => panic!("expected pair revoke"),
+        }
+        assert!(parse_command("pair".to_string(), vec!["revoke".to_string()]).is_err());
+        assert!(parse_command("pair".to_string(), vec!["nope".to_string()]).is_err());
     }
 
     #[test]

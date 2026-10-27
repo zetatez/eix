@@ -15,7 +15,7 @@ daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的
 - **session 是一等公民**：常驻、可 attach/detach、可并行、可模糊切换；关终端不影响运行。
 - **Vim 原生输入**：输入框是内置的模态编辑器，不启动 Neovim 子进程，按键零往返。
 - **默认安全**：Plan / Build / Auto / Bypass 四种执行模式，配合风险分析、bubblewrap 沙箱、
-  staged 写入、执行前快照和 secret 脱敏。
+  补丁审批、执行前快照和 secret 脱敏。
 - **上下文自动管理**：`AGENTS.md`、workspace summary、工具输出预算、自动压缩和跨 session 记忆
   不需要手动维护。
 - **可组合**：OpenAI 兼容多 provider、Skills、Markdown 命令与 agent、MCP、外部插件。
@@ -30,11 +30,11 @@ daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的
 | TUI | 多 pane 自动平铺、四种布局、统一 fuzzy picker、Markdown 转录、side-by-side diff、审批收件箱 |
 | 输入 | 内置 Vim 风格编辑器（normal / insert / visual）、leader 键、可配置快捷键、命令面板 |
 | 执行模式 | `plan` 只读、`build` 工作区写入、`auto` 意图分类、`bypass` 放行 |
-| 安全 | 风险分析、显式规则、bubblewrap 沙箱、staged shadow workspace、快照、secret 占位符 |
-| 工具 | 文件读写/编辑/patch、shell、后台进程、grep/glob、web、LSP、图片、子 agent |
+| 安全 | 风险分析、显式规则、bubblewrap 沙箱、补丁审批 + 执行前快照、secret 占位符 |
+| 工具 | `apply_patch` 编辑、`exec_command` / `write_stdin` shell、web、LSP、图片、子 agent |
 | 上下文 | sector 预算、AGENTS.md、workspace summary、自动 compact、memory / todo |
-| 扩展 | Skills、Markdown 命令、Markdown agent、MCP stdio、out-of-process 插件 |
-| Provider | 多 OpenAI 兼容 endpoint、自动拉取模型列表、重试/退避、模型切换与 reasoning 强度 |
+| 扩展 | Skills、Markdown 命令、Markdown agent、MCP stdio / HTTP、out-of-process 插件 |
+| Provider | 多 endpoint（OpenAI 兼容 / Anthropic / Gemini 原生协议）、API key + OAuth 登录、自动拉取模型列表、重试/退避、运行时模型切换与 reasoning 强度 |
 | 前端 | TUI、chat/send CLI、HTTP + SSE + `eix-sdk`、TCP，以及外部编辑器插件接口 |
 
 ## 快速开始
@@ -87,6 +87,40 @@ providers:
     model: "qwen2.5-coder:7b"
 ```
 
+`kind` 选择协议，默认 `openai`（OpenAI 及所有兼容端点）。Anthropic 与 Gemini 使用各自的原生流式
+接口，`base_url` 只写到服务根或版本前缀：
+
+```yaml
+providers:
+  claude:
+    kind: anthropic
+    base_url: "https://api.anthropic.com"
+    model: "claude-sonnet-4"
+    api_key_env: "ANTHROPIC_API_KEY"
+  google:
+    kind: gemini
+    base_url: "https://generativelanguage.googleapis.com/v1beta"
+    model: "gemini-2.5-pro"
+```
+
+单个 `[[models]]` 可以用 `kind` 覆盖所属 provider 的协议。模型目录（`/model`、`eix model --all`）
+会按协议读取 `/models`，过滤 Gemini 不支持 `generateContent` 的模型。
+
+密钥优先级：配置内联 `api_key` → `api_key_env` → `<data_dir>/auth/<provider>.json`。最后一项由
+`eix auth login` 写入（0600 权限），daemon 每次请求时读取，因此登录/注销无需重启或 `reload`：
+
+```sh
+eix auth login openai            # 交互输入 API key
+echo "$KEY" | eix auth login openai --stdin
+eix auth login claude --api-key sk-...
+eix auth list                    # 显示每个 provider 的凭据来源
+eix auth logout openai
+```
+
+需要浏览器登录的 provider 可配置 `[providers.<name>.oauth]`（authorization / token endpoint、
+`client_id`、可选 `client_secret`、`scopes`、`redirect_uri`、额外参数），`eix auth login <name>`
+会走 authorization-code + PKCE + loopback 回调；token 过期前自动 refresh。
+
 临时试用也可以只用环境变量：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`。所有配置项、默认值和
 注释见 [config.tmpl.yaml](./config.tmpl.yaml)。
 
@@ -130,10 +164,9 @@ TUI 可以把多个 session 同时开在不同 pane；同一 session 只会在�
 
 ### 审批与工作区
 
-`build` 模式下，工作区内低/中风险的写入默认直接应用（保留快照）；需要审批的写入会显示 diff，
-其中可 stage 的文件写入先进入 staged shadow workspace，审批后再落盘，读工具会看到“真实工作区 +
-staged”的合并视图。审批卡片支持 side-by-side diff、hunk 级选择、编辑 staged 内容和带理由拒绝。
-shell 无法 stage，执行前会抓工作区快照。所有路径默认经过 workspace 沙箱检查（`bypass` 例外），
+`build` 模式下，工作区内低/中风险的 `apply_patch` 默认直接应用（保留快照）；需要审批的补丁
+会显示完整 diff，审批卡片支持 side-by-side 审阅、hunk 级选择和带理由拒绝。`exec_command`
+无法预演，执行前会抓工作区快照。所有路径默认经过 workspace 沙箱检查（`bypass` 例外），
 所有工具决策写入审计事件。
 
 ### Worktree 与集成
@@ -172,6 +205,10 @@ eix tui [--session ID]
 | `Enter` | 发送 prompt；turn 运行中自动排队 |
 | `Esc Esc` | 中断当前 turn，或回到转录区 |
 
+`/model` 为当前 session 固定模型；`/model global <id>`（或 `eix model use <id>`）切换 daemon 的
+运行时默认模型，只影响没有固定模型的 session，不写回 config，daemon 重启后恢复。
+`/model global default` 清除覆盖。
+
 完整键位、prompt 命令、审批卡片、picker 和鼠标操作见
 [DESIGN.md 的实现参考](./DESIGN.md#19-实现参考)。
 
@@ -190,6 +227,11 @@ eix tui [--session ID]
 | `eix approve` / `eix deny` / `eix answer` | 无头处理审批与提问 |
 | `eix ps` / `eix tail` / `eix kill` | 后台进程 |
 | `eix status` / `eix approvals` / `eix pick` | 脚本和 dwmblocks / rofi / fzf 集成 |
+| `eix auth login\|list\|logout` | 保存 provider API key 或 OAuth 登录、查看凭据来源、注销 |
+| `eix model [show] [--all]` / `eix model use <id>` / `eix model default` | 查看模型目录与 provider 认证状态 / 切换 daemon 运行时默认模型 / 恢复配置默认值 |
+| `eix mcp auth <server>` / `eix mcp logout <server>` | 远程 MCP server 的 OAuth 授权 / 注销 |
+| `eix pair` / `eix pair list\|revoke` | 为新客户端生成一次性配对码 / 管理已配对客户端 |
+| `eix acp` | 以 Agent Client Protocol 适配器运行（stdio，供编辑器启动） |
 | `eix doctor` | 诊断配置、路径、沙箱和 daemon |
 
 完整命令和参数见 `eix --help`。
@@ -209,6 +251,7 @@ server:
 ```sh
 export EIX_TOKEN=...
 curl -s localhost:7778/health
+curl -s localhost:7778/openapi.json | jq '.paths | keys'
 curl -s localhost:7778/rpc \
   -H "Authorization: Bearer $EIX_TOKEN" \
   -H 'content-type: application/json' \
@@ -217,8 +260,20 @@ curl -s localhost:7778/rpc \
 eix --tcp 127.0.0.1:7777 --token "$EIX_TOKEN" tui
 ```
 
-HTTP 提供 `/health`、`/stats`、`POST /rpc` 和 SSE `/events`。Rust 项目可以直接依赖
-[`eix-sdk`](./crates/eix-sdk)。远程端点不会自动拉起本地 daemon；详细认证、事件过滤和 API 说明见
+HTTP 提供 `/health`、`/openapi.json`（OpenAPI 3.1）、`/stats`、`POST /rpc` 和 SSE `/events`。
+新客户端不必复制静态 token：在本机运行 `eix pair --name laptop` 生成 5 分钟有效的一次性配对码，
+客户端把它 `POST /pair`（无需认证）兑换成持久 token；daemon 只保存 token 的 SHA-256，`eix pair list`
+/ `revoke` 管理，撤销立即生效。失败的兑换按 60 秒窗口限流。
+
+```sh
+code=$(eix pair --name laptop | awk '/pairing code/{print $3}')
+curl -s localhost:7778/pair -H 'content-type: application/json' \
+  -d "{\"code\":\"$code\"}"   # => {"token":"...","client":{...}}
+```
+
+Rust 项目可以直接依赖 [`eix-sdk`](./crates/eix-sdk)，TypeScript 项目用无依赖的
+[`clients/ts`](./clients/ts)（fetch + SSE，含 session / prompt / approval / pairing）。
+远程端点不会自动拉起本地 daemon；详细认证、事件过滤和 API 说明见
 [DESIGN.md](./DESIGN.md)。
 
 ### Neovim 插件
@@ -226,6 +281,30 @@ HTTP 提供 `/health`、`/stats`、`POST /rpc` 和 SSE `/events`。Rust 项目�
 eix 不内置 Vim/Neovim 前端。插件通过 daemon 的 JSON-RPC（Unix socket 或 TCP）接入，自己负责
 buffer、窗口、键位和 picker；接口、消息格式、常用方法与最小 Lua 传输层见
 [docs/nvim.md](./docs/nvim.md)。HTTP/SSE 也可以作为插件的传输方式。
+
+### 编辑器集成（ACP）
+
+`eix acp` 在 stdio 上实现 [Agent Client Protocol](https://agentclientprotocol.com/) v1，供 Zed 等
+编辑器直接启动。适配器只做翻译：session、事件日志、worktree、MCP 和审批仍然由 daemon 持有。
+
+示例（Zed `settings.json`）：
+
+```json
+{
+  "agent_servers": {
+    "eix": {
+      "command": "eix",
+      "args": ["acp"],
+      "env": {}
+    }
+  }
+}
+```
+
+已支持：文本 prompt（含内嵌文本/资源链接）、流式回复与思考、工具调用状态、审批
+（`session/request_permission`）、`session/load` 历史回放、`session/close`、模式切换
+（`plan` / `build` / `auto` / `bypass`）与取消。图片、音频、终端代理和编辑器传入的
+`mcpServers` 暂不支持；MCP 请在 eix 配置里声明。
 
 ## 配置
 
@@ -249,7 +328,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 
 | 段 | 作用 |
 | --- | --- |
-| `providers` / `provider_runtime` | provider、默认模型、超时、重试、系统提示 |
+| `providers` / `provider_runtime` | provider（`kind` = openai/anthropic/gemini、可选 `oauth`）、默认模型、超时、重试、`max_output_tokens`、系统提示 |
 | `tools` | 自动应用策略、显式规则、沙箱、网络、快照、外部目录 |
 | `context` | token 预算、指令文件、workspace summary、自动压缩 |
 | `worktree` / `integration` | worktree 基线、自动 ready、自动提交、测试命令 |
@@ -270,7 +349,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 | Skills | `~/.config/eix/skills/<name>/SKILL.md`、项目 `.eix/skills/`；按需加载正文 |
 | 命令 | `~/.config/eix/cmds/*.md`、项目 `.eix/cmds/*.md`；`$ARGUMENTS` / `$1..$9` |
 | Agent | `~/.config/eix/agents/*.md`、项目 `.eix/agents/*.md`；`primary` / `subagent` |
-| MCP | `mcp.servers.<name>`；stdio、懒启动、`mcp__server__tool` |
+| MCP | `mcp.servers.<name>`；stdio / Streamable HTTP、懒启动、`mcp__server__tool`；远程可用 `eix mcp auth <server>` 走 OAuth |
 | 插件 | `plugins.<name>`；`eix-plugin.toml` + newline-delimited JSON，独立子进程 |
 
 兼容资源默认全部关闭，可在 `compations:` 中逐项打开。项目配置只能关闭、不能开启。示例见
@@ -333,7 +412,7 @@ CI 在 Linux 和 macOS 上跑同一套测试，并用 Rust 1.89 做 MSRV 检查�
 ## 实现状态
 
 核心闭环已经可用：daemon、SQLite 事件日志、流式 OpenAI 兼容 provider、多 pane TUI、内置 Vim
-编辑器、工具与审批、沙箱/快照/staged 写入、自动上下文、fork/rewind、worktree、集成队列、子 agent、
+编辑器、工具与审批、沙箱/快照/补丁写入、自动上下文、fork/rewind、worktree、集成队列、子 agent、
 MCP、插件、Skills、HTTP/SDK、TCP 远程，以及外部 Neovim 插件所需的协议接口。完整实现清单见
 [DESIGN.md 的实现状态](./DESIGN.md#20-实现状态)。
 

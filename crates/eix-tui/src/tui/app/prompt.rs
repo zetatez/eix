@@ -604,20 +604,37 @@ impl App {
         self.status = position;
     }
 
-    /// Submitted prompts for the focused session, oldest first.
-    pub(super) fn history_entries(&self) -> Vec<String> {
-        let Some(view) = self.focused_view() else {
-            return Vec::new();
+    /// Submitted prompts for the focused session, oldest first. The event log
+    /// is scanned once per revision; Ctrl-J/Ctrl-K reuse the cached list.
+    pub(super) fn history_entries(&mut self) -> Rc<Vec<String>> {
+        let Some((session_id, events_rev)) = self
+            .focused_view()
+            .map(|view| (view.session.id.clone(), view.events_rev))
+        else {
+            return Rc::new(Vec::new());
         };
-        view.events
-            .iter()
-            .filter(|event| event.kind == EventKind::UserMessage)
-            .filter_map(|event| {
-                serde_json::from_value::<UserMessagePayload>(event.payload.clone())
-                    .ok()
-                    .map(|payload| payload.text)
+        if let Some((cached_id, cached_rev, entries)) = &self.history_entries {
+            if *cached_id == session_id && *cached_rev == events_rev {
+                return entries.clone();
+            }
+        }
+        let entries: Vec<String> = self
+            .focused_view()
+            .map(|view| {
+                view.events
+                    .iter()
+                    .filter(|event| event.kind == EventKind::UserMessage)
+                    .filter_map(|event| {
+                        UserMessagePayload::deserialize(&event.payload)
+                            .ok()
+                            .map(|payload| payload.text)
+                    })
+                    .collect()
             })
-            .collect()
+            .unwrap_or_default();
+        let entries = Rc::new(entries);
+        self.history_entries = Some((session_id, events_rev, entries.clone()));
+        entries
     }
 
     pub(super) fn reset_history(&mut self) {

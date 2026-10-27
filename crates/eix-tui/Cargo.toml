@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = { workspace = true }
 eix-core = { path = "../eix-core" }
+eixd = { path = "../eixd" }
 ratatui = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 futures-util = { workspace = true }
@@ -23,3 +24,4 @@ pulldown-cmark = { workspace = true }
 unicode-width = "0.2"
 base64 = { workspace = true }
 syntect = { workspace = true }
+libc = { workspace = true }

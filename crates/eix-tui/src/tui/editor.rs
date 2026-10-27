@@ -414,9 +414,17 @@ impl Editor {
         }
     }
 
+    #[cfg(test)]
     pub fn layout(&self, width: usize, height: usize) -> Layout {
+        let mut layout = self.wrap(width);
+        self.fit(&mut layout, height);
+        layout
+    }
+
+    /// Wrap the buffer without deciding a viewport. The host measures the
+    /// prompt with this and reuses the result for the actual draw.
+    pub fn wrap(&self, width: usize) -> Layout {
         let width = width.max(1);
-        let height = height.max(1);
         let mut segments: Vec<Segment> = Vec::new();
         let mut cursor_line = 0;
         let mut cursor_col = 0;
@@ -480,29 +488,34 @@ impl Editor {
             });
         }
 
-        let max_offset = segments.len().saturating_sub(height);
-        let offset = if height <= 1 {
+        Layout {
+            segments,
+            cursor_line,
+            cursor_col,
+            offset: 0,
+        }
+    }
+
+    /// Fit an already wrapped layout into `height` rows, keeping the cursor in
+    /// view and remembering the scroll position across frames.
+    pub fn fit(&self, layout: &mut Layout, height: usize) {
+        let height = height.max(1);
+        let max_offset = layout.segments.len().saturating_sub(height);
+        layout.offset = if height <= 1 {
             // The host probes with height 1 to measure the draft; don't let
             // that probe move the real viewport.
-            cursor_line.min(max_offset)
+            layout.cursor_line.min(max_offset)
         } else {
             let mut offset = self.scroll.get().min(max_offset);
-            if cursor_line < offset {
-                offset = cursor_line;
-            } else if cursor_line >= offset + height {
-                offset = cursor_line + 1 - height;
+            if layout.cursor_line < offset {
+                offset = layout.cursor_line;
+            } else if layout.cursor_line >= offset + height {
+                offset = layout.cursor_line + 1 - height;
             }
             let offset = offset.min(max_offset);
             self.scroll.set(offset);
             offset
         };
-
-        Layout {
-            segments,
-            cursor_line,
-            cursor_col,
-            offset,
-        }
     }
 
     // ----------------------------------------------------------------- modes

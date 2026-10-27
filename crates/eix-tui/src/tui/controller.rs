@@ -82,6 +82,10 @@ pub enum Command {
         session_id: String,
         model: Option<String>,
     },
+    /// Switch the daemon's fallback model for sessions without a pin.
+    UseModel {
+        model: Option<String>,
+    },
     /// Select the session's primary agent.
     SetAgent {
         session_id: String,
@@ -227,6 +231,7 @@ impl Command {
             Self::CompactContext { .. } => "compact",
             Self::SetMode { .. } => "mode",
             Self::SetModel { .. } => "model",
+            Self::UseModel { .. } => "model default",
             Self::SetAgent { .. } => "agent",
             Self::SetSubagentConcurrency { .. } => "subagents",
             Self::ListModels | Self::ListAgents { .. } => "catalog",
@@ -324,7 +329,10 @@ pub enum Event {
     Models {
         models: Vec<eix_core::ModelInfo>,
         warnings: Vec<String>,
+        default_model: String,
     },
+    /// The daemon's runtime default model changed.
+    DefaultModel(String),
     Agents(Vec<eix_core::AgentSpec>),
     Mcp(Vec<eix_core::McpServerInfo>),
     PluginCommands(Vec<eix_core::PluginCommandInfo>),
@@ -594,6 +602,13 @@ async fn dispatch(
             let result: SessionResult = decode(value)?;
             send(events, Event::Updated(result.session))
         }
+        Command::UseModel { model } => {
+            let value = requester
+                .request("model.use", json!({ "model": model }))
+                .await?;
+            let result: eix_core::ModelUseResult = decode(value)?;
+            send(events, Event::DefaultModel(result.model))
+        }
         Command::SetAgent { session_id, agent } => {
             let value = requester
                 .request(
@@ -627,6 +642,7 @@ async fn dispatch(
                 Event::Models {
                     models: result.models,
                     warnings: result.warnings,
+                    default_model: result.default_model,
                 },
             )
         }
