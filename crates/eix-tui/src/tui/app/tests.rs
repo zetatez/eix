@@ -1435,6 +1435,160 @@ fn subagent_thinking_keeps_only_the_visible_tail() {
 }
 
 #[test]
+fn subagents_command_opens_the_live_child_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["parent"]);
+    app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/review-2".into());
+    app.views[0].upsert_subagent("child-2".into(), "call-2".into(), "parent/scout-1".into());
+
+    assert!(app.handle_prompt_command("/subagents", &tx));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::SubagentActivity)
+    );
+    let filtered = app.picker_filtered();
+    let names: Vec<String> = filtered
+        .iter()
+        .map(|&index| app.views[0].subagents_sorted()[index].1.name.clone())
+        .collect();
+    assert_eq!(names, ["parent/review-2", "parent/scout-1"]);
+
+    // The query matches names, ids, status and call ids.
+    app.picker.as_mut().expect("picker").query = "scout".into();
+    let filtered = app.picker_filtered();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        app.views[0].subagents_sorted()[filtered[0]].1.name,
+        "parent/scout-1"
+    );
+
+    app.picker.as_mut().expect("picker").query = "failed".into();
+    assert!(app.picker_filtered().is_empty());
+}
+
+#[test]
+fn subagents_without_children_falls_back_to_the_limit_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["parent"]);
+
+    assert!(app.handle_prompt_command("/subagents", &tx));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Subagents)
+    );
+    app.picker = None;
+
+    // The explicit spelling still opens the limit picker even with children.
+    app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+    assert!(app.handle_prompt_command("/subagents limit", &tx));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Subagents)
+    );
+}
+
+#[test]
+fn subagent_picker_previews_live_activity() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["parent"]);
+    let view = &mut app.views[0];
+    view.upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+    view.push_subagent_event(
+        "child-1",
+        SessionEvent::new(
+            "child-1",
+            1,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "exec_command",
+                "arguments": {"cmd": "cargo test"},
+            }),
+        ),
+    );
+    view.push_subagent_event(
+        "child-1",
+        SessionEvent::new(
+            "child-1",
+            2,
+            EventKind::ToolResult,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "exec_command",
+                "ok": true,
+                "denied": false,
+                "output": "all good",
+            }),
+        ),
+    );
+    view.push_subagent_event(
+        "child-1",
+        SessionEvent::new(
+            "child-1",
+            3,
+            EventKind::Error,
+            serde_json::json!({"message": "parser exploded"}),
+        ),
+    );
+    view.push_subagent_delta("child-1", "t1", true, "checking the parser");
+    view.push_subagent_delta("child-1", "t1", false, "partial answer");
+
+    app.open_picker(PickerKind::SubagentActivity, &tx);
+    let rendered = render_text(&mut app, 100, 30);
+    assert!(rendered.contains("subagents — live activity"), "{rendered}");
+    assert!(rendered.contains("live activity"), "{rendered}");
+    assert!(rendered.contains("cargo test"), "{rendered}");
+    assert!(rendered.contains("parser exploded"), "{rendered}");
+    assert!(rendered.contains("checking the parser"), "{rendered}");
+    assert!(rendered.contains("✎ Answer…"), "{rendered}");
+    assert!(rendered.contains("partial answer"), "{rendered}");
+
+    // The preview is keyed by the live revision, so later child activity
+    // replaces the cached text instead of freezing the first frame.
+    app.views[0].push_subagent_event(
+        "child-1",
+        SessionEvent::new(
+            "child-1",
+            4,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "c2",
+                "tool": "exec_command",
+                "arguments": {"cmd": "rg TODO src"},
+            }),
+        ),
+    );
+    let rendered = render_text(&mut app, 100, 30);
+    assert!(rendered.contains("rg TODO"), "{rendered}");
+}
+
+#[test]
+fn subagent_picker_enter_opens_the_child_pane() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["parent"]);
+    app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/review-2".into());
+    app.views[0].upsert_subagent("child-2".into(), "call-2".into(), "parent/scout-1".into());
+
+    app.open_picker(PickerKind::SubagentActivity, &tx);
+    // Sorted rows: review-2 first, scout-1 second.
+    app.picker.as_mut().expect("picker").selected = 1;
+    app.picker_enter(PickerKind::SubagentActivity, &tx);
+
+    assert!(app.picker.is_none());
+    assert_eq!(
+        app.pending_attach
+            .as_ref()
+            .map(|pending| pending.session_id.as_str()),
+        Some("child-2")
+    );
+    match rx.try_recv() {
+        Ok(Command::Attach(session_id)) => assert_eq!(session_id, "child-2"),
+        Ok(_) => panic!("unexpected command"),
+        Err(err) => panic!("unexpected command error: {err}"),
+    }
+}
+
+#[test]
 fn expanded_command_omits_redundant_labels_and_gutter() {
     let session = Session::new("s1", "tools", "/tmp");
     let events = vec![

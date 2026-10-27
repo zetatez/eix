@@ -642,7 +642,7 @@ fn glob_match(pattern: &str, text: &str) -> bool {
 
 /// Default number of `spawn_agent` children allowed to run concurrently in one
 /// tool batch.
-pub const DEFAULT_MAX_PARALLEL_SUBAGENTS: usize = 4;
+pub const DEFAULT_MAX_PARALLEL_SUBAGENTS: usize = 8;
 
 /// Supported concurrency levels for `spawn_agent`. The explicit exponential
 /// scale keeps the configured default and runtime override predictable while
@@ -4465,7 +4465,7 @@ pi = true
             .any(|path| path == "~/.cargo"));
         assert!(default.tools.snapshots);
         assert!(default.tools.auto_apply_workspace_edits);
-        assert_eq!(default.tools.max_parallel_subagents, 4);
+        assert_eq!(default.tools.max_parallel_subagents, 8);
         assert!(default.integration.auto_commit);
         assert!(!default.integration.auto_ready);
         assert!(!default.worktree.auto);
@@ -4497,7 +4497,7 @@ snapshots = false
 
     #[test]
     fn subagent_concurrency_levels_are_explicit() {
-        assert_eq!(DEFAULT_MAX_PARALLEL_SUBAGENTS, 4);
+        assert_eq!(DEFAULT_MAX_PARALLEL_SUBAGENTS, 8);
         for value in SUBAGENT_CONCURRENCY_OPTIONS {
             assert!(subagent_concurrency_supported(value), "{value}");
         }

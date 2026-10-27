@@ -707,6 +707,7 @@ impl App {
         if let Some(preview_area) = preview_area {
             let width = preview_area.width.saturating_sub(2) as usize;
             let height = preview_area.height as usize;
+            self.sync_subagent_preview(&filtered, selected, width);
             let lines = self.picker_preview_lines(&filtered, height);
             let mut wrapped: Vec<String> = lines
                 .iter()
@@ -714,7 +715,10 @@ impl App {
                 .collect();
             // Session previews are conversations: keep the newest lines in
             // view instead of showing the oldest part of the fetched window.
-            if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) && wrapped.len() > height
+            if matches!(
+                kind,
+                PickerKind::Sessions | PickerKind::NewPane | PickerKind::SubagentActivity
+            ) && wrapped.len() > height
             {
                 wrapped.drain(..wrapped.len() - height);
             }
@@ -734,6 +738,57 @@ impl App {
     /// other kinds render the provider's label and detail.
     pub(super) fn picker_rows(&self, kind: PickerKind, filtered: &[usize]) -> Vec<ListItem<'_>> {
         match kind {
+            PickerKind::SubagentActivity => {
+                let Some(view) = self.focused_view() else {
+                    return Vec::new();
+                };
+                let agents = view.subagents_sorted();
+                filtered
+                    .iter()
+                    .filter_map(|&index| agents.get(index))
+                    .map(|(_, agent)| {
+                        let (dot, label, color) = match agent.status {
+                            transcript::SubagentStatus::Running => {
+                                ("◐", "running", composer_accent(self.theme))
+                            }
+                            transcript::SubagentStatus::Completed => {
+                                ("●", "done", composer_success(self.theme))
+                            }
+                            transcript::SubagentStatus::Failed => {
+                                ("✗", "failed", composer_danger(self.theme))
+                            }
+                        };
+                        let mut detail = transcript::last_activity(agent).unwrap_or_default();
+                        if detail.is_empty() {
+                            detail = if agent.status == transcript::SubagentStatus::Running {
+                                if !agent.text.trim().is_empty() {
+                                    "answering…".into()
+                                } else if agent.reasoning.trim().is_empty() {
+                                    "waiting for agent…".into()
+                                } else {
+                                    "thinking…".into()
+                                }
+                            } else {
+                                "no activity".into()
+                            };
+                        }
+                        ListItem::new(Line::from(vec![
+                            Span::styled(format!("{dot} "), Style::default().fg(color)),
+                            Span::styled(
+                                pad_to(&truncate(&agent.name, 28), 28),
+                                Style::default()
+                                    .fg(composer_text(self.theme))
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                            Span::styled(format!("  {label:<7} "), Style::default().fg(color)),
+                            Span::styled(
+                                truncate(&detail, 60),
+                                Style::default().fg(composer_muted(self.theme)),
+                            ),
+                        ]))
+                    })
+                    .collect()
+            }
             PickerKind::Sessions | PickerKind::NewPane => {
                 let open_panes: Vec<Option<usize>> = self
                     .sessions
@@ -910,6 +965,58 @@ impl App {
         }
     }
 
+    /// Rebuild the local preview for the selected child agent when its live
+    /// revision or the preview width changes. Unlike file/session previews
+    /// this never hits the daemon: child events and thinking are already in
+    /// the parent view.
+    pub(super) fn sync_subagent_preview(
+        &mut self,
+        filtered: &[usize],
+        selected: usize,
+        width: usize,
+    ) {
+        if self.picker.as_ref().map(|picker| picker.kind) != Some(PickerKind::SubagentActivity) {
+            return;
+        }
+        let Some(&index) = filtered.get(selected) else {
+            return;
+        };
+        // The focused session is part of the key: two views can hold children
+        // with the same id and revision, and the picker can survive a focus
+        // change between frames.
+        let Some(key) = self.focused_view().and_then(|view| {
+            view.subagents_sorted()
+                .get(index)
+                .map(|(id, _)| format!("{}:{id}:{}:{width}", view.session.id, view.subagents_rev))
+        }) else {
+            return;
+        };
+        if self
+            .picker
+            .as_ref()
+            .is_some_and(|picker| picker.preview.key.as_deref() == Some(key.as_str()))
+        {
+            return;
+        }
+        let text = {
+            let Some(view) = self.focused_view() else {
+                return;
+            };
+            let Some((_, agent)) = view.subagents_sorted().get(index).copied() else {
+                return;
+            };
+            subagent_preview_text(agent, width, self.theme)
+        };
+        if let Some(picker) = &mut self.picker {
+            picker.preview = PickerPreview {
+                key: Some(key),
+                text: Some(text),
+                error: None,
+                loading: false,
+            };
+        }
+    }
+
     /// Right-pane preview lines for the selected picker row. `height` bounds how
     /// much of a fetched file is copied; the draw path only needs one screen.
     pub(super) fn picker_preview_lines(&self, filtered: &[usize], height: usize) -> Vec<String> {
@@ -920,6 +1027,12 @@ impl App {
             return Vec::new();
         };
         match picker.kind {
+            PickerKind::SubagentActivity => {
+                if let Some(text) = &picker.preview.text {
+                    return preview_tail(text, height);
+                }
+                vec!["select a sub-agent".into()]
+            }
             PickerKind::Sessions | PickerKind::NewPane => {
                 if let Some(text) = &picker.preview.text {
                     return preview_tail(text, height);
@@ -983,6 +1096,80 @@ impl App {
             }
         }
     }
+}
+
+/// Plain text of the selected child agent: identity/status plus its recent
+/// event log and still-streaming thinking. Older events are dropped first so a
+/// long-running child does not make every picker frame re-render its entire
+/// history.
+fn subagent_preview_text(agent: &Subagent, width: usize, theme: Theme) -> String {
+    const MAX_EVENTS: usize = 300;
+    const MAX_BYTES: usize = 64 * 1024;
+
+    let status = match agent.status {
+        transcript::SubagentStatus::Running => "running",
+        transcript::SubagentStatus::Completed => "done",
+        transcript::SubagentStatus::Failed => "failed",
+    };
+    let mut lines = vec![
+        agent.name.clone(),
+        String::new(),
+        format!("status      {status}"),
+        format!("call        {}", agent.call_id),
+        format!("events      {}", agent.events.len()),
+        String::new(),
+        "── live activity ──".to_string(),
+    ];
+    let start = agent.events.len().saturating_sub(MAX_EVENTS);
+    if start > 0 {
+        lines.push(format!("… {} older event(s)", start));
+    }
+    let rendered = transcript::render_events(&agent.events[start..], width, theme);
+    lines.extend(rendered.lines.iter().map(line_text));
+    if !agent.reasoning.trim().is_empty() {
+        lines.push(String::new());
+        lines.push("✳ Thinking…".into());
+        lines.extend(agent.reasoning.lines().map(str::to_string));
+    }
+    if !agent.text.trim().is_empty() {
+        lines.push(String::new());
+        lines.push("✎ Answer…".into());
+        lines.extend(agent.text.lines().map(str::to_string));
+    }
+    if let Some(error) = agent
+        .error
+        .as_deref()
+        .filter(|text| !text.trim().is_empty())
+    {
+        lines.push(String::new());
+        lines.push(format!("! {error}"));
+    }
+    if agent.events.is_empty() {
+        if let Some(result) = agent
+            .result
+            .as_deref()
+            .filter(|text| !text.trim().is_empty())
+        {
+            lines.push(String::new());
+            lines.push(result.to_string());
+        }
+    }
+    let mut text = lines.join("\n");
+    if text.len() > MAX_BYTES {
+        let mut cut = text.len() - MAX_BYTES;
+        while !text.is_char_boundary(cut) {
+            cut += 1;
+        }
+        text = text[cut..].to_string();
+    }
+    text
+}
+
+fn line_text(line: &Line<'_>) -> String {
+    line.spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect()
 }
 
 /// First `height` source lines. Each source line wraps to at least one display

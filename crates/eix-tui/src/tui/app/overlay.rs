@@ -41,6 +41,20 @@ impl App {
         });
     }
 
+    /// `/subagents` without a value: show the live child picker when the
+    /// focused session has children, otherwise fall back to the parallel-limit
+    /// picker so the old entry point still works.
+    pub(super) fn open_subagents(&mut self, tx: &UnboundedSender<Command>) {
+        let has_children = self
+            .focused_view()
+            .is_some_and(|view| !view.subagents.is_empty());
+        if has_children {
+            self.open_picker(PickerKind::SubagentActivity, tx);
+        } else {
+            self.open_picker(PickerKind::Subagents, tx);
+        }
+    }
+
     pub(super) fn open_processes(&mut self, tx: &UnboundedSender<Command>) {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             self.status = "no session to inspect".into();
@@ -384,6 +398,11 @@ impl App {
         } else {
             0
         };
+        let subagents_rev = if kind == PickerKind::SubagentActivity {
+            self.subagents_fingerprint()
+        } else {
+            0
+        };
         {
             let Some(picker) = self.picker.as_ref() else {
                 return Vec::new();
@@ -394,12 +413,14 @@ impl App {
                 && filter.query == picker.query
                 && filter.items_rev == picker.items_rev
                 && filter.sessions_rev == sessions_rev
+                && filter.subagents_rev == subagents_rev
             {
                 return filter.rows.clone();
             }
         }
         let rows = match kind {
             PickerKind::Sessions | PickerKind::NewPane => self.filtered_sessions(),
+            PickerKind::SubagentActivity => self.filtered_subagents(),
             _ => self.filtered_items(),
         };
         if let Some(picker) = self.picker.as_mut() {
@@ -408,11 +429,57 @@ impl App {
                 query: picker.query.clone(),
                 items_rev: picker.items_rev,
                 sessions_rev,
+                subagents_rev,
                 rows: rows.clone(),
                 valid: true,
             };
         }
         rows
+    }
+
+    /// Fingerprint of the focused session's child agents. `subagents_rev`
+    /// covers event and delta updates; the session id separates two views that
+    /// happen to share the same revision counter.
+    fn subagents_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        if let Some(view) = self.focused_view() {
+            view.session.id.hash(&mut hasher);
+            view.subagents_rev.hash(&mut hasher);
+        }
+        hasher.finish()
+    }
+
+    /// Fuzzy-filter the focused session's child agents in stable name order.
+    fn filtered_subagents(&self) -> Vec<usize> {
+        let Some(view) = self.focused_view() else {
+            return Vec::new();
+        };
+        let agents = view.subagents_sorted();
+        let query = self
+            .picker
+            .as_ref()
+            .map(|picker| picker.query.trim().to_lowercase())
+            .unwrap_or_default();
+        if query.is_empty() {
+            return (0..agents.len()).collect();
+        }
+        let mut hits: Vec<(i32, usize)> = agents
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (id, agent))| {
+                let status = match agent.status {
+                    transcript::SubagentStatus::Running => "running",
+                    transcript::SubagentStatus::Completed => "done",
+                    transcript::SubagentStatus::Failed => "failed",
+                };
+                let haystack =
+                    format!("{} {status} {} {}", agent.name, agent.call_id, id).to_lowercase();
+                fuzzy_score(&query, &haystack).map(|score| (score, index))
+            })
+            .collect();
+        hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        hits.into_iter().map(|(_, index)| index).collect()
     }
 
     /// Cheap fingerprint of the fields the session filter reads. Session rows
@@ -547,6 +614,17 @@ impl App {
                     }
                 }
             }
+            PickerKind::SubagentActivity => {
+                let child = self.focused_view().and_then(|view| {
+                    view.subagents_sorted()
+                        .get(index)
+                        .map(|(id, _)| (*id).to_string())
+                });
+                self.picker = None;
+                if let Some(child) = child {
+                    self.open_session_id_in_new_pane(child, tx);
+                }
+            }
             PickerKind::Modes => {
                 if let Some(value) = value {
                     self.picker = None;
@@ -651,6 +729,20 @@ impl App {
                 .position(|item| item.value == current.to_string())
                 .unwrap_or(0);
             self.status = format!("subagents: {current} concurrent (runtime)");
+        } else if kind == PickerKind::SubagentActivity {
+            let Some(view) = self.focused_view() else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            let running = view
+                .subagents
+                .values()
+                .filter(|agent| agent.status == transcript::SubagentStatus::Running)
+                .count();
+            self.status = format!(
+                "subagents: {running} running / {} total · Enter opens a child pane",
+                view.subagents.len()
+            );
         } else if kind == PickerKind::Modes {
             let Some(current) = self.focused_view().map(|view| view.session.mode) else {
                 self.status = "attach a session first".into();
@@ -763,7 +855,7 @@ impl App {
             "git" | "worktrees" | "branches" => self.open_picker(PickerKind::Git, tx),
             "model" => self.open_picker(PickerKind::Models, tx),
             "agents" => self.open_picker(PickerKind::Agents, tx),
-            "subagents" => self.open_picker(PickerKind::Subagents, tx),
+            "subagents" => self.open_subagents(tx),
             "mode" | "perm" => self.open_picker(PickerKind::Modes, tx),
             "toggle-mode" => self.toggle_mode(tx),
             "skills" => self.open_picker(PickerKind::Skills, tx),

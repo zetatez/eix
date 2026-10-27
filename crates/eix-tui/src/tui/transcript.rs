@@ -71,6 +71,11 @@ pub struct Subagent {
     pub reasoning: String,
     /// Turn that owns [`Subagent::reasoning`]; a new turn starts a new buffer.
     pub reasoning_turn: String,
+    /// Answer text streamed by the child's current turn, shown live in the
+    /// sub-agent picker. The stored assistant event clears it.
+    pub text: String,
+    /// Turn that owns [`Subagent::text`].
+    pub text_turn: String,
 }
 
 impl Subagent {
@@ -84,6 +89,8 @@ impl Subagent {
             error: None,
             reasoning: String::new(),
             reasoning_turn: String::new(),
+            text: String::new(),
+            text_turn: String::new(),
         }
     }
 
@@ -95,10 +102,12 @@ impl Subagent {
             EventKind::AssistantMessage => {
                 if let Ok(payload) = AssistantMessagePayload::deserialize(&event.payload) {
                     // The stored message already carries this turn's
-                    // reasoning; drop the live copy so the feed does not
-                    // repeat it.
+                    // reasoning; drop the live copies so the feed does not
+                    // repeat them.
                     self.reasoning.clear();
                     self.reasoning_turn.clear();
+                    self.text.clear();
+                    self.text_turn.clear();
                     let text = payload.text.trim();
                     if !text.is_empty() {
                         self.result = Some(text.to_string());
@@ -118,6 +127,8 @@ impl Subagent {
     pub fn complete(&mut self, ok: bool, result: Option<String>, error: Option<String>) {
         self.reasoning.clear();
         self.reasoning_turn.clear();
+        self.text.clear();
+        self.text_turn.clear();
         self.status = if ok {
             SubagentStatus::Completed
         } else {
@@ -225,6 +236,29 @@ pub fn render_with_subagents(
     let mut out = render_history_with_subagents(events, folds, width, theme, subagents);
     append_tail(&mut out, live, queued, folds, tail_width, theme, tick);
     out
+}
+
+/// Render a standalone event log, used by the sub-agent picker preview. The
+/// child has no nested `spawn_agent` cards, so the subagent map is empty.
+pub fn render_events(events: &[SessionEvent], width: usize, theme: Theme) -> Transcript {
+    let width = width.saturating_sub(2).max(1);
+    let mut blocks = Vec::new();
+    let mut tool_index = Vec::new();
+    collect_into(events, &mut blocks, &mut tool_index);
+    let no_folds = HashMap::new();
+    let no_subagents = HashMap::new();
+    let mut lines = Vec::new();
+    let mut slots = Vec::new();
+    let mut user_lines = Vec::new();
+    for collected in blocks {
+        let piece = render_block(&collected.block, &no_folds, width, theme, &no_subagents);
+        append_piece_parts(&mut lines, &mut slots, &mut user_lines, piece);
+    }
+    Transcript {
+        lines,
+        slots,
+        user_lines,
+    }
 }
 
 /// Render only the stored history. The UI caches this and renders the live
@@ -1530,73 +1564,85 @@ fn subagent_result(
 
 /// Compact activity feed for the live window. This intentionally keeps only
 /// the first line of each event so the viewport stays a fixed size.
-fn subagent_activity(subagent: &Subagent) -> Vec<String> {
+pub(crate) fn subagent_activity(subagent: &Subagent) -> Vec<String> {
+    subagent.events.iter().flat_map(activity_lines).collect()
+}
+
+/// The newest line the compact card/window would show, without formatting the
+/// whole event log. Used by the sub-agent picker rows.
+pub(crate) fn last_activity(subagent: &Subagent) -> Option<String> {
+    subagent
+        .events
+        .iter()
+        .rev()
+        .find_map(|event| activity_lines(event).pop())
+}
+
+fn activity_lines(event: &SessionEvent) -> Vec<String> {
     let mut lines = Vec::new();
-    for event in &subagent.events {
-        match event.kind {
-            EventKind::UserMessage => {
-                if let Ok(payload) = UserMessagePayload::deserialize(&event.payload) {
-                    let text = first_line(&payload.text);
-                    if !text.is_empty() {
-                        lines.push(format!("▶ {text}"));
-                    }
+    match event.kind {
+        EventKind::UserMessage => {
+            if let Ok(payload) = UserMessagePayload::deserialize(&event.payload) {
+                let text = first_line(&payload.text);
+                if !text.is_empty() {
+                    lines.push(format!("▶ {text}"));
                 }
             }
-            EventKind::AssistantMessage => {
-                if let Ok(payload) = AssistantMessagePayload::deserialize(&event.payload) {
-                    if let Some(reasoning) = payload
-                        .reasoning
-                        .as_deref()
-                        .filter(|text| !text.trim().is_empty())
-                    {
-                        lines.push(format!("✳ {}", first_line(reasoning)));
-                    }
-                    let text = first_line(&payload.text);
-                    if !text.is_empty() {
-                        lines.push(format!("✎ {text}"));
-                    }
-                }
-            }
-            EventKind::ToolCall => {
-                if let Ok(payload) = ToolCallPayload::deserialize(&event.payload) {
-                    lines.push(format!(
-                        "⚙ {}",
-                        tool_call_summary(&payload.tool, &payload.arguments)
-                    ));
-                }
-            }
-            EventKind::ToolResult => {
-                if let Ok(payload) = ToolResultPayload::deserialize(&event.payload) {
-                    let marker = if payload.ok && !payload.denied {
-                        "✓"
-                    } else {
-                        "✗"
-                    };
-                    let output = first_line(&payload.output);
-                    if output.is_empty() {
-                        lines.push(format!("{marker} {}", payload.tool));
-                    } else {
-                        lines.push(format!("{marker} {}: {output}", payload.tool));
-                    }
-                }
-            }
-            EventKind::ApprovalRequired => {
-                if let Ok(payload) = ApprovalRequiredPayload::deserialize(&event.payload) {
-                    lines.push(format!("⚠ approval: {}", first_line(&payload.summary)));
-                }
-            }
-            EventKind::InputRequired => {
-                if let Some(question) = event.payload.get("question").and_then(Value::as_str) {
-                    lines.push(format!("? {}", first_line(question)));
-                }
-            }
-            EventKind::Error => {
-                if let Some(message) = event.payload.get("message").and_then(Value::as_str) {
-                    lines.push(format!("! {}", first_line(message)));
-                }
-            }
-            _ => {}
         }
+        EventKind::AssistantMessage => {
+            if let Ok(payload) = AssistantMessagePayload::deserialize(&event.payload) {
+                if let Some(reasoning) = payload
+                    .reasoning
+                    .as_deref()
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    lines.push(format!("✳ {}", first_line(reasoning)));
+                }
+                let text = first_line(&payload.text);
+                if !text.is_empty() {
+                    lines.push(format!("✎ {text}"));
+                }
+            }
+        }
+        EventKind::ToolCall => {
+            if let Ok(payload) = ToolCallPayload::deserialize(&event.payload) {
+                lines.push(format!(
+                    "⚙ {}",
+                    tool_call_summary(&payload.tool, &payload.arguments)
+                ));
+            }
+        }
+        EventKind::ToolResult => {
+            if let Ok(payload) = ToolResultPayload::deserialize(&event.payload) {
+                let marker = if payload.ok && !payload.denied {
+                    "✓"
+                } else {
+                    "✗"
+                };
+                let output = first_line(&payload.output);
+                if output.is_empty() {
+                    lines.push(format!("{marker} {}", payload.tool));
+                } else {
+                    lines.push(format!("{marker} {}: {output}", payload.tool));
+                }
+            }
+        }
+        EventKind::ApprovalRequired => {
+            if let Ok(payload) = ApprovalRequiredPayload::deserialize(&event.payload) {
+                lines.push(format!("⚠ approval: {}", first_line(&payload.summary)));
+            }
+        }
+        EventKind::InputRequired => {
+            if let Some(question) = event.payload.get("question").and_then(Value::as_str) {
+                lines.push(format!("? {}", first_line(question)));
+            }
+        }
+        EventKind::Error => {
+            if let Some(message) = event.payload.get("message").and_then(Value::as_str) {
+                lines.push(format!("! {}", first_line(message)));
+            }
+        }
+        _ => {}
     }
     lines
 }

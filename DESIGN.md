@@ -464,7 +464,10 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     session 的预览会随选中项通过 `picker.preview` 拉取最近对话（you / assistant / tool / error）；
     session picker 只列普通 session 和 worktree session，`origin = agent` 的子 session 不进入列表，
     只能从父 transcript 的 subagent 卡片打开；child transcript 底部提供可点击的
-    `← parent agent`；worktree 标记 `⑂` 单独占一列，紧跟 session id 前；
+    `← parent agent`；`/subagents` 在父 session 有子 agent 时打开实时 subagent picker
+    （按名字搜索，右侧预览 child 事件、工具调用/结果、流式 thinking 和 answer，`Enter` 在
+    pane 中打开 child session），没有子 agent 时回退到并发上限 picker；worktree 标记 `⑂` 单独占一列，
+    紧跟 session id 前；
     files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
     grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
   - 入口：`<Space>g`（sessions，切换 pane）、`<Space>h`（timeline）、`<Space>o`（sessions，新 pane）、
@@ -966,8 +969,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > （`read_file` / `list_dir` / `grep` / `glob` / `lsp_diagnostics` / `process_output` 等）；
 > agent session 在 `run_tool_call` 里对写工具
 > 直接拒绝，深度上限 1（child 不能再 spawn）。同一 assistant 批次里的多个 `spawn_agent`
-> 用 `tokio::spawn` 并发跑，默认上限由 `[tools] max_parallel_subagents` 配置（默认 4，支持
-> 2/4/8/16/32/64/128/256）；TUI `/subagents [n]` 通过 `config.subagents` RPC 覆盖运行时值（不写回配置）。
+> 用 `tokio::spawn` 并发跑，默认上限由 `[tools] max_parallel_subagents` 配置（默认 8，支持
+> 2/4/8/16/32/64/128/256）；TUI `/subagents` 在有子 agent 时打开实时活动 picker，
+> `/subagents limit` 或 `/subagents <n>` 调整并发上限并通过 `config.subagents` RPC 覆盖运行时值（不写回配置）。
 > 同一批次里连续的只读调用（内置读工具，以及风险分析判定低风险只读、权限决定为 allow 的
 > `run_command`）在段内并发执行；无需审批且目标互不重叠的直接 `write_file` / `edit` 也会
 > 在写段内并发。同一/重叠目标、`patch`、审批或暂存写入、非只读命令、审批和交互调用作为
@@ -1262,7 +1266,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/attention` / `/cancel` | 跳到下一个需要 attention 的 pane / 取消运行 |
 | `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `providers.*` 自动拉取的 `/models` 和 `models:`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
-| `/subagents [n]` | 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 4，可选 2/4/8/16/32/64/128/256）；不带参数打开 picker（仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
+| `/subagents [n|limit]` | 有子 agent 时打开实时 picker（搜索 child，右侧预览事件/工具调用/流式 thinking 与 answer，`Enter` 在新 pane 打开）；`limit` 或 `<n>` 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 8，可选 2/4/8/16/32/64/128/256，仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
 | `/reload` | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC），并重新加载自定义 Markdown 命令 |
 | `/colorscheme` | 打开 colorscheme picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原配色 |
@@ -1374,7 +1378,7 @@ echo "$f"; done | sort | head` 可直接放行。
 tools:
   max_output_bytes: 20000
   command_timeout_secs: 60
-  max_parallel_subagents: 4  # 2/4/8/16/32/64/128/256；大规模任务可按需调高
+  max_parallel_subagents: 8  # 2/4/8/16/32/64/128/256；大规模任务可按需调高
   sandbox: auto            # auto / required / off
   sandbox_network: false
   sandbox_read_paths: ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]

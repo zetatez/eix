@@ -204,7 +204,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "search providers/models and switch this session",
         ),
         builtin("agents", "[name]", "choose the session's primary agent"),
-        builtin("subagents", "[n]", "set the max parallel spawn_agent calls"),
+        builtin(
+            "subagents",
+            "[n|limit]",
+            "monitor live sub-agents or set the max parallel spawn_agent calls",
+        ),
         builtin("mcp", "", "browse MCP servers and their tools"),
         builtin("reload", "", "re-read the daemon config files"),
         builtin(
@@ -612,6 +616,23 @@ impl SessionView {
         self.text_lines_valid = true;
     }
 
+    /// Child agents in a stable order for the picker. Sorting by name keeps
+    /// rows from moving when a child changes status.
+    fn subagents_sorted(&self) -> Vec<(&str, &Subagent)> {
+        let mut agents: Vec<(&str, &Subagent)> = self
+            .subagents
+            .iter()
+            .map(|(id, agent)| (id.as_str(), agent))
+            .collect();
+        agents.sort_by(|a, b| {
+            a.1.name
+                .cmp(&b.1.name)
+                .then_with(|| a.1.call_id.cmp(&b.1.call_id))
+                .then_with(|| a.0.cmp(b.0))
+        });
+        agents
+    }
+
     fn upsert_subagent(&mut self, agent_id: String, call_id: String, name: String) {
         match self.subagents.get_mut(&agent_id) {
             Some(subagent) => {
@@ -639,34 +660,49 @@ impl SessionView {
         true
     }
 
-    /// Append a streamed child delta to the card. Only thinking is shown
-    /// live; answer text arrives in one piece with the stored assistant
-    /// event, which also clears this buffer.
+    /// Append a streamed child delta. The card shows thinking live; the picker
+    /// preview shows both thinking and the answer. Stored assistant events
+    /// clear these buffers.
     fn push_subagent_delta(&mut self, agent_id: &str, turn_id: &str, reasoning: bool, delta: &str) {
-        if !reasoning {
-            return;
-        }
         let Some(subagent) = self.subagents.get_mut(agent_id) else {
             return;
         };
-        if subagent.reasoning_turn != turn_id {
-            subagent.reasoning.clear();
-            subagent.reasoning_turn.clear();
-            subagent.reasoning_turn.push_str(turn_id);
+        if reasoning {
+            if subagent.reasoning_turn != turn_id {
+                subagent.reasoning.clear();
+                subagent.reasoning_turn.clear();
+                subagent.reasoning_turn.push_str(turn_id);
+            }
+            subagent.reasoning.push_str(delta);
+        } else {
+            if subagent.text_turn != turn_id {
+                subagent.text.clear();
+                subagent.text_turn.clear();
+                subagent.text_turn.push_str(turn_id);
+            }
+            subagent.text.push_str(delta);
         }
-        subagent.reasoning.push_str(delta);
         self.subagents_rev = self.subagents_rev.wrapping_add(1);
     }
 
-    /// Drop the live thinking buffer when the turn is reset or retried. A
-    /// retry streams the reasoning again from the start.
+    /// Drop the live buffers when the turn is reset or retried. A retry
+    /// streams the reasoning and answer again from the start.
     fn clear_subagent_reasoning(&mut self, agent_id: &str, turn_id: &str) {
         let Some(subagent) = self.subagents.get_mut(agent_id) else {
             return;
         };
+        let mut changed = false;
         if subagent.reasoning_turn == turn_id {
             subagent.reasoning.clear();
             subagent.reasoning_turn.clear();
+            changed = true;
+        }
+        if subagent.text_turn == turn_id {
+            subagent.text.clear();
+            subagent.text_turn.clear();
+            changed = true;
+        }
+        if changed {
             self.subagents_rev = self.subagents_rev.wrapping_add(1);
         }
     }
@@ -918,6 +954,8 @@ enum PickerKind {
     Agents,
     /// Adjust the daemon's runtime subagent concurrency limit.
     Subagents,
+    /// Browse the focused session's child agents with live activity.
+    SubagentActivity,
     /// Choose the focused session's execution mode.
     Modes,
     /// Search this session's user-message history and jump to it.
@@ -945,6 +983,7 @@ impl PickerKind {
             | Self::Models
             | Self::Agents
             | Self::Subagents
+            | Self::SubagentActivity
             | Self::Modes
             | Self::Timeline
             | Self::Skills
@@ -974,6 +1013,7 @@ impl PickerKind {
             Self::Models => "model — search and switch",
             Self::Agents => "agents — choose the primary agent",
             Self::Subagents => "subagents — parallel limit",
+            Self::SubagentActivity => "subagents — live activity",
             Self::Modes => "mode — choose session execution",
             Self::Timeline => "timeline — user input history",
             Self::Skills => "skills — preview and insert",
@@ -994,6 +1034,9 @@ impl PickerKind {
             Self::Models => "type to search · Enter switch · Esc close",
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Subagents => "Enter apply · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
+            Self::SubagentActivity => {
+                "type to search · Enter open child pane · ↑/↓ or C-j/C-k/C-n/C-p · Esc close"
+            }
             Self::Modes => "type to search · Enter apply · Esc close",
             Self::Timeline => "type to search · C-j/C-k or C-n/C-p · Enter jump · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
@@ -1021,6 +1064,7 @@ struct PickerFilterCache {
     query: String,
     items_rev: u64,
     sessions_rev: u64,
+    subagents_rev: u64,
     rows: Vec<usize>,
     valid: bool,
 }

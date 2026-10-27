@@ -217,12 +217,17 @@ impl App {
             }
             "subagents" => {
                 if args.is_empty() {
+                    self.open_subagents(tx);
+                } else if args == "limit" {
                     self.open_picker(PickerKind::Subagents, tx);
                 } else {
                     match args.parse::<usize>() {
                         Ok(value) => self.set_subagent_concurrency(value, tx),
                         Err(_) => {
-                            self.error = Some("usage: /subagents [2|4|8|16|32|64|128|256]".into());
+                            self.error = Some(
+                                "usage: /subagents [n|limit] (2, 4, 8, 16, 32, 64, 128, or 256)"
+                                    .into(),
+                            );
                         }
                     }
                 }
