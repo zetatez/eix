@@ -102,6 +102,7 @@ impl App {
     pub(super) fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
         // Sessions live in the floating picker (`Space g` / `/sessions`), not in
         // a permanent sidebar: panes get the whole body.
+        self.tab_areas.clear();
         if self.views.is_empty()
             || self.effective_layout(area) != PaneLayout::Tabby
             || area.height <= 1
@@ -117,13 +118,18 @@ impl App {
         self.draw_tab_bar(frame, chunks[1]);
     }
 
-    pub(super) fn draw_tab_bar(&self, frame: &mut Frame, area: Rect) {
+    pub(super) fn draw_tab_bar(&mut self, frame: &mut Frame, area: Rect) {
         if area.width == 0 || area.height == 0 {
             return;
         }
         let theme = self.theme;
         let focused = self.focused.min(self.views.len().saturating_sub(1));
         let mut spans = Vec::with_capacity(self.views.len() * 2);
+        // Track each label's cells so a click can focus that tab. The
+        // Paragraph clips labels that run past the strip, so clip the hit
+        // rectangles too: hidden cells must not be clickable.
+        let right = area.x.saturating_add(area.width);
+        let mut column = area.x;
         for (index, view) in self.views.iter().enumerate() {
             let active = index == focused;
             let attention = !active
@@ -139,6 +145,13 @@ impl App {
             } else {
                 format!(" {} {name}{marker} ", index + 1)
             };
+            let width = UnicodeWidthStr::width(label.as_str()) as u16;
+            if column < right {
+                let visible = width.min(right - column);
+                self.tab_areas
+                    .push((Rect::new(column, area.y, visible, 1), index));
+            }
+            column = column.saturating_add(width);
             let style = if active {
                 Style::default()
                     .fg(composer_accent(theme))
@@ -154,6 +167,7 @@ impl App {
                     "│",
                     Style::default().fg(composer_border(theme)),
                 ));
+                column = column.saturating_add(1);
             }
         }
         frame.render_widget(

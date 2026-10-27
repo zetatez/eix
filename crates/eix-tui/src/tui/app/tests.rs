@@ -758,6 +758,99 @@ fn tab_layout_renders_all_tabs_but_only_the_active_pane() {
 }
 
 #[test]
+fn clicking_a_tabby_tab_focuses_that_pane() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["a", "b", "c"]);
+    app.layout = PaneLayout::Tabby;
+    app.focused = 0;
+    app.focus_input();
+    // Render once so the tab strip records its hit boxes.
+    let _ = render_text(&mut app, 80, 20);
+    assert_eq!(
+        app.tab_areas
+            .iter()
+            .map(|(_, index)| *index)
+            .collect::<Vec<_>>(),
+        vec![0, 1, 2]
+    );
+
+    let (rect, index) = app.tab_areas[2];
+    assert_eq!(index, 2);
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &tx,
+    );
+
+    assert_eq!(app.focused, 2);
+    assert_eq!(app.focused_session_id().as_deref(), Some("c"));
+    assert_eq!(app.status, "tab 3/3 focused");
+    // Switching tabs leaves the prompt cursor alone, like `Ctrl-3`.
+    assert!(matches!(app.focus, Focus::Input));
+    assert_eq!(app.input.mode(), Mode::Insert);
+}
+
+#[test]
+fn tabs_clipped_by_the_strip_have_no_hit_box() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["a", "b", "c"]);
+    app.layout = PaneLayout::Tabby;
+    app.focused = 0;
+    app.focus_input();
+    // Two 13-cell labels plus a separator already fill 27 cells, so the
+    // second tab is clipped and the third never starts.
+    let _ = render_text(&mut app, 24, 20);
+    assert_eq!(
+        app.tab_areas
+            .iter()
+            .map(|(_, index)| *index)
+            .collect::<Vec<_>>(),
+        vec![0, 1]
+    );
+    let (rect, _) = app.tab_areas[1];
+    assert!(rect.width < 13, "clipped hit box: {rect:?}");
+
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x + 1,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &tx,
+    );
+    assert_eq!(app.focused, 1);
+
+    // The hidden third tab must not react to a click at its old origin.
+    app.handle_mouse(
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 23,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        },
+        &tx,
+    );
+    assert_eq!(app.focused, 1);
+}
+
+#[test]
+fn leaving_tabby_layout_clears_tab_hit_boxes() {
+    let mut app = app_with_panes(&["a", "b", "c"]);
+    app.layout = PaneLayout::Tabby;
+    let _ = render_text(&mut app, 80, 20);
+    assert!(!app.tab_areas.is_empty());
+
+    app.layout = PaneLayout::Grid;
+    let _ = render_text(&mut app, 80, 20);
+    assert!(app.tab_areas.is_empty());
+}
+
+#[test]
 fn fibonacci_layout_shows_every_pane_without_a_tab_strip() {
     let mut app = app_with_panes(&["a", "b", "c"]);
     app.layout = PaneLayout::Fibonacci;

@@ -63,6 +63,29 @@ impl App {
             }
         }
 
+        // A click on the tab strip switches panes without moving the text
+        // cursor away from the prompt, mirroring `Ctrl-N`/`Ctrl-1..9`.
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let tab = self
+                .tab_areas
+                .iter()
+                .find(|(rect, index)| {
+                    *index < self.views.len()
+                        && x >= rect.x
+                        && x < rect.x.saturating_add(rect.width)
+                        && y >= rect.y
+                        && y < rect.y.saturating_add(rect.height)
+                })
+                .map(|(_, index)| *index);
+            if let Some(index) = tab {
+                for view in &mut self.views {
+                    view.selection = None;
+                }
+                self.focus_pane(index);
+                return;
+            }
+        }
+
         let active = self
             .views
             .iter()

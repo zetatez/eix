@@ -49,6 +49,7 @@ impl App {
             last_seen_status: "connecting…".into(),
             pending_history: None,
             pane_areas: Vec::new(),
+            tab_areas: Vec::new(),
             integrations: HashMap::new(),
             approvals: HashMap::new(),
             approval_rev: 0,

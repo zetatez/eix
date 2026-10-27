@@ -1554,6 +1554,8 @@ pub struct App {
     pending_history: Option<(String, u64)>,
     /// Pane rectangles from the last draw, used to pick a focus direction.
     pane_areas: Vec<Rect>,
+    /// Tab-strip hit boxes from the last draw, keyed by view index.
+    tab_areas: Vec<(Rect, usize)>,
     /// Latest integration state keyed by session id, fed by daemon events.
     integrations: HashMap<String, IntegrationState>,
     /// Tool calls waiting on a decision, keyed by session id.
