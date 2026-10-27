@@ -7481,6 +7481,7 @@ impl Daemon {
              5. Task state (what is done, in progress, blocked)\n\
              6. Open questions and the next concrete step\n\
              Be concise but specific. Keep exact paths, commands, error text, and identifiers. \
+             Write the summary in the language of the conversation, since the user may read it. \
              Prefer task state, decisions, and next steps over narration; this note may be \
              updated by later compactions. Do not invent facts or add commentary.",
         );
@@ -10118,7 +10119,7 @@ impl Daemon {
         let route = config.route(&model);
         let messages = vec![
             ChatMessage::system(
-                "You name coding-agent sessions. Read the conversation and reply with only a short session title. Requirements: 2-6 words, at most 32 characters including spaces, use the user's language, separate English words with single spaces, no punctuation, no quotes, no markdown.",
+                "You name coding-agent sessions. Read the conversation and reply with only a short session title. Requirements: 2-6 words, at most 32 characters including spaces, use the main language the conversation is written in, separate English words with single spaces, no punctuation, no quotes, no markdown.",
             ),
             ChatMessage::user(format!(
                 "Conversation:\n\n{}\nReturn only the session title.",
@@ -10145,7 +10146,7 @@ const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's te
 - Don't end a turn with a needed command running; if blocked, unblock yourself first, then say what's missing.
 - Preserve user work: no reverting unrelated changes, history rewrites, or destructive git. Assume changes you didn't make are the user's; build on them, ask only if they block the task. Mention unrelated bugs/tests instead of fixing them.
 - Ask only if a wrong assumption would change the outcome.
-- Reply in the user's language unless code requires it.
+- Final answers use the language of the newest user message; mixed input uses its dominant language, since borrowed terms and identifiers don't change it. If the user names an answer language, use it. Progress narration may stay in English. Keep code, commands, paths and quoted output verbatim.
 
 ## How to work
 - Scale depth to the task; expand only when it helps. Read the narrowest code and call sites; skip tools if context suffices; diagnose first.
@@ -10176,7 +10177,7 @@ const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's te
 const SUBAGENT_SYSTEM_PROMPT: &str = r#"You are a read-only sub-agent for eix. Workspace: `{cwd}`.
 
 The prompt is your full task; you cannot see the parent conversation. Investigate only that question. Search with `rg` and read the narrowest files with `cat`/`sed -n`/`nl`, batching independent `exec_command` calls. Return concise findings with file:line evidence, the minimum context needed, and any uncertainty. Prefer a short list of concrete findings over narrative. Answer the complete question, not only the easiest part; if evidence is blocked, say exactly what is missing.
-Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process. If a tool fails, change the input instead of repeating it. Follow repository instructions and load a matching skill before work. Answer in the user's language."#;
+Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process. If a tool fails, change the input instead of repeating it. Follow repository instructions and load a matching skill before work. Answer in the language of the task prompt; keep code, paths and quoted output verbatim."#;
 
 const SUBAGENT_READONLY_NOTE: &str = "\n\nThe prompt is your full task; you cannot see the parent conversation. You are a read-only sub-agent. Investigate only the assigned question, answer it completely rather than only the easiest part, and return concise findings with file:line evidence; if evidence is blocked, say exactly what is missing. Do not edit files, run mutating commands, ask questions, spawn agents, or narrate your process.";
 
@@ -10400,7 +10401,9 @@ mod tests {
         // budget does not depend on the machine running the test.
         let base = BASE_SYSTEM_PROMPT.replace("{cwd}", "/home/me/eix");
         let tokens = crate::context::estimate_tokens(&base);
-        assert!(tokens < 700, "base system prompt is {tokens} tokens");
+        // The language rule is worth a few dozen tokens; keep a hard ceiling
+        // so the compact prompt does not creep back toward a full handbook.
+        assert!(tokens < 800, "base system prompt is {tokens} tokens");
 
         let session = Session::new("id", "eix", "/home/me/eix");
         let prompt = system_prompt(&Config::default(), &session, SessionMode::Build, None);
@@ -10422,7 +10425,11 @@ mod tests {
             "build on them, ask only if they block the task",
             "Mention unrelated bugs/tests instead of fixing them",
             "Ask only if a wrong assumption would change the outcome",
-            "Reply in the user's language",
+            "language of the newest user message",
+            "mixed input uses its dominant language",
+            "If the user names an answer language, use it",
+            "Progress narration may stay in English",
+            "quoted output verbatim",
             "Scale depth to the task; expand only when it helps",
             "Read the narrowest code and call sites",
             "skip tools if context suffices",
@@ -10510,6 +10517,34 @@ mod tests {
         assert!(child.contains("Custom parent prompt."));
         assert!(child.contains("cannot see the parent conversation"));
         assert!(child.contains("read-only sub-agent"));
+    }
+
+    #[test]
+    fn system_prompt_matches_the_language_the_user_writes_in() {
+        let session = Session::new("id", "eix", "/home/me/eix");
+        let prompt = system_prompt(&Config::default(), &session, SessionMode::Build, None);
+        // The dominant language wins, not the first Latin token: a Chinese
+        // question with English identifiers still gets a Chinese answer, and
+        // an explicit language request overrides the heuristic. Only the
+        // final answer is translated; narration stays cheap.
+        for expected in [
+            "Final answers use the language of the newest user message",
+            "mixed input uses its dominant language",
+            "borrowed terms and identifiers",
+            "If the user names an answer language, use it",
+            "Progress narration may stay in English",
+            "Keep code, commands, paths and quoted output verbatim",
+        ] {
+            assert!(prompt.contains(expected), "missing {expected:?}");
+        }
+
+        // A child sees only its task prompt, so the language has to travel
+        // with the prompt; it keeps code and tool output untouched.
+        let mut child = Session::new("child", "explore", "/home/me/eix");
+        child.origin = SessionOrigin::Agent;
+        let child = system_prompt(&Config::default(), &child, SessionMode::Build, None);
+        assert!(child.contains("language of the task prompt"));
+        assert!(child.contains("quoted output verbatim"));
     }
 
     #[test]
