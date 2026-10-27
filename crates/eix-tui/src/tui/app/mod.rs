@@ -12,7 +12,7 @@ use crossterm::event::{
 };
 use eix_core::{
     theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
-    Event as SessionEvent, EventKind, HelloResult, HunkInfo, InputAnsweredPayload, InputOption,
+    Event as SessionEvent, EventKind, HelloResult, HunkInfo, InputAnsweredPayload, InputQuestion,
     InputRequiredPayload, IntegrationState, IntegrationStatus, ModelInfo, PatchProposedPayload,
     PickerItem, ProcessInfo, ProcessList, ProcessOutput, ProcessStatus, Session, SessionMode,
     SessionStatus, SubmitResult, TodoItem, ToolResultPayload, UserMessagePayload, THEME_PRESETS,
@@ -799,10 +799,7 @@ impl SessionView {
                             // daemon summary. Keep the real command line so the
                             // card can show it in full instead of approving a
                             // truncated command.
-                            let mut summary = if matches!(
-                                payload.tool.as_str(),
-                                "exec_command" | "run_command" | "start_command"
-                            ) {
+                            let mut summary = if matches!(payload.tool.as_str(), "exec_command") {
                                 payload
                                     .arguments
                                     .get("cmd")
@@ -904,13 +901,11 @@ impl SessionView {
             }
             if let Ok(payload) = InputRequiredPayload::deserialize(&event.payload) {
                 if !answered.contains(&payload.input_id) {
-                    pending = Some(PendingInput {
-                        input_id: payload.input_id,
-                        call_id: payload.call_id,
-                        question: payload.question,
-                        options: payload.options,
-                        cursor: 0,
-                    });
+                    pending = Some(PendingInput::new(
+                        payload.input_id,
+                        payload.call_id,
+                        payload.questions,
+                    ));
                 }
             }
         }
@@ -1115,9 +1110,9 @@ struct PendingAttach {
 /// A tool call or staged patch the daemon is holding until the user decides.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingKind {
-    /// A blocking tool call (`run_command`) waiting in the turn loop.
+    /// A blocking tool call (`exec_command`) waiting in the turn loop.
     Tool,
-    /// A staged `write_file` proposal; the turn has already continued.
+    /// A staged `apply_patch` proposal; the turn has already continued.
     Patch,
 }
 
@@ -1200,16 +1195,85 @@ impl PendingApproval {
     }
 }
 
-/// An `ask_user` question waiting for the user to pick an option.
+/// One `request_user_input` request waiting for answers. Each question is a
+/// tab; the automatic "Other" row at the end of every option list opens a
+/// free-form editor.
 #[derive(Clone)]
 struct PendingInput {
     input_id: String,
-    /// Tool call that produced the question, used to match `tool.completed`.
+    /// Tool call that produced the questions, used to match `tool.completed`.
     call_id: String,
-    question: String,
-    options: Vec<InputOption>,
-    /// Highlighted option; starts at the recommended (first) one.
-    cursor: usize,
+    questions: Vec<InputQuestion>,
+    /// Visible question tab.
+    tab: usize,
+    /// Highlighted row per question, including the trailing "Other" row.
+    cursors: Vec<usize>,
+    /// Free-form text per question.
+    other: Vec<String>,
+    /// Committed answer per question (`None` until answered).
+    answers: Vec<Option<String>>,
+    /// Set while the "Other" row is being edited.
+    editing: bool,
+}
+
+impl PendingInput {
+    fn new(input_id: String, call_id: String, questions: Vec<InputQuestion>) -> Self {
+        let count = questions.len();
+        Self {
+            input_id,
+            call_id,
+            questions,
+            tab: 0,
+            cursors: vec![0; count],
+            other: vec![String::new(); count],
+            answers: vec![None; count],
+            editing: false,
+        }
+    }
+
+    fn row_count(&self, tab: usize) -> usize {
+        self.questions
+            .get(tab)
+            .map(|question| question.options.len() + 1)
+            .unwrap_or(0)
+    }
+
+    fn is_other(&self, tab: usize) -> bool {
+        let question = self.questions.get(tab);
+        question.is_some_and(|question| self.cursors[tab] >= question.options.len())
+    }
+
+    fn all_answered(&self) -> bool {
+        self.answers.iter().all(Option::is_some)
+    }
+
+    /// Advance to the next unanswered tab. Returns false when every question
+    /// already has an answer.
+    fn next_unanswered(&mut self) -> bool {
+        let count = self.questions.len();
+        for offset in 1..=count {
+            let tab = (self.tab + offset) % count;
+            if self.answers[tab].is_none() {
+                self.tab = tab;
+                self.editing = false;
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Answers keyed by question id, in the shape `input.respond` expects.
+    fn answer_map(&self) -> std::collections::BTreeMap<String, Vec<String>> {
+        self.questions
+            .iter()
+            .zip(&self.answers)
+            .filter_map(|(question, answer)| {
+                answer
+                    .as_ref()
+                    .map(|answer| (question.id.clone(), vec![answer.clone()]))
+            })
+            .collect()
+    }
 }
 
 /// Inline reason for denying an approval (`r` on the card).
@@ -2169,9 +2233,8 @@ struct InputParams {
     input_id: String,
     #[serde(default)]
     call_id: String,
-    question: String,
     #[serde(default)]
-    options: Vec<InputOption>,
+    questions: Vec<InputQuestion>,
 }
 
 #[derive(Deserialize)]
@@ -2250,7 +2313,7 @@ pub(super) fn tool_call_summary(tool: &str, arguments: &Value) -> String {
             .unwrap_or_default()
     };
     match tool {
-        "exec_command" | "run_command" | "start_command" => {
+        "exec_command" => {
             let command = arguments
                 .get("cmd")
                 .and_then(Value::as_str)
@@ -2259,21 +2322,7 @@ pub(super) fn tool_call_summary(tool: &str, arguments: &Value) -> String {
         }
         "write_stdin" => format!("stdin {}", truncate(string("session_id"), 12)),
         "view_image" => format!("image {}", string("path")),
-        "read_file" => format!("read {}", string("path")),
-        "list_dir" => {
-            let path = string("path");
-            format!("ls {}", if path.is_empty() { "." } else { path })
-        }
-        "write_file" => {
-            let bytes = string("content").len();
-            format!("write {} (+{bytes} bytes)", string("path"))
-        }
-        "edit" => {
-            let old = string("oldString").len();
-            let new = string("newString").len();
-            format!("edit {} (-{old} +{new} bytes)", string("path"))
-        }
-        "patch" | "apply_patch" => {
+        "apply_patch" => {
             let text = ["patchText", "patch", "input"]
                 .iter()
                 .find_map(|key| arguments.get(*key).and_then(Value::as_str))
@@ -2288,17 +2337,9 @@ pub(super) fn tool_call_summary(tool: &str, arguments: &Value) -> String {
                 })
                 .collect();
             match files.as_slice() {
-                [] => "patch".to_string(),
-                [file] => format!("patch {file}"),
-                files => format!("patch ({} files)", files.len()),
-            }
-        }
-        "process_output" => {
-            let id = string("process_id");
-            if id.is_empty() {
-                "process output".to_string()
-            } else {
-                format!("process output {id}")
+                [] => "apply_patch".to_string(),
+                [file] => format!("apply_patch {file}"),
+                files => format!("apply_patch ({} files)", files.len()),
             }
         }
         "spawn_agent" => {
@@ -3185,10 +3226,8 @@ fn risk_level_color(level: &str, theme: Theme) -> Color {
 
 fn approval_risk(tool: &str, theme: Theme) -> (&'static str, Color) {
     match tool {
-        "run_command" => ("shell", composer_danger(theme)),
-        "write_file" | "edit" | "patch" | "edit_file" | "apply_patch" => {
-            ("workspace-write", composer_warn(theme))
-        }
+        "exec_command" => ("shell", composer_danger(theme)),
+        "apply_patch" => ("workspace-write", composer_warn(theme)),
         "spawn_agent" => ("agent", composer_accent(theme)),
         _ => ("read", composer_success(theme)),
     }
@@ -3299,7 +3338,7 @@ impl App {
         let diff_budget = capacity.saturating_sub(summary_rows + action_rows + hint_rows);
         let diff_reserve = usize::from(diff_len > 0 && diff_budget > 0);
         // File changes use the whole review budget: the card is the primary
-        // vimdiff-style view for write_file / edit / patch. Other tools keep the
+        // vimdiff-style view for apply_patch. Other tools keep the
         // compact 8-row preview so a long command result does not take over.
         let max_diff = diff_budget.saturating_sub(diff_reserve);
         let max_diff = if file_change {
@@ -3443,12 +3482,18 @@ fn approval_action_color(action: ApprovalAction, theme: Theme) -> Color {
 /// Render an `ask_user` question as a keyboard-driven option picker.
 fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme: Theme) {
     let dialog_bg = dialog_background(theme);
-    if area.width < 24 || area.height < 5 {
+    if area.width < 24 || area.height < 6 {
         return;
     }
-    let height = (pending.options.len() + 4)
+    let tab = pending.tab.min(pending.questions.len().saturating_sub(1));
+    let Some(question) = pending.questions.get(tab) else {
+        return;
+    };
+    let rows = question.options.len() + 1;
+    // Borders + tabs + prompt + rows + help.
+    let height = (rows + 5)
         .min(area.height.saturating_sub(1) as usize)
-        .max(4) as u16;
+        .max(5) as u16;
     let rect = Rect {
         x: area.x + 1,
         y: area.y + area.height - height - 1,
@@ -3458,29 +3503,57 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
     frame.render_widget(Clear, rect);
     frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
     let inner = rect.width.saturating_sub(2) as usize;
-    let cursor = pending.cursor.min(pending.options.len().saturating_sub(1));
-    let mut lines = vec![Line::from(vec![
-        Span::styled(
-            "? ",
-            Style::default()
-                .fg(composer_accent(theme))
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            truncate(&pending.question, inner.saturating_sub(2)),
-            Style::default().fg(composer_warn(theme)),
-        ),
-    ])];
+    let cursor = pending.cursors[tab].min(rows.saturating_sub(1));
     let selected_bg = composer_accent(theme);
     let selected_style = Style::default()
         .fg(badge_text_color(selected_bg))
         .bg(selected_bg)
         .add_modifier(Modifier::BOLD);
-    // Small panes clip the card; keep the highlighted option visible instead
-    // of always rendering the first N rows.
-    let visible = (height as usize).saturating_sub(4).max(1);
+
+    // One tab per question, marked with the answer state so a multi-question
+    // request shows progress at a glance.
+    let mut tabs = Vec::new();
+    for (index, item) in pending.questions.iter().enumerate() {
+        let mark = match &pending.answers[index] {
+            Some(_) => "✓",
+            None => "·",
+        };
+        let label = format!(" {mark} {} ", truncate(&item.header, 16));
+        let style = if index == tab {
+            selected_style
+        } else if pending.answers[index].is_some() {
+            Style::default().fg(composer_success(theme))
+        } else {
+            Style::default().fg(composer_muted(theme))
+        };
+        tabs.push(Span::styled(label, style));
+    }
+    let mut lines = vec![
+        Line::from(tabs),
+        Line::from(vec![
+            Span::styled(
+                "? ",
+                Style::default()
+                    .fg(composer_accent(theme))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                truncate(&question.question, inner.saturating_sub(2)),
+                Style::default().fg(composer_warn(theme)),
+            ),
+        ]),
+    ];
+    // Small panes clip the card; keep the highlighted row visible instead of
+    // always rendering the first N rows.
+    let visible = (height as usize).saturating_sub(5).max(1);
     let start = cursor.saturating_sub(visible.saturating_sub(1));
-    for (index, option) in pending.options.iter().enumerate().skip(start).take(visible) {
+    for (index, option) in question
+        .options
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+    {
         let check = if index == cursor { "x" } else { " " };
         let mut text = format!("- [{check}] {}", option.label);
         if let Some(description) = option
@@ -3505,18 +3578,48 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
         };
         lines.push(Line::from(Span::styled(pad_to(&text, inner), style)));
     }
+    // The synthetic free-form row is always last.
+    let other_index = question.options.len();
+    if other_index >= start && other_index < start + visible {
+        let editing = pending.editing && other_index == cursor;
+        let value = pending.other[tab].trim();
+        let mut text = if value.is_empty() {
+            "- [ ] Other…".to_string()
+        } else {
+            format!("- [ ] Other: {value}")
+        };
+        if editing {
+            text.push('▌');
+        }
+        let text = truncate(&text, inner);
+        let style = if other_index == cursor {
+            selected_style
+        } else {
+            Style::default().fg(composer_muted(theme))
+        };
+        lines.push(Line::from(Span::styled(pad_to(&text, inner), style)));
+    }
     lines.push(Line::from(Span::styled(
         truncate(
-            "Ctrl-J/K or j/k select · Enter answer · 1-9 jump · x cancel",
+            if pending.editing {
+                "type answer · Enter confirm · Esc cancel"
+            } else {
+                "Tab switch · j/k select · Enter answer · 1-3 jump · x cancel"
+            },
             inner,
         ),
         Style::default().fg(composer_muted(theme)),
     )));
 
+    let title = if pending.questions.len() > 1 {
+        format!(" questions {}/{} ", tab + 1, pending.questions.len())
+    } else {
+        " question ".to_string()
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(composer_accent(theme)))
-        .title(" question ");
+        .title(title);
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)

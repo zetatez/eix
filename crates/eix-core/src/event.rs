@@ -2,6 +2,8 @@
 //! Everything a frontend shows (transcript, approvals, patches, status) is a
 //! projection of these events.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -259,7 +261,7 @@ pub struct PatchResultPayload {
     pub message: Option<String>,
 }
 
-/// One selectable answer to an `ask_user` question.
+/// One selectable answer to a `request_user_input` question.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InputOption {
     pub label: String,
@@ -267,14 +269,23 @@ pub struct InputOption {
     pub description: Option<String>,
 }
 
-/// The model asked the user a multiple-choice question and is blocked until
-/// they answer. `options` is ordered best-first; index 0 is the recommendation.
+/// One question from `request_user_input`. `options` is ordered best-first;
+/// index 0 is the recommendation. Clients add a free-form "Other" choice.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InputQuestion {
+    pub id: String,
+    pub header: String,
+    pub question: String,
+    pub options: Vec<InputOption>,
+}
+
+/// The model asked the user one to three questions and is blocked until they
+/// answer. Answers are keyed by question id; each may carry several values.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputRequiredPayload {
     pub input_id: String,
     pub call_id: String,
-    pub question: String,
-    pub options: Vec<InputOption>,
+    pub questions: Vec<InputQuestion>,
 }
 
 /// The user's answer to an `InputRequired`.
@@ -282,8 +293,7 @@ pub struct InputRequiredPayload {
 pub struct InputAnsweredPayload {
     pub input_id: String,
     pub call_id: String,
-    pub answer: String,
-    pub option_index: usize,
+    pub answers: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -443,7 +453,7 @@ pub struct ContextCompactedPayload {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextClearedPayload {}
 
-/// A background process was started by `start_command`.
+/// A background process was started by `exec_command`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessStartedPayload {
     pub process_id: String,
@@ -532,14 +542,14 @@ mod tests {
 
         let call = payload(&ToolCallPayload {
             call_id: "call_1".into(),
-            tool: "read_file".into(),
-            arguments: serde_json::json!({"path": "a.rs"}),
+            tool: "exec_command".into(),
+            arguments: serde_json::json!({"cmd": "cat a.rs"}),
         });
-        assert_eq!(call["tool"], "read_file");
+        assert_eq!(call["tool"], "exec_command");
 
         let result = payload(&ToolResultPayload {
             call_id: "call_1".into(),
-            tool: "read_file".into(),
+            tool: "exec_command".into(),
             ok: true,
             denied: false,
             output: "hi".into(),

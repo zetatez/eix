@@ -54,9 +54,9 @@ const EXCLUDED: &[&str] = &[
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
-    /// One file (the target of a `write_file`).
+    /// One file (a target of `apply_patch`).
     File,
-    /// A recursive copy of the workspace (before a `run_command`).
+    /// A recursive copy of the workspace (before an `exec_command`).
     Tree,
 }
 
@@ -140,7 +140,7 @@ impl Snapshotter {
         self.root.join(session_id).join(snapshot_id)
     }
 
-    /// Copy the single file a `write_file` call is about to overwrite.
+    /// Copy the single file an `apply_patch` call is about to overwrite.
     pub async fn capture_file(
         &self,
         session_id: &str,
@@ -184,7 +184,7 @@ impl Snapshotter {
         .context("snapshot task panicked")?
     }
 
-    /// Copy the whole workspace before a `run_command`.
+    /// Copy the whole workspace before an `exec_command`.
     pub async fn capture_tree(
         &self,
         session_id: &str,
@@ -225,7 +225,7 @@ impl Snapshotter {
     }
 }
 
-/// Copy `src` to `dst`, preferring a copy-on-write reflink. A `run_command`
+/// Copy `src` to `dst`, preferring a copy-on-write reflink. An `exec_command`
 /// snapshots the whole workspace, and a regular copy of every file is the
 /// slowest part of the command. btrfs/XFS reflinks make it metadata-only; other
 /// filesystems fall back to `std::fs::copy`.
@@ -666,7 +666,7 @@ mod tests {
 
         let first = temp
             .snapshots
-            .capture_file("s1", "write_file", "call_1", &temp.cwd, &existing)
+            .capture_file("s1", "apply_patch", "call_1", &temp.cwd, &existing)
             .await
             .expect("capture existing");
         assert_eq!(first.scope, Scope::File);
@@ -676,7 +676,7 @@ mod tests {
         let created = temp.cwd.join("new.txt");
         let second = temp
             .snapshots
-            .capture_file("s1", "write_file", "call_2", &temp.cwd, &created)
+            .capture_file("s1", "apply_patch", "call_2", &temp.cwd, &created)
             .await
             .expect("capture missing");
         assert_eq!(second.files, 0);
@@ -715,7 +715,7 @@ mod tests {
 
         let snapshot = temp
             .snapshots
-            .capture_tree("s1", "run_command", "call_1", &temp.cwd)
+            .capture_tree("s1", "exec_command", "call_1", &temp.cwd)
             .await
             .expect("capture");
         assert_eq!(snapshot.scope, Scope::Tree);
@@ -761,7 +761,7 @@ mod tests {
                 .snapshots
                 .capture_file(
                     "s1",
-                    "write_file",
+                    "apply_patch",
                     &format!("call_{index}"),
                     &temp.cwd,
                     &file,
@@ -786,7 +786,7 @@ mod tests {
         std::fs::write(&file, "one").unwrap();
         let snapshot = temp
             .snapshots
-            .capture_file("s1", "write_file", "call_1", &temp.cwd, &file)
+            .capture_file("s1", "apply_patch", "call_1", &temp.cwd, &file)
             .await
             .expect("capture");
         // Rewrite the manifest with a traversal entry and make sure restore
@@ -823,7 +823,7 @@ mod tests {
         let path = real.join("a.txt").canonicalize().unwrap();
         let snapshot = temp
             .snapshots
-            .capture_file("s1", "write_file", "call_1", &link, &path)
+            .capture_file("s1", "apply_patch", "call_1", &link, &path)
             .await
             .expect("capture through a symlinked cwd");
         assert_eq!(snapshot.files, 1);

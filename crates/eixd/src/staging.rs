@@ -1,10 +1,10 @@
 //! Per-session staged writes (the shadow workspace).
 //!
-//! A `write_file` call under the default `ask` policy does not touch the real
+//! A write proposal under the default `ask` policy does not touch the real
 //! workspace. It stores the proposed bytes here and returns immediately; the
-//! user later applies or rejects the patch. Reads (`read_file`, `list_dir`) and
-//! subsequent writes see the staged contents overlaid on the real workspace, so
-//! the agent never loses track of what it has already proposed.
+//! user later applies or rejects the patch. Subsequent reads and writes see the
+//! staged contents overlaid on the real workspace, so the agent never loses
+//! track of what it has already proposed.
 //!
 //! Layout: `<data>/staging/<session>/<patch_id>.json`. The file exists only
 //! while the patch is pending; applying, rejecting or conflicting removes it.
@@ -301,7 +301,7 @@ mod tests {
         StagedPatch::new(
             session,
             &format!("call_{id}"),
-            "write_file",
+            "apply_patch",
             Path::new("/ws").join(path).as_path(),
             path,
             old.to_string(),

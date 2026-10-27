@@ -31,8 +31,8 @@ daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的
 | 输入 | 内置 Vim 风格编辑器（normal / insert / visual）、leader 键、可配置快捷键、命令面板 |
 | 执行模式 | `plan` 只读、`build` 工作区写入、`auto` 意图分类、`bypass` 放行 |
 | 安全 | 风险分析、显式规则、bubblewrap 沙箱、补丁审批 + 执行前快照、secret 占位符 |
-| 工具 | `apply_patch` 编辑、`exec_command` / `write_stdin` shell、web、LSP、图片、子 agent |
-| 上下文 | sector 预算、AGENTS.md、workspace summary、自动 compact、memory / todo |
+| 工具 | `apply_patch` 编辑、`exec_command` / `write_stdin` shell、`update_plan` 计划、`tool_search` 按需发现 MCP/插件工具、web、LSP、图片、子 agent |
+| 上下文 | sector 预算、AGENTS.md、workspace summary、自动 compact、memory / plan |
 | 扩展 | Skills、Markdown 命令、Markdown agent、MCP stdio / HTTP、out-of-process 插件 |
 | Provider | 多 endpoint（OpenAI 兼容 / Anthropic / Gemini 原生协议）、API key + OAuth 登录、自动拉取模型列表、重试/退避、运行时模型切换与 reasoning 强度 |
 | 前端 | TUI、chat/send CLI、HTTP + SSE + `eix-sdk`、TCP，以及外部编辑器插件接口 |
@@ -178,8 +178,8 @@ TUI 可以把多个 session 同时开在不同 pane；同一 session 只会在�
 ### 上下文与扩展
 
 daemon 每次请求都会从事件日志重建上下文，按 sector 分配预算，自动裁剪和压缩；`AGENTS.md`、
-workspace summary、memory 和 todo 会自动注入。Skills、命令、agent、MCP server 和插件按需加载，
-不会一次性塞满上下文。
+workspace summary、memory 和计划会自动注入。Skills、命令、agent 按需加载；MCP 与插件工具由
+`tool_search` 按需发现，不会一次性塞满上下文。
 
 ## 使用
 
@@ -350,7 +350,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 | Skills | `~/.config/eix/skills/<name>/SKILL.md`、项目 `.eix/skills/`；按需加载正文 |
 | 命令 | `~/.config/eix/cmds/*.md`、项目 `.eix/cmds/*.md`；`$ARGUMENTS` / `$1..$9` |
 | Agent | `~/.config/eix/agents/*.md`、项目 `.eix/agents/*.md`；`primary` / `subagent` |
-| MCP | `mcp.servers.<name>`；stdio / Streamable HTTP、懒启动、`mcp__server__tool`；远程可用 `eix mcp auth <server>` 走 OAuth |
+| MCP | `mcp.servers.<name>`；stdio / Streamable HTTP、懒启动、`mcp__server__tool`、resources / templates / prompts；远程可用 `eix mcp auth <server>` 走 OAuth |
 | 插件 | `plugins.<name>`；`eix-plugin.toml` + newline-delimited JSON，独立子进程 |
 
 兼容资源默认全部关闭，可在 `compations:` 中逐项打开。项目配置只能关闭、不能开启。示例见

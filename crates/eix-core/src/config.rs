@@ -553,9 +553,9 @@ fn rule_path(args: &Value) -> Option<String> {
         return normalize_workspace_path(path);
     }
     let text = args
-        .get("patchText")
+        .get("input")
+        .or_else(|| args.get("patchText"))
         .or_else(|| args.get("patch"))
-        .or_else(|| args.get("input"))
         .and_then(Value::as_str)?;
     let mut paths = text.lines().filter_map(|line| {
         line.strip_prefix("*** Add File: ")
@@ -3900,19 +3900,19 @@ api_key_env = "OPENAI_API_KEY"
             r#"
 [[tools.rules]]
 id = "allow-cargo-test"
-tool = "run_command"
+tool = "exec_command"
 command = ["cargo", "test"]
 action = "allow"
 
 [[tools.rules]]
 id = "deny-rm"
-tool = "run_command"
+tool = "exec_command"
 command_regex = "^rm "
 action = "deny"
 
 [[tools.rules]]
 id = "ask-src"
-tool = "write_file"
+tool = "apply_patch"
 path = "src/**"
 action = "ask"
 "#,
@@ -3920,16 +3920,17 @@ action = "ask"
         .expect("parse rules");
         parsed.validate().expect("valid rules");
 
-        let cargo = parsed
-            .tools
-            .matching_rules("run_command", &json!({"command": "cargo test --workspace"}));
+        let cargo = parsed.tools.matching_rules(
+            "exec_command",
+            &json!({"command": "cargo test --workspace"}),
+        );
         assert_eq!(cargo.len(), 1);
         assert_eq!(cargo[0].action, PermissionAction::Allow);
         assert_eq!(cargo[0].specificity(), 2);
 
         let rm = parsed
             .tools
-            .matching_rules("run_command", &json!({"command": "rm -rf /"}));
+            .matching_rules("exec_command", &json!({"command": "rm -rf /"}));
         assert_eq!(
             rm.first().map(|rule| rule.action),
             Some(PermissionAction::Deny)
@@ -3937,7 +3938,7 @@ action = "ask"
 
         let write = parsed
             .tools
-            .matching_rules("write_file", &json!({"path": "src/lib.rs"}));
+            .matching_rules("apply_patch", &json!({"path": "src/lib.rs"}));
         assert_eq!(
             write.first().map(|rule| rule.action),
             Some(PermissionAction::Ask)
@@ -3945,14 +3946,17 @@ action = "ask"
 
         assert!(parsed
             .tools
-            .matching_rules("write_file", &json!({"path": "docs/readme.md"}))
+            .matching_rules("apply_patch", &json!({"path": "docs/readme.md"}))
             .is_empty());
 
         // A multi-segment command cannot satisfy a prefix rule for only one
         // segment. This is the `cargo test && rm -rf /` bypass guard.
         assert!(parsed
             .tools
-            .matching_rules("run_command", &json!({"command": "cargo test && rm -rf /"}))
+            .matching_rules(
+                "exec_command",
+                &json!({"command": "cargo test && rm -rf /"})
+            )
             .is_empty());
     }
 
@@ -4035,14 +4039,14 @@ tools:
   snapshots: false
   rules:
     - id: repo-allow
-      tool: write_file
+      tool: apply_patch
       action: allow
     - id: repo-shell
-      tool: run_command
+      tool: exec_command
       command: ["true"]
       action: allow
     - id: repo-sandbox
-      tool: run_command
+      tool: exec_command
       action: sandbox
 
 plugins:
@@ -4549,19 +4553,19 @@ snapshots = false
 
             [[tools.rules]]
             id = "cargo-test"
-            tool = "run_command"
+            tool = "exec_command"
             command = ["cargo", "test"]
             action = "allow"
 
             [[tools.rules]]
             id = "tests-writes"
-            tool = "write_file"
+            tool = "apply_patch"
             path = "tests/**"
             action = "ask"
 
             [[tools.rules]]
             id = "cargo-check"
-            tool = "run_command"
+            tool = "exec_command"
             command_regex = "^cargo (check|clippy)\\b"
             action = "ask"
             "#,
@@ -4574,38 +4578,38 @@ snapshots = false
         assert_eq!(
             parsed
                 .tools
-                .matching_rules("run_command", &command)
+                .matching_rules("exec_command", &command)
                 .first()
                 .map(|rule| rule.id.as_str()),
             Some("cargo-test")
         );
         assert!(parsed
             .tools
-            .matching_rules("start_command", &command)
+            .matching_rules("apply_patch", &command)
             .is_empty());
 
         let write = json!({"path": "./tests/unit/a.rs", "content": "x"});
-        assert_eq!(parsed.tools.matching_rules("write_file", &write).len(), 1);
+        assert_eq!(parsed.tools.matching_rules("apply_patch", &write).len(), 1);
         let escape = json!({"path": "tests/../src/main.rs", "content": "x"});
         assert!(parsed
             .tools
-            .matching_rules("write_file", &escape)
+            .matching_rules("apply_patch", &escape)
             .is_empty());
         let outside = json!({"path": "src/main.rs", "content": "x"});
         assert!(parsed
             .tools
-            .matching_rules("write_file", &outside)
+            .matching_rules("apply_patch", &outside)
             .is_empty());
         assert!(parsed
             .tools
-            .matching_rules("write_file", &json!({}))
+            .matching_rules("apply_patch", &json!({}))
             .is_empty());
 
         let check = json!({"command": "cargo clippy --workspace"});
-        assert!(parsed.tools.matching_rules("run_command", &check).len() == 1);
+        assert!(parsed.tools.matching_rules("exec_command", &check).len() == 1);
         assert!(parsed
             .tools
-            .matching_rules("run_command", &json!({"command": "cargo run"}))
+            .matching_rules("exec_command", &json!({"command": "cargo run"}))
             .is_empty());
     }
 
@@ -4640,7 +4644,7 @@ action = "allow"
     #[test]
     fn rules_reject_invalid_values() {
         let invalid: Config =
-            toml::from_str("[[tools.rules]]\ntool = \"run_command\"\ncommand_regex = \"(\"\n")
+            toml::from_str("[[tools.rules]]\ntool = \"exec_command\"\ncommand_regex = \"(\"\n")
                 .expect("parse first");
         assert!(invalid.validate().is_err());
 
@@ -4648,7 +4652,7 @@ action = "allow"
         assert!(empty.validate().is_err());
 
         let prefix: Config =
-            toml::from_str("[[tools.rules]]\ntool = \"run_command\"\ncommand = []\n")
+            toml::from_str("[[tools.rules]]\ntool = \"exec_command\"\ncommand = []\n")
                 .expect("parse first");
         assert!(prefix.validate().is_err());
     }
@@ -4845,12 +4849,12 @@ extensions = ["zig"]
             denied_tools: vec!["read_secret".into()],
             ..McpServerConfig::default()
         };
-        assert!(server.allows_tool("read_file"));
+        assert!(server.allows_tool("read_rows"));
         assert!(server.allows_tool("read/file"));
-        assert!(!server.allows_tool("write_file"));
+        assert!(!server.allows_tool("write_rows"));
         assert!(!server.allows_tool("read_secret"));
         server.allowed_tools.clear();
-        assert!(server.allows_tool("write_file"));
+        assert!(server.allows_tool("write_rows"));
         assert!(!server.allows_tool("read_secret"));
     }
 
@@ -4860,8 +4864,8 @@ extensions = ["zig"]
             tool: "*".to_string(),
             ..PermissionRule::default()
         };
-        assert!(rule.matches("write_file", &json!({"path": "a"})));
-        assert!(rule.matches("run_command", &json!({"command": "ls"})));
+        assert!(rule.matches("apply_patch", &json!({"path": "a"})));
+        assert!(rule.matches("exec_command", &json!({"cmd": "ls"})));
         assert_eq!(rule.specificity(), 0);
     }
 }

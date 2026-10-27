@@ -331,8 +331,8 @@ impl SecretRedactor {
         }
         let patterns = patterns();
         // Once a secret is known, scrub it everywhere in later messages too.
-        // This catches a model copying a bare password into `write_file`
-        // content without repeating the `PASSWORD=` key.
+        // This catches a model copying a bare password into a patch or shell
+        // command without repeating the `PASSWORD=` key.
         let mut out = self.replace_known(text);
         out = self.scrub_group(&out, &patterns.pem, true, false, false);
         out = self.scrub_group(&out, &patterns.authorization, false, false, false);
@@ -1029,7 +1029,7 @@ MIIEowIBAAKCAQEAsecretkeymaterial
                 id: "call_1".into(),
                 kind: "function".into(),
                 function: FunctionCall {
-                    name: "write_file".into(),
+                    name: "apply_patch".into(),
                     arguments: arguments.clone(),
                 },
             }],

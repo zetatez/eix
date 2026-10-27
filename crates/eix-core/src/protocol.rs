@@ -5,6 +5,7 @@
 //! objects and pushes `Notification`s at any time. Notifications carry the
 //! structured events described in `DESIGN.md`, never pre-rendered text.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -536,15 +537,20 @@ pub struct ApprovalResult {
     pub accepted: bool,
 }
 
-/// Answer the model's `ask_user` question. `input_id` may be empty to target
-/// the session's current question.
+/// Answer the model's `request_user_input` questions. `input_id` may be empty
+/// to target the session's current request. Values are keyed by question id;
+/// a free-form "Other" answer is sent as its literal text.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InputRespondParams {
     pub session_id: SessionId,
     #[serde(default)]
     pub input_id: String,
-    /// Zero-based index into the question's option list.
-    pub option_index: usize,
+    #[serde(default)]
+    pub answers: BTreeMap<String, Vec<String>>,
+    /// Legacy single-question shortcut: a zero-based index into the first
+    /// question's options. Ignored when `answers` is non-empty.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub option_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

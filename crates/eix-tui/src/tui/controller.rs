@@ -164,7 +164,7 @@ pub enum Command {
     Input {
         session_id: String,
         input_id: String,
-        option_index: usize,
+        answers: std::collections::BTreeMap<String, Vec<String>>,
     },
     ProcessList {
         session_id: String,
@@ -837,7 +837,7 @@ async fn dispatch(
         Command::Input {
             session_id,
             input_id,
-            option_index,
+            answers,
         } => {
             let value = requester
                 .request(
@@ -845,7 +845,7 @@ async fn dispatch(
                     json!({
                         "session_id": session_id,
                         "input_id": input_id,
-                        "option_index": option_index,
+                        "answers": answers,
                     }),
                 )
                 .await?;

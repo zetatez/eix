@@ -91,7 +91,11 @@ async fn main() -> Result<()> {
             reason,
         } => approval(&cli, session, true, hunks, reason).await,
         Command::Deny { session, reason } => approval(&cli, session, false, None, reason).await,
-        Command::Answer { session, option } => answer(&cli, session, option).await,
+        Command::Answer {
+            session,
+            option,
+            answers,
+        } => answer(&cli, session, option, answers).await,
         Command::Approvals { json } => approvals(&cli, json).await,
         Command::Status { json } => status(&cli, json).await,
         Command::Pick { query, limit, json } => pick(&cli, query, limit, json).await,
@@ -186,8 +190,10 @@ enum Command {
     },
     Answer {
         session: Option<String>,
-        /// 1-based option number.
-        option: usize,
+        /// Legacy 1-based option number for a single-question request.
+        option: Option<usize>,
+        /// `id=value` answers for one or more questions.
+        answers: std::collections::BTreeMap<String, Vec<String>>,
     },
     Approvals {
         json: bool,
@@ -521,15 +527,38 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
         }
         "answer" | "reply" => {
             let session = take_flag(&mut args, "--session")?;
-            let option = args
-                .first()
-                .context("usage: eix answer [--session ID] <option>")?
-                .parse::<usize>()
-                .context("option must be a number")?;
-            if option == 0 {
-                bail!("option numbers start at 1");
+            if args.is_empty() {
+                bail!("usage: eix answer [--session ID] <option> | <id>=<value>...");
             }
-            Ok(Command::Answer { session, option })
+            let mut option = None;
+            let mut answers = std::collections::BTreeMap::new();
+            if args.len() == 1 {
+                if let Ok(number) = args[0].parse::<usize>() {
+                    if number == 0 {
+                        bail!("option numbers start at 1");
+                    }
+                    option = Some(number);
+                }
+            }
+            if option.is_none() {
+                for argument in &args {
+                    let (id, value) = argument
+                        .split_once('=')
+                        .with_context(|| format!("expected id=value, got {argument:?}"))?;
+                    if id.trim().is_empty() || value.trim().is_empty() {
+                        bail!("answers need a non-empty id and value");
+                    }
+                    answers
+                        .entry(id.trim().to_string())
+                        .or_insert_with(Vec::new)
+                        .push(value.to_string());
+                }
+            }
+            Ok(Command::Answer {
+                session,
+                option,
+                answers,
+            })
         }
         "approvals" | "inbox" => {
             let json = take_switch(&mut args, "--json");
@@ -1099,7 +1128,12 @@ async fn approval(
     Ok(())
 }
 
-async fn answer(cli: &Cli, session: Option<String>, option: usize) -> Result<()> {
+async fn answer(
+    cli: &Cli,
+    session: Option<String>,
+    option: Option<usize>,
+    answers: std::collections::BTreeMap<String, Vec<String>>,
+) -> Result<()> {
     let mut client = cli.connect().await?;
     let session = resolve_session(&mut client, session.as_deref(), false).await?;
     let result: InputResult = serde_json::from_value(
@@ -1109,13 +1143,17 @@ async fn answer(cli: &Cli, session: Option<String>, option: usize) -> Result<()>
                 json!({
                     "session_id": session.id,
                     "input_id": "",
-                    "option_index": option - 1,
+                    "answers": answers,
+                    "option_index": option.map(|option| option - 1),
                 }),
             )
             .await?,
     )?;
     if result.accepted {
-        println!("answered {} (option {option})", session.name);
+        match option {
+            Some(option) => println!("answered {} (option {option})", session.name),
+            None => println!("answered {}", session.name),
+        }
     } else {
         println!("{} has no pending question", session.name);
     }
@@ -2809,19 +2847,25 @@ fn render_events(events: &[Event]) {
                     serde_json::from_value::<InputRequiredPayload>(event.payload.clone())
                 {
                     println!(
-                        "ask> {} (answer in the TUI, or `eix answer <n>`)",
-                        payload.question
+                        "ask> {} question(s) (answer in the TUI, or `eix answer <id>=<value>`)",
+                        payload.questions.len()
                     );
-                    for (index, option) in payload.options.iter().enumerate() {
-                        let recommended = if index == 0 { " (recommended)" } else { "" };
-                        match option.description.as_deref() {
-                            Some(description) if !description.is_empty() => println!(
-                                "  {}. {} — {}{recommended}",
-                                index + 1,
-                                option.label,
-                                description
-                            ),
-                            _ => println!("  {}. {}{recommended}", index + 1, option.label),
+                    for question in &payload.questions {
+                        println!("  [{}] {}", question.id, question.header);
+                        println!("    {}", question.question);
+                        for (index, option) in question.options.iter().enumerate() {
+                            let recommended = if index == 0 { " (recommended)" } else { "" };
+                            match option.description.as_deref() {
+                                Some(description) if !description.is_empty() => println!(
+                                    "    {}. {} — {}{recommended}",
+                                    index + 1,
+                                    option.label,
+                                    description
+                                ),
+                                _ => {
+                                    println!("    {}. {}{recommended}", index + 1, option.label)
+                                }
+                            }
                         }
                     }
                 }
@@ -2830,7 +2874,13 @@ fn render_events(events: &[Event]) {
                 if let Ok(payload) =
                     serde_json::from_value::<InputAnsweredPayload>(event.payload.clone())
                 {
-                    println!("ask> answered: {}", payload.answer);
+                    let answers = payload
+                        .answers
+                        .iter()
+                        .map(|(id, values)| format!("{id}={}", values.join(", ")))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    println!("ask> answered: {answers}");
                 }
             }
         }
@@ -2845,10 +2895,6 @@ fn tool_call_summary(tool: &str, arguments: &Value) -> String {
             .unwrap_or_default()
     };
     match tool {
-        "write_file" => {
-            let bytes = string("content").len();
-            format!("write_file {} (+{bytes} bytes)", string("path"))
-        }
         "apply_patch" => {
             let patch = string("patchText");
             let target = patch
@@ -2866,7 +2912,7 @@ fn tool_call_summary(tool: &str, arguments: &Value) -> String {
                 format!("apply_patch {target}")
             }
         }
-        "exec_command" | "run_command" => {
+        "exec_command" => {
             let command = arguments
                 .get("cmd")
                 .and_then(Value::as_str)
@@ -2875,12 +2921,8 @@ fn tool_call_summary(tool: &str, arguments: &Value) -> String {
         }
         "write_stdin" => format!("write_stdin {}", string("session_id")),
         "view_image" => format!("view_image {}", string("path")),
-        "read_file" | "list_dir" | "web_fetch" | "web_search" => {
-            let detail = if tool.starts_with("web_") {
-                string("url")
-            } else {
-                string("path")
-            };
+        "web_fetch" | "web_search" => {
+            let detail = string("url");
             format!("{tool} {}", if detail.is_empty() { "." } else { detail })
         }
         _ => {
@@ -2965,8 +3007,9 @@ COMMANDS:
                                approve the pending tool call (all or selected hunks)
     deny [--session ID] [--reason TEXT]
                                deny the pending tool call, optionally with a reason
-    answer [--session ID] <option>
-                               answer the pending question with a 1-based option
+    answer [--session ID] <option> | <id>=<value>...
+                               answer pending question(s); a bare number picks
+                               an option for a single-question request
     approvals [--json]         list pending approvals across sessions
     status [--json]            daemon and session summary (`--json` for dwmblocks)
     pick [--query Q] [--limit N] [--json]

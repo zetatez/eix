@@ -161,8 +161,8 @@ fn normalize_tool_name(name: &str) -> String {
         "webfetch" => "web_fetch".to_string(),
         "websearch" => "web_search".to_string(),
         "task" => "spawn_agent".to_string(),
-        "todowrite" => "todo".to_string(),
-        "askuserquestion" => "ask_user".to_string(),
+        "todowrite" | "todo" => "update_plan".to_string(),
+        "askuserquestion" | "ask_user" => "request_user_input".to_string(),
         "bashoutput" => "write_stdin".to_string(),
         // eix tool names (and exposed MCP names) are lowercase.
         _ => lower,

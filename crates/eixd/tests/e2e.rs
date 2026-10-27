@@ -1563,13 +1563,22 @@ for line in sys.stdin:
     assert_eq!(snapshot.payload["ok"], true);
 
     let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), 3);
     let first: Value = serde_json::from_str(&bodies[0])?;
+    let advertised = |body: &Value, name: &str| {
+        body["tools"]
+            .as_array()
+            .is_some_and(|tools| tools.iter().any(|tool| tool["function"]["name"] == name))
+    };
+    // The base request only carries `tool_search`; the plugin schema arrives
+    // after the search result and is then used for the actual call.
+    assert!(advertised(&first, "tool_search"), "{}", first["tools"]);
+    assert!(!advertised(&first, "plugin__mock__echo"));
+    let second: Value = serde_json::from_str(&bodies[1])?;
     assert!(
-        first["tools"].as_array().is_some_and(|tools| tools
-            .iter()
-            .any(|tool| { tool["function"]["name"] == "plugin__mock__echo" })),
-        "plugin tool was not advertised: {}",
-        first["tools"]
+        advertised(&second, "plugin__mock__echo"),
+        "{}",
+        second["tools"]
     );
     drop(bodies);
 
@@ -1577,6 +1586,111 @@ for line in sys.stdin:
     mock.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
+}
+
+#[tokio::test]
+async fn exec_command_timeout_kills_the_process() -> anyhow::Result<()> {
+    let dir = temp_dir("exec-timeout");
+    std::fs::create_dir_all(&dir)?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(timeout_provider(listener));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    // `sleep` is not provably read-only, so use bypass to skip the approval
+    // card and exercise the timeout itself.
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "timeout", "cwd": dir, "mode": "bypass"}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+    let started = std::time::Instant::now();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "run it"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break;
+        }
+    }
+    // `timeout_ms` is a hard limit: the 30s sleep must not run to completion.
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "timeout did not interrupt the command"
+    );
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let result = attached
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::ToolResult && event.payload["tool"] == "exec_command"
+        })
+        .expect("exec_command result");
+    assert_eq!(result.payload["ok"], false);
+    let output = result.payload["output"].as_str().expect("output");
+    assert!(output.contains("command timed out after 300ms"), "{output}");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+/// Answers the first request with a `sleep` that outlives `timeout_ms`, then
+/// stops after the tool result.
+async fn timeout_provider(listener: TcpListener) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            let events = if has_tool_result {
+                let chunk = json!({
+                    "model": "mock-timeout",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                });
+                format!("data: {chunk}\n\ndata: [DONE]\n\n")
+            } else {
+                tool_call_event(
+                    json!({"cmd": "sleep 30", "timeout_ms": 300, "yield_time_ms": 250}),
+                    "exec_command",
+                    "call_timeout",
+                )
+            };
+            write_sse(&mut socket, &events).await;
+        });
+    }
 }
 
 #[tokio::test]
@@ -4843,9 +4957,24 @@ async fn cancelling_the_parent_stops_a_running_sub_agent() -> anyhow::Result<()>
     };
     assert_eq!(completed["cancelled"], true);
 
-    let attached: AttachResult = client
-        .request("session.attach", json!({"session_id": child}))
+    // The parent's `turn.completed` can be observed just before the child has
+    // persisted its cancellation, so poll briefly instead of racing it.
+    let mut attached = client
+        .request::<AttachResult>("session.attach", json!({"session_id": child}))
         .await?;
+    for _ in 0..40 {
+        if attached
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::AssistantMessage)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        attached = client
+            .request::<AttachResult>("session.attach", json!({"session_id": child}))
+            .await?;
+    }
     assert_eq!(attached.session.status, eix_core::SessionStatus::Idle);
     let assistant = attached
         .events
@@ -4861,7 +4990,7 @@ async fn cancelling_the_parent_stops_a_running_sub_agent() -> anyhow::Result<()>
 }
 
 #[tokio::test]
-async fn ask_user_blocks_the_turn_until_the_user_answers() -> anyhow::Result<()> {
+async fn request_user_input_blocks_the_turn_until_the_user_answers() -> anyhow::Result<()> {
     let dir = temp_dir("ask");
     std::fs::create_dir_all(&dir)?;
 
@@ -4897,20 +5026,38 @@ async fn ask_user_blocks_the_turn_until_the_user_answers() -> anyhow::Result<()>
         let notification = client.next_notification().await?;
         match notification.method.as_str() {
             "input.required" if notification.params["session_id"] == session_id.as_str() => {
-                assert_eq!(
-                    notification.params["question"],
-                    "Which database should we use?"
-                );
-                let options = notification.params["options"].as_array().expect("options");
+                let questions = notification.params["questions"]
+                    .as_array()
+                    .expect("questions");
+                assert_eq!(questions.len(), 2);
+                assert_eq!(questions[0]["question"], "Which database should we use?");
+                let options = questions[0]["options"].as_array().expect("options");
                 assert_eq!(options.len(), 3);
                 assert_eq!(options[0]["label"], "SQLite");
+                assert_eq!(questions[1]["id"], "migration");
+                let input_id = notification.params["input_id"].clone();
+                // A partial answer is rejected and keeps the request pending.
+                let partial: eix_core::InputResult = client
+                    .request(
+                        "input.respond",
+                        json!({
+                            "session_id": session_id,
+                            "input_id": input_id,
+                            "answers": { "database": ["Postgres"] },
+                        }),
+                    )
+                    .await?;
+                assert!(!partial.accepted);
                 let result: eix_core::InputResult = client
                     .request(
                         "input.respond",
                         json!({
                             "session_id": session_id,
-                            "input_id": notification.params["input_id"],
-                            "option_index": 1,
+                            "input_id": input_id,
+                            "answers": {
+                                "database": ["Postgres"],
+                                "migration": ["Yes"],
+                            },
                         }),
                     )
                     .await?;
@@ -4941,27 +5088,33 @@ async fn ask_user_blocks_the_turn_until_the_user_answers() -> anyhow::Result<()>
         .iter()
         .find(|event| event.kind == EventKind::InputRequired)
         .expect("question event");
-    assert_eq!(asked.payload["question"], "Which database should we use?");
-    assert_eq!(asked.payload["options"][2]["label"], "MySQL");
+    assert_eq!(
+        asked.payload["questions"][0]["question"],
+        "Which database should we use?"
+    );
+    assert_eq!(
+        asked.payload["questions"][0]["options"][2]["label"],
+        "MySQL"
+    );
     let answered = attached
         .events
         .iter()
         .find(|event| event.kind == EventKind::InputAnswered)
         .expect("answer event");
-    assert_eq!(answered.payload["option_index"], 1);
-    assert_eq!(
-        answered.payload["answer"],
-        "Postgres — Server, better concurrency"
-    );
+    assert_eq!(answered.payload["answers"]["database"][0], "Postgres");
+    assert_eq!(answered.payload["answers"]["migration"][0], "Yes");
     let result = attached
         .events
         .iter()
-        .find(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == "ask_user")
-        .expect("ask_user result");
+        .find(|event| {
+            event.kind == EventKind::ToolResult && event.payload["tool"] == "request_user_input"
+        })
+        .expect("request_user_input result");
     assert_eq!(result.payload["ok"], true);
     let output = result.payload["output"].as_str().expect("output");
-    assert!(output.contains("User selected option 2 of 3"), "{output}");
+    assert!(output.contains("User answered"), "{output}");
     assert!(output.contains("Postgres"), "{output}");
+    assert!(output.contains("migration"), "{output}");
 
     // The selected label reached the provider as the tool result.
     let bodies = bodies.lock().await;
@@ -5940,13 +6093,13 @@ async fn skill_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
 }
 
 #[tokio::test]
-async fn todo_tool_updates_the_session_task_list() -> anyhow::Result<()> {
+async fn update_plan_tool_updates_the_session_task_list() -> anyhow::Result<()> {
     let dir = temp_dir("todos");
     std::fs::create_dir_all(&dir)?;
     let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
-    let mock = tokio::spawn(todo_provider(listener, Arc::clone(&bodies)));
+    let mock = tokio::spawn(plan_provider(listener, Arc::clone(&bodies)));
 
     let mut config = Config::default();
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
@@ -5986,8 +6139,19 @@ async fn todo_tool_updates_the_session_task_list() -> anyhow::Result<()> {
     assert_eq!(todos.items[0].content, "inspect the code");
     assert_eq!(todos.items[0].status, "completed");
     assert_eq!(todos.items[1].status, "in_progress");
+    // A plan update is not a denial: transcripts must not mark it as one.
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let plan_result = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::ToolResult && event.payload["tool"] == "update_plan")
+        .expect("update_plan result");
+    assert_eq!(plan_result.payload["ok"], true);
+    assert_eq!(plan_result.payload["denied"], false);
     let bodies = bodies.lock().await;
-    assert!(bodies[0].contains("\"name\":\"todo\""));
+    assert!(bodies[0].contains("\"name\":\"update_plan\""));
     assert!(bodies[1].contains("[>] write the fix"));
 
     daemon.abort();
@@ -5996,7 +6160,7 @@ async fn todo_tool_updates_the_session_task_list() -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn todo_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+async fn plan_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
@@ -6019,9 +6183,10 @@ async fn todo_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
                 })
             } else {
                 let arguments = json!({
-                    "todos": [
-                        {"content": "inspect the code", "status": "completed"},
-                        {"content": "write the fix", "status": "in_progress"}
+                    "explanation": "two steps",
+                    "plan": [
+                        {"step": "inspect the code", "status": "completed"},
+                        {"step": "write the fix", "status": "in_progress"}
                     ]
                 })
                 .to_string();
@@ -6033,7 +6198,7 @@ async fn todo_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
                                 "index": 0,
                                 "id": "call_todo",
                                 "type": "function",
-                                "function": {"name": "todo", "arguments": arguments},
+                                "function": {"name": "update_plan", "arguments": arguments},
                             }]
                         },
                         "finish_reason": "tool_calls",
@@ -7366,11 +7531,18 @@ async fn plugin_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>)
             };
             let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             bodies.lock().await.push(body);
-            let has_tool_result = value["messages"]
+            // Plugin tools are deferred: round one searches, round two calls
+            // the discovered tool, round three stops.
+            let tool_results = value["messages"]
                 .as_array()
-                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
-                .unwrap_or(false);
-            if has_tool_result {
+                .map(|messages| {
+                    messages
+                        .iter()
+                        .filter(|message| message["role"] == "tool")
+                        .count()
+                })
+                .unwrap_or(0);
+            if tool_results >= 2 {
                 let chunk = json!({
                     "model": "mock-plugin",
                     "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
@@ -7378,17 +7550,22 @@ async fn plugin_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>)
                 write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
                 return;
             }
+            let (id, name, arguments) = if tool_results == 0 {
+                ("call_search", "tool_search", json!({"query": "echo text"}))
+            } else {
+                ("call_plugin_0", "plugin__mock__echo", json!({"text": "hi"}))
+            };
             let chunk = json!({
                 "model": "mock-plugin",
                 "choices": [{
                     "delta": {
                         "tool_calls": [{
                             "index": 0,
-                            "id": "call_plugin_0",
+                            "id": id,
                             "type": "function",
                             "function": {
-                                "name": "plugin__mock__echo",
-                                "arguments": json!({"text": "hi"}).to_string(),
+                                "name": name,
+                                "arguments": arguments.to_string(),
                             },
                         }]
                     },
@@ -7867,8 +8044,8 @@ async fn invalid_classifier_provider(listener: TcpListener) {
     }
 }
 
-/// A provider for the `ask_user` test: the first round asks a question, the
-/// second (after the tool result) stops with "done".
+/// A provider for the `request_user_input` test: the first round asks a
+/// question, the second (after the tool result) stops with "done".
 async fn ask_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
@@ -7893,15 +8070,30 @@ async fn ask_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
                 format!("data: {chunk}\n\ndata: [DONE]\n\n")
             } else {
                 let arguments = json!({
-                    "question": "Which database should we use?",
-                    "options": [
-                        {"label": "SQLite", "description": "Embedded, no setup"},
-                        {"label": "Postgres", "description": "Server, better concurrency"},
-                        {"label": "MySQL", "description": "Widely deployed"}
+                    "questions": [
+                        {
+                            "id": "database",
+                            "header": "Database",
+                            "question": "Which database should we use?",
+                            "options": [
+                                {"label": "SQLite", "description": "Embedded, no setup"},
+                                {"label": "Postgres", "description": "Server, better concurrency"},
+                                {"label": "MySQL", "description": "Widely deployed"}
+                            ]
+                        },
+                        {
+                            "id": "migration",
+                            "header": "Migration",
+                            "question": "Migrate the existing data?",
+                            "options": [
+                                {"label": "Yes", "description": "Run the migration"},
+                                {"label": "No", "description": "Start empty"}
+                            ]
+                        }
                     ]
                 })
                 .to_string();
-                tool_call_events("call_ask", "ask_user", &arguments)
+                tool_call_events("call_ask", "request_user_input", &arguments)
             };
             write_sse(&mut socket, &events).await;
         });

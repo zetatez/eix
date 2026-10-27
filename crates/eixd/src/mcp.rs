@@ -28,6 +28,7 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 pub const PREFIX: &str = "mcp__";
 
 pub const LIST_RESOURCES: &str = "mcp_list_resources";
+pub const LIST_TEMPLATES: &str = "mcp_list_resource_templates";
 pub const READ_RESOURCE: &str = "mcp_read_resource";
 pub const LIST_PROMPTS: &str = "mcp_list_prompts";
 pub const GET_PROMPT: &str = "mcp_get_prompt";
@@ -50,6 +51,18 @@ pub struct McpTool {
 pub struct McpResource {
     pub server: String,
     pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime: Option<String>,
+}
+
+/// A parameterized resource template advertised by an MCP server. Callers
+/// expand the RFC 6570 `uriTemplate` and read the result with
+/// `mcp_read_resource`.
+#[derive(Debug, Clone)]
+pub struct McpResourceTemplate {
+    pub server: String,
+    pub uri_template: String,
     pub name: String,
     pub description: String,
     pub mime: Option<String>,
@@ -88,6 +101,7 @@ struct Client {
     timeout: Duration,
     flags: Flags,
     resources: Vec<Value>,
+    templates: Vec<Value>,
     prompts: Vec<Value>,
 }
 
@@ -340,6 +354,11 @@ impl Client {
         self.list_paged("resources/list", "resources").await
     }
 
+    async fn list_resource_templates(&mut self) -> Result<Vec<Value>> {
+        self.list_paged("resources/templates/list", "resourceTemplates")
+            .await
+    }
+
     async fn list_prompts(&mut self) -> Result<Vec<Value>> {
         self.list_paged("prompts/list", "prompts").await
     }
@@ -393,6 +412,7 @@ pub struct McpSet {
     clients: BTreeMap<String, Client>,
     tools: Vec<McpTool>,
     resources: Vec<McpResource>,
+    templates: Vec<McpResourceTemplate>,
     prompts: Vec<McpPrompt>,
     failures: BTreeMap<String, String>,
     loaded: bool,
@@ -406,6 +426,7 @@ impl McpSet {
             clients: BTreeMap::new(),
             tools: Vec::new(),
             resources: Vec::new(),
+            templates: Vec::new(),
             prompts: Vec::new(),
             failures: BTreeMap::new(),
             loaded: false,
@@ -448,8 +469,10 @@ impl McpSet {
         client.initialize().await?;
         let raw_tools = client.list_tools().await?;
         let resources = client.list_resources().await.unwrap_or_default();
+        let templates = client.list_resource_templates().await.unwrap_or_default();
         let prompts = client.list_prompts().await.unwrap_or_default();
         client.resources = resources;
+        client.templates = templates;
         client.prompts = prompts;
         self.clients.insert(name.to_string(), client);
         self.tools.retain(|tool| tool.server != name);
@@ -503,6 +526,13 @@ impl McpSet {
                         self.failures.insert(name.clone(), format!("{err:#}"));
                     }
                 }
+                match client.list_resource_templates().await {
+                    Ok(templates) => client.templates = templates,
+                    Err(err) => {
+                        client.flags.resources_dirty = true;
+                        self.failures.insert(name.clone(), format!("{err:#}"));
+                    }
+                }
             }
             if client.flags.prompts_dirty {
                 client.flags.prompts_dirty = false;
@@ -523,6 +553,7 @@ impl McpSet {
             return;
         };
         let resources = client.resources.clone();
+        let templates = client.templates.clone();
         let prompts = client.prompts.clone();
         self.resources.retain(|resource| resource.server != name);
         for resource in resources {
@@ -543,6 +574,30 @@ impl McpSet {
                     .unwrap_or_default()
                     .to_string(),
                 mime: resource
+                    .get("mimeType")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
+        }
+        self.templates.retain(|template| template.server != name);
+        for template in templates {
+            let Some(uri_template) = template.get("uriTemplate").and_then(Value::as_str) else {
+                continue;
+            };
+            self.templates.push(McpResourceTemplate {
+                server: name.to_string(),
+                uri_template: uri_template.to_string(),
+                name: template
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or(uri_template)
+                    .to_string(),
+                description: template
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                mime: template
                     .get("mimeType")
                     .and_then(Value::as_str)
                     .map(str::to_string),
@@ -621,6 +676,35 @@ impl McpSet {
             }
             if !resource.description.is_empty() {
                 out.push_str(&format!("\n  {}", resource.description));
+            }
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    pub fn list_resource_templates(&self, server: Option<&str>) -> Result<String> {
+        let items: Vec<&McpResourceTemplate> = self
+            .templates
+            .iter()
+            .filter(|template| server.is_none_or(|server| template.server == server))
+            .collect();
+        if items.is_empty() {
+            return Ok(match server {
+                Some(server) => format!("server {server:?} exposes no resource templates"),
+                None => "no MCP resource templates".to_string(),
+            });
+        }
+        let mut out = String::new();
+        for template in items {
+            out.push_str(&format!(
+                "{}: {}\n  uriTemplate: {}",
+                template.server, template.name, template.uri_template
+            ));
+            if let Some(mime) = &template.mime {
+                out.push_str(&format!("\n  mime: {mime}"));
+            }
+            if !template.description.is_empty() {
+                out.push_str(&format!("\n  {}", template.description));
             }
             out.push('\n');
         }
@@ -785,6 +869,7 @@ async fn connect(
         timeout: Duration::from_secs(server.timeout_secs.max(1)),
         flags: Flags::default(),
         resources: Vec::new(),
+        templates: Vec::new(),
         prompts: Vec::new(),
     })
 }
@@ -1267,8 +1352,8 @@ mod tests {
     #[test]
     fn exposed_names_are_sanitized() {
         assert_eq!(
-            exposed_name("my.files", "read/file"),
-            "mcp__my_files__read_file"
+            exposed_name("my.files", "exec/command"),
+            "mcp__my_files__exec_command"
         );
         assert_eq!(sanitize("a b"), "a_b");
         assert_eq!(sanitize("ok-name_1"), "ok-name_1");
@@ -1298,10 +1383,10 @@ mod tests {
             "denied_tools": ["read_secret"]
         }))
         .unwrap();
-        assert!(config.allows_tool("read_file"));
+        assert!(config.allows_tool("read_rows"));
         assert!(config.allows_tool("search"));
         assert!(!config.allows_tool("read_secret"));
-        assert!(!config.allows_tool("write_file"));
+        assert!(!config.allows_tool("write_rows"));
     }
 
     #[test]

@@ -203,15 +203,15 @@ mod tests {
             id: "call_1".into(),
             kind: "function".into(),
             function: FunctionCall {
-                name: "read_file".into(),
-                arguments: r#"{"path":"a.rs"}"#.into(),
+                name: "exec_command".into(),
+                arguments: r#"{"cmd":"cat a.rs"}"#.into(),
             },
         };
         let assistant = ChatMessage::assistant_with_tools("", vec![call]);
         let value = serde_json::to_value(&assistant).unwrap();
         assert_eq!(value["tool_calls"][0]["id"], "call_1");
         assert_eq!(value["tool_calls"][0]["type"], "function");
-        assert_eq!(value["tool_calls"][0]["function"]["name"], "read_file");
+        assert_eq!(value["tool_calls"][0]["function"]["name"], "exec_command");
 
         let result = ChatMessage::tool("call_1", "contents");
         let value = serde_json::to_value(&result).unwrap();

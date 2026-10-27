@@ -37,7 +37,7 @@ pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ClassifierAuditPayload,
     ContextClearedPayload, ContextCompactedPayload, ContextDropPayload, ContextPinPayload,
     ErrorPayload, Event, EventKind, HunkInfo, ImageAttachment, InputAnsweredPayload, InputOption,
-    InputRequiredPayload, ModePayload, PatchProposedPayload, PatchResultPayload,
+    InputQuestion, InputRequiredPayload, ModePayload, PatchProposedPayload, PatchResultPayload,
     PermissionEvaluatedPayload, ProcessExitedPayload, ProcessStartedPayload, SnapshotPayload,
     StatusChangedPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };

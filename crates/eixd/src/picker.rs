@@ -229,7 +229,7 @@ fn search_contents(root: &Path, needle: &str, limit: usize) -> Vec<PickerItem> {
 }
 
 /// Read a workspace file for the picker's right pane. The path is resolved
-/// through the same sandbox as `read_file`; the payload is capped so selecting
+/// through the same sandbox as `exec_command`; the payload is capped so selecting
 /// a huge file cannot stall the UI.
 pub async fn file_preview(
     cwd: &Path,

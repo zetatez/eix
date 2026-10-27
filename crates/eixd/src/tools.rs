@@ -65,7 +65,7 @@ const TOOL_SPECS: &[ToolSpec] = &[
         parallel_safe: false,
     },
     ToolSpec {
-        name: "todo",
+        name: "update_plan",
         subagent_allowed: true,
         parallel_safe: false,
     },
@@ -100,12 +100,22 @@ const TOOL_SPECS: &[ToolSpec] = &[
         parallel_safe: false,
     },
     ToolSpec {
-        name: "ask_user",
+        name: "request_user_input",
+        subagent_allowed: false,
+        parallel_safe: false,
+    },
+    ToolSpec {
+        name: "tool_search",
         subagent_allowed: false,
         parallel_safe: false,
     },
     ToolSpec {
         name: "mcp_list_resources",
+        subagent_allowed: true,
+        parallel_safe: false,
+    },
+    ToolSpec {
+        name: "mcp_list_resource_templates",
         subagent_allowed: true,
         parallel_safe: false,
     },
@@ -142,38 +152,47 @@ fn build_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
             "apply_patch",
-            "Edit files with a patch. Use *** Begin Patch, Add/Update/Delete File hunks, then *** End Patch. Requires approval.",
+            "Edit files by putting one patch document in `input`. Start with *** Begin Patch, use Add/Update/Delete File hunks (Update may include *** Move to:), and end with *** End Patch. Requires approval.",
             json!({
                 "type": "object",
                 "properties": {
-                    "patchText": {"type": "string", "description": "*** Begin Patch ... *** End Patch."}
+                    "input": {"type": "string", "description": "*** Begin Patch ... *** End Patch."}
                 },
-                "required": ["patchText"]
+                "required": ["input"]
             }),
         ),
         ToolDefinition::function(
             "exec_command",
-            "Run a shell command in the workspace. Returns output, or a session id when it is still running. Use cat, sed, awk, nl, rg, fd and ls for files.",
+            "Run a command, returning output or a session ID for ongoing interaction. Quote paths with spaces and put `--` before names starting with `-`.",
             json!({
                 "type": "object",
                 "properties": {
                     "cmd": {"type": "string", "description": "Shell command to execute."},
-                    "workdir": {"type": "string", "description": "Workspace-relative directory (default: session cwd)."},
-                    "yield_time_ms": {"type": "integer", "description": "Wait for output before returning a session id (default 10000, max 30000)."},
-                    "max_output_tokens": {"type": "integer", "description": "Approximate output cap (default: config limit)."}
+                    "workdir": {"type": "string", "description": "Working directory; defaults to the turn cwd."},
+                    "tty": {"type": "boolean", "description": "Allocate a PTY for the command."},
+                    "shell": {"type": "string", "description": "Shell binary; defaults to the user's shell."},
+                    "login": {"type": "boolean", "description": "Run the shell as a login shell. Defaults to true."},
+                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding. Defaults to 10000 ms (250-30000)."},
+                    "timeout_ms": {"type": "integer", "description": "Maximum runtime; defaults to the configured timeout."},
+                    "max_output_tokens": {"type": "integer", "description": "Output token budget."},
+                    "sandbox_permissions": {"type": "string", "enum": ["use_default", "with_additional_permissions", "require_escalated"], "description": "Sandbox override; require_escalated needs approval."},
+                    "additional_permissions": {"type": "object", "description": "Extra access for this command; needs with_additional_permissions.", "properties": {"network": {"type": "object", "properties": {"enabled": {"type": "boolean"}}}, "file_system": {"type": "object", "properties": {"read": {"type": "array", "items": {"type": "string"}}, "write": {"type": "array", "items": {"type": "string"}}}}}},
+                    "justification": {"type": "string", "description": "Approval question for require_escalated."},
+                    "prefix_rule": {"type": "array", "items": {"type": "string"}, "description": "Reusable approval prefix for cmd."}
                 },
                 "required": ["cmd"]
             }),
         ),
         ToolDefinition::function(
             "write_stdin",
-            "Write stdin to a running exec_command session, or poll its new output. Use an empty chars to poll.",
+            "Writes characters to an existing exec_command session and returns recent output. An empty chars polls without writing.",
             json!({
                 "type": "object",
                 "properties": {
-                    "session_id": {"type": "string", "description": "Session id returned by exec_command."},
-                    "chars": {"type": "string", "description": "Bytes to write; empty to only poll."},
-                    "yield_time_ms": {"type": "integer", "description": "Wait for output (default 1000, max 30000)."}
+                    "session_id": {"type": "string", "description": "Running exec_command session id."},
+                    "chars": {"type": "string", "description": "Bytes to write; empty polls."},
+                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding. Defaults to 1000 ms (250-30000)."},
+                    "max_output_tokens": {"type": "integer", "description": "Output token budget."}
                 },
                 "required": ["session_id"]
             }),
@@ -203,24 +222,26 @@ fn build_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::function(
-            "todo",
-            "Replace this session's task list. Use only for genuinely multi-step work.",
+            "update_plan",
+            "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.",
             json!({
                 "type": "object",
                 "properties": {
-                    "todos": {
+                    "explanation": {"type": "string", "description": "Optional explanation for this plan update."},
+                    "plan": {
                         "type": "array",
+                        "description": "The list of steps",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "content": {"type": "string"},
-                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "cancelled"]}
+                                "step": {"type": "string", "description": "Task step text."},
+                                "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Step status."}
                             },
-                            "required": ["content", "status"]
+                            "required": ["step", "status"]
                         }
                     }
                 },
-                "required": ["todos"]
+                "required": ["plan"]
             }),
         ),
         ToolDefinition::function(
@@ -291,28 +312,54 @@ fn build_definitions() -> Vec<ToolDefinition> {
             }),
         ),
         ToolDefinition::function(
-            "ask_user",
-            "Ask the user to choose when a decision is genuinely theirs. Best option first; blocks until answered.",
+            "request_user_input",
+            "Request user input for one to three short questions and wait for the response.",
             json!({
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "Short, specific question."},
-                    "options": {
+                    "questions": {
                         "type": "array",
-                        "minItems": 2,
-                        "maxItems": 6,
-                        "description": "Options, best first.",
+                        "description": "Questions to show the user. Prefer 1 and do not exceed 3.",
+                        "minItems": 1,
+                        "maxItems": 3,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "label": {"type": "string"},
-                                "description": {"type": "string", "description": "One-line trade-off."}
+                                "id": {"type": "string", "description": "Stable identifier for mapping answers (snake_case)."},
+                                "header": {"type": "string", "description": "Short header label shown in the UI (12 or fewer chars)."},
+                                "question": {"type": "string", "description": "Single-sentence prompt shown to the user."},
+                                "options": {
+                                    "type": "array",
+                                    "minItems": 2,
+                                    "maxItems": 3,
+                                    "description": "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option; the client adds a free-form \"Other\" automatically.",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "description": "User-facing label (1-5 words)."},
+                                            "description": {"type": "string", "description": "One short sentence explaining impact/tradeoff if selected."}
+                                        },
+                                        "required": ["label", "description"]
+                                    }
+                                }
                             },
-                            "required": ["label"]
+                            "required": ["id", "header", "question", "options"]
                         }
                     }
                 },
-                "required": ["question", "options"]
+                "required": ["questions"]
+            }),
+        ),
+        ToolDefinition::function(
+            "tool_search",
+            "Search deferred tools (MCP and plugin tools) by metadata with BM25 and expose the best matches for the next model call. For MCP tool discovery, always use this instead of listing resources.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query for deferred tools."},
+                    "limit": {"type": "integer", "description": "Maximum number of tools to return. Defaults to 8."}
+                },
+                "required": ["query"]
             }),
         ),
         ToolDefinition::function(
@@ -321,7 +368,19 @@ fn build_definitions() -> Vec<ToolDefinition> {
             json!({
                 "type": "object",
                 "properties": {
-                    "server": {"type": "string", "description": "MCP server (omit for all)."}
+                    "server": {"type": "string", "description": "MCP server (omit for all)."},
+                    "cursor": {"type": "string", "description": "Opaque cursor from a previous call; omit for the first page."}
+                }
+            }),
+        ),
+        ToolDefinition::function(
+            "mcp_list_resource_templates",
+            "List parameterized resource templates exposed by configured MCP servers.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "server": {"type": "string", "description": "MCP server (omit for all)."},
+                    "cursor": {"type": "string", "description": "Opaque cursor from a previous call; omit for the first page."}
                 }
             }),
         ),
@@ -436,9 +495,39 @@ pub fn summarize(tool: &str, args: &Value) -> String {
             format!("spawn_agent {name}")
         }
         "ready" => "ready for integration".to_string(),
-        "ask_user" => {
-            let question = string_arg(args, "question");
-            format!("ask_user: {}", truncate(&question, 100))
+        "update_plan" => {
+            let steps = args
+                .get("plan")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            format!(
+                "update_plan ({steps} step{})",
+                if steps == 1 { "" } else { "s" }
+            )
+        }
+        "request_user_input" => {
+            let questions = args
+                .get("questions")
+                .and_then(Value::as_array)
+                .map(Vec::len)
+                .unwrap_or(0);
+            let first = args
+                .get("questions")
+                .and_then(Value::as_array)
+                .and_then(|questions| questions.first())
+                .and_then(|question| question.get("question"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            format!(
+                "request_user_input ({questions} question{}): {}",
+                if questions == 1 { "" } else { "s" },
+                truncate(first, 100)
+            )
+        }
+        "tool_search" => {
+            let query = string_arg(args, "query");
+            format!("tool_search: {}", truncate(&query, 100))
         }
         other if other.starts_with(eix_core::PLUGIN_TOOL_PREFIX) => {
             // Plugin arguments are opaque to the host, so show a bounded JSON
@@ -450,53 +539,79 @@ pub fn summarize(tool: &str, args: &Value) -> String {
     }
 }
 
-/// Parse and validate an `ask_user` call. Options are ordered best-first.
-pub fn ask_user_args(args: &Value) -> Result<(String, Vec<eix_core::InputOption>)> {
-    use eix_core::InputOption;
+/// Parse and validate a `request_user_input` call. Questions are ordered as
+/// the model sent them; options are ordered best-first.
+pub fn request_user_input_args(args: &Value) -> Result<Vec<eix_core::InputQuestion>> {
+    use eix_core::{InputOption, InputQuestion};
 
-    let question = args
-        .get("question")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|question| !question.is_empty())
-        .context("ask_user needs a non-empty question")?;
     let raw = args
-        .get("options")
+        .get("questions")
         .and_then(Value::as_array)
-        .context("ask_user needs an options array")?;
-    if !(2..=6).contains(&raw.len()) {
-        bail!("ask_user needs 2-6 options");
+        .context("request_user_input needs a questions array")?;
+    if !(1..=3).contains(&raw.len()) {
+        bail!("request_user_input needs 1-3 questions");
     }
-    let mut options = Vec::with_capacity(raw.len());
-    for value in raw {
-        let (label, description) = match value {
-            Value::String(label) => (label.trim().to_string(), None),
-            Value::Object(map) => {
-                let label = map
-                    .get("label")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                let description = map
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|description| !description.is_empty())
-                    .map(str::to_string);
-                (label, description)
-            }
-            _ => bail!("ask_user options must be strings or {{label, description}} objects"),
-        };
-        if label.is_empty() {
-            bail!("ask_user options need a non-empty label");
+    let mut questions = Vec::with_capacity(raw.len());
+    let mut seen = std::collections::HashSet::new();
+    for (index, value) in raw.iter().enumerate() {
+        let id = value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .with_context(|| format!("questions[{index}].id must be non-empty"))?;
+        if !seen.insert(id.to_string()) {
+            bail!("questions[{index}].id {id:?} is duplicated");
         }
-        options.push(InputOption { label, description });
+        let header = value
+            .get("header")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|header| !header.is_empty())
+            .with_context(|| format!("questions[{index}].header must be non-empty"))?;
+        let question = value
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|question| !question.is_empty())
+            .with_context(|| format!("questions[{index}].question must be non-empty"))?;
+        let raw_options = value
+            .get("options")
+            .and_then(Value::as_array)
+            .with_context(|| format!("questions[{index}].options must be an array"))?;
+        if !(2..=3).contains(&raw_options.len()) {
+            bail!("questions[{index}].options needs 2-3 choices");
+        }
+        let mut options = Vec::with_capacity(raw_options.len());
+        for option in raw_options {
+            let label = option
+                .get("label")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|label| !label.is_empty())
+                .with_context(|| format!("questions[{index}].options need a label"))?;
+            let description = option
+                .get("description")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+                .map(str::to_string);
+            options.push(InputOption {
+                label: label.to_string(),
+                description,
+            });
+        }
+        questions.push(InputQuestion {
+            id: id.to_string(),
+            header: header.to_string(),
+            question: question.to_string(),
+            options,
+        });
     }
-    Ok((question.to_string(), options))
+    Ok(questions)
 }
 
-/// A proposed `write_file`, kept in memory between showing the diff and the
+/// A proposed single-file write, kept in memory between showing the diff and
 /// user's decision. It carries the original contents (for the stale-write
 /// check and for unselected hunks) and the hunk boundaries.
 #[derive(Debug, Clone)]
@@ -623,121 +738,6 @@ impl WritePlan {
             .with_context(|| format!("cannot write {}", self.label))?;
         Ok(format!("wrote {} bytes to {}", content.len(), self.label))
     }
-}
-
-/// The file a `write_file` call targets, resolved inside `cwd`. Used for the
-/// pre-execution snapshot when no reviewed plan exists (policy `auto`).
-pub fn write_target(args: &Value, cwd: &Path, config: &Config) -> Option<PathBuf> {
-    let raw = args.get("path").and_then(Value::as_str)?;
-    resolve_path_in(cwd, raw, config).ok()
-}
-
-/// Build the review plan for a file-writing tool. `None` for tools without a
-/// file target (for example shell commands) or when the proposal cannot be
-/// prepared (the tool will report the real error after approval).
-pub async fn write_plan(
-    tool: &str,
-    args: &Value,
-    cwd: &Path,
-    config: &Config,
-) -> Option<WritePlan> {
-    write_plan_with_base(tool, args, cwd, config, None)
-        .await
-        .ok()
-}
-
-/// Like [`write_plan`], but `base` overrides the contents read from disk. The
-/// staging layer passes the newest staged contents so a second write to the
-/// same file diffs against what the agent already proposed.
-pub async fn write_plan_with_base(
-    tool: &str,
-    args: &Value,
-    cwd: &Path,
-    config: &Config,
-    base: Option<&str>,
-) -> Result<WritePlan> {
-    match tool {
-        "write_file" => write_plan_inner(args, cwd, config, base).await,
-        "edit" => edit_plan_inner(args, cwd, config, base).await,
-        _ => bail!("{tool} has no write plan"),
-    }
-}
-
-/// Apply an exact-text replacement the same way the `edit` tool does.
-fn apply_edit(old: &str, old_string: &str, new_string: &str, replace_all: bool) -> Result<String> {
-    if old_string.is_empty() {
-        bail!("oldString must not be empty");
-    }
-    if old_string == new_string {
-        bail!("oldString and newString must differ");
-    }
-    let matches = old.matches(old_string).count();
-    if matches == 0 {
-        bail!("oldString was not found in the file");
-    }
-    if matches > 1 && !replace_all {
-        bail!("oldString matched {matches} times; add more context or set replaceAll to true");
-    }
-    let updated = if replace_all {
-        old.replace(old_string, new_string)
-    } else {
-        old.replacen(old_string, new_string, 1)
-    };
-    Ok(updated)
-}
-
-async fn edit_plan_inner(
-    args: &Value,
-    cwd: &Path,
-    config: &Config,
-    base: Option<&str>,
-) -> Result<WritePlan> {
-    let raw = required_string(args, "path")?;
-    let old_string = required_string(args, "oldString")?;
-    let new_string = required_string(args, "newString")?;
-    let replace_all = args
-        .get("replaceAll")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let path = resolve_path_in(cwd, raw, config)?;
-    let old = match base {
-        Some(base) => base.to_string(),
-        None => match tokio::fs::read(&path).await {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                bail!("{} does not exist", display(&path, cwd))
-            }
-            Err(err) => {
-                return Err(err).with_context(|| format!("cannot read {}", display(&path, cwd)))
-            }
-        },
-    };
-    let new = apply_edit(&old, old_string, new_string, replace_all)?;
-    let label = display(&path, cwd);
-    Ok(build_plan(path, label, old, new, config))
-}
-
-async fn write_plan_inner(
-    args: &Value,
-    cwd: &Path,
-    config: &Config,
-    base: Option<&str>,
-) -> Result<WritePlan> {
-    let raw = required_string(args, "path")?;
-    let new = required_string(args, "content")?;
-    let path = resolve_path_in(cwd, raw, config)?;
-    let old = match base {
-        Some(base) => base.to_string(),
-        None => match tokio::fs::read(&path).await {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(err) => {
-                return Err(err).with_context(|| format!("cannot read {}", display(&path, cwd)))
-            }
-        },
-    };
-    let label = display(&path, cwd);
-    Ok(build_plan(path, label, old, new.to_string(), config))
 }
 
 /// Assemble the diff and hunk preview from already-known contents.
@@ -972,16 +972,20 @@ pub async fn execute_in(
         "use_skill" => use_skill(args, cwd, config),
         "web_fetch" => webfetch(args).await,
         "web_search" => websearch(args).await,
-        "todo" => Err(anyhow::anyhow!("todo is handled by the daemon")),
+        "update_plan" | "request_user_input" | "tool_search" => {
+            Err(anyhow::anyhow!("{tool} is handled by the daemon"))
+        }
         "apply_patch" => patch(args, cwd, config).await,
         // The daemon routes model `exec_command` calls through the process
         // registry. This synchronous path serves `shell.run` and other host
         // callers that want a bounded command.
-        "exec_command" => run_command(args, cwd, config, cancel, sandbox_root).await,
+        "exec_command" => exec_command(args, cwd, config, cancel, sandbox_root).await,
         "write_stdin" | "view_image" => Err(anyhow::anyhow!("{tool} is handled by the daemon")),
-        "mcp_list_resources" | "mcp_read_resource" | "mcp_list_prompts" | "mcp_get_prompt" => {
-            Err(anyhow::anyhow!("{tool} is handled by the daemon"))
-        }
+        "mcp_list_resources"
+        | "mcp_list_resource_templates"
+        | "mcp_read_resource"
+        | "mcp_list_prompts"
+        | "mcp_get_prompt" => Err(anyhow::anyhow!("{tool} is handled by the daemon")),
         other => Err(anyhow::anyhow!("unknown tool {other:?}")),
     };
     match result {
@@ -1565,38 +1569,7 @@ fn use_skill(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
     }
 }
 
-/// Render a numbered, paginated slice of a text file. `offset` is 1-based.
-pub fn format_read(text: &str, offset: usize, limit: usize, max_bytes: usize) -> String {
-    // Count without materialising a `Vec<&str>` for the whole file: a large
-    // log would otherwise allocate one pointer per line just to slice it.
-    let total = text.lines().count();
-    if total == 0 {
-        return "(empty file)".to_string();
-    }
-    if offset > total {
-        return format!("(offset {offset} is past the end of the file, {total} lines)");
-    }
-    let start = offset - 1;
-    let end = (start + limit).min(total);
-    let mut out = String::new();
-    for (index, line) in text.lines().skip(start).take(end - start).enumerate() {
-        out.push_str(&format!("{}: {line}\n", start + index + 1));
-        if out.len() >= max_bytes {
-            out.push_str("… [truncated]\n");
-            break;
-        }
-    }
-    if end < total {
-        out.push_str(&format!(
-            "… [{} more lines; use offset={} to continue]\n",
-            total - end,
-            end + 1
-        ));
-    }
-    cap_output(out, max_bytes)
-}
-
-/// One file operation parsed from a `patch` call.
+/// One file operation parsed from an `apply_patch` call.
 #[derive(Debug, Clone)]
 pub struct PatchOp {
     pub path: PathBuf,
@@ -1604,35 +1577,69 @@ pub struct PatchOp {
     pub old: String,
     pub new: String,
     pub delete: bool,
+    /// `*** Move to:` destination for an update hunk.
+    pub move_to: Option<PathBuf>,
+    pub move_label: Option<String>,
+}
+
+#[derive(Debug)]
+struct PatchChunk {
+    context: Option<String>,
+    old: Vec<String>,
+    new: Vec<String>,
+    end_of_file: bool,
+}
+
+fn is_hunk_header(line: &str) -> bool {
+    line.starts_with("*** Add File: ")
+        || line.starts_with("*** Delete File: ")
+        || line.starts_with("*** Update File: ")
 }
 
 /// Parse and validate an apply_patch document against the current workspace.
-/// The returned ops carry the exact old/new contents so the caller can show a
-/// diff or apply them all.
+/// The grammar follows Codex: `*** Begin Patch`, Add/Update/Delete hunks,
+/// optional `*** Move to:` and `*** End of File`, then `*** End Patch`.
 pub async fn patch_ops(patch_text: &str, cwd: &Path, config: &Config) -> Result<Vec<PatchOp>> {
-    let lines: Vec<&str> = patch_text.lines().collect();
+    let patch_text = strip_heredoc(patch_text);
+    let all: Vec<&str> = patch_text.trim().lines().collect();
+    let first = all.first().map(|line| line.trim()).unwrap_or_default();
+    let last = all.last().map(|line| line.trim()).unwrap_or_default();
+    if first != "*** Begin Patch" {
+        bail!("the first line of the patch must be '*** Begin Patch'");
+    }
+    if last != "*** End Patch" {
+        bail!("the last line of the patch must be '*** End Patch'");
+    }
+    let lines = &all[1..all.len() - 1];
     let mut index = 0;
     let mut ops = Vec::new();
+    let mut targets = std::collections::HashSet::new();
     while index < lines.len() {
         let line = lines[index];
-        if line.trim().is_empty() || line.starts_with("*** Begin Patch") {
+        if line.trim().is_empty() {
             index += 1;
             continue;
         }
-        if line.starts_with("*** End Patch") {
-            break;
-        }
         if let Some(raw) = line.strip_prefix("*** Add File: ") {
             let path = resolve_path_in(cwd, raw.trim(), config)?;
+            if !targets.insert(path.clone()) {
+                bail!("multiple operations target {}", display(&path, cwd));
+            }
             index += 1;
             let mut body = String::new();
-            while index < lines.len() && !lines[index].starts_with("*** ") {
-                let line = lines[index];
-                if let Some(content) = line.strip_prefix('+') {
-                    body.push_str(content);
-                    body.push('\n');
-                }
+            while index < lines.len() && !is_hunk_header(lines[index]) {
+                let Some(content) = lines[index].strip_prefix('+') else {
+                    bail!(
+                        "invalid Add File line {}: every line must start with '+'",
+                        index + 2
+                    );
+                };
+                body.push_str(content);
+                body.push('\n');
                 index += 1;
+            }
+            if body.is_empty() {
+                bail!("Add File {} has no lines", display(&path, cwd));
             }
             let old = match tokio::fs::read(&path).await {
                 Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
@@ -1641,127 +1648,233 @@ pub async fn patch_ops(patch_text: &str, cwd: &Path, config: &Config) -> Result<
                     return Err(err).with_context(|| format!("cannot read {}", display(&path, cwd)))
                 }
             };
-            if !old.is_empty() {
-                bail!("Add File target {} already exists", display(&path, cwd));
-            }
             ops.push(PatchOp {
                 label: display(&path, cwd),
                 path,
                 old,
                 new: body,
                 delete: false,
+                move_to: None,
+                move_label: None,
             });
             continue;
         }
         if let Some(raw) = line.strip_prefix("*** Delete File: ") {
             let path = resolve_path_in(cwd, raw.trim(), config)?;
+            if !targets.insert(path.clone()) {
+                bail!("multiple operations target {}", display(&path, cwd));
+            }
             let old = tokio::fs::read(&path)
                 .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .with_context(|| format!("cannot read {}", display(&path, cwd)))?;
+                .with_context(|| format!("Failed to read {}", display(&path, cwd)))?;
             ops.push(PatchOp {
                 label: display(&path, cwd),
                 path,
                 old,
                 new: String::new(),
                 delete: true,
+                move_to: None,
+                move_label: None,
             });
             index += 1;
             continue;
         }
         if let Some(raw) = line.strip_prefix("*** Update File: ") {
             let path = resolve_path_in(cwd, raw.trim(), config)?;
+            if !targets.insert(path.clone()) {
+                bail!("multiple operations target {}", display(&path, cwd));
+            }
             let old = tokio::fs::read(&path)
                 .await
                 .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-                .with_context(|| format!("cannot read {}", display(&path, cwd)))?;
+                .with_context(|| format!("Failed to read {}", display(&path, cwd)))?;
             index += 1;
+            let mut move_to = None;
+            if index < lines.len() {
+                if let Some(raw) = lines[index].strip_prefix("*** Move to: ") {
+                    let dest = resolve_path_in(cwd, raw.trim(), config)?;
+                    if !targets.insert(dest.clone()) {
+                        bail!("multiple operations target {}", display(&dest, cwd));
+                    }
+                    move_to = Some(dest);
+                    index += 1;
+                }
+            }
+            let mut chunks = Vec::new();
+            let mut chunk: Option<PatchChunk> = None;
+            while index < lines.len() && !is_hunk_header(lines[index]) {
+                let hline = lines[index];
+                if hline == "@@" || hline.starts_with("@@ ") {
+                    if let Some(finished) = chunk.take() {
+                        if !finished.old.is_empty() || !finished.new.is_empty() {
+                            chunks.push(finished);
+                        }
+                    }
+                    chunk = Some(PatchChunk {
+                        context: hline
+                            .strip_prefix("@@ ")
+                            .map(str::trim)
+                            .filter(|context| !context.is_empty())
+                            .map(str::to_string),
+                        old: Vec::new(),
+                        new: Vec::new(),
+                        end_of_file: false,
+                    });
+                    index += 1;
+                    continue;
+                }
+                if hline.trim() == "*** End of File" {
+                    let Some(current) = chunk.as_mut() else {
+                        bail!("Update hunk does not contain any lines");
+                    };
+                    if current.old.is_empty() && current.new.is_empty() {
+                        bail!("Update hunk does not contain any lines");
+                    }
+                    current.end_of_file = true;
+                    index += 1;
+                    continue;
+                }
+                if chunk.as_ref().is_some_and(|chunk| chunk.end_of_file) {
+                    if hline.trim().is_empty() {
+                        index += 1;
+                        continue;
+                    }
+                    bail!("expected update hunk to start with a @@ context marker, got: {hline:?}");
+                }
+                let current = chunk.get_or_insert_with(|| PatchChunk {
+                    context: None,
+                    old: Vec::new(),
+                    new: Vec::new(),
+                    end_of_file: false,
+                });
+                match hline.chars().next() {
+                    Some(' ') => {
+                        let rest = &hline[1..];
+                        current.old.push(rest.to_string());
+                        current.new.push(rest.to_string());
+                    }
+                    Some('-') => current.old.push(hline[1..].to_string()),
+                    Some('+') => current.new.push(hline[1..].to_string()),
+                    None => {
+                        current.old.push(String::new());
+                        current.new.push(String::new());
+                    }
+                    _ => bail!(
+                        "unexpected line in update hunk: {hline:?}; every line should start with ' ', '+' or '-'"
+                    ),
+                }
+                index += 1;
+            }
+            if let Some(finished) = chunk.take() {
+                if !finished.old.is_empty() || !finished.new.is_empty() {
+                    chunks.push(finished);
+                }
+            }
+            if chunks.is_empty() {
+                bail!(
+                    "Update file hunk for path '{}' is empty",
+                    display(&path, cwd)
+                );
+            }
             let mut current = old.clone();
-            let mut applied_any = false;
-            while index < lines.len() && !lines[index].starts_with("*** ") {
-                if lines[index].starts_with("@@") {
-                    index += 1;
-                    continue;
-                }
-                let mut old_block = Vec::new();
-                let mut new_block = Vec::new();
-                while index < lines.len() {
-                    let hline = lines[index];
-                    if hline.starts_with("*** ") || hline.starts_with("@@") {
-                        break;
-                    }
-                    match hline.chars().next() {
-                        Some(' ') => {
-                            let rest = &hline[1..];
-                            old_block.push(rest.to_string());
-                            new_block.push(rest.to_string());
-                        }
-                        Some('-') => old_block.push(hline[1..].to_string()),
-                        Some('+') => new_block.push(hline[1..].to_string()),
-                        None => {}
-                        _ => {
-                            // Tolerate unprefixed context lines.
-                            old_block.push(hline.to_string());
-                            new_block.push(hline.to_string());
-                        }
-                    }
-                    index += 1;
-                }
-                if old_block.is_empty() && new_block.is_empty() {
-                    continue;
-                }
-                current = apply_patch_block(&current, &old_block, &new_block)
+            for chunk in &chunks {
+                current = apply_patch_chunk(&current, chunk)
                     .with_context(|| format!("cannot apply hunk to {}", display(&path, cwd)))?;
-                applied_any = true;
             }
-            if !applied_any {
-                bail!("Update File {} has no hunks", display(&path, cwd));
-            }
+            let move_label = move_to.as_ref().map(|dest| display(dest, cwd));
             ops.push(PatchOp {
                 label: display(&path, cwd),
                 path,
                 old,
                 new: current,
                 delete: false,
+                move_to,
+                move_label,
             });
             continue;
         }
-        index += 1;
+        bail!("'{line}' is not a valid hunk header");
     }
     if ops.is_empty() {
-        bail!("patchText contains no Add/Update/Delete File sections");
+        bail!("patch contains no Add/Update/Delete File sections");
     }
     Ok(ops)
 }
 
-/// Replace the first occurrence of `old_block` with `new_block`.
-fn apply_patch_block(content: &str, old_block: &[String], new_block: &[String]) -> Result<String> {
-    if old_block.is_empty() {
-        bail!("hunk has no context or removed lines");
-    }
-    let lines: Vec<&str> = content.lines().collect();
-    let mut found = None;
-    'search: for start in 0..=lines.len().saturating_sub(old_block.len()) {
-        for (offset, expected) in old_block.iter().enumerate() {
-            if lines[start + offset].trim_end_matches('\r') != expected.trim_end_matches('\r') {
-                continue 'search;
-            }
-        }
-        found = Some(start);
-        break;
-    }
-    let Some(start) = found else {
-        bail!("hunk context was not found");
+/// Accept the heredoc wrapper some models learned from Codex shell examples.
+fn strip_heredoc(patch: &str) -> String {
+    let trimmed = patch.trim();
+    let Some(rest) = trimmed
+        .strip_prefix("<<'EOF'")
+        .or_else(|| trimmed.strip_prefix("<<\"EOF\""))
+        .or_else(|| trimmed.strip_prefix("<<EOF"))
+    else {
+        return patch.to_string();
     };
-    let mut result = Vec::with_capacity(lines.len() + new_block.len());
-    result.extend_from_slice(&lines[..start]);
-    result.extend(new_block.iter().map(String::as_str));
-    result.extend_from_slice(&lines[start + old_block.len()..]);
-    let mut out = result.join("\n");
-    if content.ends_with('\n') {
+    let rest = rest.strip_suffix("EOF").unwrap_or(rest);
+    rest.trim().to_string()
+}
+
+/// Apply one update chunk, matching Codex's exact -> rstrip -> trim search.
+fn apply_patch_chunk(content: &str, chunk: &PatchChunk) -> Result<String> {
+    let trailing_newline = content.ends_with('\n');
+    let mut lines: Vec<String> = content.lines().map(str::to_string).collect();
+    let mut search_start = 0;
+    if let Some(context) = &chunk.context {
+        let Some(index) = seek_lines(&lines, std::slice::from_ref(context), 0, false) else {
+            bail!("failed to find context {context:?}");
+        };
+        search_start = index + 1;
+    }
+    if chunk.old.is_empty() {
+        lines.extend(chunk.new.iter().cloned());
+    } else {
+        let Some(start) = seek_lines(&lines, &chunk.old, search_start, chunk.end_of_file) else {
+            bail!("hunk context was not found");
+        };
+        lines.splice(start..start + chunk.old.len(), chunk.new.iter().cloned());
+    }
+    let mut out = lines.join("\n");
+    if trailing_newline || chunk.old.is_empty() {
         out.push('\n');
     }
     Ok(out)
+}
+
+fn seek_lines(
+    lines: &[String],
+    pattern: &[String],
+    start: usize,
+    end_of_file: bool,
+) -> Option<usize> {
+    if pattern.is_empty() {
+        return Some(start);
+    }
+    if pattern.len() > lines.len() {
+        return None;
+    }
+    let search_start = if end_of_file && lines.len() >= pattern.len() {
+        lines.len() - pattern.len()
+    } else {
+        start
+    };
+    for mode in 0..3 {
+        for index in search_start..=lines.len() - pattern.len() {
+            let matched = pattern.iter().enumerate().all(|(offset, expected)| {
+                let actual = &lines[index + offset];
+                match mode {
+                    0 => actual.trim_end_matches('\r') == expected.trim_end_matches('\r'),
+                    1 => actual.trim_end() == expected.trim_end(),
+                    _ => actual.trim() == expected.trim(),
+                }
+            });
+            if matched {
+                return Some(index);
+            }
+        }
+    }
+    None
 }
 
 /// Format every replacement in a patch before it is shown for approval. The
@@ -1772,7 +1885,8 @@ pub async fn format_patch_ops(mut ops: Vec<PatchOp>, cwd: &Path, config: &Config
         if op.delete {
             continue;
         }
-        if let Some(formatted) = format_content(config, cwd, &op.path, &op.new).await {
+        let target = op.move_to.as_deref().unwrap_or(&op.path).to_path_buf();
+        if let Some(formatted) = format_content(config, cwd, &target, &op.new).await {
             op.new = formatted;
         }
     }
@@ -1791,6 +1905,12 @@ pub fn patch_diff(ops: &[PatchOp], config: &Config) -> String {
             for line in op.old.lines() {
                 out.push_str(&format!("-{line}\n"));
             }
+        } else if let Some(move_label) = &op.move_label {
+            out.push_str(&unified_diff(
+                &format!("{} -> {move_label}", op.label),
+                &op.old,
+                &op.new,
+            ));
         } else {
             out.push_str(&unified_diff(&op.label, &op.old, &op.new));
         }
@@ -1823,15 +1943,19 @@ pub async fn apply_patch_ops(ops: &[PatchOp]) -> ToolOutcome {
 }
 
 async fn write_patch_ops(ops: &[PatchOp]) -> Result<(usize, usize)> {
-    // Validate every target before writing anything.
+    // Validate every source before writing anything.
     for op in ops {
-        if op.delete {
-            continue;
-        }
-        if let Ok(current) = tokio::fs::read(&op.path).await {
-            let current = String::from_utf8_lossy(&current);
-            if current != op.old {
-                bail!("{} changed while the patch was being prepared", op.label);
+        if op.delete || op.move_to.is_some() || !op.old.is_empty() {
+            if let Ok(current) = tokio::fs::read(&op.path).await {
+                let current = String::from_utf8_lossy(&current);
+                if current != op.old {
+                    bail!("{} changed while the patch was being prepared", op.label);
+                }
+            } else if !op.delete {
+                bail!(
+                    "{} disappeared while the patch was being prepared",
+                    op.label
+                );
             }
         }
     }
@@ -1841,17 +1965,28 @@ async fn write_patch_ops(ops: &[PatchOp]) -> Result<(usize, usize)> {
         if op.delete {
             tokio::fs::remove_file(&op.path)
                 .await
-                .with_context(|| format!("cannot delete {}", op.label))?;
+                .with_context(|| format!("Failed to delete {}", op.label))?;
             deleted += 1;
         } else {
-            if let Some(parent) = op.path.parent() {
+            let target = op.move_to.as_deref().unwrap_or(&op.path);
+            if let Some(parent) = target.parent() {
                 tokio::fs::create_dir_all(parent)
                     .await
                     .with_context(|| format!("cannot create {}", parent.display()))?;
             }
-            tokio::fs::write(&op.path, op.new.as_bytes())
+            tokio::fs::write(target, op.new.as_bytes())
                 .await
-                .with_context(|| format!("cannot write {}", op.label))?;
+                .with_context(|| {
+                    format!(
+                        "Failed to write file {}",
+                        op.move_label.as_deref().unwrap_or(&op.label)
+                    )
+                })?;
+            if op.move_to.is_some() {
+                tokio::fs::remove_file(&op.path)
+                    .await
+                    .with_context(|| format!("Failed to remove original {}", op.label))?;
+            }
             written += 1;
         }
     }
@@ -1859,7 +1994,7 @@ async fn write_patch_ops(ops: &[PatchOp]) -> Result<(usize, usize)> {
 }
 
 async fn patch(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
-    let patch_text = patch_text(args).context("apply_patch needs patchText")?;
+    let patch_text = patch_text(args).context("apply_patch needs `input`")?;
     let ops = patch_ops(&patch_text, cwd, config).await?;
     let (written, deleted) = write_patch_ops(&ops).await?;
     let mut message = format!("patched {written} file(s), deleted {deleted} file(s)");
@@ -1875,13 +2010,111 @@ async fn patch(args: &Value, cwd: &Path, config: &Config) -> Result<String> {
 }
 
 /// A resolved shell invocation: sandbox wrapper, command, and working
-/// directory. Shared by `run_command` (synchronous) and `start_command`
-/// (background) so both go through the same sandbox decision.
+/// directory. `exec_command` builds one for every shell line so a background
+/// session and a synchronous run share the same sandbox decision.
 #[derive(Debug, Clone)]
 pub struct CommandPlan {
     pub program: std::ffi::OsString,
     pub args: Vec<std::ffi::OsString>,
     pub cwd: PathBuf,
+}
+
+/// Codex-compatible `exec_command` options that change how the shell line is
+/// resolved. `sandbox_permissions` is enforced by the approval gate in
+/// `server`; this struct only carries the mechanics.
+#[derive(Debug, Clone, Default)]
+pub struct CommandOptions<'a> {
+    pub shell: Option<&'a str>,
+    /// `None` keeps the Codex default (login shell).
+    pub login: Option<bool>,
+    pub tty: bool,
+    pub escalated: bool,
+    pub additional_read: Vec<String>,
+    pub additional_write: Vec<String>,
+    pub additional_network: bool,
+}
+
+impl CommandOptions<'_> {
+    fn login(&self) -> bool {
+        self.login.unwrap_or(true)
+    }
+
+    fn shell(&self) -> String {
+        self.shell
+            .map(str::trim)
+            .filter(|shell| !shell.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                std::env::var("SHELL")
+                    .ok()
+                    .filter(|shell| !shell.trim().is_empty())
+            })
+            .unwrap_or_else(|| "sh".to_string())
+    }
+}
+
+/// Read the Codex `exec_command` shell/sandbox knobs from tool arguments.
+pub fn command_options(args: &Value) -> CommandOptions<'_> {
+    let file_system = args
+        .get("additional_permissions")
+        .and_then(|permissions| permissions.get("file_system"));
+    let string_array = |key: &str| -> Vec<String> {
+        file_system
+            .and_then(|file_system| file_system.get(key))
+            .and_then(Value::as_array)
+            .map(|paths| {
+                paths
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    CommandOptions {
+        shell: args.get("shell").and_then(Value::as_str),
+        login: args.get("login").and_then(Value::as_bool),
+        tty: args.get("tty").and_then(Value::as_bool).unwrap_or(false),
+        escalated: args
+            .get("sandbox_permissions")
+            .and_then(Value::as_str)
+            .is_some_and(|value| value == "require_escalated"),
+        additional_read: string_array("read"),
+        additional_write: string_array("write"),
+        additional_network: args
+            .get("additional_permissions")
+            .and_then(|permissions| permissions.get("network"))
+            .and_then(|network| network.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    }
+}
+
+/// Whether this call asks for permissions beyond the session defaults and
+/// therefore must be shown to the user even when the command looks read-only.
+pub fn escalation_reason(args: &Value) -> Option<String> {
+    let permissions = args.get("sandbox_permissions").and_then(Value::as_str);
+    let extra = args.get("additional_permissions").is_some();
+    if !matches!(
+        permissions,
+        Some("require_escalated" | "with_additional_permissions")
+    ) && !extra
+    {
+        return None;
+    }
+    let justification = args
+        .get("justification")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|justification| !justification.is_empty());
+    Some(match (permissions, justification) {
+        (Some("require_escalated"), Some(reason)) => {
+            format!("command asks to run outside the sandbox: {reason}")
+        }
+        (Some("require_escalated"), None) => "command asks to run outside the sandbox".to_string(),
+        (_, Some(reason)) => format!("command asks for additional permissions: {reason}"),
+        (_, None) => "command asks for additional permissions".to_string(),
+    })
 }
 
 impl CommandPlan {
@@ -1932,26 +2165,53 @@ pub fn command_plan(
     sandbox_root: Option<&Path>,
     config: &Config,
 ) -> Result<CommandPlan> {
+    command_plan_with(
+        command,
+        cwd_arg,
+        session_cwd,
+        sandbox_root,
+        config,
+        CommandOptions::default(),
+    )
+}
+
+/// Like [`command_plan`], but honors Codex's `shell`, `login`, `tty` and
+/// per-command permission overrides.
+pub fn command_plan_with(
+    command: &str,
+    cwd_arg: Option<&str>,
+    session_cwd: &Path,
+    sandbox_root: Option<&Path>,
+    config: &Config,
+    options: CommandOptions<'_>,
+) -> Result<CommandPlan> {
     let command_cwd = match cwd_arg {
         Some(raw) => resolve_path_in(session_cwd, raw, config)?,
         None => session_cwd.to_path_buf(),
     };
     let command_cwd = command_cwd.canonicalize().unwrap_or(command_cwd);
-    let sandboxed = match config.tools.sandbox {
-        SandboxMode::Off => false,
-        SandboxMode::Required => {
-            if !sandbox::bwrap_available() {
-                bail!(
-                    "tools.sandbox = \"required\" but {}",
-                    sandbox::unavailable_reason()
-                );
+    let sandboxed = if options.escalated {
+        false
+    } else {
+        match config.tools.sandbox {
+            SandboxMode::Off => false,
+            SandboxMode::Required => {
+                if !sandbox::bwrap_available() {
+                    bail!(
+                        "tools.sandbox = \"required\" but {}",
+                        sandbox::unavailable_reason()
+                    );
+                }
+                true
             }
-            true
+            SandboxMode::Auto => sandbox::bwrap_available(),
         }
-        SandboxMode::Auto => sandbox::bwrap_available(),
     };
+    let shell = options.shell();
+    let login = options.login();
+    let shell_flag = if login { "-lc" } else { "-c" };
 
-    let mut args: Vec<std::ffi::OsString> = Vec::new();
+    let mut argv: Vec<std::ffi::OsString> = Vec::new();
     if sandboxed {
         // A worktree session may keep its cwd in a subdirectory. Mount the
         // worktree root, not just that subdirectory, so `.git` and git commit
@@ -1960,12 +2220,18 @@ pub fn command_plan(
             .unwrap_or(session_cwd)
             .canonicalize()
             .unwrap_or_else(|_| sandbox_root.unwrap_or(session_cwd).to_path_buf());
-        let read_paths: Vec<PathBuf> = config
+        let mut read_paths: Vec<PathBuf> = config
             .tools
             .sandbox_read_paths
             .iter()
             .map(|path| expand_sandbox_path(path, &workspace))
             .collect();
+        read_paths.extend(
+            options
+                .additional_read
+                .iter()
+                .map(|path| expand_sandbox_path(path, &workspace)),
+        );
         let mut writable_roots: Vec<PathBuf> = config
             .tools
             .sandbox_writable_roots
@@ -1973,6 +2239,12 @@ pub fn command_plan(
             .map(|path| expand_sandbox_path(path, &workspace))
             .filter(|path| path != &workspace)
             .collect();
+        writable_roots.extend(
+            options
+                .additional_write
+                .iter()
+                .map(|path| expand_sandbox_path(path, &workspace)),
+        );
         // Linked worktrees keep `.git` outside the worktree as a `gitdir:`
         // pointer. Bind that metadata directory too; otherwise every git
         // command inside the sandbox fails with "not a valid repository".
@@ -1981,29 +2253,48 @@ pub fn command_plan(
                 writable_roots.push(git_dir);
             }
         }
-        args.extend(sandbox::bwrap_args(
+        argv.push("bwrap".into());
+        argv.extend(sandbox::bwrap_args(
             &workspace,
             &command_cwd,
-            config.tools.sandbox_network,
+            config.tools.sandbox_network || options.additional_network,
             &read_paths,
             &writable_roots,
         ));
-        args.push("sh".into());
     }
-    args.push("-c".into());
-    args.push(command.into());
+    argv.push(shell.into());
+    argv.push(shell_flag.into());
+    argv.push(command.into());
+
+    // `script(1)` allocates a real PTY while keeping our own pipes for stdin,
+    // stdout and stderr, so TTY-oriented programs still behave interactively.
+    if options.tty {
+        let script = argv
+            .iter()
+            .map(|arg| shell_quote(&arg.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(" ");
+        return Ok(CommandPlan {
+            program: "script".into(),
+            args: vec!["-qefc".into(), script.into(), "/dev/null".into()],
+            cwd: command_cwd,
+        });
+    }
+
+    let program = argv.remove(0);
     Ok(CommandPlan {
-        program: if sandboxed {
-            "bwrap".into()
-        } else {
-            "sh".into()
-        },
-        args,
+        program,
+        args: argv,
         cwd: command_cwd,
     })
 }
 
-async fn run_command(
+/// Quote one argv element for `script -c` (POSIX shells, Linux only).
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+async fn exec_command(
     args: &Value,
     cwd: &Path,
     config: &Config,
@@ -2015,12 +2306,13 @@ async fn run_command(
         .or_else(|| args.get("command"))
         .and_then(Value::as_str)
         .context("cmd is required")?;
-    let plan = command_plan(
+    let plan = command_plan_with(
         command,
         optional_string(args, "workdir").or_else(|| optional_string(args, "cwd")),
         cwd,
         sandbox_root,
         config,
+        command_options(args),
     )?;
     let command_cwd = plan.cwd.clone();
     let child = plan
@@ -2032,15 +2324,20 @@ async fn run_command(
         .spawn()
         .with_context(|| format!("cannot run command in {}", command_cwd.display()))?;
 
-    let timeout = Duration::from_secs(config.tools.command_timeout_secs);
+    let timeout = args
+        .get("timeout_ms")
+        .and_then(Value::as_u64)
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_secs(config.tools.command_timeout_secs));
     let output = tokio::select! {
         result = tokio::time::timeout(timeout, child.wait_with_output()) => {
             match result {
                 Ok(result) => result.context("command failed")?,
                 Err(_) => {
                     return Ok(format!(
-                        "command timed out after {}s",
-                        config.tools.command_timeout_secs
+                        "command timed out after {}ms",
+                        timeout.as_millis()
                     ));
                 }
             }
@@ -2159,11 +2456,11 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-/// `apply_patch` is a JSON function in eix, but models often reuse Codex's
-/// freeform field names. Accept the common aliases rather than failing a call
-/// whose patch is otherwise valid.
-fn patch_text(args: &Value) -> Option<String> {
-    ["patchText", "patch", "input", "text"]
+/// `apply_patch` is a JSON function in eix (Chat Completions has no custom
+/// freeform tools), but Codex names the field `input`. Accept the old aliases
+/// so existing skills and prompts keep working.
+pub fn patch_text(args: &Value) -> Option<String> {
+    ["input", "patchText", "patch", "text"]
         .iter()
         .find_map(|key| args.get(*key).and_then(Value::as_str))
         .map(str::to_string)
@@ -2205,7 +2502,38 @@ pub(crate) fn cap_output(text: String, max: usize) -> String {
     while end > 0 && !text.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n… [truncated at {max} bytes]", &text[..end])
+    let kept = &text[..end];
+    // Count complete lines only: the cut may land mid-line, and resuming one
+    // line early is harmless while skipping content is not.
+    let shown = kept.matches('\n').count();
+    let total = text.lines().count();
+    let hint = if shown == 0 {
+        // A single very long line (minified JSON, one-line log record) has no
+        // useful range to resume from.
+        format!("… [truncated at {max} bytes: the first line is longer than the limit]")
+    } else {
+        format!(
+            "… [truncated: showed lines 1-{shown} of {total}; continue from line {} with a narrower range]",
+            shown + 1
+        )
+    };
+    format!("{kept}\n{hint}")
+}
+
+/// True when decoded process output is really a binary file. `cat` on an ELF
+/// or archive would otherwise flood the context with replacement glyphs.
+pub(crate) fn looks_binary(text: &str) -> bool {
+    let sample: Vec<char> = text.chars().take(8192).collect();
+    if sample.is_empty() {
+        return false;
+    }
+    if sample.contains(&'\0') {
+        return true;
+    }
+    let replacement = sample.iter().filter(|ch| **ch == '\u{FFFD}').count();
+    // Isolated damage from a truncated multi-byte character is normal; a
+    // stream that is mostly replacement glyphs is not text.
+    replacement * 5 > sample.len()
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -2369,10 +2697,13 @@ mod tests {
             .into(),
             ..Config::default()
         };
-        let args = json!({"path": "note.txt", "content": "hello"});
-        let plan = write_plan("write_file", &args, &cwd, &config)
-            .await
-            .expect("pre-write plan");
+        let plan = build_plan(
+            cwd.join("note.txt"),
+            "note.txt".to_string(),
+            String::new(),
+            "hello".to_string(),
+            &config,
+        );
         assert!(apply_plan(&plan, None, &cwd, &config).await.ok);
         assert_eq!(
             std::fs::read_to_string(cwd.join("note.txt")).unwrap(),
@@ -2400,10 +2731,13 @@ mod tests {
             formatter_defaults: false,
             ..Config::default()
         };
-        let args = json!({"path": "note.txt", "content": "hello"});
-        let plan = write_plan("write_file", &args, &cwd, &config)
-            .await
-            .expect("pre-write plan");
+        let plan = build_plan(
+            cwd.join("note.txt"),
+            "note.txt".to_string(),
+            String::new(),
+            "hello".to_string(),
+            &config,
+        );
         let plan = format_plan(plan, &cwd, &config).await;
         assert!(plan.formatted());
         assert!(plan.diff().contains("+helloX"), "{}", plan.diff());
@@ -2437,6 +2771,8 @@ mod tests {
             old: "hello\n".into(),
             new: "hello\n".into(),
             delete: false,
+            move_to: None,
+            move_label: None,
         }];
         let ops = format_patch_ops(ops, &cwd, &config).await;
         let diff = patch_diff(&ops, &config);
@@ -2579,19 +2915,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_plan_reports_a_unified_diff_and_hunks() {
+    async fn plan_reports_a_unified_diff_and_hunks() {
         let cwd = temp_cwd("diff");
         let config = Config::default();
         std::fs::write(cwd.join("a.txt"), "one\ntwo\nthree\n").unwrap();
 
-        let plan = write_plan(
-            "write_file",
-            &json!({"path": "a.txt", "content": "one\nTWO\nthree\n"}),
-            &cwd,
+        let plan = build_plan(
+            cwd.join("a.txt"),
+            "a.txt".to_string(),
+            "one\ntwo\nthree\n".to_string(),
+            "one\nTWO\nthree\n".to_string(),
             &config,
-        )
-        .await
-        .expect("write plan");
+        );
         let diff = plan.diff();
         assert!(diff.contains("--- a/a.txt"), "{diff}");
         assert!(diff.contains("+++ b/a.txt"), "{diff}");
@@ -2601,40 +2936,33 @@ mod tests {
         assert_eq!(hunks.len(), 1, "{hunks:?}");
         assert!(hunks[0].header.starts_with("@@ -1,3 +1,3 @@"), "{hunks:?}");
 
-        let added = write_plan(
-            "write_file",
-            &json!({"path": "new.txt", "content": "hello\n"}),
-            &cwd,
+        let added = build_plan(
+            cwd.join("new.txt"),
+            "new.txt".to_string(),
+            String::new(),
+            "hello\n".to_string(),
             &config,
-        )
-        .await
-        .expect("write plan");
+        );
         assert!(added.diff().contains("+hello"), "{}", added.diff());
 
-        assert!(
-            write_plan("exec_command", &json!({"command": "true"}), &cwd, &config)
-                .await
-                .is_none()
-        );
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[tokio::test]
-    async fn write_plan_applies_only_selected_hunks() {
+    async fn plan_applies_only_selected_hunks() {
         let cwd = temp_cwd("hunks");
         let config = Config::default();
         let original = "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\neighteen\nnineteen\ntwenty\n";
         std::fs::write(cwd.join("a.txt"), original).unwrap();
         // Two edits separated by enough context to stay distinct hunks.
         let edited = "one\nTWO\nthree\nfour\nfive\nsix\nseven\neight\nnine\nten\neleven\ntwelve\nthirteen\nfourteen\nfifteen\nsixteen\nseventeen\nEIGHTEEN\nnineteen\ntwenty\n";
-        let plan = write_plan(
-            "write_file",
-            &json!({"path": "a.txt", "content": edited}),
-            &cwd,
+        let plan = build_plan(
+            cwd.join("a.txt"),
+            "a.txt".to_string(),
+            original.to_string(),
+            edited.to_string(),
             &config,
-        )
-        .await
-        .expect("write plan");
+        );
         assert_eq!(plan.hunk_infos().len(), 2, "{:?}", plan.hunk_infos());
 
         // Selecting only the first hunk keeps the second edit out.
@@ -2651,28 +2979,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn write_plan_detects_a_changed_file() {
+    async fn plan_detects_a_changed_file() {
         let cwd = temp_cwd("guard");
         let config = Config::default();
         std::fs::write(cwd.join("a.txt"), "one").unwrap();
-        let plan = write_plan(
-            "write_file",
-            &json!({"path": "a.txt", "content": "two"}),
-            &cwd,
+        let plan = build_plan(
+            cwd.join("a.txt"),
+            "a.txt".to_string(),
+            "one".to_string(),
+            "two".to_string(),
             &config,
-        )
-        .await
-        .expect("write plan");
+        );
         assert!(plan.verify_unchanged().await.is_ok());
 
         std::fs::write(cwd.join("a.txt"), "external").unwrap();
         assert!(plan.verify_unchanged().await.is_err());
 
-        assert!(
-            write_plan("exec_command", &json!({"command": "true"}), &cwd, &config)
-                .await
-                .is_none()
-        );
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -2717,6 +3039,99 @@ mod tests {
         .await;
         assert!(out.ok);
         assert_eq!(out.output, "hi");
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn exec_command_options_and_escalation_notices() {
+        let args = json!({
+            "cmd": "ls",
+            "shell": "/bin/bash",
+            "login": false,
+            "tty": true,
+            "sandbox_permissions": "with_additional_permissions",
+            "additional_permissions": {
+                "network": {"enabled": true},
+                "file_system": {"read": ["/srv/data"], "write": ["/tmp/out"]}
+            },
+            "justification": "needs the dataset"
+        });
+        let options = command_options(&args);
+        assert_eq!(options.shell, Some("/bin/bash"));
+        assert_eq!(options.login, Some(false));
+        assert!(options.tty);
+        assert!(!options.escalated);
+        assert_eq!(options.additional_read, vec!["/srv/data".to_string()]);
+        assert_eq!(options.additional_write, vec!["/tmp/out".to_string()]);
+        assert!(options.additional_network);
+        assert_eq!(
+            escalation_reason(&args).as_deref(),
+            Some("command asks for additional permissions: needs the dataset")
+        );
+
+        // A plain command needs no special approval.
+        assert_eq!(command_options(&json!({"cmd": "ls"})).login, None);
+        assert!(escalation_reason(&json!({"cmd": "ls"})).is_none());
+        assert_eq!(
+            escalation_reason(&json!({"cmd": "ls", "sandbox_permissions": "require_escalated"}))
+                .as_deref(),
+            Some("command asks to run outside the sandbox")
+        );
+        assert!(
+            escalation_reason(&json!({"cmd": "ls", "sandbox_permissions": "use_default"}))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn command_plan_uses_a_login_shell_unless_told_otherwise() {
+        let cwd = temp_cwd("plan-shell");
+        let mut config = Config::default();
+        config.tools.sandbox = SandboxMode::Off;
+        let login = json!({"cmd": "printf hi", "shell": "/bin/bash"});
+        let plan = command_plan_with(
+            "printf hi",
+            None,
+            &cwd,
+            None,
+            &config,
+            command_options(&login),
+        )
+        .expect("plan");
+        assert_eq!(plan.program, "/bin/bash");
+        assert_eq!(
+            plan.args,
+            vec![std::ffi::OsString::from("-lc"), "printf hi".into()]
+        );
+
+        let plain = json!({"cmd": "printf hi", "shell": "/bin/sh", "login": false});
+        let plan = command_plan_with(
+            "printf hi",
+            None,
+            &cwd,
+            None,
+            &config,
+            command_options(&plain),
+        )
+        .expect("plan");
+        assert_eq!(
+            plan.args,
+            vec![std::ffi::OsString::from("-c"), "printf hi".into()]
+        );
+
+        // require_escalated always skips bwrap, even when the sandbox is on.
+        config.tools.sandbox = SandboxMode::Auto;
+        let escalated = json!({"cmd": "printf hi", "sandbox_permissions": "require_escalated"});
+        let plan = command_plan_with(
+            "printf hi",
+            None,
+            &cwd,
+            None,
+            &config,
+            command_options(&escalated),
+        )
+        .expect("plan");
+        assert_ne!(plan.program, "bwrap");
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -2984,7 +3399,9 @@ mod tests {
         assert!(
             summarize("plugin__acme__deploy", &json!({"env": "prod"})).contains("\"env\":\"prod\"")
         );
-        assert!(is_known("ask_user"));
+        assert!(is_known("request_user_input"));
+        assert!(is_known("update_plan"));
+        assert!(is_known("tool_search"));
         assert!(is_known("apply_patch"));
         assert!(hard_mutating("apply_patch"));
         assert!(hard_mutating("write_stdin"));
@@ -2993,41 +3410,51 @@ mod tests {
     }
 
     #[test]
-    fn ask_user_parses_options_and_rejects_bad_input() {
-        let (question, options) = ask_user_args(&json!({
-            "question": "Which store?",
-            "options": [
-                {"label": "SQLite", "description": "embedded"},
-                "Postgres"
-            ]
+    fn request_user_input_parses_questions_and_rejects_bad_input() {
+        let questions = request_user_input_args(&json!({
+            "questions": [{
+                "id": "store",
+                "header": "Store",
+                "question": "Which store?",
+                "options": [
+                    {"label": "SQLite", "description": "embedded"},
+                    {"label": "Postgres", "description": "server"}
+                ]
+            }]
         }))
         .expect("valid args");
-        assert_eq!(question, "Which store?");
-        assert_eq!(options.len(), 2);
-        assert_eq!(options[0].label, "SQLite");
-        assert_eq!(options[0].description.as_deref(), Some("embedded"));
-        assert_eq!(options[1].label, "Postgres");
-        assert_eq!(options[1].description, None);
+        assert_eq!(questions.len(), 1);
+        assert_eq!(questions[0].id, "store");
+        assert_eq!(questions[0].header, "Store");
+        assert_eq!(questions[0].options[0].label, "SQLite");
+        assert_eq!(
+            questions[0].options[0].description.as_deref(),
+            Some("embedded")
+        );
 
-        // Too few, too many, empty labels and a missing question all fail.
-        assert!(ask_user_args(&json!({"question": "q", "options": ["only"]})).is_err());
-        assert!(ask_user_args(&json!({"question": "q", "options": ["a", ""]})).is_err());
-        assert!(ask_user_args(&json!({"question": "  ", "options": ["a", "b"]})).is_err());
-        let seven: Vec<String> = (0..7).map(|n| format!("o{n}")).collect();
-        assert!(ask_user_args(&json!({"question": "q", "options": seven})).is_err());
-    }
-
-    #[test]
-    fn format_read_pages_with_line_numbers() {
-        let text = "a\nb\nc\nd\ne\n";
-        let page = format_read(text, 2, 2, 4096);
-        assert!(page.contains("2: b"), "{page}");
-        assert!(page.contains("3: c"), "{page}");
-        assert!(!page.contains("1: a"), "{page}");
-        assert!(page.contains("2 more lines"), "{page}");
-
-        let past = format_read(text, 99, 2, 4096);
-        assert!(past.contains("past the end"), "{past}");
+        // Missing fields, duplicate ids, too few/many options and empty
+        // questions all fail.
+        let question = json!({
+            "id": "q",
+            "header": "Q",
+            "question": "Pick",
+            "options": [{"label": "a", "description": "x"}, {"label": "b", "description": "y"}]
+        });
+        assert!(request_user_input_args(&json!({"questions": []})).is_err());
+        assert!(request_user_input_args(
+            &json!({"questions": [question.clone(), question.clone()]})
+        )
+        .is_err());
+        assert!(request_user_input_args(&json!({
+            "questions": [{"id": "q", "header": "Q", "question": "Pick", "options": [{"label": "a", "description": "x"}]}]
+        }))
+        .is_err());
+        assert!(request_user_input_args(&json!({
+            "questions": [{"id": "q", "header": "Q", "question": "  ", "options": [
+                {"label": "a", "description": "x"}, {"label": "b", "description": "y"}
+            ]}]
+        }))
+        .is_err());
     }
 
     #[tokio::test]
@@ -3072,5 +3499,29 @@ mod tests {
         .await;
         assert!(!missing.ok);
         let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn capped_output_says_where_to_continue() {
+        let text: String = (1..=50).map(|n| format!("line {n}\n")).collect();
+        let capped = cap_output(text, 100);
+        assert!(capped.contains("showed lines 1-13 of 50"), "{capped}");
+        assert!(capped.contains("continue from line 14"), "{capped}");
+        assert!(capped.starts_with("line 1\n"));
+
+        // A single over-long line has no useful range to resume from.
+        let one_line = cap_output("x".repeat(200), 50);
+        assert!(one_line.contains("first line is longer"), "{one_line}");
+        assert!(!one_line.contains("continue from line"));
+    }
+
+    #[test]
+    fn binary_output_is_detected() {
+        assert!(!looks_binary("plain text\n"));
+        assert!(!looks_binary(""));
+        assert!(looks_binary("\u{7f}ELF\u{0}\u{0}\u{0}"));
+        // Isolated replacement glyphs from a split UTF-8 sequence are fine.
+        assert!(!looks_binary("hello \u{FFFD} world, mostly text"));
+        assert!(looks_binary(&"\u{FFFD}".repeat(64)));
     }
 }

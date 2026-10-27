@@ -11,13 +11,13 @@
 //! protocol: it translates in both directions and advertises only the
 //! capabilities it implements (text prompts, embedded text context, load).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use eix_core::{
     ApprovalDecision, ApprovalScope, AssistantMessagePayload, AttachResult, Endpoint, Event,
-    EventKind, Session, SessionMode, SessionResult, SubmitResult, ToolCallPayload,
+    EventKind, InputQuestion, Session, SessionMode, SessionResult, SubmitResult, ToolCallPayload,
     ToolResultPayload, UserMessagePayload,
 };
 use serde_json::{json, Value};
@@ -118,7 +118,12 @@ enum Pending {
     Input {
         session_id: String,
         input_id: String,
-        options: HashMap<String, usize>,
+        call_id: String,
+        /// Questions still to ask, answered in order.
+        questions: Vec<InputQuestion>,
+        answers: BTreeMap<String, Vec<String>>,
+        tab: usize,
+        by_id: HashMap<String, usize>,
     },
 }
 
@@ -277,10 +282,32 @@ impl Bridge {
             Pending::Input {
                 session_id,
                 input_id,
-                options,
+                call_id,
+                questions,
+                mut answers,
+                tab,
+                by_id,
             } => {
                 if selected {
-                    if let Some(index) = option.and_then(|option| options.get(option)) {
+                    let choice = option
+                        .and_then(|option| by_id.get(option))
+                        .and_then(|index| questions.get(tab).and_then(|q| q.options.get(*index)));
+                    let Some(choice) = choice else {
+                        return Ok(());
+                    };
+                    if let Some(question) = questions.get(tab) {
+                        answers.insert(question.id.clone(), vec![choice.label.clone()]);
+                    }
+                    if tab + 1 < questions.len() {
+                        self.ask_input_question(
+                            &session_id,
+                            &input_id,
+                            &call_id,
+                            questions,
+                            answers,
+                            tab + 1,
+                        );
+                    } else {
                         let _ = self
                             .requester
                             .request(
@@ -288,7 +315,7 @@ impl Bridge {
                                 json!({
                                     "session_id": session_id,
                                     "input_id": input_id,
-                                    "option_index": index
+                                    "answers": answers,
                                 }),
                             )
                             .await;
@@ -723,27 +750,42 @@ impl Bridge {
         let Some(call_id) = params.get("call_id").and_then(Value::as_str) else {
             return;
         };
-        let question = params
-            .get("question")
-            .and_then(Value::as_str)
-            .unwrap_or("The agent needs an answer");
-        let Some(items) = params.get("options").and_then(Value::as_array) else {
-            return;
-        };
-        if items.is_empty() {
+        let questions: Vec<InputQuestion> = params
+            .get("questions")
+            .and_then(|questions| serde_json::from_value(questions.clone()).ok())
+            .unwrap_or_default();
+        if questions.is_empty() {
             return;
         }
+        self.ask_input_question(session_id, input_id, call_id, questions, BTreeMap::new(), 0);
+    }
+
+    /// Ask one question of a `request_user_input` batch. ACP has no tabs, so
+    /// the adapter asks each question in turn and only sends `input.respond`
+    /// once every answer is collected.
+    fn ask_input_question(
+        &mut self,
+        session_id: &str,
+        input_id: &str,
+        call_id: &str,
+        questions: Vec<InputQuestion>,
+        answers: BTreeMap<String, Vec<String>>,
+        tab: usize,
+    ) {
+        let Some(question) = questions.get(tab) else {
+            return;
+        };
         let mut options = Vec::new();
         let mut by_id = HashMap::new();
-        for (index, item) in items.iter().enumerate() {
-            let label = item
-                .get("label")
-                .and_then(Value::as_str)
-                .unwrap_or("Option");
-            let description = item.get("description").and_then(Value::as_str);
-            let name = match description {
-                Some(description) => format!("{label} — {description}"),
-                None => label.to_string(),
+        for (index, item) in question.options.iter().enumerate() {
+            let name = match item
+                .description
+                .as_deref()
+                .map(str::trim)
+                .filter(|description| !description.is_empty())
+            {
+                Some(description) => format!("{} — {description}", item.label),
+                None => item.label.clone(),
             };
             let option_id = format!("option-{index}");
             by_id.insert(option_id.clone(), index);
@@ -759,6 +801,11 @@ impl Bridge {
             "kind": "reject_once"
         }));
 
+        let title = if questions.len() > 1 {
+            format!("{} ({}/{})", question.header, tab + 1, questions.len())
+        } else {
+            question.question.clone()
+        };
         let key = (session_id.to_string(), call_id.to_string());
         if self.announced.insert(key) {
             self.notify(
@@ -768,8 +815,8 @@ impl Bridge {
                     "update": {
                         "sessionUpdate": "tool_call",
                         "toolCallId": call_id,
-                        "name": "ask_user",
-                        "title": question,
+                        "name": "request_user_input",
+                        "title": question.question,
                         "kind": "other",
                         "status": "pending"
                     }
@@ -784,7 +831,11 @@ impl Bridge {
             Pending::Input {
                 session_id: session_id.to_string(),
                 input_id: input_id.to_string(),
-                options: by_id,
+                call_id: call_id.to_string(),
+                questions,
+                answers,
+                tab,
+                by_id,
             },
         );
         self.request(
@@ -794,8 +845,8 @@ impl Bridge {
                 "sessionId": session_id,
                 "toolCall": {
                     "toolCallId": call_id,
-                    "name": "ask_user",
-                    "title": question,
+                    "name": "request_user_input",
+                    "title": title,
                     "kind": "other",
                     "status": "pending"
                 },
@@ -1204,14 +1255,12 @@ fn mode_state(mode: SessionMode) -> Value {
 
 fn tool_kind(tool: &str) -> &'static str {
     match tool {
-        "read_file" | "list_dir" | "view_image" | "mcp_read_resource" | "mcp_list_resources" => {
-            "read"
-        }
-        "write_file" | "edit" | "patch" | "apply_patch" | "mcp_call_tool" => "edit",
-        "grep" | "glob" | "web_search" => "search",
-        "exec_command" | "run_command" | "start_command" | "write_stdin" => "execute",
-        "webfetch" | "web_fetch" => "fetch",
-        "ask_user" => "other",
+        "view_image" | "mcp_read_resource" | "mcp_list_resources" => "read",
+        "apply_patch" | "mcp_call_tool" => "edit",
+        "web_search" => "search",
+        "exec_command" | "write_stdin" => "execute",
+        "web_fetch" => "fetch",
+        "request_user_input" => "other",
         _ => "other",
     }
 }
@@ -1246,10 +1295,10 @@ mod tests {
 
     #[test]
     fn tool_kinds_cover_the_common_tools() {
-        assert_eq!(tool_kind("read_file"), "read");
-        assert_eq!(tool_kind("write_file"), "edit");
-        assert_eq!(tool_kind("run_command"), "execute");
-        assert_eq!(tool_kind("grep"), "search");
-        assert_eq!(tool_kind("webfetch"), "fetch");
+        assert_eq!(tool_kind("view_image"), "read");
+        assert_eq!(tool_kind("apply_patch"), "edit");
+        assert_eq!(tool_kind("exec_command"), "execute");
+        assert_eq!(tool_kind("web_search"), "search");
+        assert_eq!(tool_kind("web_fetch"), "fetch");
     }
 }

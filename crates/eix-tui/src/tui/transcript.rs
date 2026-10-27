@@ -11,8 +11,8 @@ use std::collections::HashMap;
 
 use eix_core::{
     ApprovalRequiredPayload, AssistantMessagePayload, ContextCompactedPayload,
-    Event as SessionEvent, EventKind, PatchProposedPayload, PatchResultPayload, ToolCallPayload,
-    ToolResultPayload, UserMessagePayload,
+    Event as SessionEvent, EventKind, InputRequiredPayload, PatchProposedPayload,
+    PatchResultPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -776,7 +776,7 @@ fn collect_into(
                             Block::Tool(Box::new(ToolBlock {
                                 seq: event.seq,
                                 call_id: payload.call_id,
-                                tool: "write_file".into(),
+                                tool: "apply_patch".into(),
                                 arguments: Value::Null,
                                 result: None,
                                 approval: None,
@@ -1264,30 +1264,6 @@ fn tool_block(
         if let Some(diff) = patch_diff {
             push_diff(out, diff_path(block), diff, width, theme, fold);
         }
-        // A write with no diff data (including events recorded by older
-        // daemons) still shows what is being written. An approval or patch
-        // diff already carries the change; do not print the whole content a
-        // second time when the block opens by default.
-        let approval_diff = block
-            .approval
-            .as_ref()
-            .and_then(|approval| approval.diff.as_deref())
-            .is_some();
-        let patch_diff = block
-            .patch
-            .as_ref()
-            .and_then(|patch| patch.diff.as_deref())
-            .is_some();
-        if !approval_diff && !patch_diff && block.tool == "write_file" {
-            if let Some(content) = block
-                .arguments
-                .get("content")
-                .and_then(Value::as_str)
-                .filter(|text| !text.is_empty())
-            {
-                push_output(out, content.trim_end(), width, theme, fold);
-            }
-        }
         if let Some(result) = &block.result {
             push_output(out, result.output.trim_end(), width, theme, fold);
         } else if block.approval.is_some() {
@@ -1633,8 +1609,16 @@ fn activity_lines(event: &SessionEvent) -> Vec<String> {
             }
         }
         EventKind::InputRequired => {
-            if let Some(question) = event.payload.get("question").and_then(Value::as_str) {
-                lines.push(format!("? {}", first_line(question)));
+            if let Ok(payload) = InputRequiredPayload::deserialize(&event.payload) {
+                if let Some(question) = payload.questions.first() {
+                    let extra = payload.questions.len().saturating_sub(1);
+                    let suffix = if extra > 0 {
+                        format!(" (+{extra} more)")
+                    } else {
+                        String::new()
+                    };
+                    lines.push(format!("? {}{suffix}", first_line(&question.question)));
+                }
             }
         }
         EventKind::Error => {
@@ -1749,13 +1733,13 @@ fn status_color(block: &ToolBlock, theme: Theme) -> Color {
 const BODY_INDENT: &str = "    ";
 
 fn is_command_tool(tool: &str) -> bool {
-    matches!(tool, "exec_command" | "run_command" | "start_command")
+    matches!(tool, "exec_command")
 }
 
 /// Tools whose result is a reviewable file change. Their compact card already
 /// prints the path, so the expanded body is just the side-by-side diff.
 pub(super) fn is_file_change_tool(tool: &str) -> bool {
-    matches!(tool, "write_file" | "edit" | "patch" | "apply_patch")
+    matches!(tool, "apply_patch")
 }
 
 /// The expanded argument detail, tailored to the tool. The header already
@@ -1769,7 +1753,7 @@ fn detail_text(block: &ToolBlock) -> String {
             .unwrap_or_default()
     };
     match block.tool.as_str() {
-        "exec_command" | "run_command" | "start_command" => {
+        "exec_command" => {
             let cwd = string("workdir");
             let cwd = if cwd.is_empty() { string("cwd") } else { cwd };
             if cwd.is_empty() {
@@ -1780,8 +1764,7 @@ fn detail_text(block: &ToolBlock) -> String {
         }
         // The diff preview carries the change; raw old/new strings or
         // `patchText` would only duplicate it.
-        "read_file" | "list_dir" | "write_file" | "edit" | "patch" | "apply_patch"
-        | "view_image" => String::new(),
+        "apply_patch" | "view_image" => String::new(),
         "spawn_agent" => {
             let name = string("name");
             let prompt = string("prompt");

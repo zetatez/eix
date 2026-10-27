@@ -1,4 +1,4 @@
-//! Optional bubblewrap isolation for `run_command`.
+//! Optional bubblewrap isolation for `exec_command`.
 //!
 //! The sandbox keeps the host read-only and exposes only the session workspace
 //! as writable, so a command cannot touch files outside it even when it ignores

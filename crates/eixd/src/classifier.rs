@@ -351,8 +351,8 @@ mod tests {
             &ClassifierInput {
                 workspace: Path::new("/tmp/eix-classifier"),
                 mode: SessionMode::Auto,
-                tool: "run_command",
-                args: &json!({"command": "git commit -m test"}),
+                tool: "exec_command",
+                args: &json!({"cmd": "git commit -m test"}),
                 risk: &risk,
                 intent: &intent,
             },

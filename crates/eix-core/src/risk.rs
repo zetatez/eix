@@ -115,6 +115,12 @@ pub struct RiskAssessment {
     pub hard_deny: bool,
     /// The path was explicitly listed in `tools.external_directory`.
     pub external_allowed: bool,
+    /// First shell argument that leaves the workspace through `..` or a
+    /// symlink. Absolute paths and `~` are ordinary external reads; this one
+    /// is a boundary escape and the permission layer refuses it unless
+    /// `tools.external_directory` names the target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_escape: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub analysis: Option<CommandAnalysis>,
 }
@@ -169,6 +175,9 @@ impl RiskAssessment {
         }
         self.hard_deny |= other.hard_deny;
         self.external_allowed |= other.external_allowed;
+        if self.workspace_escape.is_none() {
+            self.workspace_escape = other.workspace_escape;
+        }
         if self.analysis.is_none() {
             self.analysis = other.analysis;
         }
@@ -3010,6 +3019,13 @@ fn homeish_path(target: &str) -> Option<std::path::PathBuf> {
         .map(|rest| home.join(rest))
 }
 
+/// Lexically resolve `.` and `..` without touching the filesystem. Callers
+/// that must compare against an allowlist use this so `a/../../b` cannot sneak
+/// past a prefix check.
+pub fn normalize_path(path: &Path) -> std::path::PathBuf {
+    lexical_normalize(path)
+}
+
 fn lexical_normalize(path: &Path) -> std::path::PathBuf {
     let absolute = path.is_absolute();
     let mut parts: Vec<String> = Vec::new();
@@ -4524,6 +4540,9 @@ fn classify_read_file(program: &str, path: &str, cwd: &Path, risk: &mut RiskAsse
             RiskLevel::Medium,
             format!("{program} reads outside the workspace: {path}"),
         );
+        if is_workspace_escape(path, cwd) && risk.workspace_escape.is_none() {
+            risk.workspace_escape = Some(path.to_string());
+        }
     } else {
         risk.add(
             RiskCategory::Read,
@@ -4669,6 +4688,35 @@ fn is_outside_workspace(path: &str, cwd: &Path) -> bool {
         .canonicalize()
         .unwrap_or_else(|_| lexical_normalize(&joined));
     !joined.starts_with(root)
+}
+
+/// True when a relative read leaves the workspace through `..` or a symlink
+/// whose target is outside. Absolute paths and `~` are explicit external reads
+/// (they ask); this is the silent boundary crossing shell reads refuse.
+fn is_workspace_escape(path: &str, cwd: &Path) -> bool {
+    let path = path.trim();
+    if path.is_empty()
+        || path.starts_with('~')
+        || path.contains('$')
+        || contains_command_substitution_marker(path)
+    {
+        return false;
+    }
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return false;
+    }
+    let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let joined = cwd.join(candidate);
+    let lexical = lexical_normalize(&joined);
+    if !lexical.starts_with(&root) {
+        return true;
+    }
+    // The path is inside lexically; only a symlink can still point out.
+    joined
+        .canonicalize()
+        .map(|real| !real.starts_with(&root))
+        .unwrap_or(false)
 }
 
 /// Risk for reading `path` with a file tool.
@@ -5135,32 +5183,32 @@ mod tests {
     #[test]
     fn command_prefix_matching_requires_all_segments() {
         let rule = crate::config::PermissionRule {
-            tool: "run_command".into(),
+            tool: "exec_command".into(),
             command: Some(vec!["cargo".into(), "test".into()]),
             ..Default::default()
         };
         assert!(rule.matches(
-            "run_command",
-            &serde_json::json!({"command": "cargo test --all"})
+            "exec_command",
+            &serde_json::json!({"cmd": "cargo test --all"})
         ));
         assert!(!rule.matches(
-            "run_command",
-            &serde_json::json!({"command": "cargo test && rm -rf /"})
+            "exec_command",
+            &serde_json::json!({"cmd": "cargo test && rm -rf /"})
         ));
         assert!(!rule.matches(
-            "run_command",
-            &serde_json::json!({"command": "cargo test > /etc/passwd"})
+            "exec_command",
+            &serde_json::json!({"cmd": "cargo test > /etc/passwd"})
         ));
 
         let deny = crate::config::PermissionRule {
-            tool: "run_command".into(),
+            tool: "exec_command".into(),
             command: Some(vec!["rm".into()]),
             action: PermissionAction::Deny,
             ..Default::default()
         };
         assert!(deny.matches(
-            "run_command",
-            &serde_json::json!({"command": "echo hi && rm -rf build"})
+            "exec_command",
+            &serde_json::json!({"cmd": "echo hi && rm -rf build"})
         ));
         assert!(assess_command("cargo test && rm -rf /", &cwd()).hard_deny);
         assert!(assess_command("echo x > /etc/passwd && true", &cwd())
@@ -5196,6 +5244,52 @@ mod tests {
             PermissionAction::Ask,
             "{glob_traversal:?}"
         );
+    }
+
+    #[test]
+    fn relative_escapes_are_flagged_but_explicit_external_reads_are_not() {
+        let escaped = assess_command("cat ../../etc/passwd", &cwd());
+        assert_eq!(
+            escaped.workspace_escape.as_deref(),
+            Some("../../etc/passwd"),
+            "{escaped:?}"
+        );
+
+        // Absolute paths and `~` are explicit external reads: they ask rather
+        // than being refused outright.
+        for command in ["cat /etc/hosts", "cat ~/.gitconfig", "cat src/main.rs"] {
+            let risk = assess_command(command, &cwd());
+            assert!(risk.workspace_escape.is_none(), "{command}: {risk:?}");
+        }
+
+        // A command that never reads a file argument is unaffected.
+        let build = assess_command("cargo test", &cwd());
+        assert!(build.workspace_escape.is_none(), "{build:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinks_that_leave_the_workspace_are_flagged() {
+        let base = std::env::temp_dir().join(format!("eix-risk-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("ws")).unwrap();
+        std::fs::create_dir_all(base.join("outside")).unwrap();
+        std::fs::write(base.join("outside/secret.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(base.join("outside"), base.join("ws/link")).unwrap();
+        std::fs::create_dir_all(base.join("ws/inside")).unwrap();
+        std::fs::write(base.join("ws/inside/file.txt"), "y").unwrap();
+        std::os::unix::fs::symlink(base.join("ws/inside"), base.join("ws/inner")).unwrap();
+
+        let risk = assess_command("cat link/secret.txt", &base.join("ws"));
+        assert_eq!(
+            risk.workspace_escape.as_deref(),
+            Some("link/secret.txt"),
+            "{risk:?}"
+        );
+        // A symlink that resolves inside stays a normal workspace read.
+        let inside = assess_command("cat inner/file.txt", &base.join("ws"));
+        assert!(inside.workspace_escape.is_none(), "{inside:?}");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

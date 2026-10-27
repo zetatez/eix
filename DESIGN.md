@@ -169,7 +169,7 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
   和 `eix log` 可见，不进入 provider 的 chat context。
 - rebase 冲突、测试失败、无测试命令、dirty base 或 merge 失败把错误注入 session
   （`repairing`），agent 在 worktree 内解决、跑测试、再次 `eix ready`，需要人工决定时可用
-  `ask_user`。失败发生在 agent 当前 turn 尚未结束时先标记 `repair pending`，等 turn 结束后
+  `request_user_input`。失败发生在 agent 当前 turn 尚未结束时先标记 `repair pending`，等 turn 结束后
   再注入。`conflict_repair=false` 时只重试并通知。
 - 连续失败达到 `notify_after` 发 `integration.attention`；`pause_after>0` 时暂停等待
   `integration.continue`；同一错误连续 3 次也会自动暂停，避免重复无效重试。
@@ -573,19 +573,24 @@ Ctrl-J/K or j/k select · Enter confirm · 1-9 jump · y/n · x cancel
 - `y` 应用选中（未选中则全部），`n` 拒绝。
 - 冲突检测：文件在 stage 后被外部修改 → 标红并要求重新 stage。
 
-### 9.2.1 ask_user（已实现）
+### 9.2.1 request_user_input（已实现）
 
-模型可调用 `ask_user {question, options}`（2-6 项，第一项是推荐项），用于需求歧义、
-破坏性选择或无法推断的偏好。daemon 追加 `input_required` 事件、广播 `input.required`、
-把 session 切到 `awaiting_input` 并阻塞 turn；TUI 在 pane 底部显示同样风格的选项卡片。
+模型可调用 `request_user_input {questions: [{id, header, question, options}]}`，1-3 个问题、
+每题 2-3 个互斥选项（第一项为推荐项），用于需求歧义、破坏性选择或无法推断的偏好。
+daemon 追加 `input_required` 事件、广播 `input.required`、把 session 切到 `awaiting_input`
+并阻塞 turn；TUI 在 pane 底部显示卡片。
 
-- 选项按 Markdown checkbox 渲染（`- [ ]` / `- [x]`，`[x]` 为当前高亮项）；
-  按键：`Ctrl-J`/`Ctrl-K`（或 `j`/`k`、`C-n`/`C-p`）移动，`Enter` 确认，`1-9` 直选；
-  `x` 取消整个 turn。pane 太矮时列表随光标滚动，保证高亮项可见。
-- 用户选择后 daemon 追加 `input_answered`，把选项 label（有 description 时附在 `—` 后）
-  作为 tool result 回给模型，并把状态切回 `running`。
-- 协议：`input.respond {session_id, input_id?, option_index}`；空 `input_id` 表示当前问题。
-  `eix answer N` 是无头等价物；`prompt.cancel` 会关闭等待中的问题。
+- TUI 每个问题一个 tab：`Tab` / `←→` 切换，`j`/`k` 移动，`Enter` 确认并跳到下一个未答
+  问题，`1-9` 直选，`x` 取消整个 turn。tab 标题带 `✓` / `·` 表示是否已答。
+- 每题选项后自动追加一行 `Other…`；`Enter` 进入自由输入，`Esc` 退出编辑，`Enter` 提交。
+- 全部问题答完后一次性提交；daemon 追加 `input_answered`，把每题答案（选项 label，
+  有 description 时附在 `—` 后）作为 tool result 回给模型，状态切回 `running`。
+- 协议：`input.respond {session_id, input_id?, answers: {<question id>: [value]}}`；
+  空 `input_id` 表示当前请求，缺答或有未知 id 时返回 `accepted: false` 并保持等待。
+  旧的 `option_index`（0 基）仍被接受，只映射到第一个问题。
+  `eix answer <id>=<value>...` 是无头等价物；单问题请求也可用 `eix answer N`。
+- ACP 没有 tab：按问题顺序逐个发 `session/request_permission`，收齐后一次
+  `input.respond`；任一问题取消则取消整个 turn。
 - 子 agent 不能提问（没有 UI，会阻塞父 turn）。
 
 ### 9.3 权限策略
@@ -692,8 +697,8 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   改动视为用户改动（只在阻塞任务时才问）、不修无关问题；单条命令能答的简单请求直接执行，
   只有错误假设会影响结果时才问；用用户的语言回复。
   How to work 不写死阶段，而是给判断原则，由模型按任务规模决定展开多少：先读最窄代码和
-  调用点，能靠上下文判断就少用工具；大或模糊的任务才计划，跳过直接任务和单步计划，`todo`
-  逐项完成即更新；改动修根因、复用 helper、保持相关调用面一致、默认 ASCII；验证以“足以
+  调用点，能靠上下文判断就少用工具；大或模糊的任务才计划，跳过直接任务和单步计划，
+  `update_plan` 随步骤完成更新；改动修根因、复用 helper、保持相关调用面一致、默认 ASCII；验证以“足以
   信任结果”为准，跑可能失败的检查、覆盖边界/错误路径、看 diff、不重复未变化的检查、不为
   通过而改测试，跑不了就说明。
   Communication 段要求编辑前说明改什么、分组工具调用前说明做什么和为什么，长任务约每 30 秒
@@ -867,10 +872,12 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 - 工具执行、staging、审批、diff hunk、沙箱、自动上下文管理、process view。
 
-> 实现快照（2026-10-18，进行中）：工具调用与审批门禁已落地。daemon 暴露
-> `read_file` / `list_dir`（只读，自动放行）和 `write_file` / `run_command`（需审批），
-> 所有路径经 workspace 沙箱（拒绝 `..` 与 symlink 逃逸），输出按字节截断，
-> `run_command` 带超时。provider 侧支持 OpenAI `tools` / `tool_calls` 的流式增量累积，
+> 实现快照（2026-10-18，2026-10-28 更新）：工具调用与审批门禁已落地。daemon 暴露
+> `apply_patch`（唯一写入入口）、`exec_command` / `write_stdin`（同步命令与后台会话）、
+> `view_image` 等只读工具；读文件和检索统一用 `exec_command` 里的 `rg` / `sed` / `cat`。
+> 所有路径经 workspace 沙箱（相对 `..` 与 symlink 逃逸一律拒绝，`tools.external_directory`
+> 是唯一豁免），输出按字节截断，`exec_command` 带超时并可为长任务返回后台会话 id。
+> provider 侧支持 OpenAI `tools` / `tool_calls` 的流式增量累积，
 > 一次 turn 不设固定工具往返上限：模型返回不含工具调用的回答即结束，用户可随时中断；
 > 重复相同的工具批次会被 doomloop 守卫提前终止。每轮写入
 > `tool_call` / `approval_required` / `tool_result` 事件并广播
@@ -878,35 +885,30 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
 > 选中的 hunk）。
 > 策略：`SessionMode`（`plan` / `build` / `auto` / `bypass`）加 `[[tools.rules]]`；低/中风险
-> `write_file` / `edit` 在 workspace-write 模式（`build` / `auto`）下默认直接应用，
-> `auto_apply_workspace_edits = false` 时改为
-> stage 并生成 unified diff 和逐 hunk 预览、随 `patch_proposed` 事件广播，TUI 卡片与
-> `d` 全屏审阅将 unified diff 转成左旧右新的 side-by-side 视图（syntax highlight，窄宽回退
-> unified），CLI 保留 unified 输出。高风险/forced ask 写入不 stage，直接弹出带风险元数据的审批
-> 卡片。`d` 审阅里 `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/
-> 全不选、`y` 只应用选中的 hunk（全选时整文件），`n` 拒绝；`patch.apply` / `approval.respond`
-> 接受可选 `hunks` 索引列表。应用时用基准内容拼出结果再落盘，并重新校验文件内容：
-> stage 后被外部修改则记 conflict、不覆盖。
-> `run_command` 默认用 bubblewrap 隔离（`[tools] sandbox = auto|required|off`，
+> `apply_patch` 在 workspace-write 模式（`build` / `auto`）下默认直接应用，否则阻塞审批并
+> 展示 unified diff 与逐 hunk 预览，TUI 卡片与 `d` 全屏审阅将 unified diff 转成左旧右新的
+> side-by-side 视图（syntax highlight，窄宽回退 unified），CLI 保留 unified 输出。
+> 高风险/forced ask 写入不自动应用，直接弹出带风险元数据的审批卡片。`d` 审阅里
+> `[`/`]`（或 `J`/`K`）跳 hunk、`Space` 勾选、`a` 全选/全不选、`y` 只应用选中的 hunk
+> （全选时整文件），`n` 拒绝；`patch.apply` / `approval.respond` 接受可选 `hunks` 索引列表。
+> 应用时用基准内容拼出结果再落盘，并重新校验文件内容：审批后被外部修改则记 conflict、不覆盖。
+> `exec_command` 默认用 bubblewrap 隔离（`[tools] sandbox = auto|required|off`，
 > `sandbox_network` 控制是否 `--unshare-net`，`sandbox_read_paths` 逐个只读挂载工具链缓存，
 > `sandbox_writable_roots` 额外开放目录）：系统只读、仅 session workspace 可写、`/tmp`
 > 为私有 tmpfs，默认不挂载整个 `$HOME`。bwrap 缺失时 `auto` 把需要沙箱的命令降级为强制
 > 审批，`required` 直接阻断。
-> 执行前快照已落地：`write_file` 复制目标文件（含“原本不存在”这一事实），`run_command`
-> 复制整个 workspace；排除 `.git` / `target` / `node_modules` / `.venv` / `dist` 等派生目录，
-> 单文件 8 MB、总量 200 MB、条目 5 万上限，跳过数与失败都记入 `snapshot` 事件（失败时工具
-> 输出也带一行说明），每个 session 保留 20 份。`Snapshotter::restore` 已实现并有测试覆盖，
-> 供 Phase 3 的 rewind 调用；事件日志只存索引，快照字节在 `<data>/snapshots/<session>/<id>/`。
-> `[tools] snapshots = false` 可在大仓库里关闭。
-> Staged shadow workspace 已落地：关闭 `auto_apply_workspace_edits` 后，低/中风险 `write_file` /
-> `edit` 先把提案写入
-> `<data>/staging/<session>/<patch_id>.json` 并立即返回 `staged ...`，turn 不阻塞；
-> `read_file` / `list_dir` 看到“真实工作区 + staged”合并视图，同一文件再次写入以最新
-> staged 内容为基准，可以叠加。`patch.proposed|applied|rejected|conflict` 事件与同名通知
-> 已接入，`patch.apply` / `patch.reject`（以及 `approval.respond` + patch id）负责落盘或
-> 丢弃；落盘前重新校验基准，stage 后被外部修改则记 `patch_conflict` 且不覆盖。单文件快照
-> 改为应用补丁时抓取。pending 补丁跨 daemon 重启恢复；TUI 卡片、attention、`eix approve` /
-> `eix deny`、`eix log` 均已支持补丁。`run_command` 无法 stage，仍在审批处阻塞。
+> 执行前快照已落地：`apply_patch` 复制它要改的文件（含“原本不存在”这一事实），
+> `exec_command` 复制整个 workspace；排除 `.git` / `target` / `node_modules` / `.venv` /
+> `dist` 等派生目录，单文件 8 MB、总量 200 MB、条目 5 万上限，跳过数与失败都记入 `snapshot`
+> 事件（失败时工具输出也带一行说明），每个 session 保留 20 份。`Snapshotter::restore` 已实现
+> 并有测试覆盖，供 Phase 3 的 rewind 调用；事件日志只存索引，快照字节在
+> `<data>/snapshots/<session>/<id>/`。`[tools] snapshots = false` 可在大仓库里关闭。
+> Staging store 仅保留给历史 pending 补丁：新的模型编辑直接走 `apply_patch`，不再生成 staged
+> 补丁；daemon 仍能恢复并 `patch.apply` / `patch.reject` 旧的
+> `<data>/staging/<session>/<patch_id>.json`，落盘前重新校验基准，被外部修改则记
+> `patch_conflict` 且不覆盖。pending 补丁跨 daemon 重启恢复；TUI 卡片、attention、
+> `eix approve` / `eix deny`、`eix log` 均已支持补丁。`exec_command` 直接读写真实工作区，
+> 因此与补丁审批串行，shell 看到的是已落盘内容。
 > Context ledger 是内部机制：`eixd/src/context.rs` 从事件日志重建 provider 上下文并按 sector
 > 记账（system 5% / instructions 5% / workspace 15% / history 60% / tools 10% / memory 5%），
 > 不向普通用户暴露 ledger 或手动 drop / pin 命令。
@@ -916,17 +918,15 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 一条），system / instructions / workspace / memory 不自动裁剪。`memory` 工具把 workspace
 > 记忆写入 `<data>/memory/<hash>.md`，每次重建上下文都注入 `memory` sector；当前 todo 也作为
 > 固定任务状态注入。自动压缩在 turn 开始和每个工具批次后运行；provider 返回 context-length
-> 错误时强制压缩并重试。工具批次按只读段和“目标不重叠的直接写入”段并发执行（含已放行
-> 的低风险只读命令），同一/重叠目标、`patch`、审批/暂存写入、非只读命令、审批和交互调用
-> 作为屏障，结果保持调用顺序。
-> Process view 已落地：新增 `start_command {command, cwd?}`（与 `run_command` 共用
-> `command_plan`，同一沙箱与审批门禁）在 daemon 内启动后台进程并立即返回 id，以及只读的
-> `process_output {process_id?, max_bytes?}`（缺省取本 session 最新进程）。进程归属 daemon、
+> 错误时强制压缩并重试。工具批次按只读段并发执行（含已放行且风险分析判定只读的
+> `exec_command`）；写入、审批和交互调用作为屏障，结果保持调用顺序。
+> Process view 已落地：`exec_command` 支持后台会话（`yield_time_ms` 立即返回 session id），
+> `write_stdin {session_id, chars?, yield_time_ms?}` 写入 stdin 或轮询新输出。进程归属 daemon、
 > 按 session 分组，关闭前端不影响；daemon 退出时 `kill_all` 对整个进程组 SIGTERM，2 秒后
 > SIGKILL。输出流式广播 `process.output` 并镜像到 `<data>/processes/<session>/<id>.log`
 > （0600，文件 16 MB 上限），内存保留 128 KB 尾部；事件日志只写
 > `process_started|process_exited`，避免刷爆，广播 8 MB 后停止推送但尾部继续更新。
-> `start_command` 不抓执行前快照：长跑进程的改动不是一个可回滚的单元。
+> 后台会话不抓执行前快照：长跑进程的改动不是一个可回滚的单元。
 > `process.list|output|kill` 请求与 `process.started|exited` 通知已接入；TUI `P` 打开全屏
 > 列表（`j/k` 选择、`x` kill、`r` 刷新、`PgUp/PgDn` 滚动、Esc 关闭），列表下方实时跟随选中
 > 进程输出；CLI 为 `eix ps`、`eix tail <id>`、`eix kill <id>`，`eix log` 以 `proc>` 行展示
@@ -966,16 +966,15 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 >
 > 子 agent 已落地（2026-10-18）：模型工具 `spawn_agent {label, prompt}` 由 daemon 建 child
 > session（`origin = agent`、`parent_id`、名字 `parent/<label>-N`、cwd 继承），只读工具集
-> （`read_file` / `list_dir` / `grep` / `glob` / `lsp_diagnostics` / `process_output` 等）；
+> （`exec_command` / `view_image` / `lsp_diagnostics` / `use_skill` 等）；
 > agent session 在 `run_tool_call` 里对写工具
 > 直接拒绝，深度上限 1（child 不能再 spawn）。同一 assistant 批次里的多个 `spawn_agent`
 > 用 `tokio::spawn` 并发跑，默认上限由 `[tools] max_parallel_subagents` 配置（默认 32，支持
 > 2/4/8/16/32/64/128/256）；TUI `/subagents` 在有子 agent 时打开实时活动 picker，
 > `/subagents limit` 或 `/subagents <n>` 调整并发上限并通过 `config.subagents` RPC 覆盖运行时值（不写回配置）。
-> 同一批次里连续的只读调用（内置读工具，以及风险分析判定低风险只读、权限决定为 allow 的
-> `run_command`）在段内并发执行；无需审批且目标互不重叠的直接 `write_file` / `edit` 也会
-> 在写段内并发。同一/重叠目标、`patch`、审批或暂存写入、非只读命令、审批和交互调用作为
-> 屏障，结果按调用顺序回填；写段结束后按 server 合并收集一次 LSP 诊断，避免逐文件等待。
+> 同一批次里连续的只读调用（风险分析判定只读、权限决定为 allow 的 `exec_command`）在段内
+> 并发执行；写入、审批和交互调用作为屏障，结果按调用顺序回填；写入结束后合并收集一次
+> LSP 诊断，避免逐文件等待。
 > 纯只读 + `spawn_agent` 批次会先启动 child，再与读取并行；含写入或不可证明只读调用的批次
 > 会在最后一个此类调用完成后启动 child，并与尾随只读调用重叠，避免 child 观察半写入状态。child 使用精简
 > 只读 system prompt，而不是重复完整父 prompt；同时复用父 turn 的 instructions/workspace
@@ -1002,14 +1001,10 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 >
 > **P0 补齐（2026-10-19）**
 >
-> 工具：`grep {pattern, path?, include?, literal?, caseSensitive?, limit?}`、
-> `glob {pattern, path?, hidden?, limit?}`、`edit {path, oldString, newString, replaceAll?}`
-> 和 `patch {patchText}` 已落地。`read_file` 增加 `offset`/`limit` 且输出带行号。
-> `grep` / `glob` 只读自动放行；`edit` 与 `write_file` 在 workspace-write 模式下默认直接应用，
-> 关闭 `auto_apply_workspace_edits` 时共用 staged shadow workspace（唯一匹配校验、生成
-> hunks）；`patch` 走阻塞审批，解析 `*** Begin Patch` 的
-> Add/Update/Delete，先校验全部文件再写入，并抓工作区树快照。`grep` / `glob` 目前看不到
-> staged 内容（MVP 限制）。
+> 工具：只读与检索统一走 `exec_command`（`rg`、`find`、`sed`、`cat` 等），写入统一走
+> `apply_patch`（解析 `*** Begin Patch` 的 Add/Update/Delete，先校验全部文件再写入，并抓
+> 工作区快照）。`apply_patch` 在 workspace-write 模式下默认直接应用，`ask` 决策下阻塞审批；
+> 旧的独立读取/检索/编辑工具已移除，工具面只保留 `apply_patch` 与 `exec_command` 系列。
 >
 > 扩展：`eix-core/src/commands.rs` 始终加载 `~/.config/eix/cmds`（兼容旧的 `commands/`）
 > 和项目祖先目录的 `.eix/cmds` / `.eix/commands`；命令就是提示词模板，嵌套目录映射为
@@ -1030,10 +1025,12 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
 >
 > MCP：`eixd/src/mcp.rs` 实现 stdio JSON-RPC 客户端，`[mcp.servers.<name>]` 懒启动并缓存进程。
-> `tools/list` / `resources/list` / `prompts/list` 都支持分页 cursor；工具名为
-> `mcp__<server>__<tool>`，始终需要审批（`auto` / `bypass` 除外），执行前抓树快照；资源与 prompt
-> 通过只读的 `mcp_list_resources` / `mcp_read_resource` / `mcp_list_prompts` / `mcp_get_prompt`
-> 暴露，不需要审批。`notifications/*/list_changed` 标记缓存失效，下次 turn 或 `/mcp` 刷新。
+> `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` 都支持分页
+> cursor；工具名为 `mcp__<server>__<tool>`，始终需要审批（`auto` / `bypass` 除外），执行前抓树
+> 快照；资源、resource template 与 prompt 通过只读的 `mcp_list_resources` /
+> `mcp_list_resource_templates` / `mcp_read_resource` / `mcp_list_prompts` / `mcp_get_prompt`
+> 暴露，不需要审批。MCP 工具默认不进基础请求，由 `tool_search` 按需发现（见 §19 工具发现）。
+> `notifications/*/list_changed` 标记缓存失效，下次 turn 或 `/mcp` 刷新。
 > `allowed_tools` / `denied_tools` 支持 `*` / `?`（`*` 也匹配 `/`，deny 优先）；`mcp.list` 与
 > `/mcp` 显示状态、工具/资源/prompt 数量和错误。
 >
@@ -1072,8 +1069,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > Proto 等）选择，缺失的可执行文件静默跳过；显式 `[[formatter]]` / `formatter` 条目优先，命令
 > 不存在时回退到内置候选，`command: None` 可禁用某扩展，`formatter_defaults: false` 关闭内置
 > 回退。直接写入、blocking apply、staged apply 后运行
-> （`$1` 为路径，按顺序首个匹配，失败只附注）。`todo` / `webfetch` / `websearch`
-> 为新增工具；`todo` 是 daemon 内存态任务表，网络工具无 API key（DuckDuckGo HTML），读取结果会截断。
+> （`$1` 为路径，按顺序首个匹配，失败只附注）。`update_plan` / `webfetch` / `websearch`
+> 为新增工具；`update_plan` 是 daemon 内存态任务表，网络工具无 API key（DuckDuckGo HTML），
+> 读取结果会截断。
 > TUI 支持 `[theme]` 调色板、`[keys]` 全局 / TUI 动作与 leader 覆盖（输入框的 vim 编辑键仍由编辑器
 > 自己处理），以及 prompt 里的
 > `!<cmd>`：直接执行 shell（同样沙箱、先抓 tree snapshot、只读 session 拒绝），命令和输出写入 tool 事件。
@@ -1295,19 +1293,20 @@ daemon 向模型暴露这些工具。下表的“默认审批”按默认配置�
 
 | 工具 | 行为 | 默认审批 |
 | --- | --- | --- |
-| `apply_patch` | 一个 `*** Begin Patch` 文档内完成 Add / Update / Delete 文件；先全量解析校验，再统一写入 | 工作区内低/中风险直接应用（保留 snapshot）；其余审批 |
-| `exec_command` | 在 cwd 内用 `sh -c` 执行命令；读文件、搜索、列目录分别用 `cat` / `sed` / `awk` / `nl` / `rg` / `fd` / `ls` | 只读命令放行；构建在沙箱内放行；未知/破坏性命令询问或拒绝 |
+| `apply_patch` | Codex 语义：`input` 字段承载 `*** Begin Patch` 文档，完成 Add / Update / Delete 文件，Update 可带 `*** Move to:`，支持 `*** End of File`；严格校验（Add 每行必须 `+`、目标不可重复、exact → rstrip → trim 匹配）后统一写入 | 工作区内低/中风险直接应用（保留 snapshot）；其余审批 |
+| `exec_command` | 在 cwd 内执行命令（默认 `$SHELL -lc`，可传 `shell` / `login: false` / `tty`）；`yield_time_ms` 提前让出输出，`timeout_ms` 是硬超时（到点 kill 进程组），`max_output_tokens` 限制输出；`sandbox_permissions` / `additional_permissions` 可临时放宽沙箱。读文件用 `cat` / `sed -n 'a,bp'` / `nl -ba` / `awk` / `rg -n` / `fd` / `ls`；输出截断时提示从第几行继续，二进制输出改报摘要 | 只读命令放行；构建在沙箱内放行；`require_escalated` 或额外权限强制询问；未知/破坏性命令询问或拒绝 |
 | `write_stdin` | 向仍在运行的 `exec_command` 会话写 stdin；空 `chars` 只轮询增量输出 | 轮询自动放行；写入随原命令审批结果 |
 | `view_image` | 读取工作区图片（png / jpg / jpeg / gif / webp / bmp，≤ 10 MiB），tool result 之后追加一条带图 user message | 自动放行 |
 | `use_skill` | 按名字加载内置或 `.eix/skills` 里的 Markdown skill 正文 | 自动放行 |
-| `todo` | 整表替换当前 session 的任务列表（pending / in_progress / completed / cancelled） | 自动放行 |
+| `update_plan` | 整表替换当前 session 的计划（`explanation?` + `plan[{step,status}]`，状态 pending / in_progress / completed，最多一个 in_progress） | 自动放行 |
 | `memory` | 读写当前 workspace 的跨 session 记忆（`add` / `replace` / `clear`） | 自动放行（只改 daemon 数据目录） |
 | `ready` | 把当前 worktree 标记为就绪并排入集成队列 | 自动放行 |
 | `lsp_diagnostics` | 查询某个文件的语言服务器 diagnostics（未配置对应扩展时返回 no-op） | 自动放行 |
 | `web_fetch` | 抓取 http(s) URL 并转成纯文本（HTML 去标签，约 100 KB 上限） | 默认放行（只读 GET）；配置 `network_allow` 后只放行命中域名 |
 | `web_search` | DuckDuckGo HTML 搜索，返回标题和链接（无需 API key） | 默认放行；配置 `network_allow` 时需包含 `duckduckgo.com` |
 | `spawn_agent` | 起一个只读子 agent 并发处理独立问题，可用 `agent` 指定自定义 agent | 自动放行（子 agent 只读） |
-| `ask_user` | 让用户从 2-6 个选项中选择 | 交互，不修改文件 |
+| `request_user_input` | 1-3 个问题，每题 2-3 个互斥选项；TUI 每问一个 tab，客户端自动追加 Other 自由输入 | 交互，不修改文件 |
+| `tool_search` | 用 BM25 在 MCP / 插件工具里检索，命中的 schema 加入本 turn 后续请求；plan / sub-agent 不可见 | 自动放行（只读元数据） |
 | `mcp__*` | MCP server 暴露的工具 | 默认询问；已注册的只读类工具（`get_*` / `list_*` / `read_*` / `search_*`）自动放行；resource/prompt 只读 |
 | `plugin__*` | 外部插件暴露的工具 | 默认询问（显式 allow / bypass 例外）；plan/sub-agent 不可见；执行前快照 |
 
@@ -1319,11 +1318,22 @@ daemon 向模型暴露这些工具。下表的“默认审批”按默认配置�
 会并发执行（上限 8）。`apply_patch`、非只读命令、审批和交互调用是分段屏障，写后读取在
 写入完成后执行；结果按调用顺序回填。
 
+#### 工具发现（tool_search）
+
+内置工具始终在请求里；MCP 与插件工具的 schema 默认不注入，只有 `tool_search {query, limit?}`
+会把命中的 schema 加进本 turn 后续请求的工具列表（下一轮 provider 调用即可见）。检索用
+BM25（对 name + description 分词，`mcp__server__tool` 的 `__` 会被拆成词），无命中的查询
+不会暴露任何 schema；`limit` 默认 8、上限 20。这样接入多个 MCP server 时，每轮请求不必为
+全部工具描述付 token。plan 与 sub-agent session 不暴露 `tool_search`，也拿不到延迟工具。
+刷新仍走 MCP/插件自己的 `list_changed` 与 catalog 缓存。
+
 `exec_command` 使用统一风险分析：shell tokenizer 会拆出每个命令段、输入/输出重定向、
 `sudo`/`env` 等包装器、嵌套 `sh -c` 和命令替换。`git status`、`cat`、`grep`、`ls`、
 `sed -n`、纯 `print`/`printf` 的 `awk`、`uniq`、`tr`、`cut`、`sort` 等只读过滤/查询命令
 直接放行；工作区内的 `cd`（以及 `cd <workspace> && ...`）也直接放行，离开工作区的 `cd`
-仍询问。`env` / `timeout` / `nice` / `command` 等包装器按实际执行的命令判断，只有
+仍询问。相对路径经 `..` 或 symlink 离开 workspace 时，按边界逃逸直接拒绝（不再只是询问），
+只有 `tools.external_directory` 显式列出的目标才放行；绝对路径和 `~` 仍是普通的站外读取，
+按风险询问。`env` / `timeout` / `nice` / `command` 等包装器按实际执行的命令判断，只有
 `sudo` / `doas` 额外标记提权；`env` 设置 `PATH`、`LD_PRELOAD`、`GIT_*` 等能改变命令
 查找/加载/配置的变量时仍询问，普通 `FOO=1` 之类不受影响。`xargs` 仅在内层是 `wc` /
 `ls` / `stat` 等只报告名称、元数据或计数的命令时放行，内容读取器和 `-a` / `--arg-file`
@@ -1365,8 +1375,8 @@ echo "$f"; done | sort | head` 可直接放行。
 
 隐私边界：daemon 在把消息发给 provider 之前，会把密码、`sk-…` / Stripe / GitHub / Slack
 等 token、Bearer、URL 凭据、PEM 私钥和 `password=` / `api_key:` 等赋值替换成带随机 salt 的
-占位符。占位符只在本地工具（`apply_patch` / `view_image` / `lsp_diagnostics` / `todo` /
-`memory` / `ask_user` / `use_skill`）的参数和最终文本里还原；`exec_command`、`write_stdin`、
+占位符。占位符只在本地工具（`apply_patch` / `view_image` / `lsp_diagnostics` / `update_plan` /
+`memory` / `request_user_input` / `tool_search` / `use_skill`）的参数和最终文本里还原；`exec_command`、`write_stdin`、
 `web_fetch`、`web_search` 和 MCP 参数不会还原，一旦出现占位符会被判定为 `secret-exfil`
 并硬拒绝。URL 在审批卡片和审计事件里只保留 `?…` 之前的部分。占位符映射只在当前 provider
 进程内保存；本地事件日志和 TUI 仍显示原文，方便审阅。图片内容不做文本脱敏，敏感截图不要上传。
@@ -1453,7 +1463,7 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 
 `apply_patch` 是唯一的写入入口。`ask` 决策下它阻塞在审批卡片上，卡片展示完整 diff 并支持
 逐 hunk 选择；`build` 模式下工作区内低/中风险补丁默认直接落盘，只保留 snapshot 和
-`patch_applied` 记录。模型侧不再有独立的 `edit` / `write_file`，编辑也不会先 stage 到
+`patch_applied` 记录。模型侧只有 `apply_patch` 一个写入入口，编辑不会先 stage 到
 shadow workspace。
 
 daemon 仍保留 staging store，用于读取旧 pending 补丁并支持 `patch.apply` / `patch.reject`
@@ -1650,17 +1660,20 @@ server 进程，下一条写入重新启动。
 #### MCP
 
 `[mcp.servers.<name>]` 配置的 stdio server 会在首次 turn 时懒启动、握手，并读取
-`tools/list`、`resources/list`、`prompts/list`（后两者由 server 能力决定）。工具以
-`mcp__<server>__<tool>` 暴露。已注册的只读类工具（如 `get_*`、`list_*`、`read_*`、
-`search_*`）默认放行；其余 MCP 工具仍需要审批，执行前会捕获一次工作区树快照。
-`plan` session 和 sub-agent 看不到 MCP 工具。
+`tools/list`、`resources/list`、`resources/templates/list`、`prompts/list`（后三者由 server
+能力决定）。工具以 `mcp__<server>__<tool>` 暴露。已注册的只读类工具（如 `get_*`、`list_*`、
+`read_*`、`search_*`）默认放行；其余 MCP 工具仍需要审批，执行前会捕获一次工作区树快照。
+`plan` session 和 sub-agent 看不到 MCP 工具；普通 session 也要先经 `tool_search` 发现。
 
-资源与 prompt 通过四个只读 meta-tool 暴露，不需要审批：
+资源、resource template 与 prompt 通过五个只读 meta-tool 暴露，不需要审批：
 
-- `mcp_list_resources {server?}` / `mcp_read_resource {server, uri}`
+- `mcp_list_resources {server?}` / `mcp_list_resource_templates {server?}`
+- `mcp_read_resource {server, uri}`
 - `mcp_list_prompts {server?}` / `mcp_get_prompt {server, name, arguments?}`
 
-`resources/list`、`resources/read`、`prompts/list`、`prompts/get` 都支持分页 cursor；二进制
+`mcp_list_resource_templates` 列出 RFC 6570 `uriTemplate`，由模型展开参数后再用
+`mcp_read_resource` 读取。`resources/list`、`resources/templates/list`、`resources/read`、
+`prompts/list`、`prompts/get` 都支持分页 cursor；二进制
 resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server 发来的
 `notifications/{tools,resources,prompts}/list_changed` 会标记缓存失效，下一次 turn 或
 `/mcp` 时重新读取。每个 server 可用 `allowed_tools` / `denied_tools` 过滤工具（`*` 和 `?`
@@ -1847,8 +1860,8 @@ eix 不提供内置 Neovim 前端。Neovim 插件是普通 daemon client，通�
   （`end_turn` / `cancelled`）。取消走 `session/cancel` → `prompt.cancel`。
 - 工具与审批：`session.event` 的 tool call/result 映射为 `tool_call` / `tool_call_update`；
   `tool.approval_required` 映射为 `session/request_permission`，编辑器选择回写
-  `approval.respond`（`allow-always` → `Always` + session scope）。`ask_user` 的选项也通过
-  permission 请求承载，拒绝即取消 turn。
+  `approval.respond`（`allow-always` → `Always` + session scope）。`request_user_input` 没有
+  tab，按问题顺序逐个发 permission 请求，收齐后一次 `input.respond`；拒绝即取消 turn。
 - 模式：`plan` / `build` / `auto` / `bypass`，`session/set_mode` 映射 `session.mode`。
 - 只声明已实现能力：文本 prompt、`resource_link`、内嵌文本、`loadSession`、`session/close`；
   不声明图片/音频和 MCP over ACP。客户端传入的 `mcpServers` 会被忽略并在 stderr 提示。
@@ -1909,7 +1922,7 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 - [x] git worktree（默认共享工作区；`eix new --worktree` 新建隔离 session，TUI `/new-worktree` 把当前 session 移入 `.worktrees/<slug>`，`eix worktree list|remove`）
 - [x] 集成队列（`ready` 工具 / `eix ready`、rebase → 测试 → base ff merge、冲突/测试失败注入修复、退避重试与 `eix integrate`）
 - [x] 子 agent（`spawn_agent`、只读工具集、并发批次、深度上限 1、独立事件日志）
-- [x] `ask_user`（2-6 个选项、首个为推荐项、阻塞式交互选择、`eix answer N` 无头回答）
+- [x] `request_user_input`（1-3 个问题、每题 2-3 个选项、TUI 多 tab + Other 自由输入、阻塞式交互、`eix answer <id>=<value>` / `eix answer N` 无头回答）
 - [x] 编辑器插件协议接口（Unix socket / TCP JSON-RPC、`session.subscribe`、`session.events`；见 `docs/nvim.md`）
 - [x] 远程 attach（TCP + 强制 token、首请求 `auth`、CLI `--tcp/--token`）
 - [x] 按连接过滤广播（`session.subscribe`，`null` = 全部；client 可只订阅自己打开的 session）
@@ -1929,7 +1942,7 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 - [x] session 管理（undo/redo、export/import、delete、archive、timeline、队列 `rm`/`move`；CLI `eix undo/redo/export/import/delete/archive/timeline`）
 - [x] Skills（原生 `.eix` + 可配置 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 兼容、system prompt 摘要 + `use_skill {name, arguments}`、`$ARGUMENTS` / `$1..$9`、`allowed-tools` 单 turn 限制、带预览的 `/skills` picker）
 - [x] 写入后 formatter（`[[formatter]]` command/extensions/timeout；按顺序首个匹配；直接写入与 staged apply 都生效）
-- [x] `todo` 任务列表 + `web_fetch` / `web_search` 网络工具
+- [x] `update_plan` 任务计划 + `web_fetch` / `web_search` 网络工具
 - [x] 可配置 TUI 调色板（`[theme]`，颜色名 / hex / ANSI 索引）
 - [x] HTTP API（`[server] http`；`/health`、`/openapi.json`、`/pair`、`/stats`、POST `/rpc`、SSE `/events` + `session_id` 过滤，Bearer token、CORS/OPTIONS；`eix-sdk` 类型化 Rust client、`clients/ts` 无依赖 TypeScript client）
 - [x] 客户端配对（`eix pair [--name]` / `pair list` / `pair revoke`；一次性 code、SHA-256 token、60 秒 20 次失败限流、撤销即时生效）
@@ -1941,7 +1954,7 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 - [x] 输入框 `@` 打开文件 picker（`picker.query` 的 `files` provider）、两次 `Esc` 回转录区、长草稿自动增高（默认 3 行，总高上限 12 行）
 - [x] 草稿镜像（编辑器变更同步到 `draft.set`，切 session 时从 daemon 回填）
 - [x] 统一 picker 体系（单一 overlay + 右侧预览；`picker.query` 提供 files / grep / git / worktrees / branches，`o`/`Ctrl-P`/`g`/`s`/`@` 入口）
-- [x] 工具面收敛（`apply_patch` 合并 write/edit/patch，`exec_command` 承接读/搜/列并鼓励 `rg`/`fd`/`sed`，`write_stdin` 轮询长任务，`view_image` 视觉检查）
+- [x] 工具面收敛（`apply_patch` 合并 write/edit/patch，`exec_command` 承接读/搜/列并鼓励 `rg`/`fd`/`sed`/`nl`，`write_stdin` 轮询长任务，`view_image` 视觉检查；截断提示续读行、二进制输出摘要、`..`/symlink 逃逸拒绝）
 - [x] 自定义 Markdown 命令（`~/.config/eix/cmds`、项目 `.eix/cmds`，兼容旧 `commands` 目录；`/name` 快速调用、`$ARGUMENTS` / `$1..$9`、frontmatter `description`/`agent`/`model`）
 - [x] 自定义 Markdown agent（`~/.config/eix/agents`、项目 `.eix/agents`；`role`/`model`，`/agents` 选择 primary、`spawn_agent agent:` 选择 subagent）
 - [x] 多 provider 模型目录（`providers.*` 命名 endpoint、自动拉取 `/models`、`models[]` 手动补充成本/变体、`/model` 搜索切换；token usage 与成本记录在事件日志，不在状态栏常驻）
@@ -1950,5 +1963,5 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 - [x] 运行时默认模型（`model.use` / `eix model use` / `/model global` 通过 `ArcSwap` 覆盖，`model.updated` 广播，不影响 pinned session，不写回配置）
 - [x] MCP stdio client（`mcp.servers.*`、懒启动、`tools/list` / `tools/call` / `resources/*` / `prompts/*`、分页、`list_changed` 刷新、`allowed_tools` / `denied_tools`、`mcp__server__tool` 审批 + 树快照、`/mcp` 状态）
 - [x] MCP Streamable HTTP（`url` / `headers`、JSON + SSE、`Mcp-Session-Id`、`MCP-Protocol-Version`、`mcp.reload`）与 OAuth（discovery、DCR、PKCE、loopback callback、token 刷新；`eix mcp auth/logout`）
-- [x] ACP 适配器（`eix acp`：initialize、session/new/load/close、prompt 流式、tool call、approval、ask_user、模式切换、取消；stdin/stdout JSON-RPC + mock daemon e2e）
+- [x] ACP 适配器（`eix acp`：initialize、session/new/load/close、prompt 流式、tool call、approval、request_user_input、模式切换、取消；stdin/stdout JSON-RPC + mock daemon e2e）
 - [x] 外部插件基础（`plugins.*`、`eix-plugin.toml`、`initialize` 握手、`plugin__*` 工具审批 + 快照、`plugin/*` 提示词命令、`session.*` 事件订阅、SQLite 插件存储、`plugin.list` / `plugin.commands` / `plugin.restart`；TUI widget host 与 action command 尚未实现）

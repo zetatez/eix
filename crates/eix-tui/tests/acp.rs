@@ -300,8 +300,8 @@ async fn serve(listener: UnixListener, dir: PathBuf, recorded: Arc<Mutex<Recorde
                             EventKind::ToolCall,
                             json!({
                                 "call_id": "call-1",
-                                "tool": "read_file",
-                                "arguments": { "path": "src/main.rs" }
+                                "tool": "exec_command",
+                                "arguments": { "cmd": "cat src/main.rs" }
                             }),
                         ))
                         .unwrap(),
@@ -327,9 +327,9 @@ async fn serve(listener: UnixListener, dir: PathBuf, recorded: Arc<Mutex<Recorde
                             "turn_id": turn,
                             "approval_id": "apr-1",
                             "call_id": "call-2",
-                            "tool": "run_command",
-                            "summary": "run ls",
-                            "arguments": { "command": "ls" }
+                            "tool": "exec_command",
+                            "summary": "exec_command: ls",
+                            "arguments": { "cmd": "ls" }
                         }),
                     )
                     .await;

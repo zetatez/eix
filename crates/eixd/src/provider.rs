@@ -1701,9 +1701,10 @@ fn restore_tool_arguments(tool: &str) -> bool {
         "apply_patch"
             | "view_image"
             | "lsp_diagnostics"
-            | "todo"
+            | "update_plan"
+            | "request_user_input"
+            | "tool_search"
             | "memory"
-            | "ask_user"
             | "use_skill"
     )
 }
@@ -1781,15 +1782,18 @@ mod tests {
     fn accumulates_streamed_tool_calls() {
         let mut acc = Accumulator::new("m");
         let mut on_delta = |_: StreamDelta<'_>| {};
-        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"read_file","arguments":"{\"pa"}}]}}]}"#;
-        let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"th\":\"a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#;
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_a","type":"function","function":{"name":"exec_command","arguments":"{\"cm"}}]}}]}"#;
+        let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"d\":\"cat a.rs\"}"}}]},"finish_reason":"tool_calls"}]}"#;
         apply_data(first, &mut acc, &mut on_delta).unwrap();
         apply_data(second, &mut acc, &mut on_delta).unwrap();
         let done = acc.finish();
         assert_eq!(done.tool_calls.len(), 1);
         assert_eq!(done.tool_calls[0].id, "call_a");
-        assert_eq!(done.tool_calls[0].function.name, "read_file");
-        assert_eq!(done.tool_calls[0].function.arguments, r#"{"path":"a.rs"}"#);
+        assert_eq!(done.tool_calls[0].function.name, "exec_command");
+        assert_eq!(
+            done.tool_calls[0].function.arguments,
+            r#"{"cmd":"cat a.rs"}"#
+        );
         assert_eq!(done.finish_reason.as_deref(), Some("tool_calls"));
     }
 
@@ -1798,15 +1802,15 @@ mod tests {
         let mut acc = Accumulator::new("m");
         let mut on_delta = |_: StreamDelta<'_>| {};
         let chunks = [
-            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"read_file","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"list_dir","arguments":"{}"}}]}}]}"#,
+            r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"exec_command","arguments":"{}"}},{"index":1,"id":"b","function":{"name":"apply_patch","arguments":"{}"}}]}}]}"#,
         ];
         for chunk in chunks {
             apply_data(chunk, &mut acc, &mut on_delta).unwrap();
         }
         let done = acc.finish();
         assert_eq!(done.tool_calls.len(), 2);
-        assert_eq!(done.tool_calls[0].function.name, "read_file");
-        assert_eq!(done.tool_calls[1].function.name, "list_dir");
+        assert_eq!(done.tool_calls[0].function.name, "exec_command");
+        assert_eq!(done.tool_calls[1].function.name, "apply_patch");
     }
 
     #[test]
@@ -1921,9 +1925,10 @@ mod tests {
             "apply_patch",
             "view_image",
             "lsp_diagnostics",
-            "todo",
+            "update_plan",
+            "request_user_input",
+            "tool_search",
             "memory",
-            "ask_user",
             "use_skill",
         ] {
             assert!(restore_tool_arguments(tool), "{tool}");
@@ -1942,12 +1947,12 @@ mod tests {
 
     fn tool_definition() -> ToolDefinition {
         ToolDefinition::function(
-            "read_file",
-            "Read a file",
+            "exec_command",
+            "Run a command",
             json!({
                 "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"],
+                "properties": {"cmd": {"type": "string"}},
+                "required": ["cmd"],
                 "additionalProperties": false,
             }),
         )
@@ -1959,8 +1964,8 @@ mod tests {
             id: "toolu_1".into(),
             kind: "function".into(),
             function: FunctionCall {
-                name: "read_file".into(),
-                arguments: r#"{"path":"a.rs"}"#.into(),
+                name: "exec_command".into(),
+                arguments: r#"{"cmd":"cat a.rs"}"#.into(),
             },
         };
         let messages = vec![
@@ -1979,14 +1984,17 @@ mod tests {
             body["messages"][1]["content"][0]["type"],
             Value::String("tool_use".into())
         );
-        assert_eq!(body["messages"][1]["content"][0]["input"]["path"], "a.rs");
+        assert_eq!(
+            body["messages"][1]["content"][0]["input"]["cmd"],
+            "cat a.rs"
+        );
         // Consecutive tool results become one user message with two blocks.
         let results = body["messages"][2]["content"].as_array().unwrap();
         assert_eq!(body["messages"].as_array().unwrap().len(), 3);
         assert_eq!(results.len(), 2);
         assert_eq!(results[0]["type"], "tool_result");
         assert_eq!(results[1]["tool_use_id"], "toolu_2");
-        assert_eq!(body["tools"][0]["name"], "read_file");
+        assert_eq!(body["tools"][0]["name"], "exec_command");
         assert_eq!(body["tools"][0]["input_schema"]["type"], "object");
     }
 
@@ -2003,8 +2011,8 @@ mod tests {
             r#"{"type":"message_start","message":{"model":"claude-sonnet","usage":{"input_tokens":10,"output_tokens":1}}}"#,
             r#"{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hi"}}"#,
-            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"read_file","input":{}}}"#,
-            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"a.rs\"}"}}"#,
+            r#"{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"exec_command","input":{}}}"#,
+            r#"{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"cat a.rs\"}"}}"#,
             r#"{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}"#,
             r#"{"type":"message_stop"}"#,
         ];
@@ -2022,7 +2030,7 @@ mod tests {
         assert_eq!(completion.tool_calls[0].id, "toolu_1");
         assert_eq!(
             completion.tool_calls[0].function.arguments,
-            r#"{"path":"a.rs"}"#
+            r#"{"cmd":"cat a.rs"}"#
         );
         let usage = completion.usage.unwrap();
         assert_eq!(usage.prompt_tokens, 10);
@@ -2040,7 +2048,7 @@ mod tests {
                 "content": [
                     {"type": "thinking", "thinking": "plan"},
                     {"type": "text", "text": "answer"},
-                    {"type": "tool_use", "id": "toolu_1", "name": "read_file", "input": {"path": "a.rs"}}
+                    {"type": "tool_use", "id": "toolu_1", "name": "exec_command", "input": {"cmd": "cat a.rs"}}
                 ],
                 "stop_reason": "tool_use",
                 "usage": {"input_tokens": 2, "output_tokens": 3}
@@ -2052,7 +2060,7 @@ mod tests {
         let completion = acc.finish();
         assert_eq!(completion.reasoning, "plan");
         assert_eq!(completion.text, "answer");
-        assert_eq!(completion.tool_calls[0].function.name, "read_file");
+        assert_eq!(completion.tool_calls[0].function.name, "exec_command");
         assert_eq!(completion.usage.unwrap().total_tokens, 5);
     }
 
@@ -2062,8 +2070,8 @@ mod tests {
             id: "call_1".into(),
             kind: "function".into(),
             function: FunctionCall {
-                name: "read_file".into(),
-                arguments: r#"{"path":"a.rs"}"#.into(),
+                name: "exec_command".into(),
+                arguments: r#"{"cmd":"cat a.rs"}"#.into(),
             },
         };
         let messages = vec![
@@ -2085,12 +2093,12 @@ mod tests {
         assert_eq!(body["contents"][1]["role"], "model");
         assert_eq!(
             body["contents"][1]["parts"][0]["functionCall"]["name"],
-            "read_file"
+            "exec_command"
         );
         assert_eq!(body["contents"][2]["role"], "user");
         assert_eq!(
             body["contents"][2]["parts"][0]["functionResponse"]["name"],
-            "read_file"
+            "exec_command"
         );
         let parameters = &body["tools"][0]["functionDeclarations"][0]["parameters"];
         assert_eq!(parameters["type"], "object");
@@ -2111,7 +2119,7 @@ mod tests {
             StreamDelta::Reasoning(_) => {}
         };
         let first = r#"{"candidates":[{"content":{"parts":[{"text":"think","thought":true},{"text":"Hel"}]},"index":0}],"modelVersion":"gemini-2.5-pro"}"#;
-        let second = r#"{"candidates":[{"content":{"parts":[{"text":"lo"},{"functionCall":{"name":"read_file","args":{"path":"a.rs"}}}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7}}"#;
+        let second = r#"{"candidates":[{"content":{"parts":[{"text":"lo"},{"functionCall":{"name":"exec_command","args":{"cmd":"cat a.rs"}}}]},"finishReason":"STOP","index":0}],"usageMetadata":{"promptTokenCount":3,"candidatesTokenCount":4,"totalTokenCount":7}}"#;
         apply_gemini_event(first, &mut acc, &mut on_delta).unwrap();
         apply_gemini_event(second, &mut acc, &mut on_delta).unwrap();
         let completion = acc.finish();
@@ -2120,10 +2128,10 @@ mod tests {
         assert_eq!(completion.model, "gemini-2.5-pro");
         assert_eq!(completion.finish_reason.as_deref(), Some("stop"));
         assert_eq!(completion.tool_calls.len(), 1);
-        assert_eq!(completion.tool_calls[0].function.name, "read_file");
+        assert_eq!(completion.tool_calls[0].function.name, "exec_command");
         assert_eq!(
             completion.tool_calls[0].function.arguments,
-            r#"{"path":"a.rs"}"#
+            r#"{"cmd":"cat a.rs"}"#
         );
         assert_eq!(completion.usage.unwrap().total_tokens, 7);
     }

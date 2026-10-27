@@ -1716,12 +1716,12 @@ mod tests {
     #[test]
     fn tool_schemas_are_visible_but_not_editable_or_sent_as_messages() {
         let tools = vec![ToolDefinition::function(
-            "read_file",
-            "Read a file from disk",
+            "exec_command",
+            "Run a command",
             json!({
                 "type": "object",
-                "properties": { "path": { "type": "string" } },
-                "required": ["path"]
+                "properties": { "cmd": { "type": "string" } },
+                "required": ["cmd"]
             }),
         )];
         let events = vec![user(1, "hello")];
@@ -2038,7 +2038,7 @@ mod tests {
                         id: format!("call{index}"),
                         kind: "function".into(),
                         function: eix_core::FunctionCall {
-                            name: "run_command".into(),
+                            name: "exec_command".into(),
                             arguments: "{}".into(),
                         },
                     }],
@@ -2050,7 +2050,7 @@ mod tests {
                 EventKind::ToolResult,
                 payload(&ToolResultPayload {
                     call_id: format!("call{index}"),
-                    tool: "run_command".into(),
+                    tool: "exec_command".into(),
                     ok: true,
                     denied: false,
                     output: "x".repeat(4_000),
@@ -2137,7 +2137,7 @@ mod tests {
             id: id.into(),
             kind: "function".into(),
             function: FunctionCall {
-                name: "read_file".into(),
+                name: "exec_command".into(),
                 arguments: "{}".into(),
             },
         }
@@ -2164,7 +2164,7 @@ mod tests {
             EventKind::ToolResult,
             payload(&ToolResultPayload {
                 call_id: call_id.into(),
-                tool: "read_file".into(),
+                tool: "exec_command".into(),
                 ok: true,
                 denied: false,
                 output: output.into(),
@@ -2264,7 +2264,7 @@ mod tests {
         assert_eq!(messages[2].role, Role::Assistant);
         assert_eq!(
             messages[2].tool_calls.as_ref().unwrap()[0].function.name,
-            "read_file"
+            "exec_command"
         );
         assert_eq!(messages[3].role, Role::Tool);
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));

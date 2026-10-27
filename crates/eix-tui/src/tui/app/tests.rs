@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::tui::workspace::{ActiveWorkspace, WorkspaceLayout};
+use eix_core::InputOption;
 
 #[test]
 fn paste_recognizes_image_paths_and_file_uris() {
@@ -903,8 +904,10 @@ fn transcript_renders_tool_cards() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "write_file",
-                "arguments": {"path": "out.txt", "content": "hello"},
+                "tool": "apply_patch",
+                "arguments": {
+                    "patchText": "*** Begin Patch\n*** Update File: out.txt\n@@\n-hello\n+hello\n*** End Patch\n",
+                },
             }),
         ),
         SessionEvent::new(
@@ -913,10 +916,10 @@ fn transcript_renders_tool_cards() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "write_file",
+                "tool": "apply_patch",
                 "ok": true,
                 "denied": false,
-                "output": "wrote 5 bytes to out.txt",
+                "output": "applied 1 hunk to out.txt",
             }),
         ),
     ];
@@ -928,25 +931,24 @@ fn transcript_renders_tool_cards() {
     let lines: Vec<&str> = expanded.lines().collect();
     let summary_line = lines
         .iter()
-        .position(|line| line.contains("write out.txt (+5 bytes)"))
+        .position(|line| line.contains("apply_patch out.txt"))
         .expect("summary line");
     assert!(!lines[summary_line].contains("ok"), "{expanded}");
     assert_eq!(lines[summary_line + 1].trim(), "ok", "{expanded}");
     assert!(lines[summary_line + 1].starts_with("      "), "{expanded}");
-    assert!(expanded.contains("wrote 5 bytes to out.txt"));
-    assert!(expanded.contains("hello"));
+    assert!(expanded.contains("applied 1 hunk to out.txt"));
+    // The raw patch text is not dumped next to the result.
+    assert!(!expanded.contains("Begin Patch"), "{expanded}");
     assert!(!expanded.contains("output"), "{expanded}");
-    assert!(!expanded.contains("content"), "{expanded}");
 
     // The explicit fold still collapses it.
     view.folds.insert(FoldId::Event(1), false);
     let collapsed = render_transcript(&view, 60);
-    assert!(!collapsed.contains("wrote 5 bytes to out.txt"));
-    assert!(!collapsed.contains("hello"));
+    assert!(!collapsed.contains("applied 1 hunk to out.txt"));
 }
 
 #[test]
-fn edit_and_patch_cards_open_by_default() {
+fn apply_patch_cards_open_by_default() {
     let session = Session::new("s1", "tools", "/tmp");
     let events = vec![
         SessionEvent::new(
@@ -955,11 +957,9 @@ fn edit_and_patch_cards_open_by_default() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "edit",
+                "tool": "apply_patch",
                 "arguments": {
-                    "path": "src/lib.rs",
-                    "oldString": "old edit",
-                    "newString": "new edit",
+                    "patchText": "*** Begin Patch\n*** Update File: src/one.rs\n*** Update File: src/two.rs\n*** End Patch\n",
                 },
             }),
         ),
@@ -970,10 +970,10 @@ fn edit_and_patch_cards_open_by_default() {
             serde_json::json!({
                 "patch_id": "p1",
                 "call_id": "c1",
-                "tool": "edit",
-                "path": "src/lib.rs",
-                "summary": "edit src/lib.rs",
-                "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old edit\n+new edit\n",
+                "tool": "apply_patch",
+                "path": "src/one.rs",
+                "summary": "apply_patch (2 files)",
+                "diff": "--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-old one\n+new one\n--- a/src/two.rs\n+++ b/src/two.rs\n@@ -1 +1 @@\n-old two\n+new two\n",
             }),
         ),
         SessionEvent::new(
@@ -982,42 +982,7 @@ fn edit_and_patch_cards_open_by_default() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "edit",
-                "ok": true,
-                "denied": false,
-                "output": "edited src/lib.rs",
-            }),
-        ),
-        SessionEvent::new(
-            "s1",
-            4,
-            EventKind::ToolCall,
-            serde_json::json!({
-                "call_id": "c2",
-                "tool": "patch",
-                "arguments": {"patchText": "raw patch text"},
-            }),
-        ),
-        SessionEvent::new(
-            "s1",
-            5,
-            EventKind::PatchProposed,
-            serde_json::json!({
-                "patch_id": "p2",
-                "call_id": "c2",
-                "tool": "patch",
-                "path": "src/one.rs",
-                "summary": "patch (2 files)",
-                "diff": "--- a/src/one.rs\n+++ b/src/one.rs\n@@ -1 +1 @@\n-old one\n+new one\n--- a/src/two.rs\n+++ b/src/two.rs\n@@ -1 +1 @@\n-old two\n+new two\n",
-            }),
-        ),
-        SessionEvent::new(
-            "s1",
-            6,
-            EventKind::ToolResult,
-            serde_json::json!({
-                "call_id": "c2",
-                "tool": "patch",
+                "tool": "apply_patch",
                 "ok": true,
                 "denied": false,
                 "output": "applied patch",
@@ -1026,13 +991,11 @@ fn edit_and_patch_cards_open_by_default() {
     ];
     let view = SessionView::new(session, events);
     let rendered = render_transcript(&view, 80);
-    assert!(rendered.contains("new edit"), "{rendered}");
     assert!(rendered.contains("new one"), "{rendered}");
     assert!(rendered.contains("new two"), "{rendered}");
     assert!(rendered.contains("── src/one.rs"), "{rendered}");
     assert!(rendered.contains("── src/two.rs"), "{rendered}");
-    // The raw edit/patch arguments are not dumped next to the diff.
-    assert!(!rendered.contains("oldString"), "{rendered}");
+    // The raw patch arguments are not dumped next to the diff.
     assert!(!rendered.contains("patchText"), "{rendered}");
 }
 
@@ -1046,7 +1009,7 @@ fn auto_applied_write_renders_its_diff() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "write_file",
+                "tool": "apply_patch",
                 "arguments": {"path": "out.txt", "content": "new line\n"},
             }),
         ),
@@ -1069,7 +1032,7 @@ fn auto_applied_write_renders_its_diff() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "write_file",
+                "tool": "apply_patch",
                 "ok": true,
                 "denied": false,
                 "output": "wrote 9 bytes to out.txt",
@@ -1094,7 +1057,7 @@ fn applied_patch_diff_replaces_the_staged_preview() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "write_file",
+                "tool": "apply_patch",
                 "arguments": {"path": "out.rs", "content": "fn raw(){}\n"},
             }),
         ),
@@ -1105,7 +1068,7 @@ fn applied_patch_diff_replaces_the_staged_preview() {
             serde_json::json!({
                 "patch_id": "p1",
                 "call_id": "c1",
-                "tool": "write_file",
+                "tool": "apply_patch",
                 "path": "out.rs",
                 "summary": "write out.rs",
                 "diff": "--- a/out.rs\n+++ b/out.rs\n@@ -1 +1 @@\n-fn old(){}\n+fn raw(){}\n",
@@ -1130,7 +1093,7 @@ fn applied_patch_diff_replaces_the_staged_preview() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "write_file",
+                "tool": "apply_patch",
                 "ok": true,
                 "denied": false,
                 "output": "wrote out.rs",
@@ -1180,8 +1143,8 @@ fn subagent_card_has_a_fixed_live_window_and_folds() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c2",
-                "tool": "read_file",
-                "arguments": {"path": "src/parser.rs"},
+                "tool": "exec_command",
+                "arguments": {"cmd": "cat src/parser.rs"},
             }),
         ),
     );
@@ -1193,7 +1156,7 @@ fn subagent_card_has_a_fixed_live_window_and_folds() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c2",
-                "tool": "read_file",
+                "tool": "exec_command",
                 "ok": true,
                 "denied": false,
                 "output": "fn parse() {}",
@@ -1207,9 +1170,9 @@ fn subagent_card_has_a_fixed_live_window_and_folds() {
         "{rendered}"
     );
     assert!(rendered.contains("▶ inspect the parser"), "{rendered}");
-    assert!(rendered.contains("⚙ read src/parser.rs"), "{rendered}");
+    assert!(rendered.contains("⚙ $ cat src/parser.rs"), "{rendered}");
     assert!(
-        rendered.contains("✓ read_file: fn parse() {}"),
+        rendered.contains("✓ exec_command: fn parse() {}"),
         "{rendered}"
     );
     // Five fixed rows between the window borders.
@@ -1255,8 +1218,8 @@ fn completed_subagent_shows_only_its_result() {
                 EventKind::ToolCall,
                 serde_json::json!({
                     "call_id": "c2",
-                    "tool": "read_file",
-                    "arguments": {"path": "src/parser.rs"},
+                    "tool": "exec_command",
+                    "arguments": {"cmd": "cat src/parser.rs"},
                 }),
             ))
             .unwrap(),
@@ -1264,7 +1227,7 @@ fn completed_subagent_shows_only_its_result() {
         &tx,
     );
     let running = render_transcript(&app.views[0], 60);
-    assert!(running.contains("⚙ read src/parser.rs"), "{running}");
+    assert!(running.contains("⚙ $ cat src/parser.rs"), "{running}");
 
     app.handle_event(
         Event::Notification(eix_core::Notification::new(
@@ -1300,8 +1263,8 @@ fn failed_subagent_shows_only_the_error() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c2",
-                "tool": "read_file",
-                "arguments": {"path": "src/parser.rs"},
+                "tool": "exec_command",
+                "arguments": {"cmd": "cat src/parser.rs"},
             }),
         ),
     );
@@ -1654,7 +1617,7 @@ fn expanded_command_omits_redundant_labels_and_gutter() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "run_command",
+                "tool": "exec_command",
                 "arguments": {"command": "echo hi"},
             }),
         ),
@@ -1664,7 +1627,7 @@ fn expanded_command_omits_redundant_labels_and_gutter() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "run_command",
+                "tool": "exec_command",
                 "ok": true,
                 "denied": false,
                 "output": "hi",
@@ -1697,7 +1660,7 @@ fn long_command_wraps_in_header_without_repeating_in_body() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "run_command",
+                "tool": "exec_command",
                 "arguments": {"command": command, "cwd": "/tmp"},
             }),
         ),
@@ -1707,7 +1670,7 @@ fn long_command_wraps_in_header_without_repeating_in_body() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "run_command",
+                "tool": "exec_command",
                 "ok": true,
                 "denied": false,
                 "output": "done",
@@ -2182,7 +2145,7 @@ fn expanded_tool_card_shows_the_full_long_command() {
         EventKind::ToolCall,
         serde_json::json!({
             "call_id": "c1",
-            "tool": "run_command",
+            "tool": "exec_command",
             "arguments": {"command": command, "cwd": "/tmp"},
         }),
     )];
@@ -2264,7 +2227,7 @@ fn running_turn_keeps_dots_after_a_tool_result() {
             EventKind::ToolCall,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "run_command",
+                "tool": "exec_command",
                 "arguments": {"command": "cargo test"},
             }),
         ),
@@ -2274,7 +2237,7 @@ fn running_turn_keeps_dots_after_a_tool_result() {
             EventKind::ToolResult,
             serde_json::json!({
                 "call_id": "c1",
-                "tool": "run_command",
+                "tool": "exec_command",
                 "ok": true,
                 "denied": false,
                 "output": "test result: ok",
@@ -2762,8 +2725,8 @@ fn attach_replays_a_pending_approval() {
         serde_json::json!({
             "approval_id": "a1",
             "call_id": "c1",
-            "tool": "write_file",
-            "summary": "write_file out.txt",
+            "tool": "apply_patch",
+            "summary": "apply_patch out.txt",
             "arguments": {"path": "out.txt", "content": "x"},
             "diff": "--- a/out.txt\n+++ b/out.txt\n@@ -1 +1 @@\n-x\n+y\n",
         }),
@@ -2774,7 +2737,7 @@ fn attach_replays_a_pending_approval() {
         EventKind::ToolResult,
         serde_json::json!({
             "call_id": "c1",
-            "tool": "write_file",
+            "tool": "apply_patch",
             "ok": true,
             "denied": false,
             "output": "done",
@@ -2804,8 +2767,8 @@ fn approval_card_shows_the_full_long_command() {
         serde_json::json!({
             "approval_id": "a1",
             "call_id": "c1",
-            "tool": "run_command",
-            "summary": "run_command: echo (truncated)",
+            "tool": "exec_command",
+            "summary": "exec_command: echo (truncated)",
             "arguments": {"command": command, "cwd": "/tmp"},
             "scopes": ["once", "session", "user"],
         }),
@@ -2846,8 +2809,8 @@ fn approval_keys_answer_the_focused_pane() {
             kind: PendingKind::Tool,
             approval_id: "a1".to_string(),
             call_id: "c1".to_string(),
-            tool: "write_file".to_string(),
-            summary: "write_file out.txt".to_string(),
+            tool: "apply_patch".to_string(),
+            summary: "apply_patch out.txt".to_string(),
             diff: None,
             path: None,
             hunks: Vec::new(),
@@ -2898,8 +2861,8 @@ fn app_with_diff(
             kind: PendingKind::Tool,
             approval_id: "a1".to_string(),
             call_id: "c1".to_string(),
-            tool: "write_file".to_string(),
-            summary: "write_file out.txt".to_string(),
+            tool: "apply_patch".to_string(),
+            summary: "apply_patch out.txt".to_string(),
             diff: diff.map(str::to_string),
             path: None,
             hunks: Vec::new(),
@@ -2932,8 +2895,8 @@ fn app_with_hunks(hunks: Vec<HunkInfo>) -> App {
             kind: PendingKind::Tool,
             approval_id: "a1".to_string(),
             call_id: "c1".to_string(),
-            tool: "write_file".to_string(),
-            summary: "write_file out.txt".to_string(),
+            tool: "apply_patch".to_string(),
+            summary: "apply_patch out.txt".to_string(),
             diff: Some("unused".to_string()),
             path: None,
             selected: vec![true; hunks.len()],
@@ -3131,7 +3094,7 @@ fn diff_review_needs_a_diff() {
 }
 
 #[test]
-fn write_file_card_uses_the_whole_diff_budget() {
+fn apply_patch_card_uses_the_whole_diff_budget() {
     let mut diff = String::from("--- a/out.txt\n+++ b/out.txt\n@@ -1,15 +1,15 @@\n");
     for index in 0..15 {
         diff.push_str(&format!("-old_{index}\n+new_{index}\n"));
@@ -5479,7 +5442,7 @@ fn ctrl_b_f_page_dialog_overlays() {
             .map(|i| InboxItem {
                 session_id: format!("s{i}"),
                 session_name: format!("s{i}"),
-                tool: "run_command".into(),
+                tool: "exec_command".into(),
                 summary: format!("item {i}"),
                 kind: PendingKind::Tool,
             })
@@ -6353,26 +6316,29 @@ fn input_app() -> (
     app.focus = Focus::Transcript;
     app.inputs.insert(
         "s1".to_string(),
-        PendingInput {
-            input_id: "i1".to_string(),
-            call_id: "c1".to_string(),
-            question: "Which database?".to_string(),
-            options: vec![
-                InputOption {
-                    label: "SQLite".to_string(),
-                    description: Some("embedded".to_string()),
-                },
-                InputOption {
-                    label: "Postgres".to_string(),
-                    description: None,
-                },
-                InputOption {
-                    label: "MySQL".to_string(),
-                    description: None,
-                },
-            ],
-            cursor: 0,
-        },
+        PendingInput::new(
+            "i1".to_string(),
+            "c1".to_string(),
+            vec![InputQuestion {
+                id: "db".to_string(),
+                header: "Database".to_string(),
+                question: "Which database?".to_string(),
+                options: vec![
+                    InputOption {
+                        label: "SQLite".to_string(),
+                        description: Some("embedded".to_string()),
+                    },
+                    InputOption {
+                        label: "Postgres".to_string(),
+                        description: None,
+                    },
+                    InputOption {
+                        label: "MySQL".to_string(),
+                        description: None,
+                    },
+                ],
+            }],
+        ),
     );
     (app, tx, rx)
 }
@@ -6383,22 +6349,25 @@ fn input_keys_pick_options_and_enter_answers() {
     let key = |code, modifiers| KeyEvent::new(code, modifiers);
 
     app.handle_transcript_key(key(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
-    assert_eq!(app.focused_input().expect("pending").cursor, 1);
+    assert_eq!(app.focused_input().expect("pending").cursors[0], 1);
     app.handle_transcript_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL), &tx);
-    assert_eq!(app.focused_input().expect("pending").cursor, 0);
+    assert_eq!(app.focused_input().expect("pending").cursors[0], 0);
     app.handle_transcript_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL), &tx);
-    assert_eq!(app.focused_input().expect("pending").cursor, 1);
+    assert_eq!(app.focused_input().expect("pending").cursors[0], 1);
 
     app.handle_transcript_key(key(KeyCode::Enter, KeyModifiers::NONE), &tx);
     match rx.try_recv().expect("input command") {
         Command::Input {
             session_id,
             input_id,
-            option_index,
+            answers,
         } => {
             assert_eq!(session_id, "s1");
             assert_eq!(input_id, "i1");
-            assert_eq!(option_index, 1);
+            assert_eq!(
+                answers.get("db").map(Vec::as_slice),
+                Some(&["Postgres".to_string()][..])
+            );
         }
         _ => panic!("expected an input command"),
     }
@@ -6409,7 +6378,12 @@ fn number_keys_answer_without_moving_the_cursor() {
     let (mut app, tx, mut rx) = input_app();
     app.handle_transcript_key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE), &tx);
     match rx.try_recv().expect("input command") {
-        Command::Input { option_index, .. } => assert_eq!(option_index, 2),
+        Command::Input { answers, .. } => {
+            assert_eq!(
+                answers.get("db").map(Vec::as_slice),
+                Some(&["MySQL".to_string()][..])
+            )
+        }
         _ => panic!("expected an input command"),
     }
 }
@@ -6439,13 +6413,13 @@ fn card_ctrl_navigation_works_with_prompt_focus_in_tabby() {
         KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
         &tx,
     );
-    assert_eq!(app.focused_input().expect("pending").cursor, 1);
+    assert_eq!(app.focused_input().expect("pending").cursors[0], 1);
 
     app.handle_key(
         KeyEvent::new(KeyCode::Char('k'), KeyModifiers::CONTROL),
         &tx,
     );
-    assert_eq!(app.focused_input().expect("pending").cursor, 0);
+    assert_eq!(app.focused_input().expect("pending").cursors[0], 0);
 
     app.handle_key(
         KeyEvent::new(KeyCode::Char('j'), KeyModifiers::CONTROL),
@@ -6453,7 +6427,144 @@ fn card_ctrl_navigation_works_with_prompt_focus_in_tabby() {
     );
     app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
     match rx.try_recv().expect("input command") {
-        Command::Input { option_index, .. } => assert_eq!(option_index, 1),
+        Command::Input { answers, .. } => {
+            assert_eq!(
+                answers.get("db").map(Vec::as_slice),
+                Some(&["Postgres".to_string()][..])
+            )
+        }
+        _ => panic!("expected an input command"),
+    }
+}
+
+/// Two-question request used by the tab and "Other" tests.
+fn multi_input_app() -> (
+    App,
+    UnboundedSender<Command>,
+    tokio::sync::mpsc::UnboundedReceiver<Command>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(
+        Session::new("s1", "ask", "/tmp"),
+        Vec::new(),
+    ));
+    app.focused = 0;
+    app.focus = Focus::Transcript;
+    let options = |labels: &[&str]| {
+        labels
+            .iter()
+            .map(|label| InputOption {
+                label: label.to_string(),
+                description: None,
+            })
+            .collect::<Vec<_>>()
+    };
+    app.inputs.insert(
+        "s1".to_string(),
+        PendingInput::new(
+            "i1".to_string(),
+            "c1".to_string(),
+            vec![
+                InputQuestion {
+                    id: "db".to_string(),
+                    header: "Database".to_string(),
+                    question: "Which database?".to_string(),
+                    options: options(&["SQLite", "Postgres"]),
+                },
+                InputQuestion {
+                    id: "deploy".to_string(),
+                    header: "Deploy".to_string(),
+                    question: "Deploy where?".to_string(),
+                    options: options(&["Fly", "Local"]),
+                },
+            ],
+        ),
+    );
+    (app, tx, rx)
+}
+
+#[test]
+fn multi_question_tabs_submit_one_answer_map() {
+    let (mut app, tx, mut rx) = multi_input_app();
+    let text = render_text(&mut app, 80, 30);
+    assert!(text.contains("questions 1/2"), "{text}");
+    assert!(text.contains("Database"), "{text}");
+
+    // Answering the first question jumps to the still-unanswered tab and does
+    // not send anything yet.
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    assert!(rx.try_recv().is_err(), "must wait for every question");
+    assert_eq!(app.focused_input().expect("pending").tab, 1);
+    let text = render_text(&mut app, 80, 30);
+    assert!(text.contains("questions 2/2"), "{text}");
+    assert!(text.contains("Deploy where?"), "{text}");
+
+    // Tab switches back and forth; the committed answer marker follows.
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+    assert_eq!(app.focused_input().expect("pending").tab, 0);
+    let text = render_text(&mut app, 80, 30);
+    assert!(text.contains("✓ Database"), "{text}");
+
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Right, KeyModifiers::NONE), &tx);
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE), &tx);
+    match rx.try_recv().expect("input command") {
+        Command::Input {
+            session_id,
+            input_id,
+            answers,
+        } => {
+            assert_eq!(session_id, "s1");
+            assert_eq!(input_id, "i1");
+            assert_eq!(
+                answers.get("db").map(Vec::as_slice),
+                Some(&["SQLite".to_string()][..])
+            );
+            assert_eq!(
+                answers.get("deploy").map(Vec::as_slice),
+                Some(&["Local".to_string()][..])
+            );
+        }
+        _ => panic!("expected an input command"),
+    }
+}
+
+#[test]
+fn other_row_accepts_a_free_form_answer() {
+    let (mut app, tx, mut rx) = multi_input_app();
+    // The synthetic row sits after the real options.
+    for _ in 0..2 {
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+    }
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    let pending = app.focused_input().expect("pending");
+    assert!(pending.editing, "Enter on Other starts the editor");
+    assert_eq!(pending.cursors[0], 2);
+
+    for ch in "DuckDB".chars() {
+        app.handle_transcript_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+    let text = render_text(&mut app, 80, 30);
+    assert!(text.contains("Other: DuckDB"), "{text}");
+
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    assert!(rx.try_recv().is_err(), "second question is still open");
+    let pending = app.focused_input().expect("pending");
+    assert_eq!(pending.answers[0].as_deref(), Some("DuckDB"));
+    assert_eq!(pending.tab, 1);
+
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    match rx.try_recv().expect("input command") {
+        Command::Input { answers, .. } => {
+            assert_eq!(
+                answers.get("db").map(Vec::as_slice),
+                Some(&["DuckDB".to_string()][..])
+            );
+            assert_eq!(
+                answers.get("deploy").map(Vec::as_slice),
+                Some(&["Fly".to_string()][..])
+            );
+        }
         _ => panic!("expected an input command"),
     }
 }
@@ -6468,8 +6579,8 @@ fn approval_card_uses_markdown_checkboxes() {
             kind: PendingKind::Tool,
             approval_id: "a1".to_string(),
             call_id: "c1".to_string(),
-            tool: "run_command".to_string(),
-            summary: "run_command: ls".to_string(),
+            tool: "exec_command".to_string(),
+            summary: "exec_command: ls".to_string(),
             diff: None,
             path: None,
             hunks: Vec::new(),
@@ -6500,8 +6611,8 @@ fn approval_ctrl_navigation_works_with_prompt_focus() {
             kind: PendingKind::Tool,
             approval_id: "a1".to_string(),
             call_id: "c1".to_string(),
-            tool: "run_command".to_string(),
-            summary: "run_command: ls".to_string(),
+            tool: "exec_command".to_string(),
+            summary: "exec_command: ls".to_string(),
             diff: None,
             path: None,
             hunks: Vec::new(),
@@ -6539,24 +6650,28 @@ fn pending_input_replays_from_events() {
         eix_core::payload(&InputRequiredPayload {
             input_id: "i1".to_string(),
             call_id: "c1".to_string(),
-            question: "Which?".to_string(),
-            options: vec![
-                InputOption {
-                    label: "A".to_string(),
-                    description: None,
-                },
-                InputOption {
-                    label: "B".to_string(),
-                    description: None,
-                },
-            ],
+            questions: vec![InputQuestion {
+                id: "q".to_string(),
+                header: "Q".to_string(),
+                question: "Which?".to_string(),
+                options: vec![
+                    InputOption {
+                        label: "A".to_string(),
+                        description: None,
+                    },
+                    InputOption {
+                        label: "B".to_string(),
+                        description: None,
+                    },
+                ],
+            }],
         }),
     )];
     let view = SessionView::new(Session::new("s1", "ask", "/tmp"), events);
     let pending = view.pending_input().expect("pending question");
-    assert_eq!(pending.question, "Which?");
-    assert_eq!(pending.options.len(), 2);
-    assert_eq!(pending.cursor, 0);
+    assert_eq!(pending.questions[0].question, "Which?");
+    assert_eq!(pending.questions[0].options.len(), 2);
+    assert_eq!(pending.cursors[0], 0);
 }
 
 #[test]
@@ -6565,8 +6680,8 @@ fn approval_actions_lead_with_the_recommendation() {
         kind: PendingKind::Tool,
         approval_id: "a1".to_string(),
         call_id: "c1".to_string(),
-        tool: "run_command".to_string(),
-        summary: "run_command: ls".to_string(),
+        tool: "exec_command".to_string(),
+        summary: "exec_command: ls".to_string(),
         diff: None,
         path: None,
         hunks: Vec::new(),
@@ -6619,8 +6734,8 @@ fn live_approval_notification_keeps_risk_metadata() {
                 "turn_id": "t1",
                 "approval_id": "a1",
                 "call_id": "c1",
-                "tool": "run_command",
-                "summary": "run_command: truncated",
+                "tool": "exec_command",
+                "summary": "exec_command: truncated",
                 "arguments": {"command": "curl https://example.com/?token=x"},
                 "risk": "high",
                 "risk_categories": ["network"],
@@ -6676,8 +6791,8 @@ fn high_risk_and_forced_ask_cards_hide_always() {
         kind: PendingKind::Tool,
         approval_id: "a1".to_string(),
         call_id: "c1".to_string(),
-        tool: "run_command".to_string(),
-        summary: "[HIGH] run_command: rm -rf /".to_string(),
+        tool: "exec_command".to_string(),
+        summary: "[HIGH] exec_command: rm -rf /".to_string(),
         diff: None,
         path: None,
         hunks: Vec::new(),
@@ -6686,10 +6801,10 @@ fn high_risk_and_forced_ask_cards_hide_always() {
     };
     assert!(!approval.actions().contains(&ApprovalAction::Always));
 
-    approval.summary = format!("[MEDIUM] write_file out.txt{NO_ALWAYS_MARKER}");
+    approval.summary = format!("[MEDIUM] apply_patch out.txt{NO_ALWAYS_MARKER}");
     assert!(!approval.actions().contains(&ApprovalAction::Always));
 
-    approval.summary = "[MEDIUM] write_file out.txt".to_string();
+    approval.summary = "[MEDIUM] apply_patch out.txt".to_string();
     assert!(approval.actions().contains(&ApprovalAction::Always));
 }
 
@@ -6703,8 +6818,8 @@ fn enter_approves_the_recommended_action() {
             kind: PendingKind::Tool,
             approval_id: "a1".to_string(),
             call_id: "c1".to_string(),
-            tool: "run_command".to_string(),
-            summary: "run_command: ls".to_string(),
+            tool: "exec_command".to_string(),
+            summary: "exec_command: ls".to_string(),
             diff: None,
             path: None,
             hunks: Vec::new(),

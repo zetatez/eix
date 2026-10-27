@@ -27,13 +27,13 @@ use eix_core::{
     ChatMessage, ClassifierAuditPayload, Config, ContextClearParams, ContextClearedPayload,
     ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DraftParams, DraftResult,
     ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
-    HelloResult, ImagePart, InputAnsweredPayload, InputOption, InputRequiredPayload,
-    InputRespondParams, InputResult, IntegrationContinueParams, IntegrationListParams,
-    IntegrationListResult, IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult,
-    McpServerInfo, ModeParams, ModelListResult, ModelUseParams, ModelUseResult, Notification,
-    PatchApplyParams, PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams,
-    PatchResult, PatchResultPayload, PatchReviseParams, PermissionAction, PermissionRule,
-    PickerParams, PickerPreviewParams, PickerPreviewResult, PluginCommandList, PluginListResult,
+    HelloResult, ImagePart, InputAnsweredPayload, InputRequiredPayload, InputRespondParams,
+    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
+    IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo,
+    ModeParams, ModelListResult, ModelUseParams, ModelUseResult, Notification, PatchApplyParams,
+    PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
+    PatchResultPayload, PatchReviseParams, PermissionAction, PermissionRule, PickerParams,
+    PickerPreviewParams, PickerPreviewResult, PluginCommandList, PluginListResult,
     ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
     ProviderAuthInfo, RenameParams, Request, Response, RewindParams, RewindResult, RuleSource,
     ServerMessage, Session, SessionAgentParams, SessionArchiveParams, SessionCdParams,
@@ -101,13 +101,9 @@ const MAX_REMOTE_CONNECTIONS: usize = 128;
 /// Hard cap for one `session.events` page even when the caller omits `limit`.
 const MAX_EVENTS_PAGE: usize = 5_000;
 
-/// Bound fan-out for one read-only tool batch, including `run_command` calls
+/// Bound fan-out for one read-only tool batch, including `exec_command` lines
 /// that passed the read-only risk check.
 const PARALLEL_TOOL_CONCURRENCY: usize = 8;
-
-/// Bound fan-out for one write segment. File writes to independent paths are
-/// I/O-bound, so they can tolerate more overlap than reads.
-const PARALLEL_WRITE_CONCURRENCY: usize = 32;
 
 /// Coalesce provider fragments before they reach the notification bus. A fast
 /// model emits hundreds of tiny deltas per second; sending each one allocates a
@@ -121,19 +117,6 @@ const STREAM_DELTA_BATCH_INTERVAL: Duration = Duration::from_millis(50);
 /// records exactly the decision that admitted it.
 enum ParallelCall {
     Read(PermissionDecision),
-    /// A direct (already allowed) file write and the canonical identity of its
-    /// target. Two writes may overlap only when these identities do not.
-    Write(PermissionDecision, PathBuf),
-}
-
-/// A direct write whose tool result is recorded only after the whole write
-/// segment has collected diagnostics for every touched file.
-struct PendingWrite {
-    call: ToolCall,
-    ok: bool,
-    output: String,
-    duration_ms: u64,
-    paths: Vec<PathBuf>,
 }
 
 /// Buffers streamed content and reasoning until a size or time threshold.
@@ -202,13 +185,6 @@ impl<'a> DeltaBatcher<'a> {
     }
 }
 
-enum WriteCallOutcome {
-    /// The call failed before execution or was denied; its result is already
-    /// recorded.
-    Recorded(ChatMessage),
-    Pending(PendingWrite),
-}
-
 /// True when a call is read-only at the risk-analysis level. This is used for
 /// both the parallel segment and the earlier sub-agent overlap decision.
 fn call_is_parallel_readonly(call: &ToolCall, cwd: &Path) -> bool {
@@ -245,7 +221,16 @@ fn output_cap(args: &Value, default_bytes: usize) -> usize {
 }
 
 fn format_process_output(output: &eix_core::ProcessOutput) -> String {
-    let mut text = output.text.clone();
+    // A `cat` of an image or archive decodes into replacement glyphs and NULs.
+    // Say so instead of returning a context-sized block of noise.
+    let mut text = if tools::looks_binary(&output.text) {
+        format!(
+            "(binary output: {} bytes; not shown. Use `od -c` or `xxd` for a hex view, or `view_image` for images.)",
+            output.bytes
+        )
+    } else {
+        output.text.clone()
+    };
     if text.is_empty() {
         text = if output.status.is_running() {
             "(no new output yet)".to_string()
@@ -266,7 +251,12 @@ fn format_process_output(output: &eix_core::ProcessOutput) -> String {
         text.push_str(&format!("\n\nexit code: {code}"));
     }
     if output.truncated {
-        text.push_str("\n[output truncated]");
+        // The buffer keeps the tail, so the start of the stream is gone. Point
+        // at a narrower read instead of pretending the output is complete.
+        text.push_str(&format!(
+            "\n[output truncated: {} bytes produced, only the tail is shown; re-run with a narrower range (`sed -n 'a,bp'`, `head`, or `rg -n`)]",
+            output.bytes
+        ));
     }
     text
 }
@@ -704,7 +694,6 @@ fn prepare_socket(path: &Path) -> Result<()> {
 /// in the patch document, so the caller resolves them before the snapshot.
 enum SnapshotTargets<'a> {
     None,
-    Plan(&'a tools::WritePlan),
     Patch(&'a [tools::PatchOp]),
 }
 
@@ -738,9 +727,9 @@ pub(crate) struct Daemon {
     /// holding this only around the snapshot (not the mutation) keeps writes to
     /// different files concurrent.
     snapshot_lock: Mutex<()>,
-    /// Staged `write_file` proposals, the session shadow workspace.
+    /// Staged patch proposals, the session shadow workspace.
     staging: Staging,
-    /// Background processes started with `start_command`.
+    /// Background processes started with `exec_command`.
     processes: Arc<ProcessRegistry>,
     /// Lazily started MCP servers and their tools.
     mcp: Mutex<crate::mcp::McpSet>,
@@ -763,7 +752,7 @@ pub(crate) struct Daemon {
     approvals: Mutex<HashMap<SessionId, PendingApproval>>,
     /// Session-scoped rules created by "Always allow" on the approval card.
     always: Mutex<HashMap<SessionId, Vec<PermissionRule>>>,
-    /// `ask_user` questions blocked on an answer, keyed by session.
+    /// `request_user_input` questions blocked on an answer, keyed by session.
     inputs: Mutex<HashMap<SessionId, PendingInput>>,
     /// In-flight `/btw` side questions, keyed by session (for cancellation).
     btws: Mutex<HashMap<SessionId, Arc<AtomicBool>>>,
@@ -868,22 +857,18 @@ struct PendingApproval {
 
 struct PendingInput {
     input_id: String,
-    /// Number of valid options, so an out-of-range answer is rejected instead
-    /// of silently cancelling the turn.
-    options: usize,
-    responder: oneshot::Sender<usize>,
+    /// Questions in request order; used to validate answer keys and to map
+    /// the legacy `option_index` shortcut onto the first question.
+    questions: Vec<eix_core::InputQuestion>,
+    responder: oneshot::Sender<std::collections::BTreeMap<String, Vec<String>>>,
 }
 
 #[derive(Debug, Clone)]
 struct ApprovalReply {
     decision: ApprovalDecision,
     reason: Option<String>,
-    /// Write plan captured when the diff was shown (write_file only).
-    plan: Option<tools::WritePlan>,
     /// Formatted patch operations captured when the diff was shown.
     patch_ops: Option<Vec<tools::PatchOp>>,
-    /// Hunk indices the user selected; `None` means the whole change.
-    hunks: Option<Vec<usize>>,
     /// Where an "Always" decision is remembered.
     scope: ApprovalScope,
 }
@@ -1951,7 +1936,7 @@ impl Daemon {
              conflicted files, run `git add <files>`, then `GIT_EDITOR=true git rebase --continue`\n\
              until the rebase finishes. If you cannot resolve it, run `git rebase --abort` and explain.\n\
              If the fix needs a human decision (for example which test command to use, or how\n\
-             to clean the base worktree), ask the user with `ask_user` and wait for the answer.\n\
+             to clean the base worktree), ask the user with `request_user_input` and wait for the answer.\n\
              Do not call `ready` again until something has changed. After resolving, run the\n\
              project tests, then call the `ready` tool (or run `eix ready`) to requeue. Do not\n\
              merge or rebase the base branch yourself.",
@@ -3564,13 +3549,11 @@ impl Daemon {
                     let _ = pending.responder.send(ApprovalReply {
                         decision: ApprovalDecision::Deny,
                         reason: Some("turn cancelled".to_string()),
-                        plan: None,
                         patch_ops: None,
-                        hunks: None,
                         scope: ApprovalScope::Once,
                     });
                 }
-                // Drop a pending question; the waiting `ask_user` sees a closed
+                // Drop a pending question; the waiting tool sees a closed
                 // channel and reports that the user did not answer.
                 self.inputs.lock().await.remove(&params.session_id);
                 Ok(serde_json::to_value(CancelResult { cancelled })?)
@@ -3781,9 +3764,7 @@ impl Daemon {
                 let _ = pending.responder.send(ApprovalReply {
                     decision,
                     reason,
-                    plan: None,
                     patch_ops: None,
-                    hunks,
                     scope,
                 });
                 return Ok(ApprovalResult { accepted: true });
@@ -3808,11 +3789,42 @@ impl Daemon {
             inputs.insert(params.session_id, pending);
             return Ok(InputResult { accepted: false });
         }
-        if params.option_index >= pending.options {
+        // Legacy single-question clients send an option index. Map it onto the
+        // first question's label before validating the answer map.
+        let mut requested = params.answers.clone();
+        if requested.is_empty() {
+            if let Some(index) = params.option_index {
+                let Some(question) = pending.questions.first() else {
+                    inputs.insert(params.session_id, pending);
+                    return Ok(InputResult { accepted: false });
+                };
+                let Some(option) = question.options.get(index) else {
+                    inputs.insert(params.session_id, pending);
+                    return Ok(InputResult { accepted: false });
+                };
+                requested.insert(question.id.clone(), vec![option.label.clone()]);
+            }
+        }
+        // Every question must have a non-empty answer, and no unknown ids.
+        let mut answers = std::collections::BTreeMap::new();
+        for question in &pending.questions {
+            let Some(values) = requested
+                .get(&question.id)
+                .filter(|values| values.iter().any(|value| !value.trim().is_empty()))
+            else {
+                inputs.insert(params.session_id, pending);
+                return Ok(InputResult { accepted: false });
+            };
+            answers.insert(question.id.clone(), values.clone());
+        }
+        if requested
+            .keys()
+            .any(|id| !pending.questions.iter().any(|question| &question.id == id))
+        {
             inputs.insert(params.session_id, pending);
             return Ok(InputResult { accepted: false });
         }
-        let _ = pending.responder.send(params.option_index);
+        let _ = pending.responder.send(answers);
         Ok(InputResult { accepted: true })
     }
 
@@ -4917,36 +4929,11 @@ impl Daemon {
         if !worktree_ready {
             definitions.retain(|tool| tool.function.name != "ready");
         }
-        if !read_only && !sub_agent {
-            let config = self.config.load_full();
-            let mut dynamic = Vec::new();
-            if mcp_configured {
-                let mcp_tools = {
-                    let mut mcp = self.mcp.lock().await;
-                    mcp.ensure_loaded(&config).await;
-                    mcp.refresh(&config).await;
-                    mcp.tool_definitions()
-                };
-                dynamic.extend(mcp_tools);
-            }
-            // Plugin tools are exposed only to normal sessions. A plan or
-            // sub-agent session must not see a tool that can mutate state.
-            dynamic.extend(self.plugins.tool_definitions().await);
-            if !dynamic.is_empty() {
-                // Tool schemas are paid for on every request. Built-ins always
-                // fit; cap dynamic schemas so one large integration cannot
-                // consume the whole context before the model sees the user.
-                let cap = config.context.max_tool_schema_tokens;
-                let (kept, omitted) =
-                    cap_tool_schemas(std::mem::take(&mut definitions), dynamic, cap);
-                definitions = kept;
-                if omitted > 0 {
-                    eprintln!(
-                        "eixd: omitted {omitted} dynamic tool(s) to keep tool schemas under \
-                         {cap} tokens; narrow mcp.servers.*.allowed_tools or plugin tool filters"
-                    );
-                }
-            }
+        // MCP and plugin tools are deferred: `tool_search` pulls the ones the
+        // model actually needs into a later request instead of paying for every
+        // schema on every round.
+        if read_only || sub_agent {
+            definitions.retain(|tool| tool.function.name != "tool_search");
         }
         if let Err(err) = self
             .run_turn_inner(&session_id, &turn_id, &cancel, &definitions, None)
@@ -5014,10 +5001,9 @@ impl Daemon {
             };
         let mut messages = ledger.messages();
         self.emit_context(session_id, &ledger);
-        let tools = allowed_tools;
-        // Tool schemas are fixed for the whole turn. Serializing them for the
-        // token estimate once avoids repeating it on every round and retry.
-        let tool_schema_tokens = estimate_tool_schema_tokens(tools);
+        // Deferred tools discovered by `tool_search` join this list for the
+        // rest of the turn, so later rounds see their schemas.
+        let mut tools = allowed_tools.to_vec();
         let route = config.route(&model);
         let (max_retries, retry_base, retry_max) = (
             config.provider_runtime.retry_attempts,
@@ -5105,7 +5091,10 @@ impl Daemon {
             if let Some(notice) = repeat_notice.take() {
                 messages.push(ChatMessage::system(notice));
             }
-            let request_tools = tools;
+            let request_tools = tools.as_slice();
+            // Serializing schemas once per round keeps the token estimate in
+            // step with tools discovered by `tool_search`.
+            let tool_schema_tokens = estimate_tool_schema_tokens(request_tools);
 
             let provider = self.provider.load_full();
             let mut attempt = 0u32;
@@ -5377,6 +5366,7 @@ impl Daemon {
                 &completion.tool_calls,
                 &static_context,
                 &mut messages,
+                &mut tools,
                 cancel,
             )
             .await?;
@@ -5391,7 +5381,7 @@ impl Daemon {
     /// Run one assistant tool batch in two kinds of concurrent segments:
     ///
     /// - consecutive read-only calls (including proven read-only commands)
-    /// - consecutive direct `write_file` / `edit` calls whose target files do
+    /// - consecutive direct writes whose target files do
     ///   not overlap
     ///
     /// Reads, non-read-only commands, approval-gated calls, interactive calls,
@@ -5405,6 +5395,7 @@ impl Daemon {
     /// Mutating calls, approval-gated calls, and calls the risk analyzer cannot
     /// prove read-only remain barriers, so a child never observes a
     /// half-applied change.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool_batch(
         self: &Arc<Self>,
         session_id: &str,
@@ -5412,6 +5403,7 @@ impl Daemon {
         calls: &[ToolCall],
         static_context: &Arc<StaticContext>,
         messages: &mut Vec<ChatMessage>,
+        tools: &mut Vec<ToolDefinition>,
         cancel: &Arc<AtomicBool>,
     ) -> Result<()> {
         let session = self.require_session(session_id)?;
@@ -5465,7 +5457,7 @@ impl Daemon {
 
             let Some(kind) = self.parallel_call_kind(&session, call).await else {
                 if let Err(err) = self
-                    .run_tool_call(session_id, turn_id, call, messages, cancel.as_ref())
+                    .run_tool_call(session_id, turn_id, call, messages, tools, cancel.as_ref())
                     .await
                 {
                     tool_error = Some(err);
@@ -5499,7 +5491,14 @@ impl Daemon {
                     if segment.len() == 1 {
                         let (call, _) = segment.pop().expect("one call");
                         if let Err(err) = self
-                            .run_tool_call(session_id, turn_id, &call, messages, cancel.as_ref())
+                            .run_tool_call(
+                                session_id,
+                                turn_id,
+                                &call,
+                                messages,
+                                tools,
+                                cancel.as_ref(),
+                            )
                             .await
                         {
                             tool_error = Some(err);
@@ -5537,82 +5536,6 @@ impl Daemon {
                         }
                     }
                 }
-                ParallelCall::Write(decision, target) => {
-                    // Same-file writes must stay in call order: the second may
-                    // be an `edit` based on the first result. Different files
-                    // have disjoint snapshots and formatter runs, so they can
-                    // overlap. `patch` and approval-gated writes never enter
-                    // this branch.
-                    let mut segment = vec![(call.clone(), decision, target)];
-                    index += 1;
-                    while index < calls.len() {
-                        let next = &calls[index];
-                        if next.function.name == "spawn_agent" {
-                            break;
-                        }
-                        match self.parallel_call_kind(&session, next).await {
-                            Some(ParallelCall::Write(decision, target))
-                                if segment.iter().all(|(_, _, existing)| {
-                                    !write_paths_overlap(existing, &target)
-                                }) =>
-                            {
-                                segment.push((next.clone(), decision, target));
-                                index += 1;
-                            }
-                            _ => break,
-                        }
-                    }
-
-                    if segment.len() == 1 {
-                        let (call, _, _) = segment.pop().expect("one call");
-                        if let Err(err) = self
-                            .run_tool_call(session_id, turn_id, &call, messages, cancel.as_ref())
-                            .await
-                        {
-                            tool_error = Some(err);
-                        }
-                        continue;
-                    }
-
-                    let limit = Arc::new(Semaphore::new(PARALLEL_WRITE_CONCURRENCY));
-                    let results = futures_util::future::join_all(segment.into_iter().map(
-                        |(call, decision, _)| {
-                            let daemon = Arc::clone(self);
-                            let limit = Arc::clone(&limit);
-                            let cancel = Arc::clone(cancel);
-                            async move {
-                                let _permit = limit.acquire_owned().await.expect("semaphore open");
-                                daemon
-                                    .run_file_write_call(
-                                        session_id,
-                                        turn_id,
-                                        &call,
-                                        &decision,
-                                        cancel.as_ref(),
-                                    )
-                                    .await
-                            }
-                        },
-                    ));
-                    let mut outcomes = Vec::new();
-                    for result in results.await {
-                        match result {
-                            Ok(outcome) => outcomes.push(outcome),
-                            Err(err) => {
-                                tool_error = Some(err);
-                                break;
-                            }
-                        }
-                    }
-                    if let Err(err) = self
-                        .finish_file_write_segment(session_id, turn_id, outcomes, messages)
-                        .await
-                    {
-                        if tool_error.is_none() {
-                            tool_error = Some(err);
-                        }
-                    }
-                }
             }
         }
 
@@ -5636,14 +5559,9 @@ impl Daemon {
     /// Decide whether a call can join a concurrent segment and return the
     /// permission decision that the parallel path must record.
     ///
-    /// Reads and `run_command` calls are checked through the normal permission
-    /// pipeline: a secret read, an explicit ask/deny rule, or a command the
-    /// risk analyzer cannot prove read-only stays sequential.
-    ///
-    /// Direct `write_file` / `edit` calls join a write segment only when the
-    /// static decision is already `allow` (the default auto-apply path or an
-    /// explicit allow rule). Writes that need approval, classifier review,
-    /// staging, or a `patch` tree snapshot stay sequential.
+    /// Read-only calls and `exec_command` lines are checked through the normal
+    /// permission pipeline: a secret read, an explicit ask/deny rule, or a
+    /// command the risk analyzer cannot prove read-only stays sequential.
     async fn parallel_call_kind(&self, session: &Session, call: &ToolCall) -> Option<ParallelCall> {
         let tool = call.function.name.as_str();
         let args: Value = serde_json::from_str(&call.function.arguments).ok()?;
@@ -5675,23 +5593,7 @@ impl Daemon {
             .then_some(ParallelCall::Read(decision));
         }
 
-        if !matches!(tool, "write_file" | "edit") || session.origin == SessionOrigin::Agent {
-            return None;
-        }
-        let decision = permission_decide(
-            tool,
-            &args,
-            &session.cwd,
-            &config,
-            self.session_mode(session),
-            &session_rules,
-            false,
-        );
-        if decision.action != PermissionAction::Allow || decision.force_ask {
-            return None;
-        }
-        let target = write_target_identity(&args, &session.cwd, &config)?;
-        Some(ParallelCall::Write(decision, target))
+        None
     }
 
     /// Start `spawn_agent` calls concurrently under the configured fan-out.
@@ -5836,23 +5738,15 @@ impl Daemon {
                 "tool": tool,
             }),
         );
-        let outcome = match self
-            .read_with_staging(session_id, tool, &args, &session.cwd)
-            .await
-        {
-            Some(outcome) => outcome,
-            None => {
-                tools::execute_in(
-                    tool,
-                    &args,
-                    &session.cwd,
-                    &self.config.load(),
-                    Some(cancel),
-                    session.worktree.as_deref(),
-                )
-                .await
-            }
-        };
+        let outcome = tools::execute_in(
+            tool,
+            &args,
+            &session.cwd,
+            &self.config.load(),
+            Some(cancel),
+            session.worktree.as_deref(),
+        )
+        .await;
         let (ok, output, duration_ms) = (outcome.ok, outcome.output, outcome.duration_ms);
         self.record_tool_result(session_id, call, ok, false, &output, duration_ms)?;
         self.emit_value(
@@ -5868,296 +5762,6 @@ impl Daemon {
             }),
         );
         Ok(ChatMessage::tool(call.id.clone(), output))
-    }
-
-    /// Execute one direct `write_file` / `edit` call in a concurrent write
-    /// segment. The permission decision was computed before the segment
-    /// started; this path only records it and never prompts, snapshots a
-    /// different file, or lets a write join a segment whose target overlaps.
-    async fn run_file_write_call(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        call: &ToolCall,
-        decision: &PermissionDecision,
-        cancel: &AtomicBool,
-    ) -> Result<WriteCallOutcome> {
-        let tool = call.function.name.as_str();
-        let args: Value = match serde_json::from_str(&call.function.arguments) {
-            Ok(args) => args,
-            Err(err) => {
-                let output = format!("invalid JSON arguments: {err}");
-                self.record_tool_result(session_id, call, false, false, &output, 0)?;
-                return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
-                    call.id.clone(),
-                    output,
-                )));
-            }
-        };
-        let event = self.store.append_event(
-            session_id,
-            EventKind::ToolCall,
-            payload(&ToolCallPayload {
-                call_id: call.id.clone(),
-                tool: tool.to_string(),
-                arguments: args.clone(),
-            }),
-        )?;
-        self.emit_event(&event);
-
-        if cancel.load(Ordering::SeqCst) {
-            let output = "cancelled".to_string();
-            self.record_tool_result(session_id, call, false, false, &output, 0)?;
-            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
-                call.id.clone(),
-                output,
-            )));
-        }
-        if !tools::is_known(tool) {
-            let output = format!("unknown tool {tool:?}");
-            self.record_tool_result(session_id, call, false, false, &output, 0)?;
-            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
-                call.id.clone(),
-                output,
-            )));
-        }
-        if !self.skill_allows(session_id, tool).await {
-            let output = format!("the active skill does not allow the {tool} tool");
-            self.record_tool_result(session_id, call, false, true, &output, 0)?;
-            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
-                call.id.clone(),
-                output,
-            )));
-        }
-
-        let session = self.require_session(session_id)?;
-        if session.origin == SessionOrigin::Agent {
-            let output =
-                "sub-agents are read-only; mutating or interactive tools are not available"
-                    .to_string();
-            self.record_tool_result(session_id, call, false, true, &output, 0)?;
-            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
-                call.id.clone(),
-                output,
-            )));
-        }
-
-        self.record_permission(session_id, &call.id, tool, decision, None)?;
-        if decision.action != PermissionAction::Allow || decision.force_ask {
-            let output = decision.reason.clone();
-            self.record_tool_result(session_id, call, false, true, &output, 0)?;
-            self.emit_value(
-                "tool.completed",
-                json!({
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "call_id": call.id,
-                    "tool": tool,
-                    "ok": false,
-                    "denied": true,
-                    "duration_ms": 0,
-                }),
-            );
-            return Ok(WriteCallOutcome::Recorded(ChatMessage::tool(
-                call.id.clone(),
-                output,
-            )));
-        }
-
-        self.execute_direct_file_write(session_id, turn_id, call, &args, decision, cancel)
-            .await
-            .map(WriteCallOutcome::Pending)
-    }
-
-    /// Run an already-approved direct `write_file` / `edit` and return its
-    /// provider message. Kept separate from `run_tool_call` so a whole write
-    /// segment can join without borrowing the transcript vector.
-    async fn run_direct_file_write(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        call: &ToolCall,
-        args: &Value,
-        decision: &PermissionDecision,
-        cancel: &AtomicBool,
-    ) -> Result<ChatMessage> {
-        let pending = self
-            .execute_direct_file_write(session_id, turn_id, call, args, decision, cancel)
-            .await?;
-        let notes = if pending.ok {
-            let session = self.require_session(session_id)?;
-            let config = self.config.load();
-            self.lsp_notes(&config, &session.cwd, &pending.paths).await
-        } else {
-            String::new()
-        };
-        self.finish_direct_write(session_id, turn_id, pending, notes)
-    }
-
-    /// Apply an already-approved direct write without recording its result.
-    /// The caller either finalizes it immediately or batches diagnostics for
-    /// every write in the segment before recording the tool results.
-    async fn execute_direct_file_write(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        call: &ToolCall,
-        args: &Value,
-        decision: &PermissionDecision,
-        cancel: &AtomicBool,
-    ) -> Result<PendingWrite> {
-        let tool = call.function.name.as_str();
-        let session = self.require_session(session_id)?;
-        let cwd = session.cwd.clone();
-        let config = self.config.load();
-        // Direct writes bypass the approval card. Remember the pre-write base
-        // so the post-format file can still be diffed against the old bytes.
-        let auto_plan = tools::write_plan(tool, args, &cwd, &config).await;
-        let snapshot_warning = self
-            .capture_snapshot(
-                session_id,
-                tool,
-                call,
-                args,
-                &decision.risk,
-                auto_plan
-                    .as_ref()
-                    .map_or(SnapshotTargets::None, SnapshotTargets::Plan),
-            )
-            .await?;
-
-        self.emit_value(
-            "tool.started",
-            json!({
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "call_id": call.id,
-                "tool": tool,
-            }),
-        );
-        let outcome = match &auto_plan {
-            Some(plan) => tools::apply_plan(plan, None, &cwd, &config).await,
-            None => {
-                tools::execute_in(
-                    tool,
-                    args,
-                    &cwd,
-                    &config,
-                    Some(cancel),
-                    session.worktree.as_deref(),
-                )
-                .await
-            }
-        };
-        let (ok, mut output, duration_ms) = (outcome.ok, outcome.output, outcome.duration_ms);
-        if let Some(warning) = snapshot_warning {
-            output.push_str(&format!("\n[snapshot failed: {warning}]"));
-        }
-        let auto_diff = if ok {
-            match auto_plan.as_ref() {
-                Some(plan) => Some(tools::refresh_plan(plan, &config).await.diff().to_string()),
-                None => None,
-            }
-        } else {
-            None
-        };
-        if ok {
-            let path = auto_plan
-                .as_ref()
-                .map(|plan| plan.label().to_string())
-                .or_else(|| args.get("path").and_then(Value::as_str).map(str::to_string))
-                .unwrap_or_default();
-            self.record_auto_patch(
-                session_id,
-                call,
-                &path,
-                &decision.reason,
-                auto_diff.as_deref(),
-            )?;
-        }
-        let paths = if ok {
-            written_paths(tool, args, &cwd, &config)
-        } else {
-            Vec::new()
-        };
-        Ok(PendingWrite {
-            call: call.clone(),
-            ok,
-            output,
-            duration_ms,
-            paths,
-        })
-    }
-
-    /// Record results for one write segment after a single LSP pass.
-    async fn finish_file_write_segment(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        outcomes: Vec<WriteCallOutcome>,
-        messages: &mut Vec<ChatMessage>,
-    ) -> Result<()> {
-        let session = self.require_session(session_id)?;
-        let config = self.config.load();
-        let mut paths = Vec::new();
-        let mut seen = HashSet::new();
-        for outcome in &outcomes {
-            if let WriteCallOutcome::Pending(pending) = outcome {
-                for path in &pending.paths {
-                    if seen.insert(path.clone()) {
-                        paths.push(path.clone());
-                    }
-                }
-            }
-        }
-        let notes = self.lsp_notes_many(&config, &session.cwd, &paths).await;
-        for outcome in outcomes {
-            match outcome {
-                WriteCallOutcome::Recorded(message) => messages.push(message),
-                WriteCallOutcome::Pending(pending) => {
-                    let notes = pending
-                        .paths
-                        .iter()
-                        .filter_map(|path| notes.get(path))
-                        .cloned()
-                        .collect::<String>();
-                    messages.push(self.finish_direct_write(session_id, turn_id, pending, notes)?);
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn finish_direct_write(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        mut pending: PendingWrite,
-        notes: String,
-    ) -> Result<ChatMessage> {
-        pending.output.push_str(&notes);
-        let call = pending.call;
-        self.record_tool_result(
-            session_id,
-            &call,
-            pending.ok,
-            false,
-            &pending.output,
-            pending.duration_ms,
-        )?;
-        self.emit_value(
-            "tool.completed",
-            json!({
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "call_id": call.id.clone(),
-                "tool": call.function.name.clone(),
-                "ok": pending.ok,
-                "denied": false,
-                "duration_ms": pending.duration_ms,
-            }),
-        );
-        Ok(ChatMessage::tool(call.id, pending.output))
     }
 
     /// Start one sub-agent and return its final answer as tool output.
@@ -6452,6 +6056,7 @@ impl Daemon {
         turn_id: &str,
         call: &ToolCall,
         messages: &mut Vec<ChatMessage>,
+        tools: &mut Vec<ToolDefinition>,
         cancel: &AtomicBool,
     ) -> Result<()> {
         let tool = call.function.name.as_str();
@@ -6519,6 +6124,16 @@ impl Daemon {
                 mcp_known,
             )
         };
+        // Codex's `sandbox_permissions=require_escalated` and
+        // `additional_permissions` always need a human decision, even when the
+        // command would otherwise match an allow rule.
+        if tool == "exec_command" {
+            if let Some(reason) = tools::escalation_reason(&args) {
+                decision.action = PermissionAction::Ask;
+                decision.force_ask = true;
+                decision.reason = reason;
+            }
+        }
         let classifier_audit = self
             .classify_auto(&session, messages, tool, &args, &mut decision, cancel)
             .await;
@@ -6530,7 +6145,7 @@ impl Daemon {
             classifier_audit.as_ref(),
         )?;
         // A deny is global and absolute: it must run before the special-case
-        // handlers below (todo/memory/ask_user/lsp), which otherwise bypass
+        // handlers below (plan/memory/questions/lsp), which otherwise bypass
         // the approval gate.
         if decision.action == PermissionAction::Deny {
             let output = decision.reason.clone();
@@ -6571,17 +6186,17 @@ impl Daemon {
 
         // Sub-agents have no UI; a question they asked would block the parent
         // turn with nobody to answer it.
-        if session.origin == SessionOrigin::Agent && tool == "ask_user" {
+        if session.origin == SessionOrigin::Agent && tool == "request_user_input" {
             let output = "sub-agents cannot ask the user questions".to_string();
             self.record_tool_result(session_id, call, false, true, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
         }
 
-        // `todo` only changes daemon state (the session task list). It never
-        // touches the workspace, so it bypasses the approval card.
-        if tool == "todo" {
-            let output = match parse_todos(&args) {
+        // `update_plan` only changes daemon state (the session task list). It
+        // never touches the workspace, so it bypasses the approval card.
+        if tool == "update_plan" {
+            let output = match parse_plan(&args) {
                 Ok(items) => {
                     let rendered = render_todos(&items);
                     self.todos
@@ -6597,12 +6212,55 @@ impl Daemon {
                     return Ok(());
                 }
             };
-            self.record_tool_result(session_id, call, true, true, &output, 0)?;
+            self.record_tool_result(session_id, call, true, false, &output, 0)?;
             messages.push(ChatMessage::tool(call.id.clone(), output));
             return Ok(());
         }
 
-        // `memory` persists a small note outside the workspace. Like `todo` it
+        // `tool_search` only reads deferred tool metadata. Matching schemas
+        // join the turn's tool list so the next model call can use them.
+        if tool == "tool_search" {
+            let query = args
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim();
+            let limit = args
+                .get("limit")
+                .and_then(Value::as_u64)
+                .map(|limit| limit as usize)
+                .unwrap_or(8)
+                .clamp(1, 20);
+            let deferred = self.deferred_tool_definitions(&session).await;
+            let hits = search_deferred_tools(&deferred, query, limit);
+            let mut output = if hits.is_empty() {
+                format!("no deferred tools matched {query:?}")
+            } else {
+                let mut output = format!("matched {} deferred tool(s):", hits.len());
+                for hit in &hits {
+                    output.push_str(&format!(
+                        "\n- {}: {}",
+                        hit.function.name,
+                        truncate_ui(hit.function.description.trim(), 200)
+                    ));
+                    if !tools
+                        .iter()
+                        .any(|tool| tool.function.name == hit.function.name)
+                    {
+                        tools.push(hit.clone());
+                    }
+                }
+                output
+            };
+            if deferred.is_empty() {
+                output = "no deferred tools are configured for this session".to_string();
+            }
+            self.record_tool_result(session_id, call, true, false, &output, 0)?;
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        }
+
+        // `memory` persists a small note outside the workspace. Like the plan it
         // changes daemon state rather than files, so it bypasses approval.
         if tool == "memory" {
             let action = args.get("action").and_then(Value::as_str).unwrap_or("add");
@@ -6653,11 +6311,11 @@ impl Daemon {
             return Ok(());
         }
 
-        // `ask_user` is interactive rather than mutating: it blocks the turn
-        // until the user picks an option (or the turn is cancelled).
-        if tool == "ask_user" {
+        // `request_user_input` is interactive rather than mutating: it blocks
+        // the turn until the user answers (or the turn is cancelled).
+        if tool == "request_user_input" {
             return self
-                .ask_user(session_id, turn_id, call, &args, messages, cancel)
+                .request_user_input(session_id, turn_id, call, &args, messages, cancel)
                 .await;
         }
 
@@ -6705,41 +6363,12 @@ impl Daemon {
             return Ok(());
         }
 
-        // Direct file writes share the execution path used by parallel write
-        // segments. Approval-gated writes and staged proposals stay below.
-        if decision.action != PermissionAction::Ask && matches!(tool, "write_file" | "edit") {
-            let message = self
-                .run_direct_file_write(session_id, turn_id, call, &args, &decision, cancel)
-                .await?;
-            messages.push(message);
-            return Ok(());
-        }
-
-        // Low/medium writes under an `ask` decision go into the shadow
-        // workspace and return immediately. The user applies or rejects them
-        // later. High/critical writes and forced asks block on an approval card
-        // so their risk metadata is visible and `Always` can be withheld.
-        // Explicit `allow` rules and `approval = "auto"` write directly.
-        if decision.action == PermissionAction::Ask
-            && !decision.force_ask
-            && decision.risk.level <= eix_core::RiskLevel::Medium
-            && matches!(tool, "write_file" | "edit")
-        {
-            return self
-                .stage_write(session_id, turn_id, call, &args, messages)
-                .await;
-        }
-
         let mut denial: Option<String> = None;
-        let mut plan: Option<tools::WritePlan> = None;
         let mut patch_ops: Option<Vec<tools::PatchOp>> = None;
-        let mut selected_hunks: Option<Vec<usize>> = None;
         if decision.action == PermissionAction::Ask {
             let reply = self
                 .wait_for_approval(session_id, turn_id, call, &args, &decision, cancel)
                 .await?;
-            selected_hunks = reply.hunks;
-            plan = reply.plan;
             patch_ops = reply.patch_ops;
             if reply.decision == ApprovalDecision::Always {
                 self.remember_always(session_id, tool, &args, reply.scope)
@@ -6747,12 +6376,6 @@ impl Daemon {
             }
             if reply.decision == ApprovalDecision::Deny {
                 denial = Some(reply.reason.unwrap_or_else(|| "denied by user".to_string()));
-            } else if let Some(plan) = &plan {
-                // The user reviewed a diff; do not overwrite a file that
-                // changed in the meantime.
-                if let Err(err) = plan.verify_unchanged().await {
-                    denial = Some(format!("{err:#}"));
-                }
             }
         }
 
@@ -6761,9 +6384,9 @@ impl Daemon {
         let auto_patch_ops = if direct_write && tool == "apply_patch" {
             let session = self.require_session(session_id)?;
             let patch_text = args
-                .get("patchText")
+                .get("input")
+                .or_else(|| args.get("patchText"))
                 .or_else(|| args.get("patch"))
-                .or_else(|| args.get("input"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
             tools::patch_ops(patch_text, &session.cwd, &self.config.load())
@@ -6776,23 +6399,15 @@ impl Daemon {
             .as_deref()
             .filter(|ops| !ops.is_empty())
             .or_else(|| (!auto_patch_ops.is_empty()).then_some(auto_patch_ops.as_slice()));
-        let snapshot_targets = match (&plan, snapshot_ops) {
-            (Some(plan), _) => SnapshotTargets::Plan(plan),
-            (None, Some(ops)) => SnapshotTargets::Patch(ops),
-            (None, None) => SnapshotTargets::None,
+        let snapshot_targets = match snapshot_ops {
+            Some(ops) => SnapshotTargets::Patch(ops),
+            None => SnapshotTargets::None,
         };
         let snapshot_warning = if denied {
             None
         } else {
-            self.capture_snapshot(
-                session_id,
-                tool,
-                call,
-                &args,
-                &decision.risk,
-                snapshot_targets,
-            )
-            .await?
+            self.capture_snapshot(session_id, tool, call, &decision.risk, snapshot_targets)
+                .await?
         };
         let (ok, mut output, duration_ms) = match denial {
             Some(reason) => (false, reason, 0),
@@ -6806,16 +6421,8 @@ impl Daemon {
                         "tool": tool,
                     }),
                 );
-                let outcome = match &plan {
-                    Some(plan) => {
-                        let session = self.require_session(session_id)?;
-                        let config = self.config.load();
-                        tools::apply_plan(plan, selected_hunks.as_deref(), &session.cwd, &config)
-                            .await
-                    }
-                    None if patch_ops.is_some() => {
-                        tools::apply_patch_ops(patch_ops.as_deref().unwrap_or_default()).await
-                    }
+                let outcome = match patch_ops.as_deref() {
+                    Some(ops) => tools::apply_patch_ops(ops).await,
                     None if tool == "exec_command" => self.exec_command(session_id, &args).await,
                     None if tool == "write_stdin" => self.write_stdin(session_id, &args).await,
                     None if is_mcp_meta(tool) => self.call_mcp_meta(tool, &args).await,
@@ -6834,23 +6441,15 @@ impl Daemon {
                     }
                     None => {
                         let session = self.require_session(session_id)?;
-                        match self
-                            .read_with_staging(session_id, tool, &args, &session.cwd)
-                            .await
-                        {
-                            Some(outcome) => outcome,
-                            None => {
-                                tools::execute_in(
-                                    tool,
-                                    &args,
-                                    &session.cwd,
-                                    &self.config.load(),
-                                    Some(cancel),
-                                    session.worktree.as_deref(),
-                                )
-                                .await
-                            }
-                        }
+                        tools::execute_in(
+                            tool,
+                            &args,
+                            &session.cwd,
+                            &self.config.load(),
+                            Some(cancel),
+                            session.worktree.as_deref(),
+                        )
+                        .await
                     }
                 };
                 (outcome.ok, outcome.output, outcome.duration_ms)
@@ -6862,7 +6461,7 @@ impl Daemon {
         if let Some(warning) = snapshot_warning {
             output.push_str(&format!("\n[snapshot failed: {warning}]"));
         }
-        if ok && matches!(tool, "write_file" | "edit" | "patch" | "apply_patch") {
+        if ok && tool == "apply_patch" {
             let session = self.require_session(session_id)?;
             let config = self.config.load();
             let paths = written_paths(tool, &args, &session.cwd, &config);
@@ -6872,9 +6471,7 @@ impl Daemon {
         // auto-applied cards both show the code that actually landed on disk.
         let auto_diff = if ok {
             let config = self.config.load();
-            if let Some(plan) = plan.as_ref() {
-                Some(tools::refresh_plan(plan, &config).await.diff().to_string())
-            } else if let Some(ops) = patch_ops.as_ref().filter(|ops| !ops.is_empty()) {
+            if let Some(ops) = patch_ops.as_ref().filter(|ops| !ops.is_empty()) {
                 Some(tools::refresh_patch_diff(ops, &config).await)
             } else if !auto_patch_ops.is_empty() {
                 Some(tools::refresh_patch_diff(&auto_patch_ops, &config).await)
@@ -6884,13 +6481,12 @@ impl Daemon {
         } else {
             None
         };
-        let record_change = matches!(tool, "write_file" | "edit")
-            || (matches!(tool, "patch" | "apply_patch") && auto_diff.is_some());
+        let record_change = tool == "apply_patch" && auto_diff.is_some();
         if ok && record_change {
-            let path = plan
-                .as_ref()
-                .map(|plan| plan.label().to_string())
-                .or_else(|| args.get("path").and_then(Value::as_str).map(str::to_string))
+            let path = args
+                .get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
                 .or_else(|| auto_diff.as_deref().and_then(first_diff_path))
                 .unwrap_or_default();
             let reason = decision.reason.clone();
@@ -6908,134 +6504,6 @@ impl Daemon {
                 "ok": ok,
                 "denied": denied,
                 "duration_ms": duration_ms,
-            }),
-        );
-        messages.push(ChatMessage::tool(call.id.clone(), output));
-        Ok(())
-    }
-
-    /// Stage a `write_file` or `edit` proposal in the session shadow workspace
-    /// and return immediately. The turn is not blocked: the user applies or
-    /// rejects the patch later, and reads see the staged bytes in the meantime.
-    async fn stage_write(
-        &self,
-        session_id: &str,
-        turn_id: &str,
-        call: &ToolCall,
-        args: &Value,
-        messages: &mut Vec<ChatMessage>,
-    ) -> Result<()> {
-        let tool = call.function.name.as_str();
-        let session = self.require_session(session_id)?;
-        let cwd = session.cwd.clone();
-        let Some(path) = tools::write_target(args, &cwd, self.config.load().as_ref()) else {
-            let output = format!("{tool} needs a path inside the workspace");
-            self.record_tool_result(session_id, call, false, false, &output, 0)?;
-            self.emit_value(
-                "tool.completed",
-                json!({
-                    "session_id": session_id,
-                    "turn_id": turn_id,
-                    "call_id": call.id,
-                    "tool": tool,
-                    "ok": false,
-                    "denied": false,
-                    "duration_ms": 0,
-                }),
-            );
-            messages.push(ChatMessage::tool(call.id.clone(), output));
-            return Ok(());
-        };
-        // Diff against the newest staged contents when the agent writes the
-        // same file twice before the user has decided.
-        let base = self.staging.latest_content(session_id, &path);
-        let plan = match tools::write_plan_with_base(
-            tool,
-            args,
-            &cwd,
-            &self.config.load(),
-            base.as_deref(),
-        )
-        .await
-        {
-            Ok(plan) => tools::format_plan(plan, &cwd, &self.config.load()).await,
-            Err(err) => {
-                let output = format!("{err:#}");
-                self.record_tool_result(session_id, call, false, false, &output, 0)?;
-                self.emit_value(
-                    "tool.completed",
-                    json!({
-                        "session_id": session_id,
-                        "turn_id": turn_id,
-                        "call_id": call.id,
-                        "tool": tool,
-                        "ok": false,
-                        "denied": false,
-                        "duration_ms": 0,
-                    }),
-                );
-                messages.push(ChatMessage::tool(call.id.clone(), output));
-                return Ok(());
-            }
-        };
-        let summary = self.tool_summary(tool, args);
-        let hunks = plan.hunk_infos();
-        let mut patch = StagedPatch::new(
-            session_id,
-            &call.id,
-            tool,
-            plan.path(),
-            plan.label(),
-            plan.old().to_string(),
-            plan.new_content().to_string(),
-        );
-        patch.formatted = plan.formatted();
-        self.staging.add(patch.clone())?;
-        let event = self.store.append_event(
-            session_id,
-            EventKind::PatchProposed,
-            payload(&PatchProposedPayload {
-                patch_id: patch.patch_id.clone(),
-                call_id: call.id.clone(),
-                tool: tool.to_string(),
-                path: patch.label.clone(),
-                summary: summary.clone(),
-                diff: Some(plan.diff().to_string()),
-                hunks: hunks.clone(),
-            }),
-        )?;
-        self.emit_event(&event);
-        self.emit_value(
-            "patch.proposed",
-            json!({
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "patch_id": patch.patch_id,
-                "call_id": call.id,
-                "tool": tool,
-                "path": patch.label,
-                "summary": summary,
-                "diff": plan.diff(),
-                "hunks": hunks,
-            }),
-        );
-        self.announce_patch(&session);
-
-        let output = format!(
-            "staged {} as patch {}; the file is not written yet — the user will apply or reject the patch",
-            patch.label, patch.patch_id
-        );
-        self.record_tool_result(session_id, call, true, false, &output, 0)?;
-        self.emit_value(
-            "tool.completed",
-            json!({
-                "session_id": session_id,
-                "turn_id": turn_id,
-                "call_id": call.id,
-                "tool": tool,
-                "ok": true,
-                "denied": false,
-                "duration_ms": 0,
             }),
         );
         messages.push(ChatMessage::tool(call.id.clone(), output));
@@ -7199,6 +6667,26 @@ impl Daemon {
             definitions.retain(|tool| tool.function.name != "ready");
         }
         definitions
+    }
+
+    /// MCP and plugin tool schemas that stay out of the base request and are
+    /// exposed on demand by `tool_search`. Plan and sub-agent sessions never
+    /// see them because they may mutate state.
+    async fn deferred_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
+        if self.session_mode(session) == SessionMode::Plan || session.origin == SessionOrigin::Agent
+        {
+            return Vec::new();
+        }
+        let config = self.config.load_full();
+        let mut tools = Vec::new();
+        if config.mcp.servers.values().any(|server| server.enabled) {
+            let mut mcp = self.mcp.lock().await;
+            mcp.ensure_loaded(&config).await;
+            mcp.refresh(&config).await;
+            tools.extend(mcp.tool_definitions());
+        }
+        tools.extend(self.plugins.tool_definitions().await);
+        tools
     }
 
     /// Rebuild the ledger with the exact tool schemas the request will carry.
@@ -7718,100 +7206,6 @@ impl Daemon {
         Ok(())
     }
 
-    /// Serve `read_file` / `list_dir` from the shadow workspace when a pending
-    /// patch touches the requested path. `None` falls back to the real tool.
-    async fn read_with_staging(
-        &self,
-        session_id: &str,
-        tool: &str,
-        args: &Value,
-        cwd: &Path,
-    ) -> Option<tools::ToolOutcome> {
-        match tool {
-            "read_file" => {
-                let path = tools::write_target(args, cwd, self.config.load().as_ref())?;
-                let content = self.staging.latest_content(session_id, &path)?;
-                let offset = args
-                    .get("offset")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(1)
-                    .max(1) as usize;
-                let limit = args
-                    .get("limit")
-                    .and_then(Value::as_u64)
-                    .unwrap_or(2000)
-                    .max(1) as usize;
-                Some(tools::ToolOutcome {
-                    ok: true,
-                    output: tools::format_read(
-                        &content,
-                        offset,
-                        limit,
-                        self.config.load().tools.max_output_bytes,
-                    ),
-                    duration_ms: 0,
-                })
-            }
-            "list_dir" => self.staged_listing(session_id, args, cwd).await,
-            _ => None,
-        }
-    }
-
-    /// Merge pending staged paths into a directory listing. Files that only
-    /// exist in the shadow workspace are shown so the agent can find them.
-    async fn staged_listing(
-        &self,
-        session_id: &str,
-        args: &Value,
-        cwd: &Path,
-    ) -> Option<tools::ToolOutcome> {
-        let patches = self.staging.pending(session_id);
-        if patches.is_empty() {
-            return None;
-        }
-        let raw = args.get("path").and_then(Value::as_str).unwrap_or(".");
-        let dir = tools::resolve_path_in(cwd, raw, self.config.load().as_ref()).ok()?;
-        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-        let mut disk_read = false;
-        if let Ok(mut entries) = tokio::fs::read_dir(&dir).await {
-            disk_read = true;
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let name = entry.file_name().to_string_lossy().into_owned();
-                let suffix = match entry.file_type().await {
-                    Ok(kind) if kind.is_dir() => "/",
-                    _ => "",
-                };
-                names.insert(format!("{name}{suffix}"));
-            }
-        }
-        for patch in &patches {
-            let Ok(relative) = patch.path.strip_prefix(&dir) else {
-                continue;
-            };
-            let mut components = relative.components();
-            let Some(first) = components.next() else {
-                continue;
-            };
-            let suffix = if components.next().is_some() { "/" } else { "" };
-            names.insert(format!("{}{suffix}", first.as_os_str().to_string_lossy()));
-        }
-        if !disk_read && names.is_empty() {
-            // Nothing staged under this path either: let the real tool report
-            // the missing directory.
-            return None;
-        }
-        let text = if names.is_empty() {
-            "(empty directory)".to_string()
-        } else {
-            names.into_iter().collect::<Vec<_>>().join("\n")
-        };
-        Some(tools::ToolOutcome {
-            ok: true,
-            output: tools::cap_output(text, self.config.load().tools.max_output_bytes),
-            duration_ms: 0,
-        })
-    }
-
     /// Apply or reject a staged patch. An empty `patch_id` targets the oldest
     /// pending patch in the session (used by `eix approve` / `eix deny`).
     async fn decide_patch(
@@ -8150,12 +7544,13 @@ impl Daemon {
             .get("workdir")
             .or_else(|| args.get("cwd"))
             .and_then(Value::as_str);
-        let plan = match tools::command_plan(
+        let plan = match tools::command_plan_with(
             command,
             cwd,
             &session.cwd,
             session.worktree.as_deref(),
             &self.config.load(),
+            tools::command_options(args),
         ) {
             Ok(plan) => plan,
             Err(err) => {
@@ -8176,7 +7571,15 @@ impl Daemon {
                 }
             }
         };
-        let wait = yield_time(args, 10_000);
+        let timeout = args
+            .get("timeout_ms")
+            .and_then(Value::as_u64)
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis);
+        let wait = timeout.map_or_else(
+            || yield_time(args, 10_000),
+            |timeout| yield_time(args, 10_000).min(timeout),
+        );
         let max_bytes = output_cap(args, self.config.load().tools.max_output_bytes);
         if let Err(err) = self
             .processes
@@ -8204,6 +7607,30 @@ impl Daemon {
             }
         };
         let text = format_process_output(&output);
+        // `timeout_ms` is a hard runtime limit, not just an early yield: kill
+        // the process group when it is still running and report why.
+        if let Some(timeout) = timeout {
+            let running = self
+                .processes
+                .list(Some(session_id))
+                .iter()
+                .any(|process| process.id == info.id && process.status.is_running());
+            if running {
+                let _ = self.processes.kill(&info.id);
+                let _ = self
+                    .processes
+                    .wait_for_exit(session_id, &info.id, Duration::from_millis(500))
+                    .await;
+                return tools::ToolOutcome {
+                    ok: false,
+                    output: tools::cap_output(
+                        format!("command timed out after {}ms\n{text}", timeout.as_millis()),
+                        self.config.load().tools.max_output_bytes,
+                    ),
+                    duration_ms: started.elapsed().as_millis() as u64,
+                };
+            }
+        }
         tools::ToolOutcome {
             ok: true,
             output: tools::cap_output(text, self.config.load().tools.max_output_bytes),
@@ -8546,6 +7973,7 @@ impl Daemon {
         let server = args.get("server").and_then(Value::as_str);
         let result = match tool {
             crate::mcp::LIST_RESOURCES => mcp.list_resources(server),
+            crate::mcp::LIST_TEMPLATES => mcp.list_resource_templates(server),
             crate::mcp::LIST_PROMPTS => mcp.list_prompts(server),
             crate::mcp::READ_RESOURCE => {
                 let (server, uri) = match (server, args.get("uri").and_then(Value::as_str)) {
@@ -8635,18 +8063,12 @@ impl Daemon {
         session_id: &str,
         tool: &str,
         call: &ToolCall,
-        args: &Value,
         risk: &eix_core::RiskAssessment,
         targets: SnapshotTargets<'_>,
     ) -> Result<Option<String>> {
         let is_mcp = tool.starts_with(crate::mcp::PREFIX);
         let mcp_mutating = is_mcp && risk.categories.contains(&eix_core::RiskCategory::McpWrite);
         if !(risk.mutates_workspace() || mcp_mutating) || !self.config.load().tools.snapshots {
-            return Ok(None);
-        }
-        // Rewriting identical bytes cannot change the workspace, so there is
-        // nothing for a snapshot to protect.
-        if matches!(targets, SnapshotTargets::Plan(plan) if !plan.changes()) {
             return Ok(None);
         }
         // Snapshot directories are pruned after each capture. Serializing just
@@ -8664,7 +8086,7 @@ impl Daemon {
             }
             _ => None,
         };
-        let scope = if matches!(tool, "write_file" | "edit") || patch_targets.is_some() {
+        let scope = if patch_targets.is_some() {
             Scope::File
         } else {
             Scope::Tree
@@ -8680,24 +8102,7 @@ impl Daemon {
             return Ok(warning);
         }
         let result = match tool {
-            "write_file" | "edit" => {
-                let plan = match targets {
-                    SnapshotTargets::Plan(plan) => Some(plan),
-                    _ => None,
-                };
-                let path = plan
-                    .map(|plan| plan.path().to_path_buf())
-                    .or_else(|| tools::write_target(args, &cwd, self.config.load().as_ref()));
-                match path {
-                    Some(path) => {
-                        self.snapshots
-                            .capture_file(session_id, tool, &call.id, &cwd, &path)
-                            .await
-                    }
-                    None => Err(anyhow::anyhow!("cannot resolve the write target")),
-                }
-            }
-            "patch" | "apply_patch" => match patch_targets {
+            "apply_patch" => match patch_targets {
                 Some(paths) => {
                     self.snapshots
                         .capture_files(session_id, tool, &call.id, &cwd, &paths)
@@ -8709,7 +8114,7 @@ impl Daemon {
                         .await
                 }
             },
-            "run_command" | "exec_command" => {
+            "exec_command" => {
                 self.snapshots
                     .capture_tree(session_id, tool, &call.id, &cwd)
                     .await
@@ -8805,41 +8210,6 @@ impl Daemon {
         notes
     }
 
-    /// Collect diagnostics for every file written by one parallel segment in a
-    /// single pass, then return the rendered note for each path.
-    async fn lsp_notes_many(
-        &self,
-        config: &Config,
-        cwd: &Path,
-        paths: &[PathBuf],
-    ) -> HashMap<PathBuf, String> {
-        if paths.is_empty() {
-            return HashMap::new();
-        }
-        let results = {
-            let mut lsp = self.lsp.lock().await;
-            lsp.diagnostics_many(config, cwd, paths).await
-        };
-        results
-            .into_iter()
-            .map(|(path, result)| {
-                let mut notes = String::new();
-                match result {
-                    Ok(diagnostics) if !diagnostics.is_empty() => {
-                        notes.push_str("\n\nLSP diagnostics:\n");
-                        for diagnostic in diagnostics.iter().take(50) {
-                            notes.push_str(&diagnostic.label(&path));
-                            notes.push('\n');
-                        }
-                    }
-                    Ok(_) => {}
-                    Err(err) => notes.push_str(&format!("\n[lsp: {err}]")),
-                }
-                (path, notes)
-            })
-            .collect()
-    }
-
     fn record_tool_result(
         &self,
         session_id: &str,
@@ -8865,9 +8235,9 @@ impl Daemon {
         Ok(())
     }
 
-    /// Ask the user a multiple-choice question and block until they answer or
-    /// the turn is cancelled. The selected option label becomes the tool output.
-    async fn ask_user(
+    /// Ask the user one to three questions and block until they answer or the
+    /// turn is cancelled. Answers are keyed by question id in the tool output.
+    async fn request_user_input(
         &self,
         session_id: &str,
         turn_id: &str,
@@ -8876,7 +8246,7 @@ impl Daemon {
         messages: &mut Vec<ChatMessage>,
         cancel: &AtomicBool,
     ) -> Result<()> {
-        let (question, options): (String, Vec<InputOption>) = match tools::ask_user_args(args) {
+        let questions = match tools::request_user_input_args(args) {
             Ok(parsed) => parsed,
             Err(err) => {
                 let output = format!("{err:#}");
@@ -8892,7 +8262,7 @@ impl Daemon {
             session_id.to_string(),
             PendingInput {
                 input_id: input_id.clone(),
-                options: options.len(),
+                questions: questions.clone(),
                 responder,
             },
         );
@@ -8903,8 +8273,7 @@ impl Daemon {
             payload(&InputRequiredPayload {
                 input_id: input_id.clone(),
                 call_id: call.id.clone(),
-                question: question.clone(),
-                options: options.clone(),
+                questions: questions.clone(),
             }),
         )?;
         self.emit_event(&event);
@@ -8915,13 +8284,12 @@ impl Daemon {
                 "turn_id": turn_id,
                 "input_id": input_id,
                 "call_id": call.id,
-                "question": question,
-                "options": options,
+                "questions": questions,
             }),
         );
         self.transition(session_id, SessionStatus::AwaitingInput)?;
 
-        let answer = tokio::select! {
+        let answers = tokio::select! {
             answer = receiver => answer.ok(),
             _ = wait_for_cancel(cancel) => None,
         };
@@ -8930,7 +8298,7 @@ impl Daemon {
             self.transition(session_id, SessionStatus::Running)?;
         }
 
-        let Some(index) = answer.filter(|index| *index < options.len()) else {
+        let Some(answers) = answers else {
             let output = "the user did not answer (turn cancelled)".to_string();
             self.record_tool_result(session_id, call, false, true, &output, 0)?;
             self.emit_value(
@@ -8939,7 +8307,7 @@ impl Daemon {
                     "session_id": session_id,
                     "turn_id": turn_id,
                     "call_id": call.id,
-                    "tool": "ask_user",
+                    "tool": "request_user_input",
                     "ok": false,
                     "denied": true,
                     "duration_ms": 0,
@@ -8949,33 +8317,27 @@ impl Daemon {
             return Ok(());
         };
 
-        let option = &options[index];
-        let answer = match option
-            .description
-            .as_deref()
-            .map(str::trim)
-            .filter(|description| !description.is_empty())
-        {
-            Some(description) => format!("{} — {description}", option.label),
-            None => option.label.clone(),
-        };
         let event = self.store.append_event(
             session_id,
             EventKind::InputAnswered,
             payload(&InputAnsweredPayload {
                 input_id: input_id.clone(),
                 call_id: call.id.clone(),
-                answer: answer.clone(),
-                option_index: index,
+                answers: answers.clone(),
             }),
         )?;
         self.emit_event(&event);
 
-        let output = format!(
-            "User selected option {} of {}: {answer}",
-            index + 1,
-            options.len()
-        );
+        let mut output = String::from("User answered:");
+        for question in &questions {
+            let values = answers.get(&question.id).cloned().unwrap_or_default();
+            output.push_str(&format!(
+                "\n- {} ({}): {}",
+                question.header,
+                question.id,
+                values.join(", ")
+            ));
+        }
         self.record_tool_result(session_id, call, true, false, &output, 0)?;
         self.emit_value(
             "tool.completed",
@@ -8983,7 +8345,7 @@ impl Daemon {
                 "session_id": session_id,
                 "turn_id": turn_id,
                 "call_id": call.id,
-                "tool": "ask_user",
+                "tool": "request_user_input",
                 "ok": true,
                 "denied": false,
                 "duration_ms": 0,
@@ -9009,9 +8371,7 @@ impl Daemon {
             return Ok(ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("turn cancelled".to_string()),
-                plan: None,
                 patch_ops: None,
-                hunks: None,
                 scope: ApprovalScope::Once,
             });
         }
@@ -9020,18 +8380,13 @@ impl Daemon {
         let summary = self.tool_summary(tool, args);
         let cwd = self.require_session(session_id)?.cwd;
         let config = self.config.load();
-        let plan = match tools::write_plan(tool, args, &cwd, &config).await {
-            Some(plan) => Some(tools::format_plan(plan, &cwd, &config).await),
-            None => None,
-        };
         let mut patch_ops = None;
-        let diff = match &plan {
-            Some(plan) => Some(plan.diff().to_string()),
-            None if tool == "apply_patch" => {
+        let diff = match tool {
+            "apply_patch" => {
                 let patch_text = args
-                    .get("patchText")
+                    .get("input")
+                    .or_else(|| args.get("patchText"))
                     .or_else(|| args.get("patch"))
-                    .or_else(|| args.get("input"))
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 match tools::patch_ops(patch_text, &cwd, &config).await {
@@ -9044,12 +8399,9 @@ impl Daemon {
                     Err(_) => None,
                 }
             }
-            None => None,
+            _ => None,
         };
-        let hunks = plan
-            .as_ref()
-            .map(|plan| plan.hunk_infos())
-            .unwrap_or_default();
+        let hunks: Vec<eix_core::HunkInfo> = Vec::new();
         let (responder, receiver) = oneshot::channel();
         let allow_always =
             decision.risk.level <= eix_core::RiskLevel::Medium && !decision.force_ask;
@@ -9131,21 +8483,16 @@ impl Daemon {
             reply = receiver => reply.unwrap_or(ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("approval channel closed".to_string()),
-                plan: None,
                 patch_ops: None,
-                hunks: None,
                 scope: ApprovalScope::Once,
             }),
             _ = wait_for_cancel(cancel) => ApprovalReply {
                 decision: ApprovalDecision::Deny,
                 reason: Some("turn cancelled".to_string()),
-                plan: None,
                 patch_ops: None,
-                hunks: None,
                 scope: ApprovalScope::Once,
             },
         };
-        reply.plan = plan;
         reply.patch_ops = patch_ops;
 
         self.approvals.lock().await.remove(session_id);
@@ -9318,7 +8665,7 @@ fn tool_batch_signature(calls: &[ToolCall]) -> u64 {
     hasher.finish()
 }
 
-/// `read_file, run_command` — enough for a message to name the stalled batch.
+/// `exec_command` — enough for a message to name the stalled batch.
 fn tool_batch_names(calls: &[ToolCall]) -> String {
     let mut names: Vec<&str> = Vec::new();
     for call in calls {
@@ -9351,7 +8698,7 @@ struct RepeatGuard {
 
 impl RepeatGuard {
     /// Record one batch. Only *consecutive* repeats count, so an `edit` between
-    /// two identical `run_command` batches resets the streak.
+    /// two identical `exec_command` batches resets the streak.
     fn observe(&mut self, calls: &[ToolCall]) -> RepeatVerdict {
         let signature = tool_batch_signature(calls);
         let count = match self.last {
@@ -9582,35 +8929,41 @@ fn cap_text(text: &str, max: usize) -> String {
     format!("{}\n[truncated]", &text[..end])
 }
 
-/// Validate the `todo` tool payload. The model sends the complete list on
-/// every call, so stale items disappear without a separate delete operation.
-fn parse_todos(args: &Value) -> Result<Vec<eix_core::TodoItem>> {
+/// Validate the `update_plan` tool payload. The model sends the complete list
+/// on every call, so stale items disappear without a separate delete
+/// operation. At most one step may be `in_progress`.
+fn parse_plan(args: &Value) -> Result<Vec<eix_core::TodoItem>> {
     let items = args
-        .get("todos")
+        .get("plan")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow::anyhow!("todos must be an array"))?;
+        .ok_or_else(|| anyhow::anyhow!("plan must be an array"))?;
     let mut parsed = Vec::with_capacity(items.len());
+    let mut in_progress = 0;
     for (index, item) in items.iter().enumerate() {
         let content = item
-            .get("content")
+            .get("step")
+            .or_else(|| item.get("content"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|content| !content.is_empty())
-            .ok_or_else(|| anyhow::anyhow!("todos[{index}].content must be non-empty"))?;
+            .ok_or_else(|| anyhow::anyhow!("plan[{index}].step must be non-empty"))?;
         let status = item
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("pending");
-        if !matches!(
-            status,
-            "pending" | "in_progress" | "completed" | "cancelled"
-        ) {
-            bail!("todos[{index}].status must be pending, in_progress, completed or cancelled");
+        if !matches!(status, "pending" | "in_progress" | "completed") {
+            bail!("plan[{index}].status must be pending, in_progress or completed");
+        }
+        if status == "in_progress" {
+            in_progress += 1;
         }
         parsed.push(eix_core::TodoItem {
             content: content.to_string(),
             status: status.to_string(),
         });
+    }
+    if in_progress > 1 {
+        bail!("at most one plan step can be in_progress");
     }
     Ok(parsed)
 }
@@ -9713,31 +9066,73 @@ fn is_mcp_meta(tool: &str) -> bool {
     matches!(
         tool,
         crate::mcp::LIST_RESOURCES
+            | crate::mcp::LIST_TEMPLATES
             | crate::mcp::READ_RESOURCE
             | crate::mcp::LIST_PROMPTS
             | crate::mcp::GET_PROMPT
     )
 }
 
-/// Keep built-in schemas and append dynamic MCP schemas while they fit. The
-/// caller logs `omitted` so a truncated tool list is never silent.
-fn cap_tool_schemas(
-    mut builtins: Vec<ToolDefinition>,
-    dynamic: Vec<ToolDefinition>,
-    cap: usize,
-) -> (Vec<ToolDefinition>, usize) {
-    let mut used = estimate_tool_schema_tokens(&builtins);
-    let mut omitted = 0;
-    for tool in dynamic {
-        let cost = estimate_tool_schema_tokens(std::slice::from_ref(&tool));
-        if used.saturating_add(cost) <= cap {
-            used += cost;
-            builtins.push(tool);
-        } else {
-            omitted += 1;
-        }
+/// Rank deferred tools with BM25 over their name and description. Ties keep
+/// the catalog order, so a server's own ordering stays meaningful.
+fn search_deferred_tools(
+    tools: &[ToolDefinition],
+    query: &str,
+    limit: usize,
+) -> Vec<ToolDefinition> {
+    let terms = search_terms(query);
+    if terms.is_empty() {
+        return tools.iter().take(limit).cloned().collect();
     }
-    (builtins, omitted)
+    let docs: Vec<Vec<String>> = tools
+        .iter()
+        .map(|tool| {
+            let mut text = tool.function.name.clone();
+            text.push(' ');
+            text.push_str(&tool.function.description);
+            search_terms(&text)
+        })
+        .collect();
+    let total = docs.len() as f64;
+    let average = (docs.iter().map(Vec::len).sum::<usize>() as f64 / total).max(1.0);
+    let (k1, b) = (1.2_f64, 0.75_f64);
+    let mut scored: Vec<(f64, usize)> = docs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, doc)| {
+            let mut score = 0.0;
+            for term in &terms {
+                let frequency = doc.iter().filter(|word| *word == term).count();
+                if frequency == 0 {
+                    continue;
+                }
+                let matching = docs
+                    .iter()
+                    .filter(|doc| doc.iter().any(|word| word == term))
+                    .count() as f64;
+                let idf = (1.0 + (total - matching + 0.5) / (matching + 0.5)).ln();
+                let length = doc.len() as f64;
+                score += idf * (frequency as f64 * (k1 + 1.0))
+                    / (frequency as f64 + k1 * (1.0 - b + b * length / average));
+            }
+            (score > 0.0).then_some((score, index))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+    scored
+        .into_iter()
+        .take(limit)
+        .map(|(_, index)| tools[index].clone())
+        .collect()
+}
+
+/// Lowercase alphanumeric search terms. Tool names use `__` separators, so
+/// splitting on non-alphanumerics indexes each component.
+fn search_terms(text: &str) -> Vec<String> {
+    text.split(|ch: char| !ch.is_alphanumeric())
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_lowercase())
+        .collect()
 }
 
 /// Tiny wildcard matcher for skill tool restrictions (`*` and `?`).
@@ -9818,49 +9213,12 @@ fn first_diff_path(diff: &str) -> Option<String> {
     })
 }
 
-/// Canonical identity of a `write_file` / `edit` target, used only to decide
-/// whether two writes overlap. Existing files resolve through symlinks; a new
-/// file resolves through its nearest existing ancestor. Ambiguous targets (for
-/// example a dangling symlink) return `None` and stay in the sequential path.
-fn write_target_identity(args: &Value, cwd: &Path, config: &Config) -> Option<PathBuf> {
-    let target = tools::write_target(args, cwd, config)?;
-    if let Ok(real) = target.canonicalize() {
-        return Some(real);
-    }
-    if target.symlink_metadata().is_ok() {
-        return None;
-    }
-    let mut suffix = Vec::new();
-    let mut current = target.as_path();
-    loop {
-        if let Ok(real) = current.canonicalize() {
-            let mut resolved = real;
-            for name in suffix.iter().rev() {
-                resolved.push(name);
-            }
-            return Some(resolved);
-        }
-        suffix.push(current.file_name()?.to_os_string());
-        current = current.parent()?;
-    }
-}
-
-/// Two writes overlap when they name the same file or one target is an
-/// ancestor directory of the other. Component-aware `starts_with` avoids
-/// treating sibling names such as `a.txt` and `a.txt.bak` as a prefix match.
-fn write_paths_overlap(a: &Path, b: &Path) -> bool {
-    a == b || a.starts_with(b) || b.starts_with(a)
-}
-
-/// Files a successful write touched, for post-edit diagnostics.
+/// Files a successful patch touched, for post-edit diagnostics.
 fn written_paths(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Vec<PathBuf> {
-    if matches!(tool, "write_file" | "edit") {
-        return tools::write_target(args, cwd, config).into_iter().collect();
-    }
-    if !matches!(tool, "patch" | "apply_patch") {
+    if tool != "apply_patch" {
         return Vec::new();
     }
-    ["patchText", "patch", "input"]
+    ["input", "patchText", "patch"]
         .iter()
         .find_map(|key| args.get(*key).and_then(Value::as_str))
         .map(|text| {
@@ -9868,6 +9226,7 @@ fn written_paths(tool: &str, args: &Value, cwd: &Path, config: &Config) -> Vec<P
                 .filter_map(|line| {
                     line.strip_prefix("*** Add File: ")
                         .or_else(|| line.strip_prefix("*** Update File: "))
+                        .or_else(|| line.strip_prefix("*** Move to: "))
                 })
                 .filter_map(|raw| tools::resolve_path_in(cwd, raw.trim(), config).ok())
                 .collect()
@@ -9881,9 +9240,9 @@ fn build_always_rule(tool: &str, args: &Value, source: RuleSource) -> Permission
     // a later patch to the same path is not asked again just because its
     // content changed.
     let patch_paths: Vec<&str> = args
-        .get("patchText")
+        .get("input")
+        .or_else(|| args.get("patchText"))
         .or_else(|| args.get("patch"))
-        .or_else(|| args.get("input"))
         .and_then(Value::as_str)
         .map(|text| {
             text.lines()
@@ -9891,6 +9250,7 @@ fn build_always_rule(tool: &str, args: &Value, source: RuleSource) -> Permission
                     line.strip_prefix("*** Add File: ")
                         .or_else(|| line.strip_prefix("*** Update File: "))
                         .or_else(|| line.strip_prefix("*** Delete File: "))
+                        .or_else(|| line.strip_prefix("*** Move to: "))
                         .map(str::trim)
                         .filter(|path| !path.is_empty())
                 })
@@ -10149,8 +9509,8 @@ const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's te
 - Final answers use the language of the newest user message; mixed input uses its dominant language, since borrowed terms and identifiers don't change it. If the user names an answer language, use it. Progress narration may stay in English. Keep code, commands, paths and quoted output verbatim.
 
 ## How to work
-- Scale depth to the task; expand only when it helps. Read the narrowest code and call sites; skip tools if context suffices; diagnose first.
-- Plan only large or ambiguous work; skip simple tasks and one-step plans; update `todo` as done.
+- Scale depth to the task. Read the narrowest code and call sites; skip tools if context suffices; diagnose first.
+- Plan only large or ambiguous work; skip simple tasks and one-step plans; keep `update_plan` current as steps finish.
 - Smallest coherent change in existing style; default to ASCII; fix root causes, reuse helpers; no placeholders.
 - Verify enough to trust it: run what can fail, cover edge/error paths, inspect the diff, skip unchanged reruns, never weaken tests; if you can't, say so.
 
@@ -10164,9 +9524,10 @@ const BASE_SYSTEM_PROMPT: &str = r#"You are eix, a coding agent in the user's te
 - After resume or compaction, continue from the summary; don't restart; answer the newest request.
 
 ## Tools
-- Files: `cat`, `sed -n`, `awk`, `nl`, `rg`/`rg --files`, `fd`, `ls`; batch independent commands in `exec_command`.
+- Files: `rg -n`, `nl -ba f | sed -n '1,200p'`, `cat`, `awk`, `fd`, `ls`; batch independent commands in `exec_command`.
 - Edits: `apply_patch`; shell/Python for bulk rewrites, generated files, analysis. `view_image` for visual checks.
 - Use `write_stdin` for long or interactive work.
+- MCP/plugin tools are hidden until `tool_search` finds them; search by name or capability, then call.
 - Instructions/workspace are in context; don't repeat `ls`/`git status` unless stale.
 - If a tool fails, change the approach.
 - Use `spawn_agent` only for broad or independent verification, not 1-2 reads; batch prompts, children are read-only.
@@ -10286,7 +9647,7 @@ mod tests {
     #[test]
     fn repeat_guard_warns_then_aborts_on_identical_batches() {
         let mut guard = RepeatGuard::default();
-        let batch = vec![tool_call("run_command", r#"{"command":["cargo","test"]}"#)];
+        let batch = vec![tool_call("exec_command", r#"{"cmd":"cargo test"}"#)];
 
         // Fresh, fresh, warn, warn, abort.
         assert!(matches!(guard.observe(&batch), RepeatVerdict::Fresh));
@@ -10308,8 +9669,11 @@ mod tests {
     #[test]
     fn repeat_guard_resets_on_a_different_batch() {
         let mut guard = RepeatGuard::default();
-        let test = vec![tool_call("run_command", r#"{"command":["cargo","test"]}"#)];
-        let edit = vec![tool_call("edit", r#"{"path":"src/lib.rs"}"#)];
+        let test = vec![tool_call("exec_command", r#"{"cmd":"cargo test"}"#)];
+        let edit = vec![tool_call(
+            "apply_patch",
+            r#"{"patchText":"*** Begin Patch\n*** End Patch\n"}"#,
+        )];
 
         assert!(matches!(guard.observe(&test), RepeatVerdict::Fresh));
         assert!(matches!(guard.observe(&test), RepeatVerdict::Fresh));
@@ -10322,34 +9686,43 @@ mod tests {
     #[test]
     fn repeat_guard_treats_equivalent_arguments_as_the_same_call() {
         // Same call: different key order, spacing and call id.
-        let first = vec![tool_call("read_file", r#"{"path":"a.rs","limit":10}"#)];
-        let second = vec![tool_call("read_file", r#"{ "limit": 10, "path": "a.rs" }"#)];
+        let first = vec![tool_call(
+            "exec_command",
+            r#"{"cmd":"cat a.rs","workdir":"src"}"#,
+        )];
+        let second = vec![tool_call(
+            "exec_command",
+            r#"{ "workdir": "src", "cmd": "cat a.rs" }"#,
+        )];
         assert_eq!(tool_batch_signature(&first), tool_batch_signature(&second));
 
         // A different argument is a different call.
-        let third = vec![tool_call("read_file", r#"{"path":"a.rs","limit":20}"#)];
+        let third = vec![tool_call(
+            "exec_command",
+            r#"{"cmd":"cat b.rs","workdir":"src"}"#,
+        )];
         assert_ne!(tool_batch_signature(&first), tool_batch_signature(&third));
     }
 
     #[test]
     fn repeat_guard_distinguishes_batch_order_and_size() {
         let ab = vec![
-            tool_call("read_file", r#"{"path":"a.rs"}"#),
-            tool_call("read_file", r#"{"path":"b.rs"}"#),
+            tool_call("exec_command", r#"{"cmd":"cat a.rs"}"#),
+            tool_call("exec_command", r#"{"cmd":"cat b.rs"}"#),
         ];
         let ba = vec![
-            tool_call("read_file", r#"{"path":"b.rs"}"#),
-            tool_call("read_file", r#"{"path":"a.rs"}"#),
+            tool_call("exec_command", r#"{"cmd":"cat b.rs"}"#),
+            tool_call("exec_command", r#"{"cmd":"cat a.rs"}"#),
         ];
-        let single = vec![tool_call("read_file", r#"{"path":"a.rs"}"#)];
+        let single = vec![tool_call("exec_command", r#"{"cmd":"cat a.rs"}"#)];
 
         assert_ne!(tool_batch_signature(&ab), tool_batch_signature(&ba));
         assert_ne!(tool_batch_signature(&ab), tool_batch_signature(&single));
         assert_eq!(
             tool_batch_signature(&ab),
             tool_batch_signature(&[
-                tool_call("read_file", r#"{"path":"a.rs"}"#),
-                tool_call("read_file", r#"{"path":"b.rs"}"#),
+                tool_call("exec_command", r#"{"cmd":"cat a.rs"}"#),
+                tool_call("exec_command", r#"{"cmd":"cat b.rs"}"#),
             ])
         );
     }
@@ -10357,11 +9730,11 @@ mod tests {
     #[test]
     fn tool_batch_names_dedups_and_keeps_order() {
         let batch = vec![
-            tool_call("grep", "{}"),
-            tool_call("read_file", "{}"),
-            tool_call("grep", "{}"),
+            tool_call("exec_command", r#"{"cmd":"rg -n foo"}"#),
+            tool_call("apply_patch", r#"{"patchText":"x"}"#),
+            tool_call("exec_command", r#"{"cmd":"ls"}"#),
         ];
-        assert_eq!(tool_batch_names(&batch), "grep, read_file");
+        assert_eq!(tool_batch_names(&batch), "exec_command, apply_patch");
     }
 
     #[tokio::test]
@@ -10430,13 +9803,14 @@ mod tests {
             "If the user names an answer language, use it",
             "Progress narration may stay in English",
             "quoted output verbatim",
-            "Scale depth to the task; expand only when it helps",
+            "Scale depth to the task",
             "Read the narrowest code and call sites",
             "skip tools if context suffices",
             "diagnose first",
             "Plan only large or ambiguous work",
             "skip simple tasks and one-step plans",
-            "update `todo` as done",
+            "keep `update_plan` current as steps finish",
+            "MCP/plugin tools are hidden until `tool_search` finds them",
             "Smallest coherent change in existing style",
             "default to ASCII",
             "fix root causes, reuse helpers",
@@ -10472,8 +9846,9 @@ mod tests {
             "continue from the summary",
             "don't restart",
             "answer the newest request",
-            "Files: `cat`, `sed -n`, `awk`, `nl`",
-            "`rg`/`rg --files`, `fd`, `ls`",
+            "Files: `rg -n`",
+            "`nl -ba f | sed -n '1,200p'`",
+            "`cat`, `awk`, `fd`, `ls`",
             "Edits: `apply_patch`",
             "shell/Python for bulk rewrites, generated files, analysis",
             "`view_image` for visual checks",
@@ -10633,7 +10008,7 @@ mod tests {
             Some(1)
         );
         assert_eq!(
-            last_agent_barrier(&[call("spawn_agent", "{}"), call("todo", "{}")], cwd),
+            last_agent_barrier(&[call("spawn_agent", "{}"), call("update_plan", "{}")], cwd),
             Some(1)
         );
     }
@@ -10728,34 +10103,29 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tool_schemas_are_omitted_when_they_exceed_the_cap() {
-        let builtin = vec![ToolDefinition::function(
-            "read_file",
-            "Read a file",
-            json!({"type": "object", "properties": {"path": {"type": "string"}}}),
-        )];
-        let dynamic = vec![
+    fn tool_search_ranks_the_closest_deferred_schema() {
+        let tools = vec![
             ToolDefinition::function(
-                "mcp__one__tool",
-                "First dynamic tool",
-                json!({"type": "object", "properties": {"a": {"type": "string"}}}),
+                "mcp__github__create_pull_request",
+                "Open a pull request in a GitHub repository",
+                json!({"type": "object", "properties": {}}),
             ),
             ToolDefinition::function(
-                "mcp__two__tool",
-                "Second dynamic tool",
-                json!({"type": "object", "properties": {"b": {"type": "string"}}}),
+                "mcp__linear__create_issue",
+                "Create a Linear issue",
+                json!({"type": "object", "properties": {}}),
+            ),
+            ToolDefinition::function(
+                "plugin__acme__deploy",
+                "Deploy the current build to production",
+                json!({"type": "object", "properties": {}}),
             ),
         ];
-        let builtin_cost = estimate_tool_schema_tokens(&builtin);
-        let first_cost = estimate_tool_schema_tokens(&dynamic[..1]);
-        let (kept, omitted) =
-            cap_tool_schemas(builtin.clone(), dynamic.clone(), builtin_cost + first_cost);
-        assert_eq!(kept.len(), 2);
-        assert_eq!(omitted, 1);
-        // Built-ins survive even when the cap is already exhausted.
-        let (kept, omitted) = cap_tool_schemas(builtin, dynamic, 1);
-        assert_eq!(kept.len(), 1);
-        assert_eq!(omitted, 2);
+        let hits = search_deferred_tools(&tools, "pull request github", 2);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].function.name, "mcp__github__create_pull_request");
+        // No term match means no schemas are exposed.
+        assert!(search_deferred_tools(&tools, "nonexistent", 8).is_empty());
     }
 
     #[test]
@@ -10821,43 +10191,6 @@ mod tests {
     }
 
     #[test]
-    fn write_target_identity_resolves_symlinks_and_overlap_prefixes() {
-        let dir = std::env::temp_dir().join(format!(
-            "eix-write-identity-{}-{}",
-            std::process::id(),
-            now_ms()
-        ));
-        std::fs::create_dir_all(dir.join("sub")).unwrap();
-        std::fs::write(dir.join("file.txt"), "contents").unwrap();
-        std::os::unix::fs::symlink(dir.join("file.txt"), dir.join("link.txt")).unwrap();
-        std::os::unix::fs::symlink(dir.join("missing.txt"), dir.join("dangling.txt")).unwrap();
-        let config = Config::default();
-
-        let linked = write_target_identity(&json!({"path": "link.txt"}), &dir, &config).unwrap();
-        let direct = write_target_identity(&json!({"path": "file.txt"}), &dir, &config).unwrap();
-        assert_eq!(linked, direct);
-        assert_eq!(linked, dir.join("file.txt").canonicalize().unwrap());
-
-        // A new file resolves through its nearest existing ancestor, so a
-        // symlinked parent and its real path share one identity.
-        let through_sub =
-            write_target_identity(&json!({"path": "sub/new.txt"}), &dir, &config).unwrap();
-        assert_eq!(
-            through_sub,
-            dir.join("sub").canonicalize().unwrap().join("new.txt")
-        );
-        assert!(write_target_identity(&json!({"path": "dangling.txt"}), &dir, &config).is_none());
-
-        assert!(write_paths_overlap(&dir.join("a"), &dir.join("a/b")));
-        assert!(!write_paths_overlap(
-            &dir.join("a.txt"),
-            &dir.join("a.txt.bak")
-        ));
-
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
     fn pairing_codes_are_grouped_and_compared_loosely() {
         let code = new_pairing_code();
         assert_eq!(code.len(), 19, "code should be 4x4 hex groups: {code}");
@@ -10892,5 +10225,39 @@ mod tests {
         assert_eq!(hash.len(), 64);
         assert_eq!(hash, hash_token(&first));
         assert_ne!(hash, hash_token(&second));
+    }
+
+    #[test]
+    fn binary_shell_output_is_summarized() {
+        let output = eix_core::ProcessOutput {
+            process_id: "p1".into(),
+            truncated: false,
+            text: "\u{7f}ELF\u{0}\u{0}binary".to_string(),
+            bytes: 13,
+            status: eix_core::ProcessStatus::Exited,
+            exit_code: Some(0),
+        };
+        let text = format_process_output(&output);
+        assert!(text.contains("binary output"), "{text}");
+        assert!(text.contains("od -c"), "{text}");
+        assert!(text.contains("exit code: 0"), "{text}");
+        assert!(!text.contains("ELF"), "{text}");
+    }
+
+    #[test]
+    fn truncated_shell_output_points_at_a_narrower_range() {
+        let output = eix_core::ProcessOutput {
+            process_id: "p1".into(),
+            truncated: true,
+            text: "the tail\n".to_string(),
+            bytes: 9_000,
+            status: eix_core::ProcessStatus::Running,
+            exit_code: None,
+        };
+        let text = format_process_output(&output);
+        assert!(text.contains("9000 bytes produced"), "{text}");
+        assert!(text.contains("only the tail is shown"), "{text}");
+        assert!(text.contains("sed -n 'a,bp'"), "{text}");
+        assert!(text.contains("write_stdin"), "{text}");
     }
 }

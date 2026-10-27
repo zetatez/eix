@@ -8,6 +8,38 @@ impl App {
     /// behave the same in every layout.
     pub(super) fn handle_card_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) -> bool {
         if self.focused_input().is_some() {
+            // While editing the "Other" row, every printable key belongs to
+            // the text field instead of the option picker.
+            if self.focused_input().is_some_and(|pending| pending.editing) {
+                match key.code {
+                    KeyCode::Enter => {
+                        self.commit_input_other(tx);
+                        return true;
+                    }
+                    KeyCode::Esc => {
+                        if let Some(pending) = self.pending_input_mut() {
+                            pending.editing = false;
+                        }
+                        return true;
+                    }
+                    KeyCode::Backspace => {
+                        if let Some(pending) = self.pending_input_mut() {
+                            pending.other[pending.tab].pop();
+                        }
+                        return true;
+                    }
+                    KeyCode::Char(ch)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        if let Some(pending) = self.pending_input_mut() {
+                            pending.other[pending.tab].push(ch);
+                        }
+                        return true;
+                    }
+                    _ => return true,
+                }
+            }
             if key.modifiers.contains(KeyModifiers::CONTROL) {
                 match key.code {
                     KeyCode::Char('n') | KeyCode::Char('j') => {
@@ -22,6 +54,14 @@ impl App {
                 }
             }
             match key.code {
+                KeyCode::Tab | KeyCode::Right => {
+                    self.move_input_tab(1);
+                    return true;
+                }
+                KeyCode::BackTab | KeyCode::Left => {
+                    self.move_input_tab(-1);
+                    return true;
+                }
                 KeyCode::Char('j') | KeyCode::Down => {
                     self.move_input_cursor(1);
                     return true;
@@ -31,9 +71,7 @@ impl App {
                     return true;
                 }
                 KeyCode::Enter => {
-                    if let Some(cursor) = self.focused_input().map(|pending| pending.cursor) {
-                        self.respond_input(cursor, tx);
-                    }
+                    self.commit_input_selection(tx);
                     return true;
                 }
                 KeyCode::Char(ch @ '1'..='9') => {
@@ -174,14 +212,26 @@ impl App {
             self.inputs.remove(session_id);
             return;
         };
-        // Keep the highlighted option when the same question is reloaded.
-        if let Some(cursor) = self
+        // Keep tab, highlighted rows, typed text and committed answers when
+        // the same request is reloaded.
+        if let Some(previous) = self
             .inputs
             .get(session_id)
             .filter(|pending| pending.input_id == next.input_id)
-            .map(|pending| pending.cursor)
         {
-            next.cursor = cursor.min(next.options.len().saturating_sub(1));
+            if previous.questions.len() == next.questions.len() {
+                next.tab = previous.tab.min(next.questions.len().saturating_sub(1));
+                next.cursors = previous.cursors.clone();
+                next.other = previous.other.clone();
+                next.answers = previous.answers.clone();
+                next.editing = previous.editing;
+                for tab in 0..next.cursors.len() {
+                    let rows = next.row_count(tab);
+                    if rows > 0 {
+                        next.cursors[tab] = next.cursors[tab].min(rows - 1);
+                    }
+                }
+            }
         }
         self.inputs.insert(session_id.to_string(), next);
     }
@@ -191,38 +241,127 @@ impl App {
         self.inputs.get(&view.session.id)
     }
 
-    /// Move the highlight in the focused question's option list.
-    pub(super) fn move_input_cursor(&mut self, delta: isize) {
-        let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
+    fn pending_input_mut(&mut self) -> Option<&mut PendingInput> {
+        let session_id = self.focused_view()?.session.id.clone();
+        self.inputs.get_mut(&session_id)
+    }
+
+    /// Switch to the next/previous question tab.
+    pub(super) fn move_input_tab(&mut self, delta: isize) {
+        let Some(pending) = self.pending_input_mut() else {
             return;
         };
-        let Some(pending) = self.inputs.get_mut(&session_id) else {
-            return;
-        };
-        let len = pending.options.len();
+        let len = pending.questions.len();
         if len == 0 {
             return;
         }
-        pending.cursor = (pending.cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        pending.tab = (pending.tab as isize + delta).rem_euclid(len as isize) as usize;
+        pending.editing = false;
     }
 
-    /// Answer the focused question with `option_index`.
+    /// Move the highlight in the focused question's row list. The last row is
+    /// the synthetic "Other" entry.
+    pub(super) fn move_input_cursor(&mut self, delta: isize) {
+        let Some(pending) = self.pending_input_mut() else {
+            return;
+        };
+        let len = pending.row_count(pending.tab);
+        if len == 0 {
+            return;
+        }
+        let cursor = &mut pending.cursors[pending.tab];
+        *cursor = (*cursor as isize + delta).clamp(0, len as isize - 1) as usize;
+        pending.editing = false;
+    }
+
+    /// Enter on the highlighted row: commit a normal option, or start editing
+    /// the "Other" text field.
+    pub(super) fn commit_input_selection(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(pending) = self.pending_input_mut() else {
+            return;
+        };
+        let tab = pending.tab;
+        if pending.is_other(tab) {
+            pending.editing = true;
+            return;
+        }
+        let question = &pending.questions[tab];
+        let Some(option) = question.options.get(pending.cursors[tab]) else {
+            return;
+        };
+        let mut answer = option.label.clone();
+        if let Some(description) = option
+            .description
+            .as_deref()
+            .map(str::trim)
+            .filter(|description| !description.is_empty())
+        {
+            answer.push_str(" — ");
+            answer.push_str(description);
+        }
+        pending.answers[tab] = Some(answer);
+        if !pending.next_unanswered() {
+            pending.editing = false;
+        }
+        self.submit_input_if_complete(tx);
+    }
+
+    /// Commit the free-form "Other" answer.
+    pub(super) fn commit_input_other(&mut self, tx: &UnboundedSender<Command>) {
+        let Some(pending) = self.pending_input_mut() else {
+            return;
+        };
+        let tab = pending.tab;
+        let text = pending.other[tab].trim().to_string();
+        if text.is_empty() {
+            pending.editing = false;
+            return;
+        }
+        pending.answers[tab] = Some(text);
+        pending.editing = false;
+        if !pending.next_unanswered() {
+            pending.editing = false;
+        }
+        self.submit_input_if_complete(tx);
+    }
+
+    /// Answer the focused question with `option_index` and advance.
     pub(super) fn respond_input(&mut self, option_index: usize, tx: &UnboundedSender<Command>) {
+        let Some(pending) = self.pending_input_mut() else {
+            return;
+        };
+        let tab = pending.tab;
+        let rows = pending.row_count(tab).saturating_sub(1);
+        if option_index >= rows {
+            return;
+        }
+        pending.cursors[tab] = option_index;
+        pending.editing = false;
+        self.commit_input_selection(tx);
+    }
+
+    /// Send the complete answer map once every question has an answer.
+    fn submit_input_if_complete(&mut self, tx: &UnboundedSender<Command>) {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             return;
         };
         let Some(pending) = self.inputs.get(&session_id) else {
             return;
         };
-        let Some(option) = pending.options.get(option_index) else {
+        if !pending.all_answered() {
             return;
-        };
+        }
         let input_id = pending.input_id.clone();
-        self.status = format!("answered: {}", truncate(&option.label, 60));
+        let answers = pending.answer_map();
+        let count = answers.len();
+        self.status = format!(
+            "answered {count} question{}",
+            if count == 1 { "" } else { "s" }
+        );
         let _ = tx.send(Command::Input {
             session_id,
             input_id,
-            option_index,
+            answers,
         });
     }
 

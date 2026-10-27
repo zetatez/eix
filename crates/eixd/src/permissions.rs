@@ -114,7 +114,7 @@ pub fn assess_tool(
         }
         "apply_patch" => {
             let mut risk = RiskAssessment::new();
-            let text = ["patchText", "patch", "input", "text"]
+            let text = ["input", "patchText", "patch", "text"]
                 .iter()
                 .find_map(|key| args.get(*key).and_then(Value::as_str))
                 .unwrap_or_default();
@@ -123,7 +123,8 @@ pub fn assess_tool(
                 let raw = line
                     .strip_prefix("*** Add File: ")
                     .or_else(|| line.strip_prefix("*** Update File: "))
-                    .or_else(|| line.strip_prefix("*** Delete File: "));
+                    .or_else(|| line.strip_prefix("*** Delete File: "))
+                    .or_else(|| line.strip_prefix("*** Move to: "));
                 if let Some(raw) = raw {
                     found = true;
                     let allowed = crate::tools::resolve_path_in(cwd, raw.trim(), config)
@@ -381,6 +382,24 @@ pub fn decide(
     {
         risk.hard_deny = false;
         risk.level = RiskLevel::High;
+    }
+
+    // A shell argument that leaves the workspace through `..` or a symlink is
+    // a boundary escape, not just a risky read. Refuse it in every mode; the
+    // same `tools.external_directory` allowlist file tools use is the only
+    // way to name the target explicitly.
+    if let Some(escaped) = risk.workspace_escape.clone() {
+        let target = eix_core::risk::normalize_path(&cwd.join(&escaped));
+        let target = target.canonicalize().unwrap_or(target);
+        if !config.tools.external_path_allowed(&target) {
+            return PermissionDecision {
+                action: PermissionAction::Deny,
+                risk,
+                rule: None,
+                reason: format!("path escapes the session workspace: {escaped}"),
+                force_ask: false,
+            };
+        }
     }
 
     let capability_denial = read_only_denial(capability, &risk, matches!(tool, "exec_command"));
@@ -698,6 +717,51 @@ mod tests {
             false,
         );
         assert_eq!(network.action, PermissionAction::Deny);
+    }
+
+    #[test]
+    fn shell_workspace_escapes_are_denied() {
+        let config = config();
+        let escaped = decide(
+            "exec_command",
+            &json!({"cmd": "cat ../../etc/passwd"}),
+            Path::new("/tmp/eix-perm"),
+            &config,
+            SessionMode::Build,
+            &[],
+            false,
+        );
+        assert_eq!(escaped.action, PermissionAction::Deny, "{escaped:?}");
+        assert!(
+            escaped.reason.contains("escapes the session workspace"),
+            "{escaped:?}"
+        );
+
+        // An absolute path outside is an explicit read: approval, not a denial.
+        let external = decide(
+            "exec_command",
+            &json!({"cmd": "cat /etc/hosts"}),
+            Path::new("/tmp/eix-perm"),
+            &config,
+            SessionMode::Build,
+            &[],
+            false,
+        );
+        assert_eq!(external.action, PermissionAction::Ask, "{external:?}");
+
+        // `external_directory` is the explicit escape hatch.
+        let mut allowed = config;
+        allowed.tools.external_directory = vec!["/etc".into()];
+        let escaped = decide(
+            "exec_command",
+            &json!({"cmd": "cat ../../etc/hosts"}),
+            Path::new("/tmp/eix-perm"),
+            &allowed,
+            SessionMode::Build,
+            &[],
+            false,
+        );
+        assert_eq!(escaped.action, PermissionAction::Ask, "{escaped:?}");
     }
 
     #[test]

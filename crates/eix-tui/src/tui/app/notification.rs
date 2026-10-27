@@ -356,10 +356,7 @@ impl App {
                         self.focus = Focus::Transcript;
                     }
                     self.status = format!("approval needed: {}", params.summary);
-                    let mut summary = if matches!(
-                        params.tool.as_str(),
-                        "exec_command" | "run_command" | "start_command"
-                    ) {
+                    let mut summary = if matches!(params.tool.as_str(), "exec_command") {
                         params
                             .arguments
                             .get("cmd")
@@ -430,16 +427,14 @@ impl App {
                     {
                         self.focus = Focus::Transcript;
                     }
-                    self.status = format!("question: {}", truncate(&params.question, 60));
+                    self.status = params
+                        .questions
+                        .first()
+                        .map(|question| format!("question: {}", truncate(&question.header, 40)))
+                        .unwrap_or_else(|| "question".to_string());
                     self.inputs.insert(
                         params.session_id,
-                        PendingInput {
-                            input_id: params.input_id,
-                            call_id: params.call_id,
-                            question: params.question,
-                            options: params.options,
-                            cursor: 0,
-                        },
+                        PendingInput::new(params.input_id, params.call_id, params.questions),
                     );
                 }
             }
