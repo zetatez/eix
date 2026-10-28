@@ -2361,6 +2361,47 @@ impl Config {
                     "plugins.{name} needs `command` or `manifest`"
                 )));
             }
+            for (key, pattern) in plugin
+                .network_allow
+                .iter()
+                .enumerate()
+                .map(|(index, pattern)| (format!("network_allow[{index}]"), pattern))
+            {
+                let value = pattern.trim();
+                if value.is_empty()
+                    || value.contains('/')
+                    || value.contains(':')
+                    || value.contains('*') && !value.starts_with("*.")
+                    || value.matches('*').count() > 1
+                {
+                    return Err(ConfigError::Invalid(format!(
+                        "plugins.{name}.{key}: use a host name or a single leading `*.` wildcard"
+                    )));
+                }
+            }
+            for secret in &plugin.secrets {
+                let valid = !secret.is_empty()
+                    && secret
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+                if !valid {
+                    return Err(ConfigError::Invalid(format!(
+                        "plugins.{name}.secrets: {secret:?} is not an environment variable name"
+                    )));
+                }
+            }
+            for target in &plugin.rpc_allow {
+                if target != "*" && !crate::plugin::valid_plugin_name(target) {
+                    return Err(ConfigError::Invalid(format!(
+                        "plugins.{name}.rpc_allow: invalid plugin name {target:?}"
+                    )));
+                }
+                if target == name {
+                    return Err(ConfigError::Invalid(format!(
+                        "plugins.{name}.rpc_allow must not include itself"
+                    )));
+                }
+            }
         }
         for (index, formatter) in self.formatter.0.iter().enumerate() {
             if formatter

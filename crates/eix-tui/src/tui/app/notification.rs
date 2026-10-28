@@ -9,6 +9,63 @@ impl App {
         tx: &UnboundedSender<Command>,
     ) {
         match notification.method.as_str() {
+            "plugin.ui.open" | "plugin.ui.update" => {
+                let params = &notification.params;
+                let plugin = params
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or("plugin");
+                let title = params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or(plugin);
+                let body = params
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                self.open_text_view(format!("{plugin} · {title}"), body);
+                self.status = format!("{plugin} · {title}");
+            }
+            "plugin.ui.close" => {
+                let plugin = notification
+                    .params
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or("plugin");
+                if self
+                    .text_view
+                    .as_ref()
+                    .is_some_and(|view| view.title.starts_with(&format!("{plugin} · ")))
+                {
+                    self.text_view = None;
+                    self.status = format!("{plugin} closed its panel");
+                }
+            }
+            "plugin.notify" => {
+                let plugin = notification
+                    .params
+                    .get("plugin")
+                    .and_then(Value::as_str)
+                    .unwrap_or("plugin");
+                let level = notification
+                    .params
+                    .get("level")
+                    .and_then(Value::as_str)
+                    .unwrap_or("info");
+                let message = notification
+                    .params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let tone = if level == "error" || level == "warn" || level == "warning" {
+                    ToastTone::Warning
+                } else {
+                    ToastTone::Success
+                };
+                self.status = format!("{plugin}: {message}");
+                self.push_toast(self.status.clone(), tone, ATTENTION_TOAST_DISPLAY);
+            }
             "integration.updated" => {
                 if let Ok(state) = serde_json::from_value::<IntegrationState>(notification.params) {
                     let session_id = state.session_id.clone();

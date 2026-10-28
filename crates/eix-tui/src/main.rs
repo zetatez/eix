@@ -12,6 +12,7 @@ use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
+use base64::Engine as _;
 use eix_core::config as core_config;
 use eix_core::sandbox as core_sandbox;
 use eix_core::{
@@ -41,6 +42,7 @@ async fn main() -> Result<()> {
         Command::Daemon => daemon(&cli).await,
         Command::Doctor => doctor(&cli).await,
         Command::Mcp(cmd) => mcp_command(&cli, cmd).await,
+        Command::Plugin(cmd) => plugin_command(&cli, cmd).await,
         Command::Auth(cmd) => auth_command(&cli, cmd).await,
         Command::Model(cmd) => model_command(&cli, cmd).await,
         Command::Pair(cmd) => pair_command(&cli, cmd).await,
@@ -265,6 +267,7 @@ enum Command {
         process: String,
     },
     Mcp(McpCmd),
+    Plugin(PluginCmd),
     Auth(AuthCmd),
     Model(ModelCmd),
     Pair(PairCmd),
@@ -280,6 +283,30 @@ enum McpCmd {
     Auth { server: String, no_browser: bool },
     /// Forget a stored OAuth token.
     Logout { server: String },
+}
+
+#[derive(Clone)]
+enum PluginCmd {
+    /// Write `eix-plugin.sums` for a package directory.
+    Pack { directory: PathBuf },
+    /// Verify checksums and the detached signature.
+    Verify {
+        directory: PathBuf,
+        allow_unsigned: bool,
+    },
+    /// Verify and copy a package under the plugin root.
+    Install {
+        directory: PathBuf,
+        allow_unsigned: bool,
+        force: bool,
+    },
+    /// Add or replace a trusted publisher key.
+    Trust {
+        publisher: String,
+        public_key: String,
+    },
+    /// Remove a trusted publisher key.
+    Untrust { publisher: String },
 }
 
 #[derive(Clone)]
@@ -798,6 +825,68 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
                     Ok(Command::Mcp(McpCmd::Logout { server }))
                 }
                 other => bail!("usage: eix mcp auth <server> | logout <server> (got {other:?})"),
+            }
+        }
+        "plugin" => {
+            let sub = args.first().cloned().ok_or_else(|| {
+                anyhow::anyhow!("usage: eix plugin <pack|verify|install|trust|untrust>")
+            })?;
+            args.remove(0);
+            match sub.as_str() {
+                "pack" => {
+                    let directory = args
+                        .first()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    Ok(Command::Plugin(PluginCmd::Pack { directory }))
+                }
+                "verify" => {
+                    let allow_unsigned = take_switch(&mut args, "--allow-unsigned");
+                    let directory = args
+                        .first()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    Ok(Command::Plugin(PluginCmd::Verify {
+                        directory,
+                        allow_unsigned,
+                    }))
+                }
+                "install" => {
+                    let allow_unsigned = take_switch(&mut args, "--allow-unsigned");
+                    let force = take_switch(&mut args, "--force");
+                    let directory = args.first().map(PathBuf::from).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "usage: eix plugin install <directory> [--force] [--allow-unsigned]"
+                        )
+                    })?;
+                    Ok(Command::Plugin(PluginCmd::Install {
+                        directory,
+                        allow_unsigned,
+                        force,
+                    }))
+                }
+                "trust" => {
+                    let publisher = args.first().cloned().ok_or_else(|| {
+                        anyhow::anyhow!("usage: eix plugin trust <publisher> <base64-public-key>")
+                    })?;
+                    let public_key = args.get(1).cloned().ok_or_else(|| {
+                        anyhow::anyhow!("usage: eix plugin trust <publisher> <base64-public-key>")
+                    })?;
+                    Ok(Command::Plugin(PluginCmd::Trust {
+                        publisher,
+                        public_key,
+                    }))
+                }
+                "untrust" => {
+                    let publisher = args
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("usage: eix plugin untrust <publisher>"))?;
+                    Ok(Command::Plugin(PluginCmd::Untrust { publisher }))
+                }
+                other => bail!(
+                    "unknown plugin command {other:?}; use pack, verify, install, trust or untrust"
+                ),
             }
         }
         "daemon" | "up" => Ok(Command::Daemon),
@@ -1782,6 +1871,89 @@ async fn kill(cli: &Cli, process: &str) -> Result<()> {
         println!("process {process} is not running");
     }
     Ok(())
+}
+
+/// Package, verify, install and trust plugins. Installation never edits the
+/// config; it prints the exact `[plugins.<name>]` snippet to add.
+async fn plugin_command(_cli: &Cli, cmd: PluginCmd) -> Result<()> {
+    let config_dir = core_config::config_dir();
+    let plugins_root = config_dir.join("plugins");
+    let trust_path = config_dir.join("plugin-trust.toml");
+    match cmd {
+        PluginCmd::Pack { directory } => {
+            let entries = eix_core::pack_plugin(&directory)
+                .with_context(|| format!("cannot pack {}", directory.display()))?;
+            println!(
+                "packed {} file(s); wrote {}",
+                entries.len(),
+                directory
+                    .join(eix_core::plugin_package::DEFAULT_CHECKSUMS)
+                    .display()
+            );
+            println!("sign the checksum file and write the base64 signature to eix-plugin.sig");
+            Ok(())
+        }
+        PluginCmd::Verify {
+            directory,
+            allow_unsigned,
+        } => {
+            let manifest = eix_core::PluginManifest::load(&directory.join("eix-plugin.toml"))?;
+            let trust = eix_core::PluginTrustStore::load(&trust_path)?;
+            eix_core::verify_plugin(&directory, &manifest, &trust, allow_unsigned)?;
+            println!("verified {} ({})", manifest.name, manifest.version);
+            Ok(())
+        }
+        PluginCmd::Install {
+            directory,
+            allow_unsigned,
+            force,
+        } => {
+            let trust = eix_core::PluginTrustStore::load(&trust_path)?;
+            let installed =
+                eix_core::install_plugin(&directory, &plugins_root, &trust, allow_unsigned, force)?;
+            println!(
+                "installed {} ({}) to {}",
+                installed.name,
+                installed.manifest.version,
+                installed.path.display()
+            );
+            println!();
+            println!("Add this to your global config and reload the daemon:");
+            println!();
+            println!("[plugins.{}]", installed.name);
+            println!(
+                "manifest = {:?}",
+                installed.path.join("eix-plugin.toml").display().to_string()
+            );
+            Ok(())
+        }
+        PluginCmd::Trust {
+            publisher,
+            public_key,
+        } => {
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(public_key.trim())
+                .context("public key must be base64")?;
+            if decoded.len() != 32 {
+                bail!("an Ed25519 public key is 32 bytes, got {}", decoded.len());
+            }
+            let mut trust = eix_core::PluginTrustStore::load(&trust_path)?;
+            trust.insert(publisher.clone(), public_key.trim().to_string());
+            trust.save(&trust_path)?;
+            println!("trusted publisher {publisher} ({})", trust_path.display());
+            Ok(())
+        }
+        PluginCmd::Untrust { publisher } => {
+            let mut trust = eix_core::PluginTrustStore::load(&trust_path)?;
+            let removed = trust.keys.remove(&publisher).is_some();
+            trust.save(&trust_path)?;
+            println!(
+                "{} publisher {publisher}",
+                if removed { "removed" } else { "unknown" }
+            );
+            Ok(())
+        }
+    }
 }
 
 async fn mcp_command(cli: &Cli, cmd: McpCmd) -> Result<()> {
@@ -3040,6 +3212,13 @@ COMMANDS:
     mcp auth <server> [--no-browser]
                                authorize a remote MCP server with OAuth (PKCE)
     mcp logout <server>        forget a remote MCP server's OAuth token
+    plugin pack [DIR]          write eix-plugin.sums for a plugin directory
+    plugin verify [DIR] [--allow-unsigned]
+                               verify checksums and the detached signature
+    plugin install DIR [--force] [--allow-unsigned]
+                               verify and install under ~/.config/eix/plugins
+    plugin trust PUBLISHER KEY trust a base64 Ed25519 publisher key
+    plugin untrust PUBLISHER   remove a trusted publisher key
     auth login PROVIDER [--api-key KEY | --stdin] [--no-browser]
                                store an API key or run the provider's OAuth flow
     auth list [--json]         show providers and where each credential comes from
@@ -3082,6 +3261,8 @@ EXAMPLES:
     eix ready --session 4f2a9c11
     eix integrate status
     eix integrate continue 4f2a9c11
+    eix plugin pack examples/plugins/echo
+    eix plugin install examples/plugins/echo --allow-unsigned
     eix --tcp 127.0.0.1:7777 --token \"$EIX_TOKEN\" ls"
     );
 }

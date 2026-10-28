@@ -1446,12 +1446,26 @@ for line in sys.stdin:
                 "description": "Review a path",
                 "args": "<path>",
                 "prompt": "Review $ARGUMENTS"}],
+            "hooks": [{
+                "point": "tool.after",
+                "priority": 10,
+                "timeout_ms": 0,
+                "on_error": "ignore"}],
             "events": []}})
     elif method == "tools/call":
         text = msg["params"]["arguments"].get("text", "")
         send({"jsonrpc": "2.0", "id": msg["id"], "result": {
             "ok": True,
             "content": [{"type": "text", "text": "plugin:" + text}]}})
+    elif method == "commands/run":
+        arguments = msg["params"].get("arguments", "")
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "ok": True,
+            "output": "words:" + str(len(arguments.split()))}})
+    elif method == "hooks/run":
+        output = msg["params"].get("output", "")
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "output": output + "|hooked"}})
     else:
         send({"jsonrpc": "2.0", "id": msg.get("id"),
               "error": {"code": -32601, "message": "unknown method"}})
@@ -1464,7 +1478,8 @@ name = "mock"
 version = "0.1.0"
 api_version = 2
 description = "Mock plugin"
-capabilities = ["tools", "commands"]
+capabilities = ["tools", "commands", "hooks"]
+settings = "settings.schema.json"
 
 [components.server]
 command = "python3"
@@ -1475,7 +1490,22 @@ name = "triage"
 description = "Triage an issue"
 args = "<issue>"
 prompt = "Triage $ARGUMENTS"
+
+[[contributes.commands]]
+name = "count"
+description = "Count words"
+args = "<text>"
+action = "count"
 "#,
+    )?;
+    std::fs::write(
+        dir.join("settings.schema.json"),
+        r#"{
+          "type": "object",
+          "properties": {
+            "project": {"type": "string", "title": "Project"}
+          }
+        }"#,
     )?;
 
     std::fs::create_dir_all(dir.join("prompts"))?;
@@ -1511,8 +1541,13 @@ prompt = "Triage $ARGUMENTS"
         "mock".to_string(),
         eix_core::PluginConfig {
             // The manifest supplies the process command and the declarative
-            // `triage` command; the plugin server supplies `echo` and `review`.
+            // `triage`/`count` commands; the plugin server supplies `echo` and
+            // `review`.
             manifest: Some(std::path::PathBuf::from("eix-plugin.toml")),
+            settings: std::collections::BTreeMap::from([(
+                "project".to_string(),
+                Value::String("acme".into()),
+            )]),
             ..eix_core::PluginConfig::default()
         },
     );
@@ -1540,7 +1575,8 @@ prompt = "Triage $ARGUMENTS"
     assert_eq!(mock_info.state, eix_core::PluginState::Ready);
     assert_eq!(mock_info.version, "0.1.0");
     assert_eq!(mock_info.tools, 1);
-    assert_eq!(mock_info.commands, 2);
+    assert_eq!(mock_info.commands, 3);
+    assert_eq!(mock_info.hooks, 1);
     assert!(mock_info.error.is_none());
     let prompts = list
         .plugins
@@ -1555,7 +1591,7 @@ prompt = "Triage $ARGUMENTS"
 
     let commands: eix_core::PluginCommandList =
         client.request("plugin.commands", Value::Null).await?;
-    assert_eq!(commands.commands.len(), 3);
+    assert_eq!(commands.commands.len(), 4);
     let review = commands
         .commands
         .iter()
@@ -1568,6 +1604,12 @@ prompt = "Triage $ARGUMENTS"
         .find(|command| command.name == "plugin/mock/triage")
         .expect("declarative command");
     assert_eq!(triage.prompt, "Triage $ARGUMENTS");
+    let count = commands
+        .commands
+        .iter()
+        .find(|command| command.name == "plugin/mock/count")
+        .expect("declarative action command");
+    assert!(count.action);
     let prompts_triage = commands
         .commands
         .iter()
@@ -1579,6 +1621,33 @@ prompt = "Triage $ARGUMENTS"
         .request("session.create", json!({"name": "plugin", "cwd": dir}))
         .await?;
     let session_id = created.session.id.clone();
+
+    // Action commands call `commands/run` and return text without a model turn.
+    let action: eix_core::PluginCommandRunResult = client
+        .request(
+            "plugin.command.run",
+            json!({
+                "name": "plugin/mock/count",
+                "arguments": "one two three",
+                "session_id": session_id,
+            }),
+        )
+        .await?;
+    assert!(action.ok);
+    assert_eq!(action.output.as_deref(), Some("words:3"));
+    assert!(action.prompt.is_none());
+
+    // Settings expose the manifest schema and the configured values.
+    let settings: eix_core::PluginSettingsResult = client
+        .request("plugin.settings", json!({"name": "mock"}))
+        .await?;
+    assert_eq!(settings.plugin, "mock");
+    assert_eq!(
+        settings.schema.as_ref().unwrap()["properties"]["project"]["title"],
+        "Project"
+    );
+    assert_eq!(settings.values["project"], "acme");
+
     let _: SubmitResult = client
         .request(
             "prompt.submit",
@@ -1629,6 +1698,13 @@ prompt = "Triage $ARGUMENTS"
             .as_str()
             .unwrap()
             .contains("plugin:hi"),
+        "{}",
+        result.payload["output"]
+    );
+    // `tool.after` hooks can rewrite the recorded output.
+    assert_eq!(
+        result.payload["output"].as_str().unwrap(),
+        "plugin:hi|hooked",
         "{}",
         result.payload["output"]
     );

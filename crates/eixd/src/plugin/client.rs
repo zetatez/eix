@@ -50,7 +50,12 @@ pub struct PluginClient {
 }
 
 impl PluginClient {
-    pub async fn spawn(spec: &PluginSpec, store: Arc<Store>) -> Result<Arc<Self>> {
+    pub async fn spawn(
+        spec: &PluginSpec,
+        store: Arc<Store>,
+        bus: tokio::sync::broadcast::Sender<eix_core::Notification>,
+        rpc_tx: mpsc::Sender<super::host_api::RpcCallRequest>,
+    ) -> Result<Arc<Self>> {
         let workspace = spec.cwd.clone();
         let plugin_data_dir = spec.data_dir.clone();
         std::fs::create_dir_all(&plugin_data_dir)
@@ -106,6 +111,13 @@ impl PluginClient {
             workspace,
             Arc::clone(&store),
             frame_tx.clone(),
+            plugin_data_dir,
+            spec.network_allow.clone(),
+            spec.secrets.clone(),
+            spec.rpc_allow.clone(),
+            spec.env.clone(),
+            bus,
+            rpc_tx,
         );
 
         let writer_connection = Arc::clone(&connection);
@@ -150,7 +162,20 @@ impl PluginClient {
                 name: "eixd".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
-            features: vec!["content_blocks".to_string(), "cancel".to_string()],
+            features: vec![
+                "content_blocks".to_string(),
+                "cancel".to_string(),
+                "hooks".to_string(),
+                "ui".to_string(),
+                "rpc".to_string(),
+                "jobs".to_string(),
+                "fs".to_string(),
+                "net".to_string(),
+                "secrets".to_string(),
+                "session_read".to_string(),
+                "blobs".to_string(),
+                "command_actions".to_string(),
+            ],
             capabilities: spec.capabilities.clone(),
             workspace: Some(workspace.to_path_buf()),
             config: json!({

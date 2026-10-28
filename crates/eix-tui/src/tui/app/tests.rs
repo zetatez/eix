@@ -4084,6 +4084,7 @@ fn command_palette_includes_user_commands() {
         template: Some("deploy {{args}}".into()),
         agent: None,
         model: None,
+        action: false,
     });
     let items = command_items(&commands);
     assert!(items.iter().any(|item| {
@@ -4106,6 +4107,7 @@ fn plugin_commands_join_the_menu_without_shadowing_builtins() {
                 args: "<path>".into(),
                 description: "review from a plugin".into(),
                 prompt: "Review $ARGUMENTS".into(),
+                action: false,
             },
             eix_core::PluginCommandInfo {
                 plugin: "acme".into(),
@@ -4113,6 +4115,7 @@ fn plugin_commands_join_the_menu_without_shadowing_builtins() {
                 args: String::new(),
                 description: "must not shadow the built-in".into(),
                 prompt: "shadowed".into(),
+                action: false,
             },
         ],
     );

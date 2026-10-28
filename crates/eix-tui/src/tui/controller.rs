@@ -110,6 +110,16 @@ pub enum Command {
     ListMcp,
     /// List prompt commands contributed by server plugins.
     ListPluginCommands,
+    /// List plugins and optionally load one plugin's settings schema.
+    ListPlugins {
+        name: Option<String>,
+    },
+    /// Run an action command exported by a plugin.
+    RunPluginCommand {
+        session_id: String,
+        name: String,
+        arguments: String,
+    },
     /// Re-read the daemon config files.
     ReloadConfig,
     /// Hide or restore a session.
@@ -280,6 +290,8 @@ impl Command {
             Self::ListModels | Self::ListAgents { .. } => "catalog",
             Self::ListMcp => "mcp",
             Self::ListPluginCommands => "plugin commands",
+            Self::ListPlugins { .. } => "plugins",
+            Self::RunPluginCommand { .. } => "plugin command",
             Self::ReloadConfig => "reload",
             Self::ArchiveSession { .. } => "archive",
             Self::DeleteSession { .. } => "delete",
@@ -386,6 +398,14 @@ pub enum Event {
     Agents(Vec<eix_core::AgentSpec>),
     Mcp(Vec<eix_core::McpServerInfo>),
     PluginCommands(Vec<eix_core::PluginCommandInfo>),
+    Plugins {
+        list: eix_core::PluginListResult,
+        settings: Option<eix_core::PluginSettingsResult>,
+    },
+    PluginCommandResult {
+        session_id: String,
+        result: eix_core::PluginCommandRunResult,
+    },
     SubagentConcurrency {
         value: usize,
     },
@@ -736,6 +756,38 @@ async fn dispatch(
             let value = requester.request("plugin.commands", Value::Null).await?;
             let result: eix_core::PluginCommandList = decode(value)?;
             send(events, Event::PluginCommands(result.commands))
+        }
+        Command::ListPlugins { name } => {
+            let value = requester.request("plugin.list", Value::Null).await?;
+            let list: eix_core::PluginListResult = decode(value)?;
+            let settings = match name {
+                Some(name) => {
+                    let value = requester
+                        .request("plugin.settings", json!({ "name": name }))
+                        .await?;
+                    Some(decode(value)?)
+                }
+                None => None,
+            };
+            send(events, Event::Plugins { list, settings })
+        }
+        Command::RunPluginCommand {
+            session_id,
+            name,
+            arguments,
+        } => {
+            let value = requester
+                .request(
+                    "plugin.command.run",
+                    json!({
+                        "name": name,
+                        "arguments": arguments,
+                        "session_id": session_id,
+                    }),
+                )
+                .await?;
+            let result: eix_core::PluginCommandRunResult = decode(value)?;
+            send(events, Event::PluginCommandResult { session_id, result })
         }
         Command::ArchiveSession {
             session_id,

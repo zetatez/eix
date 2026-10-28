@@ -19,20 +19,22 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use eix_core::plugin::{
-    valid_plugin_name, valid_tool_name, ManifestCommand, PluginCapability, PluginCommand,
-    PluginCommandInfo, PluginCommandList, PluginConfig, PluginInfo, PluginInitializeResult,
-    PluginListResult, PluginManifest, PluginState, PluginTool, PluginToolCallParams,
-    PluginToolCallResult, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
+    valid_hook_point, valid_plugin_name, valid_tool_name, valid_ui_surface, ManifestCommand,
+    PluginCapability, PluginCommand, PluginCommandInfo, PluginCommandList, PluginCommandRunResult,
+    PluginConfig, PluginHook, PluginInfo, PluginInitializeResult, PluginListResult, PluginManifest,
+    PluginRpc, PluginSettingsResult, PluginState, PluginTool, PluginToolCallParams,
+    PluginToolCallResult, PluginUi, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
 };
 use eix_core::redact::redact;
-use eix_core::{Config, ToolDefinition};
+use eix_core::{Config, Notification, ToolDefinition};
 use serde_json::Value;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{broadcast, mpsc, Mutex};
 
 use crate::store::Store;
 use crate::tools::ToolOutcome;
 
 use client::PluginClient;
+use host_api::RpcCallRequest;
 
 const DEFAULT_CAPABILITIES: &[PluginCapability] =
     &[PluginCapability::Tools, PluginCapability::Commands];
@@ -40,6 +42,7 @@ const MAX_PLUGIN_OUTPUT: usize = 1_000_000;
 const MAX_TOOL_DESCRIPTION: usize = 2048;
 const MAX_COMMAND_PROMPT: usize = 256 * 1024;
 const MAX_EVENT_PATTERN: usize = 128;
+const MAX_SETTINGS_SCHEMA: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 struct PluginEvent {
@@ -65,6 +68,28 @@ struct CommandRef {
     args: String,
     description: String,
     prompt: String,
+    /// `Some(action)` for commands that call `commands/run` instead of
+    /// submitting a prompt.
+    action: Option<String>,
+}
+
+/// One registered hook callback.
+#[derive(Debug, Clone)]
+struct HookRef {
+    plugin: String,
+    point: String,
+    priority: i32,
+    timeout: Option<Duration>,
+    on_error: String,
+}
+
+/// One static UI surface declared at initialize.
+#[derive(Debug, Clone)]
+struct UiRef {
+    plugin: String,
+    surface: String,
+    id: String,
+    title: String,
 }
 
 /// Everything needed to start one plugin.
@@ -82,6 +107,10 @@ struct PluginSpec {
     allowed_tools: Vec<String>,
     denied_tools: Vec<String>,
     settings: BTreeMap<String, Value>,
+    settings_schema: Option<Value>,
+    network_allow: Vec<String>,
+    secrets: Vec<String>,
+    rpc_allow: Vec<String>,
     has_server: bool,
     declarative_commands: Vec<ManifestCommand>,
 }
@@ -103,6 +132,7 @@ impl PluginSpec {
     }
 }
 
+#[derive(Clone)]
 struct PluginStatus {
     name: String,
     version: String,
@@ -112,9 +142,13 @@ struct PluginStatus {
     state: PluginState,
     tools: usize,
     commands: usize,
+    hooks: usize,
+    ui: usize,
+    rpc: usize,
     events: Vec<String>,
     capabilities: Vec<PluginCapability>,
     error: Option<String>,
+    settings_schema: Option<Value>,
 }
 
 impl PluginStatus {
@@ -128,6 +162,9 @@ impl PluginStatus {
             state: self.state,
             tools: self.tools,
             commands: self.commands,
+            hooks: self.hooks,
+            ui: self.ui,
+            rpc: self.rpc,
             events: self.events.clone(),
             capabilities: self.capabilities.clone(),
             error: self.error.clone(),
@@ -144,16 +181,27 @@ pub struct PluginManager {
     subscriptions: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     tools: Mutex<Vec<ToolRef>>,
     commands: Mutex<Vec<CommandRef>>,
+    hooks: Mutex<Vec<HookRef>>,
+    ui: Mutex<Vec<UiRef>>,
+    /// RPC methods per plugin, copied from `initialize`.
+    rpc_methods: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
     statuses: Mutex<BTreeMap<String, PluginStatus>>,
     event_tx: mpsc::Sender<PluginEvent>,
+    rpc_tx: mpsc::Sender<RpcCallRequest>,
+    bus: broadcast::Sender<Notification>,
     /// False when no running plugin subscribed to any event. `publish` is
     /// called for every daemon notification, so this keeps the common case
     /// cheap.
     has_event_subscribers: AtomicBool,
+    has_hooks: AtomicBool,
 }
 
 impl PluginManager {
-    pub fn new(store: Arc<Store>, data_dir: PathBuf) -> Arc<Self> {
+    pub fn new(
+        store: Arc<Store>,
+        data_dir: PathBuf,
+        bus: broadcast::Sender<Notification>,
+    ) -> Arc<Self> {
         // Bounded so a plugin event storm cannot grow memory without bound.
         // `publish` drops events under backpressure; events are best-effort
         // notifications, not durable state.
@@ -193,6 +241,18 @@ impl PluginManager {
                 }
             }
         });
+
+        let (rpc_tx, mut rpc_rx) = mpsc::channel::<RpcCallRequest>(64);
+        let rpc_clients = Arc::clone(&clients);
+        let rpc_methods = Arc::new(Mutex::new(BTreeMap::<String, BTreeSet<String>>::new()));
+        let router_methods = Arc::clone(&rpc_methods);
+        tokio::spawn(async move {
+            while let Some(request) = rpc_rx.recv().await {
+                let result = route_rpc(&request, &rpc_clients, &router_methods).await;
+                let _ = request.reply.send(result);
+            }
+        });
+
         Arc::new(Self {
             store,
             data_dir,
@@ -200,19 +260,29 @@ impl PluginManager {
             subscriptions,
             tools: Mutex::new(Vec::new()),
             commands: Mutex::new(Vec::new()),
+            hooks: Mutex::new(Vec::new()),
+            ui: Mutex::new(Vec::new()),
+            rpc_methods,
             statuses: Mutex::new(BTreeMap::new()),
             event_tx,
+            rpc_tx,
+            bus,
             has_event_subscribers: AtomicBool::new(false),
+            has_hooks: AtomicBool::new(false),
         })
     }
 
     /// Stop every plugin and start the enabled set from `config`.
     pub async fn load(&self, config: &Config) {
         self.has_event_subscribers.store(false, Ordering::Relaxed);
+        self.has_hooks.store(false, Ordering::Relaxed);
         self.stop_all().await;
         self.subscriptions.lock().await.clear();
         self.tools.lock().await.clear();
         self.commands.lock().await.clear();
+        self.hooks.lock().await.clear();
+        self.ui.lock().await.clear();
+        self.rpc_methods.lock().await.clear();
         self.statuses.lock().await.clear();
 
         for (name, plugin) in &config.plugins {
@@ -231,9 +301,13 @@ impl PluginManager {
                     },
                     tools: 0,
                     commands: 0,
+                    hooks: 0,
+                    ui: 0,
+                    rpc: 0,
                     events: Vec::new(),
                     capabilities: plugin.capabilities.clone(),
                     error: None,
+                    settings_schema: None,
                 },
             );
             if !plugin.enabled {
@@ -257,9 +331,14 @@ impl PluginManager {
             return Ok(());
         }
 
-        let client = PluginClient::spawn(&spec, Arc::clone(&self.store))
-            .await
-            .with_context(|| format!("plugin {} failed to start", spec.name))?;
+        let client = PluginClient::spawn(
+            &spec,
+            Arc::clone(&self.store),
+            self.bus.clone(),
+            self.rpc_tx.clone(),
+        )
+        .await
+        .with_context(|| format!("plugin {} failed to start", spec.name))?;
         let init = match client.initialize(&spec, &spec.cwd).await {
             Ok(init) => init,
             Err(err) => {
@@ -294,12 +373,28 @@ impl PluginManager {
         let mut out = Vec::new();
         for command in &spec.declarative_commands {
             validate_command_name(&command.name)?;
-            if command.prompt.trim().is_empty() {
+            let action = command
+                .action
+                .as_deref()
+                .map(str::trim)
+                .filter(|action| !action.is_empty());
+            let has_prompt = !command.prompt.trim().is_empty();
+            if has_prompt == action.is_some() {
                 bail!(
-                    "plugin {} command {:?} has an empty prompt",
+                    "plugin {} command {:?} needs exactly one of `prompt` or `action`",
                     spec.name,
                     command.name
                 );
+            }
+            if let Some(action) = action {
+                validate_rpc_name(action)?;
+                if !spec.has_server {
+                    bail!(
+                        "plugin {} command {:?} uses an action but has no server",
+                        spec.name,
+                        command.name
+                    );
+                }
             }
             if command.prompt.len() > MAX_COMMAND_PROMPT {
                 bail!(
@@ -314,6 +409,7 @@ impl PluginManager {
                 args: command.args.clone(),
                 description: command.description.clone(),
                 prompt: command.prompt.clone(),
+                action: action.map(str::to_string),
             });
         }
         Ok(out)
@@ -334,9 +430,13 @@ impl PluginManager {
                 state: PluginState::Ready,
                 tools: 0,
                 commands: count,
+                hooks: 0,
+                ui: 0,
+                rpc: 0,
                 events: Vec::new(),
                 capabilities: spec.capabilities.clone(),
                 error: None,
+                settings_schema: spec.settings_schema.clone(),
             },
         );
         Ok(())
@@ -351,21 +451,22 @@ impl PluginManager {
     ) -> Result<()> {
         let capabilities: BTreeSet<PluginCapability> = spec.capabilities.iter().copied().collect();
 
-        if !init.hooks.is_empty() {
+        if !init.hooks.is_empty() && !capabilities.contains(&PluginCapability::Hooks) {
             bail!(
-                "plugin {} declares hooks, which are not implemented in this build",
+                "plugin {} declares {} hook(s) but was not granted `hooks`",
+                spec.name,
+                init.hooks.len()
+            );
+        }
+        if !init.ui.is_empty() && !capabilities.contains(&PluginCapability::Ui) {
+            bail!(
+                "plugin {} declares UI contributions but was not granted `ui`",
                 spec.name
             );
         }
-        if !init.ui.is_empty() {
+        if !init.rpc.is_empty() && !capabilities.contains(&PluginCapability::Rpc) {
             bail!(
-                "plugin {} declares UI contributions, which are not implemented in this build",
-                spec.name
-            );
-        }
-        if !init.rpc.is_empty() {
-            bail!(
-                "plugin {} declares RPC methods, which are not implemented in this build",
+                "plugin {} declares RPC methods but was not granted `rpc`",
                 spec.name
             );
         }
@@ -392,6 +493,9 @@ impl PluginManager {
 
         let events = validate_events(spec, &init.events)?;
         let tools = validate_tools(spec, &init.tools)?;
+        let hooks = validate_hooks(spec, &init.hooks)?;
+        let ui = validate_ui(spec, &init.ui)?;
+        let rpc = validate_rpc(spec, &init.rpc)?;
         let mut commands = declarative;
         commands.extend(validate_commands(spec, &init.commands)?);
 
@@ -400,8 +504,14 @@ impl PluginManager {
 
         let tool_count = tools.len();
         let command_count = commands.len();
+        let hook_count = hooks.len();
+        let ui_count = ui.len();
+        let rpc_count = rpc.len();
         self.tools.lock().await.extend(tools);
         self.commands.lock().await.extend(commands);
+        self.hooks.lock().await.extend(hooks);
+        self.ui.lock().await.extend(ui);
+        self.rpc_methods.lock().await.insert(spec.name.clone(), rpc);
         self.clients
             .lock()
             .await
@@ -416,6 +526,7 @@ impl PluginManager {
             self.has_event_subscribers
                 .store(!subscriptions.is_empty(), Ordering::Relaxed);
         }
+        self.refresh_has_hooks().await;
         self.statuses.lock().await.insert(
             spec.name.clone(),
             PluginStatus {
@@ -427,12 +538,21 @@ impl PluginManager {
                 state: PluginState::Ready,
                 tools: tool_count,
                 commands: command_count,
+                hooks: hook_count,
+                ui: ui_count,
+                rpc: rpc_count,
                 events,
                 capabilities: spec.capabilities.clone(),
                 error: None,
+                settings_schema: spec.settings_schema.clone(),
             },
         );
         Ok(())
+    }
+
+    async fn refresh_has_hooks(&self) {
+        let has_hooks = !self.hooks.lock().await.is_empty();
+        self.has_hooks.store(has_hooks, Ordering::Relaxed);
     }
 
     async fn check_tool_conflicts(&self, tools: &[ToolRef]) -> Result<()> {
@@ -485,9 +605,13 @@ impl PluginManager {
                     state: PluginState::Failed,
                     tools: 0,
                     commands: 0,
+                    hooks: 0,
+                    ui: 0,
+                    rpc: 0,
                     events: Vec::new(),
                     capabilities: plugin.capabilities.clone(),
                     error: Some(message),
+                    settings_schema: None,
                 },
             );
         }
@@ -528,6 +652,10 @@ impl PluginManager {
             .lock()
             .await
             .retain(|command| command.plugin != name);
+        self.hooks.lock().await.retain(|hook| hook.plugin != name);
+        self.ui.lock().await.retain(|ui| ui.plugin != name);
+        self.rpc_methods.lock().await.remove(name);
+        self.refresh_has_hooks().await;
         {
             let mut subscriptions = self.subscriptions.lock().await;
             subscriptions.remove(name);
@@ -539,6 +667,9 @@ impl PluginManager {
             status.error = error.map(|error| redact(&error));
             status.tools = 0;
             status.commands = 0;
+            status.hooks = 0;
+            status.ui = 0;
+            status.rpc = 0;
             status.events.clear();
         }
         true
@@ -599,9 +730,317 @@ impl PluginManager {
                     args: command.args.clone(),
                     description: command.description.clone(),
                     prompt: command.prompt.clone(),
+                    action: command.action.is_some(),
                 })
                 .collect(),
         }
+    }
+
+    /// Declared text surfaces. The TUI uses these to label plugin panels and
+    /// to decide whether a `plugin.ui.open` event is expected.
+    pub async fn ui_surfaces(&self) -> Vec<Value> {
+        self.refresh().await;
+        self.ui
+            .lock()
+            .await
+            .iter()
+            .map(|surface| {
+                serde_json::json!({
+                    "plugin": surface.plugin,
+                    "surface": surface.surface,
+                    "id": surface.id,
+                    "title": surface.title,
+                })
+            })
+            .collect()
+    }
+
+    pub async fn run_command(
+        &self,
+        name: &str,
+        arguments: &str,
+        session_id: &str,
+        cwd: &Path,
+    ) -> Result<PluginCommandRunResult> {
+        let command = self
+            .commands
+            .lock()
+            .await
+            .iter()
+            .find(|command| command.exposed == name)
+            .cloned()
+            .with_context(|| format!("unknown plugin command {name:?}"))?;
+        let action = command
+            .action
+            .clone()
+            .with_context(|| format!("plugin command {name:?} submits a prompt directly"))?;
+        let client = self
+            .clients
+            .lock()
+            .await
+            .get(&command.plugin)
+            .cloned()
+            .with_context(|| format!("plugin {} is not running", command.plugin))?;
+        let value = client
+            .request(
+                "commands/run",
+                serde_json::json!({
+                    "command": action,
+                    "arguments": arguments,
+                    "session_id": session_id,
+                    "workspace": cwd,
+                    "cwd": cwd,
+                }),
+            )
+            .await
+            .with_context(|| format!("plugin {} command {name} failed", command.plugin))?;
+        let mut result: PluginCommandRunResult =
+            serde_json::from_value(value).context("invalid plugin command result")?;
+        if let Some(prompt) = &result.prompt {
+            if prompt.len() > MAX_COMMAND_PROMPT {
+                bail!("plugin command {name:?} returned an oversized prompt");
+            }
+        }
+        if let Some(output) = &result.output {
+            if output.len() > MAX_PLUGIN_OUTPUT {
+                bail!("plugin command {name:?} returned oversized output");
+            }
+        }
+        if !result.ok {
+            result.ok = false;
+        }
+        Ok(result)
+    }
+
+    pub async fn settings(&self, name: &str, config: &Config) -> Result<PluginSettingsResult> {
+        let status = self
+            .statuses
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .with_context(|| format!("unknown plugin {name:?}"))?;
+        let plugin = config
+            .plugins
+            .get(name)
+            .with_context(|| format!("unknown plugin {name:?}"))?;
+        Ok(PluginSettingsResult {
+            plugin: name.to_string(),
+            schema: status.settings_schema.clone(),
+            values: serde_json::to_value(&plugin.settings).unwrap_or(Value::Null),
+        })
+    }
+
+    /// Run `tool.before` hooks. Returns a denial reason when a hook vetoes the
+    /// call. Hooks can never approve a tool that normal policy asks about.
+    pub async fn run_tool_before(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        tool: &str,
+        arguments: &Value,
+        cwd: &Path,
+    ) -> Option<String> {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return None;
+        }
+        let hooks = self.hook_refs("tool.before").await;
+        for hook in hooks {
+            let Some(client) = self.hook_client(&hook).await else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "point": "tool.before",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "tool": tool,
+                "arguments": arguments,
+                "workspace": cwd,
+                "cwd": cwd,
+            });
+            match call_hook(&client, &hook, request).await {
+                Ok(value) => {
+                    let deny = value.get("action").and_then(Value::as_str) == Some("deny")
+                        || value.get("decision").and_then(Value::as_str) == Some("deny")
+                        || value.get("deny").and_then(Value::as_bool) == Some(true)
+                        || value.get("allow").and_then(Value::as_bool) == Some(false);
+                    if deny {
+                        let reason = value
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .filter(|reason| !reason.trim().is_empty())
+                            .unwrap_or("denied by plugin hook");
+                        return Some(cap(reason, 4096));
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "eixd: plugin {} hook tool.before failed: {}",
+                        hook.plugin,
+                        redact(&format!("{err:#}"))
+                    );
+                    if hook.on_error == "deny" {
+                        return Some(format!("plugin {} hook failed", hook.plugin));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Run `tool.after` hooks. The last non-empty `output` replacement wins.
+    pub async fn run_tool_after(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        tool: &str,
+        ok: bool,
+        denied: bool,
+        output: &str,
+        cwd: &Path,
+    ) -> Option<String> {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return None;
+        }
+        let hooks = self.hook_refs("tool.after").await;
+        let mut current = output.to_string();
+        let mut replaced = false;
+        for hook in hooks {
+            let Some(client) = self.hook_client(&hook).await else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "point": "tool.after",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "tool": tool,
+                "ok": ok,
+                "denied": denied,
+                "output": current,
+                "workspace": cwd,
+                "cwd": cwd,
+            });
+            match call_hook(&client, &hook, request).await {
+                Ok(value) => {
+                    if let Some(output) = value.get("output").and_then(Value::as_str) {
+                        current = cap(output, MAX_PLUGIN_OUTPUT);
+                        replaced = true;
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "eixd: plugin {} hook tool.after failed: {}",
+                        hook.plugin,
+                        redact(&format!("{err:#}"))
+                    );
+                }
+            }
+        }
+        replaced.then_some(current)
+    }
+
+    /// Run `prompt.build` hooks sequentially. Each hook may return `prompt`;
+    /// the value is size-checked before the next hook sees it.
+    pub async fn run_prompt_build(&self, session_id: &str, prompt: &str) -> String {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return prompt.to_string();
+        }
+        let mut current = prompt.to_string();
+        for hook in self.hook_refs("prompt.build").await {
+            let Some(client) = self.hook_client(&hook).await else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "point": "prompt.build",
+                "session_id": session_id,
+                "prompt": current,
+            });
+            match call_hook(&client, &hook, request).await {
+                Ok(value) => {
+                    if let Some(prompt) = value.get("prompt").and_then(Value::as_str) {
+                        if prompt.trim().is_empty() {
+                            continue;
+                        }
+                        if prompt.len() > MAX_COMMAND_PROMPT {
+                            eprintln!(
+                                "eixd: plugin {} hook prompt.build returned an oversized prompt",
+                                hook.plugin
+                            );
+                            continue;
+                        }
+                        current = prompt.to_string();
+                    }
+                }
+                Err(err) => {
+                    eprintln!(
+                        "eixd: plugin {} hook prompt.build failed: {}",
+                        hook.plugin,
+                        redact(&format!("{err:#}"))
+                    );
+                }
+            }
+        }
+        current
+    }
+
+    /// Fire-and-forget `turn.end` notification. Turn completion must not wait
+    /// on plugin bookkeeping.
+    pub fn run_turn_end(
+        self: &Arc<Self>,
+        session_id: &str,
+        turn_id: &str,
+        ok: bool,
+        error: Option<String>,
+    ) {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return;
+        }
+        let manager = Arc::clone(self);
+        let session_id = session_id.to_string();
+        let turn_id = turn_id.to_string();
+        tokio::spawn(async move {
+            for hook in manager.hook_refs("turn.end").await {
+                let Some(client) = manager.hook_client(&hook).await else {
+                    continue;
+                };
+                let request = serde_json::json!({
+                    "point": "turn.end",
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "ok": ok,
+                    "error": error,
+                });
+                if let Err(err) = call_hook(&client, &hook, request).await {
+                    eprintln!(
+                        "eixd: plugin {} hook turn.end failed: {}",
+                        hook.plugin,
+                        redact(&format!("{err:#}"))
+                    );
+                }
+            }
+        });
+    }
+
+    async fn hook_refs(&self, point: &str) -> Vec<HookRef> {
+        let mut hooks: Vec<_> = self
+            .hooks
+            .lock()
+            .await
+            .iter()
+            .filter(|hook| hook.point == point)
+            .cloned()
+            .collect();
+        hooks.sort_by(|left, right| {
+            left.priority
+                .cmp(&right.priority)
+                .then_with(|| left.plugin.cmp(&right.plugin))
+        });
+        hooks
+    }
+
+    async fn hook_client(&self, hook: &HookRef) -> Option<Arc<PluginClient>> {
+        let client = self.clients.lock().await.get(&hook.plugin).cloned()?;
+        (!client.is_closed()).then_some(client)
     }
 
     pub async fn call(
@@ -699,6 +1138,10 @@ impl PluginManager {
             .lock()
             .await
             .retain(|command| command.plugin != name);
+        self.hooks.lock().await.retain(|hook| hook.plugin != name);
+        self.ui.lock().await.retain(|ui| ui.plugin != name);
+        self.rpc_methods.lock().await.remove(name);
+        self.refresh_has_hooks().await;
         if !plugin.enabled {
             self.statuses.lock().await.insert(
                 name.to_string(),
@@ -711,9 +1154,13 @@ impl PluginManager {
                     state: PluginState::Disabled,
                     tools: 0,
                     commands: 0,
+                    hooks: 0,
+                    ui: 0,
+                    rpc: 0,
                     events: Vec::new(),
                     capabilities: plugin.capabilities.clone(),
                     error: None,
+                    settings_schema: None,
                 },
             );
             return Ok(());
@@ -746,15 +1193,22 @@ impl PluginManager {
 
     pub async fn shutdown(&self) {
         self.has_event_subscribers.store(false, Ordering::Relaxed);
+        self.has_hooks.store(false, Ordering::Relaxed);
         self.stop_all().await;
         self.subscriptions.lock().await.clear();
         self.tools.lock().await.clear();
         self.commands.lock().await.clear();
+        self.hooks.lock().await.clear();
+        self.ui.lock().await.clear();
+        self.rpc_methods.lock().await.clear();
         let mut statuses = self.statuses.lock().await;
         for status in statuses.values_mut() {
             status.state = PluginState::Stopped;
             status.tools = 0;
             status.commands = 0;
+            status.hooks = 0;
+            status.ui = 0;
+            status.rpc = 0;
             status.events.clear();
         }
     }
@@ -794,13 +1248,20 @@ fn resolve_spec(
                 manifest.name
             );
         }
-        if manifest.components.ui.is_some() {
-            bail!(
-                "plugin {name} manifest {} declares components.ui, which is not implemented in this build",
-                path.display()
+        // `components.ui` is a packaging declaration. Text surfaces arrive
+        // through `initialize.ui` and `host.ui.*`; the child process itself
+        // still runs as a server component with the `ui` capability.
+        if manifest.components.ui.is_some() && manifest.components.server.is_none() {
+            eprintln!(
+                "eixd: plugin {name}: components.ui is declared but only server components start in this build"
             );
         }
     }
+    let settings_schema = manifest
+        .as_ref()
+        .map(|(path, manifest)| load_settings_schema(path, manifest))
+        .transpose()?
+        .flatten();
 
     let (command, args) = if !plugin.command.trim().is_empty() {
         (plugin.command.clone(), plugin.args.clone())
@@ -874,9 +1335,59 @@ fn resolve_spec(
         allowed_tools: plugin.allowed_tools.clone(),
         denied_tools: plugin.denied_tools.clone(),
         settings: plugin.settings.clone(),
+        settings_schema,
+        network_allow: plugin.network_allow.clone(),
+        secrets: plugin.secrets.clone(),
+        rpc_allow: plugin.rpc_allow.clone(),
         has_server,
         declarative_commands,
     })
+}
+
+/// Load and validate the JSON Schema referenced by the manifest. The file must
+/// stay inside the package directory; a plugin cannot point at arbitrary host
+/// files.
+fn load_settings_schema(manifest_path: &Path, manifest: &PluginManifest) -> Result<Option<Value>> {
+    let Some(relative) = &manifest.settings else {
+        return Ok(None);
+    };
+    let base = manifest_path.parent().unwrap_or(Path::new("."));
+    let base = base
+        .canonicalize()
+        .with_context(|| format!("cannot resolve {}", base.display()))?;
+    let path = if relative.is_absolute() {
+        relative.clone()
+    } else {
+        base.join(relative)
+    };
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("cannot resolve settings schema {}", path.display()))?;
+    if !path.starts_with(&base) {
+        bail!(
+            "settings schema {} is outside the plugin directory",
+            path.display()
+        );
+    }
+    let meta = std::fs::metadata(&path)
+        .with_context(|| format!("cannot stat settings schema {}", path.display()))?;
+    if meta.len() as usize > MAX_SETTINGS_SCHEMA {
+        bail!("settings schema exceeds {MAX_SETTINGS_SCHEMA} bytes");
+    }
+    let text = std::fs::read_to_string(&path)
+        .with_context(|| format!("cannot read settings schema {}", path.display()))?;
+    let schema: Value = serde_json::from_str(&text)
+        .with_context(|| format!("invalid settings schema {}", path.display()))?;
+    if !schema.is_object() {
+        bail!("settings schema {} must be a JSON object", path.display());
+    }
+    if schema.get("type").and_then(Value::as_str) != Some("object") {
+        bail!(
+            "settings schema {} must declare \"type\": \"object\"",
+            path.display()
+        );
+    }
+    Ok(Some(schema))
 }
 
 fn validate_tools(spec: &PluginSpec, tools: &[PluginTool]) -> Result<Vec<ToolRef>> {
@@ -920,13 +1431,30 @@ fn validate_commands(spec: &PluginSpec, commands: &[PluginCommand]) -> Result<Ve
         let prompt = command
             .prompt
             .as_deref()
-            .filter(|prompt| !prompt.trim().is_empty())
-            .with_context(|| {
-                format!(
-                    "plugin {} command {:?} needs a non-empty prompt",
-                    spec.name, command.name
-                )
-            })?;
+            .filter(|prompt| !prompt.trim().is_empty());
+        let action = command
+            .action
+            .as_deref()
+            .map(str::trim)
+            .filter(|action| !action.is_empty());
+        if prompt.is_some() == action.is_some() {
+            bail!(
+                "plugin {} command {:?} needs exactly one of `prompt` or `action`",
+                spec.name,
+                command.name
+            );
+        }
+        if let Some(action) = action {
+            validate_rpc_name(action)?;
+            if !spec.has_server {
+                bail!(
+                    "plugin {} command {:?} uses an action but has no server",
+                    spec.name,
+                    command.name
+                );
+            }
+        }
+        let prompt = prompt.unwrap_or_default();
         if prompt.len() > MAX_COMMAND_PROMPT {
             bail!(
                 "plugin {} command {:?} prompt is too long",
@@ -940,6 +1468,7 @@ fn validate_commands(spec: &PluginSpec, commands: &[PluginCommand]) -> Result<Ve
             args: command.args.clone(),
             description: command.description.clone(),
             prompt: prompt.to_string(),
+            action: action.map(str::to_string),
         });
     }
     Ok(out)
@@ -953,6 +1482,111 @@ fn validate_command_name(name: &str) -> Result<()> {
         );
     }
     Ok(())
+}
+
+fn validate_rpc_name(name: &str) -> Result<()> {
+    if !valid_tool_name(name) {
+        bail!(
+            "invalid RPC method name {:?}: use letters, digits, '.', '_' or '-', without '__'",
+            name
+        );
+    }
+    Ok(())
+}
+
+fn validate_hooks(spec: &PluginSpec, hooks: &[PluginHook]) -> Result<Vec<HookRef>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for hook in hooks {
+        if !valid_hook_point(&hook.point) {
+            bail!(
+                "plugin {} hook {:?} is not a supported hook point",
+                spec.name,
+                hook.point
+            );
+        }
+        if !seen.insert(hook.point.clone()) {
+            bail!(
+                "plugin {} registers hook {:?} more than once",
+                spec.name,
+                hook.point
+            );
+        }
+        let on_error = hook.on_error.trim();
+        let on_error = if on_error.is_empty() {
+            "allow"
+        } else {
+            on_error
+        };
+        if !matches!(on_error, "allow" | "deny" | "ignore") {
+            bail!(
+                "plugin {} hook {:?} on_error must be allow, deny or ignore",
+                spec.name,
+                hook.point
+            );
+        }
+        if hook.timeout_ms > 300_000 {
+            bail!(
+                "plugin {} hook {:?} timeout_ms must be <= 300000",
+                spec.name,
+                hook.point
+            );
+        }
+        out.push(HookRef {
+            plugin: spec.name.clone(),
+            point: hook.point.clone(),
+            priority: hook.priority,
+            timeout: (hook.timeout_ms > 0).then(|| Duration::from_millis(hook.timeout_ms)),
+            on_error: on_error.to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn validate_ui(spec: &PluginSpec, ui: &[PluginUi]) -> Result<Vec<UiRef>> {
+    let mut out = Vec::new();
+    let mut seen = BTreeSet::new();
+    for surface in ui {
+        if !valid_ui_surface(&surface.surface) {
+            bail!(
+                "plugin {} UI surface {:?} is not supported",
+                spec.name,
+                surface.surface
+            );
+        }
+        if surface.id.trim().is_empty() || surface.id.len() > 128 {
+            bail!("plugin {} UI surface id must be 1..=128 bytes", spec.name);
+        }
+        if !seen.insert(surface.id.clone()) {
+            bail!(
+                "plugin {} declares UI surface {:?} more than once",
+                spec.name,
+                surface.id
+            );
+        }
+        out.push(UiRef {
+            plugin: spec.name.clone(),
+            surface: surface.surface.clone(),
+            id: surface.id.clone(),
+            title: surface.title.clone(),
+        });
+    }
+    Ok(out)
+}
+
+fn validate_rpc(spec: &PluginSpec, rpc: &[PluginRpc]) -> Result<BTreeSet<String>> {
+    let mut out = BTreeSet::new();
+    for method in rpc {
+        validate_rpc_name(&method.name)?;
+        if !out.insert(method.name.clone()) {
+            bail!(
+                "plugin {} declares RPC method {:?} more than once",
+                spec.name,
+                method.name
+            );
+        }
+    }
+    Ok(out)
 }
 
 fn validate_events(spec: &PluginSpec, events: &[String]) -> Result<Vec<String>> {
@@ -988,6 +1622,24 @@ fn validate_events(spec: &PluginSpec, events: &[String]) -> Result<Vec<String>> 
     Ok(out)
 }
 
+/// Call one hook with its declared timeout. The plugin's own request timeout
+/// still applies when the hook does not set one.
+async fn call_hook(client: &PluginClient, hook: &HookRef, params: Value) -> Result<Value> {
+    match hook.timeout {
+        Some(timeout) => tokio::time::timeout(timeout, client.request("hooks/run", params))
+            .await
+            .with_context(|| {
+                format!(
+                    "plugin {} hook {} timed out after {}ms",
+                    hook.plugin,
+                    hook.point,
+                    timeout.as_millis()
+                )
+            })?,
+        None => client.request("hooks/run", params).await,
+    }
+}
+
 fn wildcard(pattern: &str, text: &str) -> bool {
     fn walk(pattern: &[u8], text: &[u8]) -> bool {
         match pattern.split_first() {
@@ -1000,6 +1652,47 @@ fn wildcard(pattern: &str, text: &str) -> bool {
         }
     }
     walk(pattern.as_bytes(), text.as_bytes())
+}
+
+/// Route one plugin-to-plugin call. The target must be running and must have
+/// advertised the method; the caller's allowlist is checked by `HostContext`.
+async fn route_rpc(
+    request: &RpcCallRequest,
+    clients: &Arc<Mutex<BTreeMap<String, Arc<PluginClient>>>>,
+    methods: &Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
+) -> std::result::Result<Value, String> {
+    let exported = methods
+        .lock()
+        .await
+        .get(&request.target)
+        .is_some_and(|methods| methods.contains(&request.method));
+    if !exported {
+        return Err(format!(
+            "plugin {} does not export RPC method {:?}",
+            request.target, request.method
+        ));
+    }
+    let client = clients
+        .lock()
+        .await
+        .get(&request.target)
+        .cloned()
+        .ok_or_else(|| format!("plugin {} is not running", request.target))?;
+    if client.is_closed() {
+        return Err(format!("plugin {} is not running", request.target));
+    }
+    client
+        .request(
+            "rpc.call",
+            serde_json::json!({
+                "method": request.method,
+                "arguments": request.params,
+                "caller": request.from,
+                "depth": request.depth,
+            }),
+        )
+        .await
+        .map_err(|err| redact(&format!("{err:#}")))
 }
 
 fn cap(text: &str, max: usize) -> String {
@@ -1037,6 +1730,10 @@ mod tests {
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             settings: BTreeMap::new(),
+            settings_schema: None,
+            network_allow: Vec::new(),
+            secrets: Vec::new(),
+            rpc_allow: Vec::new(),
             has_server: false,
             declarative_commands: Vec::new(),
         }
@@ -1088,10 +1785,76 @@ mod tests {
             let manager = PluginManager::new(
                 Arc::new(crate::store::Store::in_memory().unwrap()),
                 PathBuf::from("/tmp"),
+                tokio::sync::broadcast::channel(8).0,
             );
             manager.tools.lock().await.extend(refs.clone());
             manager.check_tool_conflicts(&refs).await
         });
         assert!(error.is_err());
+    }
+
+    #[test]
+    fn hooks_are_validated_and_deduplicated() {
+        let hook = PluginHook {
+            point: "tool.before".into(),
+            priority: 5,
+            timeout_ms: 500,
+            on_error: "deny".into(),
+        };
+        let hooks = validate_hooks(&spec("acme"), &[hook.clone()]).unwrap();
+        assert_eq!(hooks[0].priority, 5);
+        assert_eq!(hooks[0].on_error, "deny");
+
+        let mut invalid = hook.clone();
+        invalid.point = "tool.unknown".into();
+        assert!(validate_hooks(&spec("acme"), &[invalid]).is_err());
+
+        let mut invalid = hook.clone();
+        invalid.on_error = "explode".into();
+        assert!(validate_hooks(&spec("acme"), &[invalid]).is_err());
+
+        assert!(validate_hooks(&spec("acme"), &[hook.clone(), hook]).is_err());
+    }
+
+    #[test]
+    fn rpc_methods_are_validated_and_deduplicated() {
+        let rpc = PluginRpc {
+            name: "issues.search".into(),
+            description: String::new(),
+        };
+        let methods = validate_rpc(&spec("acme"), std::slice::from_ref(&rpc)).unwrap();
+        assert!(methods.contains("issues.search"));
+        assert!(validate_rpc(&spec("acme"), &[rpc.clone(), rpc]).is_err());
+        assert!(validate_rpc(
+            &spec("acme"),
+            &[PluginRpc {
+                name: "../escape".into(),
+                description: String::new(),
+            }]
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn action_commands_require_a_server() {
+        let command = PluginCommand {
+            name: "sync".into(),
+            description: String::new(),
+            args: String::new(),
+            prompt: None,
+            action: Some("sync".into()),
+        };
+        assert!(validate_commands(&spec("acme"), std::slice::from_ref(&command)).is_err());
+
+        let mut server = spec("acme");
+        server.has_server = true;
+        let refs = validate_commands(&server, std::slice::from_ref(&command)).unwrap();
+        assert_eq!(refs[0].action.as_deref(), Some("sync"));
+
+        let both = PluginCommand {
+            prompt: Some("prompt".into()),
+            ..command.clone()
+        };
+        assert!(validate_commands(&server, &[both]).is_err());
     }
 }

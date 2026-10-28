@@ -549,6 +549,40 @@ impl App {
             Event::PluginCommands(commands) => {
                 self.set_plugin_commands(commands);
             }
+            Event::Plugins { list, settings } => {
+                let (title, text, status) = match &settings {
+                    Some(settings) => (
+                        format!("plugin · {}", settings.plugin),
+                        render_plugin_settings(settings),
+                        "plugin settings · Esc closes".to_string(),
+                    ),
+                    None => (
+                        "plugins".to_string(),
+                        render_plugin_list(&list),
+                        format!("{} plugin(s)", list.plugins.len()),
+                    ),
+                };
+                self.open_text_view(title, &text);
+                self.status = status;
+            }
+            Event::PluginCommandResult { session_id, result } => {
+                if !result.ok {
+                    self.error = Some("plugin command failed".into());
+                    self.status = "plugin command failed".into();
+                }
+                if let Some(prompt) = result.prompt.filter(|prompt| !prompt.trim().is_empty()) {
+                    if self.session_busy(&session_id) {
+                        self.enqueue(session_id, &prompt, tx);
+                    } else {
+                        self.send_prompt(&session_id, &prompt, tx, false, Vec::new());
+                    }
+                } else if let Some(output) = result.output {
+                    if !output.trim().is_empty() {
+                        self.status = truncate(&output.replace('\n', " "), 100);
+                        self.open_text_view("plugin command", &output);
+                    }
+                }
+            }
             Event::SubagentConcurrency { value } => {
                 self.subagent_concurrency = value;
                 self.status = format!("subagents → {value} (runtime)");
@@ -1557,4 +1591,107 @@ impl App {
             self.status = "no session".into();
         }
     }
+}
+
+fn render_plugin_list(list: &eix_core::PluginListResult) -> String {
+    if list.plugins.is_empty() {
+        return "no plugins configured\n\nAdd [plugins.<name>] to the global config.".into();
+    }
+    let mut lines = Vec::new();
+    for plugin in &list.plugins {
+        lines.push(format!(
+            "{}  {}  [{}]{}",
+            plugin.name,
+            plugin.version,
+            match plugin.state {
+                eix_core::PluginState::Disabled => "disabled",
+                eix_core::PluginState::Starting => "starting",
+                eix_core::PluginState::Ready => "ready",
+                eix_core::PluginState::Degraded => "degraded",
+                eix_core::PluginState::Failed => "failed",
+                eix_core::PluginState::Stopped => "stopped",
+            },
+            if plugin.error.is_some() { "  !" } else { "" }
+        ));
+        if !plugin.description.is_empty() {
+            lines.push(format!("  {}", plugin.description));
+        }
+        lines.push(format!(
+            "  tools {} · commands {} · hooks {} · ui {} · rpc {}",
+            plugin.tools, plugin.commands, plugin.hooks, plugin.ui, plugin.rpc
+        ));
+        if !plugin.events.is_empty() {
+            lines.push(format!("  events: {}", plugin.events.join(", ")));
+        }
+        if let Some(error) = &plugin.error {
+            lines.push(format!("  error: {error}"));
+        }
+        lines.push(String::new());
+    }
+    lines.push("Run /plugins <name> to inspect one plugin's settings form.".into());
+    lines.join("\n")
+}
+
+fn render_plugin_settings(settings: &eix_core::PluginSettingsResult) -> String {
+    let mut lines = vec![format!("plugin: {}", settings.plugin), String::new()];
+    let values = settings.values.as_object().cloned().unwrap_or_default();
+    match settings
+        .schema
+        .as_ref()
+        .and_then(|schema| schema.get("properties"))
+        .and_then(|properties| properties.as_object())
+    {
+        Some(properties) if !properties.is_empty() => {
+            lines.push("settings".into());
+            for (key, schema) in properties {
+                let kind = schema
+                    .get("type")
+                    .and_then(|kind| kind.as_str())
+                    .unwrap_or("string");
+                let title = schema
+                    .get("title")
+                    .and_then(|title| title.as_str())
+                    .unwrap_or(key);
+                let required = settings
+                    .schema
+                    .as_ref()
+                    .and_then(|schema| schema.get("required"))
+                    .and_then(|required| required.as_array())
+                    .is_some_and(|required| required.iter().any(|item| item.as_str() == Some(key)));
+                let value = values
+                    .get(key)
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "<unset>".into());
+                lines.push(format!(
+                    "  {key} ({kind}{}) = {value}",
+                    if required { ", required" } else { "" }
+                ));
+                if title != key {
+                    lines.push(format!("    {title}"));
+                }
+                if let Some(description) = schema.get("description").and_then(|text| text.as_str())
+                {
+                    lines.push(format!("    {description}"));
+                }
+                if let Some(options) = schema.get("enum").and_then(|options| options.as_array()) {
+                    let options = options
+                        .iter()
+                        .map(|option| option.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    lines.push(format!("    options: {options}"));
+                }
+            }
+        }
+        _ => {
+            lines.push("This plugin does not ship a settings schema.".into());
+            if !values.is_empty() {
+                lines.push(String::new());
+                lines.push(serde_json::to_string_pretty(&settings.values).unwrap_or_default());
+            }
+        }
+    }
+    lines.push(String::new());
+    lines.push("Edit values under [plugins.<name>.settings] in the global config.".into());
+    lines.join("\n")
 }

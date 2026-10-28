@@ -116,7 +116,11 @@ pub struct ManifestCommand {
     /// Hint shown next to the command in the menu, e.g. `[query]`.
     pub args: String,
     /// Prompt template expanded by the frontend with `$ARGUMENTS` / `$1..$9`.
+    /// Exactly one of `prompt` and `action` must be set.
     pub prompt: String,
+    /// Runtime action handled by the plugin server (`commands/run`). The
+    /// plugin may return a prompt to submit or plain output to display.
+    pub action: Option<String>,
 }
 
 /// Static contributions declared in the manifest.
@@ -155,6 +159,24 @@ pub struct PluginManifest {
     /// Optional JSON Schema for plugin settings, rendered by the TUI.
     #[serde(default)]
     pub settings: Option<PathBuf>,
+    /// Optional distribution metadata: publisher, detached signature and the
+    /// checksum file. Install/verify is implemented in `plugin_package`.
+    #[serde(default)]
+    pub package: Option<PluginPackage>,
+}
+
+/// Distribution metadata for a plugin directory.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginPackage {
+    /// Trust-store key name used to verify the detached signature.
+    pub publisher: Option<String>,
+    /// Detached Ed25519 signature over the checksum file. Defaults to
+    /// `eix-plugin.sig`.
+    pub signature: Option<PathBuf>,
+    /// Checksum file, relative to the manifest. Defaults to
+    /// `eix-plugin.sums`.
+    pub checksums: Option<PathBuf>,
 }
 
 fn default_schema() -> u32 {
@@ -178,6 +200,7 @@ impl Default for PluginManifest {
             components: PluginComponents::default(),
             contributes: PluginContributions::default(),
             settings: None,
+            package: None,
         }
     }
 }
@@ -246,16 +269,49 @@ impl PluginManifest {
                     command.name
                 ));
             }
-            if command.prompt.trim().is_empty() {
+            let has_prompt = !command.prompt.trim().is_empty();
+            let has_action = command
+                .action
+                .as_deref()
+                .is_some_and(|action| !action.trim().is_empty());
+            if has_prompt == has_action {
                 return Err(format!(
-                    "declarative command {:?} needs a non-empty prompt",
+                    "declarative command {:?} needs exactly one of `prompt` or `action`",
                     command.name
                 ));
+            }
+            if has_action && self.components.server.is_none() {
+                return Err(format!(
+                    "declarative command {:?} uses `action` but the manifest has no server component",
+                    command.name
+                ));
+            }
+            if let Some(action) = &command.action {
+                if has_action && !valid_tool_name(action.trim()) {
+                    return Err(format!(
+                        "declarative command {:?} action name {:?} must contain only letters, digits, '.', '_' or '-', without '__'",
+                        command.name, action
+                    ));
+                }
             }
         }
         if let Some(settings) = &self.settings {
             if settings.as_os_str().is_empty() {
                 return Err("settings schema path is empty".into());
+            }
+            validate_relative_path(settings, "settings schema")?;
+        }
+        if let Some(package) = &self.package {
+            if let Some(checksums) = &package.checksums {
+                validate_relative_path(checksums, "package.checksums")?;
+            }
+            if let Some(signature) = &package.signature {
+                validate_relative_path(signature, "package.signature")?;
+            }
+            if let Some(publisher) = &package.publisher {
+                if publisher.trim().is_empty() || publisher.len() > 128 {
+                    return Err("package.publisher must be 1..=128 bytes".into());
+                }
             }
         }
         Ok(())
@@ -344,6 +400,15 @@ pub struct PluginConfig {
     pub denied_tools: Vec<String>,
     /// Free-form settings passed to `initialize` and exposed to the plugin.
     pub settings: BTreeMap<String, Value>,
+    /// Host names or wildcard patterns (`*.example.com`) the plugin may reach
+    /// through `host.net.request`. Empty denies every request.
+    pub network_allow: Vec<String>,
+    /// Environment variable names the plugin may read through
+    /// `host.secrets.get`. Empty denies every secret.
+    pub secrets: Vec<String>,
+    /// Other plugins this plugin may call through `host.rpc.call`. Empty denies
+    /// every call; `"*"` allows every RPC-capable plugin.
+    pub rpc_allow: Vec<String>,
 }
 
 impl Default for PluginConfig {
@@ -360,6 +425,9 @@ impl Default for PluginConfig {
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
             settings: BTreeMap::new(),
+            network_allow: Vec::new(),
+            secrets: Vec::new(),
+            rpc_allow: Vec::new(),
         }
     }
 }
@@ -379,6 +447,35 @@ impl PluginConfig {
                 .allowed_tools
                 .iter()
                 .any(|pattern| wildcard(pattern, name))
+    }
+
+    /// Whether `host.net.request` may reach `host`. Checks are case
+    /// insensitive and support a leading `*.` wildcard only.
+    pub fn allows_host(&self, host: &str) -> bool {
+        let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
+        !host.is_empty()
+            && self.network_allow.iter().any(|pattern| {
+                let pattern = pattern.trim().to_ascii_lowercase();
+                if let Some(suffix) = pattern.strip_prefix("*.") {
+                    host.len() > suffix.len()
+                        && host.ends_with(suffix)
+                        && host.as_bytes()[host.len() - suffix.len() - 1] == b'.'
+                } else {
+                    pattern == host
+                }
+            })
+    }
+
+    /// Whether the plugin may read this environment variable.
+    pub fn allows_secret(&self, name: &str) -> bool {
+        self.secrets.iter().any(|allowed| allowed == name)
+    }
+
+    /// Whether this plugin may call RPC methods exported by `target`.
+    pub fn allows_rpc_target(&self, target: &str) -> bool {
+        self.rpc_allow
+            .iter()
+            .any(|allowed| allowed == "*" || (allowed != "*" && wildcard(allowed, target)))
     }
 }
 
@@ -538,26 +635,40 @@ pub struct PluginInitializeResult {
     pub commands: Vec<PluginCommand>,
     /// Daemon notification methods, e.g. `session.*`, `tool.completed`.
     pub events: Vec<String>,
-    /// Reserved for the hook milestone. Must stay empty for now.
+    /// Hook points the plugin wants to run. Requires the `hooks` capability.
     pub hooks: Vec<PluginHook>,
-    /// Reserved for the UI milestone. Must stay empty for now.
+    /// Static UI surfaces. Requires the `ui` capability.
     pub ui: Vec<PluginUi>,
-    /// Reserved for the RPC milestone. Must stay empty for now.
+    /// RPC methods other plugins may call. Requires the `rpc` capability.
     pub rpc: Vec<PluginRpc>,
 }
+
+/// Hook points understood by the host. Unknown points are rejected so a typo
+/// cannot silently disable a security-relevant hook.
+pub const PLUGIN_HOOK_POINTS: &[&str] = &["tool.before", "tool.after", "prompt.build", "turn.end"];
+
+/// UI surfaces the host knows how to render. `panel` and `status` are text
+/// surfaces; `picker` is reserved for a later milestone.
+pub const PLUGIN_UI_SURFACES: &[&str] = &["panel", "status", "picker"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginHook {
+    /// One of [`PLUGIN_HOOK_POINTS`].
     pub point: String,
+    /// Lower runs first. Ties break on plugin name.
     pub priority: i32,
+    /// Per-hook timeout. `0` uses the plugin's configured timeout.
     pub timeout_ms: u64,
+    /// `allow` (keep going), `deny` (reject the tool), or `ignore` (keep the
+    /// original value and continue).
     pub on_error: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginUi {
+    /// One of [`PLUGIN_UI_SURFACES`].
     pub surface: String,
     pub id: String,
     pub title: String,
@@ -567,6 +678,7 @@ pub struct PluginUi {
 #[serde(default)]
 pub struct PluginRpc {
     pub name: String,
+    #[serde(default)]
     pub description: String,
 }
 
@@ -599,6 +711,10 @@ pub struct PluginCommand {
     pub args: String,
     #[serde(default)]
     pub prompt: Option<String>,
+    /// Runtime action name passed back to `commands/run`. Mutually exclusive
+    /// with `prompt`.
+    #[serde(default)]
+    pub action: Option<String>,
 }
 
 /// `plugin.commands` result row, with the host-side namespace applied.
@@ -611,11 +727,47 @@ pub struct PluginCommandInfo {
     pub args: String,
     pub description: String,
     pub prompt: String,
+    /// True when the frontend must call `plugin.command.run` instead of
+    /// submitting `prompt` directly.
+    #[serde(default)]
+    pub action: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginCommandList {
     pub commands: Vec<PluginCommandInfo>,
+}
+
+/// `plugin.command.run` parameters.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginCommandRunParams {
+    /// Exposed command name, e.g. `plugin/acme/review`.
+    pub name: String,
+    #[serde(default)]
+    pub arguments: String,
+    pub session_id: String,
+}
+
+/// `plugin.command.run` result. `prompt` is submitted as a user message;
+/// otherwise `output` is shown to the user.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginCommandRunResult {
+    #[serde(default = "default_true")]
+    pub ok: bool,
+    #[serde(default)]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub output: Option<String>,
+}
+
+/// `plugin.settings` result. `values` mirrors `[plugins.<name>.settings]`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginSettingsResult {
+    pub plugin: String,
+    #[serde(default)]
+    pub schema: Option<Value>,
+    #[serde(default)]
+    pub values: Value,
 }
 
 /// Lifecycle state exposed by `plugin.list`.
@@ -646,6 +798,12 @@ pub struct PluginInfo {
     pub tools: usize,
     #[serde(default)]
     pub commands: usize,
+    #[serde(default)]
+    pub hooks: usize,
+    #[serde(default)]
+    pub ui: usize,
+    #[serde(default)]
+    pub rpc: usize,
     #[serde(default)]
     pub events: Vec<String>,
     #[serde(default)]
@@ -794,6 +952,26 @@ pub fn valid_plugin_name(name: &str) -> bool {
 
 pub fn valid_tool_name(name: &str) -> bool {
     valid_plugin_name(name) && !name.contains("__")
+}
+
+/// Hook points are a closed set; a typo would otherwise become a silent no-op.
+pub fn valid_hook_point(point: &str) -> bool {
+    PLUGIN_HOOK_POINTS.contains(&point)
+}
+
+pub fn valid_ui_surface(surface: &str) -> bool {
+    PLUGIN_UI_SURFACES.contains(&surface)
+}
+
+fn validate_relative_path(path: &Path, label: &str) -> Result<(), String> {
+    if path.is_absolute()
+        || path
+            .components()
+            .any(|part| matches!(part, std::path::Component::ParentDir))
+    {
+        return Err(format!("{label} must be a relative path without `..`"));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -969,5 +1147,80 @@ mod tests {
             is_error: false,
         };
         assert_eq!(result.to_text(), "hello\n[diff a.rs]");
+    }
+
+    #[test]
+    fn action_commands_need_a_server_and_exactly_one_body() {
+        let mut manifest: PluginManifest = toml::from_str(
+            r#"
+            schema = 2
+            name = "acme"
+            api_version = 2
+
+            [[contributes.commands]]
+            name = "sync"
+            action = "sync"
+            "#,
+        )
+        .unwrap();
+        assert!(manifest.validate().is_err());
+
+        manifest.components.server = Some(PluginComponent {
+            command: "python3".into(),
+            ..Default::default()
+        });
+        manifest.validate().unwrap();
+
+        manifest.contributes.commands[0].prompt = "also a prompt".into();
+        assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn hook_and_ui_names_are_closed_sets() {
+        assert!(valid_hook_point("tool.before"));
+        assert!(valid_hook_point("turn.end"));
+        assert!(!valid_hook_point("tool.exec"));
+        assert!(valid_ui_surface("panel"));
+        assert!(!valid_ui_surface("pane"));
+    }
+
+    #[test]
+    fn allowlists_default_to_deny_and_scope_rpc_targets() {
+        let mut config = PluginConfig::default();
+        assert!(!config.allows_host("api.example.com"));
+        assert!(!config.allows_secret("TOKEN"));
+        assert!(!config.allows_rpc_target("other"));
+        config.network_allow = vec!["*.example.com".into()];
+        config.secrets = vec!["TOKEN".into()];
+        config.rpc_allow = vec!["other*".into()];
+        assert!(config.allows_host("api.example.com"));
+        assert!(!config.allows_host("example.com"));
+        assert!(config.allows_secret("TOKEN"));
+        assert!(config.allows_rpc_target("other-plugin"));
+        assert!(!config.allows_rpc_target("acme"));
+    }
+
+    #[test]
+    fn package_paths_must_stay_inside_the_package() {
+        let mut manifest = PluginManifest {
+            name: "acme".into(),
+            components: PluginComponents {
+                server: Some(PluginComponent {
+                    command: "true".into(),
+                    ..Default::default()
+                }),
+                ui: None,
+            },
+            ..Default::default()
+        };
+        manifest.package = Some(PluginPackage {
+            publisher: Some("acme".into()),
+            signature: Some(PathBuf::from("../escape.sig")),
+            checksums: Some(PathBuf::from("eix-plugin.sums")),
+        });
+        assert!(manifest.validate().is_err());
+        manifest.package.as_mut().unwrap().signature = Some(PathBuf::from("eix-plugin.sig"));
+        manifest.settings = Some(PathBuf::from("/etc/settings.json"));
+        assert!(manifest.validate().is_err());
     }
 }

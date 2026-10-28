@@ -16,3 +16,12 @@ name = "triage"
 description = "Ask the model to triage an issue."
 args = "<issue>"
 prompt = "Triage the following issue and propose the next concrete step:\n\n$ARGUMENTS"
+
+# Action commands call the plugin server's `commands/run` instead of expanding
+# a prompt locally. The plugin may return a prompt to submit or output to show.
+[[contributes.commands]]
+name = "count"
+description = "Count words in the arguments without calling the model."
+args = "<text>"
+action = "count"
+

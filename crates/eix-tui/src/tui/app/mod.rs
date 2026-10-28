@@ -117,6 +117,9 @@ struct CommandSpec {
     template: Option<String>,
     agent: Option<String>,
     model: Option<String>,
+    /// Plugin action commands call `plugin.command.run` instead of submitting
+    /// a prompt locally.
+    action: bool,
 }
 
 fn builtin(name: &str, args: &str, description: &str) -> CommandSpec {
@@ -127,6 +130,7 @@ fn builtin(name: &str, args: &str, description: &str) -> CommandSpec {
         template: None,
         agent: None,
         model: None,
+        action: false,
     }
 }
 
@@ -139,6 +143,7 @@ fn builtin_prompt(name: &str, args: &str, description: &str, template: &str) -> 
         template: Some(template.to_string()),
         agent: None,
         model: None,
+        action: false,
     }
 }
 
@@ -228,6 +233,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "monitor live sub-agents or set the max parallel spawn_agent calls",
         ),
         builtin("mcp", "", "browse MCP servers and their tools"),
+        builtin(
+            "plugins",
+            "[name]",
+            "list plugins or inspect one plugin's settings form",
+        ),
         builtin("reload", "", "re-read the daemon config files"),
         builtin(
             "timeline",
@@ -333,6 +343,7 @@ fn merge_commands(
             template: Some(command.template),
             agent: command.agent,
             model: command.model,
+            action: false,
         };
         if let Some(existing) = commands.iter_mut().find(|item| item.name == spec.name) {
             *existing = spec;
@@ -345,9 +356,10 @@ fn merge_commands(
             name: command.name.clone(),
             args: command.args.clone(),
             description: command.description.clone(),
-            template: Some(command.prompt.clone()),
+            template: (!command.action).then(|| command.prompt.clone()),
             agent: None,
             model: None,
+            action: command.action,
         };
         // Plugin names are namespaced, but a user can still create a Markdown
         // command under the same path. Built-ins and user commands win: a

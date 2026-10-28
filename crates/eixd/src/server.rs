@@ -34,18 +34,19 @@ use eix_core::{
     ModelUseParams, ModelUseResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
     PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
     PermissionAction, PermissionRule, PickerParams, PickerPreviewParams, PickerPreviewResult,
-    PluginCommandList, PluginListResult, ProcessKillParams, ProcessKillResult, ProcessList,
-    ProcessListParams, ProcessOutputParams, ProviderAuthInfo, RenameParams, Request, Response,
-    RewindParams, RewindResult, RuleSource, ScheduleAddParams, ScheduleListParams,
-    ScheduleListResult, ScheduleRemoveParams, ScheduleRemoveResult, ServerMessage, Session,
-    SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
-    SessionId, SessionImportParams, SessionList, SessionMode, SessionModelParams, SessionOrigin,
-    SessionReadyParams, SessionRef, SessionResult, SessionStatus, ShellRunParams, ShellRunResult,
-    SnapshotPayload, StatsResult, StatusChangedPayload, SubagentConcurrencyParams, SubmitParams,
-    SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, ToolCall,
-    ToolCallPayload, ToolDefinition, ToolResultPayload, UndoResult, UserMessagePayload,
-    WorkspaceDiffParams, WorkspaceDiffResult, WorktreeCreateParams, WorktreeRemoveParams,
-    WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    PluginCommandList, PluginCommandRunParams, PluginListResult, PluginSettingsResult,
+    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
+    ProviderAuthInfo, RenameParams, Request, Response, RewindParams, RewindResult, RuleSource,
+    ScheduleAddParams, ScheduleListParams, ScheduleListResult, ScheduleRemoveParams,
+    ScheduleRemoveResult, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
+    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
+    SessionList, SessionMode, SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef,
+    SessionResult, SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
+    StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
+    SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
+    ToolResultPayload, UndoResult, UserMessagePayload, WorkspaceDiffParams, WorkspaceDiffResult,
+    WorktreeCreateParams, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -427,7 +428,8 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     ));
     let blobs = BlobStore::new(data_dir.join("blobs"), config.images.clone());
     let subagent_concurrency = config.tools.max_parallel_subagents;
-    let plugins = crate::plugin::PluginManager::new(Arc::clone(&store), data_dir.clone());
+    let plugins =
+        crate::plugin::PluginManager::new(Arc::clone(&store), data_dir.clone(), bus.clone());
     plugins.load(&config).await;
     let daemon = Arc::new(Daemon {
         store,
@@ -3314,6 +3316,30 @@ impl Daemon {
                 let list: PluginCommandList = self.plugins.commands().await;
                 Ok(serde_json::to_value(list)?)
             }
+            "plugin.command.run" => {
+                let params: PluginCommandRunParams = parse_params(request.params.clone())?;
+                let session = self.require_session(&params.session_id)?;
+                let result = self
+                    .plugins
+                    .run_command(
+                        &params.name,
+                        &params.arguments,
+                        &params.session_id,
+                        &session.cwd,
+                    )
+                    .await?;
+                Ok(serde_json::to_value(result)?)
+            }
+            "plugin.settings" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.settings needs `name`"))?;
+                let config = self.config.load_full();
+                let result: PluginSettingsResult = self.plugins.settings(name, &config).await?;
+                Ok(serde_json::to_value(result)?)
+            }
             "plugin.restart" => {
                 let name = request
                     .params
@@ -4948,6 +4974,11 @@ impl Daemon {
             return Err(rpc("invalid_params", "prompt must not be empty"));
         }
         let mut session = self.require_session(&params.session_id)?;
+        let text = if internal || text.is_empty() {
+            text
+        } else {
+            self.plugins.run_prompt_build(&session.id, &text).await
+        };
         let images = load_images(
             &session.cwd,
             self.config.load().as_ref(),
@@ -5421,6 +5452,10 @@ impl Daemon {
             );
             let message = format!("{err:#}");
             self.fail_turn(&session_id, &turn_id, &message);
+            self.plugins
+                .run_turn_end(&session_id, &turn_id, false, Some(message));
+        } else {
+            self.plugins.run_turn_end(&session_id, &turn_id, true, None);
         }
         self.approvals.lock().await.remove(&session_id);
         self.turns.lock().await.remove(&session_id);
@@ -6658,6 +6693,31 @@ impl Daemon {
             return Ok(());
         }
 
+        // Plugin `tool.before` hooks run after normal policy. They may veto a
+        // call, but can never turn an approval into an automatic allow.
+        if let Some(reason) = self
+            .plugins
+            .run_tool_before(session_id, turn_id, tool, &args, &session.cwd)
+            .await
+        {
+            let output = format!("plugin hook denied {tool}: {reason}");
+            self.record_tool_result(session_id, call, false, true, &output, 0)?;
+            self.emit_value(
+                "tool.completed",
+                json!({
+                    "session_id": session_id,
+                    "turn_id": turn_id,
+                    "call_id": call.id,
+                    "tool": tool,
+                    "ok": false,
+                    "denied": true,
+                    "duration_ms": 0,
+                }),
+            );
+            messages.push(ChatMessage::tool(call.id.clone(), output));
+            return Ok(());
+        }
+
         // Sub-agents have no UI; a question they asked would block the parent
         // turn with nobody to answer it.
         if session.origin == SessionOrigin::Agent && tool == "request_user_input" {
@@ -6965,6 +7025,14 @@ impl Daemon {
                 .unwrap_or_default();
             let reason = decision.reason.clone();
             self.record_auto_patch(session_id, call, &path, &reason, auto_diff.as_deref())?;
+        }
+
+        if let Some(hooked) = self
+            .plugins
+            .run_tool_after(session_id, turn_id, tool, ok, denied, &output, &session.cwd)
+            .await
+        {
+            output = hooked;
         }
 
         self.record_tool_result(session_id, call, ok, denied, &output, duration_ms)?;

@@ -13,6 +13,7 @@ pub mod event;
 pub mod message;
 pub mod picker;
 pub mod plugin;
+pub mod plugin_package;
 pub mod process;
 pub mod protocol;
 pub mod redact;
@@ -51,10 +52,15 @@ pub use picker::{
     KIND_WORKTREES,
 };
 pub use plugin::{
-    ContentBlock, PluginCapability, PluginCommandInfo, PluginCommandList, PluginConfig, PluginInfo,
-    PluginListResult, PluginManifest, PluginState, PluginToolCallParams, PluginToolCallResult,
+    ContentBlock, PluginCapability, PluginCommandInfo, PluginCommandList, PluginCommandRunParams,
+    PluginCommandRunResult, PluginConfig, PluginInfo, PluginListResult, PluginManifest,
+    PluginPackage, PluginSettingsResult, PluginState, PluginToolCallParams, PluginToolCallResult,
     RpcError, RpcNotification, RpcRequest, RpcResponse, PLUGIN_API_VERSION, PLUGIN_COMMAND_PREFIX,
     PLUGIN_TOOL_PREFIX,
+};
+pub use plugin_package::{
+    install as install_plugin, pack as pack_plugin, verify as verify_plugin, InstalledPlugin,
+    PluginTrustStore,
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};
 pub use protocol::{

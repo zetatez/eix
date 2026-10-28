@@ -440,8 +440,10 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 name = "eix-core"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "dirs",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "sha2",

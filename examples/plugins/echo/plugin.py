@@ -92,7 +92,7 @@ def initialize(params):
         "name": PLUGIN_NAME,
         "version": "0.1.0",
         "api_version": API_VERSION,
-        "features": ["content_blocks", "cancel"],
+        "features": ["content_blocks", "cancel", "command_actions"],
         "tools": [
             {
                 "name": "word_count",
@@ -181,6 +181,25 @@ def call_tool(params):
     }
 
 
+def run_command(params):
+    """Handle declarative/runtime action commands.
+
+    The host passes the action name from the manifest as ``command``. Return
+    ``prompt`` to submit a user message, or ``output`` to show plain text.
+    """
+    command = params.get("command")
+    arguments = str(params.get("arguments", ""))
+    if command == "count":
+        return {
+            "ok": True,
+            "output": f"{len(arguments.split())} word(s) in the arguments",
+        }
+    return {
+        "ok": False,
+        "output": f"unknown command action {command!r}",
+    }
+
+
 def main():
     while True:
         line = sys.stdin.readline()
@@ -225,6 +244,8 @@ def main():
                 reply(request_id, initialize(params))
             elif method == "tools/call":
                 reply(request_id, call_tool(params))
+            elif method == "commands/run":
+                reply(request_id, run_command(params))
             else:
                 reply(
                     request_id,

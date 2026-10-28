@@ -249,6 +249,12 @@ impl App {
                 self.open_picker(PickerKind::Mcp, tx);
                 true
             }
+            "plugins" => {
+                let name = (!args.is_empty()).then(|| args.to_string());
+                let _ = tx.send(Command::ListPlugins { name });
+                self.status = "plugins: loading…".into();
+                true
+            }
             "reload" => {
                 let _ = tx.send(Command::ReloadConfig);
                 self.status = "reloading config…".into();
@@ -525,6 +531,19 @@ impl App {
                 true
             }
             _ => {
+                if spec.action {
+                    let Some(session_id) = self.focused_session_id() else {
+                        self.status = "no session yet".into();
+                        return true;
+                    };
+                    let _ = tx.send(Command::RunPluginCommand {
+                        session_id,
+                        name: spec.name.clone(),
+                        arguments: args.to_string(),
+                    });
+                    self.status = format!("/{}: running…", spec.name);
+                    return true;
+                }
                 if let Some(template) = spec.template {
                     let expanded = eix_core::expand_command(&template, args);
                     if expanded.trim().is_empty() {
