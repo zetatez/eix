@@ -784,8 +784,9 @@ impl Default for ToolsConfig {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
-    /// Built-in palette name (`github-dark`, `one-light`, `tokyo-night`,
-    /// `monokai`, `sublime-mariana`, `catppuccin-latte`, …). Explicit fields
+    /// Built-in palette name (`dark-github`, `light-one`, `dark-tokyo`,
+    /// `dark-monokai`, `dark-mariana`, `light-catppuccin`, …). Names are
+    /// `<light|dark>-<scheme>`. Explicit fields
     /// below override individual slots of the preset; without a preset the
     /// terminal palette is used (transparent background).
     pub preset: Option<String>,
@@ -832,11 +833,11 @@ impl ThemePreset {
     }
 }
 
-/// Every built-in preset, in picker order. Aliases resolve through
-/// [`theme_preset`].
-pub const THEME_PRESETS: [ThemePreset; 16] = [
+/// Every built-in preset, in picker order. Names follow
+/// `<light|dark>-<scheme>` and resolve through [`theme_preset`].
+pub const THEME_PRESETS: [ThemePreset; 21] = [
     ThemePreset {
-        name: "github-dark",
+        name: "dark-github",
         description: "GitHub Dark / Primer",
         background: Some("#0d1117"),
         normal: Some("#e6edf3"),
@@ -849,7 +850,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#161b22"),
     },
     ThemePreset {
-        name: "github-light",
+        name: "light-github",
         description: "GitHub Light / Primer",
         background: Some("#ffffff"),
         normal: Some("#1f2328"),
@@ -862,7 +863,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#f6f8fa"),
     },
     ThemePreset {
-        name: "gruvbox-dark",
+        name: "dark-gruvbox",
         description: "Gruvbox Dark",
         background: Some("#282828"),
         normal: Some("#ebdbb2"),
@@ -875,7 +876,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#3c3836"),
     },
     ThemePreset {
-        name: "solarized-dark",
+        name: "dark-solarized",
         description: "Solarized Dark",
         background: Some("#002b36"),
         normal: Some("#839496"),
@@ -888,7 +889,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#073642"),
     },
     ThemePreset {
-        name: "solarized-light",
+        name: "light-solarized",
         description: "Solarized Light",
         background: Some("#fdf6e3"),
         normal: Some("#657b83"),
@@ -901,7 +902,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#eee8d5"),
     },
     ThemePreset {
-        name: "nord",
+        name: "dark-nord",
         description: "Nord",
         background: Some("#2e3440"),
         normal: Some("#d8dee9"),
@@ -914,7 +915,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#3b4252"),
     },
     ThemePreset {
-        name: "dracula",
+        name: "dark-dracula",
         description: "Dracula",
         background: Some("#282a36"),
         normal: Some("#f8f8f2"),
@@ -927,7 +928,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#44475a"),
     },
     ThemePreset {
-        name: "catppuccin-mocha",
+        name: "dark-catppuccin",
         description: "Catppuccin Mocha",
         background: Some("#1e1e2e"),
         normal: Some("#cdd6f4"),
@@ -940,7 +941,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#313244"),
     },
     ThemePreset {
-        name: "one-dark",
+        name: "dark-one",
         description: "Atom One Dark",
         background: Some("#282c34"),
         normal: Some("#abb2bf"),
@@ -953,7 +954,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#21252b"),
     },
     ThemePreset {
-        name: "one-light",
+        name: "light-one",
         description: "Atom One Light",
         background: Some("#fafafa"),
         normal: Some("#383a42"),
@@ -966,7 +967,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#f0f0f1"),
     },
     ThemePreset {
-        name: "tokyo-night",
+        name: "dark-tokyo",
         description: "Tokyo Night",
         background: Some("#1a1b26"),
         normal: Some("#c0caf5"),
@@ -979,7 +980,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#24283b"),
     },
     ThemePreset {
-        name: "monokai",
+        name: "dark-monokai",
         description: "Sublime Text Monokai",
         background: Some("#272822"),
         normal: Some("#f8f8f2"),
@@ -992,7 +993,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#3e3d32"),
     },
     ThemePreset {
-        name: "sublime-mariana",
+        name: "dark-mariana",
         description: "Sublime Text Mariana",
         background: Some("#303841"),
         normal: Some("#d8dee9"),
@@ -1005,7 +1006,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#343d46"),
     },
     ThemePreset {
-        name: "gruvbox-light",
+        name: "light-gruvbox",
         description: "Gruvbox Light",
         background: Some("#fbf1c7"),
         normal: Some("#3c3836"),
@@ -1018,7 +1019,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#ebdbb2"),
     },
     ThemePreset {
-        name: "catppuccin-latte",
+        name: "light-catppuccin",
         description: "Catppuccin Latte",
         background: Some("#eff1f5"),
         normal: Some("#4c4f69"),
@@ -1031,7 +1032,7 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         panel: Some("#e6e9ef"),
     },
     ThemePreset {
-        name: "rose-pine-dawn",
+        name: "light-rose-pine",
         description: "Rosé Pine Dawn",
         background: Some("#faf4ed"),
         normal: Some("#464261"),
@@ -1043,30 +1044,85 @@ pub const THEME_PRESETS: [ThemePreset; 16] = [
         diff_delete: Some("#b4637a"),
         panel: Some("#f2e9e1"),
     },
+    ThemePreset {
+        name: "light-delek",
+        description: "Vim Delek",
+        background: Some("#ffffff"),
+        normal: Some("#000000"),
+        comment: Some("#ee0000"),
+        string: Some("#00cd00"),
+        function: Some("#008b8b"),
+        error: Some("#ff0000"),
+        diff_add: Some("#5f875f"),
+        diff_delete: Some("#af5faf"),
+        panel: Some("#add8e6"),
+    },
+    ThemePreset {
+        name: "light-peachpuff",
+        description: "Vim Peach Puff",
+        background: Some("#ffdab9"),
+        normal: Some("#000000"),
+        comment: Some("#406090"),
+        string: Some("#c00058"),
+        function: Some("#008b8b"),
+        error: Some("#ff0000"),
+        diff_add: Some("#5f875f"),
+        diff_delete: Some("#af5faf"),
+        panel: Some("#ffaf87"),
+    },
+    ThemePreset {
+        name: "dark-ron",
+        description: "Vim Ron",
+        background: Some("#000000"),
+        normal: Some("#00ffff"),
+        comment: Some("#00ff00"),
+        string: Some("#00ffff"),
+        function: Some("#ffff00"),
+        error: Some("#ff0000"),
+        diff_add: Some("#5f875f"),
+        diff_delete: Some("#af5faf"),
+        panel: Some("#444444"),
+    },
+    ThemePreset {
+        name: "light-zellner",
+        description: "Vim Zellner",
+        background: Some("#ffffff"),
+        normal: Some("#000000"),
+        comment: Some("#ff0000"),
+        string: Some("#ff00ff"),
+        function: Some("#0000ff"),
+        error: Some("#ff0000"),
+        diff_add: Some("#5f875f"),
+        diff_delete: Some("#af5faf"),
+        panel: Some("#dadada"),
+    },
+    ThemePreset {
+        name: "dark-desert",
+        description: "Vim Desert",
+        background: Some("#333333"),
+        normal: Some("#ffffff"),
+        comment: Some("#6dceeb"),
+        string: Some("#ffa0a0"),
+        function: Some("#89fb98"),
+        error: Some("#ff0000"),
+        diff_add: Some("#5f875f"),
+        diff_delete: Some("#af5faf"),
+        panel: Some("#666666"),
+    },
 ];
 
-/// Look up a preset by name, accepting case/`-`/`_` variations plus a few
-/// aliases (`github-dark-default`, `mocha`, …).
+/// Look up a preset by name, accepting case/`-`/`_` and space variations.
+///
+/// Names are `<light|dark>-<scheme>`: the brightness prefix decides how the
+/// palette is used, the scheme is the family (`dark-github`, `light-github`,
+/// `dark-gruvbox`, …). Variants collapse into their family, so Catppuccin
+/// Mocha is `dark-catppuccin` and Latte is `light-catppuccin`. Older names
+/// such as `github-dark` or `catppuccin-latte` are intentionally gone.
 pub fn theme_preset(name: &str) -> Option<&'static ThemePreset> {
     let normalized = name.trim().to_ascii_lowercase().replace(['_', ' '], "-");
-    let canonical = match normalized.as_str() {
-        "github-dark-default" | "github" | "primer-dark" => "github-dark",
-        "github-light-default" | "primer-light" => "github-light",
-        "gruvbox" | "gruvbox-dark-hard" | "gruvbox-dark-medium" => "gruvbox-dark",
-        "solarized" | "solarized-dark-high-contrast" => "solarized-dark",
-        "solarized-light-high-contrast" => "solarized-light",
-        "catppuccin" | "catppuccin-mocha-dark" | "mocha" => "catppuccin-mocha",
-        "atom-one-dark" | "onedark" => "one-dark",
-        "atom-one-light" | "onelight" => "one-light",
-        "tokyo" | "tokyonight" | "tokyo-night-storm" => "tokyo-night",
-        "sublime" | "sublime-monokai" | "monokai-sublime" => "monokai",
-        "mariana" => "sublime-mariana",
-        "gruvbox-light-hard" | "gruvbox-light-medium" | "gruvbox-light-soft" => "gruvbox-light",
-        "latte" => "catppuccin-latte",
-        "rosepine-dawn" | "rose-pine-light" => "rose-pine-dawn",
-        other => other,
-    };
-    THEME_PRESETS.iter().find(|preset| preset.name == canonical)
+    THEME_PRESETS
+        .iter()
+        .find(|preset| preset.name == normalized)
 }
 
 /// Run a command after a file tool writes real content. `$1` is appended to
@@ -3461,10 +3517,37 @@ persistent_mode = true
     }
 
     #[test]
-    fn retired_neutral_theme_presets_are_gone() {
+    fn retired_theme_names_are_gone() {
         assert!(theme_preset("dark").is_none());
         assert!(theme_preset("light").is_none());
-        assert!(theme_preset("github-dark").is_some());
+        // Old brightness-suffix names and standalone variants no longer
+        // resolve; only `<light|dark>-<scheme>` is accepted.
+        for old in [
+            "github-dark",
+            "github-light",
+            "gruvbox-dark",
+            "solarized-light",
+            "catppuccin-latte",
+            "one-dark",
+            "tokyo-night",
+            "monokai",
+            "sublime-mariana",
+            "rose-pine-dawn",
+            "nord",
+            "dracula",
+            "delek",
+            "peachpuff",
+            "ron",
+            "zellner",
+            "desert",
+        ] {
+            assert!(theme_preset(old).is_none(), "{old} should be gone");
+        }
+        // Case and separator normalization still works on the new names.
+        assert_eq!(
+            theme_preset("Dark_GitHub").map(|preset| preset.name),
+            Some("dark-github")
+        );
         assert!(Config::default().theme.preset.is_none());
     }
 
@@ -3510,21 +3593,23 @@ persistent_mode = true
     }
 
     #[test]
-    fn theme_preset_aliases_resolve() {
-        for (alias, canonical) in [
-            ("atom-one-dark", "one-dark"),
-            ("atom-one-light", "one-light"),
-            ("tokyonight", "tokyo-night"),
-            ("sublime", "monokai"),
-            ("mariana", "sublime-mariana"),
-            ("gruvbox-light-medium", "gruvbox-light"),
-            ("latte", "catppuccin-latte"),
-            ("rose-pine-light", "rose-pine-dawn"),
-        ] {
-            assert_eq!(
-                theme_preset(alias).map(|preset| preset.name),
-                Some(canonical),
-                "{alias}"
+    fn theme_preset_names_use_a_brightness_prefix() {
+        for preset in &THEME_PRESETS {
+            assert!(
+                preset.name.starts_with("dark-") || preset.name.starts_with("light-"),
+                "{} is missing the light-/dark- prefix",
+                preset.name
+            );
+            let scheme = preset
+                .name
+                .split_once('-')
+                .map(|(_, scheme)| scheme)
+                .unwrap_or_default();
+            assert!(!scheme.is_empty(), "{} has no scheme name", preset.name);
+            assert!(
+                !scheme.starts_with("dark-") && !scheme.starts_with("light-"),
+                "{} repeats the brightness prefix",
+                preset.name
             );
         }
     }
