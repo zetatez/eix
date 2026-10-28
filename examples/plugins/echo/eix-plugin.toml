@@ -1,9 +1,18 @@
+schema = 2
 name = "echo"
 version = "0.1.0"
 description = "Example eix server plugin: tools, commands, events and storage."
-api_version = 1
+api_version = 2
 capabilities = ["tools", "commands", "events", "storage"]
 
-[server]
+[components.server]
 command = "python3"
 entry = "plugin.py"
+
+# Declarative commands need no server process. They are expanded by the
+# frontend, so a package can ship prompt-only functionality as a single file.
+[[contributes.commands]]
+name = "triage"
+description = "Ask the model to triage an issue."
+args = "<issue>"
+prompt = "Triage the following issue and propose the next concrete step:\n\n$ARGUMENTS"

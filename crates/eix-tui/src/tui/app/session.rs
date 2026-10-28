@@ -48,9 +48,9 @@ impl App {
         self.status = format!("jumped to e{seq}");
     }
 
-    /// Advance the focused session through `Plan → Build → Auto → Bypass`.
+    /// Advance the focused session through `Plan → Build → Auto → Full`.
     /// `delta` is +1 for Tab and -1 for Shift-Tab, so the reverse walk is
-    /// `Build → Plan → Bypass → Auto`. Update locally first so rapid presses
+    /// `Build → Plan → Full → Auto`. Update locally first so rapid presses
     /// keep moving before the daemon round-trip lands; the session event
     /// reconciles the final state.
     pub(super) fn cycle_mode(&mut self, delta: isize, tx: &UnboundedSender<Command>) {
@@ -58,7 +58,7 @@ impl App {
             SessionMode::Plan,
             SessionMode::Build,
             SessionMode::Auto,
-            SessionMode::Bypass,
+            SessionMode::Full,
         ];
         let Some(view) = self.focused_view_mut() else {
             self.status = "attach a session first".into();

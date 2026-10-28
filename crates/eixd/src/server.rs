@@ -25,24 +25,26 @@ use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
     ApprovalScope, AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult,
     ChatMessage, ClassifierAuditPayload, Config, ContextClearParams, ContextClearedPayload,
-    ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DraftParams, DraftResult,
-    ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams, FunctionCall,
-    HelloResult, ImagePart, InputAnsweredPayload, InputRequiredPayload, InputRespondParams,
-    InputResult, IntegrationContinueParams, IntegrationListParams, IntegrationListResult,
-    IntegrationState, IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo,
-    ModeParams, ModelListResult, ModelUseParams, ModelUseResult, Notification, PatchApplyParams,
-    PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
-    PatchResultPayload, PatchReviseParams, PermissionAction, PermissionRule, PickerParams,
-    PickerPreviewParams, PickerPreviewResult, PluginCommandList, PluginListResult,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    ProviderAuthInfo, RenameParams, Request, Response, RewindParams, RewindResult, RuleSource,
-    ServerMessage, Session, SessionAgentParams, SessionArchiveParams, SessionCdParams,
-    SessionExport, SessionExportResult, SessionId, SessionImportParams, SessionList, SessionMode,
-    SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef, SessionResult,
-    SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
-    StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
-    SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
-    ToolResultPayload, UserMessagePayload, WorktreeCreateParams, WorktreeRemoveParams,
+    ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DoctorReport, DraftParams,
+    DraftResult, ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams,
+    FunctionCall, GoalParams, GoalResult, HelloResult, ImagePart, InputAnsweredPayload,
+    InputRequiredPayload, InputRespondParams, InputResult, IntegrationContinueParams,
+    IntegrationListParams, IntegrationListResult, IntegrationState, IntegrationStatus,
+    LspWorkspaceParams, McpListResult, McpServerInfo, ModeParams, ModelListResult, ModelRole,
+    ModelUseParams, ModelUseResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
+    PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
+    PermissionAction, PermissionRule, PickerParams, PickerPreviewParams, PickerPreviewResult,
+    PluginCommandList, PluginListResult, ProcessKillParams, ProcessKillResult, ProcessList,
+    ProcessListParams, ProcessOutputParams, ProviderAuthInfo, RenameParams, Request, Response,
+    RewindParams, RewindResult, RuleSource, ScheduleAddParams, ScheduleListParams,
+    ScheduleListResult, ScheduleRemoveParams, ScheduleRemoveResult, ServerMessage, Session,
+    SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
+    SessionId, SessionImportParams, SessionList, SessionMode, SessionModelParams, SessionOrigin,
+    SessionReadyParams, SessionRef, SessionResult, SessionStatus, ShellRunParams, ShellRunResult,
+    SnapshotPayload, StatsResult, StatusChangedPayload, SubagentConcurrencyParams, SubmitParams,
+    SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, ToolCall,
+    ToolCallPayload, ToolDefinition, ToolResultPayload, UndoResult, UserMessagePayload,
+    WorkspaceDiffParams, WorkspaceDiffResult, WorktreeCreateParams, WorktreeRemoveParams,
     WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
@@ -429,6 +431,8 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     plugins.load(&config).await;
     let daemon = Arc::new(Daemon {
         store,
+        data_dir: data_dir.clone(),
+        socket: socket.clone(),
         provider,
         config: arc_swap::ArcSwap::from_pointee(config),
         model_override: arc_swap::ArcSwap::from_pointee(None),
@@ -475,6 +479,13 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     let integration = Arc::clone(&daemon);
     tokio::spawn(async move {
         integration.integration_loop().await;
+    });
+    // `/loop` and `/schedule` prompts are due checks, not a second queue: the
+    // loop only submits when the session is idle, so a long turn slides the
+    // next fire instead of stacking prompts.
+    let scheduler = Arc::clone(&daemon);
+    tokio::spawn(async move {
+        scheduler.schedule_loop().await;
     });
     if let Ok(report) = daemon.gc_blobs().await {
         if report.removed > 0 {
@@ -699,6 +710,11 @@ enum SnapshotTargets<'a> {
 
 pub(crate) struct Daemon {
     store: Arc<Store>,
+    /// Where the daemon keeps its database, snapshots and blobs. Reported by
+    /// `doctor.report`.
+    data_dir: PathBuf,
+    /// Unix socket the daemon is listening on, also for diagnostics.
+    socket: PathBuf,
     provider: arc_swap::ArcSwap<Provider>,
     config: arc_swap::ArcSwap<Config>,
     /// Runtime default model set with `model.use`. `None` follows the config;
@@ -887,6 +903,45 @@ impl Daemon {
         self.config.load().default_model().to_string()
     }
 
+    /// Model for one session turn. An explicit pin wins, then the role model
+    /// (`plan` / `explore` / `execute`), then the daemon default.
+    fn model_for_session(&self, session: &Session) -> String {
+        if let Some(model) = session
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            return model.to_string();
+        }
+        let role = model_role_for(session.origin, self.session_mode(session));
+        self.config
+            .load()
+            .role_model(role)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_model())
+    }
+
+    /// Model for background helpers (titles, compaction, permission
+    /// classification). An explicit pin still wins; otherwise these use the
+    /// `execute` role so planning with an expensive model does not make every
+    /// helper call expensive too.
+    fn model_for_background(&self, session: &Session) -> String {
+        if let Some(model) = session
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+        {
+            return model.to_string();
+        }
+        self.config
+            .load()
+            .role_model(ModelRole::Execute)
+            .map(str::to_string)
+            .unwrap_or_else(|| self.default_model())
+    }
+
     /// Change the runtime default model. `None`, an empty string or `default`
     /// restores the config default. Sessions with a pinned model are unaffected.
     fn use_model(&self, model: Option<String>) -> Result<String> {
@@ -992,10 +1047,7 @@ impl Daemon {
     async fn generate_worktree_name(&self, session: &Session, text: &str) -> String {
         let fallback = crate::integration::fallback_worktree_name(text);
         let config = self.config.load_full();
-        let model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model());
+        let model = self.model_for_background(session);
         let route = config.route(&model);
         let messages = vec![
             ChatMessage::system(
@@ -2260,6 +2312,149 @@ impl Daemon {
         }
     }
 
+    /// Fire `/loop` and `/schedule` prompts when they are due and the session
+    /// is idle. A busy session keeps its row due, so the prompt fires as soon
+    /// as the current turn finishes instead of being lost.
+    async fn schedule_loop(self: Arc<Self>) {
+        loop {
+            if let Err(err) = self.fire_due_schedules().await {
+                eprintln!("eixd: scheduled prompts: {}", redact(&format!("{err:#}")));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn fire_due_schedules(self: &Arc<Self>) -> Result<()> {
+        let now = now_ms();
+        for schedule in self.store.due_schedules(now)? {
+            let Ok(session) = self.require_session(&schedule.session_id) else {
+                // The session was deleted between the query and the check.
+                self.store.remove_schedule(&schedule.id)?;
+                continue;
+            };
+            if session.archived || session.status.is_busy() {
+                continue;
+            }
+            // Reserve the slot before submitting: a failing prompt must not
+            // retry every second.
+            if schedule.kind == "loop" {
+                let interval = schedule.interval_secs.max(1) as i64 * 1_000;
+                self.store.advance_schedule(&schedule.id, now + interval)?;
+            } else {
+                self.store.remove_schedule(&schedule.id)?;
+            }
+            let params = SubmitParams {
+                session_id: schedule.session_id.clone(),
+                text: schedule.prompt.clone(),
+                images: Vec::new(),
+            };
+            if let Err(err) = self.submit(params, Origin::Local).await {
+                eprintln!(
+                    "eixd: scheduled prompt {} failed: {}",
+                    schedule.id,
+                    redact(&format!("{err:#}"))
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn doctor_lines(&self) -> Result<Vec<String>> {
+        let config = self.config.load_full();
+        let mut lines = Vec::new();
+        lines.push(format!("socket   {}", self.socket.display()));
+        lines.push(format!("data     {}", self.data_dir.display()));
+        let config_path = eix_core::config::default_config_path();
+        lines.push(format!(
+            "config   {}{}",
+            config_path.display(),
+            if config_path.exists() {
+                ""
+            } else {
+                " (missing, defaults)"
+            }
+        ));
+        lines.push(format!(
+            "daemon   eixd {} pid {} protocol {} uptime {}s",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id(),
+            PROTOCOL_VERSION,
+            self.started.elapsed().as_secs()
+        ));
+        lines.push(format!("model    {}", self.default_model()));
+        lines.push(format!("api      {}", config.chat_endpoint()));
+        lines.push(format!(
+            "key      {}",
+            if config.api_key().is_some() {
+                "present"
+            } else {
+                "absent (set EIX_API_KEY or the configured env var)"
+            }
+        ));
+        lines.push(format!(
+            "sandbox  {} ({})",
+            config.tools.sandbox.as_str(),
+            eix_core::sandbox::status()
+        ));
+        lines.push("input    native (built-in Vim editor)".to_string());
+        lines.push(format!(
+            "snapshot {}",
+            if config.tools.snapshots {
+                "on (before apply_patch/exec_command)"
+            } else {
+                "off"
+            }
+        ));
+        lines.push(format!(
+            "rules    {} · network {}",
+            config.tools.rules.len(),
+            if config.tools.sandbox_network {
+                "allowed"
+            } else {
+                "blocked"
+            }
+        ));
+        lines.push("classify auto in auto mode · session model".to_string());
+        let mut compat = Vec::new();
+        if config.compations.claude_code {
+            compat.push("claude");
+        }
+        if config.compations.opencode {
+            compat.push("opencode");
+        }
+        if config.compations.codex_cli {
+            compat.push("codex");
+        }
+        if config.compations.gemini_cli {
+            compat.push("gemini");
+        }
+        if config.compations.pi {
+            compat.push("pi");
+        }
+        lines.push(format!(
+            "compations {}",
+            if compat.is_empty() {
+                "off (native .eix only)".to_string()
+            } else {
+                compat.join(", ")
+            }
+        ));
+        lines.push(format!(
+            "context  {} tokens · workspace summary {}",
+            config.context.budget_tokens,
+            if config.context.workspace_summary {
+                "on"
+            } else {
+                "off"
+            }
+        ));
+        for warning in &config.security_warnings {
+            lines.push(format!("warning  {warning}"));
+        }
+        lines.push(format!("sessions {}", self.store.session_count()?));
+        Ok(lines)
+    }
+
     /// A daemon restart cannot resume an in-flight HTTP stream. Mark those
     /// sessions errored instead of pretending they are still running.
     async fn recover(&self) {
@@ -2665,42 +2860,42 @@ impl Daemon {
                 }
                 "session.create" => {
                     let params: CreateSessionParams = parse_params(request.params.clone())?;
-                    if params.mode == Some(SessionMode::Bypass) {
+                    if params.mode == Some(SessionMode::Full) {
                         return Err(rpc(
                             "forbidden",
-                            "remote clients cannot create bypass sessions",
+                            "remote clients cannot create full-mode sessions",
                         ));
                     }
                 }
                 "session.mode" => {
                     let params: ModeParams = parse_params(request.params.clone())?;
-                    if params.mode == SessionMode::Bypass {
-                        return Err(rpc("forbidden", "remote clients cannot enable bypass mode"));
+                    if params.mode == SessionMode::Full {
+                        return Err(rpc("forbidden", "remote clients cannot enable full mode"));
                     }
                 }
                 "prompt.submit" => {
                     let params: SubmitParams = parse_params(request.params.clone())?;
                     let session = self.require_session(&params.session_id)?;
                     self.validate_remote_cwd(&session.cwd)?;
-                    if self.session_mode(&session) == SessionMode::Bypass {
+                    if self.session_mode(&session) == SessionMode::Full {
                         return Err(rpc(
                             "forbidden",
-                            "remote clients cannot run turns in bypass sessions",
+                            "remote clients cannot run turns in full-mode sessions",
                         ));
                     }
                 }
                 // Integration can run tests and start an internal agent turn,
-                // so it follows the same workspace and bypass restrictions.
+                // so it follows the same workspace and full-mode restrictions.
                 "session.ready" | "integration.continue" => {
                     let params: SessionRef = parse_params(request.params.clone())?;
                     let session = self.require_session(&params.session_id)?;
                     self.validate_remote_cwd(&session.cwd)?;
-                    if session.mode == SessionMode::Bypass
-                        || self.session_mode(&session) == SessionMode::Bypass
+                    if session.mode == SessionMode::Full
+                        || self.session_mode(&session) == SessionMode::Full
                     {
                         return Err(rpc(
                             "forbidden",
-                            "remote clients cannot prepare bypass sessions",
+                            "remote clients cannot prepare full-mode sessions",
                         ));
                     }
                 }
@@ -2794,18 +2989,12 @@ impl Daemon {
                 if self.turns.lock().await.contains_key(&params.session_id) {
                     return Err(rpc("busy", "cannot undo while a turn is running"));
                 }
-                let changed = if request.method == "session.undo" {
-                    self.store.undo_last_turn(&params.session_id)?
+                let result = if request.method == "session.undo" {
+                    self.undo_with_files(&params.session_id).await?
                 } else {
-                    self.store.redo_last_undo(&params.session_id)?
+                    self.redo_with_files(&params.session_id).await?
                 };
-                match changed {
-                    Some(count) => Ok(json!({ "changed": count })),
-                    None if request.method == "session.undo" => {
-                        Err(rpc("nothing_to_undo", "no user turn to undo"))
-                    }
-                    None => Err(rpc("nothing_to_redo", "nothing to redo")),
-                }
+                Ok(serde_json::to_value(result)?)
             }
             "shell.run" => {
                 let params: ShellRunParams = parse_params(request.params.clone())?;
@@ -2950,11 +3139,11 @@ impl Daemon {
                 if origin == Origin::Remote {
                     // Exported sessions carry their own mode and working
                     // directory. Do not let an imported document smuggle in
-                    // bypass mode or a path outside the daemon's workspace.
-                    if session.mode == SessionMode::Bypass {
+                    // full mode or a path outside the daemon's workspace.
+                    if session.mode == SessionMode::Full {
                         return Err(rpc(
                             "forbidden",
-                            "remote clients cannot import bypass sessions",
+                            "remote clients cannot import full-mode sessions",
                         ));
                     }
                     let cwd = params.cwd.as_deref().unwrap_or(&session.cwd);
@@ -3174,13 +3363,13 @@ impl Daemon {
                 if origin == Origin::Remote {
                     self.validate_remote_cwd(&source.cwd)?;
                     // A fork copies the persisted mode, so a temporary
-                    // override must not make a bypass session look safe.
-                    if source.mode == SessionMode::Bypass
-                        || self.session_mode(&source) == SessionMode::Bypass
+                    // override must not make a full-mode session look safe.
+                    if source.mode == SessionMode::Full
+                        || self.session_mode(&source) == SessionMode::Full
                     {
                         return Err(rpc(
                             "forbidden",
-                            "remote clients cannot fork bypass sessions",
+                            "remote clients cannot fork full-mode sessions",
                         ));
                     }
                 }
@@ -3491,6 +3680,104 @@ impl Daemon {
                     })?;
                 self.emit_session(&session);
                 Ok(serde_json::to_value(SessionResult { session })?)
+            }
+            "session.diff" => {
+                let params: WorkspaceDiffParams = parse_params(request.params.clone())?;
+                let session = self.require_session(&params.session_id)?;
+                let result = workspace_diff(&session.cwd, params.staged)
+                    .await
+                    .map_err(|err| rpc("invalid_params", format!("{err:#}")))?;
+                Ok(serde_json::to_value(result)?)
+            }
+            "doctor.report" => Ok(serde_json::to_value(DoctorReport {
+                lines: self.doctor_lines()?,
+            })?),
+            "session.goal" => {
+                let params: GoalParams = parse_params(request.params.clone())?;
+                self.require_session(&params.session_id)?;
+                if params.clear {
+                    self.store.clear_goal(&params.session_id)?;
+                    return Ok(serde_json::to_value(GoalResult { goal: None })?);
+                }
+                if let Some(text) = params.text.as_deref() {
+                    let text = text.trim();
+                    if text.is_empty() {
+                        return Err(rpc("invalid_params", "goal text must not be empty"));
+                    }
+                    self.store.set_goal(&params.session_id, text)?;
+                }
+                if let Some(done) = params.done {
+                    self.store.set_goal_done(&params.session_id, done)?;
+                }
+                Ok(serde_json::to_value(GoalResult {
+                    goal: self.store.goal(&params.session_id)?,
+                })?)
+            }
+            "schedule.list" => {
+                let params: ScheduleListParams = parse_params(request.params.clone())?;
+                if let Some(session_id) = params.session_id.as_deref() {
+                    self.require_session(session_id)?;
+                }
+                Ok(serde_json::to_value(ScheduleListResult {
+                    schedules: self.store.list_schedules(params.session_id.as_deref())?,
+                })?)
+            }
+            "schedule.add" => {
+                let params: ScheduleAddParams = parse_params(request.params.clone())?;
+                self.require_session(&params.session_id)?;
+                let prompt = params.prompt.trim();
+                if prompt.is_empty() {
+                    return Err(rpc("invalid_params", "prompt must not be empty"));
+                }
+                let kind = match params.kind.as_str() {
+                    "loop" | "once" => params.kind.as_str(),
+                    other => {
+                        return Err(rpc(
+                            "invalid_params",
+                            format!("unknown schedule kind {other:?}"),
+                        ))
+                    }
+                };
+                let interval = params.interval_secs;
+                let next_at = if kind == "loop" {
+                    if interval == 0 {
+                        return Err(rpc("invalid_params", "interval must be positive"));
+                    }
+                    now_ms() + interval as i64 * 1_000
+                } else {
+                    params
+                        .at
+                        .filter(|at| *at > now_ms())
+                        .ok_or_else(|| rpc("invalid_params", "a future fire time is required"))?
+                };
+                let schedule = self
+                    .store
+                    .add_schedule(
+                        &Uuid::new_v4().to_string(),
+                        &params.session_id,
+                        kind,
+                        prompt,
+                        interval,
+                        next_at,
+                    )?
+                    .ok_or_else(|| rpc("internal", "cannot store schedule"))?;
+                Ok(serde_json::to_value(schedule)?)
+            }
+            "schedule.remove" => {
+                let params: ScheduleRemoveParams = parse_params(request.params.clone())?;
+                let removed = if let Some(id) = params.id.as_deref() {
+                    usize::from(self.store.remove_schedule(id)?)
+                } else if let Some(session_id) = params.session_id.as_deref() {
+                    self.require_session(session_id)?;
+                    self.store
+                        .remove_schedules(session_id, params.kind.as_deref())?
+                } else {
+                    return Err(rpc(
+                        "invalid_params",
+                        "schedule id or session_id is required",
+                    ));
+                };
+                Ok(serde_json::to_value(ScheduleRemoveResult { removed })?)
             }
             "session.mode" => {
                 let params: ModeParams = parse_params(request.params.clone())?;
@@ -4080,10 +4367,7 @@ impl Daemon {
         let daemon = Arc::clone(self);
         let session_id = session.id.clone();
         let id = btw_id.clone();
-        let model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model());
+        let model = self.model_for_session(&session);
         tokio::spawn(async move {
             daemon.run_btw(session_id, id, question, model).await;
         });
@@ -4277,18 +4561,176 @@ impl Daemon {
     ///
     /// Rollback is best-effort: files that were never captured, changes made
     /// outside eix, and failed restores are reported instead of hidden.
+    /// `/undo`: hide the newest user turn and put the workspace back to the
+    /// state the turn started from. Snapshots are captured before each write,
+    /// so replaying them in reverse yields the pre-turn tree.
+    async fn undo_with_files(&self, session_id: &str) -> Result<UndoResult> {
+        let session = self.require_session(session_id)?;
+        let Some(cutoff) = self.store.last_visible_user_turn(session_id)? else {
+            return Err(rpc("nothing_to_undo", "no user turn to undo"));
+        };
+        let mut snapshots: Vec<(u64, String, usize)> = Vec::new();
+        for event in self
+            .store
+            .events_after_kind_async(session_id, cutoff.saturating_sub(1), EventKind::Snapshot)
+            .await?
+        {
+            let Ok(snapshot) = serde_json::from_value::<SnapshotPayload>(event.payload) else {
+                continue;
+            };
+            if snapshot.ok && !snapshot.snapshot_id.is_empty() {
+                snapshots.push((event.seq, snapshot.snapshot_id, snapshot.skipped));
+            }
+        }
+        snapshots.sort_by_key(|(seq, _, _)| *seq);
+
+        let snapshots_enabled = self.config.load().tools.snapshots;
+        let mut result = UndoResult {
+            changed: 0,
+            files_restored: 0,
+            files_removed: 0,
+            files_missing: 0,
+            warnings: Vec::new(),
+        };
+
+        // Capture the current workspace before rolling it back. Redo restores
+        // this snapshot, so the bytes the undo discards are not lost.
+        let mut redo_snapshot = None;
+        if snapshots_enabled && !snapshots.is_empty() {
+            let _guard = self.snapshot_lock.lock().await;
+            let call_id = format!("undo-{}", Uuid::new_v4());
+            let capture = self
+                .snapshots
+                .capture_tree(session_id, "undo", &call_id, &session.cwd)
+                .await;
+            let (snapshot_id, _) = self
+                .record_snapshot(session_id, "undo", &call_id, Scope::Tree, capture)
+                .await?;
+            redo_snapshot = snapshot_id;
+        }
+
+        let changed = self
+            .store
+            .undo_last_turn(session_id)?
+            .ok_or_else(|| rpc("nothing_to_undo", "no user turn to undo"))?;
+        result.changed = changed;
+        if let (Some(snapshot_id), Some(round)) =
+            (redo_snapshot, self.store.last_undo_round(session_id)?)
+        {
+            self.store
+                .record_undo_snapshot(session_id, round, &snapshot_id)?;
+        }
+
+        if snapshots.is_empty() {
+            result.warnings.push(
+                "no snapshots in this turn; files changed outside tool calls were left as they are"
+                    .into(),
+            );
+            return Ok(result);
+        }
+        if !snapshots_enabled {
+            result
+                .warnings
+                .push("tools.snapshots is disabled, so the workspace was not rolled back".into());
+            return Ok(result);
+        }
+
+        let cwd = session.cwd.clone();
+        let mut failed = 0usize;
+        let mut skipped = 0usize;
+        for (_, snapshot_id, skipped_files) in snapshots.iter().rev() {
+            skipped += skipped_files;
+            match self.snapshots.restore(session_id, snapshot_id, &cwd).await {
+                Ok(report) => {
+                    result.files_restored += report.restored;
+                    result.files_removed += report.removed;
+                    result.files_missing += report.missing;
+                }
+                Err(err) => {
+                    failed += 1;
+                    result.warnings.push(format!(
+                        "snapshot {snapshot_id} could not be restored: {err:#}"
+                    ));
+                }
+            }
+        }
+        if skipped > 0 {
+            result.warnings.push(format!(
+                "{skipped} file(s) were too large or excluded and were never captured"
+            ));
+        }
+        if result.files_missing > 0 {
+            result.warnings.push(format!(
+                "{} pre-existing file(s) could not be put back",
+                result.files_missing
+            ));
+        }
+        if failed > 0 {
+            result
+                .warnings
+                .push("the workspace may be partially rolled back".into());
+        }
+        Ok(result)
+    }
+
+    /// `/redo`: restore the conversation hidden by the newest undo and, when
+    /// the undo captured one, the workspace snapshot taken just before it.
+    async fn redo_with_files(&self, session_id: &str) -> Result<UndoResult> {
+        let round = self
+            .store
+            .last_undo_round(session_id)?
+            .ok_or_else(|| rpc("nothing_to_redo", "nothing to redo"))?;
+        let snapshot = self.store.take_undo_snapshot(session_id, round)?;
+        let cwd = self.require_session(session_id)?.cwd;
+        let changed = self
+            .store
+            .redo_last_undo(session_id)?
+            .ok_or_else(|| rpc("nothing_to_redo", "nothing to redo"))?;
+        let mut result = UndoResult {
+            changed,
+            files_restored: 0,
+            files_removed: 0,
+            files_missing: 0,
+            warnings: Vec::new(),
+        };
+        let Some(snapshot_id) = snapshot else {
+            return Ok(result);
+        };
+        if !self.config.load().tools.snapshots {
+            result
+                .warnings
+                .push("tools.snapshots is disabled, so the workspace was not restored".into());
+            return Ok(result);
+        }
+        match self.snapshots.restore(session_id, &snapshot_id, &cwd).await {
+            Ok(report) => {
+                result.files_restored = report.restored;
+                result.files_removed = report.removed;
+                result.files_missing = report.missing;
+                if result.files_missing > 0 {
+                    result.warnings.push(format!(
+                        "{} file(s) could not be put back",
+                        result.files_missing
+                    ));
+                }
+            }
+            Err(err) => result.warnings.push(format!(
+                "snapshot {snapshot_id} could not be restored: {err:#}"
+            )),
+        }
+        Ok(result)
+    }
+
     async fn rewind_session(&self, params: RewindParams, origin: Origin) -> Result<RewindResult> {
         let source = self.require_session(&params.session_id)?;
         if origin == Origin::Remote {
             self.validate_remote_cwd(&source.cwd)?;
             // Rewind also forks the persisted mode; check both the effective
-            // and stored mode so a temporary override cannot mask bypass.
-            if source.mode == SessionMode::Bypass
-                || self.session_mode(&source) == SessionMode::Bypass
-            {
+            // and stored mode so a temporary override cannot mask full mode.
+            if source.mode == SessionMode::Full || self.session_mode(&source) == SessionMode::Full {
                 return Err(rpc(
                     "forbidden",
-                    "remote clients cannot rewind bypass sessions",
+                    "remote clients cannot rewind full-mode sessions",
                 ));
             }
         }
@@ -4574,7 +5016,7 @@ impl Daemon {
             json!({
                 "session_id": session.id.clone(),
                 "turn_id": turn_id.clone(),
-                "model": session.model.clone().unwrap_or_else(|| self.default_model()),
+                "model": self.model_for_session(&session),
             }),
         );
 
@@ -4980,10 +5422,7 @@ impl Daemon {
     ) -> Result<()> {
         let session = self.require_session(session_id)?;
         let config = self.config.load_full();
-        let model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model());
+        let model = self.model_for_session(&session);
         let turn_started = Instant::now();
         // A sub-agent reuses the parent turn's snapshot. The parent itself
         // keeps this snapshot for every round, so parent and child agree on
@@ -5882,9 +6321,9 @@ impl Daemon {
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|agent| !agent.is_empty());
+        let config = self.config.load();
         let agent = match requested_agent {
             Some(name) => {
-                let config = self.config.load();
                 let Some(spec) = eix_core::find_agent(&parent.cwd, name, &config.compations) else {
                     bail!("unknown sub-agent {name:?}");
                 };
@@ -5901,10 +6340,16 @@ impl Daemon {
             label.or_else(|| agent.as_ref().map(|agent| agent.name.as_str())),
         );
         let mut child = Session::new(Uuid::new_v4().to_string(), name.clone(), parent.cwd.clone());
+        // Precedence: the agent's own `model:`, the explore role, then the
+        // parent's pin. Role routing wins over an inherited pin so a cheap
+        // explore model stays cheap even when the parent plans with a larger
+        // one.
         child.model = agent
             .as_ref()
             .and_then(|agent| agent.model.clone())
+            .or_else(|| config.role_model(ModelRole::Explore).map(str::to_string))
             .or_else(|| parent.model.clone());
+        drop(config);
         child.agent = agent.as_ref().map(|agent| agent.name.clone());
         child.parent_id = Some(parent.id.clone());
         child.origin = SessionOrigin::Agent;
@@ -6014,10 +6459,7 @@ impl Daemon {
             json!({
                 "session_id": child.id,
                 "turn_id": turn_id,
-                "model": child
-                    .model
-                    .clone()
-                    .unwrap_or_else(|| self.default_model()),
+                "model": self.model_for_session(child),
             }),
         );
         if let Err(err) = self
@@ -6750,11 +7192,13 @@ impl Daemon {
             .cloned()
             .unwrap_or_default();
         let tasks = (!todos.is_empty()).then(|| todo_context(&todos));
+        let goal = self
+            .store
+            .goal(&session.id)?
+            .filter(|goal| !goal.done)
+            .map(|goal| goal_context(&goal.text));
         let memory = self.memory.read(&session.cwd).await;
-        let model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model());
+        let model = self.model_for_session(&session);
         let route = config.route(&model);
         let budget = config.context.effective_budget_tokens(route.context_tokens);
         let resources = self.prompt_resources(&config, &session.cwd).await;
@@ -6769,6 +7213,7 @@ impl Daemon {
             skills: (!resources.skills.is_empty()).then(|| resources.skills.clone()),
             memory,
             tasks,
+            goal,
             environment: Some(
                 environment_summary(
                     &session.cwd,
@@ -6831,11 +7276,13 @@ impl Daemon {
             .cloned()
             .unwrap_or_default();
         let tasks = (!todos.is_empty()).then(|| todo_context(&todos));
+        let goal = self
+            .store
+            .goal(&session.id)?
+            .filter(|goal| !goal.done)
+            .map(|goal| goal_context(&goal.text));
         let memory = self.memory.read(&session.cwd).await;
-        let model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model());
+        let model = self.model_for_session(&session);
         let route = config.route(&model);
         let budget = config.context.effective_budget_tokens(route.context_tokens);
         let resources = self.prompt_resources(&config, &session.cwd).await;
@@ -6850,6 +7297,7 @@ impl Daemon {
             skills: (!resources.skills.is_empty()).then(|| resources.skills.clone()),
             memory,
             tasks,
+            goal,
             environment: Some(
                 environment_summary(
                     &session.cwd,
@@ -7074,10 +7522,8 @@ impl Daemon {
              summary now. Return only the summary.",
         ));
         let config = self.config.load();
-        let model = self
-            .require_session(session_id)?
-            .model
-            .unwrap_or_else(|| self.default_model());
+        let session = self.require_session(session_id)?;
+        let model = self.model_for_background(&session);
         let cancel = AtomicBool::new(false);
         let route = config.route(&model);
         let provider = self.provider.load_full();
@@ -7818,10 +8264,7 @@ impl Daemon {
         if intent.trim().is_empty() {
             return None;
         }
-        let model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model());
+        let model = self.model_for_background(session);
         let route = config.route(&model);
         let key = classifier_cache_key(session, tool, args, decision, &intent, &model);
         let now = Instant::now();
@@ -9063,6 +9506,73 @@ fn todo_context(items: &[eix_core::TodoItem]) -> String {
     out.trim_end().to_string()
 }
 
+/// Largest diff rendered in the `/diff` overlay. Beyond this the tail is cut;
+/// the full diff is still available through the shell.
+const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+async fn workspace_diff(cwd: &Path, staged: bool) -> Result<WorkspaceDiffResult> {
+    let mut command = tokio::process::Command::new("git");
+    command.arg("-C").arg(cwd);
+    if staged {
+        command.args(["diff", "--cached", "--no-color", "--no-ext-diff", "HEAD"]);
+    } else {
+        command.args(["diff", "HEAD", "--no-color", "--no-ext-diff"]);
+    }
+    let output = command.output().await.context("cannot run git diff")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("{}", stderr.trim());
+    }
+    let mut diff = String::from_utf8_lossy(&output.stdout).to_string();
+    let files = diff
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count();
+    let mut notes = Vec::new();
+    if !staged {
+        let untracked = tokio::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args(["ls-files", "--others", "--exclude-standard"])
+            .output()
+            .await;
+        if let Ok(output) = untracked {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let mut names: Vec<&str> = stdout.lines().filter(|line| !line.is_empty()).collect();
+            if !names.is_empty() {
+                let extra = names.len().saturating_sub(20);
+                names.truncate(20);
+                let mut note = format!("untracked (not in this diff): {}", names.join(", "));
+                if extra > 0 {
+                    note.push_str(&format!(", +{extra} more"));
+                }
+                notes.push(note);
+            }
+        }
+    }
+    let truncated = diff.len() > MAX_DIFF_BYTES;
+    if truncated {
+        let mut cut = MAX_DIFF_BYTES;
+        while !diff.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        diff.truncate(cut);
+        notes.push("diff truncated; narrow it with the shell or stage fewer files".into());
+    }
+    Ok(WorkspaceDiffResult {
+        diff,
+        files,
+        truncated,
+        notes,
+    })
+}
+
+fn goal_context(text: &str) -> String {
+    format!(
+        "Goal for this session (persists across turns; keep it in scope until the user clears or completes it):\n{text}"
+    )
+}
+
 fn render_todos(items: &[eix_core::TodoItem]) -> String {
     if items.is_empty() {
         return "task list cleared".to_string();
@@ -9120,6 +9630,19 @@ fn default_name(cwd: &Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("session")
         .to_string()
+}
+
+/// Route a turn to its task role. Sub-agents are always exploration, even if
+/// their parent happens to be in Plan mode; other sessions use `plan` only
+/// while Plan mode is active.
+fn model_role_for(origin: SessionOrigin, mode: SessionMode) -> ModelRole {
+    if origin == SessionOrigin::Agent {
+        ModelRole::Explore
+    } else if mode == SessionMode::Plan {
+        ModelRole::Plan
+    } else {
+        ModelRole::Execute
+    }
 }
 
 /// Keep a session in the same subdirectory when its auto-worktree is created.
@@ -9550,10 +10073,7 @@ impl Daemon {
 
     async fn generate_session_name(&self, session: &Session, transcript: &str) -> Option<String> {
         let config = self.config.load_full();
-        let model = session
-            .model
-            .clone()
-            .unwrap_or_else(|| self.default_model());
+        let model = self.model_for_background(session);
         let route = config.route(&model);
         let messages = vec![
             ChatMessage::system(
@@ -9842,8 +10362,8 @@ fn permissions_note(
         SessionMode::Auto => format!(
             "\n\n## Approvals\nMode: Auto (sandbox: {sandbox}, network: {network}). Unruled low-risk calls may be auto-approved after an intent check; stay inside the workspace.\n{scope}{rules}{escalation}\n{segmentation}"
         ),
-        SessionMode::Bypass => format!(
-            "\n\n## Approvals\nMode: Bypass (sandbox: {sandbox}, network: {network}). Unruled asks are allowed and external writes are permitted. Keep scope minimal and never bypass secret-path or catastrophic denials.\n{scope}{rules}"
+        SessionMode::Full => format!(
+            "\n\n## Approvals\nMode: Full (sandbox: {sandbox}, network: {network}). Unruled asks are allowed and external writes are permitted. Keep scope minimal and never bypass secret-path or catastrophic denials.\n{scope}{rules}"
         ),
     }
 }
@@ -9943,6 +10463,39 @@ fn describe_rule(rule: &PermissionRule) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_roles_route_plan_explore_and_execute() {
+        assert_eq!(
+            model_role_for(SessionOrigin::User, SessionMode::Plan),
+            ModelRole::Plan
+        );
+        assert_eq!(
+            model_role_for(SessionOrigin::Fork, SessionMode::Plan),
+            ModelRole::Plan
+        );
+        assert_eq!(
+            model_role_for(SessionOrigin::User, SessionMode::Build),
+            ModelRole::Execute
+        );
+        assert_eq!(
+            model_role_for(SessionOrigin::User, SessionMode::Auto),
+            ModelRole::Execute
+        );
+        assert_eq!(
+            model_role_for(SessionOrigin::User, SessionMode::Full),
+            ModelRole::Execute
+        );
+        // A child explores even when spawned from a Plan-mode parent.
+        assert_eq!(
+            model_role_for(SessionOrigin::Agent, SessionMode::Plan),
+            ModelRole::Explore
+        );
+        assert_eq!(
+            model_role_for(SessionOrigin::Agent, SessionMode::Build),
+            ModelRole::Explore
+        );
+    }
 
     fn tool_call(name: &str, arguments: &str) -> ToolCall {
         let mut hasher = DefaultHasher::new();

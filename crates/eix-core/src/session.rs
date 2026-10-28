@@ -126,13 +126,13 @@ pub enum SessionMode {
     Build,
     /// Workspace-write. Unruled default `ask` results go through the
     /// intent-aware classifier; only a confident, in-scope `allow` runs without
-    /// prompting. It does not grant Bypass-level external path writes.
+    /// prompting. It does not grant Full-level external path writes.
     Auto,
-    /// Full/bypass behavior: unruled asks are allowed, external writes are
+    /// Full behavior: unruled asks are allowed, external writes are
     /// permitted (except secret-path and catastrophic hard denies), and build
     /// commands fall back to unsandboxed execution when no sandbox is
     /// available.
-    Bypass,
+    Full,
 }
 
 impl SessionMode {
@@ -141,7 +141,7 @@ impl SessionMode {
             Self::Plan => "plan",
             Self::Build => "build",
             Self::Auto => "auto",
-            Self::Bypass => "bypass",
+            Self::Full => "full",
         }
     }
 
@@ -151,7 +151,7 @@ impl SessionMode {
             Self::Plan => "Plan",
             Self::Build => "Build",
             Self::Auto => "Auto",
-            Self::Bypass => "Bypass",
+            Self::Full => "Full",
         }
     }
 
@@ -169,7 +169,7 @@ impl SessionMode {
     /// deliberately does not qualify: it sends those calls through the
     /// classifier instead of blanket-allowing them.
     pub fn allows_unruled_asks(self) -> bool {
-        matches!(self, Self::Bypass)
+        matches!(self, Self::Full)
     }
 
     /// True when unruled default `ask` calls should be sent to the classifier.
@@ -179,12 +179,12 @@ impl SessionMode {
 
     /// True when file tools may leave the workspace without an extra guard.
     pub fn allows_external_writes(self) -> bool {
-        matches!(self, Self::Bypass)
+        matches!(self, Self::Full)
     }
 
     /// True when a build command may run without a sandbox.
     pub fn allows_unsandboxed_exec(self) -> bool {
-        matches!(self, Self::Bypass)
+        matches!(self, Self::Full)
     }
 
     /// True for modes that automatically apply workspace edits.
@@ -201,7 +201,7 @@ impl std::str::FromStr for SessionMode {
             "plan" => Ok(Self::Plan),
             "build" => Ok(Self::Build),
             "auto" => Ok(Self::Auto),
-            "bypass" => Ok(Self::Bypass),
+            "full" => Ok(Self::Full),
             _ => Err(()),
         }
     }
@@ -339,7 +339,8 @@ pub struct Session {
     pub name: String,
     pub cwd: PathBuf,
     pub status: SessionStatus,
-    /// Model pinned to this session. `None` means "use the daemon default".
+    /// Model pinned to this session. `None` means "use the configured task
+    /// role, or the daemon default when no role is set".
     #[serde(default)]
     pub model: Option<String>,
     /// Session this one was forked from (or the parent of a sub-agent).
@@ -457,7 +458,7 @@ mod tests {
             SessionMode::Plan,
             SessionMode::Build,
             SessionMode::Auto,
-            SessionMode::Bypass,
+            SessionMode::Full,
         ];
         for mode in all {
             assert_eq!(mode.as_str().parse::<SessionMode>(), Ok(mode));
@@ -472,10 +473,10 @@ mod tests {
         assert!(SessionMode::Auto.uses_classifier());
         assert!(!SessionMode::Plan.uses_classifier());
         assert!(!SessionMode::Build.uses_classifier());
-        assert!(SessionMode::Bypass.allows_unruled_asks());
-        assert!(!SessionMode::Bypass.uses_classifier());
+        assert!(SessionMode::Full.allows_unruled_asks());
+        assert!(!SessionMode::Full.uses_classifier());
         assert!(!SessionMode::Auto.allows_external_writes());
-        assert!(SessionMode::Bypass.allows_external_writes());
+        assert!(SessionMode::Full.allows_external_writes());
         assert!(SessionMode::Build.applies_workspace_edits());
         assert!(SessionMode::Auto.applies_workspace_edits());
         assert!(!SessionMode::Plan.applies_workspace_edits());
@@ -484,8 +485,8 @@ mod tests {
     #[test]
     fn session_mode_serde_uses_plain_mode_names() {
         assert_eq!(
-            serde_json::to_string(&SessionMode::Bypass).unwrap(),
-            "\"bypass\""
+            serde_json::to_string(&SessionMode::Full).unwrap(),
+            "\"full\""
         );
         assert_eq!(
             serde_json::from_str::<SessionMode>("\"plan\"").unwrap(),

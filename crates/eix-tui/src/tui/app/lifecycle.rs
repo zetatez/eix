@@ -58,6 +58,7 @@ impl App {
             diff_body: None,
             inputs: HashMap::new(),
             diff_view: None,
+            text_view: None,
             process_view: None,
             transcript_search: None,
             status: "connecting…".into(),

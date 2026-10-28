@@ -138,6 +138,43 @@ pub enum Command {
         session_id: String,
         redo: bool,
     },
+    /// Show the repository diff for the session workspace.
+    WorkspaceDiff {
+        session_id: String,
+        staged: bool,
+    },
+    /// Collect daemon diagnostics for `/doctor`.
+    Doctor,
+    /// Rename a session.
+    RenameSession {
+        session_id: String,
+        name: String,
+    },
+    /// Read or update the persistent session goal.
+    Goal {
+        session_id: String,
+        text: Option<String>,
+        done: Option<bool>,
+        clear: bool,
+    },
+    /// List loop/once prompts for a session (or all sessions).
+    ListSchedules {
+        session_id: Option<String>,
+    },
+    /// Add a loop or one-shot prompt.
+    AddSchedule {
+        session_id: String,
+        kind: String,
+        prompt: String,
+        interval_secs: u64,
+        at: Option<i64>,
+    },
+    /// Remove one schedule or every schedule for a session.
+    RemoveSchedules {
+        id: Option<String>,
+        session_id: Option<String>,
+        kind: Option<String>,
+    },
     /// Ask a one-off side question (never written to the session log).
     Btw {
         session_id: String,
@@ -245,6 +282,13 @@ impl Command {
             Self::RunShell { .. } => "shell",
             Self::Undo { redo: false, .. } => "undo",
             Self::Undo { redo: true, .. } => "redo",
+            Self::WorkspaceDiff { .. } => "diff",
+            Self::Doctor => "doctor",
+            Self::RenameSession { .. } => "rename",
+            Self::Goal { .. } => "goal",
+            Self::ListSchedules { .. }
+            | Self::AddSchedule { .. }
+            | Self::RemoveSchedules { .. } => "schedule",
             Self::Btw { .. } => "btw",
             Self::BtwCancel { .. } => "btw",
             Self::Submit { .. } => "submit",
@@ -345,7 +389,21 @@ pub enum Event {
     },
     Archived(Session),
     Deleted(String),
-    Rewritten(String),
+    Rewritten {
+        session_id: String,
+        note: String,
+    },
+    WorkspaceDiff(eix_core::WorkspaceDiffResult),
+    Doctor(Vec<String>),
+    Goal(Option<eix_core::Goal>),
+    Schedules {
+        session_id: Option<String>,
+        schedules: Vec<eix_core::Schedule>,
+    },
+    ScheduleAdded(eix_core::Schedule),
+    SchedulesRemoved {
+        removed: usize,
+    },
     Todos(Vec<eix_core::TodoItem>),
     ShellRan {
         ok: bool,
@@ -725,10 +783,124 @@ async fn dispatch(
         }
         Command::Undo { session_id, redo } => {
             let method = if redo { "session.redo" } else { "session.undo" };
-            requester
+            let value = requester
                 .request(method, json!({ "session_id": session_id }))
                 .await?;
-            send(events, Event::Rewritten(session_id))
+            let result: eix_core::UndoResult = decode(value)?;
+            let mut note = if redo {
+                format!("{} event(s) restored", result.changed)
+            } else {
+                format!("{} event(s) hidden", result.changed)
+            };
+            if result.files_restored > 0 || result.files_removed > 0 {
+                note.push_str(&format!(
+                    " · {} file(s) restored, {} removed",
+                    result.files_restored, result.files_removed
+                ));
+            }
+            if let Some(warning) = result.warnings.first() {
+                note.push_str(&format!(" · {warning}"));
+            }
+            send(events, Event::Rewritten { session_id, note })
+        }
+        Command::WorkspaceDiff { session_id, staged } => {
+            let value = requester
+                .request(
+                    "session.diff",
+                    json!({ "session_id": session_id, "staged": staged }),
+                )
+                .await?;
+            let result: eix_core::WorkspaceDiffResult = decode(value)?;
+            send(events, Event::WorkspaceDiff(result))
+        }
+        Command::Doctor => {
+            let value = requester.request("doctor.report", Value::Null).await?;
+            let report: eix_core::DoctorReport = decode(value)?;
+            send(events, Event::Doctor(report.lines))
+        }
+        Command::RenameSession { session_id, name } => {
+            let value = requester
+                .request(
+                    "session.rename",
+                    json!({ "session_id": session_id, "name": name }),
+                )
+                .await?;
+            let result: eix_core::SessionResult = decode(value)?;
+            send(events, Event::Updated(result.session))
+        }
+        Command::Goal {
+            session_id,
+            text,
+            done,
+            clear,
+        } => {
+            let value = requester
+                .request(
+                    "session.goal",
+                    json!({
+                        "session_id": session_id,
+                        "text": text,
+                        "done": done,
+                        "clear": clear,
+                    }),
+                )
+                .await?;
+            let result: eix_core::GoalResult = decode(value)?;
+            send(events, Event::Goal(result.goal))
+        }
+        Command::ListSchedules { session_id } => {
+            let value = requester
+                .request("schedule.list", json!({ "session_id": session_id }))
+                .await?;
+            let result: eix_core::ScheduleListResult = decode(value)?;
+            send(
+                events,
+                Event::Schedules {
+                    session_id,
+                    schedules: result.schedules,
+                },
+            )
+        }
+        Command::AddSchedule {
+            session_id,
+            kind,
+            prompt,
+            interval_secs,
+            at,
+        } => {
+            let value = requester
+                .request(
+                    "schedule.add",
+                    json!({
+                        "session_id": session_id,
+                        "kind": kind,
+                        "prompt": prompt,
+                        "interval_secs": interval_secs,
+                        "at": at,
+                    }),
+                )
+                .await?;
+            let schedule: eix_core::Schedule = decode(value)?;
+            send(events, Event::ScheduleAdded(schedule))
+        }
+        Command::RemoveSchedules {
+            id,
+            session_id,
+            kind,
+        } => {
+            let value = requester
+                .request(
+                    "schedule.remove",
+                    json!({ "id": id, "session_id": session_id, "kind": kind }),
+                )
+                .await?;
+            let result: eix_core::ScheduleRemoveResult = decode(value)?;
+            send(
+                events,
+                Event::SchedulesRemoved {
+                    removed: result.removed,
+                },
+            )
         }
         Command::ReloadConfig => {
             let value = requester.request("config.reload", Value::Null).await?;

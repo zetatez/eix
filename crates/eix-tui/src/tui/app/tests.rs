@@ -755,7 +755,7 @@ fn tab_layout_renders_all_tabs_but_only_the_active_pane() {
         .expect("tab strip");
     let prompt_top = tab_row + 1;
     assert!(lines[prompt_top].contains('╭'), "{rendered}");
-    assert!(status_bar_row(&rendered).contains("Build  ·"), "{rendered}");
+    assert!(status_bar_row(&rendered).contains("Build ·"), "{rendered}");
 }
 
 #[test]
@@ -3332,7 +3332,7 @@ fn command_line_menu_navigates_with_ctrl_keys() {
         .into_iter()
         .map(|spec| spec.name.as_str())
         .collect();
-    assert_eq!(names, vec!["ready", "reload", "redo"]);
+    assert_eq!(names, vec!["ready", "reload", "redo", "rename"]);
     assert_eq!(app.cmdline_menu_cursor, None);
 
     app.handle_key(
@@ -5722,13 +5722,13 @@ fn status_bar_keeps_every_session_mode_aligned() {
     let reference = left(&app);
     assert_eq!(
         reference,
-        " N · Build  · ⠶ · deepseek-v4.1-flash · llmgate · high"
+        " N · Build · ⠶ · deepseek-v4.1-flash · llmgate · high"
     );
     let first_dot = reference.find('·').expect("separator");
 
-    // Every label is padded to Bypass's width, so neither the total line
+    // Every label is padded to Build's width, so neither the total line
     // length nor the first separator moves when the mode changes.
-    for mode in [SessionMode::Plan, SessionMode::Auto, SessionMode::Bypass] {
+    for mode in [SessionMode::Plan, SessionMode::Auto, SessionMode::Full] {
         app.views[0].session.mode = mode;
         let line = left(&app);
         assert_eq!(line.len(), reference.len(), "{mode:?}: {line}");
@@ -5756,7 +5756,7 @@ fn status_bar_colors_every_session_mode_differently() {
         SessionMode::Plan,
         SessionMode::Build,
         SessionMode::Auto,
-        SessionMode::Bypass,
+        SessionMode::Full,
     ] {
         app.views[0].session.mode = mode;
         let line = app.status_bar_left();
@@ -5799,7 +5799,7 @@ fn session_mode_colors_stay_distinct_and_readable_in_every_theme() {
             SessionMode::Plan,
             SessionMode::Build,
             SessionMode::Auto,
-            SessionMode::Bypass,
+            SessionMode::Full,
         ]
         .into_iter()
         .map(|mode| session_mode_color(mode, theme))
@@ -5967,15 +5967,15 @@ fn mode_feedback_stays_out_of_toasts() {
     ));
     app.focused = 0;
 
-    app.status = "mode: bypass".into();
+    app.status = "mode: full".into();
     let text = render_text(&mut app, 80, 20);
     let bar = status_bar_row(&text);
-    assert!(!bar.contains("mode: bypass"), "{bar}");
+    assert!(!bar.contains("mode: full"), "{bar}");
     assert!(
         !text
             .lines()
             .nth(1)
-            .is_some_and(|line| line.contains("mode: bypass")),
+            .is_some_and(|line| line.contains("mode: full")),
         "{text}"
     );
     assert!(app.status_bar_middle().is_none());
@@ -6139,14 +6139,14 @@ fn prompt_normal_mode_tab_cycles_modes() {
     }
 
     app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
-    assert_eq!(app.views[0].session.mode, SessionMode::Bypass);
+    assert_eq!(app.views[0].session.mode, SessionMode::Full);
     assert_eq!(app.status, "ready");
-    match rx.try_recv().expect("set bypass mode") {
+    match rx.try_recv().expect("set full mode") {
         Command::SetMode {
             session_id, mode, ..
         } => {
             assert_eq!(session_id, "s1");
-            assert_eq!(mode, SessionMode::Bypass);
+            assert_eq!(mode, SessionMode::Full);
         }
         _ => panic!("unexpected command"),
     }
@@ -6165,7 +6165,7 @@ fn prompt_normal_mode_shift_tab_cycles_backward() {
     app.status = "ready".into();
     app.handle_input_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
 
-    // Build → Plan, then Plan → Bypass. The reverse walk stays available
+    // Build → Plan, then Plan → Full. The reverse walk stays available
     // from the prompt without a round-trip through the transcript.
     for (key, expected) in [
         (
@@ -6174,7 +6174,7 @@ fn prompt_normal_mode_shift_tab_cycles_backward() {
         ),
         (
             KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT),
-            SessionMode::Bypass,
+            SessionMode::Full,
         ),
     ] {
         app.handle_input_key(key, &tx);
@@ -7556,7 +7556,7 @@ fn perm_command_opens_a_searchable_picker() {
             .map(|item| item.value.as_str())
             .collect::<Vec<_>>()
     };
-    assert_eq!(values, ["plan", "build", "auto", "bypass"]);
+    assert_eq!(values, ["plan", "build", "auto", "full"]);
     let current = app
         .picker
         .as_ref()
@@ -7567,7 +7567,7 @@ fn perm_command_opens_a_searchable_picker() {
         .expect("build row");
     assert!(current.label.contains("(current)"), "{:?}", current.label);
 
-    app.picker.as_mut().expect("picker").query = "bypass".into();
+    app.picker.as_mut().expect("picker").query = "full".into();
     app.picker.as_mut().expect("picker").selected = 0;
     app.picker_enter(PickerKind::Modes, &tx);
     assert!(app.picker.is_none());
@@ -7577,7 +7577,7 @@ fn perm_command_opens_a_searchable_picker() {
             selected = Some(mode);
         }
     }
-    assert_eq!(selected, Some(SessionMode::Bypass));
+    assert_eq!(selected, Some(SessionMode::Full));
 }
 
 #[test]
@@ -7643,7 +7643,7 @@ fn tab_and_shift_tab_cycle_every_session_mode() {
     assert_eq!(app.views[0].session.mode, SessionMode::Build);
     for expected in [
         SessionMode::Auto,
-        SessionMode::Bypass,
+        SessionMode::Full,
         SessionMode::Plan,
         SessionMode::Build,
     ] {
@@ -7655,11 +7655,11 @@ fn tab_and_shift_tab_cycle_every_session_mode() {
         }
     }
 
-    // Shift-Tab mirrors the ring: Build → Plan → Bypass → Auto → Build.
+    // Shift-Tab mirrors the ring: Build → Plan → Full → Auto → Build.
     // Terminals encode it as either BackTab or Shift+Tab; both must work.
     for (step, expected) in [
         SessionMode::Plan,
-        SessionMode::Bypass,
+        SessionMode::Full,
         SessionMode::Auto,
         SessionMode::Build,
     ]
@@ -7695,7 +7695,7 @@ fn leader_m_still_opens_the_full_mode_picker() {
         .iter()
         .map(|item| item.value.as_str())
         .collect();
-    assert_eq!(values, ["plan", "build", "auto", "bypass"]);
+    assert_eq!(values, ["plan", "build", "auto", "full"]);
     assert!(
         rx.try_recv().is_err(),
         "opening the picker must not change the mode"
@@ -7791,7 +7791,7 @@ fn prompt_border_stays_below_the_draft_inside_the_box() {
     assert!(!lines[bottom_row - 1].contains("Build"), "{rendered}");
     assert!(!lines[bottom_row - 1].contains("deepseek"), "{rendered}");
     let status_row = status_bar_row(&rendered);
-    assert!(status_row.contains(" I · Build  ·"), "{rendered}");
+    assert!(status_row.contains(" I · Build ·"), "{rendered}");
     assert!(status_row.contains("deepseek-v4.1-flash"), "{rendered}");
     assert!(status_row.contains("llmgate"), "{rendered}");
     assert!(status_row.contains("· high"), "{rendered}");
@@ -7822,7 +7822,7 @@ fn status_bar_keeps_workspace_metadata_when_narrow() {
     let rendered = render_text(&mut app, 40, 20);
     let bar = status_bar_row(&rendered);
     assert!(bar.contains("/tmp · main"), "{bar}");
-    assert!(bar.contains("Build  ·"), "{bar}");
+    assert!(bar.contains("Build ·"), "{bar}");
     assert!(UnicodeWidthStr::width(bar) <= 40, "{bar}");
 }
 
@@ -7880,7 +7880,7 @@ fn prompt_is_a_minimal_styled_panel_with_command_menu() {
     app.connected = true;
 
     let empty = render_text(&mut app, 80, 20);
-    assert!(empty.contains("Build  · ◰"), "{empty}");
+    assert!(empty.contains("Build · ◰"), "{empty}");
     assert!(!empty.contains("eixd"), "no footer brand: {empty}");
     assert!(!empty.contains("/cmds"), "no footer hints: {empty}");
     assert!(empty.contains("1 ◰ prompt polish"), "{empty}");
@@ -7908,7 +7908,7 @@ fn prompt_is_a_minimal_styled_panel_with_command_menu() {
     assert!(!lines[top_border].contains("~/git/eix"), "{empty}");
     assert!(!lines[prompt_bottom - 1].contains(" N "), "{empty}");
     assert!(!lines[prompt_bottom - 1].contains("Build"), "{empty}");
-    assert!(status_bar.contains(" N · Build  ·"), "{empty}");
+    assert!(status_bar.contains(" N · Build ·"), "{empty}");
     assert!(status_bar.contains("~/git/eix"), "{empty}");
     assert!(!lines[prompt_bottom - 1].contains("gpt-5"), "{empty}");
     assert!(status_bar.contains("gpt-5"), "{empty}");
@@ -7948,7 +7948,7 @@ fn status_feedback_uses_top_right_toasts() {
         "model: loading provider catalogs…",
         "approvals · Enter opens · y/n answer · Esc closes",
         "layout: grid",
-        "mode: bypass",
+        "mode: full",
         "pane closed",
         "no tasks",
         "no MCP servers configured (see [mcp.servers])",
@@ -7976,13 +7976,13 @@ fn status_feedback_uses_top_right_toasts() {
     app.status = "retrying 2/5".into();
     let text = render_text(&mut app, 80, 20);
     let bar = status_bar_row(&text);
-    assert!(bar.contains("Build  ·"), "{bar}");
+    assert!(bar.contains("Build ·"), "{bar}");
     assert!(!bar.contains("retrying 2/5"), "{bar}");
     assert!(bar.contains("gpt-5"), "{bar}");
 
     // The primary group is ordered Vim mode → agent mode → model →
     // provider → reasoning, and cwd stays pinned to the right edge.
-    assert!(bar.trim_start().starts_with("N · Build  ·"), "{bar}");
+    assert!(bar.trim_start().starts_with("N · Build ·"), "{bar}");
     let vim_mode = bar.find('N').unwrap();
     let build = bar.find("Build").unwrap();
     let model = bar.find("gpt-5").unwrap();
@@ -8017,7 +8017,7 @@ fn status_feedback_uses_top_right_toasts() {
     app.focus = Focus::Transcript;
     let text = render_text(&mut app, 80, 20);
     let bar = status_bar_row(&text);
-    assert!(bar.trim_start().starts_with("N · Build  ·"), "{text}");
+    assert!(bar.trim_start().starts_with("N · Build ·"), "{text}");
 }
 
 #[test]
@@ -8211,6 +8211,36 @@ fn default_theme_keeps_the_prompt_transparent() {
 }
 
 #[test]
+fn default_theme_defers_borders_and_accents_to_the_terminal() {
+    let theme = Theme::default();
+    assert_eq!(composer_accent(theme), Color::Reset);
+    assert_eq!(composer_focus(theme), Color::Reset);
+    assert_eq!(composer_border(theme), Color::DarkGray);
+    assert_eq!(composer_inactive_border(theme), Color::DarkGray);
+
+    // Presets still paint their own accent hue.
+    let preset = Theme::from_config(&eix_core::ThemeConfig {
+        preset: Some("dark-github".into()),
+        ..Default::default()
+    });
+    assert!(matches!(composer_accent(preset), Color::Rgb(..)));
+}
+
+#[test]
+fn default_theme_inverts_mode_badges_instead_of_filling_them() {
+    let style = composer_mode_style(Mode::Normal, true, Theme::default());
+    assert_eq!(style.bg, None, "default badge should not paint a fill");
+    assert!(style.add_modifier.contains(Modifier::REVERSED));
+
+    let preset = Theme::from_config(&eix_core::ThemeConfig {
+        preset: Some("dark-github".into()),
+        ..Default::default()
+    });
+    let style = composer_mode_style(Mode::Normal, true, preset);
+    assert_eq!(style.bg, Some(composer_accent(preset)));
+}
+
+#[test]
 fn prompt_errors_render_in_a_dialog_not_the_input_header() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
@@ -8221,7 +8251,7 @@ fn prompt_errors_render_in_a_dialog_not_the_input_header() {
     app.error = Some("provider returned 500".into());
 
     let text = render_text(&mut app, 80, 20);
-    assert!(text.contains("Build  ·"), "{text}");
+    assert!(text.contains("Build ·"), "{text}");
     assert!(!text.contains("error: provider returned 500"), "{text}");
     assert!(text.contains(" error "), "{text}");
     assert!(text.contains("provider returned 500"), "{text}");
@@ -8254,4 +8284,219 @@ fn a_message_mentioning_slash_exit_is_still_sent() {
         Command::Submit { text, .. } => assert_eq!(text, "please run /exit later"),
         _ => panic!("expected a submit"),
     }
+}
+
+fn find_command(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>,
+    matches: impl Fn(&Command) -> bool,
+) -> Option<Command> {
+    while let Ok(command) = rx.try_recv() {
+        if matches(&command) {
+            return Some(command);
+        }
+    }
+    None
+}
+
+#[test]
+fn rename_diff_doctor_goal_and_schedules_dispatch_to_the_daemon() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+
+    assert!(app.handle_prompt_command("/rename auth flow", &tx));
+    assert!(matches!(
+        find_command(&mut rx, |command| matches!(command, Command::RenameSession { .. })),
+        Some(Command::RenameSession { name, .. }) if name == "auth flow"
+    ));
+
+    assert!(app.handle_prompt_command("/diff staged", &tx));
+    assert!(matches!(
+        find_command(&mut rx, |command| matches!(
+            command,
+            Command::WorkspaceDiff { .. }
+        )),
+        Some(Command::WorkspaceDiff { staged: true, .. })
+    ));
+
+    assert!(app.handle_prompt_command("/doctor", &tx));
+    assert!(find_command(&mut rx, |command| matches!(command, Command::Doctor)).is_some());
+
+    assert!(app.handle_prompt_command("/goal ship the release", &tx));
+    assert!(matches!(
+        find_command(&mut rx, |command| matches!(command, Command::Goal { .. })),
+        Some(Command::Goal {
+            text: Some(text),
+            done: None,
+            clear: false,
+            ..
+        }) if text == "ship the release"
+    ));
+
+    assert!(app.handle_prompt_command("/goal done", &tx));
+    assert!(matches!(
+        find_command(&mut rx, |command| matches!(command, Command::Goal { .. })),
+        Some(Command::Goal {
+            done: Some(true),
+            ..
+        })
+    ));
+
+    assert!(app.handle_prompt_command("/loop 10m check the build", &tx));
+    assert!(matches!(
+        find_command(&mut rx, |command| matches!(command, Command::AddSchedule { .. })),
+        Some(Command::AddSchedule {
+            kind,
+            interval_secs: 600,
+            prompt,
+            ..
+        }) if kind == "loop" && prompt == "check the build"
+    ));
+
+    assert!(app.handle_prompt_command("/schedule +30m run the tests", &tx));
+    assert!(matches!(
+        find_command(&mut rx, |command| matches!(command, Command::AddSchedule { .. })),
+        Some(Command::AddSchedule {
+            kind,
+            at: Some(at),
+            prompt,
+            ..
+        }) if kind == "once" && prompt == "run the tests" && at > eix_core::now_ms()
+    ));
+
+    assert!(app.handle_prompt_command("/loop stop", &tx));
+    assert!(matches!(
+        find_command(&mut rx, |command| matches!(command, Command::RemoveSchedules { .. })),
+        Some(Command::RemoveSchedules {
+            session_id: Some(_),
+            kind: Some(kind),
+            ..
+        }) if kind == "loop"
+    ));
+}
+
+#[test]
+fn rename_and_schedule_reject_empty_arguments() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+
+    assert!(app.handle_prompt_command("/rename ", &tx));
+    assert!(app
+        .error
+        .as_deref()
+        .is_some_and(|err| err.contains("/rename")));
+    assert!(find_command(&mut rx, |command| matches!(
+        command,
+        Command::RenameSession { .. }
+    ))
+    .is_none());
+
+    assert!(app.handle_prompt_command("/loop nonsense prompt", &tx));
+    assert!(app
+        .error
+        .as_deref()
+        .is_some_and(|err| err.contains("/loop")));
+    assert!(find_command(&mut rx, |command| matches!(
+        command,
+        Command::AddSchedule { .. }
+    ))
+    .is_none());
+}
+
+#[test]
+fn duration_and_schedule_parsing_accepts_compound_units() {
+    use super::command::{parse_duration, parse_schedule_at};
+
+    assert_eq!(parse_duration("90s"), Some(90));
+    assert_eq!(parse_duration("10m"), Some(600));
+    assert_eq!(parse_duration("1h30m"), Some(5_400));
+    assert_eq!(parse_duration("1d"), Some(86_400));
+    assert_eq!(parse_duration("5"), Some(5));
+    assert_eq!(parse_duration("0"), None);
+    assert_eq!(parse_duration("m"), None);
+    assert_eq!(parse_duration("5x"), None);
+
+    let at = parse_schedule_at("+10m").expect("relative schedule");
+    assert!(at >= eix_core::now_ms() + 9 * 60 * 1_000);
+}
+
+#[test]
+fn builtin_review_commands_expand_into_prompts() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+
+    for (command, needle) in [
+        ("/code-review the parser", "Review the current changes"),
+        ("/security-review", "security review"),
+        ("/simplify", "Simplify the code"),
+        ("/verify", "Verify the current change"),
+    ] {
+        assert!(app.handle_prompt_command(command, &tx), "{command}");
+        let Some(Command::Submit { text, .. }) =
+            find_command(&mut rx, |command| matches!(command, Command::Submit { .. }))
+        else {
+            panic!("{command} did not submit a prompt");
+        };
+        assert!(text.contains(needle), "{command}: {text}");
+        assert!(
+            !text.contains("$ARGUMENTS"),
+            "{command} left the placeholder: {text}"
+        );
+        // Pretend the daemon finished the previous turn; otherwise the next
+        // command is queued instead of submitted.
+        app.submitting = false;
+        app.submitting_session = None;
+    }
+
+    // The focus argument is appended to the template.
+    assert!(app.handle_prompt_command("/code-review the parser", &tx));
+    let Some(Command::Submit { text, .. }) =
+        find_command(&mut rx, |command| matches!(command, Command::Submit { .. }))
+    else {
+        panic!("code-review did not submit a prompt");
+    };
+    assert!(text.contains("the parser"), "{text}");
+}
+
+#[test]
+fn text_overlay_scrolls_and_closes() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+    app.handle_event(
+        Event::WorkspaceDiff(eix_core::WorkspaceDiffResult {
+            diff: (1..=40)
+                .map(|line| format!("+line {line}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            files: 1,
+            truncated: false,
+            notes: vec!["untracked: new.rs".into()],
+        }),
+        &tx,
+    );
+    let view = app.text_view.as_ref().expect("text overlay");
+    assert!(view.title.contains("diff"));
+    assert_eq!(view.lines.len(), 42, "notes are appended");
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE), &tx);
+    assert_eq!(app.text_view.as_ref().unwrap().scroll, usize::MAX);
+    // Drawing clamps "end" to the last page instead of an out-of-range index.
+    let _ = render_text(&mut app, 80, 20);
+    let scroll = app.text_view.as_ref().unwrap().scroll;
+    assert!(scroll < app.text_view.as_ref().unwrap().lines.len());
+
+    app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+    assert!(app.text_view.is_none());
+}
+
+#[test]
+fn doctor_results_open_in_the_text_overlay() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+    app.handle_event(
+        Event::Doctor(vec!["socket /tmp/eix.sock".into(), "snapshot on".into()]),
+        &tx,
+    );
+    let view = app.text_view.as_ref().expect("doctor overlay");
+    assert_eq!(view.title, "doctor");
+    assert_eq!(view.lines.len(), 2);
 }

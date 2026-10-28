@@ -20,7 +20,8 @@ use super::syntax::{light_background, CodeHighlighter};
 use super::theme::Theme;
 
 const MUTED: Color = Color::Rgb(110, 116, 129);
-const ACCENT: Color = Color::Rgb(122, 162, 247);
+/// Transparent palettes have no accent hue; follow the terminal foreground.
+const ACCENT: Color = Color::Reset;
 const SUCCESS: Color = Color::Rgb(126, 199, 149);
 /// Inline code borrows dwm's default bar blue (#005577). On a dark terminal the
 /// same hue is lifted just enough to stay readable against a transparent

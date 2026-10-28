@@ -1,5 +1,7 @@
 //! Slash command execution.
 
+use chrono::TimeZone;
+
 use super::*;
 
 impl App {
@@ -347,6 +349,155 @@ impl App {
                 }
                 true
             }
+            "rename" => {
+                let Some(session_id) = self.focused_session_id() else {
+                    self.status = "no session yet".into();
+                    return true;
+                };
+                let name = args.trim();
+                if name.is_empty() {
+                    self.error = Some("usage: /rename <name>".into());
+                } else {
+                    self.status = format!("renaming to {name}…");
+                    let _ = tx.send(Command::RenameSession {
+                        session_id,
+                        name: name.to_string(),
+                    });
+                }
+                true
+            }
+            "diff" => {
+                let Some(session_id) = self.focused_session_id() else {
+                    self.status = "no session yet".into();
+                    return true;
+                };
+                let staged = matches!(args, "staged" | "--staged" | "cached");
+                if !args.is_empty() && !staged {
+                    self.error = Some("usage: /diff [staged]".into());
+                    return true;
+                }
+                let _ = tx.send(Command::WorkspaceDiff { session_id, staged });
+                self.status = "loading diff…".into();
+                true
+            }
+            "doctor" => {
+                let _ = tx.send(Command::Doctor);
+                self.status = "running doctor…".into();
+                true
+            }
+            "goal" => {
+                let Some(session_id) = self.focused_session_id() else {
+                    self.status = "no session yet".into();
+                    return true;
+                };
+                let (text, done, clear) = match args {
+                    "" | "status" => (None, None, false),
+                    "clear" | "off" => (None, None, true),
+                    "done" | "complete" => (None, Some(true), false),
+                    "reopen" | "open" => (None, Some(false), false),
+                    text => (Some(text.to_string()), None, false),
+                };
+                let _ = tx.send(Command::Goal {
+                    session_id,
+                    text,
+                    done,
+                    clear,
+                });
+                self.status = "updating goal…".into();
+                true
+            }
+            "loop" => {
+                let Some(session_id) = self.focused_session_id() else {
+                    self.status = "no session yet".into();
+                    return true;
+                };
+                if args.is_empty() || args == "list" {
+                    let _ = tx.send(Command::ListSchedules {
+                        session_id: Some(session_id),
+                    });
+                    self.status = "loading schedules…".into();
+                } else if args == "stop" || args == "clear" {
+                    let _ = tx.send(Command::RemoveSchedules {
+                        id: None,
+                        session_id: Some(session_id),
+                        kind: Some("loop".into()),
+                    });
+                } else {
+                    let (interval, prompt) = args
+                        .split_once(char::is_whitespace)
+                        .map(|(head, rest)| (head, rest.trim()))
+                        .unwrap_or((args, ""));
+                    let Some(seconds) = parse_duration(interval) else {
+                        self.error = Some(
+                            "usage: /loop <interval> <prompt> · e.g. /loop 10m check the build"
+                                .into(),
+                        );
+                        return true;
+                    };
+                    if prompt.is_empty() {
+                        self.error = Some("usage: /loop <interval> <prompt>".into());
+                        return true;
+                    }
+                    let _ = tx.send(Command::AddSchedule {
+                        session_id,
+                        kind: "loop".into(),
+                        prompt: prompt.to_string(),
+                        interval_secs: seconds,
+                        at: None,
+                    });
+                    self.status = format!("starting a loop every {interval}…");
+                }
+                true
+            }
+            "schedule" => {
+                let Some(session_id) = self.focused_session_id() else {
+                    self.status = "no session yet".into();
+                    return true;
+                };
+                if args.is_empty() || args == "list" {
+                    let _ = tx.send(Command::ListSchedules {
+                        session_id: Some(session_id),
+                    });
+                    self.status = "loading schedules…".into();
+                } else if let Some(id) = args.strip_prefix("stop ") {
+                    let _ = tx.send(Command::RemoveSchedules {
+                        id: Some(id.trim().to_string()),
+                        session_id: None,
+                        kind: None,
+                    });
+                } else if args == "stop" || args == "clear" {
+                    let _ = tx.send(Command::RemoveSchedules {
+                        id: None,
+                        session_id: Some(session_id),
+                        kind: Some("once".into()),
+                    });
+                } else {
+                    let (when, prompt) = args
+                        .split_once(char::is_whitespace)
+                        .map(|(head, rest)| (head, rest.trim()))
+                        .unwrap_or((args, ""));
+                    let Some(at) = parse_schedule_at(when) else {
+                        self.error = Some(
+                            "usage: /schedule <+duration|HH:MM> <prompt> · e.g. /schedule +30m run tests"
+                                .into(),
+                        );
+                        return true;
+                    };
+                    if prompt.is_empty() {
+                        self.error = Some("usage: /schedule <when> <prompt>".into());
+                        return true;
+                    }
+                    let _ = tx.send(Command::AddSchedule {
+                        session_id,
+                        kind: "once".into(),
+                        prompt: prompt.to_string(),
+                        interval_secs: 0,
+                        at: Some(at),
+                    });
+                    self.status = format!("scheduling for {when}…");
+                }
+                true
+            }
             "perm" => {
                 self.command_mode(args, tx);
                 true
@@ -588,7 +739,7 @@ already exists, update it in place rather than rewriting it from scratch.";
                 });
             }
             Err(()) => {
-                self.error = Some("usage: /perm plan | build | auto | bypass".into());
+                self.error = Some("usage: /perm plan | build | auto | full".into());
             }
         }
     }
@@ -602,4 +753,67 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.status = format!("setting subagents to {value}…");
         let _ = tx.send(Command::SetSubagentConcurrency { value });
     }
+}
+
+/// Parse `30s`, `10m`, `2h`, `1h30m`, `1d`, or a bare number of seconds.
+pub(super) fn parse_duration(text: &str) -> Option<u64> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut total = 0u64;
+    let mut number = 0u64;
+    let mut digits = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            number = number
+                .saturating_mul(10)
+                .saturating_add(u64::from(ch as u8 - b'0'));
+            digits = true;
+            continue;
+        }
+        let scale = match ch {
+            's' => 1,
+            'm' => 60,
+            'h' => 3_600,
+            'd' => 86_400,
+            _ => return None,
+        };
+        if !digits {
+            return None;
+        }
+        total = total.saturating_add(number.saturating_mul(scale));
+        number = 0;
+        digits = false;
+    }
+    if digits {
+        total = total.saturating_add(number);
+    }
+    (total > 0).then_some(total)
+}
+
+/// Parse a one-shot time: `+30m` (relative), `30m` (relative) or `HH:MM`
+/// (today, or tomorrow when that time already passed).
+pub(super) fn parse_schedule_at(text: &str) -> Option<i64> {
+    let text = text.trim();
+    if let Some(rest) = text.strip_prefix('+') {
+        let seconds = parse_duration(rest)?;
+        return Some(eix_core::now_ms() + seconds as i64 * 1_000);
+    }
+    if let Some((hour, minute)) = text.split_once(':') {
+        let hour: u32 = hour.parse().ok()?;
+        let minute: u32 = minute.parse().ok()?;
+        if hour > 23 || minute > 59 {
+            return None;
+        }
+        let now = chrono::Local::now();
+        let naive = now.date_naive().and_hms_opt(hour, minute, 0)?;
+        let mut at = chrono::Local.from_local_datetime(&naive).single()?;
+        if at <= now {
+            at += chrono::Duration::days(1);
+        }
+        return Some(at.timestamp_millis());
+    }
+    let seconds = parse_duration(text)?;
+    Some(eix_core::now_ms() + seconds as i64 * 1_000)
 }

@@ -919,7 +919,8 @@ impl Transcript {
 
 const TEXT: Color = Color::Rgb(220, 223, 228);
 const MUTED: Color = Color::Rgb(110, 116, 129);
-const ACCENT: Color = Color::Rgb(122, 162, 247);
+/// Transparent palettes have no accent hue; follow the terminal foreground.
+const ACCENT: Color = Color::Reset;
 const SUCCESS: Color = Color::Rgb(126, 199, 149);
 const DANGER: Color = Color::Rgb(231, 130, 132);
 const WARN: Color = Color::Rgb(229, 192, 123);

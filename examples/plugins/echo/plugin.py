@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Minimal eix server plugin.
+"""Minimal eix server plugin (plugin API v2).
 
-Wire format: one JSON object per line on stdin/stdout. Host requests and
-plugin requests share the same shape (``id`` + ``method`` + ``params``);
-notifications have no ``id``.
+Wire format: JSON-RPC 2.0, one object per line on stdin/stdout. The daemon can
+send several requests at once, so responses are matched by ``id`` rather than
+by order. Notifications (events, ``$/cancel``, ``shutdown``) carry no ``id``.
 
-The plugin advertises two tools, one prompt command and a ``session.*`` event
-subscription. ``remember`` / ``recall`` use the host-managed KV store, scoped
-to the plugin name, so it never sees another plugin's data.
+The plugin advertises two tools, one prompt command, a declarative command
+declared in ``eix-plugin.toml``, and a ``session.*`` event subscription.
+``remember`` / ``recall`` use the host-managed KV store, scoped to the plugin
+name, so the plugin never sees another plugin's data.
 """
 
 import json
 import sys
 
 PLUGIN_NAME = "echo"
-API_VERSION = 1
+API_VERSION = 2
+PROTOCOL_VERSION = 2
 _next_host_id = 1000
+
+# JSON-RPC 2.0 error codes used by this example.
+METHOD_NOT_FOUND = -32601
+INVALID_PARAMS = -32602
+INTERNAL = -32603
 
 
 def send(value):
@@ -24,7 +31,7 @@ def send(value):
 
 
 def reply(request_id, result=None, error=None):
-    message = {"id": request_id}
+    message = {"jsonrpc": "2.0", "id": request_id}
     if error is not None:
         message["error"] = error
     else:
@@ -32,17 +39,30 @@ def reply(request_id, result=None, error=None):
     send(message)
 
 
+def text(value):
+    """One text content block."""
+    return {"type": "text", "text": value}
+
+
 def host_request(method, params):
     """Call a daemon host method and wait for its matching response.
 
-    Event notifications can arrive while we wait; ignore them. The daemon
-    handles this request from inside its own request loop, so a plugin can
-    safely use storage during a tool call or during initialize.
+    The daemon may interleave notifications and requests from other calls while
+    we wait. This example only needs the answer to its own request; a more
+    complete plugin would buffer or dispatch the others instead of dropping
+    them.
     """
     global _next_host_id
     request_id = _next_host_id
     _next_host_id += 1
-    send({"id": request_id, "method": method, "params": params})
+    send(
+        {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }
+    )
     while True:
         line = sys.stdin.readline()
         if not line:
@@ -58,7 +78,8 @@ def host_request(method, params):
 
 
 def initialize(params):
-    # Demonstrate the host RPC path without making startup depend on it.
+    # `host.log` is also accepted as a notification, but using the request form
+    # here shows how a plugin waits for a host acknowledgement.
     try:
         host_request(
             "host.log",
@@ -71,6 +92,7 @@ def initialize(params):
         "name": PLUGIN_NAME,
         "version": "0.1.0",
         "api_version": API_VERSION,
+        "features": ["content_blocks", "cancel"],
         "tools": [
             {
                 "name": "word_count",
@@ -122,18 +144,25 @@ def call_tool(params):
     name = params.get("tool")
     arguments = params.get("arguments") or {}
     if name == "word_count":
-        text = str(arguments.get("text", ""))
-        return {"ok": True, "output": f"{len(text.split())} word(s)"}
+        value = str(arguments.get("text", ""))
+        return {
+            "ok": True,
+            "content": [text(f"{len(value.split())} word(s)")],
+        }
     if name == "remember":
         key = str(arguments.get("key", "")).strip()
         value = str(arguments.get("value", ""))
         if not key:
-            return {"ok": False, "output": "key must not be empty"}
+            return {
+                "ok": False,
+                "is_error": True,
+                "content": [text("key must not be empty")],
+            }
         host_request(
             "host.storage.set",
             {"scope": "global", "key": key, "value": value},
         )
-        return {"ok": True, "output": f"remembered {key}"}
+        return {"ok": True, "content": [text(f"remembered {key}")]}
     if name == "recall":
         key = str(arguments.get("key", "")).strip()
         result = host_request(
@@ -141,8 +170,15 @@ def call_tool(params):
             {"scope": "global", "key": key},
         )
         value = result.get("value") if result else None
-        return {"ok": True, "output": value if value is not None else "(missing)"}
-    return {"ok": False, "output": f"unknown tool {name!r}"}
+        return {
+            "ok": True,
+            "content": [text(value if value is not None else "(missing)")],
+        }
+    return {
+        "ok": False,
+        "is_error": True,
+        "content": [text(f"unknown tool {name!r}")],
+    }
 
 
 def main():
@@ -163,36 +199,44 @@ def main():
         request_id = message.get("id")
         params = message.get("params") or {}
 
-        # Event notifications from the daemon have no id.
+        # Notifications have no id. Events, cancellation and shutdown use this
+        # shape.
         if method is not None and request_id is None:
             if method == "shutdown":
                 return
+            if method == "$/cancel":
+                continue
             if method.startswith("session."):
-                print(
-                    f"echo plugin: event {method}",
-                    file=sys.stderr,
-                )
+                print(f"echo plugin: event {method}", file=sys.stderr)
             continue
 
         try:
             if method == "initialize":
+                protocol = params.get("protocol_version")
+                if protocol != PROTOCOL_VERSION:
+                    reply(
+                        request_id,
+                        error={
+                            "code": INVALID_PARAMS,
+                            "message": f"unsupported protocol version {protocol!r}",
+                        },
+                    )
+                    continue
                 reply(request_id, initialize(params))
             elif method == "tools/call":
                 reply(request_id, call_tool(params))
-            elif method == "host.ping":
-                reply(request_id, {"pong": True})
             else:
                 reply(
                     request_id,
                     error={
-                        "code": "unsupported",
+                        "code": METHOD_NOT_FOUND,
                         "message": f"unknown method {method!r}",
                     },
                 )
         except Exception as exc:
             reply(
                 request_id,
-                error={"code": "plugin_error", "message": str(exc)},
+                error={"code": INTERNAL, "message": str(exc)},
             )
 
 

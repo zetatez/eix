@@ -1,11 +1,14 @@
 //! Plugin manifest and protocol types.
 //!
 //! Plugins are out-of-process programs. `eixd` starts one child per enabled
-//! plugin, speaks newline-delimited JSON over stdin/stdout, and only exposes
-//! host capabilities that were granted in configuration. The process boundary
-//! keeps a crashing plugin away from sessions, approvals and the event log;
-//! it is not an OS sandbox, so a plugin still runs with the daemon user's
+//! plugin, speaks newline-delimited JSON-RPC 2.0 over stdin/stdout, and only
+//! exposes host capabilities granted in configuration. The process boundary
+//! keeps a crashing plugin away from sessions, approvals and the event log; it
+//! is not an OS sandbox, so a plugin still runs with the daemon user's
 //! permissions.
+//!
+//! This module is the wire contract. The daemon host lives in
+//! `eixd/src/plugin/`; the design notes live in `docs/plugins.md`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -13,8 +16,9 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Bumped when the plugin handshake or wire messages become incompatible.
-pub const PLUGIN_API_VERSION: u32 = 1;
+/// Bumped when the handshake or wire messages become incompatible. The host
+/// only starts plugins that advertise the same major version.
+pub const PLUGIN_API_VERSION: u32 = 2;
 
 /// Every model-visible plugin tool starts with this prefix. Exposed names are
 /// `plugin__<plugin>__<tool>`; the host keeps the real mapping.
@@ -24,8 +28,11 @@ pub const PLUGIN_TOOL_PREFIX: &str = "plugin__";
 /// built-in `/command` or a user Markdown command.
 pub const PLUGIN_COMMAND_PREFIX: &str = "plugin/";
 
+/// The only JSON-RPC version the plugin protocol accepts.
+pub const JSONRPC_VERSION: &str = "2.0";
+
 /// A capability a plugin can request. The daemon grants a subset from config;
-/// a contribution is ignored unless its capability was granted.
+/// a contribution is rejected unless its capability was granted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PluginCapability {
@@ -37,20 +44,24 @@ pub enum PluginCapability {
     Events,
     /// Use the host-managed global/workspace KV store.
     Storage,
-    /// Run in the hook pipeline (reserved for the next phase).
+    /// Run in the hook pipeline.
     Hooks,
-    /// Expose plugin RPC methods to other plugins (reserved).
+    /// Expose plugin RPC methods to other plugins.
     Rpc,
-    /// Contribute TUI widgets/commands (reserved for the TUI host).
+    /// Contribute TUI views, pickers and status fragments.
     Ui,
-    /// Make outbound network requests through the host (reserved).
+    /// Make outbound network requests through the host.
     Network,
-    /// Read workspace files through the host (reserved).
+    /// Read workspace files through the host.
     WorkspaceRead,
-    /// Write workspace files through the host (reserved).
+    /// Write workspace files through the host.
     WorkspaceWrite,
-    /// Read host secrets (reserved).
+    /// Read host secrets.
     Secrets,
+    /// Register background jobs.
+    Jobs,
+    /// Read session metadata.
+    SessionsRead,
 }
 
 impl PluginCapability {
@@ -67,12 +78,13 @@ impl PluginCapability {
             Self::WorkspaceRead => "workspace_read",
             Self::WorkspaceWrite => "workspace_write",
             Self::Secrets => "secrets",
+            Self::Jobs => "jobs",
+            Self::SessionsRead => "sessions_read",
         }
     }
 }
 
-/// One process entry point in a manifest. A package can expose a server
-/// component, a UI component, or both.
+/// One process entry point in a manifest.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginComponent {
@@ -85,24 +97,68 @@ pub struct PluginComponent {
     pub entry: Option<PathBuf>,
 }
 
+/// Components shipped by one package. A package can be declarative only, or
+/// add a server process, a UI process, or both.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginComponents {
+    pub server: Option<PluginComponent>,
+    pub ui: Option<PluginComponent>,
+}
+
+/// A prompt command declared directly in the manifest. Declarative commands
+/// do not need a server process.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ManifestCommand {
+    pub name: String,
+    pub description: String,
+    /// Hint shown next to the command in the menu, e.g. `[query]`.
+    pub args: String,
+    /// Prompt template expanded by the frontend with `$ARGUMENTS` / `$1..$9`.
+    pub prompt: String,
+}
+
+/// Static contributions declared in the manifest.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginContributions {
+    pub commands: Vec<ManifestCommand>,
+}
+
 /// `eix-plugin.toml` next to a plugin's entry point.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginManifest {
+    /// Manifest schema. Only `2` is supported; v1 manifests are rejected.
+    #[serde(default = "default_schema")]
+    pub schema: u32,
     pub name: String,
     #[serde(default)]
     pub version: String,
     #[serde(default)]
     pub description: String,
+    /// Major protocol version the package implements.
     #[serde(default = "default_api_version")]
     pub api_version: u32,
+    /// Advisory minimum host version. The host records it but does not
+    /// enforce it yet.
+    #[serde(default)]
+    pub min_host_version: Option<String>,
     /// Capabilities the package would like to use. The host still applies the
     /// narrower grant from config.
     #[serde(default)]
     pub capabilities: Vec<PluginCapability>,
     #[serde(default)]
-    pub server: Option<PluginComponent>,
+    pub components: PluginComponents,
     #[serde(default)]
-    pub ui: Option<PluginComponent>,
+    pub contributes: PluginContributions,
+    /// Optional JSON Schema for plugin settings, rendered by the TUI.
+    #[serde(default)]
+    pub settings: Option<PathBuf>,
+}
+
+fn default_schema() -> u32 {
+    2
 }
 
 fn default_api_version() -> u32 {
@@ -112,13 +168,16 @@ fn default_api_version() -> u32 {
 impl Default for PluginManifest {
     fn default() -> Self {
         Self {
+            schema: default_schema(),
             name: String::new(),
             version: String::new(),
             description: String::new(),
             api_version: PLUGIN_API_VERSION,
+            min_host_version: None,
             capabilities: Vec::new(),
-            server: None,
-            ui: None,
+            components: PluginComponents::default(),
+            contributes: PluginContributions::default(),
+            settings: None,
         }
     }
 }
@@ -142,6 +201,12 @@ impl PluginManifest {
     }
 
     pub fn validate(&self) -> Result<(), String> {
+        if self.schema != 2 {
+            return Err(format!(
+                "unsupported manifest schema {}; only schema 2 is supported",
+                self.schema
+            ));
+        }
         if self.name.trim().is_empty() {
             return Err("plugin name is empty".into());
         }
@@ -158,14 +223,39 @@ impl PluginManifest {
                 self.api_version, PLUGIN_API_VERSION
             ));
         }
-        if self.server.is_none() && self.ui.is_none() {
-            return Err("manifest needs a [server] or [ui] component".into());
+        if self.components.server.is_none()
+            && self.components.ui.is_none()
+            && self.contributes.commands.is_empty()
+        {
+            return Err("manifest needs a server component, a ui component, or a command".into());
         }
-        for (label, component) in [("server", &self.server), ("ui", &self.ui)] {
+        for (label, component) in [
+            ("components.server", &self.components.server),
+            ("components.ui", &self.components.ui),
+        ] {
             if let Some(component) = component {
                 if component.command.trim().is_empty() && component.entry.is_none() {
                     return Err(format!("[{label}] needs `command` or `entry`"));
                 }
+            }
+        }
+        for command in &self.contributes.commands {
+            if !valid_tool_name(&command.name) {
+                return Err(format!(
+                    "declarative command name {:?} must contain only letters, digits, '.', '_' or '-', without '__'",
+                    command.name
+                ));
+            }
+            if command.prompt.trim().is_empty() {
+                return Err(format!(
+                    "declarative command {:?} needs a non-empty prompt",
+                    command.name
+                ));
+            }
+        }
+        if let Some(settings) = &self.settings {
+            if settings.as_os_str().is_empty() {
+                return Err("settings schema path is empty".into());
             }
         }
         Ok(())
@@ -173,8 +263,18 @@ impl PluginManifest {
 
     /// Resolve the server command. `base` is the manifest's directory.
     pub fn server_command(&self, base: &Path) -> Option<(String, Vec<String>)> {
-        let component = self.server.as_ref()?;
-        Some(resolve_component(component, base))
+        self.components
+            .server
+            .as_ref()
+            .map(|component| resolve_component(component, base))
+    }
+
+    /// Resolve the UI command. `base` is the manifest's directory.
+    pub fn ui_command(&self, base: &Path) -> Option<(String, Vec<String>)> {
+        self.components
+            .ui
+            .as_ref()
+            .map(|component| resolve_component(component, base))
     }
 }
 
@@ -202,8 +302,7 @@ fn resolve_component(component: &PluginComponent, base: &Path) -> (String, Vec<S
     }
     // A bare command (`python3`) is looked up on PATH. A command containing a
     // path component (`./bin/server`) is relative to the manifest, matching
-    // how `entry` is resolved. Without this, it would silently resolve against
-    // the daemon's cwd instead.
+    // how `entry` is resolved.
     let command_path = Path::new(&component.command);
     let command = if !command_path.is_absolute()
         && command_path
@@ -217,13 +316,13 @@ fn resolve_component(component: &PluginComponent, base: &Path) -> (String, Vec<S
     (command, args)
 }
 
-/// One configured server plugin. Mirrors `[mcp.servers.<name>]` so users have
-/// one mental model for child-process extensions.
+/// One configured plugin. Mirrors `[mcp.servers.<name>]` so users have one
+/// mental model for child-process extensions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginConfig {
     /// Program to execute. When empty and `manifest` is set, the manifest's
-    /// `[server]` component supplies it.
+    /// server component supplies it.
     pub command: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
@@ -236,13 +335,15 @@ pub struct PluginConfig {
     /// Optional `eix-plugin.toml`. Relative paths resolve from the config cwd.
     pub manifest: Option<PathBuf>,
     /// Capabilities granted to this plugin. Empty means "the manifest's
-    /// requested capabilities", or tools + commands when there is no manifest.
-    /// Config can narrow, but never widen, a manifest's request.
+    /// requested capabilities". Config can narrow, but never widen, a
+    /// manifest's request.
     pub capabilities: Vec<PluginCapability>,
     /// Only expose matching plugin tool names. Empty means every tool.
     pub allowed_tools: Vec<String>,
     /// Hide matching plugin tool names. Deny wins.
     pub denied_tools: Vec<String>,
+    /// Free-form settings passed to `initialize` and exposed to the plugin.
+    pub settings: BTreeMap<String, Value>,
 }
 
 impl Default for PluginConfig {
@@ -258,6 +359,7 @@ impl Default for PluginConfig {
             capabilities: Vec::new(),
             allowed_tools: Vec::new(),
             denied_tools: Vec::new(),
+            settings: BTreeMap::new(),
         }
     }
 }
@@ -294,19 +396,22 @@ fn wildcard(pattern: &str, text: &str) -> bool {
     walk(pattern.as_bytes(), text.as_bytes())
 }
 
-/// A request in either direction. Host -> plugin uses this shape; plugin ->
-/// host uses the same shape for `host.*` methods.
+/// A JSON-RPC 2.0 request. The same shape travels in both directions; the
+/// host dispatches incoming requests whose method starts with `host.`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginRequest {
+pub struct RpcRequest {
+    #[serde(default = "jsonrpc_version")]
+    pub jsonrpc: String,
     pub id: u64,
     pub method: String,
     #[serde(default)]
     pub params: Value,
 }
 
-impl PluginRequest {
+impl RpcRequest {
     pub fn new(id: u64, method: impl Into<String>, params: Value) -> Self {
         Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             method: method.into(),
             params,
@@ -314,69 +419,101 @@ impl PluginRequest {
     }
 }
 
-/// A successful or failed response to a [`PluginRequest`].
+/// A JSON-RPC 2.0 response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginResponse {
+pub struct RpcResponse {
+    #[serde(default = "jsonrpc_version")]
+    pub jsonrpc: String,
     pub id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub error: Option<PluginErrorObject>,
+    pub error: Option<RpcError>,
 }
 
-impl PluginResponse {
+impl RpcResponse {
     pub fn ok<T: Serialize>(id: u64, result: T) -> Self {
         Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             result: Some(serde_json::to_value(result).unwrap_or(Value::Null)),
             error: None,
         }
     }
 
-    pub fn err(id: u64, code: impl Into<String>, message: impl Into<String>) -> Self {
+    pub fn err(id: u64, code: i64, message: impl Into<String>) -> Self {
         Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
             id,
             result: None,
-            error: Some(PluginErrorObject {
-                code: code.into(),
+            error: Some(RpcError {
+                code,
                 message: message.into(),
+                data: None,
             }),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginErrorObject {
-    pub code: String,
+pub struct RpcError {
+    pub code: i64,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
-/// A one-way message. Host event delivery and plugin log forwarding use this.
+/// A one-way JSON-RPC notification. Host event delivery, progress and
+/// cancellation use this shape.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PluginNotification {
+pub struct RpcNotification {
+    #[serde(default = "jsonrpc_version")]
+    pub jsonrpc: String,
     pub method: String,
     #[serde(default)]
     pub params: Value,
 }
 
-impl PluginNotification {
+impl RpcNotification {
     pub fn new<T: Serialize>(method: impl Into<String>, params: T) -> Self {
         Self {
+            jsonrpc: JSONRPC_VERSION.to_string(),
             method: method.into(),
             params: serde_json::to_value(params).unwrap_or(Value::Null),
         }
     }
 }
 
+fn jsonrpc_version() -> String {
+    JSONRPC_VERSION.to_string()
+}
+
+/// Error codes used by the host. Plugin-defined errors may use other values.
+pub mod error_code {
+    pub const INVALID_PARAMS: i64 = -32602;
+    pub const METHOD_NOT_FOUND: i64 = -32601;
+    pub const INTERNAL: i64 = -32603;
+    pub const UNAUTHORIZED: i64 = -32001;
+    pub const UNSUPPORTED: i64 = -32002;
+    pub const TIMEOUT: i64 = -32003;
+    pub const CANCELLED: i64 = -32004;
+    pub const PLUGIN_FAILED: i64 = -32005;
+}
+
 /// Handshake parameters sent to a server plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginInitializeParams {
     pub protocol_version: u32,
+    pub api_version: u32,
     pub plugin: PluginIdentity,
     pub host: PluginIdentity,
+    /// Host features the plugin may use, e.g. `content_blocks`, `cancel`.
+    pub features: Vec<String>,
     pub capabilities: Vec<PluginCapability>,
     #[serde(default)]
     pub workspace: Option<PathBuf>,
+    /// Host-provided config: data directory, settings, and future scoped
+    /// grants. Treat it as read-only.
     #[serde(default)]
     pub config: Value,
 }
@@ -393,14 +530,44 @@ pub struct PluginIdentity {
 pub struct PluginInitializeResult {
     pub name: String,
     pub version: String,
-    /// Must match [`PLUGIN_API_VERSION`]; omitted by older test plugins.
-    #[serde(default = "default_api_version")]
+    /// Must match [`PLUGIN_API_VERSION`].
     pub api_version: u32,
+    /// Feature subset the plugin understands.
+    pub features: Vec<String>,
     pub tools: Vec<PluginTool>,
     pub commands: Vec<PluginCommand>,
     /// Daemon notification methods, e.g. `session.*`, `tool.completed`.
-    /// Empty means no event delivery.
     pub events: Vec<String>,
+    /// Reserved for the hook milestone. Must stay empty for now.
+    pub hooks: Vec<PluginHook>,
+    /// Reserved for the UI milestone. Must stay empty for now.
+    pub ui: Vec<PluginUi>,
+    /// Reserved for the RPC milestone. Must stay empty for now.
+    pub rpc: Vec<PluginRpc>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginHook {
+    pub point: String,
+    pub priority: i32,
+    pub timeout_ms: u64,
+    pub on_error: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUi {
+    pub surface: String,
+    pub id: String,
+    pub title: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginRpc {
+    pub name: String,
+    pub description: String,
 }
 
 /// One model tool from a plugin. Names are plugin-local; the host exposes them
@@ -413,7 +580,7 @@ pub struct PluginTool {
     #[serde(default = "empty_schema")]
     pub input_schema: Value,
     /// Advisory only. The host still treats every plugin call as high risk and
-    /// requires approval.
+    /// requires approval unless the user explicitly trusts read-only tools.
     #[serde(default)]
     pub read_only: bool,
 }
@@ -422,8 +589,7 @@ fn empty_schema() -> Value {
     serde_json::json!({"type": "object", "properties": {}})
 }
 
-/// One prompt command. `prompt` is a template expanded by the frontend using
-/// the same `$ARGUMENTS` / `$1..$9` rules as Markdown commands.
+/// One prompt command advertised at runtime.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginCommand {
     pub name: String,
@@ -452,15 +618,30 @@ pub struct PluginCommandList {
     pub commands: Vec<PluginCommandInfo>,
 }
 
+/// Lifecycle state exposed by `plugin.list`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginState {
+    Disabled,
+    Starting,
+    Ready,
+    Degraded,
+    Failed,
+    Stopped,
+}
+
 /// `plugin.list` row.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginInfo {
     pub name: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub description: String,
     pub enabled: bool,
     #[serde(default)]
     pub command: String,
-    /// `starting`, `running`, `failed` or `stopped`.
-    pub state: String,
+    pub state: PluginState,
     #[serde(default)]
     pub tools: usize,
     #[serde(default)]
@@ -488,7 +669,37 @@ pub struct PluginToolCallParams {
     #[serde(default)]
     pub session_id: Option<String>,
     #[serde(default)]
+    pub workspace: Option<PathBuf>,
+    #[serde(default)]
     pub cwd: Option<PathBuf>,
+}
+
+/// Rich tool output. Large binary payloads should be stored through
+/// `host.blob.put` and referenced by handle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ContentBlock {
+    Text {
+        text: String,
+    },
+    Image {
+        mime: String,
+        blob: String,
+    },
+    Resource {
+        uri: String,
+        #[serde(default)]
+        title: Option<String>,
+        #[serde(default)]
+        mime: Option<String>,
+    },
+    Diff {
+        path: String,
+        patch: String,
+    },
+    Json {
+        value: Value,
+    },
 }
 
 /// `tools/call` result.
@@ -497,7 +708,39 @@ pub struct PluginToolCallResult {
     #[serde(default = "default_true")]
     pub ok: bool,
     #[serde(default)]
-    pub output: String,
+    pub content: Vec<ContentBlock>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured: Option<Value>,
+    #[serde(default)]
+    pub is_error: bool,
+}
+
+impl PluginToolCallResult {
+    /// Flatten the result for the current text-only transcript. Non-text
+    /// blocks become a short placeholder until the TUI renders them.
+    pub fn to_text(&self) -> String {
+        let mut out = Vec::new();
+        for block in &self.content {
+            match block {
+                ContentBlock::Text { text } => out.push(text.clone()),
+                ContentBlock::Image { mime, .. } => out.push(format!("[image {mime}]")),
+                ContentBlock::Resource { uri, title, .. } => out.push(match title {
+                    Some(title) => format!("[resource {title} <{uri}>]"),
+                    None => format!("[resource <{uri}>]"),
+                }),
+                ContentBlock::Diff { path, .. } => out.push(format!("[diff {path}]")),
+                ContentBlock::Json { value } => {
+                    out.push(serde_json::to_string(value).unwrap_or_default())
+                }
+            }
+        }
+        if let Some(structured) = &self.structured {
+            if out.is_empty() {
+                out.push(serde_json::to_string(structured).unwrap_or_default());
+            }
+        }
+        out.join("\n")
+    }
 }
 
 fn default_true() -> bool {
@@ -558,40 +801,77 @@ mod tests {
     use super::*;
 
     #[test]
-    fn manifest_parses_and_resolves_server_entry() {
+    fn manifest_v2_parses_and_resolves_components() {
         let manifest: PluginManifest = toml::from_str(
             r#"
+            schema = 2
             name = "acme"
             version = "0.1.0"
-            api_version = 1
+            api_version = 2
             capabilities = ["tools", "commands"]
 
-            [server]
+            [components.server]
             command = "python3"
             entry = "plugin.py"
+
+            [[contributes.commands]]
+            name = "review"
+            description = "review a file"
+            prompt = "Review $ARGUMENTS"
             "#,
         )
         .unwrap();
         manifest.validate().unwrap();
         assert_eq!(manifest.name, "acme");
-        assert_eq!(
-            manifest.capabilities,
-            vec![PluginCapability::Tools, PluginCapability::Commands]
-        );
         let (command, args) = manifest.server_command(Path::new("/tmp/acme")).unwrap();
         assert_eq!(command, "python3");
         assert_eq!(args, vec!["/tmp/acme/plugin.py"]);
+        assert_eq!(manifest.contributes.commands[0].name, "review");
+    }
+
+    #[test]
+    fn declarative_only_manifest_is_valid() {
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+            schema = 2
+            name = "prompts"
+            api_version = 2
+
+            [[contributes.commands]]
+            name = "triage"
+            prompt = "Triage the issue"
+            "#,
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+    }
+
+    #[test]
+    fn v1_manifest_is_rejected() {
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+            name = "old"
+            api_version = 1
+            [server]
+            command = "true"
+            "#,
+        )
+        .unwrap();
+        assert!(manifest.validate().is_err());
     }
 
     #[test]
     fn entry_only_component_does_not_repeat_the_entry_as_an_arg() {
         let manifest = PluginManifest {
             name: "entry".into(),
-            server: Some(PluginComponent {
-                command: String::new(),
-                args: vec!["--flag".into()],
-                entry: Some(PathBuf::from("plugin.py")),
-            }),
+            components: PluginComponents {
+                server: Some(PluginComponent {
+                    command: String::new(),
+                    args: vec!["--flag".into()],
+                    entry: Some(PathBuf::from("plugin.py")),
+                }),
+                ui: None,
+            },
             ..Default::default()
         };
         let (command, args) = manifest.server_command(Path::new("/tmp/entry")).unwrap();
@@ -614,11 +894,14 @@ mod tests {
     fn relative_server_command_resolves_against_the_manifest_dir() {
         let manifest = PluginManifest {
             name: "relative".into(),
-            server: Some(PluginComponent {
-                command: "./bin/plugin".into(),
-                args: Vec::new(),
-                entry: None,
-            }),
+            components: PluginComponents {
+                server: Some(PluginComponent {
+                    command: "./bin/plugin".into(),
+                    args: Vec::new(),
+                    entry: None,
+                }),
+                ui: None,
+            },
             ..Default::default()
         };
         let (command, args) = manifest.server_command(Path::new("/tmp/relative")).unwrap();
@@ -633,11 +916,14 @@ mod tests {
     fn manifest_rejects_wrong_api_version() {
         let manifest = PluginManifest {
             name: "old".into(),
-            api_version: 0,
-            server: Some(PluginComponent {
-                command: "true".into(),
-                ..Default::default()
-            }),
+            api_version: 1,
+            components: PluginComponents {
+                server: Some(PluginComponent {
+                    command: "true".into(),
+                    ..Default::default()
+                }),
+                ui: None,
+            },
             ..Default::default()
         };
         assert!(manifest.validate().is_err());
@@ -658,10 +944,30 @@ mod tests {
     #[test]
     fn protocol_response_round_trips() {
         let line =
-            serde_json::to_string(&PluginResponse::ok(1, serde_json::json!({"ok": true}))).unwrap();
+            serde_json::to_string(&RpcResponse::ok(1, serde_json::json!({"ok": true}))).unwrap();
         let value: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(value["jsonrpc"], JSONRPC_VERSION);
         assert_eq!(value["id"], 1);
         assert_eq!(value["result"]["ok"], true);
         assert!(value.get("error").is_none());
+    }
+
+    #[test]
+    fn tool_result_flattens_rich_blocks() {
+        let result = PluginToolCallResult {
+            ok: true,
+            content: vec![
+                ContentBlock::Text {
+                    text: "hello".into(),
+                },
+                ContentBlock::Diff {
+                    path: "a.rs".into(),
+                    patch: "@@".into(),
+                },
+            ],
+            structured: None,
+            is_error: false,
+        };
+        assert_eq!(result.to_text(), "hello\n[diff a.rs]");
     }
 }

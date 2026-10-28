@@ -1245,8 +1245,8 @@ fn mode_state(mode: SessionMode) -> Value {
                 "description": "Let the classifier approve low-risk calls"
             },
             {
-                "id": "bypass",
-                "name": "Bypass",
+                "id": "full",
+                "name": "Full",
                 "description": "Skip unruled approvals; hard denies still apply"
             }
         ]

@@ -5,10 +5,10 @@ Bun, Deno and browsers (`fetch`, `ReadableStream`, `AbortSignal`).
 
 The daemon must expose HTTP:
 
-```yaml
-server:
-  http: 127.0.0.1:7778
-  token: "{env:EIX_TOKEN}"
+```toml
+[server]
+http = "127.0.0.1:7778"
+token = "{env:EIX_TOKEN}"
 ```
 
 ```sh

@@ -7,14 +7,14 @@
 daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的前端，Neovim 通过协议接成
 外部插件。关掉终端不会中断正在运行的 turn，下次启动或 attach 即可继续。
 
-[设计文档](./DESIGN.md) · [完整配置模板](./config.tmpl.yaml) · [插件示例](./examples/plugins/echo) ·
-[Neovim 集成](./docs/nvim.md) · [协议契约](./crates/eix-core/src/protocol.rs)
+[设计文档](./DESIGN.md) · [完整配置模板](./config.tmpl.toml) · [插件示例](./examples/plugins/echo) ·
+[插件体系设计](./docs/plugins.md) · [Neovim 集成](./docs/nvim.md) · [协议契约](./crates/eix-core/src/protocol.rs)
 
 ## 为什么是 eix
 
 - **session 是一等公民**：常驻、可 attach/detach、可并行、可模糊切换；关终端不影响运行。
 - **Vim 原生输入**：输入框是内置的模态编辑器，不启动 Neovim 子进程，按键零往返。
-- **默认安全**：Plan / Build / Auto / Bypass 四种执行模式，配合风险分析、bubblewrap 沙箱、
+- **默认安全**：Plan / Build / Auto / Full 四种执行模式，配合风险分析、bubblewrap 沙箱、
   补丁审批、执行前快照和 secret 脱敏。
 - **上下文自动管理**：`AGENTS.md`、workspace summary、工具输出预算、自动压缩和跨 session 记忆
   不需要手动维护。
@@ -26,10 +26,10 @@ daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的
 
 | 领域 | 能力 |
 | --- | --- |
-| Session | 事件日志 + SQLite 持久化、自动命名、attach/detach、fork / rewind、undo/redo、export/import |
+| Session | 事件日志 + SQLite 持久化、自动命名、attach/detach、fork / rewind、undo/redo（对话 + 工作区文件）、export/import |
 | TUI | 多 pane 自动平铺、四种布局、统一 fuzzy picker、Markdown 转录、side-by-side diff、审批收件箱 |
 | 输入 | 内置 Vim 风格编辑器（normal / insert / visual）、leader 键、可配置快捷键、命令面板 |
-| 执行模式 | `plan` 只读、`build` 工作区写入、`auto` 意图分类、`bypass` 放行 |
+| 执行模式 | `plan` 只读、`build` 工作区写入、`auto` 意图分类、`full` 放行 |
 | 安全 | 风险分析、显式规则、bubblewrap 沙箱、补丁审批 + 执行前快照、secret 占位符 |
 | 工具 | `apply_patch` 编辑、`exec_command` / `write_stdin` shell、`update_plan` 计划、`tool_search` 按需发现 MCP/插件工具、web、LSP、图片、子 agent |
 | 上下文 | sector 预算、AGENTS.md、workspace summary、自动 compact、memory / plan |
@@ -60,16 +60,15 @@ cargo build --release
 
 ### 配置 provider
 
-最小配置（和下面的本地配置二选一；`providers` 中恰好一个 `default: true`）：
+最小配置（和下面的本地配置二选一；`providers` 中恰好一个 `default = true`）：
 
-```yaml
-# ~/.config/eix/config.yaml
-providers:
-  openai:
-    default: true
-    base_url: "https://api.openai.com/v1"
-    model: "gpt-4o-mini"
-    api_key_env: "OPENAI_API_KEY"
+```toml
+# ~/.config/eix/config.toml
+[providers.openai]
+default = true
+base_url = "https://api.openai.com/v1"
+model = "gpt-4o-mini"
+api_key_env = "OPENAI_API_KEY"
 ```
 
 ```sh
@@ -79,32 +78,45 @@ export OPENAI_API_KEY=...
 
 本地模型或兼容端点：
 
-```yaml
-providers:
-  local:
-    default: true
-    base_url: "http://localhost:11434/v1"
-    model: "qwen2.5-coder:7b"
+```toml
+[providers.local]
+default = true
+base_url = "http://localhost:11434/v1"
+model = "qwen2.5-coder:7b"
 ```
 
 `kind` 选择协议，默认 `openai`（OpenAI 及所有兼容端点）。Anthropic 与 Gemini 使用各自的原生流式
 接口，`base_url` 只写到服务根或版本前缀：
 
-```yaml
-providers:
-  claude:
-    kind: anthropic
-    base_url: "https://api.anthropic.com"
-    model: "claude-sonnet-4"
-    api_key_env: "ANTHROPIC_API_KEY"
-  google:
-    kind: gemini
-    base_url: "https://generativelanguage.googleapis.com/v1beta"
-    model: "gemini-2.5-pro"
+```toml
+[providers.claude]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-4"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[providers.google]
+kind = "gemini"
+base_url = "https://generativelanguage.googleapis.com/v1beta"
+model = "gemini-2.5-pro"
 ```
 
 单个 `[[models]]` 可以用 `kind` 覆盖所属 provider 的协议。模型目录（`/model`、`eix model --all`）
 会按协议读取 `/models`，过滤 Gemini 不支持 `generateContent` 的模型。
+
+可以按任务角色选择模型，例如规划用更强的模型、探索和执行用便宜的模型：
+
+```toml
+[model_roles]
+plan = "anthropic/claude-sonnet-4"     # Plan 模式的只读规划
+explore = "anthropic/claude-haiku-4"   # spawn_agent 探索子代理
+execute = "anthropic/claude-haiku-4"   # 普通读写 turn 与后台辅助调用
+```
+
+值使用与 `/model` 相同的选择 id（可带 `#variant`）。`plan` / `explore` 未配置时回退到
+`execute`，`execute` 未配置时回退到默认 provider 的模型；因此只配置昂贵的 `plan` 时，其余任务
+仍然使用原来的通用模型。`/model` 固定的 session 或 agent frontmatter 的 `model:` 优先于角色
+配置；子代理优先使用自己的 `model:`，其次是 `explore`，最后继承父 session 的固定模型。
 
 密钥优先级：配置内联 `api_key` → `api_key_env` → `<data_dir>/auth/<provider>.json`。最后一项由
 `eix auth login` 写入（0600 权限），daemon 每次请求时读取，因此登录/注销无需重启或 `reload`：
@@ -122,7 +134,7 @@ eix auth logout openai
 会走 authorization-code + PKCE + loopback 回调；token 过期前自动 refresh。
 
 临时试用也可以只用环境变量：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`。所有配置项、默认值和
-注释见 [config.tmpl.yaml](./config.tmpl.yaml)。
+注释见 [config.tmpl.toml](./config.tmpl.toml)。
 
 ### 第一次运行
 
@@ -158,7 +170,7 @@ TUI 可以把多个 session 同时开在不同 pane；同一 session 只会在�
 | `plan` | 硬只读；保留只读 shell 检查，隐藏写入和后台命令 |
 | `build` | 默认；workspace-write，按风险/规则决定直接执行、沙箱或询问 |
 | `auto` | workspace-write；未命中规则的默认询问交给意图分类器，低置信度仍询问 |
-| `bypass` | 解除 workspace 路径限制并放行默认询问；硬拒绝、secret 保护和显式 `deny` / `ask` 仍生效 |
+| `full` | 解除 workspace 路径限制并放行默认询问；硬拒绝、secret 保护和显式 `deny` / `ask` 仍生效 |
 
 在 TUI 用 `Tab` / `Shift-Tab` 循环，或 `/perm` / `Space m`；CLI 用 `eix mode`。
 
@@ -166,7 +178,7 @@ TUI 可以把多个 session 同时开在不同 pane；同一 session 只会在�
 
 `build` 模式下，工作区内低/中风险的 `apply_patch` 默认直接应用（保留快照）；需要审批的补丁
 会显示完整 diff，审批卡片支持 side-by-side 审阅、hunk 级选择和带理由拒绝。`exec_command`
-无法预演，执行前会抓工作区快照。所有路径默认经过 workspace 沙箱检查（`bypass` 例外），
+无法预演，执行前会抓工作区快照。所有路径默认经过 workspace 沙箱检查（`full` 例外），
 所有工具决策写入审计事件。
 
 ### Worktree 与集成
@@ -210,6 +222,11 @@ eix tui [--session ID]
 运行时默认模型，只影响没有固定模型的 session，不写回 config，daemon 重启后恢复。
 `/model global default` 清除覆盖。
 
+`/undo` / `/redo` 同时回滚对话和工作区文件（best effort，恢复失败会明确提示）；`/diff` 和
+`/doctor` 在可滚动 overlay 中展示仓库 diff 与 daemon 诊断；`/goal` 设置跨轮注入的持久目标，
+`/loop` / `/schedule` 在 session 空闲时按间隔或指定时间再次发送 prompt；`/code-review`、
+`/security-review`、`/simplify`、`/verify` 是内置的审查与验证 prompt 模板。
+
 完整键位、prompt 命令、审批卡片、picker 和鼠标操作见
 [DESIGN.md 的实现参考](./DESIGN.md#19-实现参考)。
 
@@ -242,11 +259,11 @@ eix tui [--session ID]
 只监听 Unix socket 时，连接靠文件系统权限保护。需要脚本、Web 前端或跨机器访问时，可以打开
 HTTP 和/或 TCP：
 
-```yaml
-server:
-  http: 127.0.0.1:7778
-  tcp: 127.0.0.1:7777
-  token: "{env:EIX_TOKEN}"
+```toml
+[server]
+http = "127.0.0.1:7778"
+tcp = "127.0.0.1:7777"
+token = "{env:EIX_TOKEN}"
 ```
 
 ```sh
@@ -304,25 +321,25 @@ buffer、窗口、键位和 picker；接口、消息格式、常用方法与最�
 
 已支持：文本 prompt（含内嵌文本/资源链接）、流式回复与思考、工具调用状态、审批
 （`session/request_permission`）、`session/load` 历史回放、`session/close`、模式切换
-（`plan` / `build` / `auto` / `bypass`）与取消。图片、音频、终端代理和编辑器传入的
+（`plan` / `build` / `auto` / `full`）与取消。图片、音频、终端代理和编辑器传入的
 `mcpServers` 暂不支持；MCP 请在 eix 配置里声明。
 
 ## 配置
 
-eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.yaml`、`AGENTS.md`、
+eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.toml`、`AGENTS.md`、
 `skills/`、`cmds/`、`agents/`。`EIX_CONFIG_DIR` 可覆盖这个目录。
 
 配置分层（daemon 从启动目录向上查找）：
 
-1. `~/.config/eix/config.yaml`（或 `EIX_CONFIG` / `--config`；显式路径不再合并项目层）
-2. 祖先目录的 `.eix/config.yaml`，从最外层到最近层依次覆盖
+1. `~/.config/eix/config.toml`（或 `EIX_CONFIG` / `--config`；显式路径不再合并项目层）
+2. 祖先目录的 `.eix/config.toml`，从最外层到最近层依次覆盖
 
 表递归合并，数组整体替换。全局层和显式配置支持 `{env:NAME}` 与 `{file:path}`；项目层不展开
 这两个占位符。daemon 每 2 秒检查 mtime，变更后热重载；解析失败保留旧配置并通过 `config.error`
 通知，TUI 里也可以 `/reload`。
 
 项目层只能收紧策略：会扩大权限或影响信任的字段会被丢弃；`allow` / `sandbox` 规则降级为 `ask`；
-项目 `cli.json` 不能把默认模式设为 `bypass`。项目配置永远不能添加插件、开启其他 agent 的兼容
+项目 `cli.json` 不能把默认模式设为 `full`。项目配置永远不能添加插件、开启其他 agent 的兼容
 资源，也不能扩大沙箱或网络权限。被拒绝的项会写入 `security_warnings`，可用 `eix doctor` 查看。
 
 常用配置段：
@@ -330,6 +347,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 | 段 | 作用 |
 | --- | --- |
 | `providers` / `provider_runtime` | provider（`kind` = openai/anthropic/gemini、可选 `oauth`）、默认模型、超时、重试、`max_output_tokens`、系统提示、`prompt_profile`、`persistent_mode` |
+| `models` / `model_roles` | 固定模型目录，以及按 `plan` / `explore` / `execute` 任务角色选择模型 |
 | `tools` | 自动应用策略、显式规则、沙箱、网络、快照、外部目录 |
 | `context` | token 预算、指令文件、workspace summary、自动压缩 |
 | `worktree` / `integration` | worktree 基线、自动 ready、自动提交、测试命令 |
@@ -341,7 +359,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 
 环境变量只覆盖启动、连接、模型和 CLI 初始值：`EIX_BASE_URL`、`EIX_MODEL`、`EIX_API_KEY`、
 `EIX_SOCKET`、`EIX_DATA_DIR`、`EIX_CONFIG`、`EIX_CONFIG_DIR`、`EIX_CLI_CONFIG`、
-`EIX_TCP`、`EIX_TCP_TOKEN`、`EIX_HTTP`。其余配置写入 `config.yaml`。
+`EIX_TCP`、`EIX_TCP_TOKEN`、`EIX_HTTP`。其余配置写入 `config.toml`。
 
 ## 扩展
 
@@ -351,7 +369,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 | 命令 | `~/.config/eix/cmds/*.md`、项目 `.eix/cmds/*.md`；`$ARGUMENTS` / `$1..$9` |
 | Agent | `~/.config/eix/agents/*.md`、项目 `.eix/agents/*.md`；`primary` / `subagent` |
 | MCP | `mcp.servers.<name>`；stdio / Streamable HTTP、懒启动、`mcp__server__tool`、resources / templates / prompts；远程可用 `eix mcp auth <server>` 走 OAuth |
-| 插件 | `plugins.<name>`；`eix-plugin.toml` + newline-delimited JSON，独立子进程 |
+| 插件 | `plugins.<name>`；`eix-plugin.toml`（schema 2）+ JSON-RPC 2.0 over stdio，独立子进程；声明式命令可无进程 |
 
 兼容资源默认全部关闭，可在 `compations:` 中逐项打开。项目配置只能关闭、不能开启。示例见
 [examples/plugins/echo](./examples/plugins/echo)，完整说明见 [DESIGN.md](./DESIGN.md)。

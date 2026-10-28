@@ -7,7 +7,7 @@
 //! 4. the mode's default-ask policy (only applies to unruled `ask` results).
 //!
 //! `Auto` leaves unruled default asks in place for the daemon's intent-aware
-//! classifier; `Bypass` allows them directly. The classifier can only turn a
+//! classifier; `Full` allows them directly. The classifier can only turn a
 //! remaining `ask` into `allow`, and it never widens the workspace boundary.
 
 use std::path::Path;
@@ -32,7 +32,7 @@ impl From<SessionMode> for Capability {
         match mode {
             SessionMode::Plan => Self::ReadOnly,
             SessionMode::Build | SessionMode::Auto => Self::WorkspaceWrite,
-            SessionMode::Bypass => Self::Full,
+            SessionMode::Full => Self::Full,
         }
     }
 }
@@ -373,7 +373,7 @@ pub fn decide(
         SandboxMode::Auto | SandboxMode::Required => eix_core::sandbox::bwrap_available(),
     };
 
-    // Bypass lifts the workspace path boundary for file tools. Keep the hard
+    // Full lifts the workspace path boundary for file tools. Keep the hard
     // denial for secret-path combinations and all catastrophic commands.
     if full_access
         && risk.hard_deny
@@ -557,7 +557,7 @@ pub fn decide(
         PermissionAction::Sandbox if mode.allows_unsandboxed_exec() => (
             PermissionAction::Allow,
             false,
-            "session mode bypass allows an unsandboxed build command".to_string(),
+            "session mode full allows an unsandboxed build command".to_string(),
         ),
         PermissionAction::Sandbox => (
             PermissionAction::Ask,
@@ -574,11 +574,11 @@ pub fn decide(
     }
 }
 
-/// Why an unruled default `ask` was allowed. Only `Bypass` takes this path;
+/// Why an unruled default `ask` was allowed. Only `Full` takes this path;
 /// `Auto` is handled by the daemon's classifier.
 fn auto_allow_reason(mode: SessionMode) -> String {
     match mode {
-        SessionMode::Bypass => "session mode bypass allows unruled asks".to_string(),
+        SessionMode::Full => "session mode full allows unruled asks".to_string(),
         _ => "session mode allows unruled asks".to_string(),
     }
 }
@@ -943,7 +943,7 @@ mod tests {
             &json!({"cmd": "echo hi"}),
             Path::new("/tmp/eix-perm"),
             &config,
-            SessionMode::Bypass,
+            SessionMode::Full,
             &[],
             false,
         );
@@ -953,7 +953,7 @@ mod tests {
             &json!({"cmd": "rm -rf /"}),
             Path::new("/tmp/eix-perm"),
             &config,
-            SessionMode::Bypass,
+            SessionMode::Full,
             &[],
             false,
         );
@@ -961,7 +961,7 @@ mod tests {
     }
 
     #[test]
-    fn bypass_mode_allows_unruled_asks_and_external_writes() {
+    fn full_mode_allows_unruled_asks_and_external_writes() {
         let config = config();
         for (tool, args) in [
             ("apply_patch", patch("out.txt")),
@@ -974,7 +974,7 @@ mod tests {
                 &args,
                 Path::new("/tmp/eix-perm"),
                 &config,
-                SessionMode::Bypass,
+                SessionMode::Full,
                 &[],
                 false,
             );
@@ -985,7 +985,7 @@ mod tests {
             );
         }
 
-        // Explicit ask rules still win over the bypass mode.
+        // Explicit ask rules still win over the full mode.
         let mut config = config;
         config.tools.rules = vec![PermissionRule {
             tool: "exec_command".into(),
@@ -998,7 +998,7 @@ mod tests {
             &json!({"cmd": "git push"}),
             Path::new("/tmp/eix-perm"),
             &config,
-            SessionMode::Bypass,
+            SessionMode::Full,
             &[],
             false,
         );
@@ -1042,7 +1042,7 @@ mod tests {
             assert!(decision.rule.is_none());
         }
 
-        // Auto is workspace-write, not bypass: external file writes stay
+        // Auto is workspace-write, not Full: external file writes stay
         // blocked by the hard path guard.
         let external = decide(
             "apply_patch",
@@ -1085,7 +1085,7 @@ mod tests {
     }
 
     #[test]
-    fn bypass_mode_runs_build_commands_without_a_sandbox() {
+    fn full_mode_runs_build_commands_without_a_sandbox() {
         let mut config = config();
         config.tools.sandbox = eix_core::SandboxMode::Off;
         let decision = decide(
@@ -1093,7 +1093,7 @@ mod tests {
             &json!({"cmd": "cargo test"}),
             Path::new("/tmp/eix-perm"),
             &config,
-            SessionMode::Bypass,
+            SessionMode::Full,
             &[],
             false,
         );
@@ -1164,7 +1164,7 @@ mod tests {
             &json!({"cmd": "rm -rf /"}),
             cwd(),
             &config,
-            SessionMode::Bypass,
+            SessionMode::Full,
             &[],
             false,
         );
@@ -1196,7 +1196,7 @@ mod tests {
             &json!({"cmd": "git status"}),
             cwd(),
             &config,
-            SessionMode::Bypass,
+            SessionMode::Full,
             &[],
             false,
         );

@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use eix_core::{
-    now_ms, Event, EventKind, IntegrationState, IntegrationStatus, Session, SessionMode,
-    SessionStatus,
+    now_ms, Event, EventKind, Goal, IntegrationState, IntegrationStatus, Schedule, Session,
+    SessionMode, SessionStatus,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use serde::Serialize;
@@ -146,6 +146,40 @@ impl Store {
                 updated_at INTEGER NOT NULL
             );
 
+            -- One persistent goal per session. Injected into the context on
+            -- every turn until marked done or cleared.
+            CREATE TABLE IF NOT EXISTS session_goals (
+                session_id TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+                text       TEXT NOT NULL,
+                done       INTEGER NOT NULL DEFAULT 0,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+
+            -- Prompt schedulers owned by the daemon. `loop` repeats every
+            -- interval; `once` is removed after it fires.
+            CREATE TABLE IF NOT EXISTS session_schedules (
+                id            TEXT PRIMARY KEY,
+                session_id    TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                kind          TEXT NOT NULL,
+                prompt        TEXT NOT NULL,
+                interval_secs INTEGER NOT NULL DEFAULT 0,
+                next_at       INTEGER NOT NULL,
+                created_at    INTEGER NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS session_schedules_due
+                ON session_schedules(next_at);
+
+            -- Snapshot taken immediately before an undo rolls the workspace
+            -- back, so redo can put those bytes back.
+            CREATE TABLE IF NOT EXISTS undo_snapshots (
+                session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                round       INTEGER NOT NULL,
+                snapshot_id TEXT NOT NULL,
+                PRIMARY KEY (session_id, round)
+            );
+
             -- One row per session worktree. The queue is deliberately separate
             -- from turns so a failed merge cannot make a session look busy.
             CREATE TABLE IF NOT EXISTS session_integrations (
@@ -207,6 +241,7 @@ impl Store {
         add_column(&conn, "sessions", "archived", "INTEGER NOT NULL DEFAULT 0")?;
         add_column(&conn, "events", "undone", "INTEGER NOT NULL DEFAULT 0")?;
         migrate_session_modes(&conn)?;
+        migrate_session_mode_names(&conn)?;
         drop_legacy_search_index(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -483,6 +518,222 @@ impl Store {
         )?;
         tx.commit()?;
         Ok(Some(count))
+    }
+
+    /// Sequence of the newest visible user message, i.e. the first event an
+    /// undo would hide. `None` when there is nothing left to undo.
+    pub fn last_visible_user_turn(&self, id: &str) -> Result<Option<u64>> {
+        let conn = self.read_conn();
+        let seq: Option<i64> = conn
+            .query_row(
+                "SELECT seq FROM events
+                 WHERE session_id = ?1 AND undone = 0 AND kind = 'user_message'
+                 ORDER BY seq DESC LIMIT 1",
+                params![id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(seq.map(|seq| seq as u64))
+    }
+
+    /// Newest undo round, or `None` when nothing has been undone.
+    pub fn last_undo_round(&self, id: &str) -> Result<Option<i64>> {
+        let conn = self.read_conn();
+        let round: Option<i64> = conn.query_row(
+            "SELECT MAX(undone) FROM events WHERE session_id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        Ok(round.filter(|round| *round > 0))
+    }
+
+    /// Remember the pre-undo workspace snapshot for a round so redo can put
+    /// the files back.
+    pub fn record_undo_snapshot(&self, id: &str, round: i64, snapshot_id: &str) -> Result<()> {
+        let conn = self.conn();
+        conn.execute(
+            "INSERT OR REPLACE INTO undo_snapshots (session_id, round, snapshot_id)
+             VALUES (?1, ?2, ?3)",
+            params![id, round, snapshot_id],
+        )?;
+        Ok(())
+    }
+
+    /// Take (and forget) the snapshot recorded for an undo round.
+    pub fn take_undo_snapshot(&self, id: &str, round: i64) -> Result<Option<String>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let snapshot: Option<String> = tx
+            .query_row(
+                "SELECT snapshot_id FROM undo_snapshots
+                 WHERE session_id = ?1 AND round = ?2",
+                params![id, round],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if snapshot.is_some() {
+            tx.execute(
+                "DELETE FROM undo_snapshots WHERE session_id = ?1 AND round = ?2",
+                params![id, round],
+            )?;
+        }
+        tx.commit()?;
+        Ok(snapshot)
+    }
+
+    pub fn goal(&self, id: &str) -> Result<Option<Goal>> {
+        let conn = self.read_conn();
+        conn.query_row(
+            "SELECT text, done, created_at, updated_at FROM session_goals
+             WHERE session_id = ?1",
+            params![id],
+            |row| {
+                Ok(Goal {
+                    text: row.get(0)?,
+                    done: row.get::<_, i64>(1)? != 0,
+                    created_at: row.get(2)?,
+                    updated_at: row.get(3)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+    }
+
+    /// Create or replace the session goal. Replacing reopens a completed goal.
+    pub fn set_goal(&self, id: &str, text: &str) -> Result<Option<Goal>> {
+        let now = now_ms();
+        let conn = self.conn();
+        let changed = conn.execute(
+            "INSERT INTO session_goals (session_id, text, done, created_at, updated_at)
+             VALUES (?1, ?2, 0, ?3, ?3)
+             ON CONFLICT(session_id) DO UPDATE SET
+                 text = excluded.text,
+                 done = 0,
+                 updated_at = excluded.updated_at",
+            params![id, text, now],
+        )?;
+        drop(conn);
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.goal(id)
+    }
+
+    pub fn set_goal_done(&self, id: &str, done: bool) -> Result<Option<Goal>> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE session_goals SET done = ?1, updated_at = ?2 WHERE session_id = ?3",
+            params![done as i64, now_ms(), id],
+        )?;
+        drop(conn);
+        if changed == 0 {
+            return Ok(None);
+        }
+        self.goal(id)
+    }
+
+    pub fn clear_goal(&self, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "DELETE FROM session_goals WHERE session_id = ?1",
+            params![id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn add_schedule(
+        &self,
+        id: &str,
+        session_id: &str,
+        kind: &str,
+        prompt: &str,
+        interval_secs: u64,
+        next_at: i64,
+    ) -> Result<Option<Schedule>> {
+        let created_at = now_ms();
+        let conn = self.conn();
+        let changed = conn.execute(
+            "INSERT INTO session_schedules
+                (id, session_id, kind, prompt, interval_secs, next_at, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                session_id,
+                kind,
+                prompt,
+                interval_secs as i64,
+                next_at,
+                created_at
+            ],
+        )?;
+        drop(conn);
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Schedule {
+            id: id.to_string(),
+            session_id: session_id.to_string(),
+            kind: kind.to_string(),
+            prompt: prompt.to_string(),
+            interval_secs,
+            next_at,
+            created_at,
+        }))
+    }
+
+    pub fn list_schedules(&self, session_id: Option<&str>) -> Result<Vec<Schedule>> {
+        let conn = self.read_conn();
+        let mut statement = conn.prepare(
+            "SELECT id, session_id, kind, prompt, interval_secs, next_at, created_at
+             FROM session_schedules
+             WHERE (?1 IS NULL OR session_id = ?1)
+             ORDER BY next_at, created_at",
+        )?;
+        let rows = statement.query_map(params![session_id], row_to_schedule)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Schedules whose fire time has passed, skipping archived sessions.
+    pub fn due_schedules(&self, now: i64) -> Result<Vec<Schedule>> {
+        let conn = self.read_conn();
+        let mut statement = conn.prepare(
+            "SELECT s.id, s.session_id, s.kind, s.prompt, s.interval_secs, s.next_at,
+                    s.created_at
+             FROM session_schedules s
+             JOIN sessions ON sessions.id = s.session_id
+             WHERE s.next_at <= ?1 AND sessions.archived = 0
+             ORDER BY s.next_at",
+        )?;
+        let rows = statement.query_map(params![now], row_to_schedule)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn advance_schedule(&self, id: &str, next_at: i64) -> Result<bool> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE session_schedules SET next_at = ?1 WHERE id = ?2",
+            params![next_at, id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    pub fn remove_schedule(&self, id: &str) -> Result<bool> {
+        let conn = self.conn();
+        let changed = conn.execute("DELETE FROM session_schedules WHERE id = ?1", params![id])?;
+        Ok(changed > 0)
+    }
+
+    pub fn remove_schedules(&self, session_id: &str, kind: Option<&str>) -> Result<usize> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "DELETE FROM session_schedules
+             WHERE session_id = ?1 AND (?2 IS NULL OR kind = ?2)",
+            params![session_id, kind],
+        )?;
+        Ok(changed)
     }
 
     /// Highest event sequence in a session, or `None` when the session has no
@@ -1407,6 +1658,18 @@ fn row_to_integration(row: &Row<'_>) -> rusqlite::Result<IntegrationState> {
     })
 }
 
+fn row_to_schedule(row: &Row<'_>) -> rusqlite::Result<Schedule> {
+    Ok(Schedule {
+        id: row.get(0)?,
+        session_id: row.get(1)?,
+        kind: row.get(2)?,
+        prompt: row.get(3)?,
+        interval_secs: row.get::<_, i64>(4)?.max(0) as u64,
+        next_at: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
 fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
     let status_text: String = row.get(3)?;
     let status = status_text.parse::<SessionStatus>().map_err(|_| {
@@ -1511,7 +1774,7 @@ fn migrate_session_modes(conn: &Connection) -> Result<()> {
             "UPDATE sessions SET mode = CASE
                  WHEN agent = 'plan'
                    OR permission IN ('read-only', 'readonly', 'read_only') THEN 'plan'
-                 WHEN permission IN ('full', 'bypass') THEN 'bypass'
+                 WHEN permission IN ('full', 'bypass') THEN 'full'
                  ELSE 'build'
              END",
             [],
@@ -1534,6 +1797,31 @@ fn migrate_session_modes(conn: &Connection) -> Result<()> {
     )?;
     conn.execute(
         "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('sessions.mode.v1', '1')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// `bypass` was renamed to `full` with no parsing alias, so rewrite stored
+/// values once. Without this an old session would silently drop to `build`
+/// because the mode column falls back to the default when it cannot parse.
+fn migrate_session_mode_names(conn: &Connection) -> Result<()> {
+    let migrated: Option<String> = conn
+        .query_row(
+            "SELECT value FROM schema_meta WHERE key = 'sessions.mode.v2'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if migrated.is_some() {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE sessions SET mode = 'full' WHERE mode = 'bypass'",
+        [],
+    )?;
+    conn.execute(
+        "INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('sessions.mode.v2', '1')",
         [],
     )?;
     Ok(())
@@ -1596,11 +1884,11 @@ mod tests {
     fn mode_round_trips_and_fork_inherits_it() {
         let store = Store::in_memory().unwrap();
         let mut parent = session("s1");
-        parent.mode = SessionMode::Bypass;
+        parent.mode = SessionMode::Full;
         store.create_session(&parent).unwrap();
         assert_eq!(
             store.get_session("s1").unwrap().unwrap().mode,
-            SessionMode::Bypass
+            SessionMode::Full
         );
 
         let updated = store
@@ -1665,7 +1953,7 @@ mod tests {
         assert_eq!(by_id("build").agent, None);
         assert_eq!(by_id("custom").mode, SessionMode::Build);
         assert_eq!(by_id("custom").agent.as_deref(), Some("reviewer"));
-        assert_eq!(by_id("full").mode, SessionMode::Bypass);
+        assert_eq!(by_id("full").mode, SessionMode::Full);
 
         // The migration marker stops a later startup from overwriting an
         // explicit user mode change with the old permission column.
@@ -1680,6 +1968,39 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(mode, "build");
+        }
+    }
+
+    #[test]
+    fn stored_bypass_modes_become_full_once() {
+        let store = Store::init(Connection::open_in_memory().unwrap()).unwrap();
+        let mut legacy = session("s1");
+        legacy.mode = SessionMode::Full;
+        store.create_session(&legacy).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE sessions SET mode = 'bypass' WHERE id = 's1'", [])
+                .unwrap();
+            // Pretend the database predates the rename.
+            conn.execute("DELETE FROM schema_meta WHERE key = 'sessions.mode.v2'", [])
+                .unwrap();
+            migrate_session_mode_names(&conn).unwrap();
+            let mode: String = conn
+                .query_row("SELECT mode FROM sessions WHERE id = 's1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(mode, "full");
+            // The marker keeps a later startup from touching a newer value.
+            conn.execute("UPDATE sessions SET mode = 'plan' WHERE id = 's1'", [])
+                .unwrap();
+            migrate_session_mode_names(&conn).unwrap();
+            let mode: String = conn
+                .query_row("SELECT mode FROM sessions WHERE id = 's1'", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(mode, "plan");
         }
     }
 
@@ -2161,5 +2482,71 @@ mod tests {
 
         // Hash uniqueness is enforced by the schema.
         assert!(store.create_client_token("dupe", &hash_b).is_err());
+    }
+
+    #[test]
+    fn goals_are_replaced_completed_and_cleared() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        assert!(store.goal("s1").unwrap().is_none());
+
+        let goal = store.set_goal("s1", "ship the release").unwrap().unwrap();
+        assert_eq!(goal.text, "ship the release");
+        assert!(!goal.done);
+
+        let goal = store.set_goal_done("s1", true).unwrap().unwrap();
+        assert!(goal.done);
+
+        // Replacing the text reopens the goal.
+        let goal = store.set_goal("s1", "ship it twice").unwrap().unwrap();
+        assert!(!goal.done);
+        assert_eq!(goal.text, "ship it twice");
+
+        assert!(store.clear_goal("s1").unwrap());
+        assert!(store.goal("s1").unwrap().is_none());
+        assert!(!store.clear_goal("s1").unwrap());
+    }
+
+    #[test]
+    fn schedules_round_trip_and_only_due_rows_fire() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+
+        let repeating = store
+            .add_schedule("a", "s1", "loop", "check the build", 10, 100)
+            .unwrap()
+            .unwrap();
+        assert_eq!(repeating.interval_secs, 10);
+        assert_eq!(store.list_schedules(Some("s1")).unwrap().len(), 1);
+        assert!(store.due_schedules(99).unwrap().is_empty());
+        assert_eq!(store.due_schedules(100).unwrap().len(), 1);
+
+        store.advance_schedule("a", 200).unwrap();
+        store
+            .add_schedule("b", "s1", "once", "say hi", 0, 50)
+            .unwrap();
+        let due = store.due_schedules(150).unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, "b");
+
+        assert!(store.remove_schedule("b").unwrap());
+        assert_eq!(store.remove_schedules("s1", Some("loop")).unwrap(), 1);
+        assert!(store.list_schedules(Some("s1")).unwrap().is_empty());
+        assert!(!store.remove_schedule("missing").unwrap());
+    }
+
+    #[test]
+    fn undo_snapshots_are_taken_once_per_round() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        assert!(store.take_undo_snapshot("s1", 1).unwrap().is_none());
+
+        store.record_undo_snapshot("s1", 1, "snap-a").unwrap();
+        assert_eq!(
+            store.take_undo_snapshot("s1", 1).unwrap().as_deref(),
+            Some("snap-a")
+        );
+        // Taking it forgets the mapping so a second redo cannot replay it.
+        assert!(store.take_undo_snapshot("s1", 1).unwrap().is_none());
     }
 }

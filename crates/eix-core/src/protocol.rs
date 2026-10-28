@@ -225,6 +225,135 @@ pub struct RewindResult {
     pub warnings: Vec<String>,
 }
 
+/// Result of `session.undo` / `session.redo`. `changed` is the number of events
+/// whose visibility flipped; the file counters describe the workspace rollback
+/// that `/undo` performs from the turn's snapshots.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UndoResult {
+    pub changed: usize,
+    #[serde(default)]
+    pub files_restored: usize,
+    #[serde(default)]
+    pub files_removed: usize,
+    #[serde(default)]
+    pub files_missing: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
+/// `session.diff`: the repository diff for the session workspace.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceDiffParams {
+    pub session_id: SessionId,
+    /// Compare the index to `HEAD` instead of the working tree to `HEAD`.
+    #[serde(default)]
+    pub staged: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceDiffResult {
+    pub diff: String,
+    pub files: usize,
+    #[serde(default)]
+    pub truncated: bool,
+    /// Non-fatal notes such as untracked files that `git diff` does not show.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub notes: Vec<String>,
+}
+
+/// `doctor.report`: human-readable daemon diagnostics, rendered as a text
+/// overlay by the TUI. One entry per line.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DoctorReport {
+    pub lines: Vec<String>,
+}
+
+/// A session goal that persists across turns and is injected into the context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Goal {
+    pub text: String,
+    pub done: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalParams {
+    pub session_id: SessionId,
+    /// New goal text. Omitted leaves the text unchanged.
+    #[serde(default)]
+    pub text: Option<String>,
+    /// Mark the goal done (or reopen it).
+    #[serde(default)]
+    pub done: Option<bool>,
+    /// Remove the goal entirely; wins over the other fields.
+    #[serde(default)]
+    pub clear: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GoalResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub goal: Option<Goal>,
+}
+
+/// A scheduled or looping prompt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Schedule {
+    pub id: String,
+    pub session_id: SessionId,
+    /// `loop` repeats every `interval_secs`; `once` fires at `next_at`.
+    pub kind: String,
+    pub prompt: String,
+    #[serde(default)]
+    pub interval_secs: u64,
+    pub next_at: i64,
+    pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleAddParams {
+    pub session_id: SessionId,
+    pub prompt: String,
+    /// `loop` or `once`.
+    pub kind: String,
+    /// Required for `loop`.
+    #[serde(default)]
+    pub interval_secs: u64,
+    /// Absolute fire time in epoch milliseconds for `once`.
+    #[serde(default)]
+    pub at: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleListParams {
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleListResult {
+    pub schedules: Vec<Schedule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRemoveParams {
+    /// Remove one schedule by id.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Otherwise remove every schedule for a session.
+    #[serde(default)]
+    pub session_id: Option<SessionId>,
+    /// Restrict a session-wide removal to `loop` or `once`.
+    #[serde(default)]
+    pub kind: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScheduleRemoveResult {
+    pub removed: usize,
+}
+
 /// `session.worktree.create`: move an existing session into a new git
 /// worktree. The session keeps its history; only `cwd`/`worktree` change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -894,8 +1023,8 @@ mod tests {
     #[test]
     fn session_mode_params_use_the_new_wire_names() {
         let create: CreateSessionParams =
-            serde_json::from_value(json!({"cwd": "/tmp", "mode": "bypass"})).unwrap();
-        assert_eq!(create.mode, Some(crate::SessionMode::Bypass));
+            serde_json::from_value(json!({"cwd": "/tmp", "mode": "full"})).unwrap();
+        assert_eq!(create.mode, Some(crate::SessionMode::Full));
 
         let mode: ModeParams =
             serde_json::from_value(json!({"session_id": "s1", "mode": "plan"})).unwrap();

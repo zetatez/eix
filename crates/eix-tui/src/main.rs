@@ -158,7 +158,7 @@ enum Command {
     },
     Mode {
         session: Option<String>,
-        /// `plan` / `build` / `auto` / `bypass`.
+        /// `plan` / `build` / `auto` / `full`.
         mode: String,
         /// Do not persist the change (lost on daemon restart).
         temporary: bool,
@@ -467,7 +467,7 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
             let temporary = take_switch(&mut args, "--temporary") || take_switch(&mut args, "-t");
             let mode = args.first().cloned().ok_or_else(|| {
                 anyhow::anyhow!(
-                    "usage: eix mode <plan|build|auto|bypass> [--session ID] [--temporary]"
+                    "usage: eix mode <plan|build|auto|full> [--session ID] [--temporary]"
                 )
             })?;
             Ok(Command::Mode {
@@ -2999,7 +2999,7 @@ COMMANDS:
                                create a session (default: share the current workspace;
                                --worktree creates .worktrees/<name> immediately)
     mode MODE [--session ID] [--temporary]
-                               set plan / build / auto / bypass for a session
+                               set plan / build / auto / full for a session
     log [--session ID]         print the persisted transcript
     rename [--session ID] NAME
     cancel [--session ID]      cancel the running turn
@@ -3060,7 +3060,7 @@ OPTIONS:
     --socket <path>     daemon socket (default: $XDG_RUNTIME_DIR/eix.sock;
                         macOS: ~/Library/Caches/eix/eix.sock)
     --data-dir <path>   state directory (default: ~/.local/share/eix)
-    --config <path>     config file (default: ~/.config/eix/config.yaml)
+    --config <path>     config file (default: ~/.config/eix/config.toml)
     --tcp <host:port>   connect to a remote daemon instead of the socket
     --token <token>     remote token (or EIX_TCP / EIX_TCP_TOKEN)
 

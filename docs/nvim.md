@@ -23,10 +23,10 @@ eix status --json
 
 需要跨机器时使用 TCP：
 
-```yaml
-server:
-  tcp: 127.0.0.1:7777
-  token: "..."
+```toml
+[server]
+tcp = "127.0.0.1:7777"
+token = "..."
 ```
 
 TCP 连接的第一个请求必须是：
@@ -93,7 +93,7 @@ connect
 | `prompt.cancel` | `{session_id}` | 取消当前 turn |
 | `approval.respond` | `{session_id, approval_id, decision, reason?, hunks?, scope?}` | 审批；`decision` 为 `approve` / `deny` / `always` |
 | `input.respond` | `{session_id, input_id, option_index}` | 回答模型的提问 |
-| `session.mode` | `{session_id, mode, temporary?}` | 切换 plan/build/auto/bypass |
+| `session.mode` | `{session_id, mode, temporary?}` | 切换 plan/build/auto/full |
 | `draft.get` / `draft.set` | `{session_id}` / `{session_id, text}` | 读写未发送输入 |
 | `process.list` / `process.output` / `process.kill` | `{session_id?}` / `{process_id, ...}` / `{process_id}` | 后台进程 |
 | `picker.query` / `picker.preview` | `{kind, session_id?, query?, limit?}` / `{kind, session_id?, value, limit?}` | 文件、git、session、context 选择器数据 |

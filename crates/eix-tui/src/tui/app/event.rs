@@ -648,7 +648,7 @@ impl App {
                     };
                 }
             }
-            Event::Rewritten(session_id) => {
+            Event::Rewritten { session_id, note } => {
                 if let Some(index) = self
                     .views
                     .iter()
@@ -659,8 +659,83 @@ impl App {
                         slot: AttachSlot::Existing(index),
                     });
                     let _ = tx.send(Command::Attach(session_id));
-                    self.status = "history updated".into();
+                    self.status = format!("{note} · history updated");
                 }
+            }
+            Event::WorkspaceDiff(result) => {
+                let mut text = result.diff.clone();
+                for note in &result.notes {
+                    if !text.is_empty() {
+                        text.push_str("\n\n");
+                    }
+                    text.push_str(&format!("[{note}]"));
+                }
+                if text.trim().is_empty() {
+                    text = "(no changes in the working tree)".to_string();
+                }
+                self.open_text_view(format!("diff · {} file(s)", result.files), &text);
+                self.status = if result.truncated {
+                    "diff truncated · j/k scroll · Esc close".into()
+                } else {
+                    "diff · j/k scroll · Esc close".into()
+                };
+            }
+            Event::Doctor(lines) => {
+                self.open_text_view("doctor", &lines.join("\n"));
+                self.status = "doctor · Esc close".into();
+            }
+            Event::Goal(goal) => {
+                self.status = match goal {
+                    Some(goal) if goal.done => {
+                        format!("goal completed · {}", truncate(&goal.text, 80))
+                    }
+                    Some(goal) => format!("goal · {}", truncate(&goal.text, 100)),
+                    None => "goal cleared".into(),
+                };
+            }
+            Event::Schedules {
+                session_id,
+                schedules,
+            } => {
+                let now = eix_core::now_ms();
+                let mut lines = Vec::new();
+                for schedule in &schedules {
+                    let due = ((schedule.next_at - now).max(0) / 1_000) as u64;
+                    let when = if schedule.kind == "loop" {
+                        format!("every {}s · next in {}s", schedule.interval_secs, due)
+                    } else {
+                        format!("once · in {}s", due)
+                    };
+                    lines.push(format!(
+                        "{}  {}  {}  {}",
+                        short_id(&schedule.id),
+                        short_id(&schedule.session_id),
+                        when,
+                        truncate(&schedule.prompt, 120)
+                    ));
+                }
+                if lines.is_empty() {
+                    lines.push("no scheduled prompts".to_string());
+                }
+                let title = match session_id {
+                    Some(id) => format!("schedules · {}", short_id(&id)),
+                    None => "schedules".to_string(),
+                };
+                self.open_text_view(title, &lines.join("\n"));
+                self.status = format!("{} schedule(s)", schedules.len());
+            }
+            Event::ScheduleAdded(schedule) => {
+                self.status = if schedule.kind == "loop" {
+                    format!(
+                        "loop every {}s · {}",
+                        schedule.interval_secs, schedule.prompt
+                    )
+                } else {
+                    format!("scheduled · {}", schedule.prompt)
+                };
+            }
+            Event::SchedulesRemoved { removed } => {
+                self.status = format!("removed {removed} schedule(s)");
             }
             Event::Draft { session_id, text } => {
                 if self.input_session.as_deref() != Some(session_id.as_str()) {
@@ -991,6 +1066,11 @@ impl App {
 
         if self.help {
             self.handle_help_key(key);
+            return;
+        }
+
+        if self.text_view.is_some() {
+            self.handle_text_view_key(key);
             return;
         }
 

@@ -65,6 +65,9 @@ impl App {
         if self.process_view.is_some() {
             self.draw_processes(frame, area);
         }
+        if self.text_view.is_some() {
+            self.draw_text_view(frame, area);
+        }
         if self.inbox.is_some() {
             self.draw_inbox(frame, area);
         }

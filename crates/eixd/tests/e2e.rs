@@ -6,9 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use eix_core::{
-    AgentRole, ApprovalResult, AttachResult, Config, EventKind, EventsResult, FormatterConfig,
-    HelloResult, ModelConfig, PermissionAction, PermissionRule, ProviderConfig, Request, Response,
-    ServerMessage, SessionMode, SessionResult, SubmitResult, PROTOCOL_VERSION,
+    AgentRole, ApprovalResult, AttachResult, Config, DoctorReport, EventKind, EventsResult,
+    FormatterConfig, HelloResult, ModelConfig, PermissionAction, PermissionRule, ProviderConfig,
+    Request, Response, ServerMessage, SessionMode, SessionResult, SubmitResult, UndoResult,
+    WorkspaceDiffResult, PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, ReadHalf, WriteHalf};
@@ -1428,10 +1429,11 @@ for line in sys.stdin:
     msg = json.loads(line)
     method = msg.get("method")
     if method == "initialize":
-        send({"id": msg["id"], "result": {
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
             "name": "mock",
             "version": "0.1.0",
-            "api_version": 1,
+            "api_version": 2,
+            "features": ["content_blocks", "cancel"],
             "tools": [{
                 "name": "echo",
                 "description": "Echo text",
@@ -1447,10 +1449,50 @@ for line in sys.stdin:
             "events": []}})
     elif method == "tools/call":
         text = msg["params"]["arguments"].get("text", "")
-        send({"id": msg["id"], "result": {"ok": True, "output": "plugin:" + text}})
+        send({"jsonrpc": "2.0", "id": msg["id"], "result": {
+            "ok": True,
+            "content": [{"type": "text", "text": "plugin:" + text}]}})
     else:
-        send({"id": msg.get("id"),
-              "error": {"code": "unsupported", "message": "unknown method"}})
+        send({"jsonrpc": "2.0", "id": msg.get("id"),
+              "error": {"code": -32601, "message": "unknown method"}})
+"#,
+    )?;
+    std::fs::write(
+        dir.join("eix-plugin.toml"),
+        r#"schema = 2
+name = "mock"
+version = "0.1.0"
+api_version = 2
+description = "Mock plugin"
+capabilities = ["tools", "commands"]
+
+[components.server]
+command = "python3"
+entry = "plugin.py"
+
+[[contributes.commands]]
+name = "triage"
+description = "Triage an issue"
+args = "<issue>"
+prompt = "Triage $ARGUMENTS"
+"#,
+    )?;
+
+    std::fs::create_dir_all(dir.join("prompts"))?;
+    std::fs::write(
+        dir.join("prompts/eix-plugin.toml"),
+        r#"schema = 2
+name = "prompts"
+version = "0.2.0"
+api_version = 2
+description = "Declarative commands only"
+capabilities = ["commands"]
+
+[[contributes.commands]]
+name = "triage"
+description = "Triage an issue"
+args = "<issue>"
+prompt = "Triage $ARGUMENTS"
 "#,
     )?;
 
@@ -1463,16 +1505,23 @@ for line in sys.stdin:
     config.default_provider_mut().base_url = format!("http://{addr}/v1");
     config.default_provider_mut().model = "mock-model".to_string();
     config.default_provider_mut().api_key = None;
+    config.load_cwd = dir.clone();
     config.provider_runtime.timeout_secs = 30;
     config.plugins.insert(
         "mock".to_string(),
         eix_core::PluginConfig {
-            command: "python3".to_string(),
-            args: vec![script.to_string_lossy().into_owned()],
-            capabilities: vec![
-                eix_core::PluginCapability::Tools,
-                eix_core::PluginCapability::Commands,
-            ],
+            // The manifest supplies the process command and the declarative
+            // `triage` command; the plugin server supplies `echo` and `review`.
+            manifest: Some(std::path::PathBuf::from("eix-plugin.toml")),
+            ..eix_core::PluginConfig::default()
+        },
+    );
+    config.plugins.insert(
+        "prompts".to_string(),
+        eix_core::PluginConfig {
+            // No server component: this package is declarative only and must
+            // not spawn a process.
+            manifest: Some(std::path::PathBuf::from("prompts/eix-plugin.toml")),
             ..eix_core::PluginConfig::default()
         },
     );
@@ -1482,18 +1531,49 @@ for line in sys.stdin:
     let mut client = connect(&socket).await?;
 
     let list: eix_core::PluginListResult = client.request("plugin.list", Value::Null).await?;
-    assert_eq!(list.plugins.len(), 1);
-    assert_eq!(list.plugins[0].name, "mock");
-    assert_eq!(list.plugins[0].state, "running");
-    assert_eq!(list.plugins[0].tools, 1);
-    assert_eq!(list.plugins[0].commands, 1);
-    assert!(list.plugins[0].error.is_none());
+    assert_eq!(list.plugins.len(), 2);
+    let mock_info = list
+        .plugins
+        .iter()
+        .find(|plugin| plugin.name == "mock")
+        .expect("mock plugin");
+    assert_eq!(mock_info.state, eix_core::PluginState::Ready);
+    assert_eq!(mock_info.version, "0.1.0");
+    assert_eq!(mock_info.tools, 1);
+    assert_eq!(mock_info.commands, 2);
+    assert!(mock_info.error.is_none());
+    let prompts = list
+        .plugins
+        .iter()
+        .find(|plugin| plugin.name == "prompts")
+        .expect("declarative plugin");
+    assert_eq!(prompts.state, eix_core::PluginState::Ready);
+    assert_eq!(prompts.command, "");
+    assert_eq!(prompts.tools, 0);
+    assert_eq!(prompts.commands, 1);
+    assert!(prompts.error.is_none());
 
     let commands: eix_core::PluginCommandList =
         client.request("plugin.commands", Value::Null).await?;
-    assert_eq!(commands.commands.len(), 1);
-    assert_eq!(commands.commands[0].name, "plugin/mock/review");
-    assert_eq!(commands.commands[0].prompt, "Review $ARGUMENTS");
+    assert_eq!(commands.commands.len(), 3);
+    let review = commands
+        .commands
+        .iter()
+        .find(|command| command.name == "plugin/mock/review")
+        .expect("runtime command");
+    assert_eq!(review.prompt, "Review $ARGUMENTS");
+    let triage = commands
+        .commands
+        .iter()
+        .find(|command| command.name == "plugin/mock/triage")
+        .expect("declarative command");
+    assert_eq!(triage.prompt, "Triage $ARGUMENTS");
+    let prompts_triage = commands
+        .commands
+        .iter()
+        .find(|command| command.name == "plugin/prompts/triage")
+        .expect("declarative-only command");
+    assert_eq!(prompts_triage.prompt, "Triage $ARGUMENTS");
 
     let created: SessionResult = client
         .request("session.create", json!({"name": "plugin", "cwd": dir}))
@@ -1609,12 +1689,12 @@ async fn exec_command_timeout_kills_the_process() -> anyhow::Result<()> {
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
     let mut client = connect(&socket).await?;
-    // `sleep` is not provably read-only, so use bypass to skip the approval
+    // `sleep` is not provably read-only, so use full mode to skip the approval
     // card and exercise the timeout itself.
     let created: SessionResult = client
         .request(
             "session.create",
-            json!({"name": "timeout", "cwd": dir, "mode": "bypass"}),
+            json!({"name": "timeout", "cwd": dir, "mode": "full"}),
         )
         .await?;
     let session_id = created.session.id.clone();
@@ -2066,19 +2146,19 @@ async fn plan_mode_refuses_writes_and_mode_is_logged() -> anyhow::Result<()> {
             "session.mode",
             json!({
                 "session_id": session_id,
-                "mode": "bypass",
+                "mode": "full",
                 "temporary": true,
             }),
         )
         .await?;
-    assert_eq!(temporary.session.mode, SessionMode::Bypass);
+    assert_eq!(temporary.session.mode, SessionMode::Full);
     let listed: eix_core::SessionList = client.request("session.list", Value::Null).await?;
     let row = listed
         .sessions
         .iter()
         .find(|session| session.id == session_id)
         .expect("session row");
-    assert_eq!(row.mode, SessionMode::Bypass);
+    assert_eq!(row.mode, SessionMode::Full);
     // ...and is announced as temporary in the event log.
     let attached: AttachResult = client
         .request("session.attach", json!({"session_id": session_id}))
@@ -2089,7 +2169,7 @@ async fn plan_mode_refuses_writes_and_mode_is_logged() -> anyhow::Result<()> {
         .rev()
         .find(|event| event.kind == EventKind::Mode)
         .expect("temporary mode event");
-    assert_eq!(temp_event.payload["to"], "bypass");
+    assert_eq!(temp_event.payload["to"], "full");
     assert_eq!(temp_event.payload["temporary"], true);
 
     daemon.abort();
@@ -2765,7 +2845,7 @@ async fn background_process_streams_output_and_can_be_killed() -> anyhow::Result
     let created: SessionResult = client
         .request(
             "session.create",
-            json!({"name": "process", "cwd": dir, "mode": "bypass"}),
+            json!({"name": "process", "cwd": dir, "mode": "full"}),
         )
         .await?;
     let session_id = created.session.id.clone();
@@ -4418,7 +4498,7 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
     assert_eq!(pong.result.expect("ping result")["pong"], true);
 
     // The token does not grant local-only execution or a way to escape the
-    // daemon's workspace through bypass mode or an absolute cwd.
+    // daemon's workspace through full mode or an absolute cwd.
     for (method, params) in [
         (
             "shell.run",
@@ -4426,7 +4506,7 @@ async fn tcp_attach_requires_the_configured_token() -> anyhow::Result<()> {
         ),
         (
             "session.create",
-            json!({"name": "bypass", "cwd": dir.clone(), "mode": "bypass"}),
+            json!({"name": "full", "cwd": dir.clone(), "mode": "full"}),
         ),
         ("session.create", json!({"name": "escape", "cwd": "/"})),
     ] {
@@ -6387,10 +6467,10 @@ async fn repeat_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Strin
 async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
     let dir = temp_dir("reload");
     std::fs::create_dir_all(&dir)?;
-    let config_path = dir.join("config.yaml");
+    let config_path = dir.join("config.toml");
     std::fs::write(
         &config_path,
-        "providers:\n  openai:\n    default: true\n    base_url: http://127.0.0.1:9/v1\n    model: first-model\n    api_key: test\n",
+        "[providers.openai]\ndefault = true\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"first-model\"\napi_key = \"test\"\n",
     )?;
 
     let mut config = Config::default();
@@ -6414,7 +6494,7 @@ async fn config_reload_switches_the_default_model() -> anyhow::Result<()> {
 
     std::fs::write(
         &config_path,
-        "providers:\n  openai:\n    default: true\n    base_url: http://127.0.0.1:9/v1\n    model: second-model\n    api_key: test\n",
+        "[providers.openai]\ndefault = true\nbase_url = \"http://127.0.0.1:9/v1\"\nmodel = \"second-model\"\napi_key = \"test\"\n",
     )?;
     let reloaded: Value = client.request("config.reload", Value::Null).await?;
     assert_eq!(reloaded["reloaded"], true);
@@ -6882,7 +6962,7 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
         .expect("created session id")
         .to_string();
 
-    // Remote clients cannot execute local shell commands, enable bypass, or
+    // Remote clients cannot execute local shell commands, enable full mode, or
     // point a session outside the daemon's workspace.
     for (id, method, params) in [
         (
@@ -6893,12 +6973,12 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
         (
             5,
             "session.mode",
-            json!({"session_id": target.clone(), "mode": "bypass"}),
+            json!({"session_id": target.clone(), "mode": "full"}),
         ),
         (
             6,
             "session.create",
-            json!({"name": "bypass", "cwd": dir.clone(), "mode": "bypass"}),
+            json!({"name": "full", "cwd": dir.clone(), "mode": "full"}),
         ),
         (7, "session.create", json!({"name": "escape", "cwd": "/"})),
         (
@@ -6921,18 +7001,18 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
         );
     }
 
-    // A local bypass session cannot be used as a remote bypass: importing,
+    // A local full session cannot be used as a remote full session: importing,
     // forking, or rewinding it is rejected as well.
     let local_session: SessionResult = local
         .request(
             "session.create",
-            json!({"name": "local-bypass", "cwd": dir.clone()}),
+            json!({"name": "local-full", "cwd": dir.clone()}),
         )
         .await?;
     local
         .request::<Value>(
             "session.mode",
-            json!({"session_id": local_session.session.id, "mode": "bypass"}),
+            json!({"session_id": local_session.session.id, "mode": "full"}),
         )
         .await?;
     let exported: Value = local
@@ -6961,7 +7041,7 @@ async fn http_transport_serves_health_rpc_and_server_sent_events() -> anyhow::Re
         (
             12,
             "prompt.submit",
-            json!({"session_id": local_session.session.id, "text": "remote bypass"}),
+            json!({"session_id": local_session.session.id, "text": "remote full"}),
         ),
         (
             14,
@@ -7356,6 +7436,148 @@ async fn undo_and_redo_toggle_the_newest_turn() -> anyhow::Result<()> {
     daemon.abort();
     mock.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn undo_and_redo_restore_workspace_files() -> anyhow::Result<()> {
+    let root = temp_dir("undo-files");
+    let dir = root.join("workspace");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("out.txt"), "before")?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(tool_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), root.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "undo-files", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "write out.txt"}),
+        )
+        .await?;
+    assert_eq!(wait_turn(&mut client).await?, "done");
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
+
+    let undone: UndoResult = client
+        .request("session.undo", json!({"session_id": session_id}))
+        .await?;
+    assert!(undone.changed >= 2, "{undone:?}");
+    assert!(undone.files_restored >= 1, "{undone:?}");
+    assert!(undone.warnings.is_empty(), "{undone:?}");
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
+
+    let redone: UndoResult = client
+        .request("session.redo", json!({"session_id": session_id}))
+        .await?;
+    assert!(redone.changed >= 2, "{redone:?}");
+    assert!(redone.files_restored >= 1, "{redone:?}");
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "hello");
+
+    // Undoing again rolls the files back once more; the redo snapshot is
+    // consumed, so a second redo has nothing left to replay.
+    let undone: UndoResult = client
+        .request("session.undo", json!({"session_id": session_id}))
+        .await?;
+    assert!(undone.files_restored >= 1, "{undone:?}");
+    assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn workspace_diff_and_doctor_report_the_daemon_view() -> anyhow::Result<()> {
+    let root = temp_dir("diff-doctor");
+    let dir = root.join("workspace");
+    std::fs::create_dir_all(&dir)?;
+    assert!(git(&dir, &["init", "-q"]).status.success());
+    std::fs::write(dir.join("tracked.txt"), "old\n")?;
+    assert!(git(&dir, &["add", "."]).status.success());
+    assert!(git(&dir, &["commit", "-qm", "init"]).status.success());
+    std::fs::write(dir.join("tracked.txt"), "new\n")?;
+    std::fs::write(dir.join("untracked.txt"), "fresh\n")?;
+
+    let socket = root.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(
+        Config::default(),
+        socket.clone(),
+        root.join("data"),
+    ));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "diff", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let diff: WorkspaceDiffResult = client
+        .request("session.diff", json!({"session_id": session_id}))
+        .await?;
+    assert_eq!(diff.files, 1, "{}", diff.diff);
+    assert!(diff.diff.contains("tracked.txt"), "{}", diff.diff);
+    assert!(diff.diff.contains("-old"), "{}", diff.diff);
+    assert!(diff.diff.contains("+new"), "{}", diff.diff);
+    assert!(!diff.truncated);
+    assert!(
+        diff.notes.iter().any(|note| note.contains("untracked.txt")),
+        "{:?}",
+        diff.notes
+    );
+
+    // The staged view compares the index to HEAD, so the unstaged edit and the
+    // untracked file are both absent.
+    let staged: WorkspaceDiffResult = client
+        .request(
+            "session.diff",
+            json!({"session_id": session_id, "staged": true}),
+        )
+        .await?;
+    assert_eq!(staged.files, 0);
+    assert!(staged.diff.trim().is_empty(), "{}", staged.diff);
+    assert!(staged.notes.is_empty(), "{:?}", staged.notes);
+
+    let doctor: DoctorReport = client.request("doctor.report", Value::Null).await?;
+    assert!(
+        doctor
+            .lines
+            .iter()
+            .any(|line| line.starts_with("socket") && line.contains("eix.sock")),
+        "{:?}",
+        doctor.lines
+    );
+    assert!(
+        doctor.lines.iter().any(|line| line.starts_with("data")),
+        "{:?}",
+        doctor.lines
+    );
+    assert!(
+        doctor
+            .lines
+            .iter()
+            .any(|line| line.starts_with("daemon") && line.contains("protocol")),
+        "{:?}",
+        doctor.lines
+    );
+
+    daemon.abort();
+    let _ = tokio::fs::remove_dir_all(&root).await;
     Ok(())
 }
 

@@ -16,7 +16,7 @@
  */
 
 export type SessionId = string;
-export type SessionMode = "plan" | "build" | "auto" | "bypass";
+export type SessionMode = "plan" | "build" | "auto" | "full";
 export type SessionOrigin = "user" | "fork" | "agent";
 export type SessionStatus =
   | "idle"

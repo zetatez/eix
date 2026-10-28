@@ -118,7 +118,7 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
 - busy 的 session 拒绝 rewind（`session_busy`）。
 - 已实现（2026-10-18）：`session.fork` 仅复制历史，`session.rewind` 组合 fork + 快照回滚；
   CLI `eix rewind [--session ID] [--at SEQ] [--name NAME]` 走 rewind，`F` / `f` 仍是纯 fork。
-  fork 默认共享源工作区；`worktree.auto: true` 时才在 git 仓库里同时起 worktree（见下）。
+  fork 默认共享源工作区；`worktree.auto = true` 时才在 git 仓库里同时起 worktree（见下）。
 
 ### 4.6 worktree
 
@@ -129,9 +129,9 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
   `.worktrees/<slug>`，已有 worktree 时只提示、不重复创建。
   worktree 从**执行命令时 cwd 所在的分支**拉出，而不是固定从 `master`；`worktree.base`
   或 per-repo `base` 显式设置时覆盖。自动 worktree 的名称由模型根据任务总结成英文 kebab-case；
-  模型失败时用 ASCII 词或 `task-<timestamp>`。`worktree.auto: true` 可恢复 CLI /
+  模型失败时用 ASCII 词或 `task-<timestamp>`。`worktree.auto = true` 可恢复 CLI /
   自动启动 session 的首条 prompt 自动创建；`eix new --shared` 显式共享工作区。
-- repo 内 fork 默认共享源工作区；`worktree.auto: true` 时才给新分支建 worktree；`eix fork --shared` / `session.fork worktree=false` 显式共享。
+- repo 内 fork 默认共享源工作区；`worktree.auto = true` 时才给新分支建 worktree；`eix fork --shared` / `session.fork worktree=false` 显式共享。
 - worktree 与 session 生命周期解耦：session 归档不自动删除 worktree，需显式确认。
 - 已实现（2026-10-18）：`eixd/src/worktree.rs` shell out 给 git，`git worktree add -b eix/<slug> .worktrees/<slug>`；
   main repo 用 `git rev-parse --git-common-dir` 解析并 canonicalize（支持 subdir 和 linked worktree），
@@ -189,7 +189,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 | 模式 | 进入 | 主要按键 |
 |---|---|---|
 | insert | `i a I A o O` / 聚焦输入框 | 文本输入、`Backspace`/`Delete`、方向键、`Home`/`End`、`Tab`（4 空格）、`Ctrl-w/u/k/a/e`；`Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 换行；`Enter` 提交 |
-| normal | `Esc` | `h j k l w W b B e E 0 ^ $ gg G f F t T ; ,`；`d c y` + motion / `dd cc yy` / `iw aw`；`x X D C s S r ~ J p P u Ctrl-r`；`v`/`V`；`Tab` 正向循环 Plan → Build → Auto → Bypass，`Shift-Tab` 反向循环 |
+| normal | `Esc` | `h j k l w W b B e E 0 ^ $ gg G f F t T ; ,`；`d c y` + motion / `dd cc yy` / `iw aw`；`x X D C s S r ~ J p P u Ctrl-r`；`v`/`V`；`Tab` 正向循环 Plan → Build → Auto → Full，`Shift-Tab` 反向循环 |
 | visual / v-line | `v` / `V` | 同 normal 的 motion；`d x y c p ~ o`，选区反色 |
 
 - 计数（`3w`、`2dd`）、preferred column（`j/k`）、`;`/`,` 重复 find 均按 vim 习惯实现。
@@ -215,8 +215,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 在转录区和输入框 normal 模式，1 秒内连续按两次 `Ctrl-W` 聚焦下一个 pane；最后一个 pane 会回绕到第一个。
   insert 模式的 `Ctrl-W` 仍用于删除前一个词。
 - `Ctrl-J`/`Ctrl-K` 上下翻转录历史（`j`/`k`、`3j`、`dj`、`↑`/`↓` 是草稿内行移动）。
-- 输入框 normal 模式与转录区的 `Tab` 按 Plan → Build → Auto → Bypass → Plan 正向循环，
-  `Shift-Tab` 反向循环（Build → Plan → Bypass → Auto）。`Space m`（或 `/perm`）仍打开完整
+- 输入框 normal 模式与转录区的 `Tab` 按 Plan → Build → Auto → Full → Plan 正向循环，
+  `Shift-Tab` 反向循环（Build → Plan → Full → Auto）。`Space m`（或 `/perm`）仍打开完整
   picker 直接选择某个模式。输入框下方 statusline 左侧显示当前模式；本地立即更新以支持
   连续切换，daemon 的 session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
@@ -251,8 +251,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 输入框下方保留一条 Vim 风格 statusline：左侧依次是 `N/I/V/VL · SessionMode · <状态图标> ·
   模型 · provider · reasoning`（模式徽标 `I` 绿 / `N` 蓝 / `V` 琥珀，命令行激活时显示 `C`；
   失焦时降低对比度；
-  Plan 琥珀、Build 蓝色、Auto 淡橙、Bypass 粉红；idle 显示 `⠶`，running 显示田字方块动画，
-  其他状态显示符号和状态名；四种模式固定 6 列宽（Bypass 最长），切换时状态栏不位移）。
+  Plan 琥珀、Build 蓝色、Auto 淡橙、Full 粉红；idle 显示 `⠶`，running 显示田字方块动画，
+  其他状态显示符号和状态名；四种模式固定 5 列宽（Build 最长），切换时状态栏不位移）。
   右侧靠右显示 `cwd（~ 缩写） · git 分支`；
   worktree/图片数、运行中的 integration 状态，以及多 pane 时的 `当前/总数`、排队数和 attention
   数在空间允许时出现在中部或右侧，变窄时优先保留 cwd/branch。只有没有其他可见反馈的失败、
@@ -356,8 +356,8 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `Ctrl-T` | 任意焦点：推理强度 low → medium → high → low（默认 medium） |
 | `Ctrl-/` | 任意焦点：打开可搜索的模型 picker（`Ctrl-_` / `Ctrl-7` 也兼容） |
 | `Ctrl-P` | 转录区 / 输入框 normal 模式：打开命令面板 |
-| `Tab` | normal 模式下正向循环 Plan → Build → Auto → Bypass（命令面板的 `cycle execution mode` 同义） |
-| `Shift-Tab` | normal 模式下反向循环 Build → Plan → Bypass → Auto |
+| `Tab` | normal 模式下正向循环 Plan → Build → Auto → Full（命令面板的 `cycle execution mode` 同义） |
+| `Shift-Tab` | normal 模式下反向循环 Build → Plan → Full → Auto |
 | `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
 | `<Space>n/W/o/f/s/i/g/p/c/a/x/m/v/t/r/l` | TUI 动作（见 5.1）；可用 `[keys]` 覆盖 |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
@@ -385,7 +385,7 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `/processes` / `/approvals` / `/attention` | 进程 / 审批收件箱 / 下一个 attention |
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
 | `/cancel` | 取消运行 |
-| `/perm` | picker 搜索并选择 `plan` / `build` / `auto` / `bypass`；也可直接带 mode；与 `Space m` 相同；旧名 `/mode` 仍可用 |
+| `/perm` | picker 搜索并选择 `plan` / `build` / `auto` / `full`；也可直接带 mode；与 `Space m` 相同；旧名 `/mode` 仍可用 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
@@ -430,8 +430,8 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
 | `j/k`、`PgUp/PgDn`、`<C-u>`、`gg/G`、`<C-f>/<C-b>` | 滚动（`Ctrl-D` 保留给退出） |
 | `/`、`n/N` | 搜索 |
 | `za`、`zR/zM` | 折叠当前/全部 |
-| `Tab` | 正向循环 Plan → Build → Auto → Bypass |
-| `Shift-Tab` | 反向循环 Build → Plan → Bypass → Auto |
+| `Tab` | 正向循环 Plan → Build → Auto → Full |
+| `Shift-Tab` | 反向循环 Build → Plan → Full → Auto |
 | `<CR>` | 提交输入（insert 模式） |
 | `y` / `Y` / `v` | 复制当前块 / 整条消息 / 可视选择 |
 | `gf` / `gx` | 打开路径 / URL |
@@ -599,8 +599,9 @@ daemon 追加 `input_required` 事件、广播 `input.required`、把 session �
 
 权限按四层处理，层与层之间没有隐式跳过：
 
-1. **执行模式**：session 的 `plan` / `build` / `auto` / `bypass`，存于
-   `sessions.mode`（旧库从 `(permission, agent)` 自动迁移，默认 `build`）。`session.create`
+1. **执行模式**：session 的 `plan` / `build` / `auto` / `full`，存于
+   `sessions.mode`（旧库从 `(permission, agent)` 自动迁移，默认 `build`；改名前的
+   `bypass` 值一次性改写为 `full`，不留解析别名）。`session.create`
    可带 `mode`；`session.mode` 可在运行时切换，`temporary: true` 只存内存并在事件日志
    留下 `mode` 事件，daemon 重启后回到持久值。子 agent 永远按只读处理。
    - `plan`：硬只读。隐藏 `apply_patch` / `write_stdin`；运行时拒绝
@@ -616,8 +617,8 @@ daemon 追加 `input_required` 事件、广播 `input.required`、把 session �
      上下文/参数上限 6000 字符。分类器只能把 `ask` 改成 `allow`，不能创建 `deny`；文件工具
      （`apply_patch` / `exec_command`）和 secret / destructive / privilege / external
      write 类别不进入分类器。超时、非法 JSON、低置信度或无用户意图都保持 `ask`。它不会像
-     `bypass` 一样解除外部路径限制。
-   - `bypass`：近似 Claude Code 的 `bypassPermissions`：解除 workspace 路径限制、默认 ask
+     `full` 一样解除外部路径限制。
+   - `full`：近似 Claude Code 的 `bypassPermissions`：解除 workspace 路径限制、默认 ask
      直接放行；没有 sandbox 时构建命令也直接执行。仍然执行硬拒绝、secret 路径保护、`deny` /
      显式 `ask` 规则。
    - Agent 不再叠加能力：`AgentSpec` 只有 prompt / model / role，execution capability 只由
@@ -636,19 +637,19 @@ daemon 追加 `input_required` 事件、广播 `input.required`、把 session �
    `command = ["rm"]`），非 deny 规则要求所有 segment 都满足，且带重定向的命令不会命中
    `command` 前缀，避免 `cargo test && rm` 或 `echo hi > /etc/passwd` 被 allow。
 4. **模式默认值 / sandbox**：`Mode` 只决定未命中规则的默认 ask 如何处理：`build` 询问；
-   `auto` 先交给分类器，分类器低置信度 / 超时 / 非法输出仍询问；`bypass` 直接放行。分类器
+   `auto` 先交给分类器，分类器低置信度 / 超时 / 非法输出仍询问；`full` 直接放行。分类器
    输入包含最近用户意图、工具名与参数、静态风险等级 / categories / reasons、workspace；
    输出严格 JSON `{decision, confidence, reason}`，只接受 `allow` 且 confidence
    ≥ `0.8`，其余全部按 `ask`。相同 session + 意图 + 参数 + 模型 + 风险 + categories
    的 allow 判决复用 600 秒；key 包含 session、workspace、意图、工具、参数、
    模型、风险等级和 categories。参数超出 6000 字符时不分类，保持询问。
-   `auto` 仍然 workspace-write；`bypass` 另外允许
+   `auto` 仍然 workspace-write；`full` 另外允许
    外部路径写入和无 sandbox 的构建命令。三者都不绕过硬拒绝、显式 deny、能力上限或“需要沙箱
-   但沙箱不可用”（`bypass` 的 unsandboxed fallback 除外）。`sandbox = "auto" | "required" |
+   但沙箱不可用”（`full` 的 unsandboxed fallback 除外）。`sandbox = "auto" | "required" |
    "off"` 只决定在哪执行：构建命令默认 sandbox；bwrap 不可用时 auto 降级为强制审批，
    required 直接阻断。
 
-项目层 `.eix/config.yaml` 只能收紧：`sandbox = "off"`、
+项目层 `.eix/config.toml` 只能收紧：`sandbox = "off"`、
 `sandbox_network = true`、`external_directory`、`network_allow`、额外
 sandbox 只读/可写路径会被忽略；项目 `allow` / `sandbox` 规则降级为 `ask`；
 `snapshots = false` 被忽略。
@@ -718,7 +719,7 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   `update_plan` 等存在的工具。读取、搜索、列目录优先 `cat` / `sed` / `awk` / `nl` / `rg` /
   `fd` / `ls`；编辑用 `apply_patch`；批量改写可用 shell/Python；不重复上下文中已有的
   `ls` / `git status`。
-- `permissions_note` 按 Plan/Build/Auto/Bypass 渲染模式、sandbox、network、writable/read-only
+- `permissions_note` 按 Plan/Build/Auto/Full 渲染模式、sandbox、network、writable/read-only
   roots、network allowlist、显式 allow/deny 规则和 escalation 规则；命令分段匹配（`|`、`&&`、
   `||`、`;`、subshell）与“重定向/替换/环境变量前缀/通配符不参与 allow 前缀匹配”写进提示词，
   避免模型提出无效或过宽的 `prefix_rule`。
@@ -904,7 +905,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用
 > 选中的 hunk）。
-> 策略：`SessionMode`（`plan` / `build` / `auto` / `bypass`）加 `[[tools.rules]]`；低/中风险
+> 策略：`SessionMode`（`plan` / `build` / `auto` / `full`）加 `[[tools.rules]]`；低/中风险
 > `apply_patch` 在 workspace-write 模式（`build` / `auto`）下默认直接应用，否则阻塞审批并
 > 展示 unified diff 与逐 hunk 预览，TUI 卡片与 `d` 全屏审阅将 unified diff 转成左旧右新的
 > side-by-side 视图（syntax highlight，窄宽回退 unified），CLI 保留 unified 输出。
@@ -1049,9 +1050,17 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `/model` picker（含变体行）已接入；`turn.completed`
 > 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
 >
+> 角色模型：`[model_roles]` 的 `plan` / `explore` / `execute` 复用同一套 `/model` id。
+> `plan` 用于 `SessionMode::Plan` 的主会话 turn，`explore` 用于 `spawn_agent` 子会话，
+> `execute` 用于其余主会话 turn 以及标题、压缩、权限分类等后台调用。未配置的 `plan` /
+> `explore` 回退到 `execute`，未配置的 `execute` 回退到 daemon 默认模型（含 `model.use`
+> 运行时覆盖）；显式 `/model` pin 与 agent frontmatter 的 `model:` 优先。子代理的选择顺序是
+> agent `model:` → `explore` → 父 session pin，因此父会话用昂贵模型规划时，探索子代理仍可
+> 使用便宜模型。`model_roles` 属于可信全局配置，项目层会被忽略并记录安全警告。
+>
 > MCP：`eixd/src/mcp.rs` 实现 stdio JSON-RPC 客户端，`[mcp.servers.<name>]` 懒启动并缓存进程。
 > `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` 都支持分页
-> cursor；工具名为 `mcp__<server>__<tool>`，始终需要审批（`auto` / `bypass` 除外），执行前抓树
+> cursor；工具名为 `mcp__<server>__<tool>`，始终需要审批（`auto` / `full` 除外），执行前抓树
 > 快照；资源、resource template 与 prompt 通过只读的 `mcp_list_resources` /
 > `mcp_list_resource_templates` / `mcp_read_resource` / `mcp_list_prompts` / `mcp_get_prompt`
 > 暴露，不需要审批。MCP 工具默认不进基础请求，由 `tool_search` 按需发现（见 §19 工具发现）。
@@ -1059,27 +1068,37 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `allowed_tools` / `denied_tools` 支持 `*` / `?`（`*` 也匹配 `/`，deny 优先）；`mcp.list` 与
 > `/mcp` 显示状态、工具/资源/prompt 数量和错误。
 >
-> Plugins：`eix-core/src/plugin.rs` 定义 `eix-plugin.toml`、`PluginConfig`、
-> `PLUGIN_API_VERSION = 1` 和 newline-delimited JSON DTO；`eixd/src/plugin.rs` 每个启用的
-> server plugin 启动一个子进程并完成 `initialize` 握手。manifest 的 capabilities 是申请，
-> 全局 config 的 `capabilities` 是授权（可收窄、不可扩大）；未授权的贡献会让启动失败。
+> Plugins：`eix-core/src/plugin.rs` 定义 `eix-plugin.toml`（schema / API v2）、`PluginConfig`、
+> `PLUGIN_API_VERSION = 2`、JSON-RPC 2.0 DTO 和 content blocks；`eixd/src/plugin/` 由
+> `mod.rs`（注册表与生命周期）、`client.rs`（进程与多路复用）、`host_api.rs`（能力 API）
+> 组成。每个启用的 server plugin 启动一个子进程并完成 `initialize` 握手；只有声明式命令的
+> 包不启动进程。manifest 的 capabilities 是申请，全局 config 的 `capabilities` 是授权
+> （可收窄、不可扩大）；未授权的贡献会让启动失败。
 > 工具暴露为 `plugin__<plugin>__<tool>`，默认走 `RiskCategory::Plugin` 审批并抓树快照
-> （显式 `allow` 规则或 `bypass` 模式除外；`auto` 分类器不放行），
-> `plan` / sub-agent 不可见；命令暴露为 `plugin/<plugin>/<command>`，当前只支持提示词模板。
+> （显式 `allow` 规则或 `full` 模式除外；`auto` 分类器不放行），
+> `plan` / sub-agent 不可见；命令暴露为 `plugin/<plugin>/<command>`，支持提示词模板和
+> manifest 声明式命令，action command 尚未启用。请求按 id 多路复用，慢工具不会阻塞事件或
+> 同插件的第二个调用；超时会发送 `$/cancel`。
 > 事件通过 mpsc fire-and-forget 投递，慢插件不会阻塞 turn；storage 由 `plugin_kv` 表按
 > 插件名和 `global` / `workspace:<path>` 隔离，每个插件限制 10,000 行 / 16 MiB。
 > `plugin.list` / 工具 / 命令刷新会检测子进程退出并转为 `failed`、移除其贡献；daemon
-> 退出时向空闲插件发送 `shutdown` 通知，500ms 后强制回收。项目层 config 在 merge 前删除
+> 退出时发送 `shutdown` 通知，500ms 后强制回收。项目层 config 在 merge 前删除
 > 整个 `plugins` 表。进程边界只隔离崩溃，不是 OS sandbox：插件仍以 daemon 用户权限运行。
-> TUI widget host、action command、hooks/rpc/network/workspace/secrets API 仍是后续阶段。
+> TUI widget host、action command、hooks / UI / rpc / network / workspace / secrets API 仍是后续阶段。
 >
 > Session 管理：`session.archive` / `session.delete` / `session.export` / `session.import` /
 > `session.timeline` / `session.undo` / `session.redo` / `session.todos` RPC；archive 是持久化
 > 标记且默认列表隐藏，delete 级联事件/草稿/搜索，export/import 保留事件 seq（压缩范围仍然有效）。
-> undo/redo 用 `events.undone` 批次标记隐藏/恢复最近一个 user turn，并同步 FTS 索引；工作区文件
-> 不自动回滚（需要 `rewind`）。TUI 对应 `/undo`、`/redo`、`/timeline`、`/archive`、
-> `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI
-> 的 `eix export` / `eix import`。
+> undo/redo 用 `events.undone` 批次标记隐藏/恢复最近一个 user turn，并同步 FTS 索引；`/undo`
+> 还会把该 turn 的可见 snapshot 逆序重放，回滚工作区，并在回滚前抓一份 tree snapshot 存入
+> `undo_snapshots`，`/redo` 用它把文件也恢复。快照缺失、被 prune 或 `tools.snapshots` 关闭时
+> 在结果里给出 warning，而不是静默失败。`session.diff` / `doctor.report` 分别服务 `/diff` 和
+> `/doctor`；`session.goal` + `session_goals` 表让 goal 跨轮注入上下文，`schedule.*` +
+> `session_schedules` 表由 daemon 每秒检查、仅在 session 空闲时提交（loop 先推进 `next_at`，
+> once 先删除，避免失败后反复重试）。TUI 对应 `/undo`、`/redo`、`/rename`、`/diff`、
+> `/doctor`、`/goal`、`/loop`、`/schedule`、`/timeline`、`/archive`、`/delete`（两次确认）、
+> `/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI 的 `eix export` /
+> `eix import`。
 >
 > Skills：`eix-core/src/skills.rs` 始终加载内置 `frontend` / `engineering` / `review` 和原生
 > `.eix`，再按 `[compations]` 开关加载 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 的
@@ -1094,7 +1113,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > SQL/Terraform/Nix/Kotlin/Swift/Dart/Elixir/Haskell/OCaml/Scala/Ruby/PHP/R/Zig/Nim/V/Crystal/
 > Gleam/Elm/Clojure/Solidity/Cairo/GDScript/Jsonnet/CMake/Markdown/JSON/YAML/HTML/CSS/GraphQL/
 > Proto 等）选择，缺失的可执行文件静默跳过；显式 `[[formatter]]` / `formatter` 条目优先，命令
-> 不存在时回退到内置候选，`command: None` 可禁用某扩展，`formatter_defaults: false` 关闭内置
+> 不存在时回退到内置候选，`command: None` 可禁用某扩展，`formatter_defaults = false` 关闭内置
 > 回退。直接写入、blocking apply、staged apply 后运行
 > （`$1` 为路径，按顺序首个匹配，失败只附注）。`update_plan` / `webfetch` / `websearch`
 > 为新增工具；`update_plan` 是 daemon 内存态任务表，网络工具无 API key（DuckDuckGo HTML），
@@ -1182,8 +1201,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 | `Enter` | insert 模式发送（turn 运行中自动排队）；normal / 转录区把当前 session 提到第一位 |
 | `Ctrl-J` | insert 模式换行 |
 | `Ctrl-P` | 命令面板（输入框 normal / 转录区） |
-| `Tab` | 输入框 normal / 转录区：Plan → Build → Auto → Bypass 循环 |
-| `Shift-Tab` | 反向循环：Build → Plan → Bypass → Auto |
+| `Tab` | 输入框 normal / 转录区：Plan → Build → Auto → Full 循环 |
+| `Shift-Tab` | 反向循环：Build → Plan → Full → Auto |
 | `j` / `k` | 转录区滚动；输入框 normal 下移动草稿行 |
 | `Ctrl-J` / `Ctrl-K` | 输入框 normal：浏览已提交的 prompt 历史 |
 | `gg` / `G` | 转录区顶部 / 跟随末尾 |
@@ -1302,9 +1321,19 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/timeline` | 当前 session 用户输入历史，按时间倒序；带时间戳、搜索和完整预览，`Ctrl-J/K` 或 `Ctrl-N/P` 选择，`Enter` 跳到对应消息位置（`Space h` 同效） |
 | `/archive` | 归档当前 session（从 picker/列表隐藏，事件保留） |
 | `/delete` | 删除当前 session；需要连续执行两次确认 |
-| `/undo` / `/redo` | 隐藏/恢复最近一个 user turn（事件仍在日志里，可通过 redo 恢复） |
-| `/fork [name]` | fork 当前 session（默认共享工作区；`worktree.auto: true` 时自动建 worktree） |
-| `/perm` | 弹窗搜索并选择执行模式：`plan` / `build` / `auto` / `bypass`；也可直接 `/perm <mode>`；`Space m` 打开同一 picker；旧名 `/mode` 仍可用 |
+| `/undo` / `/redo` | 隐藏/恢复最近一个 user turn，并按该 turn 的执行前快照回滚/恢复工作区文件（事件仍在日志里） |
+| `/rename <name>` | 重命名当前 session |
+| `/diff [staged]` | 在可滚动 overlay 中查看 `git diff HEAD`；`staged` 只比较 index 与 HEAD；untracked 文件与截断会给出提示 |
+| `/doctor` | 在 overlay 中显示 daemon socket / data / config、模型、沙箱、snapshot、规则和 session 数 |
+| `/goal [text\|done\|reopen\|clear]` | 设置一个跨轮持久化并注入上下文的 goal；`done` 后不再注入 |
+| `/loop <interval> <prompt>` | session 空闲时按间隔重复 prompt（`30s` / `10m` / `1h30m`）；`/loop stop` 清除 |
+| `/schedule <+duration\|HH:MM> <prompt>` | 在指定时间运行一次 prompt；`/schedule stop [id]` 清除 |
+| `/code-review [focus]` | 内置 prompt：审查当前 diff 的正确性、回归和测试缺口 |
+| `/security-review [focus]` | 内置 prompt：按注入、路径、secret、SSRF、授权等维度审计当前 diff |
+| `/simplify [scope]` | 内置 prompt：在不改变行为的前提下精简改动 |
+| `/verify [scope]` | 内置 prompt：跑格式化、构建、测试并实际验证改动，要求给出证据 |
+| `/fork [name]` | fork 当前 session（默认共享工作区；`worktree.auto = true` 时自动建 worktree） |
+| `/perm` | 弹窗搜索并选择执行模式：`plan` / `build` / `auto` / `full`；也可直接 `/perm <mode>`；`Space m` 打开同一 picker；旧名 `/mode` 仍可用 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
@@ -1316,7 +1345,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 
 daemon 向模型暴露这些工具。下表的“默认审批”按默认配置概述；`build` 模式下工作区内的
 低/中风险 `apply_patch` 默认直接应用（仍保留 snapshot 和 patch 记录），
-`tools.auto_apply_workspace_edits: false` 或显式规则要求时才改用审批卡片。
+`tools.auto_apply_workspace_edits = false` 或显式规则要求时才改用审批卡片。
 
 | 工具 | 行为 | 默认审批 |
 | --- | --- | --- |
@@ -1335,9 +1364,9 @@ daemon 向模型暴露这些工具。下表的“默认审批”按默认配置�
 | `request_user_input` | 1-3 个问题，每题 2-3 个互斥选项；TUI 每问一个 tab，客户端自动追加 Other 自由输入 | 交互，不修改文件 |
 | `tool_search` | 用 BM25 在 MCP / 插件工具里检索，命中的 schema 加入本 turn 后续请求；plan / sub-agent 不可见 | 自动放行（只读元数据） |
 | `mcp__*` | MCP server 暴露的工具 | 默认询问；已注册的只读类工具（`get_*` / `list_*` / `read_*` / `search_*`）自动放行；resource/prompt 只读 |
-| `plugin__*` | 外部插件暴露的工具 | 默认询问（显式 allow / bypass 例外）；plan/sub-agent 不可见；执行前快照 |
+| `plugin__*` | 外部插件暴露的工具 | 默认询问（显式 allow / full 例外）；plan/sub-agent 不可见；执行前快照 |
 
-所有路径默认都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸；`bypass` 会解除 workspace
+所有路径默认都会做 workspace 沙箱检查（拒绝 `..` 和 symlink 逃逸；`full` 会解除 workspace
 路径限制，但仍执行硬拒绝和 secret 保护）；工具输出先按
 `max_output_bytes` 截断，进入 provider 上下文时再按 `context.tool_output_tokens` 做 head/tail
 省略，完整输出仍保留在事件日志。一个工具批次里连续的只读工具（`view_image` /
@@ -1393,7 +1422,7 @@ echo "$f"; done | sort | head` 可直接放行。
 `sed` / `awk` 等执行器时仍会询问。`cargo test` / `npm test` 等构建命令默认在沙箱内
 执行；`rm`、写入重定向、未知程序、脚本解释器、`find -exec`、网络命令等按风险询问。
 `rm -rf /`、块设备 `dd`、`mkfs`、关机、fork bomb、私钥读取以及把 secret 占位符送进
-网络/命令/MCP 调用会硬拒绝，`auto` / `bypass` 和任何 `allow` 规则都不能绕过。
+网络/命令/MCP 调用会硬拒绝，`auto` / `full` 和任何 `allow` 规则都不能绕过。
 `git push --force` 视为高风险，默认询问；`sed -i`、`awk` 的 `system`/重定向、`date -s`、
 `ss -K`、`sort -o`/`-T`/`--files0-from`、`diff --paginate`、`find -files0-from`、
 `xxd`/`uniq` 的第二个文件参数、`wc`/`du --files0-from` 等带副作用或动态文件集的选项同样
@@ -1412,41 +1441,46 @@ echo "$f"; done | sort | head` 可直接放行。
 都会显示；在 TUI 里用 `d` 全屏审阅可以按 hunk 选择应用，命令行用
 `eix approve --hunks 0,2`（不带参数或空选择 = 整文件）。策略由 `tools:` 配置控制：
 
-```yaml
-tools:
-  max_output_bytes: 20000
-  command_timeout_secs: 60
-  max_parallel_subagents: 32  # 2/4/8/16/32/64/128/256；大规模任务可按需调高
-  sandbox: auto            # auto / required / off
-  sandbox_network: false
-  sandbox_read_paths: ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]
-  sandbox_writable_roots: []
-  snapshots: true
-  external_directory: ["/tmp/eix-shared", "~/.cache/eix/**"]
-  network_allow: ["docs.rs", "*.github.com"]
+```toml
+[tools]
+max_output_bytes = 20000
+command_timeout_secs = 60
+max_parallel_subagents = 32  # 2/4/8/16/32/64/128/256；大规模任务可按需调高
+sandbox = "auto"             # auto / required / off
+sandbox_network = false
+sandbox_read_paths = ["~/.cargo", "~/.rustup", "~/.cache", "~/.npm"]
+sandbox_writable_roots = []
+snapshots = true
+external_directory = ["/tmp/eix-shared", "~/.cache/eix/**"]
+network_allow = ["docs.rs", "*.github.com"]
 ```
 
-显式规则按“具体度”选择，`deny` 全局优先，不会被 `auto` / `bypass` 绕过：
+显式规则按“具体度”选择，`deny` 全局优先，不会被 `auto` / `full` 绕过：
 
-```yaml
-tools:
-  rules:
-    - id: block-rm
-      tool: exec_command
-      command_regex: "^rm "
-      action: deny
-    - id: cargo-sandbox
-      tool: exec_command
-      command: [cargo, test]  # argv token 前缀，不是整条 shell 字符串
-      action: sandbox
-    - id: review-src
-      tool: apply_patch
-      path: "src/**"
-      action: ask
-    - id: docs-allow
-      tool: web_fetch
-      path: "https://docs.rs/**"
-      action: allow
+```toml
+[[tools.rules]]
+id = "block-rm"
+tool = "exec_command"
+command_regex = "^rm "
+action = "deny"
+
+[[tools.rules]]
+id = "cargo-sandbox"
+tool = "exec_command"
+command = ["cargo", "test"]  # argv token 前缀，不是整条 shell 字符串
+action = "sandbox"
+
+[[tools.rules]]
+id = "review-src"
+tool = "apply_patch"
+path = "src/**"
+action = "ask"
+
+[[tools.rules]]
+id = "docs-allow"
+tool = "web_fetch"
+path = "https://docs.rs/**"
+action = "allow"
 ```
 
 - 规则字段是 AND 关系；`tool = "*"` 可匹配任意工具。`path` 对文件工具是 workspace 相对
@@ -1458,10 +1492,10 @@ tools:
   避免 `echo hi` 的 allow 覆盖 `echo hi > /etc/passwd`。`signature` 匹配规范化后的完整参数。
   `command_regex` 用于复杂表达式，但更适合 `deny` 而不是 `allow`。
 - `allow` 只放行风险分析本来会 ask 的调用；硬拒绝和命令中的危险段仍然优先。`sandbox` 表示
-  必须在沙箱内执行，bwrap 不可用时转为 `ask`（只有 `bypass` 会直接放行）。`action = "deny"` 最先
+  必须在沙箱内执行，bwrap 不可用时转为 `ask`（只有 `full` 会直接放行）。`action = "deny"` 最先
   扫描所有来源，哪怕更具体的规则是 `allow`。
 - 规则来源优先级为 `session > user > project > builtin`；具体度相同时越靠近当前 session 的
-  来源胜出。项目 `.eix/config.yaml` 只能收紧：`sandbox = "off"`、
+  来源胜出。项目 `.eix/config.toml` 只能收紧：`sandbox = "off"`、
   `sandbox_network = true`、`external_directory`、`network_allow`、额外
   sandbox 路径会被忽略，`allow` / `sandbox` 规则会降级为 `ask`，并写入
   `security_warnings`（`eix doctor` 可见）。
@@ -1481,9 +1515,9 @@ session workspace 可写；`sandbox_read_paths` 里的工具链缓存逐个只�
 阻断，`off` 完全关闭沙箱。`eix doctor` 会显示规则数量、网络和 bwrap 状态。
 
 `build` 对未命中规则的默认 `ask` 仍然询问；`auto` 把这些调用交给意图分类器，只有高置信度、
-与当前请求直接相关的安全步骤才放行，超时 / 非法输出 / 低置信度仍然询问；`bypass` 直接放行。
+与当前请求直接相关的安全步骤才放行，超时 / 非法输出 / 低置信度仍然询问；`full` 直接放行。
 三者都不会绕过硬拒绝、`deny` / 显式 `ask` 规则、`plan` 的只读上限或“必须沙箱”的失败路径
-（`bypass` 在无 sandbox 时是例外）。一次 turn 不设固定工具往返上限，由模型自行结束
+（`full` 在无 sandbox 时是例外）。一次 turn 不设固定工具往返上限，由模型自行结束
 或用户中断；重复工具批次仍会被 doomloop 守卫终止。
 
 #### 补丁审批与 staging
@@ -1515,7 +1549,7 @@ daemon 仍保留 staging store，用于读取旧 pending 补丁并支持 `patch.
   `session.rewind`：`eix rewind` 会按 `seq >= at` 倒序恢复快照并返回
   新 session。回滚是尽力而为的，恢复失败、缺失文件、被 prune 的旧快照都会在结果的
   `warnings` 里列出，`restored = false` 表示工作区没有完全回到切点。
-- 大仓库可以设 `tools.snapshots: false` 关掉；关闭后不再记录 `snapshot` 事件。
+- 大仓库可以设 `tools.snapshots = false` 关掉；关闭后不再记录 `snapshot` 事件。
   `eix doctor` 会显示当前开关。
 
 ### 19.3 Provider 自动重试
@@ -1559,7 +1593,7 @@ daemon 仍保留 staging store，用于读取旧 pending 补丁并支持 `patch.
 | `pi` | `$PI_CODING_AGENT_DIR`（默认 `~/.pi/agent`）与项目 `.pi` 下的 skills、prompts，以及 `AGENTS.md` / `CLAUDE.md`；也读 `.agents/skills` |
 
 - 同一目录下原生 `.eix` 资源优先；更靠近 cwd 的项目层覆盖外层。
-- 项目 `.eix/config.yaml` 只能关闭兼容开关，不能开启；尝试开启会被忽略并写入 `security_warnings`。
+- 项目 `.eix/config.toml` 只能关闭兼容开关，不能开启；尝试开启会被忽略并写入 `security_warnings`。
 - 只读取资源文件，不导入其他 agent 的 permissions、hooks、settings、provider 或 MCP 配置。
 - Gemini 的 `{{args}}` 会转换成 eix 的 `$ARGUMENTS`；其他 agent 的命名占位符只保证原样保留。
 - 兼容 agent 定义时只读取 Markdown 正文和 eix 支持的 frontmatter；Claude/Gemini 的工具列表不会被解释成 eix 权限。
@@ -1710,68 +1744,72 @@ resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server �
 #### 插件（out-of-process）
 
 插件是独立子进程，不是 Rust `dylib`，因此崩溃或死循环不会拖垮 daemon。`eixd` 通过
-stdin/stdout 的 newline-delimited JSON 与插件通信，协议版本是独立的
-`PLUGIN_API_VERSION = 1`。每个 `[plugins.<name>]` 条目只启动一个 server 进程：
+stdin/stdout 的 newline-delimited JSON-RPC 2.0 与插件通信，协议版本是独立的
+`PLUGIN_API_VERSION = 2`。每个 `[plugins.<name>]` 条目最多启动一个 server 进程；
+只有 `[[contributes.commands]]` 的声明式包不启动进程。
 
-```yaml
-plugins:
-  echo:
-    enabled: true
-    manifest: examples/plugins/echo/eix-plugin.toml
-    capabilities: [tools, commands, events, storage]
-    timeout_secs: 30
+```toml
+[plugins.echo]
+enabled = true
+manifest = "examples/plugins/echo/eix-plugin.toml"
+timeout_secs = 30
 ```
 
-`manifest` 指向 `eix-plugin.toml`，其中声明 `name`、`version`、`api_version`、
-`capabilities` 和 `[server]` 入口。也可以直接写 `command` / `args` 跳过 manifest。
-manifest 的 capability 是“申请”，配置里的 `capabilities` 是“授权”；配置可以收窄，
-不能扩大 manifest 的申请。没有 manifest 且未写 `capabilities` 时默认只授予
-`tools` + `commands`。
+`manifest` 指向 `eix-plugin.toml`，其中声明 `schema = 2`、`name`、`version`、
+`api_version = 2`、`capabilities`、`[components.server]` 入口和可选的声明式命令。
+也可以直接写 `command` / `args` 跳过 manifest。manifest 的 capability 是“申请”，
+配置里的 `capabilities` 是“授权”；配置可以收窄，不能扩大 manifest 的申请。没有
+manifest 且未写 `capabilities` 时默认只授予 `tools` + `commands`。schema / API v1
+不再兼容。
 
 启动握手：
 
 1. daemon 启动子进程，发送 `initialize`（协议版本、插件名、host 版本、授权能力、
-   workspace、数据目录）。
-2. 插件返回 `tools`、`commands`、`events` 和 `api_version`。
+   workspace、数据目录和 `settings`）。请求是多路复用的，握手期间也能接收 host 调用。
+2. 插件返回 `tools`、`commands`、`events`、`features` 和 `api_version`。
 3. daemon 校验名称、能力、schema 和数量；未授权却声明贡献会启动失败，而不是静默放大权限。
+   `hooks` / `ui` / `rpc` 在本版必须为空，非空会拒绝启动并提示未实现。
 4. 工具以 `plugin__<plugin>__<tool>` 暴露，命令以 `plugin/<plugin>/<command>` 合并进
    TUI 的 `/` 菜单；命令目前是提示词模板（`$ARGUMENTS` / `$1..$9`），action command 尚未启用。
 
-插件工具**默认需要审批**（显式 `allow` 规则或 `bypass` 模式除外），风险类别为
+插件工具**默认需要审批**（显式 `allow` 规则或 `full` 模式除外），风险类别为
 `plugin`，执行前会抓工作区快照；`auto` 模式的分类器不会替插件工具放行。`plan` session
 和 sub-agent 看不到插件工具。插件命令不会覆盖内置命令或用户 Markdown 命令。
 `allowed_tools` / `denied_tools` 支持 `*` / `?`，deny 优先。
 
 能力边界：
 
-- `tools`：注册模型工具。
-- `commands`：注册提示词命令。
+- `tools`：注册模型工具；结果使用 content blocks（text/image/resource/diff/json）。
+- `commands`：注册提示词命令，可来自 manifest 或运行时握手。
 - `events`：订阅 daemon 通知（如 `session.*`、`tool.completed`）。投递是 fire-and-forget，
   慢插件不会阻塞 turn。
 - `storage`：使用 host 管理的 SQLite KV（`global` 或 `workspace:<path>`，按插件名隔离）。
-- `hooks` / `rpc` / `ui` / `network` / `workspace_read` / `workspace_write` / `secrets`：
-  协议中保留，当前 host 不提供对应 API。
+- `hooks` / `rpc` / `ui` / `network` / `workspace_read` / `workspace_write` / `secrets` /
+  `jobs` / `sessions_read`：协议中保留，当前 host 不提供对应 API；`host.*` 预留方法统一
+  返回 `unsupported`。
 
 **安全边界**：能力校验限制的是 host API，不是操作系统。插件仍以 daemon 用户身份运行，
 可以直接读写该用户可访问的文件，因此只应安装可信插件。需要强隔离时应使用单独的
 用户/容器运行 daemon；项目配置永远不能添加插件。
 
-相关 RPC：`plugin.list`（状态、工具/命令数、错误）、`plugin.commands`（TUI 命令目录）、
+相关 RPC：`plugin.list`（状态 `disabled` / `starting` / `ready` / `degraded` / `failed` /
+`stopped`、工具/命令数、错误）、`plugin.commands`（TUI 命令目录）、
 `plugin.restart {name}`（重启单个插件）。`/reload` 会重新读取插件配置并重启全部插件。
 `plugin.list`、工具目录和命令刷新时会检查子进程：意外退出会标记为 `failed`，移除它的
-工具和命令，`plugin.restart` 可以重新拉起。daemon 正常退出时向空闲插件发送 `shutdown`
-通知并短暂等待，不响应的插件会被强制回收。`storage` 每个插件最多 10,000 行 / 16 MiB，
-超限的 `host.storage.set` 返回错误，需要删除旧键释放空间。完整示例见
-`examples/plugins/echo/`。
+工具和命令，`plugin.restart` 可以重新拉起。daemon 正常退出时发送 `shutdown` 通知并短暂
+等待，不响应的插件会被强制回收。`storage` 每个插件最多 10,000 行 / 16 MiB，超限的
+`host.storage.set` 返回错误，需要删除旧键释放空间。完整示例见
+`examples/plugins/echo/`。目标架构（更多贡献点、hooks、UI、细粒度授权、分发与路线图）
+见 `docs/plugins.md`。
 
 ### 19.5 HTTP API 与远程 attach
 
 除 Unix socket / TCP 外，还可以只开一个 HTTP 端口给脚本、SDK 或 Web 前端用：
 
-```yaml
-server:
-  http: 127.0.0.1:7778   # 或用 EIX_HTTP
-  token: "..."           # 与 TCP 共用；开 http 时必填
+```toml
+[server]
+http = "127.0.0.1:7778"   # 或用 EIX_HTTP
+token = "..."             # 与 TCP 共用；开 http 时必填
 ```
 
 - `GET /health`：无需认证，返回 `{"ok":true,"version":"..."}`。
@@ -1842,11 +1880,11 @@ TypeScript / 浏览器侧使用 `clients/ts`（无依赖，`fetch` + 自己解�
 
 默认只监听 Unix socket（0600，靠文件系统权限保护）。要跨机器用，在配置里打开 TCP：
 
-```yaml
-server:
-  tcp: 127.0.0.1:7777    # 或用 EIX_TCP
-  http: 127.0.0.1:7778   # 可选；或用 EIX_HTTP
-  token: "..."           # 打开 tcp/http 时必填，非空
+```toml
+[server]
+tcp = "127.0.0.1:7777"    # 或用 EIX_TCP
+http = "127.0.0.1:7778"   # 可选；或用 EIX_HTTP
+token = "..."             # 打开 tcp/http 时必填，非空
 ```
 
 设置 `tcp` 后 token 是强制的（配置校验会拒绝空 token）。TCP 连接必须把 `auth {token}`
@@ -1889,7 +1927,7 @@ eix 不提供内置 Neovim 前端。Neovim 插件是普通 daemon client，通�
   `tool.approval_required` 映射为 `session/request_permission`，编辑器选择回写
   `approval.respond`（`allow-always` → `Always` + session scope）。`request_user_input` 没有
   tab，按问题顺序逐个发 permission 请求，收齐后一次 `input.respond`；拒绝即取消 turn。
-- 模式：`plan` / `build` / `auto` / `bypass`，`session/set_mode` 映射 `session.mode`。
+- 模式：`plan` / `build` / `auto` / `full`，`session/set_mode` 映射 `session.mode`。
 - 只声明已实现能力：文本 prompt、`resource_link`、内嵌文本、`loadSession`、`session/close`；
   不声明图片/音频和 MCP over ACP。客户端传入的 `mcpServers` 会被忽略并在 stderr 提示。
 
@@ -1960,12 +1998,12 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 - [x] 客户端通知（后台 attention 在底部状态栏居中提示，可选 `bell`，不弹桌面通知）
 - [x] 日志脱敏（`redact`：Bearer / `sk-` / 敏感键赋值）与 provider 上下行可逆脱敏
 - [x] GitHub Actions CI（fmt / clippy `-D warnings` / test；无 git 时自动 skip）
-- [x] session 执行模式（`plan` / `build` / `auto` / `bypass`；`session.mode` 支持临时切换并记录事件；旧库从 permission/agent 自动迁移）
+- [x] session 执行模式（`plan` / `build` / `auto` / `full`；`session.mode` 支持临时切换并记录事件；旧库从 permission/agent 自动迁移）
 - [x] 显式权限规则（`[[tools.rules]]`：工具名 + 路径 glob + argv 前缀 / 正则 / signature；deny 全局优先、按具体度选择、项目配置只能收紧）
 - [x] 统一风险分析与审计（只读命令分析、硬 deny、network/secret 保护、`permission_evaluated` 事件、审批 scope / risk UX、`external_directory`）
 - [x] `auto` 意图分类器（固定启用、使用 session 模型、内置 timeout / confidence / max risk / cache；只把默认 ask 降为 allow，失败回退询问；审计写入 `permission_evaluated.classifier`）
 - [x] 自动压缩（超过 `auto_compact_threshold` 时总结旧 turn，保留最近 N 轮；`context_compacted` 事件）
-- [x] 配置分层 + 占位符 + 热重载 + `cli.json`（全局 → 祖先 `.eix/config.yaml`、`{env:}` / `{file:}`、mtime 轮询 + `/reload`、项目默认 model/agent/mode）
+- [x] 配置分层 + 占位符 + 热重载 + `cli.json`（全局 → 祖先 `.eix/config.toml`、`{env:}` / `{file:}`、mtime 轮询 + `/reload`、项目默认 model/agent/mode）
 - [x] session 管理（undo/redo、export/import、delete、archive、timeline、队列 `rm`/`move`；CLI `eix undo/redo/export/import/delete/archive/timeline`）
 - [x] Skills（原生 `.eix` + 可配置 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 兼容、system prompt 摘要 + `use_skill {name, arguments}`、`$ARGUMENTS` / `$1..$9`、`allowed-tools` 单 turn 限制、带预览的 `/skills` picker）
 - [x] 写入后 formatter（`[[formatter]]` command/extensions/timeout；按顺序首个匹配；直接写入与 staged apply 都生效）

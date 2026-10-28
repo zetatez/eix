@@ -60,6 +60,7 @@ pub struct Sections {
     pub workspace: Option<String>,
     pub memory: Option<String>,
     pub tasks: Option<String>,
+    pub goal: Option<String>,
     pub environment: Option<String>,
 }
 
@@ -348,6 +349,7 @@ impl Ledger {
         entries.extend(event_entries);
         entries.extend(volatile_entries(
             sections.tasks.as_deref(),
+            sections.goal.as_deref(),
             sections.environment.as_deref(),
             &policy,
         ));
@@ -439,6 +441,7 @@ impl Ledger {
         entries.extend(history);
         entries.extend(volatile_entries(
             sections.tasks.as_deref(),
+            sections.goal.as_deref(),
             sections.environment.as_deref(),
             &policy,
         ));
@@ -741,7 +744,12 @@ fn stable_entries(
 /// Sections that change between tool rounds go after append-only history. They
 /// use the user role so providers that only allow a leading system message do
 /// not reject the request; the XML tag keeps them distinct from user input.
-fn volatile_entries(tasks: Option<&str>, environment: Option<&str>, policy: &Policy) -> Vec<Entry> {
+fn volatile_entries(
+    tasks: Option<&str>,
+    goal: Option<&str>,
+    environment: Option<&str>,
+    policy: &Policy,
+) -> Vec<Entry> {
     let mut entries = Vec::new();
     if let Some(text) = tasks {
         entries.push(volatile(
@@ -749,6 +757,15 @@ fn volatile_entries(tasks: Option<&str>, environment: Option<&str>, policy: &Pol
             Sector::Memory,
             "tasks",
             format!("<tasks>\n{text}\n</tasks>"),
+            policy,
+        ));
+    }
+    if let Some(text) = goal {
+        entries.push(volatile(
+            "goal",
+            Sector::Memory,
+            "goal",
+            format!("<goal>\n{text}\n</goal>"),
             policy,
         ));
     }
@@ -2654,6 +2671,7 @@ mod tests {
             Sections {
                 memory: Some("prefers focused diffs".into()),
                 tasks: Some("Current task list:\n[ ] fix it".into()),
+                goal: Some("ship the release without regressions".into()),
                 ..Sections::default()
             },
             &events,
@@ -2666,12 +2684,13 @@ mod tests {
         let info = ledger.info();
         assert!(info.entries.iter().any(|entry| entry.id == "memory"));
         assert!(info.entries.iter().any(|entry| entry.id == "tasks"));
+        assert!(info.entries.iter().any(|entry| entry.id == "goal"));
         let memory = info
             .sectors
             .iter()
             .find(|sector| sector.sector == Sector::Memory)
             .unwrap();
-        assert_eq!(memory.entries, 2);
+        assert_eq!(memory.entries, 3);
         assert!(memory.tokens > 0);
 
         // Memory is part of the cacheable prefix; tasks follow history so a
@@ -2685,6 +2704,8 @@ mod tests {
         };
         assert!(position("prefers focused diffs") < position("do it"));
         assert!(position("<tasks>") > position("do it"));
+        assert!(position("<goal>") > position("do it"));
+        assert!(position("ship the release without regressions") > position("do it"));
     }
 
     #[test]

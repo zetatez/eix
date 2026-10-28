@@ -598,6 +598,42 @@ impl App {
         );
     }
 
+    pub(super) fn draw_text_view(&mut self, frame: &mut Frame, area: Rect) {
+        let dialog_bg = dialog_background(self.theme);
+        let Some(view) = &mut self.text_view else {
+            return;
+        };
+        let rect = search_dialog_rect(area);
+        frame.render_widget(Clear, rect);
+        frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(composer_accent(self.theme)))
+            .title(format!(" {} ", view.title))
+            .title_bottom(" j/k scroll · PgUp/PgDn · g/G · Esc close ");
+        let inner = block.inner(rect);
+        frame.render_widget(block, rect);
+        let height = inner.height as usize;
+        let max_scroll = view.lines.len().saturating_sub(height.max(1));
+        if view.scroll == usize::MAX {
+            view.scroll = max_scroll;
+        } else {
+            view.scroll = view.scroll.min(max_scroll);
+        }
+        let body: Vec<Line> = view
+            .lines
+            .iter()
+            .skip(view.scroll)
+            .take(height)
+            .map(|line| Line::from(line.clone()))
+            .collect();
+        frame.render_widget(
+            Paragraph::new(body)
+                .style(Style::default().fg(composer_text(self.theme)).bg(dialog_bg)),
+            inner,
+        );
+    }
+
     pub(super) fn draw_picker(&mut self, frame: &mut Frame, area: Rect) {
         let filtered = self.picker_filtered();
         let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {

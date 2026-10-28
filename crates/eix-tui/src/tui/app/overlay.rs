@@ -55,6 +55,40 @@ impl App {
         }
     }
 
+    /// Scroll or dismiss a read-only text overlay.
+    pub(super) fn handle_text_view_key(&mut self, key: KeyEvent) {
+        let mut close = false;
+        if let Some(view) = self.text_view.as_mut() {
+            let last = view.lines.len().saturating_sub(1);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('Q') => close = true,
+                KeyCode::Char('j') | KeyCode::Down => {
+                    view.scroll = view.scroll.saturating_add(1).min(last);
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    view.scroll = view.scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown | KeyCode::Char(' ') => {
+                    view.scroll = view.scroll.saturating_add(12).min(last);
+                }
+                KeyCode::PageUp => {
+                    view.scroll = view.scroll.saturating_sub(12);
+                }
+                KeyCode::Char('g') | KeyCode::Home => view.scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => view.scroll = usize::MAX,
+                _ => {}
+            }
+        }
+        if close {
+            self.text_view = None;
+            self.status = "closed".into();
+        }
+    }
+
+    pub(super) fn open_text_view(&mut self, title: impl Into<String>, text: &str) {
+        self.text_view = Some(TextView::new(title, text));
+    }
+
     pub(super) fn open_processes(&mut self, tx: &UnboundedSender<Command>) {
         let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) else {
             self.status = "no session to inspect".into();

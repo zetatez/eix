@@ -47,6 +47,7 @@ mod notification;
 mod overlay;
 mod overlay_draw;
 mod prompt;
+mod prompts;
 mod search;
 mod session;
 mod status;
@@ -89,9 +90,9 @@ const THEME_DEFAULT_VALUE: &str = "@default";
 /// Running sessions rotate a quadrant square clockwise; idle sessions show `⠶`.
 const RUNNING_SPINNER: [&str; 4] = ["◰", "◳", "◲", "◱"];
 
-/// "Bypass" is the longest execution-mode label. Pad every mode badge to this
+/// "Build" is the longest execution-mode label. Pad every mode badge to this
 /// width so the rest of the statusline never moves when the mode changes.
-const SESSION_MODE_WIDTH: usize = 6;
+const SESSION_MODE_WIDTH: usize = 5;
 
 /// Re-read the focused session's git branch at this interval.
 const GIT_BRANCH_REFRESH: Duration = Duration::from_secs(5);
@@ -124,6 +125,18 @@ fn builtin(name: &str, args: &str, description: &str) -> CommandSpec {
         args: args.to_string(),
         description: description.to_string(),
         template: None,
+        agent: None,
+        model: None,
+    }
+}
+
+/// A built-in command whose body is a prompt template.
+fn builtin_prompt(name: &str, args: &str, description: &str, template: &str) -> CommandSpec {
+    CommandSpec {
+        name: name.to_string(),
+        args: args.to_string(),
+        description: description.to_string(),
+        template: Some(template.to_string()),
         agent: None,
         model: None,
     }
@@ -218,8 +231,62 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("archive", "", "hide this session from the picker"),
         builtin("delete", "", "delete this session (run twice to confirm)"),
-        builtin("undo", "", "hide the newest turn (/redo restores it)"),
-        builtin("redo", "", "restore the most recently undone turn"),
+        builtin(
+            "undo",
+            "",
+            "hide the newest turn and roll the workspace back",
+        ),
+        builtin(
+            "redo",
+            "",
+            "restore the most recently undone turn and its files",
+        ),
+        builtin("rename", "<name>", "rename this session"),
+        builtin(
+            "diff",
+            "[staged]",
+            "review the workspace diff in a scrollable overlay",
+        ),
+        builtin("doctor", "", "show daemon and config diagnostics"),
+        builtin(
+            "goal",
+            "[text|done|reopen|clear]",
+            "set a goal that persists across turns",
+        ),
+        builtin(
+            "loop",
+            "[interval prompt|stop]",
+            "repeat a prompt on an interval while the session is idle",
+        ),
+        builtin(
+            "schedule",
+            "[when prompt|stop [id]]",
+            "run a prompt once at +duration or HH:MM",
+        ),
+        builtin_prompt(
+            "code-review",
+            "[focus]",
+            "review the current diff for correctness and tests",
+            prompts::CODE_REVIEW,
+        ),
+        builtin_prompt(
+            "security-review",
+            "[focus]",
+            "audit the current diff for security issues",
+            prompts::SECURITY_REVIEW,
+        ),
+        builtin_prompt(
+            "simplify",
+            "[scope]",
+            "simplify the changed code without changing behaviour",
+            prompts::SIMPLIFY,
+        ),
+        builtin_prompt(
+            "verify",
+            "[scope]",
+            "verify the change with builds, tests and a live check",
+            prompts::VERIFY,
+        ),
         builtin(
             "skills",
             "[name] [args]",
@@ -230,7 +297,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("colorscheme", "", "choose a colorscheme with live preview"),
         builtin(
             "perm",
-            "[plan|build|auto|bypass]",
+            "[plan|build|auto|full]",
             "choose the session permission mode in a search picker",
         ),
         builtin("fork", "[name]", "fork this session into a new pane"),
@@ -309,10 +376,13 @@ fn prompt_input_height_for_rows(area_height: u16, rows: usize) -> u16 {
 // box.
 const COMPOSER_TEXT: Color = Color::Rgb(220, 223, 228);
 const COMPOSER_MUTED: Color = Color::Rgb(140, 149, 168);
-const COMPOSER_BORDER: Color = Color::Rgb(74, 88, 120);
-const COMPOSER_INACTIVE_BORDER: Color = Color::Rgb(50, 55, 68);
-const COMPOSER_ACCENT: Color = Color::Rgb(122, 162, 247);
-const COMPOSER_FOCUS: Color = Color::Rgb(154, 202, 255);
+// Without a preset the palette is transparent: borders and accents defer to
+// the terminal's own colors instead of painting a fixed tint (the previous
+// periwinkle read as purple on many terminals).
+const COMPOSER_BORDER: Color = Color::DarkGray;
+const COMPOSER_INACTIVE_BORDER: Color = Color::DarkGray;
+const COMPOSER_ACCENT: Color = Color::Reset;
+const COMPOSER_FOCUS: Color = Color::Reset;
 const COMPOSER_SUCCESS: Color = Color::Rgb(126, 199, 149);
 const COMPOSER_WARN: Color = Color::Rgb(229, 192, 123);
 const COMPOSER_ORANGE: Color = Color::Rgb(245, 169, 127);
@@ -1472,6 +1542,30 @@ struct DiffView {
     width: usize,
 }
 
+/// Read-only scrollable text overlay used by `/diff`, `/doctor` and the
+/// schedule listing.
+struct TextView {
+    title: String,
+    lines: Vec<String>,
+    /// Lines scrolled from the top. `usize::MAX` means "stay at the end";
+    /// drawing clamps it to the last page.
+    scroll: usize,
+}
+
+impl TextView {
+    fn new(title: impl Into<String>, text: &str) -> Self {
+        let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+        if lines.is_empty() {
+            lines.push(String::new());
+        }
+        Self {
+            title: title.into(),
+            lines,
+            scroll: 0,
+        }
+    }
+}
+
 /// Full-screen background process list, opened with `P` from the transcript.
 struct ProcessView {
     session_id: String,
@@ -1710,6 +1804,8 @@ pub struct App {
     inputs: HashMap<String, PendingInput>,
     /// Full-screen diff review, when open.
     diff_view: Option<DiffView>,
+    /// Read-only text overlay (`/diff`, `/doctor`, `/schedule` listing).
+    text_view: Option<TextView>,
     /// Full-screen background process list, when open.
     process_view: Option<ProcessView>,
     /// Vim-style `/` / `?` search within the focused transcript.
@@ -1844,7 +1940,7 @@ fn mode_picker_items(current: SessionMode) -> Vec<PickerItem> {
             "workspace-write; allow unruled default asks (no external writes)",
         ),
         (
-            SessionMode::Bypass,
+            SessionMode::Full,
             "full access; external writes allowed, unsandboxed fallback",
         ),
     ]
@@ -2512,11 +2608,51 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/undo",
-                description: "hide the newest turn",
+                description: "hide the newest turn and roll its tool-call changes back",
             },
             HelpEntry {
                 key: "/redo",
-                description: "restore the most recently undone turn",
+                description: "restore the most recently undone turn and its files",
+            },
+            HelpEntry {
+                key: "/rename <name>",
+                description: "rename this session",
+            },
+            HelpEntry {
+                key: "/diff [staged]",
+                description: "review the workspace diff in a scrollable overlay",
+            },
+            HelpEntry {
+                key: "/doctor",
+                description: "show daemon, config, sandbox and snapshot diagnostics",
+            },
+            HelpEntry {
+                key: "/goal [text|done|reopen|clear]",
+                description: "set a goal that persists across turns and is injected into context",
+            },
+            HelpEntry {
+                key: "/loop <interval> <prompt>",
+                description: "repeat a prompt while idle; /loop stop clears them",
+            },
+            HelpEntry {
+                key: "/schedule <+duration|HH:MM> <prompt>",
+                description: "run a prompt once; /schedule stop [id] clears them",
+            },
+            HelpEntry {
+                key: "/code-review",
+                description: "review the current diff for correctness, regressions and tests",
+            },
+            HelpEntry {
+                key: "/security-review",
+                description: "audit the current diff for injection, secrets and authorization gaps",
+            },
+            HelpEntry {
+                key: "/simplify",
+                description: "simplify the changed code without changing behaviour",
+            },
+            HelpEntry {
+                key: "/verify",
+                description: "build, test and exercise the change; report evidence",
             },
             HelpEntry {
                 key: "/skills [name] [args]",
@@ -2540,7 +2676,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/perm",
-                description: "choose Plan · Build · Auto · Bypass in a search picker (alias: /mode)",
+                description: "choose Plan · Build · Auto · Full in a search picker (alias: /mode)",
             },
             HelpEntry {
                 key: "/exit",
@@ -2685,15 +2821,15 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Tab",
-                description: "cycle Plan → Build → Auto → Bypass → Plan",
+                description: "cycle Plan → Build → Auto → Full → Plan",
             },
             HelpEntry {
                 key: "Shift-Tab",
-                description: "cycle the other way: Build → Plan → Bypass → Auto → Build",
+                description: "cycle the other way: Build → Plan → Full → Auto → Build",
             },
             HelpEntry {
                 key: "Space m",
-                description: "open the full Plan / Build / Auto / Bypass mode picker",
+                description: "open the full Plan / Build / Auto / Full mode picker",
             },
             HelpEntry {
                 key: "Space n",
@@ -2765,7 +2901,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "[keys]",
-                description: "override global/TUI actions and leader chords in config.yaml; `leader` changes the prefix",
+                description: "override global/TUI actions and leader chords in config.toml; `leader` changes the prefix",
             },
             HelpEntry {
                 key: "help search",
@@ -3504,11 +3640,20 @@ fn draw_input_card(frame: &mut Frame, area: Rect, pending: &PendingInput, theme:
     frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
     let inner = rect.width.saturating_sub(2) as usize;
     let cursor = pending.cursors[tab].min(rows.saturating_sub(1));
-    let selected_bg = composer_accent(theme);
-    let selected_style = Style::default()
-        .fg(badge_text_color(selected_bg))
-        .bg(selected_bg)
-        .add_modifier(Modifier::BOLD);
+    let accent = composer_accent(theme);
+    let selected_style = if matches!(accent, Color::Rgb(..)) {
+        Style::default()
+            .fg(badge_text_color(accent))
+            .bg(accent)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        // Transparent palettes keep the terminal background and mark the
+        // selection with the same low-contrast fill as other lists.
+        Style::default()
+            .fg(composer_text(theme))
+            .bg(composer_selection(theme))
+            .add_modifier(Modifier::BOLD)
+    };
 
     // One tab per question, marked with the answer state so a multi-question
     // request shows progress at a glance.
@@ -3929,14 +4074,14 @@ fn composer_status_color(status: SessionStatus, theme: Theme) -> Color {
 
 /// The four execution modes use four different colors: Plan is read-only
 /// amber, Build is workspace-write blue, Auto is classifier-gated light orange
-/// and Bypass is unguarded pink. Auto keeps its own orange because the theme
+/// and Full is unguarded pink. Auto keeps its own orange because the theme
 /// palettes have no slot that stays distinct from every other mode color.
 fn session_mode_color(mode: SessionMode, theme: Theme) -> Color {
     let color = match mode {
         SessionMode::Plan => composer_warn(theme),
         SessionMode::Build => composer_accent(theme),
         SessionMode::Auto => COMPOSER_ORANGE,
-        SessionMode::Bypass => composer_danger(theme),
+        SessionMode::Full => composer_danger(theme),
     };
     readable_mode_color(color, theme)
 }
@@ -4022,17 +4167,32 @@ fn readable_mode_color(color: Color, theme: Theme) -> Color {
 }
 
 fn composer_mode_style(mode: Mode, focused: bool, theme: Theme) -> Style {
-    let (color, foreground) = if focused {
-        let color = composer_mode_color(mode, theme);
-        (color, badge_text_color(color))
+    let color = if focused {
+        composer_mode_color(mode, theme)
     } else {
         // Blurred badges keep deliberately low contrast.
-        (composer_border(theme), COMPOSER_BADGE_TEXT)
+        composer_border(theme)
     };
+    if uses_terminal_palette(theme) || !matches!(color, Color::Rgb(..)) {
+        // A transparent palette (or an ANSI color) cannot carry the fixed badge
+        // text color, so invert the terminal colors instead of painting a fill.
+        let modifier = if focused {
+            Modifier::BOLD | Modifier::REVERSED
+        } else {
+            Modifier::DIM | Modifier::REVERSED
+        };
+        return Style::default().add_modifier(modifier);
+    }
     Style::default()
-        .fg(foreground)
+        .fg(badge_text_color(color))
         .bg(color)
         .add_modifier(Modifier::BOLD)
+}
+
+/// True when the palette is the built-in transparent default: no preset, no
+/// explicit background and no accent slot, so nothing should be filled.
+fn uses_terminal_palette(theme: Theme) -> bool {
+    theme.preset.is_none() && theme.background.is_none() && theme.function.is_none()
 }
 
 fn truncate_line(line: Line<'static>, width: usize) -> Line<'static> {
