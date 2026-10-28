@@ -22,6 +22,7 @@ impl App {
             session_id,
             at_seq,
             name: None,
+            branch: false,
         });
         self.status = match at_seq {
             Some(seq) => format!("forking before e{seq}…"),
@@ -830,16 +831,8 @@ impl App {
     /// low → medium → high → low. A model without an explicit variant starts
     /// at the default medium, so the first step is high.
     pub(super) fn cycle_reasoning(&mut self, tx: &UnboundedSender<Command>) {
-        let Some(session_id) = self.focused_session_id() else {
-            self.status = "reasoning: no session".into();
-            return;
-        };
         let selection = self.model().to_string();
-        if selection.is_empty() || selection == "-" {
-            self.status = "reasoning: no model".into();
-            return;
-        }
-        let (base, current) = split_model_variant(&selection);
+        let (_, current) = split_model_variant(&selection);
         let next = match current.unwrap_or("medium") {
             "low" => "medium",
             "medium" => "high",
@@ -848,11 +841,36 @@ impl App {
             "none" => "low",
             _ => "low",
         };
-        let model = if next == "medium" {
-            // Medium is the default, so keep the plain model id.
-            base.to_string()
+        self.set_reasoning(next, tx);
+    }
+
+    /// Pin the focused session's reasoning strength. `medium` is the model's
+    /// default, so it clears the `#variant` suffix instead of storing one.
+    pub(super) fn set_reasoning(&mut self, effort: &str, tx: &UnboundedSender<Command>) -> bool {
+        let Some(session_id) = self.focused_session_id() else {
+            self.status = "effort: no session".into();
+            return false;
+        };
+        let selection = self.model().to_string();
+        if selection.is_empty() || selection == "-" {
+            self.status = "effort: no model".into();
+            return false;
+        }
+        let (base, _) = split_model_variant(&selection);
+        let base = base.to_string();
+        let effort = match effort {
+            "low" | "medium" | "high" => effort,
+            _ => {
+                self.error = Some(format!(
+                    "unknown effort {effort:?} · use low, medium or high"
+                ));
+                return false;
+            }
+        };
+        let model = if effort == "medium" {
+            base
         } else {
-            format!("{base}#{next}")
+            format!("{base}#{effort}")
         };
         if let Some(view) = self
             .views
@@ -866,5 +884,6 @@ impl App {
             session_id,
             model: Some(model),
         });
+        true
     }
 }

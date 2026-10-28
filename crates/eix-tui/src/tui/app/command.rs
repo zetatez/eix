@@ -172,6 +172,94 @@ impl App {
                 self.command_compact(args, tx);
                 true
             }
+            "rewind" => {
+                if args.is_empty() {
+                    self.open_picker(PickerKind::Rewind, tx);
+                } else if let Some(session_id) = self.focused_session_id() {
+                    let mut parts = args.split_whitespace();
+                    let target = parts.next().unwrap_or_default();
+                    let scope_arg = parts.next();
+                    if parts.next().is_some() {
+                        self.error = Some("usage: /rewind [n|e<seq>] [both|chat|files]".into());
+                        return true;
+                    }
+                    let scope = match scope_arg.unwrap_or("both") {
+                        "both" => Some(eix_core::RewindScope::Both),
+                        "chat" | "conversation" => Some(eix_core::RewindScope::Conversation),
+                        "files" | "file" => Some(eix_core::RewindScope::Files),
+                        other => {
+                            self.error = Some(format!(
+                                "unknown rewind scope {other:?} · use both, chat or files"
+                            ));
+                            None
+                        }
+                    };
+                    if let Some(scope) = scope {
+                        let turns: Vec<u64> = self
+                            .focused_view()
+                            .map(|view| {
+                                timeline_picker_items(&view.events)
+                                    .into_iter()
+                                    .filter_map(|item| item.value.parse::<u64>().ok())
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        let at_seq = if let Some(seq) = target.strip_prefix('e') {
+                            seq.parse::<u64>().ok().filter(|seq| turns.contains(seq))
+                        } else {
+                            target
+                                .parse::<usize>()
+                                .ok()
+                                .filter(|n| *n > 0)
+                                .and_then(|n| turns.get(n - 1).copied())
+                        };
+                        match at_seq {
+                            Some(at_seq) => {
+                                let _ = tx.send(Command::Rewind {
+                                    session_id,
+                                    at_seq,
+                                    scope,
+                                });
+                                self.status = format!("rewinding to e{at_seq} · {}", scope.label());
+                            }
+                            None => {
+                                self.error = Some(format!(
+                                    "no checkpoint {target:?} · /rewind opens the picker"
+                                ));
+                            }
+                        }
+                    }
+                }
+                true
+            }
+            "context" => {
+                let all = match args {
+                    "" => Some(false),
+                    "all" | "full" => Some(true),
+                    _ => None,
+                };
+                match (all, self.focused_session_id()) {
+                    (Some(all), Some(session_id)) => {
+                        let _ = tx.send(Command::ContextInfo { session_id, all });
+                        self.status = "context: reading ledger…".into();
+                    }
+                    (Some(_), None) => self.status = "context: no session".into(),
+                    (None, _) => self.error = Some("usage: /context [all]".into()),
+                }
+                true
+            }
+            "effort" => {
+                if args.is_empty() {
+                    let (_, current) = split_model_variant(self.model());
+                    let current = current.unwrap_or("medium");
+                    self.status = format!("effort: {current} · low|medium|high");
+                } else {
+                    if self.set_reasoning(args, tx) {
+                        self.status = format!("effort: {args}");
+                    }
+                }
+                true
+            }
             "btw" => {
                 self.command_btw(args, tx);
                 true
@@ -525,8 +613,22 @@ impl App {
                         session_id,
                         at_seq: None,
                         name,
+                        branch: false,
                     });
                     self.status = "forking…".into();
+                }
+                true
+            }
+            "branch" => {
+                let name = (!args.is_empty()).then(|| args.to_string());
+                if let Some(session_id) = self.focused_session_id() {
+                    let _ = tx.send(Command::Fork {
+                        session_id,
+                        at_seq: None,
+                        name,
+                        branch: true,
+                    });
+                    self.status = "branching…".into();
                 }
                 true
             }

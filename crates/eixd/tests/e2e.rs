@@ -794,6 +794,52 @@ async fn daemon_stops_a_repeating_tool_batch() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn context_info_reports_the_token_ledger() -> anyhow::Result<()> {
+    let dir = temp_dir("context-info");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "context", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "first question"}),
+        )
+        .await?;
+    wait_turn(&mut client).await?;
+
+    let info: eix_core::ContextLedgerResult = client
+        .request("context.info", json!({"session_id": session_id}))
+        .await?;
+    assert!(info.total_tokens > 0);
+    assert!(info.budget_tokens > 0);
+    assert!(!info.sectors.is_empty());
+    assert!(info.entries.iter().any(|entry| entry.kind == "user"));
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
     let dir = temp_dir("clear");
     std::fs::create_dir_all(&dir)?;
@@ -7506,6 +7552,156 @@ async fn undo_and_redo_toggle_the_newest_turn() -> anyhow::Result<()> {
         .await?;
     assert!(client
         .request::<Value>("session.undo", json!({"session_id": session_id}))
+        .await
+        .is_err());
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn rewind_to_any_turn_respects_the_scope() -> anyhow::Result<()> {
+    let dir = temp_dir("rewind-scope");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "rewind", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let mut user_seqs = Vec::new();
+    for text in ["first turn", "second turn"] {
+        let submitted: SubmitResult = client
+            .request(
+                "prompt.submit",
+                json!({"session_id": session_id, "text": text}),
+            )
+            .await?;
+        loop {
+            let notification = client.next_notification().await?;
+            if notification.method == "turn.completed"
+                && notification.params["session_id"] == session_id.as_str()
+                && notification.params["turn_id"] == submitted.turn_id.as_str()
+            {
+                break;
+            }
+        }
+        let attached: AttachResult = client
+            .request("session.attach", json!({"session_id": session_id}))
+            .await?;
+        let user = attached
+            .events
+            .iter()
+            .filter(|event| event.kind == EventKind::UserMessage)
+            .find(|event| event.payload["text"] == text)
+            .expect("user event");
+        user_seqs.push(user.seq);
+    }
+
+    // Conversation-only hides the second turn but leaves every event on disk.
+    let rewound: Value = client
+        .request(
+            "session.rewind_to",
+            json!({
+                "session_id": session_id,
+                "at_seq": user_seqs[1],
+                "scope": "conversation",
+            }),
+        )
+        .await?;
+    assert_eq!(rewound["at_seq"], user_seqs[1]);
+    assert!(rewound["changed"].as_u64().unwrap_or(0) >= 2);
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(
+        attached
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::UserMessage
+                && event.payload["text"] == "first turn")
+    );
+    assert!(!attached.events.iter().any(
+        |event| event.kind == EventKind::UserMessage && event.payload["text"] == "second turn"
+    ));
+
+    // Redo restores that range.
+    let redone: Value = client
+        .request("session.redo", json!({"session_id": session_id}))
+        .await?;
+    assert!(redone["changed"].as_u64().unwrap_or(0) >= 2);
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(attached.events.iter().any(
+        |event| event.kind == EventKind::UserMessage && event.payload["text"] == "second turn"
+    ));
+
+    // Files-only keeps the conversation visible and changes no events.
+    let rewound: Value = client
+        .request(
+            "session.rewind_to",
+            json!({
+                "session_id": session_id,
+                "at_seq": user_seqs[0],
+                "scope": "files",
+            }),
+        )
+        .await?;
+    assert_eq!(rewound["changed"], 0);
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(attached.events.iter().any(
+        |event| event.kind == EventKind::UserMessage && event.payload["text"] == "second turn"
+    ));
+
+    // Both hides the first turn and everything after it.
+    let rewound: Value = client
+        .request(
+            "session.rewind_to",
+            json!({
+                "session_id": session_id,
+                "at_seq": user_seqs[0],
+                "scope": "both",
+            }),
+        )
+        .await?;
+    assert!(rewound["changed"].as_u64().unwrap_or(0) >= 2);
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(!attached
+        .events
+        .iter()
+        .any(|event| event.kind == EventKind::UserMessage));
+
+    // An assistant event is not a checkpoint.
+    assert!(client
+        .request::<Value>(
+            "session.rewind_to",
+            json!({
+                "session_id": session_id,
+                "at_seq": user_seqs[0] + 1,
+                "scope": "conversation",
+            }),
+        )
         .await
         .is_err());
 

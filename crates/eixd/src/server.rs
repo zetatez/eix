@@ -25,18 +25,19 @@ use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
     ApprovalScope, AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult,
     ChatMessage, ClassifierAuditPayload, Config, ContextClearParams, ContextClearedPayload,
-    ContextCompactParams, ContextCompactedPayload, CreateSessionParams, DoctorReport, DraftParams,
-    DraftResult, ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams,
-    FunctionCall, GoalParams, GoalResult, HelloResult, ImagePart, InputAnsweredPayload,
-    InputRequiredPayload, InputRespondParams, InputResult, IntegrationContinueParams,
-    IntegrationListParams, IntegrationListResult, IntegrationState, IntegrationStatus,
-    LspWorkspaceParams, McpListResult, McpServerInfo, ModeParams, ModelListResult, ModelRole,
-    ModelUseParams, ModelUseResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
-    PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
-    PermissionAction, PermissionRule, PickerParams, PickerPreviewParams, PickerPreviewResult,
-    PluginCommandList, PluginCommandRunParams, PluginListResult, PluginSettingsResult,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    ProviderAuthInfo, RenameParams, Request, Response, RewindParams, RewindResult, RuleSource,
+    ContextCompactParams, ContextCompactedPayload, ContextInfoParams, CreateSessionParams,
+    DoctorReport, DraftParams, DraftResult, ErrorPayload, Event, EventKind, EventsParams,
+    EventsResult, ForkParams, FunctionCall, GoalParams, GoalResult, HelloResult, ImagePart,
+    InputAnsweredPayload, InputRequiredPayload, InputRespondParams, InputResult,
+    IntegrationContinueParams, IntegrationListParams, IntegrationListResult, IntegrationState,
+    IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo, ModeParams,
+    ModelListResult, ModelRole, ModelUseParams, ModelUseResult, Notification, PatchApplyParams,
+    PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
+    PatchResultPayload, PatchReviseParams, PermissionAction, PermissionRule, PickerParams,
+    PickerPreviewParams, PickerPreviewResult, PluginCommandList, PluginCommandRunParams,
+    PluginListResult, PluginSettingsResult, ProcessKillParams, ProcessKillResult, ProcessList,
+    ProcessListParams, ProcessOutputParams, ProviderAuthInfo, RenameParams, Request, Response,
+    RewindParams, RewindResult, RewindScope, RewindToParams, RewindToResult, RuleSource,
     ScheduleAddParams, ScheduleListParams, ScheduleListResult, ScheduleRemoveParams,
     ScheduleRemoveResult, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
     SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
@@ -447,6 +448,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         started: Instant::now(),
         snapshots,
         snapshot_lock: Mutex::new(()),
+        rewind_lock: Mutex::new(()),
         staging,
         processes,
         mcp: Mutex::new(crate::mcp::McpSet::new(data_dir.join("oauth").join("mcp"))),
@@ -745,6 +747,9 @@ pub(crate) struct Daemon {
     /// holding this only around the snapshot (not the mutation) keeps writes to
     /// different files concurrent.
     snapshot_lock: Mutex<()>,
+    /// Serializes `/rewind` and `/redo` so a round number and its pre-rewind
+    /// snapshot cannot be allocated twice.
+    rewind_lock: Mutex<()>,
     /// Staged patch proposals, the session shadow workspace.
     staging: Staging,
     /// Background processes started with `exec_command`.
@@ -2980,6 +2985,11 @@ impl Daemon {
                 }
                 Ok(json!({ "deleted": deleted }))
             }
+            "session.rewind_to" => {
+                let params: RewindToParams = parse_params(request.params.clone())?;
+                let result = self.rewind_to(params).await?;
+                Ok(serde_json::to_value(result)?)
+            }
             "session.undo" | "session.redo" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
                 if self.turns.lock().await.contains_key(&params.session_id) {
@@ -3580,6 +3590,11 @@ impl Daemon {
             "context.clear" => {
                 let params: ContextClearParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(self.context_clear(params).await?)?)
+            }
+            "context.info" => {
+                let params: ContextInfoParams = parse_params(request.params.clone())?;
+                let ledger = self.build_ledger(&params.session_id).await?;
+                Ok(serde_json::to_value(ledger.info())?)
             }
             "picker.query" => {
                 let params: PickerParams = parse_params(request.params.clone())?;
@@ -4604,77 +4619,116 @@ impl Daemon {
     ///
     /// Rollback is best-effort: files that were never captured, changes made
     /// outside eix, and failed restores are reported instead of hidden.
-    /// `/undo`: hide the newest user turn and put the workspace back to the
-    /// state the turn started from. Snapshots are captured before each write,
-    /// so replaying them in reverse yields the pre-turn tree.
-    async fn undo_with_files(&self, session_id: &str) -> Result<UndoResult> {
-        let session = self.require_session(session_id)?;
-        let Some(cutoff) = self.store.last_visible_user_turn(session_id)? else {
-            return Err(rpc("nothing_to_undo", "no user turn to undo"));
-        };
-        let mut snapshots: Vec<(u64, String, usize)> = Vec::new();
-        for event in self
-            .store
-            .events_after_kind_async(session_id, cutoff.saturating_sub(1), EventKind::Snapshot)
-            .await?
-        {
-            let Ok(snapshot) = serde_json::from_value::<SnapshotPayload>(event.payload) else {
-                continue;
-            };
-            if snapshot.ok && !snapshot.snapshot_id.is_empty() {
-                snapshots.push((event.seq, snapshot.snapshot_id, snapshot.skipped));
-            }
+    /// `/rewind`: hide the conversation at or after `at_seq` and/or put the
+    /// workspace back to the state that turn started from. Snapshots are
+    /// captured before each write, so replaying the ones in the discarded
+    /// range in reverse yields the pre-turn tree.
+    async fn rewind_to(&self, params: RewindToParams) -> Result<RewindToResult> {
+        let session = self.require_session(&params.session_id)?;
+        if session.status.is_busy() {
+            return Err(rpc(
+                "busy",
+                format!("session {} is {}", session.id, session.status.as_str()),
+            ));
         }
-        snapshots.sort_by_key(|(seq, _, _)| *seq);
+        if !self
+            .store
+            .is_visible_user_turn(&session.id, params.at_seq)?
+        {
+            return Err(rpc(
+                "invalid_params",
+                format!(
+                    "e{} is not a visible user turn in session {}",
+                    params.at_seq, session.id
+                ),
+            ));
+        }
+
+        let mut snapshots: Vec<(u64, String, usize)> = Vec::new();
+        if params.scope.restores_files() {
+            for event in self
+                .store
+                .events_after_kind_async(
+                    &session.id,
+                    params.at_seq.saturating_sub(1),
+                    EventKind::Snapshot,
+                )
+                .await?
+            {
+                let Ok(snapshot) = serde_json::from_value::<SnapshotPayload>(event.payload) else {
+                    continue;
+                };
+                if snapshot.ok && !snapshot.snapshot_id.is_empty() {
+                    snapshots.push((event.seq, snapshot.snapshot_id, snapshot.skipped));
+                }
+            }
+            snapshots.sort_by_key(|(seq, _, _)| *seq);
+        }
 
         let snapshots_enabled = self.config.load().tools.snapshots;
-        let mut result = UndoResult {
+        let mut result = RewindToResult {
+            at_seq: params.at_seq,
+            scope: params.scope,
             changed: 0,
             files_restored: 0,
             files_removed: 0,
             files_missing: 0,
             warnings: Vec::new(),
         };
+        if params.scope.restores_files() && !snapshots.is_empty() && !snapshots_enabled {
+            result
+                .warnings
+                .push("tools.snapshots is disabled, so the workspace was not rolled back".into());
+        }
+
+        // Only one rewind may allocate a round and capture its redo snapshot at
+        // a time, otherwise two clients could reuse the same round.
+        let _rewind_guard = self.rewind_lock.lock().await;
 
         // Capture the current workspace before rolling it back. Redo restores
-        // this snapshot, so the bytes the undo discards are not lost.
+        // this snapshot, so the bytes the rewind discards are not lost.
         let mut redo_snapshot = None;
-        if snapshots_enabled && !snapshots.is_empty() {
+        if params.scope.restores_files() && snapshots_enabled && !snapshots.is_empty() {
             let _guard = self.snapshot_lock.lock().await;
-            let call_id = format!("undo-{}", Uuid::new_v4());
+            let call_id = format!("rewind-{}", Uuid::new_v4());
             let capture = self
                 .snapshots
-                .capture_tree(session_id, "undo", &call_id, &session.cwd)
+                .capture_tree(&session.id, "rewind", &call_id, &session.cwd)
                 .await;
             let (snapshot_id, _) = self
-                .record_snapshot(session_id, "undo", &call_id, Scope::Tree, capture)
+                .record_snapshot(&session.id, "rewind", &call_id, Scope::Tree, capture)
                 .await?;
             redo_snapshot = snapshot_id;
         }
 
-        let changed = self
-            .store
-            .undo_last_turn(session_id)?
-            .ok_or_else(|| rpc("nothing_to_undo", "no user turn to undo"))?;
-        result.changed = changed;
-        if let (Some(snapshot_id), Some(round)) =
-            (redo_snapshot, self.store.last_undo_round(session_id)?)
-        {
+        let round = self.store.next_rewind_round(&session.id)?;
+        if params.scope.restores_conversation() {
+            result.changed = self.store.rewind_to(&session.id, params.at_seq, round)?;
+        }
+        // A files-only rewind hides no events, so reserve its round explicitly.
+        // The empty id means "nothing to restore" for `/redo`, but the slot
+        // still keeps the rewind stack in order.
+        let redo_snapshot = match redo_snapshot {
+            Some(snapshot_id) => Some(snapshot_id),
+            None if !params.scope.restores_conversation() => Some(String::new()),
+            None => None,
+        };
+        if let Some(snapshot_id) = redo_snapshot {
             self.store
-                .record_undo_snapshot(session_id, round, &snapshot_id)?;
+                .record_undo_snapshot(&session.id, round, &snapshot_id)?;
         }
 
+        if !params.scope.restores_files() {
+            return Ok(result);
+        }
         if snapshots.is_empty() {
             result.warnings.push(
-                "no snapshots in this turn; files changed outside tool calls were left as they are"
+                "no snapshots in this range; files changed outside tool calls were left as they are"
                     .into(),
             );
             return Ok(result);
         }
         if !snapshots_enabled {
-            result
-                .warnings
-                .push("tools.snapshots is disabled, so the workspace was not rolled back".into());
             return Ok(result);
         }
 
@@ -4683,7 +4737,7 @@ impl Daemon {
         let mut skipped = 0usize;
         for (_, snapshot_id, skipped_files) in snapshots.iter().rev() {
             skipped += skipped_files;
-            match self.snapshots.restore(session_id, snapshot_id, &cwd).await {
+            match self.snapshots.restore(&session.id, snapshot_id, &cwd).await {
                 Ok(report) => {
                     result.files_restored += report.restored;
                     result.files_removed += report.removed;
@@ -4716,19 +4770,37 @@ impl Daemon {
         Ok(result)
     }
 
-    /// `/redo`: restore the conversation hidden by the newest undo and, when
-    /// the undo captured one, the workspace snapshot taken just before it.
+    /// `/undo`: hide the newest visible user turn and roll back its files.
+    async fn undo_with_files(&self, session_id: &str) -> Result<UndoResult> {
+        let Some(at_seq) = self.store.last_visible_user_turn(session_id)? else {
+            return Err(rpc("nothing_to_undo", "no user turn to undo"));
+        };
+        let result = self
+            .rewind_to(RewindToParams {
+                session_id: session_id.to_string(),
+                at_seq,
+                scope: RewindScope::Both,
+            })
+            .await?;
+        Ok(UndoResult {
+            changed: result.changed,
+            files_restored: result.files_restored,
+            files_removed: result.files_removed,
+            files_missing: result.files_missing,
+            warnings: result.warnings,
+        })
+    }
+
+    /// `/redo`: restore the conversation hidden by the newest rewind and, when
+    /// that rewind captured one, the workspace snapshot taken just before it.
     async fn redo_with_files(&self, session_id: &str) -> Result<UndoResult> {
         let round = self
             .store
-            .last_undo_round(session_id)?
+            .last_rewind_round(session_id)?
             .ok_or_else(|| rpc("nothing_to_redo", "nothing to redo"))?;
         let snapshot = self.store.take_undo_snapshot(session_id, round)?;
         let cwd = self.require_session(session_id)?.cwd;
-        let changed = self
-            .store
-            .redo_last_undo(session_id)?
-            .ok_or_else(|| rpc("nothing_to_redo", "nothing to redo"))?;
+        let changed = self.store.redo_round(session_id, round)?;
         let mut result = UndoResult {
             changed,
             files_restored: 0,
@@ -4739,6 +4811,9 @@ impl Daemon {
         let Some(snapshot_id) = snapshot else {
             return Ok(result);
         };
+        if snapshot_id.is_empty() {
+            return Ok(result);
+        }
         if !self.config.load().tools.snapshots {
             result
                 .warnings

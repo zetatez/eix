@@ -490,25 +490,36 @@ impl Store {
     /// it) from `events()` and the transcript. Each undo gets its own marker so
     /// repeated undo/redo behaves like a stack.
     pub fn undo_last_turn(&self, id: &str) -> Result<Option<usize>> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let cutoff: Option<i64> = tx
-            .query_row(
-                "SELECT seq FROM events
-                 WHERE session_id = ?1 AND undone = 0 AND kind = 'user_message'
-                 ORDER BY seq DESC LIMIT 1",
-                params![id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(cutoff) = cutoff else {
+        let Some(cutoff) = self.last_visible_user_turn(id)? else {
             return Ok(None);
         };
-        let round: i64 = tx.query_row(
-            "SELECT COALESCE(MAX(undone), 0) + 1 FROM events WHERE session_id = ?1",
+        let round = self.next_rewind_round(id)?;
+        Ok(Some(self.rewind_to(id, cutoff, round)?))
+    }
+
+    /// Allocate the next rewind round for a session. Rounds are shared by the
+    /// `events.undone` marker and `undo_snapshots`, so a files-only rewind
+    /// (which hides no events) still gets a distinct redo slot.
+    pub fn next_rewind_round(&self, id: &str) -> Result<i64> {
+        let conn = self.read_conn();
+        let round: i64 = conn.query_row(
+            "SELECT MAX(round) FROM (
+                 SELECT COALESCE(MAX(undone), 0) AS round
+                 FROM events WHERE session_id = ?1
+                 UNION ALL
+                 SELECT COALESCE(MAX(round), 0) AS round
+                 FROM undo_snapshots WHERE session_id = ?1
+             )",
             params![id],
             |row| row.get(0),
         )?;
+        Ok(round + 1)
+    }
+
+    /// Hide every visible event at or after `cutoff` under `round`.
+    pub fn rewind_to(&self, id: &str, cutoff: u64, round: i64) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
         let count = tx.execute(
             "UPDATE events SET undone = ?1
              WHERE session_id = ?2 AND seq >= ?3 AND undone = 0",
@@ -519,21 +530,22 @@ impl Store {
             params![now_ms(), id],
         )?;
         tx.commit()?;
-        Ok(Some(count))
+        Ok(count)
     }
 
-    /// Restore the most recent undo batch.
+    /// Restore the most recent rewind batch.
     pub fn redo_last_undo(&self, id: &str) -> Result<Option<usize>> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let round: Option<i64> = tx.query_row(
-            "SELECT MAX(undone) FROM events WHERE session_id = ?1",
-            params![id],
-            |row| row.get(0),
-        )?;
-        let Some(round) = round.filter(|round| *round > 0) else {
+        let Some(round) = self.last_rewind_round(id)? else {
             return Ok(None);
         };
+        Ok(Some(self.redo_round(id, round)?))
+    }
+
+    /// Unhide the events hidden under `round`. Files-only rounds have no such
+    /// events, so this returns 0 and only the snapshot is restored.
+    pub fn redo_round(&self, id: &str, round: i64) -> Result<usize> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
         let count = tx.execute(
             "UPDATE events SET undone = 0 WHERE session_id = ?1 AND undone = ?2",
             params![id, round],
@@ -543,7 +555,7 @@ impl Store {
             params![now_ms(), id],
         )?;
         tx.commit()?;
-        Ok(Some(count))
+        Ok(count)
     }
 
     /// Sequence of the newest visible user message, i.e. the first event an
@@ -562,15 +574,37 @@ impl Store {
         Ok(seq.map(|seq| seq as u64))
     }
 
-    /// Newest undo round, or `None` when nothing has been undone.
-    pub fn last_undo_round(&self, id: &str) -> Result<Option<i64>> {
+    /// Whether `seq` is a visible user message, i.e. a valid rewind target.
+    pub fn is_visible_user_turn(&self, id: &str, seq: u64) -> Result<bool> {
         let conn = self.read_conn();
-        let round: Option<i64> = conn.query_row(
-            "SELECT MAX(undone) FROM events WHERE session_id = ?1",
+        let found: Option<i64> = conn
+            .query_row(
+                "SELECT 1 FROM events
+                 WHERE session_id = ?1 AND seq = ?2 AND undone = 0
+                   AND kind = 'user_message'",
+                params![id, seq],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(found.is_some())
+    }
+
+    /// Newest rewind round, or `None` when nothing has been rewound. Includes
+    /// files-only rounds, which have a snapshot row but no hidden events.
+    pub fn last_rewind_round(&self, id: &str) -> Result<Option<i64>> {
+        let conn = self.read_conn();
+        let round: i64 = conn.query_row(
+            "SELECT MAX(round) FROM (
+                 SELECT COALESCE(MAX(undone), 0) AS round
+                 FROM events WHERE session_id = ?1
+                 UNION ALL
+                 SELECT COALESCE(MAX(round), 0) AS round
+                 FROM undo_snapshots WHERE session_id = ?1
+             )",
             params![id],
             |row| row.get(0),
         )?;
-        Ok(round.filter(|round| *round > 0))
+        Ok((round > 0).then_some(round))
     }
 
     /// Remember the pre-undo workspace snapshot for a round so redo can put
@@ -2352,6 +2386,61 @@ mod tests {
             restored.iter().map(|event| event.seq).collect::<Vec<_>>(),
             vec![4, 3]
         );
+    }
+
+    #[test]
+    fn rewind_to_any_turn_and_redo_restores_the_range() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        let mut turns = Vec::new();
+        for i in 0..3 {
+            let user = store
+                .append_event(
+                    "s1",
+                    EventKind::UserMessage,
+                    serde_json::json!({"text": format!("m{i}")}),
+                )
+                .unwrap();
+            turns.push(user.seq);
+            store
+                .append_event(
+                    "s1",
+                    EventKind::AssistantMessage,
+                    serde_json::json!({"text": "a"}),
+                )
+                .unwrap();
+        }
+        assert!(store.is_visible_user_turn("s1", turns[1]).unwrap());
+        assert!(!store.is_visible_user_turn("s1", turns[1] + 1).unwrap());
+
+        let round = store.next_rewind_round("s1").unwrap();
+        assert_eq!(round, 1);
+        // The second user turn and everything after it.
+        assert_eq!(store.rewind_to("s1", turns[1], round).unwrap(), 4);
+        assert_eq!(store.last_rewind_round("s1").unwrap(), Some(1));
+        assert!(store.recent_user_messages("s1", 10).unwrap().len() == 1);
+
+        assert_eq!(store.redo_round("s1", round).unwrap(), 4);
+        assert_eq!(store.recent_user_messages("s1", 10).unwrap().len(), 3);
+        assert_eq!(store.last_rewind_round("s1").unwrap(), None);
+        assert_eq!(store.next_rewind_round("s1").unwrap(), 1);
+    }
+
+    #[test]
+    fn files_only_rewind_rounds_reserve_a_slot_and_can_be_redone() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("s1")).unwrap();
+        let round = store.next_rewind_round("s1").unwrap();
+        store.record_undo_snapshot("s1", round, "snap-a").unwrap();
+        assert_eq!(store.last_rewind_round("s1").unwrap(), Some(round));
+        // A files-only round hides no events, but still advances the counter.
+        assert_eq!(store.next_rewind_round("s1").unwrap(), round + 1);
+        assert_eq!(store.redo_round("s1", round).unwrap(), 0);
+        assert_eq!(
+            store.take_undo_snapshot("s1", round).unwrap().as_deref(),
+            Some("snap-a")
+        );
+        assert_eq!(store.last_rewind_round("s1").unwrap(), None);
     }
 
     #[test]

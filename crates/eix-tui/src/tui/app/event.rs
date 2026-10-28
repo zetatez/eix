@@ -404,6 +404,43 @@ impl App {
                 };
                 let _ = tx.send(Command::Attach(id));
             }
+            Event::Branched(session) => {
+                let id = session.id.clone();
+                let name = session.name.clone();
+                self.upsert_session(session, true);
+                self.selected = self
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == id)
+                    .unwrap_or(0);
+                self.pending_attach = Some(PendingAttach {
+                    session_id: id.clone(),
+                    slot: AttachSlot::Existing(self.focused),
+                });
+                self.error = None;
+                self.status = format!("branched {name} · original kept in sessions");
+                let _ = tx.send(Command::Attach(id));
+            }
+            Event::ContextInfo {
+                session_id,
+                all,
+                info,
+            } => {
+                let text = render_context_ledger(&info, all);
+                let title = if all {
+                    format!("context · {} · all entries", short_id(&session_id))
+                } else {
+                    format!(
+                        "context · {} · /context all for entries",
+                        short_id(&session_id)
+                    )
+                };
+                self.open_text_view(title, &text);
+                self.status = format!(
+                    "{} / {} tokens · Esc close",
+                    info.total_tokens, info.budget_tokens
+                );
+            }
             Event::PickerData { kind, items, query } => {
                 let Some(picker) = &mut self.picker else {
                     return;
@@ -1693,5 +1730,92 @@ fn render_plugin_settings(settings: &eix_core::PluginSettingsResult) -> String {
     }
     lines.push(String::new());
     lines.push("Edit values under [plugins.<name>.settings] in the global config.".into());
+    lines.join("\n")
+}
+
+/// Human-readable `/context` report. The bar uses a fixed 20-cell width so
+/// sector rows line up in a monospace font without depending on the terminal.
+fn render_context_ledger(info: &eix_core::ContextLedgerResult, all: bool) -> String {
+    const BAR_WIDTH: usize = 20;
+    let percent = info
+        .total_tokens
+        .saturating_mul(100)
+        .checked_div(info.budget_tokens)
+        .unwrap_or(0);
+    let mut lines = vec![format!(
+        "total  {:>8} / {} tokens  ({percent}%)",
+        info.total_tokens, info.budget_tokens
+    )];
+    if info.trimmed > 0 {
+        lines.push(format!(
+            "       {} entr(ies) dropped automatically to fit the budget",
+            info.trimmed
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "{:<14} {:>8} {:>8}  {:<20} {:>7}",
+        "sector", "used", "budget", "usage", "entries"
+    ));
+    for sector in &info.sectors {
+        let filled = sector
+            .tokens
+            .saturating_mul(BAR_WIDTH)
+            .checked_div(sector.budget_tokens)
+            .unwrap_or(0)
+            .min(BAR_WIDTH);
+        let mut flags = String::new();
+        if sector.pinned > 0 {
+            flags.push_str(&format!(" · {} pinned", sector.pinned));
+        }
+        if sector.dropped > 0 {
+            flags.push_str(&format!(" · {} dropped", sector.dropped));
+        }
+        lines.push(format!(
+            "{:<14} {:>8} {:>8}  {}{:<width$} {:>7}{flags}",
+            sector.sector.as_str(),
+            sector.tokens,
+            sector.budget_tokens,
+            "#".repeat(filled),
+            "",
+            sector.entries,
+            width = BAR_WIDTH.saturating_sub(filled)
+        ));
+    }
+    if all {
+        lines.push(String::new());
+        lines.push(format!("entries ({})", info.entries.len()));
+        for entry in &info.entries {
+            let mut flags = Vec::new();
+            if entry.pinned {
+                flags.push("pinned");
+            }
+            if entry.dropped {
+                flags.push("dropped");
+            }
+            if entry.compacted {
+                flags.push("compacted");
+            }
+            if entry.auto {
+                flags.push("auto");
+            }
+            if entry.editable {
+                flags.push("editable");
+            }
+            let suffix = if flags.is_empty() {
+                String::new()
+            } else {
+                format!(" · {}", flags.join(", "))
+            };
+            lines.push(format!(
+                "[{}] {:<12} {:>7} tok  {}{suffix}",
+                entry.sector.as_str(),
+                entry.kind,
+                entry.tokens,
+                entry.preview
+            ));
+            lines.push(format!("    id: {}", entry.id));
+        }
+    }
     lines.join("\n")
 }

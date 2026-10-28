@@ -3332,7 +3332,7 @@ fn command_line_menu_navigates_with_ctrl_keys() {
         .into_iter()
         .map(|spec| spec.name.as_str())
         .collect();
-    assert_eq!(names, vec!["ready", "reload", "redo", "rename"]);
+    assert_eq!(names, vec!["ready", "reload", "rewind", "redo", "rename"]);
     assert_eq!(app.cmdline_menu_cursor, None);
 
     app.handle_key(
@@ -8587,4 +8587,243 @@ fn doctor_results_open_in_the_text_overlay() {
     let view = app.text_view.as_ref().expect("doctor overlay");
     assert_eq!(view.title, "doctor");
     assert_eq!(view.lines.len(), 2);
+}
+
+fn command_app_with_turns() -> App {
+    let events = vec![
+        SessionEvent::new(
+            "s1",
+            1,
+            EventKind::UserMessage,
+            serde_json::json!({"text": "first request"}),
+        ),
+        SessionEvent::new(
+            "s1",
+            2,
+            EventKind::AssistantMessage,
+            serde_json::json!({"text": "first answer"}),
+        ),
+        SessionEvent::new(
+            "s1",
+            3,
+            EventKind::UserMessage,
+            serde_json::json!({"text": "second request"}),
+        ),
+        SessionEvent::new(
+            "s1",
+            4,
+            EventKind::AssistantMessage,
+            serde_json::json!({"text": "second answer"}),
+        ),
+        SessionEvent::new(
+            "s1",
+            5,
+            EventKind::UserMessage,
+            serde_json::json!({"text": "third request"}),
+        ),
+    ];
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(
+        Session::new("s1", "rewind", "/tmp"),
+        events,
+    ));
+    app.focused = 0;
+    app
+}
+
+fn drain_commands(rx: &mut tokio::sync::mpsc::UnboundedReceiver<Command>) -> Vec<Command> {
+    let mut commands = Vec::new();
+    while let Ok(command) = rx.try_recv() {
+        commands.push(command);
+    }
+    commands
+}
+
+#[test]
+fn undo_aliases_rewind_and_opens_the_checkpoint_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/undo", &tx, true));
+
+    let picker = app.picker.as_ref().expect("rewind picker");
+    assert_eq!(picker.kind, PickerKind::Rewind);
+    assert_eq!(
+        picker
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["5", "3", "1"]
+    );
+}
+
+#[test]
+fn rewind_number_counts_back_from_the_newest_turn_and_takes_a_scope() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/rewind 2 files", &tx, true));
+
+    let sent = drain_commands(&mut rx);
+    assert!(
+        sent.iter().any(|command| matches!(
+            command,
+            Command::Rewind {
+                session_id,
+                at_seq: 3,
+                scope: eix_core::RewindScope::Files,
+            } if session_id == "s1"
+        )),
+        "unexpected commands: {}",
+        sent.len()
+    );
+
+    // A literal event sequence is accepted too.
+    assert!(app.handle_command_text("/rewind e1 chat", &tx, true));
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::Rewind {
+            at_seq: 1,
+            scope: eix_core::RewindScope::Conversation,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn rewind_rejects_unknown_checkpoints_and_scopes() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/rewind 99", &tx, true));
+    assert!(app.error.is_some());
+    assert!(!drain_commands(&mut rx)
+        .iter()
+        .any(|command| matches!(command, Command::Rewind { .. })));
+
+    app.error = None;
+    assert!(app.handle_command_text("/rewind 1 sideways", &tx, true));
+    assert!(app.error.is_some());
+    assert!(!drain_commands(&mut rx)
+        .iter()
+        .any(|command| matches!(command, Command::Rewind { .. })));
+}
+
+#[test]
+fn context_command_requests_the_ledger_and_renders_it() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/context all", &tx, true));
+    assert!(drain_commands(&mut rx).iter().any(|command| matches!(
+        command,
+        Command::ContextInfo {
+            session_id,
+            all: true,
+        } if session_id == "s1"
+    )));
+
+    let info = eix_core::ContextLedgerResult {
+        entries: vec![eix_core::ContextEntryInfo {
+            id: "e1".into(),
+            sector: eix_core::Sector::History,
+            kind: "user".into(),
+            tokens: 12,
+            chars: 40,
+            preview: "first request".into(),
+            detail: "first request".into(),
+            pinned: false,
+            dropped: false,
+            compacted: false,
+            auto: false,
+            editable: true,
+        }],
+        sectors: vec![eix_core::ContextSectorInfo {
+            sector: eix_core::Sector::History,
+            tokens: 12,
+            budget_tokens: 100,
+            entries: 1,
+            pinned: 0,
+            dropped: 0,
+        }],
+        total_tokens: 12,
+        budget_tokens: 100,
+        trimmed: 0,
+    };
+    app.handle_event(
+        Event::ContextInfo {
+            session_id: "s1".into(),
+            all: true,
+            info,
+        },
+        &tx,
+    );
+    let view = app.text_view.as_ref().expect("context overlay");
+    let text = view.lines.join("\n");
+    assert!(text.contains("history"), "{text}");
+    assert!(text.contains("first request"), "{text}");
+    assert!(text.contains("12 / 100 tokens"), "{text}");
+}
+
+#[test]
+fn effort_sets_the_model_variant() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    app.views[0].session.model = Some("mock-model".into());
+
+    assert!(app.handle_command_text("/effort high", &tx, true));
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::SetModel {
+            session_id,
+            model: Some(model),
+        } if session_id == "s1" && model == "mock-model#high"
+    )));
+    assert_eq!(
+        app.views[0].session.model.as_deref(),
+        Some("mock-model#high")
+    );
+
+    assert!(app.handle_command_text("/effort medium", &tx, true));
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::SetModel {
+            model: Some(model),
+            ..
+        } if model == "mock-model"
+    )));
+}
+
+#[test]
+fn branch_forks_and_replaces_the_focused_pane() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/branch feature", &tx, true));
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::Fork {
+            session_id,
+            branch: true,
+            name: Some(name),
+            ..
+        } if session_id == "s1" && name == "feature"
+    )));
+
+    let branch = Session::new("s2", "feature", "/tmp");
+    app.handle_event(Event::Branched(branch), &tx);
+    // The pane keeps its session until the attach response arrives.
+    assert_eq!(view_order(&app), vec!["s1"]);
+    assert_eq!(
+        app.pending_attach.as_ref().map(|p| p.session_id.as_str()),
+        Some("s2")
+    );
+    assert!(matches!(
+        app.pending_attach.as_ref().map(|p| p.slot),
+        Some(AttachSlot::Existing(0))
+    ));
+    assert!(app.sessions.iter().any(|session| session.id == "s2"));
+    assert!(drain_commands(&mut rx)
+        .iter()
+        .any(|command| matches!(command, Command::Attach(id) if id == "s2")));
 }

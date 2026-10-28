@@ -889,6 +889,7 @@ impl PluginManager {
     }
 
     /// Run `tool.after` hooks. The last non-empty `output` replacement wins.
+    #[allow(clippy::too_many_arguments)]
     pub async fn run_tool_after(
         &self,
         session_id: &str,
@@ -1801,7 +1802,7 @@ mod tests {
             timeout_ms: 500,
             on_error: "deny".into(),
         };
-        let hooks = validate_hooks(&spec("acme"), &[hook.clone()]).unwrap();
+        let hooks = validate_hooks(&spec("acme"), std::slice::from_ref(&hook)).unwrap();
         assert_eq!(hooks[0].priority, 5);
         assert_eq!(hooks[0].on_error, "deny");
 

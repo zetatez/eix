@@ -26,7 +26,7 @@ daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的
 
 | 领域 | 能力 |
 | --- | --- |
-| Session | 事件日志 + SQLite 持久化、自动命名、attach/detach、fork / rewind、undo/redo（对话 + 工作区文件）、export/import |
+| Session | 事件日志 + SQLite 持久化、自动命名、attach/detach、fork / branch / rewind、rewind/redo（对话 + 工作区文件）、export/import |
 | TUI | 多 pane 自动平铺、四种布局、统一 fuzzy picker、Markdown 转录、side-by-side diff、审批收件箱 |
 | 输入 | 内置 Vim 风格编辑器（normal / insert / visual）、leader 键、可配置快捷键、命令面板 |
 | 执行模式 | `plan` 只读、`build` 工作区写入、`auto` 意图分类、`full` 放行 |
@@ -225,10 +225,14 @@ session 固定 Plan 模式模型，`/model-plan default` 清除并回退到 `mod
 只影响没有固定模型的 session，不写回 config，daemon 重启后恢复。
 `/model global default` 清除覆盖。
 
-`/undo` / `/redo` 同时回滚对话和工作区文件（best effort，恢复失败会明确提示）；`/diff` 和
-`/doctor` 在可滚动 overlay 中展示仓库 diff 与 daemon 诊断；`/goal` 设置跨轮注入的持久目标，
-`/loop` / `/schedule` 在 session 空闲时按间隔或指定时间再次发送 prompt；`/code-review`、
-`/security-review`、`/simplify`、`/verify` 是内置的审查与验证 prompt 模板。
+`/rewind` 打开 checkpoint picker，选中后再选择回滚范围（对话、文件或两者）；也可以直接
+`/rewind <n> [both|chat|files]`，`n` 从最新 user turn 倒数。`/undo` 是 `/rewind` 的兼容别名，
+`/redo` 恢复最近一次 rewind。`/context` 在 overlay 中显示 token 预算与各 sector 占用
+（`/context all` 附带逐条 entry）；`/effort low|medium|high` 调整当前 session 的 reasoning；
+`/branch` 分叉当前对话并把当前 pane 切到新分支（原 session 仍保留在 session picker）。
+`/diff` 和 `/doctor` 在可滚动 overlay 中展示仓库 diff 与 daemon 诊断；`/goal` 设置跨轮注入的
+持久目标，`/loop` / `/schedule` 在 session 空闲时按间隔或指定时间再次发送 prompt；
+`/code-review`、`/security-review`、`/simplify`、`/verify` 是内置的审查与验证 prompt 模板。
 
 完整键位、prompt 命令、审批卡片、picker 和鼠标操作见
 [DESIGN.md 的实现参考](./DESIGN.md#19-实现参考)。

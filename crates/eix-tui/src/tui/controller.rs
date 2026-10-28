@@ -25,6 +25,7 @@ pub const ATTACH_TAIL_EVENTS: usize = 1000;
 /// Number of older events requested per history page.
 pub const HISTORY_PAGE_EVENTS: usize = 500;
 
+#[allow(clippy::enum_variant_names)]
 pub enum Command {
     Hello,
     List,
@@ -153,6 +154,18 @@ pub enum Command {
         session_id: String,
         redo: bool,
     },
+    /// Roll back to just before a visible user turn.
+    Rewind {
+        session_id: String,
+        at_seq: u64,
+        scope: eix_core::RewindScope,
+    },
+    /// Read the session's context token ledger for `/context`.
+    ContextInfo {
+        session_id: String,
+        /// Include the per-entry breakdown, not just the sector table.
+        all: bool,
+    },
     /// Show the repository diff for the session workspace.
     WorkspaceDiff {
         session_id: String,
@@ -232,6 +245,8 @@ pub enum Command {
         /// Copy history before this sequence; `None` copies everything.
         at_seq: Option<u64>,
         name: Option<String>,
+        /// Replace the focused pane with the fork instead of opening a new one.
+        branch: bool,
     },
     PickerData {
         session_id: String,
@@ -300,6 +315,8 @@ impl Command {
             Self::RunShell { .. } => "shell",
             Self::Undo { redo: false, .. } => "undo",
             Self::Undo { redo: true, .. } => "redo",
+            Self::Rewind { .. } => "rewind",
+            Self::ContextInfo { .. } => "context",
             Self::WorkspaceDiff { .. } => "diff",
             Self::Doctor => "doctor",
             Self::RenameSession { .. } => "rename",
@@ -377,6 +394,13 @@ pub enum Event {
         killed: bool,
     },
     Forked(Session),
+    /// A fork that replaced the focused pane (`/branch`).
+    Branched(Session),
+    ContextInfo {
+        session_id: String,
+        all: bool,
+        info: eix_core::ContextLedgerResult,
+    },
     PickerData {
         kind: String,
         items: Vec<eix_core::PickerItem>,
@@ -871,6 +895,47 @@ async fn dispatch(
             }
             send(events, Event::Rewritten { session_id, note })
         }
+        Command::Rewind {
+            session_id,
+            at_seq,
+            scope,
+        } => {
+            let value = requester
+                .request(
+                    "session.rewind_to",
+                    json!({ "session_id": session_id, "at_seq": at_seq, "scope": scope }),
+                )
+                .await?;
+            let result: eix_core::RewindToResult = decode(value)?;
+            let mut note = format!("rewound to e{}", result.at_seq);
+            if scope.restores_conversation() {
+                note.push_str(&format!(" · {} event(s) hidden", result.changed));
+            }
+            if scope.restores_files() && (result.files_restored > 0 || result.files_removed > 0) {
+                note.push_str(&format!(
+                    " · {} file(s) restored, {} removed",
+                    result.files_restored, result.files_removed
+                ));
+            }
+            if let Some(warning) = result.warnings.first() {
+                note.push_str(&format!(" · {warning}"));
+            }
+            send(events, Event::Rewritten { session_id, note })
+        }
+        Command::ContextInfo { session_id, all } => {
+            let value = requester
+                .request("context.info", json!({ "session_id": session_id }))
+                .await?;
+            let info: eix_core::ContextLedgerResult = decode(value)?;
+            send(
+                events,
+                Event::ContextInfo {
+                    session_id,
+                    all,
+                    info,
+                },
+            )
+        }
         Command::WorkspaceDiff { session_id, staged } => {
             let value = requester
                 .request(
@@ -1137,6 +1202,7 @@ async fn dispatch(
             session_id,
             at_seq,
             name,
+            branch,
         } => {
             let value = requester
                 .request(
@@ -1145,7 +1211,11 @@ async fn dispatch(
                 )
                 .await?;
             let result: SessionResult = decode(value)?;
-            send(events, Event::Forked(result.session))
+            if branch {
+                send(events, Event::Branched(result.session))
+            } else {
+                send(events, Event::Forked(result.session))
+            }
         }
         Command::PickerData {
             session_id,

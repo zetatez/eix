@@ -1090,18 +1090,21 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > TUI widget host、action command、hooks / UI / rpc / network / workspace / secrets API 仍是后续阶段。
 >
 > Session 管理：`session.archive` / `session.delete` / `session.export` / `session.import` /
-> `session.timeline` / `session.undo` / `session.redo` / `session.todos` RPC；archive 是持久化
-> 标记且默认列表隐藏，delete 级联事件/草稿/搜索，export/import 保留事件 seq（压缩范围仍然有效）。
-> undo/redo 用 `events.undone` 批次标记隐藏/恢复最近一个 user turn，并同步 FTS 索引；`/undo`
-> 还会把该 turn 的可见 snapshot 逆序重放，回滚工作区，并在回滚前抓一份 tree snapshot 存入
-> `undo_snapshots`，`/redo` 用它把文件也恢复。快照缺失、被 prune 或 `tools.snapshots` 关闭时
-> 在结果里给出 warning，而不是静默失败。`session.diff` / `doctor.report` 分别服务 `/diff` 和
-> `/doctor`；`session.goal` + `session_goals` 表让 goal 跨轮注入上下文，`schedule.*` +
-> `session_schedules` 表由 daemon 每秒检查、仅在 session 空闲时提交（loop 先推进 `next_at`，
-> once 先删除，避免失败后反复重试）。TUI 对应 `/undo`、`/redo`、`/rename`、`/diff`、
-> `/doctor`、`/goal`、`/loop`、`/schedule`、`/timeline`、`/archive`、`/delete`（两次确认）、
-> `/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI 的 `eix export` /
-> `eix import`。
+> `session.timeline` / `session.rewind_to` / `session.undo` / `session.redo` / `session.todos`
+> RPC；archive 是持久化标记且默认列表隐藏，delete 级联事件/草稿/搜索，export/import 保留
+> 事件 seq（压缩范围仍然有效）。rewind 用 `events.undone` 批次标记隐藏任意可见 user turn
+> 及其后的事件，并同步 FTS 索引；`scope` 决定是否隐藏对话、是否把该范围的可见 snapshot
+> 逆序重放来回滚工作区。回滚前会抓一份 tree snapshot 存入 `undo_snapshots`，`/redo` 用它
+> 把文件也恢复；files-only 回滚不隐藏事件，但仍占用一个 rewind round，因此也能 redo。
+> 快照缺失、被 prune 或 `tools.snapshots` 关闭时在结果里给出 warning，而不是静默失败。
+> `context.info` 返回只读 token ledger（sector 预算、entry、trimmed 数），供 `/context`
+> 渲染。`session.diff` / `doctor.report` 分别服务 `/diff` 和 `/doctor`；`session.goal` +
+> `session_goals` 表让 goal 跨轮注入上下文，`schedule.*` + `session_schedules` 表由 daemon
+> 每秒检查、仅在 session 空闲时提交（loop 先推进 `next_at`，once 先删除，避免失败后反复
+> 重试）。TUI 对应 `/rewind`（`/undo` 别名）、`/redo`、`/context`、`/effort`、`/branch`、
+> `/rename`、`/diff`、`/doctor`、`/goal`、`/loop`、`/schedule`、`/timeline`、`/archive`、
+> `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI
+> 的 `eix export` / `eix import`。
 >
 > Skills：`eix-core/src/skills.rs` 始终加载内置 `frontend` / `engineering` / `review` 和原生
 > `.eix`，再按 `[compations]` 开关加载 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 的
@@ -1325,7 +1328,11 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/timeline` | 当前 session 用户输入历史，按时间倒序；带时间戳、搜索和完整预览，`Ctrl-J/K` 或 `Ctrl-N/P` 选择，`Enter` 跳到对应消息位置（`Space h` 同效） |
 | `/archive` | 归档当前 session（从 picker/列表隐藏，事件保留） |
 | `/delete` | 删除当前 session；需要连续执行两次确认 |
-| `/undo` / `/redo` | 隐藏/恢复最近一个 user turn，并按该 turn 的执行前快照回滚/恢复工作区文件（事件仍在日志里） |
+| `/rewind [n\|both\|chat\|files]` | 回滚到第 n 个 user turn（从最新倒数）或 `e<seq>`：`both` 隐藏对话并回滚工作区文件，`chat` 只隐藏对话，`files` 只恢复文件；不带参数打开 checkpoint picker，选中后再选范围。`/undo` 是兼容别名 |
+| `/redo` | 恢复最近一次 rewind 隐藏的对话和/或文件 |
+| `/context [all]` | 在 overlay 中显示 token 总量/预算、各 sector 占用和自动裁剪数；`all` 附带逐条 entry |
+| `/effort [low\|medium\|high]` | 设置当前 session 的 reasoning effort；不带参数显示当前值 |
+| `/branch [name]` | 分叉当前 session 并把当前 pane 切到新分支（原 session 保留在 picker） |
 | `/rename <name>` | 重命名当前 session |
 | `/diff [staged]` | 在可滚动 overlay 中查看 `git diff HEAD`；`staged` 只比较 index 与 HEAD；untracked 文件与截断会给出提示 |
 | `/doctor` | 在 overlay 中显示 daemon socket / data / config、模型、沙箱、snapshot、规则和 session 数 |

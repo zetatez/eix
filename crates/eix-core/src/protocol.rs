@@ -210,6 +210,63 @@ pub struct RewindParams {
     pub name: Option<String>,
 }
 
+/// What `/rewind` rolls back. The default matches the old `/undo` behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewindScope {
+    /// Hide the turn and restore the files it changed.
+    #[default]
+    Both,
+    /// Hide the turn but leave the working tree alone.
+    Conversation,
+    /// Restore the files but keep the conversation visible.
+    Files,
+}
+
+impl RewindScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Both => "conversation and files",
+            Self::Conversation => "conversation",
+            Self::Files => "files",
+        }
+    }
+
+    pub fn restores_conversation(self) -> bool {
+        matches!(self, Self::Both | Self::Conversation)
+    }
+
+    pub fn restores_files(self) -> bool {
+        matches!(self, Self::Both | Self::Files)
+    }
+}
+
+/// `session.rewind_to`: roll back to just before a visible user turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindToParams {
+    pub session_id: SessionId,
+    /// Sequence of the user message that starts the discarded range.
+    pub at_seq: u64,
+    #[serde(default)]
+    pub scope: RewindScope,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RewindToResult {
+    pub at_seq: u64,
+    pub scope: RewindScope,
+    /// Number of events hidden. Always 0 for a files-only rewind.
+    pub changed: usize,
+    #[serde(default)]
+    pub files_restored: usize,
+    #[serde(default)]
+    pub files_removed: usize,
+    #[serde(default)]
+    pub files_missing: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
+}
+
 /// Result of `session.rewind`. `restored` is false when at least one snapshot
 /// could not be applied; `warnings` explains why, including files whose bytes
 /// were never captured.
@@ -599,6 +656,12 @@ pub struct SessionCdParams {
 /// stay in the log (and the transcript); they are simply not sent again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextClearParams {
+    pub session_id: SessionId,
+}
+
+/// `context.info`: a read-only snapshot of the token ledger.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextInfoParams {
     pub session_id: SessionId,
 }
 

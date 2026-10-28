@@ -310,6 +310,7 @@ impl App {
                 } else {
                     self.picker = None;
                 }
+                self.pending_rewind = None;
             }
             KeyCode::Up => self.move_picker(-1),
             KeyCode::Down => self.move_picker(1),
@@ -702,6 +703,41 @@ impl App {
                     self.apply_theme_picker(&value);
                 }
             }
+            PickerKind::Rewind => {
+                if let Some(value) = value {
+                    match value.parse::<u64>() {
+                        Ok(seq) => {
+                            self.picker = None;
+                            self.pending_rewind = Some(seq);
+                            self.open_picker(PickerKind::RewindScope, tx);
+                        }
+                        Err(_) => self.error = Some("invalid checkpoint".into()),
+                    }
+                }
+            }
+            PickerKind::RewindScope => {
+                let at_seq = self.pending_rewind.take();
+                self.picker = None;
+                if let Some(at_seq) = at_seq {
+                    let scope = match value.as_deref() {
+                        Some("chat") => Some(eix_core::RewindScope::Conversation),
+                        Some("files") => Some(eix_core::RewindScope::Files),
+                        Some("both") | None => Some(eix_core::RewindScope::Both),
+                        Some(other) => {
+                            self.error = Some(format!("unknown rewind scope {other:?}"));
+                            None
+                        }
+                    };
+                    if let (Some(scope), Some(session_id)) = (scope, self.focused_session_id()) {
+                        let _ = tx.send(Command::Rewind {
+                            session_id,
+                            at_seq,
+                            scope,
+                        });
+                        self.status = format!("rewinding to e{at_seq} · {}", scope.label());
+                    }
+                }
+            }
             PickerKind::Mcp | PickerKind::Todos => {
                 self.picker = None;
             }
@@ -818,6 +854,16 @@ impl App {
             };
             picker.set_items(timeline_picker_items(&view.events));
             self.status = format!("timeline: {} user message(s)", picker.items.len());
+        } else if kind == PickerKind::Rewind {
+            let Some(view) = self.focused_view() else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            picker.set_items(timeline_picker_items(&view.events));
+            self.status = format!("rewind: {} checkpoint(s)", picker.items.len());
+        } else if kind == PickerKind::RewindScope {
+            picker.set_items(rewind_scope_picker_items());
+            self.status = "rewind: choose what to restore".into();
         } else if kind == PickerKind::Skills {
             let cwd = self
                 .focused_view()

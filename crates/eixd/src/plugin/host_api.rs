@@ -130,7 +130,7 @@ impl HostContext {
     }
 
     async fn execute(&self, request: &RpcRequest) -> RpcResponse {
-        match self.dispatch(&request).await {
+        match self.dispatch(request).await {
             Ok(value) => RpcResponse::ok(request.id, value),
             Err(err) => {
                 RpcResponse::err(request.id, error_code::INVALID_PARAMS, format!("{err:#}"))

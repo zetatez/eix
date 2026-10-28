@@ -150,8 +150,12 @@ fn builtin_prompt(name: &str, args: &str, description: &str, template: &str) -> 
 /// Old slash-command spellings that stay accepted, mapped to the canonical
 /// name. Aliases are transparent in the menu: typing one shows only its
 /// canonical command, so `/mode` no longer competes with `/model`.
-const COMMAND_ALIASES: &[(&str, &str)] =
-    &[("mode", "perm"), ("worktrees", "git"), ("branches", "git")];
+const COMMAND_ALIASES: &[(&str, &str)] = &[
+    ("mode", "perm"),
+    ("worktrees", "git"),
+    ("branches", "git"),
+    ("undo", "rewind"),
+];
 
 fn command_alias(name: &str) -> Option<&'static str> {
     COMMAND_ALIASES
@@ -247,14 +251,24 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("archive", "", "hide this session from the picker"),
         builtin("delete", "", "delete this session (run twice to confirm)"),
         builtin(
-            "undo",
-            "",
-            "hide the newest turn and roll the workspace back",
+            "rewind",
+            "[n|chat|files]",
+            "roll back to an earlier checkpoint (conversation, files or both)",
         ),
         builtin(
             "redo",
             "",
-            "restore the most recently undone turn and its files",
+            "restore the most recently rewound turn and its files",
+        ),
+        builtin(
+            "context",
+            "[all]",
+            "show the context token ledger and budget",
+        ),
+        builtin(
+            "effort",
+            "[low|medium|high]",
+            "set the reasoning effort for this session",
         ),
         builtin("rename", "<name>", "rename this session"),
         builtin(
@@ -316,6 +330,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "choose the session permission mode in a search picker",
         ),
         builtin("fork", "[name]", "fork this session into a new pane"),
+        builtin(
+            "branch",
+            "[name]",
+            "fork this session and switch this pane to the new branch",
+        ),
         builtin("exit", "", "save the draft and quit eix"),
         builtin("quit", "", "save the draft and quit eix"),
         builtin(
@@ -1044,6 +1063,10 @@ enum PickerKind {
     Modes,
     /// Search this session's user-message history and jump to it.
     Timeline,
+    /// Pick an earlier user turn to rewind to.
+    Rewind,
+    /// Pick what a rewind restores (conversation, files, or both).
+    RewindScope,
     /// Browse installed skills, with a body preview.
     Skills,
     /// Preview and apply a color preset.
@@ -1071,6 +1094,8 @@ impl PickerKind {
             | Self::SubagentActivity
             | Self::Modes
             | Self::Timeline
+            | Self::Rewind
+            | Self::RewindScope
             | Self::Skills
             | Self::Themes
             | Self::Mcp
@@ -1102,6 +1127,8 @@ impl PickerKind {
             Self::SubagentActivity => "subagents — live activity",
             Self::Modes => "mode — choose session execution",
             Self::Timeline => "timeline — user input history",
+            Self::Rewind => "rewind — pick a checkpoint",
+            Self::RewindScope => "rewind — what to restore",
             Self::Skills => "skills — preview and insert",
             Self::Themes => "colorschemes — live preview",
             Self::Mcp => "mcp — servers and tools",
@@ -1126,6 +1153,8 @@ impl PickerKind {
             }
             Self::Modes => "type to search · Enter apply · Esc close",
             Self::Timeline => "type to search · C-j/C-k or C-n/C-p · Enter jump · Esc close",
+            Self::Rewind => "type to search · Enter choose checkpoint · Esc close",
+            Self::RewindScope => "Enter rewind · ↑/↓ choose scope · Esc close",
             Self::Skills => "Enter insert · preview on the right · Esc close",
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
             Self::Mcp => "Enter close · ↑/↓ or C-j/C-k/C-n/C-p select · Esc close",
@@ -1786,6 +1815,8 @@ pub struct App {
     help_selected: usize,
     /// First `/delete` arms a confirmation; the second one deletes.
     pending_delete: Option<String>,
+    /// Checkpoint chosen in the `/rewind` picker, waiting for a scope choice.
+    pending_rewind: Option<u64>,
     /// Sessions created by this client during this run. On quit, unused ones
     /// are deleted so opening a pane without typing does not pollute history.
     created_sessions: HashSet<String>,
@@ -2018,6 +2049,35 @@ fn timeline_picker_items(events: &[SessionEvent]) -> Vec<PickerItem> {
             )
         })
         .collect()
+}
+
+/// What `/rewind` restores after a checkpoint is chosen.
+fn rewind_scope_picker_items() -> Vec<PickerItem> {
+    [
+        (
+            "both",
+            "conversation and files",
+            "Hide the turn and put the workspace back.",
+        ),
+        (
+            "chat",
+            "conversation only",
+            "Hide the turn but leave the working tree as it is.",
+        ),
+        (
+            "files",
+            "files only",
+            "Restore the workspace but keep the conversation visible.",
+        ),
+    ]
+    .into_iter()
+    .map(|(value, label, detail)| {
+        PickerItem::new(value)
+            .with_label(label)
+            .with_detail(detail)
+            .with_preview(detail)
+    })
+    .collect()
 }
 
 /// Rows for the `/colorscheme` picker. The first row clears the preset;
@@ -2646,12 +2706,20 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "delete the session permanently (confirm twice)",
             },
             HelpEntry {
-                key: "/undo",
-                description: "hide the newest turn and roll its tool-call changes back",
+                key: "/rewind [n|both|chat|files]",
+                description: "roll back to an earlier checkpoint; /undo still works as an alias",
             },
             HelpEntry {
                 key: "/redo",
-                description: "restore the most recently undone turn and its files",
+                description: "restore the most recently rewound turn and its files",
+            },
+            HelpEntry {
+                key: "/context [all]",
+                description: "show the context token ledger, budget and sector usage",
+            },
+            HelpEntry {
+                key: "/effort [low|medium|high]",
+                description: "set this session's reasoning effort",
             },
             HelpEntry {
                 key: "/rename <name>",
@@ -2711,7 +2779,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/fork",
-                description: "fork this session (/fork optional-name)",
+                description: "fork this session into a new pane (/fork optional-name)",
+            },
+            HelpEntry {
+                key: "/branch",
+                description: "fork this session and switch this pane to the new branch",
             },
             HelpEntry {
                 key: "/perm",

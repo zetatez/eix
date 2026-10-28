@@ -39,6 +39,7 @@ impl App {
             help_query: String::new(),
             help_selected: 0,
             pending_delete: None,
+            pending_rewind: None,
             created_sessions: HashSet::new(),
             pending_images: Vec::new(),
             inflight_images: Vec::new(),
