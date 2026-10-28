@@ -3790,9 +3790,10 @@ fn theme_background_paints_panes_and_dialogs() {
     app.theme = Theme::default();
     app.open_picker(PickerKind::Themes, &tx);
     app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
-    assert_eq!(app.theme.preset, Some("dark-github"));
+    let first = eix_core::THEME_PRESETS[0].name;
+    assert_eq!(app.theme.preset, Some(first));
     terminal.draw(|frame| app.draw(frame)).unwrap();
-    let preview_bg = Color::Rgb(13, 17, 23);
+    let preview_bg = app.theme.background.expect("preset background");
     assert_eq!(terminal.backend().buffer()[(2, 2)].bg, preview_bg);
     // The centered picker's border and body should use the previewed
     // palette, not the terminal's default background.
@@ -3807,14 +3808,26 @@ fn theme_picker_enter_commits_the_preview() {
     let mut app = App::new(None);
     app.open_picker(PickerKind::Themes, &tx);
     app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
-    assert_eq!(app.theme.preset, Some("dark-github"));
+    let first = eix_core::THEME_PRESETS[0].name;
+    assert_eq!(app.theme.preset, Some(first));
 
     app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
     assert!(app.picker.is_none());
     assert!(app.theme_picker_backup.is_none());
-    assert_eq!(app.theme_config.preset.as_deref(), Some("dark-github"));
-    assert_eq!(app.theme.preset, Some("dark-github"));
-    assert!(app.status.contains("colorscheme → dark-github"));
+    assert_eq!(app.theme_config.preset.as_deref(), Some(first));
+    assert_eq!(app.theme.preset, Some(first));
+    assert!(app.status.contains(&format!("colorscheme → {first}")));
+}
+
+#[test]
+fn theme_picker_lists_default_then_sorted_presets() {
+    let items = theme_picker_items();
+    let values: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
+    let expected: Vec<&str> = std::iter::once(THEME_DEFAULT_VALUE)
+        .chain(THEME_PRESETS.iter().map(|preset| preset.name))
+        .collect();
+    assert_eq!(values, expected);
+    assert_eq!(values[0], THEME_DEFAULT_VALUE);
 }
 
 #[test]
