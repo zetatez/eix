@@ -2601,13 +2601,31 @@ fn classify_segment(segment: &CommandSegment, cwd: &Path, risk: &mut RiskAssessm
         );
     }
     match program {
-        "printenv" | "env" | "set" => {
+        "printenv" | "env" => {
             risk.add(
                 RiskCategory::SecretRead,
                 RiskLevel::Critical,
                 "reads the process environment, which may contain credentials".to_string(),
             );
             risk.hard_deny = true;
+        }
+        // Bare `set` prints the shell's variables, which include the
+        // environment. `set -e` / `set -u` / `set -o pipefail` are ordinary
+        // script setup and do not read anything.
+        "set" if args.is_empty() => {
+            risk.add(
+                RiskCategory::SecretRead,
+                RiskLevel::Critical,
+                "reads the process environment, which may contain credentials".to_string(),
+            );
+            risk.hard_deny = true;
+        }
+        "set" => {
+            risk.add(
+                RiskCategory::ExecSafe,
+                RiskLevel::Low,
+                "sets shell options or positional parameters".to_string(),
+            );
         }
         "export" if args.is_empty() || args.iter().any(|arg| arg == "-p") => {
             risk.add(
@@ -5009,6 +5027,30 @@ mod tests {
         }
         assert!(assess_command("cat ~/.ssh/id_rsa", &cwd()).hard_deny);
         assert!(assess_command("jq -n env", &cwd()).hard_deny);
+    }
+
+    #[test]
+    fn set_with_options_is_not_an_environment_read() {
+        // `set -e` is script setup, not `set` printing the environment. The
+        // bare form still leaks variables and must stay denied.
+        for command in [
+            "set -e",
+            "set -euo pipefail",
+            "set -u",
+            "set -o pipefail",
+            "set -x",
+            "set -- a b",
+        ] {
+            let risk = assess_command(command, &cwd());
+            assert!(!risk.hard_deny, "{command}: {risk:?}");
+            assert_eq!(
+                risk.default_action(),
+                PermissionAction::Allow,
+                "{command}: {risk:?}"
+            );
+        }
+        assert!(assess_command("set", &cwd()).hard_deny);
+        assert!(assess_command("bash -c 'set; echo done'", &cwd()).hard_deny);
     }
 
     #[test]
