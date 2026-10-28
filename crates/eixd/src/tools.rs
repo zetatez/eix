@@ -223,7 +223,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "update_plan",
-            "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.",
+            "Update the task plan for multi-phase or ambiguous work. Skip straightforward and single-step tasks. At most one step can be in_progress.",
             json!({
                 "type": "object",
                 "properties": {

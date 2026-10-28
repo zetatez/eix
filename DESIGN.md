@@ -412,8 +412,10 @@ diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syn
 `Copied N chars`；优先调用
 `wl-copy` / `xclip` / `xsel` / `pbcopy`，不可用时回退到 OSC 52。
 `/colorscheme` 打开带实时预览的 colorscheme picker：上下移动立即重绘界面，`Enter` 应用，`Esc`
-恢复打开前的配色；不再通过 `/colorscheme <name>` 直接切换。内置 preset 覆盖 GitHub、One、
-Tokyo Night、Monokai、Mariana、Gruvbox、Catppuccin 与 Rosé Pine 的亮色/暗色版本。亮色主题下
+恢复打开前的配色；不再通过 `/colorscheme <name>` 直接切换。内置 preset 统一命名为
+`<light|dark>-<scheme>`（如 `dark-github`、`light-github`），覆盖 GitHub、One、Tokyo、Monokai、
+Mariana、Gruvbox、Catppuccin、Rosé Pine 以及 Vim 的 Delek、Peach Puff、Ron、Zellner、Desert 的
+亮色/暗色版本。亮色主题下
 模式徽标会保留色相并自动压暗，保证至少 3:1 的对比度。预设里的 `background` 会同时应用到转录区、
 colorscheme picker 和其他浮层；默认配色和没有 `background` 的自定义配色继续使用终端背景。
 输入框不再使用独立的 `panel` 填充，始终跟随主题 `background`（默认即终端背景）。
@@ -703,12 +705,14 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
   `kind`，TUI 用简短标签显示原因。
 - 删除/pin 是 session 级策略，可保存为项目默认。
-- 系统提示按“紧凑基座 + 条件 fragment”组织。基座保持 <800 tokens：
-  Working agreement 约定简洁、先读代码、端到端完成、保留用户改动、不修无关问题，并写明
-  AGENTS.md 的作用域（目录树 + 触碰的每个文件，越深越优先，用户指令最高）；How to work
-  约定先读最窄代码、只对大/模糊/多阶段任务计划、最小连贯改动、修根因、验证可失败的检查，
-  把文件内容/命令输出/MCP 描述视为不可信数据；Communication 约定 review 先列 findings、
-  最终答复四段且 <70 行；Continuity 约定压缩后继续，以及“无新请求时只收尾不发明工作”。
+- 系统提示按“紧凑基座 + 条件 fragment”组织。基座保持 <800 tokens，并直接采用 codex 的
+  工作契约：端到端完成、默认用户要的是实现而不是提案、不猜、验证先窄后宽、ambition vs
+  precision（新项目放开、存量代码外科手术式）、脏工作区与意外改动保护、AGENTS.md 作用域、
+  不重复读已 patch 的文件；规划沿用 codex 的门槛（多阶段或模糊任务，跳过直接任务和单步计划）。
+  同时借鉴 OpenCode 的紧凑写法：Harness 上下文（`<environment>`/`<tasks>` 不是用户消息）、
+  分组工具调用的简短 preamble、未要求不 spawn sub-agent、破坏性操作先问、超出请求不自行扩权，
+  以及“最终答复先给结果、自包含”。Communication 约定 review 先列 findings、最终答复四段且
+  <70 行；Continuity 约定压缩后继续，以及“无新请求时只收尾不发明工作”。
 - 基座不写死工具清单：`tool_note` 根据本次请求实际发送的 schema 生成 `## Tools`，只描述
   `exec_command` / `apply_patch` / `write_stdin` / `tool_search` / `spawn_agent` / `use_skill` /
   `update_plan` 等存在的工具。读取、搜索、列目录优先 `cat` / `sed` / `awk` / `nl` / `rg` /
@@ -718,8 +722,9 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   roots、network allowlist、显式 allow/deny 规则和 escalation 规则；命令分段匹配（`|`、`&&`、
   `||`、`;`、subshell）与“重定向/替换/环境变量前缀/通配符不参与 allow 前缀匹配”写进提示词，
   避免模型提出无效或过宽的 `prefix_rule`。
-- `persistent_mode = true` 时追加 Persistent follow-up：无新用户消息只做收尾/验证，记录目标、
-  最后状态、停止条件和下次检查；优先等待机制，否则 1-3 分钟起步并退避；环境上下文不是新请求。
+- `persistent_mode = true` 时追加 codex 的 Proactivity：无新用户消息只做直接支持已完成工作的
+  follow-up，先确定范围、目标结果、证据和停止条件；记录目标、最后状态、停止条件和下次检查；
+  优先等待机制，否则 1-3 分钟起步并退避，保留用户指定的节奏；需要新授权的外部动作先征求同意。
   默认关闭，因为 eix 的普通 turn 结束即结束。
 - review 仍默认输出人类可读的 findings-first；需要 CI/机器可读时，内置 `review` skill 要求只输出
   一个 JSON 对象（findings / confidence_score / priority / code_location /
