@@ -105,10 +105,12 @@ max_output_tokens = 8192             # required by Anthropic / Gemini
 # model = "claude-haiku-4"
 # context_tokens = 200000
 
-# Per-role defaults: plan | explore | execute.
+# Per-role defaults: execute | plan.
+# `execute` is shared by normal turns and exploration sub-agents. `plan` only
+# affects Plan mode and falls back to the session's /model pin, then `execute`.
 # [model_roles]
 # plan = "openrouter/gpt-5"
-# explore = "ollama/qwen2.5-coder:7b"
+# execute = "ollama/qwen2.5-coder:7b"
 
 # --- Tools ------------------------------------------------------------------
 [tools]
@@ -240,6 +242,14 @@ MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
 # timeout_secs = 30
 # allowed_tools = ["word_*"]
 # denied_tools = ["remember"]
+#
+# Capability-scoped allowlists are empty by default and deny everything.
+# network_allow accepts exact hosts or one leading `*.` wildcard.
+# network_allow = ["api.example.com", "*.example-cdn.com"]
+# secrets lists environment variable names readable through host.secrets.get.
+# secrets = ["ECHO_TOKEN"]
+# rpc_allow lists other plugins callable through host.rpc.call; "*" allows all.
+# rpc_allow = ["other-plugin"]
 #
 # [plugins.echo.settings]
 # repo = "acme"
