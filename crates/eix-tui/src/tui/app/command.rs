@@ -207,6 +207,16 @@ impl App {
                 }
                 true
             }
+            "model-plan" => {
+                if args.is_empty() {
+                    self.open_picker(PickerKind::PlanModels, tx);
+                } else if let Some(session_id) = self.focused_session_id() {
+                    let model = (args != "default").then(|| args.to_string());
+                    let _ = tx.send(Command::SetPlanModel { session_id, model });
+                    self.status = format!("switching Plan model to {args}…");
+                }
+                true
+            }
             "agents" => {
                 if args.is_empty() {
                     self.open_picker(PickerKind::Agents, tx);

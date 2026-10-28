@@ -3991,6 +3991,7 @@ fn picker_detail_columns_align_for_every_kind() {
         PickerKind::Git,
         PickerKind::Commands,
         PickerKind::Models,
+        PickerKind::PlanModels,
         PickerKind::Agents,
         PickerKind::Subagents,
         PickerKind::Modes,
@@ -7156,6 +7157,84 @@ fn model_command_opens_the_picker_and_preselects_the_current_model() {
 }
 
 #[test]
+fn model_plan_command_opens_its_picker_and_sets_the_plan_pin() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    let mut pane = session_pane("s1", "one");
+    pane.session.model = Some("openai/gpt-4o".into());
+    pane.session.plan_model = Some("router/gpt-5".into());
+    app.views.push(pane);
+    app.focused = 0;
+
+    assert!(app.handle_prompt_command("/model-plan", &tx));
+    assert!(matches!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::PlanModels)
+    ));
+    assert!(app.picker.as_ref().unwrap().loading);
+
+    app.handle_event(
+        Event::Models {
+            models: vec![
+                eix_core::ModelInfo {
+                    id: "openai/gpt-4o".into(),
+                    api_model: Some("gpt-4o".into()),
+                    name: "gpt-4o".into(),
+                    provider: "openai".into(),
+                    default: false,
+                    variants: Vec::new(),
+                    input_cost: None,
+                    output_cost: None,
+                    context_tokens: None,
+                },
+                eix_core::ModelInfo {
+                    id: "router/gpt-5".into(),
+                    api_model: Some("gpt-5".into()),
+                    name: "GPT-5".into(),
+                    provider: "Router".into(),
+                    default: false,
+                    variants: Vec::new(),
+                    input_cost: None,
+                    output_cost: None,
+                    context_tokens: None,
+                },
+            ],
+            warnings: Vec::new(),
+            default_model: "gpt-4o".into(),
+        },
+        &tx,
+    );
+    let picker = app.picker.as_ref().expect("plan model picker");
+    assert!(!picker.loading);
+    // Selection follows `plan_model`, not the normal `model` pin.
+    assert_eq!(picker.items[picker.selected].value, "router/gpt-5");
+
+    app.picker.as_mut().unwrap().selected = 1;
+    app.picker_enter(PickerKind::PlanModels, &tx);
+    assert!(app.picker.is_none());
+    let mut plan_commands = Vec::new();
+    while let Ok(command) = rx.try_recv() {
+        if let Command::SetPlanModel { session_id, model } = command {
+            plan_commands.push((session_id, model));
+        }
+    }
+    assert_eq!(
+        plan_commands,
+        vec![("s1".to_string(), Some("openai/gpt-4o".to_string()))]
+    );
+
+    // `default` clears the pin so Plan mode falls back to the role or `/model`.
+    assert!(app.handle_prompt_command("/model-plan default", &tx));
+    let mut plan_commands = Vec::new();
+    while let Ok(command) = rx.try_recv() {
+        if let Command::SetPlanModel { session_id, model } = command {
+            plan_commands.push((session_id, model));
+        }
+    }
+    assert_eq!(plan_commands, vec![("s1".to_string(), None)]);
+}
+
+#[test]
 fn ctrl_slash_opens_the_model_picker_from_both_focus_modes() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -7625,7 +7704,7 @@ fn mode_alias_does_not_compete_with_model_in_the_command_menu() {
         .iter()
         .map(|spec| spec.name.as_str())
         .collect();
-    assert_eq!(names, ["model"]);
+    assert_eq!(names, ["model", "model-plan"]);
     app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),

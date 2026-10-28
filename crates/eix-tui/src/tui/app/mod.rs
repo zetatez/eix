@@ -216,6 +216,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "[id]",
             "search providers/models and switch this session",
         ),
+        builtin(
+            "model-plan",
+            "[id]",
+            "choose the model used by this session's Plan-mode turns",
+        ),
         builtin("agents", "[name]", "choose the session's primary agent"),
         builtin(
             "subagents",
@@ -1015,6 +1020,8 @@ enum PickerKind {
     Commands,
     /// Pin the focused session to a configured model.
     Models,
+    /// Pin the focused session's Plan-mode model.
+    PlanModels,
     /// Select the focused session's primary agent.
     Agents,
     /// Adjust the daemon's runtime subagent concurrency limit.
@@ -1046,6 +1053,7 @@ impl PickerKind {
             | Self::NewPane
             | Self::Commands
             | Self::Models
+            | Self::PlanModels
             | Self::Agents
             | Self::Subagents
             | Self::SubagentActivity
@@ -1076,6 +1084,7 @@ impl PickerKind {
             Self::Git => "git — worktree/branch",
             Self::Commands => "commands",
             Self::Models => "model — search and switch",
+            Self::PlanModels => "plan model — search and switch",
             Self::Agents => "agents — choose the primary agent",
             Self::Subagents => "subagents — parallel limit",
             Self::SubagentActivity => "subagents — live activity",
@@ -1097,6 +1106,7 @@ impl PickerKind {
             Self::Git => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Models => "type to search · Enter switch · Esc close",
+            Self::PlanModels => "type to search · Enter switch · Esc close",
             Self::Agents => "Enter select · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Subagents => "Enter apply · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::SubagentActivity => {
@@ -2034,12 +2044,20 @@ fn theme_slot(value: Option<&'static str>) -> &'static str {
     value.unwrap_or("—")
 }
 
-/// Rows for `/model`. `@default` clears the session's pinned model.
-fn model_picker_items(models: &[eix_core::ModelInfo]) -> Vec<PickerItem> {
+/// Rows for `/model` and `/model-plan`. `@default` clears the session's pin.
+fn model_picker_items(models: &[eix_core::ModelInfo], command: &str) -> Vec<PickerItem> {
+    let preview = format!(
+        "Clear this session's {} override.\n\nUse /{command} to pin a model again.",
+        if command == "model-plan" {
+            "Plan-mode model"
+        } else {
+            "model"
+        }
+    );
     let mut items = vec![PickerItem::new("@default")
         .with_label("@default")
         .with_detail("daemon default")
-        .with_preview("Clear this session's model override.\n\nUse /model to pin a model again.")];
+        .with_preview(preview)];
     for model in models {
         // The configured default model belongs to the built-in `default`
         // provider even when its id starts with a model-family prefix.

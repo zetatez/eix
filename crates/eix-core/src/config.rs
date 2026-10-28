@@ -1538,9 +1538,7 @@ impl ProviderConfig {
 pub enum ModelRole {
     /// Read-only planning turns (`SessionMode::Plan`).
     Plan,
-    /// Read-only sub-agent turns spawned with `spawn_agent`.
-    Explore,
-    /// Normal read/write turns, and the fallback for the other roles.
+    /// Normal reads/writes and exploration sub-agents.
     Execute,
 }
 
@@ -1549,17 +1547,17 @@ pub enum ModelRole {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ModelRolesConfig {
-    /// Model used for planning turns. Falls back to `execute`.
+    /// Model used for planning turns. Falls back to the session's `/model`
+    /// choice, then `execute`.
     pub plan: Option<String>,
-    /// Model used for exploration sub-agents. Falls back to `execute`.
-    pub explore: Option<String>,
-    /// Baseline model for normal work. Falls back to the daemon default.
+    /// Shared default for normal work and exploration sub-agents. Falls back
+    /// to the daemon default model.
     pub execute: Option<String>,
 }
 
 impl ModelRolesConfig {
-    /// Resolve one role, applying the documented fallback chain. `None` means
-    /// the caller should use the daemon default model.
+    /// Resolve one role. `None` means the caller should try the session pin,
+    /// then [`Config::default_model`].
     pub fn model(&self, role: ModelRole) -> Option<&str> {
         fn clean(value: Option<&String>) -> Option<&str> {
             value
@@ -1567,15 +1565,10 @@ impl ModelRolesConfig {
                 .filter(|model| !model.is_empty())
         }
 
-        let direct = match role {
+        match role {
             ModelRole::Plan => clean(self.plan.as_ref()),
-            ModelRole::Explore => clean(self.explore.as_ref()),
             ModelRole::Execute => clean(self.execute.as_ref()),
-        };
-        direct.or_else(|| match role {
-            ModelRole::Plan | ModelRole::Explore => clean(self.execute.as_ref()),
-            ModelRole::Execute => None,
-        })
+        }
     }
 }
 
@@ -2499,7 +2492,6 @@ impl Config {
         }
         for (role, selection) in [
             ("plan", self.model_roles.plan.as_deref()),
-            ("explore", self.model_roles.explore.as_deref()),
             ("execute", self.model_roles.execute.as_deref()),
         ] {
             let Some(selection) = selection.map(str::trim).filter(|model| !model.is_empty()) else {
@@ -3521,7 +3513,6 @@ model = "base"
 
 [model_roles]
 plan = "local/planner#high"
-explore = "local/explorer"
 execute = "local/worker"
 "#,
         )
@@ -3531,30 +3522,16 @@ execute = "local/worker"
             config.role_model(ModelRole::Plan),
             Some("local/planner#high")
         );
-        assert_eq!(
-            config.role_model(ModelRole::Explore),
-            Some("local/explorer")
-        );
         assert_eq!(config.role_model(ModelRole::Execute), Some("local/worker"));
     }
 
     #[test]
-    fn model_roles_fall_back_to_execute_then_unset() {
-        let roles = ModelRolesConfig {
-            execute: Some("local/worker".into()),
-            ..ModelRolesConfig::default()
-        };
-        assert_eq!(roles.model(ModelRole::Plan), Some("local/worker"));
-        assert_eq!(roles.model(ModelRole::Explore), Some("local/worker"));
-        assert_eq!(roles.model(ModelRole::Execute), Some("local/worker"));
-
+    fn model_roles_treat_empty_as_unset() {
         let roles = ModelRolesConfig {
             plan: Some("local/planner".into()),
-            explore: Some("  ".into()),
-            ..ModelRolesConfig::default()
+            execute: Some("  ".into()),
         };
         assert_eq!(roles.model(ModelRole::Plan), Some("local/planner"));
-        assert_eq!(roles.model(ModelRole::Explore), None);
         assert_eq!(roles.model(ModelRole::Execute), None);
     }
 

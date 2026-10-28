@@ -339,10 +339,15 @@ pub struct Session {
     pub name: String,
     pub cwd: PathBuf,
     pub status: SessionStatus,
-    /// Model pinned to this session. `None` means "use the configured task
-    /// role, or the daemon default when no role is set".
+    /// Model pinned to this session for normal turns and exploration.
+    /// `None` means "use the configured `execute` role, or the daemon default
+    /// when no role is set".
     #[serde(default)]
     pub model: Option<String>,
+    /// Model pinned to this session for Plan-mode turns. `None` falls back to
+    /// the configured `plan` role, then [`Self::model`].
+    #[serde(default)]
+    pub plan_model: Option<String>,
     /// Session this one was forked from (or the parent of a sub-agent).
     #[serde(default)]
     pub parent_id: Option<String>,
@@ -378,6 +383,7 @@ impl Session {
             cwd: cwd.into(),
             status: SessionStatus::Idle,
             model: None,
+            plan_model: None,
             parent_id: None,
             forked_from_seq: None,
             worktree: None,

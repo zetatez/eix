@@ -903,23 +903,21 @@ impl Daemon {
         self.config.load().default_model().to_string()
     }
 
-    /// Model for one session turn. An explicit pin wins, then the role model
-    /// (`plan` / `explore` / `execute`), then the daemon default.
+    /// Model for one session turn. Plan-mode turns prefer the session's
+    /// `/model-plan` pin, then the configured `plan` role, then the session's
+    /// normal model. Other turns use the normal model, then the configured
+    /// `execute` role.
     fn model_for_session(&self, session: &Session) -> String {
-        if let Some(model) = session
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        {
-            return model.to_string();
-        }
+        let config = self.config.load();
         let role = model_role_for(session.origin, self.session_mode(session));
-        self.config
-            .load()
-            .role_model(role)
-            .map(str::to_string)
-            .unwrap_or_else(|| self.default_model())
+        resolve_model(
+            role,
+            session.model.as_deref(),
+            session.plan_model.as_deref(),
+            config.role_model(ModelRole::Plan),
+            config.role_model(ModelRole::Execute),
+            &self.default_model(),
+        )
     }
 
     /// Model for background helpers (titles, compaction, permission
@@ -927,19 +925,15 @@ impl Daemon {
     /// `execute` role so planning with an expensive model does not make every
     /// helper call expensive too.
     fn model_for_background(&self, session: &Session) -> String {
-        if let Some(model) = session
-            .model
-            .as_deref()
-            .map(str::trim)
-            .filter(|model| !model.is_empty())
-        {
-            return model.to_string();
-        }
-        self.config
-            .load()
-            .role_model(ModelRole::Execute)
-            .map(str::to_string)
-            .unwrap_or_else(|| self.default_model())
+        let config = self.config.load();
+        resolve_model(
+            ModelRole::Execute,
+            session.model.as_deref(),
+            None,
+            None,
+            config.role_model(ModelRole::Execute),
+            &self.default_model(),
+        )
     }
 
     /// Change the runtime default model. `None`, an empty string or `default`
@@ -3351,6 +3345,12 @@ impl Daemon {
                     session: self.set_model(params)?,
                 })?)
             }
+            "session.plan_model" => {
+                let params: SessionModelParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(SessionResult {
+                    session: self.set_plan_model(params)?,
+                })?)
+            }
             "session.agent" => {
                 let params: SessionAgentParams = parse_params(request.params.clone())?;
                 Ok(serde_json::to_value(SessionResult {
@@ -4249,7 +4249,8 @@ impl Daemon {
             .unwrap_or(session.mode)
     }
 
-    /// Apply `session.model`. Pinning `None` restores the daemon default.
+    /// Apply `session.model`. Pinning `None` falls back to the configured
+    /// `execute` role, then the daemon default.
     fn set_model(&self, params: SessionModelParams) -> Result<Session> {
         let session = self.require_session(&params.session_id)?;
         let model = params
@@ -4259,6 +4260,22 @@ impl Daemon {
         let updated = self
             .store
             .set_session_model(&session.id, model.as_deref())?
+            .ok_or_else(|| rpc("not_found", "no such session"))?;
+        self.emit_session(&updated);
+        Ok(updated)
+    }
+
+    /// Apply `session.plan_model`. Pinning `None` falls back to the configured
+    /// `plan` role, then the session's normal model.
+    fn set_plan_model(&self, params: SessionModelParams) -> Result<Session> {
+        let session = self.require_session(&params.session_id)?;
+        let model = params
+            .model
+            .map(|model| model.trim().to_string())
+            .filter(|model| !model.is_empty());
+        let updated = self
+            .store
+            .set_session_plan_model(&session.id, model.as_deref())?
             .ok_or_else(|| rpc("not_found", "no such session"))?;
         self.emit_session(&updated);
         Ok(updated)
@@ -6340,15 +6357,13 @@ impl Daemon {
             label.or_else(|| agent.as_ref().map(|agent| agent.name.as_str())),
         );
         let mut child = Session::new(Uuid::new_v4().to_string(), name.clone(), parent.cwd.clone());
-        // Precedence: the agent's own `model:`, the explore role, then the
-        // parent's pin. Role routing wins over an inherited pin so a cheap
-        // explore model stays cheap even when the parent plans with a larger
-        // one.
+        // Sub-agents share the parent's normal (explore/execute) model, never
+        // the Plan-mode model. The agent's own `model:` still wins.
         child.model = agent
             .as_ref()
             .and_then(|agent| agent.model.clone())
-            .or_else(|| config.role_model(ModelRole::Explore).map(str::to_string))
-            .or_else(|| parent.model.clone());
+            .or_else(|| parent.model.clone())
+            .or_else(|| config.role_model(ModelRole::Execute).map(str::to_string));
         drop(config);
         child.agent = agent.as_ref().map(|agent| agent.name.clone());
         child.parent_id = Some(parent.id.clone());
@@ -9632,17 +9647,43 @@ fn default_name(cwd: &Path) -> String {
         .to_string()
 }
 
-/// Route a turn to its task role. Sub-agents are always exploration, even if
-/// their parent happens to be in Plan mode; other sessions use `plan` only
-/// while Plan mode is active.
+/// Route a turn to its task role. Sub-agents are always execution (the same
+/// model as normal work), even if their parent is in Plan mode; other sessions
+/// use `plan` only while Plan mode is active.
 fn model_role_for(origin: SessionOrigin, mode: SessionMode) -> ModelRole {
-    if origin == SessionOrigin::Agent {
-        ModelRole::Explore
-    } else if mode == SessionMode::Plan {
+    if origin != SessionOrigin::Agent && mode == SessionMode::Plan {
         ModelRole::Plan
     } else {
         ModelRole::Execute
     }
+}
+
+/// Resolve a model from the session pins, role config, and daemon default.
+///
+/// Plan turns try `plan_model` then the `plan` role before the shared chain.
+/// Every role then falls back to the session's normal model, the `execute`
+/// role, and finally `default_model` (never an error).
+fn resolve_model(
+    role: ModelRole,
+    session_model: Option<&str>,
+    plan_model: Option<&str>,
+    plan_role: Option<&str>,
+    execute_role: Option<&str>,
+    default_model: &str,
+) -> String {
+    fn clean(model: Option<&str>) -> Option<&str> {
+        model.map(str::trim).filter(|model| !model.is_empty())
+    }
+
+    if role == ModelRole::Plan {
+        if let Some(model) = clean(plan_model).or_else(|| clean(plan_role)) {
+            return model.to_string();
+        }
+    }
+    clean(session_model)
+        .or_else(|| clean(execute_role))
+        .map(str::to_string)
+        .unwrap_or_else(|| default_model.to_string())
 }
 
 /// Keep a session in the same subdirectory when its auto-worktree is created.
@@ -10465,7 +10506,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn model_roles_route_plan_explore_and_execute() {
+    fn model_roles_route_plan_and_execute() {
         assert_eq!(
             model_role_for(SessionOrigin::User, SessionMode::Plan),
             ModelRole::Plan
@@ -10486,14 +10527,120 @@ mod tests {
             model_role_for(SessionOrigin::User, SessionMode::Full),
             ModelRole::Execute
         );
-        // A child explores even when spawned from a Plan-mode parent.
+        // A child explores with the normal execution model, even when spawned
+        // from a Plan-mode parent.
         assert_eq!(
             model_role_for(SessionOrigin::Agent, SessionMode::Plan),
-            ModelRole::Explore
+            ModelRole::Execute
         );
         assert_eq!(
             model_role_for(SessionOrigin::Agent, SessionMode::Build),
-            ModelRole::Explore
+            ModelRole::Execute
+        );
+    }
+
+    #[test]
+    fn plan_model_falls_back_from_pin_to_config_to_normal_model() {
+        // A session `/model-plan` pin is the strongest choice.
+        assert_eq!(
+            resolve_model(
+                ModelRole::Plan,
+                Some("normal"),
+                Some("planner"),
+                Some("cfg-plan"),
+                Some("cfg-exec"),
+                "default",
+            ),
+            "planner"
+        );
+        // Then the configured `plan` role.
+        assert_eq!(
+            resolve_model(
+                ModelRole::Plan,
+                Some("normal"),
+                None,
+                Some("cfg-plan"),
+                Some("cfg-exec"),
+                "default",
+            ),
+            "cfg-plan"
+        );
+        // Without a Plan model, the session's `/model` still applies.
+        assert_eq!(
+            resolve_model(
+                ModelRole::Plan,
+                Some("normal"),
+                None,
+                None,
+                Some("cfg-exec"),
+                "default",
+            ),
+            "normal"
+        );
+        // Then the shared `execute` role, then the daemon default.
+        assert_eq!(
+            resolve_model(
+                ModelRole::Plan,
+                None,
+                None,
+                None,
+                Some("cfg-exec"),
+                "default",
+            ),
+            "cfg-exec"
+        );
+        assert_eq!(
+            resolve_model(ModelRole::Plan, None, None, None, None, "default"),
+            "default"
+        );
+        // Empty and whitespace-only values count as unset.
+        assert_eq!(
+            resolve_model(
+                ModelRole::Plan,
+                Some("  "),
+                Some(""),
+                Some(" "),
+                Some("cfg-exec"),
+                "default",
+            ),
+            "cfg-exec"
+        );
+    }
+
+    #[test]
+    fn execute_model_ignores_plan_pins() {
+        assert_eq!(
+            resolve_model(
+                ModelRole::Execute,
+                Some("normal"),
+                Some("planner"),
+                Some("cfg-plan"),
+                Some("cfg-exec"),
+                "default",
+            ),
+            "normal"
+        );
+        assert_eq!(
+            resolve_model(
+                ModelRole::Execute,
+                None,
+                Some("planner"),
+                Some("cfg-plan"),
+                Some("cfg-exec"),
+                "default",
+            ),
+            "cfg-exec"
+        );
+        assert_eq!(
+            resolve_model(
+                ModelRole::Execute,
+                None,
+                Some("planner"),
+                Some("cfg-plan"),
+                None,
+                "default",
+            ),
+            "default"
         );
     }
 

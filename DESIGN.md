@@ -489,7 +489,8 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
   `agent pick`/`fzf`、file 语法高亮预览。
 - 已补（2026-10-19）：`/model` 打开客户端生成的模型 picker（含 `id#variant` 行），
   `/agents` 打开 primary agent picker；两者都复用同一个 overlay，数据来自
-  `model.list` / `agent.list`，选中后发 `session.model` / `session.agent`。
+  `model.list` / `agent.list`，选中后发 `session.model` / `session.agent`；`/model-plan`
+  复用同一个模型 picker，选中后发 `session.plan_model`。
 - 已补（2026-10-22）：`[providers.<name>]` 注册多个 OpenAI 兼容 provider；恰好一个
   设置 `default = true`，表名即模型选择前缀。`model.list` 并发拉取每个 provider 的
   `GET /models`，失败只降级为该 provider 的 warning，默认 provider 的 model /
@@ -1050,13 +1051,15 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `/model` picker（含变体行）已接入；`turn.completed`
 > 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
 >
-> 角色模型：`[model_roles]` 的 `plan` / `explore` / `execute` 复用同一套 `/model` id。
-> `plan` 用于 `SessionMode::Plan` 的主会话 turn，`explore` 用于 `spawn_agent` 子会话，
-> `execute` 用于其余主会话 turn 以及标题、压缩、权限分类等后台调用。未配置的 `plan` /
-> `explore` 回退到 `execute`，未配置的 `execute` 回退到 daemon 默认模型（含 `model.use`
-> 运行时覆盖）；显式 `/model` pin 与 agent frontmatter 的 `model:` 优先。子代理的选择顺序是
-> agent `model:` → `explore` → 父 session pin，因此父会话用昂贵模型规划时，探索子代理仍可
-> 使用便宜模型。`model_roles` 属于可信全局配置，项目层会被忽略并记录安全警告。
+> 角色模型：`[model_roles]` 的 `plan` / `execute` 复用同一套 `/model` id。
+> `execute` 用于普通主会话 turn、`spawn_agent` 子会话，以及标题、压缩、权限分类等后台
+> 调用；`plan` 只用于 `SessionMode::Plan` 的主会话 turn。Plan 模式的优先级是
+> session 的 `/model-plan` → `plan` → session 的 `/model` → `execute` → daemon 默认模型
+> （含 `model.use` 运行时覆盖）；非 Plan 模式是 session 的 `/model` → `execute` →
+> daemon 默认。`/model-plan default` 清除 session pin 并回退，不报错。子代理选择顺序是
+> agent frontmatter `model:` → 父 session 的 `/model` → `execute` → daemon 默认，不会继承
+> 父 session 的 Plan 模型，因此父会话用昂贵模型规划时，探索子代理仍使用便宜模型。
+> `model_roles` 属于可信全局配置，项目层会被忽略并记录安全警告。
 >
 > MCP：`eixd/src/mcp.rs` 实现 stdio JSON-RPC 客户端，`[mcp.servers.<name>]` 懒启动并缓存进程。
 > `tools/list` / `resources/list` / `resources/templates/list` / `prompts/list` 都支持分页
@@ -1310,6 +1313,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
 | `/attention` / `/cancel` | 跳到下一个需要 attention 的 pane / 取消运行 |
 | `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `providers.*` 自动拉取的 `/models` 和 `models:`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
+| `/model-plan [id]` | 为当前 session 固定 Plan 模式模型（同样支持 picker 与 `id#variant`）；`default` 清除，回退到 `model_roles.plan` 或 `/model` |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
 | `/subagents [n|limit]` | 有子 agent 时打开实时 picker（搜索 child，右侧预览事件/工具调用/流式 thinking 与 answer，`Enter` 在新 pane 打开）；`limit` 或 `<n>` 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 32，可选 2/4/8/16/32/64/128/256，仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |

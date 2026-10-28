@@ -627,6 +627,16 @@ impl App {
                     }
                 }
             }
+            PickerKind::PlanModels => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    if let Some(session_id) = self.focused_session_id() {
+                        let model = (value != "@default").then_some(value);
+                        let _ = tx.send(Command::SetPlanModel { session_id, model });
+                        self.status = "switching Plan model…".into();
+                    }
+                }
+            }
             PickerKind::Agents => {
                 if let Some(value) = value {
                     self.picker = None;
@@ -745,6 +755,10 @@ impl App {
         } else if kind == PickerKind::Models {
             picker.loading = true;
             self.status = "model: loading provider catalogs…".into();
+            let _ = tx.send(Command::ListModels);
+        } else if kind == PickerKind::PlanModels {
+            picker.loading = true;
+            self.status = "plan model: loading provider catalogs…".into();
             let _ = tx.send(Command::ListModels);
         } else if kind == PickerKind::Agents {
             let Some(session_id) = self.focused_session_id() else {

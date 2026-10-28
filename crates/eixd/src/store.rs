@@ -113,6 +113,7 @@ impl Store {
                 cwd        TEXT NOT NULL,
                 status     TEXT NOT NULL,
                 model      TEXT,
+                plan_model TEXT,
                 parent_id  TEXT,
                 forked_from_seq INTEGER,
                 worktree   TEXT,
@@ -239,6 +240,7 @@ impl Store {
         add_column(&conn, "sessions", "mode", "TEXT NOT NULL DEFAULT 'build'")?;
         add_column(&conn, "sessions", "agent", "TEXT")?;
         add_column(&conn, "sessions", "archived", "INTEGER NOT NULL DEFAULT 0")?;
+        add_column(&conn, "sessions", "plan_model", "TEXT")?;
         add_column(&conn, "events", "undone", "INTEGER NOT NULL DEFAULT 0")?;
         migrate_session_modes(&conn)?;
         migrate_session_mode_names(&conn)?;
@@ -253,15 +255,16 @@ impl Store {
         let conn = self.conn();
         conn.execute(
             "INSERT INTO sessions
-                (id, name, cwd, status, model, parent_id, forked_from_seq, worktree, origin,
+                (id, name, cwd, status, model, plan_model, parent_id, forked_from_seq, worktree, origin,
                  mode, agent, archived, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 session.id,
                 session.name,
                 session.cwd.to_string_lossy(),
                 session.status.as_str(),
                 session.model,
+                session.plan_model,
                 session.parent_id,
                 session.forked_from_seq.map(|seq| seq as i64),
                 session.worktree.as_ref().map(|path| path.to_string_lossy()),
@@ -286,11 +289,11 @@ impl Store {
         let conn = self.read_conn();
         let sql = if include_archived {
             "SELECT id, name, cwd, status, model, created_at, updated_at,
-                    parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                    parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
              FROM sessions ORDER BY updated_at DESC, created_at DESC"
         } else {
             "SELECT id, name, cwd, status, model, created_at, updated_at,
-                    parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                    parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
              FROM sessions WHERE archived = 0 ORDER BY updated_at DESC, created_at DESC"
         };
         let mut stmt = conn.prepare(sql)?;
@@ -307,7 +310,7 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -329,7 +332,7 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -337,7 +340,8 @@ impl Store {
             .optional()?)
     }
 
-    /// Change a session's pinned model. `None` restores the daemon default.
+    /// Change a session's pinned normal model. `None` falls back to the
+    /// configured `execute` role, then the daemon default.
     pub fn set_session_model(&self, id: &str, model: Option<&str>) -> Result<Option<Session>> {
         let conn = self.conn();
         let changed = conn.execute(
@@ -350,7 +354,29 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
+                 FROM sessions WHERE id = ?1",
+                params![id],
+                row_to_session,
+            )
+            .optional()?)
+    }
+
+    /// Change a session's Plan-mode model. `None` falls back to the configured
+    /// `plan` role, then the session's normal model.
+    pub fn set_session_plan_model(&self, id: &str, model: Option<&str>) -> Result<Option<Session>> {
+        let conn = self.conn();
+        let changed = conn.execute(
+            "UPDATE sessions SET plan_model = ?1, updated_at = ?2 WHERE id = ?3",
+            params![model, now_ms(), id],
+        )?;
+        if changed == 0 {
+            return Ok(None);
+        }
+        Ok(conn
+            .query_row(
+                "SELECT id, name, cwd, status, model, created_at, updated_at,
+                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -371,7 +397,7 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -392,7 +418,7 @@ impl Store {
         Ok(conn
             .query_row(
                 "SELECT id, name, cwd, status, model, created_at, updated_at,
-                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                        parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
                  FROM sessions WHERE id = ?1",
                 params![id],
                 row_to_session,
@@ -841,14 +867,36 @@ impl Store {
     ) -> Result<Option<Session>> {
         let mut conn = self.conn();
         let tx = conn.transaction()?;
-        let source: Option<(String, Option<String>, String, Option<String>)> = tx
+        struct ForkSource {
+            cwd: String,
+            model: Option<String>,
+            plan_model: Option<String>,
+            mode: String,
+            agent: Option<String>,
+        }
+        let source: Option<ForkSource> = tx
             .query_row(
-                "SELECT cwd, model, mode, agent FROM sessions WHERE id = ?1",
+                "SELECT cwd, model, plan_model, mode, agent FROM sessions WHERE id = ?1",
                 params![source_id],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                |row| {
+                    Ok(ForkSource {
+                        cwd: row.get(0)?,
+                        model: row.get(1)?,
+                        plan_model: row.get(2)?,
+                        mode: row.get(3)?,
+                        agent: row.get(4)?,
+                    })
+                },
             )
             .optional()?;
-        let Some((source_cwd, model, mode, agent)) = source else {
+        let Some(ForkSource {
+            cwd: source_cwd,
+            model,
+            plan_model,
+            mode,
+            agent,
+        }) = source
+        else {
             return Ok(None);
         };
         let max_seq: i64 = tx.query_row(
@@ -871,6 +919,7 @@ impl Store {
             .unwrap_or_else(|| PathBuf::from(source_cwd));
         let mut session = Session::new(uuid::Uuid::new_v4().to_string(), name, cwd);
         session.model = model;
+        session.plan_model = plan_model;
         session.agent = agent;
         session.parent_id = Some(source_id.to_string());
         session.forked_from_seq = Some(upto as u64);
@@ -880,15 +929,16 @@ impl Store {
         session.mode = mode.parse().unwrap_or_default();
         tx.execute(
             "INSERT INTO sessions
-                (id, name, cwd, status, model, parent_id, forked_from_seq, worktree, origin,
+                (id, name, cwd, status, model, plan_model, parent_id, forked_from_seq, worktree, origin,
                  mode, agent, archived, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 session.id,
                 session.name,
                 session.cwd.to_string_lossy(),
                 session.status.as_str(),
                 session.model,
+                session.plan_model,
                 session.parent_id,
                 session.forked_from_seq.map(|seq| seq as i64),
                 session.worktree.as_ref().map(|path| path.to_string_lossy()),
@@ -1264,7 +1314,7 @@ impl Store {
         let conn = self.read_conn();
         let mut stmt = conn.prepare(
             "SELECT id, name, cwd, status, model, created_at, updated_at,
-                    parent_id, forked_from_seq, worktree, origin, mode, agent, archived
+                    parent_id, forked_from_seq, worktree, origin, mode, agent, archived, plan_model
              FROM sessions WHERE status IN ('running', 'awaiting_approval', 'awaiting_input')",
         )?;
         let rows = stmt.query_map([], row_to_session)?;
@@ -1700,6 +1750,7 @@ fn row_to_session(row: &Row<'_>) -> rusqlite::Result<Session> {
             .unwrap_or_default(),
         agent: row.get(12)?,
         archived: row.get::<_, i64>(13)? != 0,
+        plan_model: row.get(14)?,
     })
 }
 
@@ -1905,6 +1956,46 @@ mod tests {
 
         assert!(store
             .set_session_mode("missing", SessionMode::Auto)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn plan_model_round_trips_and_fork_inherits_it() {
+        let store = Store::in_memory().unwrap();
+        let mut parent = session("s1");
+        parent.plan_model = Some("local/planner".into());
+        store.create_session(&parent).unwrap();
+        assert_eq!(
+            store
+                .get_session("s1")
+                .unwrap()
+                .unwrap()
+                .plan_model
+                .as_deref(),
+            Some("local/planner")
+        );
+
+        let updated = store
+            .set_session_plan_model("s1", Some("local/planner#high"))
+            .unwrap()
+            .expect("updated row");
+        assert_eq!(updated.plan_model.as_deref(), Some("local/planner#high"));
+
+        let forked = store
+            .fork_session("s1", None, "fork", None, None)
+            .unwrap()
+            .expect("fork");
+        assert_eq!(forked.plan_model.as_deref(), Some("local/planner#high"));
+
+        let cleared = store
+            .set_session_plan_model("s1", None)
+            .unwrap()
+            .expect("cleared row");
+        assert_eq!(cleared.plan_model, None);
+
+        assert!(store
+            .set_session_plan_model("missing", Some("local/planner"))
             .unwrap()
             .is_none());
     }

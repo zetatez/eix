@@ -104,19 +104,20 @@ model = "gemini-2.5-pro"
 单个 `[[models]]` 可以用 `kind` 覆盖所属 provider 的协议。模型目录（`/model`、`eix model --all`）
 会按协议读取 `/models`，过滤 Gemini 不支持 `generateContent` 的模型。
 
-可以按任务角色选择模型，例如规划用更强的模型、探索和执行用便宜的模型：
+可以按任务角色选择模型，例如规划用更强的模型、探索和执行共用一个便宜的模型：
 
 ```toml
 [model_roles]
 plan = "anthropic/claude-sonnet-4"     # Plan 模式的只读规划
-explore = "anthropic/claude-haiku-4"   # spawn_agent 探索子代理
-execute = "anthropic/claude-haiku-4"   # 普通读写 turn 与后台辅助调用
+execute = "anthropic/claude-haiku-4"   # 普通读写 turn、探索子代理与后台辅助调用
 ```
 
-值使用与 `/model` 相同的选择 id（可带 `#variant`）。`plan` / `explore` 未配置时回退到
-`execute`，`execute` 未配置时回退到默认 provider 的模型；因此只配置昂贵的 `plan` 时，其余任务
-仍然使用原来的通用模型。`/model` 固定的 session 或 agent frontmatter 的 `model:` 优先于角色
-配置；子代理优先使用自己的 `model:`，其次是 `explore`，最后继承父 session 的固定模型。
+值使用与 `/model` 相同的选择 id（可带 `#variant`）。`/model` 固定 session 的
+`execute` 模型，`/model-plan` 固定 Plan 模式模型；两者都只影响当前 session。
+Plan 模式的优先级是 `/model-plan` → `model_roles.plan` → `/model` →
+`model_roles.execute` → daemon 默认模型，因此未配置昂贵的 Plan 模型时会自动回退，
+不会报错。子代理和后台辅助调用始终使用 `/model` / `model_roles.execute`，不会继承
+Plan 模型；子代理自己的 `model:` 仍然优先。
 
 密钥优先级：配置内联 `api_key` → `api_key_env` → `<data_dir>/auth/<provider>.json`。最后一项由
 `eix auth login` 写入（0600 权限），daemon 每次请求时读取，因此登录/注销无需重启或 `reload`：
@@ -218,8 +219,10 @@ eix tui [--session ID]
 | `Enter` | 发送 prompt；turn 运行中自动排队 |
 | `Esc Esc` | 中断当前 turn，或回到转录区 |
 
-`/model` 为当前 session 固定模型；`/model global <id>`（或 `eix model use <id>`）切换 daemon 的
-运行时默认模型，只影响没有固定模型的 session，不写回 config，daemon 重启后恢复。
+`/model` 为当前 session 固定普通 turn 与探索子代理共用的模型；`/model-plan` 为当前
+session 固定 Plan 模式模型，`/model-plan default` 清除并回退到 `model_roles.plan` 或
+`/model`。`/model global <id>`（或 `eix model use <id>`）切换 daemon 的运行时默认模型，
+只影响没有固定模型的 session，不写回 config，daemon 重启后恢复。
 `/model global default` 清除覆盖。
 
 `/undo` / `/redo` 同时回滚对话和工作区文件（best effort，恢复失败会明确提示）；`/diff` 和
@@ -347,7 +350,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 | 段 | 作用 |
 | --- | --- |
 | `providers` / `provider_runtime` | provider（`kind` = openai/anthropic/gemini、可选 `oauth`）、默认模型、超时、重试、`max_output_tokens`、系统提示、`prompt_profile`、`persistent_mode` |
-| `models` / `model_roles` | 固定模型目录，以及按 `plan` / `explore` / `execute` 任务角色选择模型 |
+| `models` / `model_roles` | 固定模型目录，以及 `plan` / `execute` 任务角色模型（`execute` 同时用于探索子代理） |
 | `tools` | 自动应用策略、显式规则、沙箱、网络、快照、外部目录 |
 | `context` | token 预算、指令文件、workspace summary、自动压缩 |
 | `worktree` / `integration` | worktree 基线、自动 ready、自动提交、测试命令 |

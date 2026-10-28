@@ -471,10 +471,19 @@ impl App {
                 }
                 let count = models.len();
                 self.models = models;
-                let current = self
-                    .focused_view()
-                    .and_then(|view| view.session.model.clone());
-                let items = model_picker_items(&self.models);
+                let plan_kind = self
+                    .picker
+                    .as_ref()
+                    .is_some_and(|picker| picker.kind == PickerKind::PlanModels);
+                let command = if plan_kind { "model-plan" } else { "model" };
+                let current = self.focused_view().and_then(|view| {
+                    if plan_kind {
+                        view.session.plan_model.clone()
+                    } else {
+                        view.session.model.clone()
+                    }
+                });
+                let items = model_picker_items(&self.models, command);
                 let selected = current
                     .as_deref()
                     .and_then(|model| {
@@ -490,7 +499,7 @@ impl App {
                     })
                     .unwrap_or(0);
                 if let Some(picker) = &mut self.picker {
-                    if picker.kind == PickerKind::Models {
+                    if matches!(picker.kind, PickerKind::Models | PickerKind::PlanModels) {
                         picker.set_items(items);
                         picker.selected = selected;
                         picker.loading = false;

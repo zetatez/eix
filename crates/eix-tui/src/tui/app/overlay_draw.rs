@@ -904,7 +904,7 @@ impl App {
                 // the whole picker, not just the currently filtered rows.
                 // Models use a wider separator; commands keep the `/` menu's
                 // fixed command-name width.
-                let model_width = if kind == PickerKind::Models {
+                let model_width = if matches!(kind, PickerKind::Models | PickerKind::PlanModels) {
                     picker
                         .items
                         .iter()
@@ -915,7 +915,10 @@ impl App {
                 } else {
                     0
                 };
-                let detail_width = if matches!(kind, PickerKind::Models | PickerKind::Commands) {
+                let detail_width = if matches!(
+                    kind,
+                    PickerKind::Models | PickerKind::PlanModels | PickerKind::Commands
+                ) {
                     0
                 } else {
                     picker
@@ -931,7 +934,7 @@ impl App {
                         .unwrap_or(0)
                         .min(PICKER_LABEL_MAX)
                 };
-                let separator = if kind == PickerKind::Models {
+                let separator = if matches!(kind, PickerKind::Models | PickerKind::PlanModels) {
                     "    "
                 } else {
                     "  "
@@ -941,7 +944,7 @@ impl App {
                     .filter_map(|&index| picker.items.get(index))
                     .map(|item| {
                         let label = match kind {
-                            PickerKind::Models => {
+                            PickerKind::Models | PickerKind::PlanModels => {
                                 pad_to(&truncate(&item.label, model_width), model_width)
                             }
                             PickerKind::Commands => pad_to(

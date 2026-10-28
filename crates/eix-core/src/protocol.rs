@@ -444,11 +444,12 @@ pub struct SubmitParams {
 }
 
 /// `session.cd`: move a session to another working directory.
-/// `session.model`: pin a session to one of the models from `model.list`.
+/// `session.model`: pin a session's normal (execute/explore) model from
+/// `model.list`. `session.plan_model`: pin the model for its Plan-mode turns.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionModelParams {
     pub session_id: SessionId,
-    /// Empty or omitted restores the daemon default.
+    /// Empty or omitted restores the fallback chain (role, then daemon default).
     #[serde(default)]
     pub model: Option<String>,
 }

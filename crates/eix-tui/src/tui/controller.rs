@@ -82,6 +82,11 @@ pub enum Command {
         session_id: String,
         model: Option<String>,
     },
+    /// Pin the model used by this session's Plan-mode turns.
+    SetPlanModel {
+        session_id: String,
+        model: Option<String>,
+    },
     /// Switch the daemon's fallback model for sessions without a pin.
     UseModel {
         model: Option<String>,
@@ -268,6 +273,7 @@ impl Command {
             Self::CompactContext { .. } => "compact",
             Self::SetMode { .. } => "mode",
             Self::SetModel { .. } => "model",
+            Self::SetPlanModel { .. } => "model plan",
             Self::UseModel { .. } => "model default",
             Self::SetAgent { .. } => "agent",
             Self::SetSubagentConcurrency { .. } => "subagents",
@@ -654,6 +660,16 @@ async fn dispatch(
             let value = requester
                 .request(
                     "session.model",
+                    json!({ "session_id": session_id, "model": model }),
+                )
+                .await?;
+            let result: SessionResult = decode(value)?;
+            send(events, Event::Updated(result.session))
+        }
+        Command::SetPlanModel { session_id, model } => {
+            let value = requester
+                .request(
+                    "session.plan_model",
                     json!({ "session_id": session_id, "model": model }),
                 )
                 .await?;
