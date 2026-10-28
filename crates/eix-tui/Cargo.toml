@@ -12,7 +12,15 @@ path = "src/main.rs"
 anyhow = { workspace = true }
 eix-core = { path = "../eix-core" }
 eixd = { path = "../eixd" }
-ratatui = { workspace = true }
+# Keep ratatui on the same crossterm as the rest of the TUI, and skip the
+# backend/underline features we do not use: their weak optional deps would
+# still be locked and would pull in a second sha2/block-buffer generation.
+ratatui = { workspace = true, default-features = false, features = [
+    "all-widgets",
+    "crossterm_0_28",
+    "layout-cache",
+    "macros",
+] }
 crossterm = { workspace = true, features = ["event-stream"] }
 futures-util = { workspace = true }
 tokio = { workspace = true }

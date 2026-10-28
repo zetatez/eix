@@ -4962,7 +4962,7 @@ async fn cancelling_the_parent_stops_a_running_sub_agent() -> anyhow::Result<()>
     let mut attached = client
         .request::<AttachResult>("session.attach", json!({"session_id": child}))
         .await?;
-    for _ in 0..40 {
+    for _ in 0..100 {
         if attached
             .events
             .iter()

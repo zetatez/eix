@@ -18,7 +18,7 @@ anyhow = "1"
 similar = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-ratatui = "0.29"
+ratatui = { version = "0.30", default-features = false }
 crossterm = "0.28"
 rmpv = "1"
 toml = "0.8"
@@ -46,7 +46,7 @@ futures-util = "0.3"
 libc = "0.2"
 arc-swap = "1"
 base64 = "0.22"
-sha2 = "0.10"
+sha2 = "0.11"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
