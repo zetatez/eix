@@ -3823,8 +3823,14 @@ fn theme_picker_enter_commits_the_preview() {
 fn theme_picker_lists_default_then_sorted_presets() {
     let items = theme_picker_items();
     let values: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
+    let mut presets: Vec<&str> = THEME_PRESETS.iter().map(|preset| preset.name).collect();
+    // Light palettes first, then dark, each group alphabetical by scheme.
+    presets.sort_by_key(|name| {
+        let (brightness, scheme) = name.split_once('-').expect("brightness prefix");
+        (brightness == "dark", scheme)
+    });
     let expected: Vec<&str> = std::iter::once(THEME_DEFAULT_VALUE)
-        .chain(THEME_PRESETS.iter().map(|preset| preset.name))
+        .chain(presets)
         .collect();
     assert_eq!(values, expected);
     assert_eq!(values[0], THEME_DEFAULT_VALUE);

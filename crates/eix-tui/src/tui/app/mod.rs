@@ -2020,8 +2020,9 @@ fn timeline_picker_items(events: &[SessionEvent]) -> Vec<PickerItem> {
         .collect()
 }
 
-/// Rows for the interactive `/colorscheme` picker. The first row clears the preset;
-/// the rest are the built-in palettes in `THEME_PRESETS` order.
+/// Rows for the `/colorscheme` picker. The first row clears the preset;
+/// the rest group light palettes before dark ones, sorted by scheme name
+/// within each group.
 fn theme_picker_items() -> Vec<PickerItem> {
     let mut items = vec![PickerItem::new(THEME_DEFAULT_VALUE)
         .with_label("default")
@@ -2029,7 +2030,15 @@ fn theme_picker_items() -> Vec<PickerItem> {
         .with_preview(
             "default\n\nUse the terminal background and palette. The prompt has no separate fill; explicit [theme] slot overrides still apply.",
         )];
-    items.extend(THEME_PRESETS.iter().map(|preset| {
+    let mut presets: Vec<_> = THEME_PRESETS.iter().collect();
+    presets.sort_by_key(|preset| {
+        let (brightness, scheme) = preset
+            .name
+            .split_once('-')
+            .unwrap_or(("light", preset.name));
+        (brightness == "dark", scheme)
+    });
+    items.extend(presets.into_iter().map(|preset| {
         let preview = format!(
             "{}\n\n{}\n\nnormal      {}\ncomment     {}\nstring      {}\nfunction    {}\nerror       {}\ndiff_add    {}\ndiff_delete {}\npanel       {}\nbackground  {}",
             preset.name,

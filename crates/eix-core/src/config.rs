@@ -832,10 +832,10 @@ impl ThemePreset {
     }
 }
 
-/// Every built-in preset, in picker order. Names follow
-/// `<light|dark>-<scheme>` and resolve through [`theme_preset`]. The list is
-/// sorted by scheme name, with the light variant before the dark one, so the
-/// picker and config errors read alphabetically.
+/// Every built-in preset. Names follow `<light|dark>-<scheme>` and resolve
+/// through [`theme_preset`]. This array keeps each scheme's light and dark
+/// variants adjacent; the `/colorscheme` picker groups all light palettes
+/// before dark ones and sorts each group by scheme name.
 pub const THEME_PRESETS: [ThemePreset; 21] = [
     ThemePreset {
         name: "light-catppuccin",
