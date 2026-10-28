@@ -78,6 +78,55 @@ Use for refactors, data-model changes, or work where structure, abstraction, or 
 - Check call sites and invariants before changing a shared API; migrate all callers instead of leaving compatibility shims unless asked.
 "#;
 
+const REVIEW_SKILL: &str = r#"# Review
+
+Use when asked to review a change, commit, branch, or pull request.
+
+## Rules
+
+- Review only the change under review. Do not flag pre-existing problems unless the change makes them worse.
+- A finding must affect correctness, security, performance, or maintainability; be discrete and actionable; and be something the author would likely fix. If it depends on an unstated assumption or only speculates that another part might break, drop it.
+- Findings first, ordered by severity and almost always with `path:line`:
+  - P0: data loss, security hole, broken build, or a regression that ships immediately.
+  - P1: a likely bug, crash, or behavior regression in a normal path.
+  - P2: edge case, missing test, unclear contract, or fragile assumption.
+  - P3: naming, style, wording, or cleanup.
+- Each finding states what breaks and why it matters, plus the inputs or conditions needed to trigger it. If you did not verify it, say so instead of guessing.
+- Deduplicate by changed location and defect: one finding per issue. Do not split variants of the same bug.
+- If a repository instruction file (AGENTS.md or equivalent) supplies the rule, cite that file and the smallest supporting line range in the finding.
+- Ignore trivial style unless it obscures meaning or violates a documented standard. Do not claim higher severity than the evidence supports.
+- No praise, no restating the diff, no generic advice. Suggest a fix only when it is concrete.
+- Keep the summary last and short. If there are no findings, say "No findings" and list residual risks or tests you did not run.
+
+## Structured output
+
+When the caller asks for machine-readable or CI output, return only one JSON object, with no markdown fence or extra prose:
+
+{
+  "findings": [
+    {
+      "title": "<= 80 chars, imperative",
+      "body": "one Markdown paragraph: why this is a problem, with file/line references",
+      "confidence_score": 0.0,
+      "priority": 0,
+      "code_location": {
+        "absolute_file_path": "/abs/path",
+        "line_range": {"start": 1, "end": 1}
+      }
+    }
+  ],
+  "overall_correctness": "patch is correct" | "patch is incorrect",
+  "overall_explanation": "1-3 sentences justifying the verdict",
+  "overall_confidence_score": 0.0
+}
+
+- `priority` is 0-3 for P0-P3; omit it only when severity is genuinely undetermined.
+- Prefix each `title` with `[P0]`-`[P3]` to match `priority`.
+- `line_range` must overlap the change and stay as short as possible (never more than 10 lines).
+- `overall_correctness` is "patch is correct" only when existing code and tests still hold and no blocking bug remains; ignore nits for this verdict.
+- Do not generate a PR fix or apply edits.
+"#;
+
 /// Skills every installation has. User and project skills with the same name
 /// override them.
 pub fn builtin_skills() -> Vec<Skill> {
@@ -91,6 +140,11 @@ pub fn builtin_skills() -> Vec<Skill> {
             "engineering",
             "Deeper judgment for refactors, data models, abstractions, and test scope.",
             ENGINEERING_SKILL,
+        ),
+        (
+            "review",
+            "Review a change: P0-P3 findings first, only this change, evidence with path:line.",
+            REVIEW_SKILL,
         ),
     ]
     .into_iter()
@@ -123,29 +177,106 @@ pub fn find_skill(cwd: &Path, name: &str, compat: &CompatConfig) -> Option<Skill
         .find(|skill| skill.name == name)
 }
 
-/// `<available_skills>` block appended to the system prompt. Empty when no
-/// skills are installed.
-pub fn available_prompt(skills: &[Skill]) -> String {
+/// `<available_skills>` catalog. Empty when no skills are installed.
+///
+/// The catalog is a stable prefix but it is not free: a machine with many
+/// user skills could crowd out the conversation. Keep it inside `max_bytes`
+/// (the daemon passes 2% of the context window, capped at 8 KiB) by shortening
+/// descriptions first, then omitting descriptions, then omitting trailing
+/// skills. The full instructions stay behind `use_skill`.
+pub fn available_prompt(skills: &[Skill], max_bytes: usize) -> String {
     if skills.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "\n<available_skills>\nCall the `use_skill` tool with a skill name to load its full instructions before doing work that matches it. Pass `arguments` when the skill uses `$ARGUMENTS` or `$1`..`$9`.\n",
+    let max_bytes = max_bytes.max(256);
+    let mut header = String::from(
+        "<available_skills>\n\
+         Skills are instructions in `SKILL.md` files. When a task matches a skill, call `use_skill` \
+         with its name before doing the work and follow the full file, not a summary. Do not delegate \
+         skill reading to sub-agents. Reuse a skill's scripts and assets instead of rewriting them. \
+         Pass `arguments` when the skill uses `$ARGUMENTS` or `$1`..`$9`. Catalog paths are host \
+         paths; read the file directly.\n",
     );
-    for skill in skills {
-        out.push_str(&format!(
-            "  <skill>\n    <name>{}</name>\n    <description>{}</description>\n",
-            skill.name, skill.description
-        ));
-        if !skill.allowed_tools.is_empty() {
-            out.push_str(&format!(
-                "    <allowed_tools>{}</allowed_tools>\n",
-                skill.allowed_tools.join(", ")
-            ));
+    let footer = "</available_skills>\n";
+    let fixed = header.len() + footer.len();
+
+    // Phase 1: cap each description, then halve it until the catalog fits.
+    let mut description_cap = 240;
+    loop {
+        let entries: Vec<String> = skills
+            .iter()
+            .map(|skill| catalog_line(skill, Some(description_cap)))
+            .collect();
+        if fixed + entries.iter().map(|entry| entry.len() + 1).sum::<usize>() <= max_bytes {
+            header.push_str(&entries.join("\n"));
+            header.push('\n');
+            header.push_str(footer);
+            return header;
         }
-        out.push_str("  </skill>\n");
+        if description_cap <= 40 {
+            break;
+        }
+        description_cap /= 2;
     }
-    out.push_str("</available_skills>\n");
+
+    // Phase 2: names and paths only.
+    let entries: Vec<String> = skills
+        .iter()
+        .map(|skill| catalog_line(skill, None))
+        .collect();
+    if fixed + entries.iter().map(|entry| entry.len() + 1).sum::<usize>() <= max_bytes {
+        header.push_str(&entries.join("\n"));
+        header.push('\n');
+        header.push_str(footer);
+        return header;
+    }
+
+    // Phase 3: keep as many leading skills as fit and name the rest.
+    let mut kept = Vec::new();
+    let mut used = fixed;
+    for (index, entry) in entries.iter().enumerate() {
+        let omitted = skills.len() - index - 1;
+        let marker = omitted_marker(omitted);
+        if used + entry.len() + 1 + marker.len() > max_bytes {
+            break;
+        }
+        used += entry.len() + 1;
+        kept.push(entry.clone());
+    }
+    let omitted = skills.len() - kept.len();
+    header.push_str(&kept.join("\n"));
+    if omitted > 0 {
+        if !kept.is_empty() {
+            header.push('\n');
+        }
+        header.push_str(&omitted_marker(omitted));
+    }
+    header.push('\n');
+    header.push_str(footer);
+    header
+}
+
+fn catalog_line(skill: &Skill, description_cap: Option<usize>) -> String {
+    let path = skill.source.display();
+    match description_cap {
+        Some(cap) if !skill.description.trim().is_empty() => {
+            let description = cap_chars(skill.description.trim(), cap);
+            format!("- {}: {} (path: {})", skill.name, description, path)
+        }
+        _ => format!("- {} (path: {})", skill.name, path),
+    }
+}
+
+fn omitted_marker(omitted: usize) -> String {
+    format!("[{omitted} skills omitted]")
+}
+
+fn cap_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    out.push('…');
     out
 }
 
@@ -333,8 +464,8 @@ mod tests {
         assert_eq!(audit.allowed_tools, vec!["exec_command"]);
         let lint = find_skill(&project, "lint", &compat).expect("nested Pi skill");
         assert_eq!(lint.description, "nested Pi skill");
-        let prompt = available_prompt(&skills);
-        assert!(prompt.contains("<name>review</name>"));
+        let prompt = available_prompt(&skills, 8 * 1024);
+        assert!(prompt.contains("- review:"));
         assert!(prompt.contains("use_skill"));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -342,13 +473,30 @@ mod tests {
     #[test]
     fn builtin_skills_are_listed_and_project_skills_override_them() {
         let builtins = builtin_skills();
-        for name in ["frontend", "engineering"] {
+        for name in ["frontend", "engineering", "review"] {
             let skill = builtins
                 .iter()
                 .find(|skill| skill.name == name)
                 .unwrap_or_else(|| panic!("missing builtin {name}"));
             assert!(!skill.body.is_empty());
             assert!(skill.source.starts_with("<builtin>"));
+        }
+        let review = builtins
+            .iter()
+            .find(|skill| skill.name == "review")
+            .expect("review");
+        for expected in [
+            "P0",
+            "P3",
+            "Deduplicate",
+            "confidence_score",
+            "overall_correctness",
+            "absolute_file_path",
+        ] {
+            assert!(
+                review.body.contains(expected),
+                "review skill is missing {expected:?}"
+            );
         }
         let frontend = builtins
             .iter()
@@ -366,9 +514,9 @@ mod tests {
                 "frontend skill is missing {expected:?}"
             );
         }
-        let prompt = available_prompt(&builtins);
-        assert!(prompt.contains("<name>frontend</name>"));
-        assert!(prompt.contains("<name>engineering</name>"));
+        let prompt = available_prompt(&builtins, 8 * 1024);
+        assert!(prompt.contains("- frontend:"));
+        assert!(prompt.contains("- engineering:"));
 
         let root = temp_dir("builtin");
         std::fs::create_dir_all(root.join(".eix/skills/frontend")).unwrap();
@@ -381,5 +529,36 @@ mod tests {
         assert_eq!(frontend.description, "local frontend");
         assert_eq!(frontend.body, "Local body");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn skill_catalog_respects_its_budget_and_keeps_tool_grants_out() {
+        let skills: Vec<Skill> = (0..12)
+            .map(|index| Skill {
+                name: format!("skill-{index:02}"),
+                description: "a very long description that should be shortened before the \
+                              catalog is allowed to grow past its byte budget "
+                    .repeat(4),
+                body: String::new(),
+                allowed_tools: vec!["exec_command".to_string()],
+                source: PathBuf::from(format!("/tmp/skills/skill-{index:02}/SKILL.md")),
+            })
+            .collect();
+
+        let full = available_prompt(&skills, 64 * 1024);
+        assert!(full.contains("- skill-00:"));
+        assert!(
+            !full.contains("<allowed_tools>"),
+            "grants belong to use_skill"
+        );
+
+        let compact = available_prompt(&skills, 700);
+        assert!(
+            compact.len() <= 700,
+            "catalog is {} bytes: {compact}",
+            compact.len()
+        );
+        assert!(compact.contains("[") && compact.contains("skills omitted]"));
+        assert!(compact.ends_with("</available_skills>\n"));
     }
 }

@@ -14,8 +14,10 @@ pub enum Sector {
     System,
     /// `AGENTS.md` and other configured instruction files.
     Instructions,
-    /// A compact snapshot of the workspace (entries, git branch/status).
+    /// A compact snapshot of the workspace (top-level entries).
     Workspace,
+    /// Volatile environment facts: cwd, OS, shell, date, git, sandbox, mode.
+    Environment,
     /// Conversation turns.
     History,
     /// Tool calls and their output.
@@ -26,10 +28,11 @@ pub enum Sector {
 
 impl Sector {
     /// Fixed display/accounting order.
-    pub const ALL: [Sector; 6] = [
+    pub const ALL: [Sector; 7] = [
         Sector::System,
         Sector::Instructions,
         Sector::Workspace,
+        Sector::Environment,
         Sector::History,
         Sector::Tools,
         Sector::Memory,
@@ -40,6 +43,7 @@ impl Sector {
             Self::System => "system",
             Self::Instructions => "instructions",
             Self::Workspace => "workspace",
+            Self::Environment => "environment",
             Self::History => "history",
             Self::Tools => "tools",
             Self::Memory => "memory",
@@ -51,7 +55,8 @@ impl Sector {
         match self {
             Self::System => 0.05,
             Self::Instructions => 0.05,
-            Self::Workspace => 0.15,
+            Self::Workspace => 0.12,
+            Self::Environment => 0.03,
             Self::History => 0.60,
             Self::Tools => 0.10,
             Self::Memory => 0.05,
@@ -67,6 +72,7 @@ impl std::str::FromStr for Sector {
             "system" => Self::System,
             "instructions" => Self::Instructions,
             "workspace" => Self::Workspace,
+            "environment" => Self::Environment,
             "history" => Self::History,
             "tools" => Self::Tools,
             "memory" => Self::Memory,

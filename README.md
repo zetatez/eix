@@ -329,7 +329,7 @@ eix 自己的全局文件统一在 `~/.config/eix/`（macOS 也是）：`config.
 
 | 段 | 作用 |
 | --- | --- |
-| `providers` / `provider_runtime` | provider（`kind` = openai/anthropic/gemini、可选 `oauth`）、默认模型、超时、重试、`max_output_tokens`、系统提示 |
+| `providers` / `provider_runtime` | provider（`kind` = openai/anthropic/gemini、可选 `oauth`）、默认模型、超时、重试、`max_output_tokens`、系统提示、`prompt_profile`、`persistent_mode` |
 | `tools` | 自动应用策略、显式规则、沙箱、网络、快照、外部目录 |
 | `context` | token 预算、指令文件、workspace summary、自动压缩 |
 | `worktree` / `integration` | worktree 基线、自动 ready、自动提交、测试命令 |

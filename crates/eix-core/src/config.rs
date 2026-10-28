@@ -1186,8 +1186,8 @@ pub struct ContextConfig {
     /// missing file is skipped. `AGENTS.md` is read from the eix config
     /// directory as well, when present.
     pub instructions_files: Vec<String>,
-    /// Include a compact workspace summary (top-level entries, git branch and
-    /// status) in the request.
+    /// Include a compact workspace summary (cwd and top-level entries) in the
+    /// request. Git state is reported separately in the environment section.
     pub workspace_summary: bool,
     /// Summarize old history automatically before a turn would overflow
     /// `budget_tokens`.
@@ -1376,6 +1376,26 @@ pub struct ProviderConfig {
     pub oauth: Option<ProviderOAuthConfig>,
 }
 
+/// Built-in system prompt variants. `default` carries the full working
+/// agreement; `concise` is a shorter profile for models that follow terse
+/// instructions well or need the context budget for code.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptProfile {
+    #[default]
+    Default,
+    Concise,
+}
+
+impl PromptProfile {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Concise => "concise",
+        }
+    }
+}
+
 /// Global provider runtime knobs. Kept separate from endpoint/model tables so
 /// every provider shares one timeout, retry policy and prompt.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1394,8 +1414,17 @@ pub struct ProviderRuntimeConfig {
     /// Completion budget for protocols that require it (Anthropic, Gemini).
     /// OpenAI-compatible servers use their own default when it is unset.
     pub max_output_tokens: u32,
-    /// Optional replacement for the built-in system prompt.
+    /// Optional replacement for the built-in base prompt. Tool guidance and
+    /// the active permission contract are still appended, so a custom prompt
+    /// cannot silently remove escalation rules.
     pub system_prompt: Option<String>,
+    /// Built-in prompt variant used when `system_prompt` is unset.
+    pub prompt_profile: PromptProfile,
+    /// Tell the model how to behave when it is sampled again without a new
+    /// user message. Off by default: eix turns end when the task is done, so
+    /// the extra contract would otherwise be noise. Enable it for schedules,
+    /// heartbeats, or any integration that resumes a session by itself.
+    pub persistent_mode: bool,
 }
 
 impl Default for ProviderRuntimeConfig {
@@ -1408,6 +1437,8 @@ impl Default for ProviderRuntimeConfig {
             retry_max_secs: 60,
             max_output_tokens: 8_192,
             system_prompt: None,
+            prompt_profile: PromptProfile::Default,
+            persistent_mode: false,
         }
     }
 }
@@ -3369,6 +3400,8 @@ retry_base_ms = 10
 retry_max_secs = 1
 context_tokens = 8192
 system_prompt = "custom"
+prompt_profile = "concise"
+persistent_mode = true
 "#,
         )
         .expect("parse");
@@ -3380,6 +3413,16 @@ system_prompt = "custom"
             config.provider_runtime.system_prompt.as_deref(),
             Some("custom")
         );
+        assert_eq!(
+            config.provider_runtime.prompt_profile,
+            PromptProfile::Concise
+        );
+        assert!(config.provider_runtime.persistent_mode);
+        assert_eq!(
+            Config::default().provider_runtime.prompt_profile,
+            PromptProfile::Default
+        );
+        assert!(!Config::default().provider_runtime.persistent_mode);
     }
 
     #[test]

@@ -492,6 +492,7 @@ dependencies = [
  "anyhow",
  "arc-swap",
  "base64 0.22.1",
+ "chrono",
  "eix-core",
  "eix-sdk",
  "futures-util",

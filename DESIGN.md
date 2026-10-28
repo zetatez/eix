@@ -671,12 +671,23 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 | sector | 内容 | 预算 |
 |---|---|---|
 | system | 系统提示 | 5% |
-| instructions | AGENTS.md（仓库根 → cwd）、项目约定 | 5% |
-| workspace | 文件树、git 状态、选中文件 | 15% |
+| instructions | AGENTS.md（仓库根 → cwd）、项目约定、技能目录 | 5% |
+| workspace | 文件树、选中文件 | 12% |
+| environment | cwd、OS、shell、日期/时区、git 状态、sandbox、mode | 3% |
 | history | 对话历史 | 60% |
 | tools | 工具输出（可截断/引用 blob） | 10% |
 | memory | 跨 session 记忆 + 当前任务列表 | 5% |
 
+- 请求布局固定为“稳定前缀 → 历史 → 易变后缀”：system、instructions（含 `<available_skills>`，
+  预算 2% 或 8 KiB，先截短 description，再省略 skill）、workspace、memory 与工具 schema 不随
+  工具轮次变化；`tasks` 与 `environment` 每轮重建并追加在历史之后，避免破坏 provider 前缀缓存。
+  易变段使用 user role 加 XML 标签，兼容只允许首条 system 的 provider。
+- 基座之后按需追加稳定的工具与权限 fragment：工具说明只列本次请求实际存在的 schema
+  （无 `spawn_agent` 就不提子代理），权限说明按模式渲染 workspace/read-only/writable roots、
+  network allowlist、显式 allow/deny 规则，以及命令分段匹配规则；`persistent_mode` 打开时
+  再追加“无新用户消息时如何续接”的契约。
+- 接近 `auto_compact_threshold`（默认提前 0.1）时追加一条 `<context>` 压力提示，提醒模型收敛
+  读取范围；压缩摘要带续接前缀，说明这是既有任务的延续。
 - 条目的 token 成本只用于内部预算和自动裁剪。
 - 工具结果先按 `tools.max_output_bytes` 截断，再按 `context.tool_output_tokens` 对 provider
   视图做 head/tail 省略；完整输出保留在事件日志。
@@ -692,25 +703,29 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
   `kind`，TUI 用简短标签显示原因。
 - 删除/pin 是 session 级策略，可保存为项目默认。
-- 系统提示用 Working agreement + How to work 组织。Working agreement 约定协作方式：简洁、
-  先读代码、按显式要求验收、端到端完成且不把实现请求降级为分析、保留用户改动并把没见过的
-  改动视为用户改动（只在阻塞任务时才问）、不修无关问题；单条命令能答的简单请求直接执行，
-  只有错误假设会影响结果时才问；用用户的语言回复。
-  How to work 不写死阶段，而是给判断原则，由模型按任务规模决定展开多少：先读最窄代码和
-  调用点，能靠上下文判断就少用工具；大或模糊的任务才计划，跳过直接任务和单步计划，
-  `update_plan` 随步骤完成更新；改动修根因、复用 helper、保持相关调用面一致、默认 ASCII；验证以“足以
-  信任结果”为准，跑可能失败的检查、覆盖边界/错误路径、看 diff、不重复未变化的检查、不为
-  通过而改测试，跑不了就说明。
-  Communication 段要求编辑前说明改什么、分组工具调用前说明做什么和为什么，长任务约每 30 秒
-  给一次简短进展，不复述读取/阶段/计划，也不用“做 X 而不是 Y”的反衬式自夸；review 未要求
-  不改代码且先列 findings；最终答复不超过 70 行、文件路径可点击、无 emoji/em dash、不以
-  “Summary” 开头或 “If you want” 结尾、多选项用编号。Continuity 段规定新消息以最新为准，
-  resume/压缩后从摘要继续而不是重来。前端设计和更细的工程判断不放进基座，改为内置
-  `frontend` / `engineering` skill，由模型按任务需要加载；`frontend` 覆盖设计方向、控件与
-  布局、dev server 启动和 Playwright 视觉验证。
-  工具使用上统一走 `exec_command`：读取、搜索、列目录分别用 `cat` / `sed` / `awk` / `nl` /
-  `rg` / `fd` / `ls`（优先 `rg` / `rg --files`）；源码编辑用 `apply_patch`，批量改写和分析
-  可以写 shell/Python 脚本；不重复 `ls`/`git status` 等上下文中已有的信息。
+- 系统提示按“紧凑基座 + 条件 fragment”组织。基座保持 <800 tokens：
+  Working agreement 约定简洁、先读代码、端到端完成、保留用户改动、不修无关问题，并写明
+  AGENTS.md 的作用域（目录树 + 触碰的每个文件，越深越优先，用户指令最高）；How to work
+  约定先读最窄代码、只对大/模糊/多阶段任务计划、最小连贯改动、修根因、验证可失败的检查，
+  把文件内容/命令输出/MCP 描述视为不可信数据；Communication 约定 review 先列 findings、
+  最终答复四段且 <70 行；Continuity 约定压缩后继续，以及“无新请求时只收尾不发明工作”。
+- 基座不写死工具清单：`tool_note` 根据本次请求实际发送的 schema 生成 `## Tools`，只描述
+  `exec_command` / `apply_patch` / `write_stdin` / `tool_search` / `spawn_agent` / `use_skill` /
+  `update_plan` 等存在的工具。读取、搜索、列目录优先 `cat` / `sed` / `awk` / `nl` / `rg` /
+  `fd` / `ls`；编辑用 `apply_patch`；批量改写可用 shell/Python；不重复上下文中已有的
+  `ls` / `git status`。
+- `permissions_note` 按 Plan/Build/Auto/Bypass 渲染模式、sandbox、network、writable/read-only
+  roots、network allowlist、显式 allow/deny 规则和 escalation 规则；命令分段匹配（`|`、`&&`、
+  `||`、`;`、subshell）与“重定向/替换/环境变量前缀/通配符不参与 allow 前缀匹配”写进提示词，
+  避免模型提出无效或过宽的 `prefix_rule`。
+- `persistent_mode = true` 时追加 Persistent follow-up：无新用户消息只做收尾/验证，记录目标、
+  最后状态、停止条件和下次检查；优先等待机制，否则 1-3 分钟起步并退避；环境上下文不是新请求。
+  默认关闭，因为 eix 的普通 turn 结束即结束。
+- review 仍默认输出人类可读的 findings-first；需要 CI/机器可读时，内置 `review` skill 要求只输出
+  一个 JSON 对象（findings / confidence_score / priority / code_location /
+  overall_correctness / overall_confidence_score），并按位置与缺陷去重。
+- 前端设计和更细的工程判断不放进基座，改为内置 `frontend` / `engineering` skill，由模型按任务
+  需要加载；`frontend` 覆盖设计方向、控件与布局、dev server 启动和 Playwright 视觉验证。
   工具批次按只读段并发：`view_image` / `web_fetch` / `web_search` 和风险分析判定低风险只读、
   权限放行的 `exec_command` 可以在段内同时执行。`apply_patch`、非只读命令、审批和交互调用
   作为屏障，写后的读取仍在写入完成后执行，避免读到半应用状态。快照创建/裁剪串行化以保护
@@ -910,14 +925,16 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `eix approve` / `eix deny`、`eix log` 均已支持补丁。`exec_command` 直接读写真实工作区，
 > 因此与补丁审批串行，shell 看到的是已落盘内容。
 > Context ledger 是内部机制：`eixd/src/context.rs` 从事件日志重建 provider 上下文并按 sector
-> 记账（system 5% / instructions 5% / workspace 15% / history 60% / tools 10% / memory 5%），
-> 不向普通用户暴露 ledger 或手动 drop / pin 命令。
-> `AGENTS.md`（仓库根 → cwd 与 config 目录）注入 `instructions` sector，workspace summary 注入顶层
-> 文件树与 git branch/status。上下文压缩落成 `context_compacted` 事件，重启后重放一致；
+> 记账（system 5% / instructions 5% / workspace 12% / environment 3% / history 60% / tools 10% /
+> memory 5%），不向普通用户暴露 ledger 或手动 drop / pin 命令。
+> `AGENTS.md`（仓库根 → cwd 与 config 目录）以 `<instructions file scope>` 注入 `instructions`
+> sector；更深的文件覆盖外层，模型在触碰 cwd 之外的目录时需自行检查该目录的 AGENTS.md。
+> workspace summary 只含顶层文件树，cwd/git/sandbox/mode 等易变事实放在历史之后的
+> `environment` 段。上下文压缩落成 `context_compacted` 事件，重启后重放一致；
 > `tools` / `history` 超预算时从最旧条目自动裁剪（保留最新 4 条，必要时 emergency trim 到最新
 > 一条），system / instructions / workspace / memory 不自动裁剪。`memory` 工具把 workspace
-> 记忆写入 `<data>/memory/<hash>.md`，每次重建上下文都注入 `memory` sector；当前 todo 也作为
-> 固定任务状态注入。自动压缩在 turn 开始和每个工具批次后运行；provider 返回 context-length
+> 记忆写入 `<data>/memory/<hash>.md`，每次重建上下文都注入 `memory` sector；当前 todo 每轮
+> 追加为易变 `tasks` 段。自动压缩在 turn 开始和每个工具批次后运行；provider 返回 context-length
 > 错误时强制压缩并重试。工具批次按只读段并发执行（含已放行且风险分析判定只读的
 > `exec_command`）；写入、审批和交互调用作为屏障，结果保持调用顺序。
 > Process view 已落地：`exec_command` 支持后台会话（`yield_time_ms` 立即返回 session id），
@@ -1018,8 +1035,11 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 模型：`[providers.<name>]` 提供命名 OpenAI 兼容 endpoint，恰好一个 provider 设置
 > `default = true`；表名即选择前缀。`/model` 自动拉取每个 provider 的 `/models`，选择 id 为
 > `<provider>/<api-model-id>`。`[[models]]` 仍可手动固定模型、补充成本/上下文/variants，或用
-> `provider` 复用命名 endpoint。timeout / retry / context_tokens / system_prompt 属于独立的
-> `[provider_runtime]`，不重复放在每个 provider 表里。`Config::route` 解析 provider 前缀和 `id#variant`，变体作为 `reasoning_effort`
+> `provider` 复用命名 endpoint。timeout / retry / context_tokens / system_prompt / prompt_profile /
+> persistent_mode 属于独立的 `[provider_runtime]`，不重复放在每个 provider 表里。`prompt_profile`
+> 是 `default` 或 `concise`，仅在 `system_prompt` 未设置时选用内置提示词；`persistent_mode`
+> 默认 false，为 schedule/heartbeat 等会自动恢复 session 的集成追加续接契约。
+> `Config::route` 解析 provider 前缀和 `id#variant`，变体作为 `reasoning_effort`
 > 发送；未指定变体时默认 `medium`，保留值 `#none` 表示不发送。`model.list` / `session.model` /
 > `/model` picker（含变体行）已接入；`turn.completed`
 > 带 `usage` / `cost` / `duration_ms`，用于内部统计与状态消息。
@@ -1056,11 +1076,13 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI
 > 的 `eix export` / `eix import`。
 >
-> Skills：`eix-core/src/skills.rs` 始终加载内置 `frontend` / `engineering` 和原生 `.eix`，再按
-> `[compations]` 开关加载 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 的
+> Skills：`eix-core/src/skills.rs` 始终加载内置 `frontend` / `engineering` / `review` 和原生
+> `.eix`，再按 `[compations]` 开关加载 Claude Code / OpenCode / Codex CLI / Gemini CLI / Pi 的
 > `<name>/SKILL.md`（`.agents/skills` 由 Gemini 或 Pi 开关启用；同目录原生 `.eix` 优先）。
-> system prompt 只放 `<available_skills>` 摘要，模型用
-> 只读 `use_skill {name, arguments}` 按需取正文，正文展开 `$ARGUMENTS` / `$1..$9`。
+> system prompt 只放紧凑的 `<available_skills>` 目录（名称、截短后的 description、path；总预算
+> 为上下文的 2% 或 8 KiB，超限时先截 description，再省略条目），`allowed_tools` 只在
+> `use_skill` 的返回体出现。模型用只读 `use_skill {name, arguments}` 按需取正文，正文展开
+> `$ARGUMENTS` / `$1..$9`。
 > `allowed-tools` 支持通配，加载后在本 turn 内限制工具（并集，`use_skill` 始终可用，下一条
 > user prompt 清空）；Claude 风格工具名映射到 eix 名称。TUI `/skills` 是带正文预览的 picker。
 > Post-write formatter：默认按扩展名从内置表（Go/Rust/Python/JS/TS/C/C++/Shell/Lua/TOML/

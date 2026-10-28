@@ -28,9 +28,10 @@ pub use config::{
     CompatConfig, Config, ConfigError, ContextConfig, FormatterConfig, FormattersConfig,
     ImagesConfig, IntegrationConfig, LspConfig, LspServerConfig, McpConfig, McpServerConfig,
     ModelConfig, ModelInfo, ModelRoute, NotificationsConfig, PermissionAction, PermissionRule,
-    ProviderConfig, ProviderKind, ProviderOAuthConfig, ProviderSource, RepoIntegrationConfig,
-    RuleSource, SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, WorktreeConfig,
-    DEFAULT_MAX_PARALLEL_SUBAGENTS, SUBAGENT_CONCURRENCY_OPTIONS, THEME_PRESETS,
+    PromptProfile, ProviderConfig, ProviderKind, ProviderOAuthConfig, ProviderSource,
+    RepoIntegrationConfig, RuleSource, SandboxMode, ServerConfig, ThemeConfig, ThemePreset,
+    ToolsConfig, WorktreeConfig, DEFAULT_MAX_PARALLEL_SUBAGENTS, SUBAGENT_CONCURRENCY_OPTIONS,
+    THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
 pub use event::{

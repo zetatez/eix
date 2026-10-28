@@ -4773,6 +4773,9 @@ async fn spawn_agent_runs_a_readonly_child_and_returns_its_answer() -> anyhow::R
         .expect("spawn_agent result");
     assert_eq!(result.payload["ok"], true);
     let output = result.payload["output"].as_str().expect("output");
+    assert!(output.starts_with("<subagent_result agent=\""), "{output}");
+    assert!(output.contains("status=\"ok\""), "{output}");
+    assert!(output.ends_with("</subagent_result>"), "{output}");
     assert!(output.contains("child answer"), "{output}");
 
     // The same batch also read the workspace, exercising the read + sub-agent
@@ -5893,10 +5896,14 @@ async fn skills_are_listed_in_the_prompt_and_loadable_with_use_skill() -> anyhow
     let bodies = bodies.lock().await;
     assert!(bodies.len() >= 2);
     assert!(bodies[0].contains("<available_skills>"));
-    assert!(bodies[0].contains("deploy checklist"));
-    assert!(bodies[0].contains("Claude-compatible audit"));
-    assert!(bodies[0].contains("<allowed_tools>exec_command</allowed_tools>"));
+    assert!(bodies[0].contains("- deploy"), "{}", bodies[0]);
+    assert!(bodies[0].contains("- audit"));
+    assert!(
+        !bodies[0].contains("<allowed_tools>"),
+        "tool grants belong to the use_skill result, not the catalog"
+    );
     assert!(bodies[1].contains("Run the deploy checklist before shipping."));
+    assert!(bodies[1].contains("# skill: deploy"));
 
     daemon.abort();
     mock.abort();
@@ -6268,7 +6275,14 @@ async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Resul
         .find(|event| event.kind == EventKind::ContextCompacted)
         .expect("auto compaction event");
     assert_eq!(compacted.payload["messages"], 2);
-    assert_eq!(compacted.payload["summary"], "Hello from mock");
+    // The stored summary carries an explicit continuation prefix so the next
+    // model does not restart completed work.
+    let summary_text = compacted.payload["summary"].as_str().expect("summary");
+    assert!(
+        summary_text.contains("Another model started this task"),
+        "{summary_text}"
+    );
+    assert!(summary_text.ends_with("Hello from mock"), "{summary_text}");
 
     let bodies = bodies.lock().await;
     assert_eq!(bodies.len(), 4, "three turns plus one summary");
@@ -6312,7 +6326,19 @@ async fn repeat_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Strin
             bodies.lock().await.push(body);
             let last_is_tool = value["messages"]
                 .as_array()
-                .and_then(|messages| messages.last())
+                .and_then(|messages| {
+                    // Volatile sections (`<environment>`, `<tasks>`, …) are
+                    // appended as user messages after history, so look past
+                    // them when deciding whether the last real step was a tool
+                    // result.
+                    messages.iter().rev().find(|message| {
+                        let content = message["content"].as_str().unwrap_or_default();
+                        message["role"] != "user"
+                            || !["<environment>", "<tasks>", "<context>"]
+                                .iter()
+                                .any(|tag| content.starts_with(tag))
+                    })
+                })
                 .map(|message| message["role"] == "tool")
                 .unwrap_or(false);
             let events = if last_is_tool {

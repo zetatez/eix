@@ -152,7 +152,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
             "apply_patch",
-            "Edit files by putting one patch document in `input`. Start with *** Begin Patch, use Add/Update/Delete File hunks (Update may include *** Move to:), and end with *** End Patch. Requires approval.",
+            "Edit files with one patch in `input`: *** Begin Patch, Add/Update/Delete File hunks (Update may include *** Move to:), *** End Patch. Requires approval.",
             json!({
                 "type": "object",
                 "properties": {
@@ -163,35 +163,35 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "exec_command",
-            "Run a command, returning output or a session ID for ongoing interaction. Quote paths with spaces and put `--` before names starting with `-`.",
+            "Run a shell command; returns output or a session ID for ongoing work. Quote paths with spaces and put `--` before names starting with `-`.",
             json!({
                 "type": "object",
                 "properties": {
                     "cmd": {"type": "string", "description": "Shell command to execute."},
                     "workdir": {"type": "string", "description": "Working directory; defaults to the turn cwd."},
-                    "tty": {"type": "boolean", "description": "Allocate a PTY for the command."},
+                    "tty": {"type": "boolean", "description": "Allocate a PTY (default false)."},
                     "shell": {"type": "string", "description": "Shell binary; defaults to the user's shell."},
                     "login": {"type": "boolean", "description": "Run the shell as a login shell. Defaults to true."},
                     "yield_time_ms": {"type": "integer", "description": "Wait before yielding. Defaults to 10000 ms (250-30000)."},
                     "timeout_ms": {"type": "integer", "description": "Maximum runtime; defaults to the configured timeout."},
-                    "max_output_tokens": {"type": "integer", "description": "Output token budget."},
-                    "sandbox_permissions": {"type": "string", "enum": ["use_default", "with_additional_permissions", "require_escalated"], "description": "Sandbox override; require_escalated needs approval."},
+                    "max_output_tokens": {"type": "integer", "description": "Output token budget; defaults to 4000."},
+                    "sandbox_permissions": {"type": "string", "enum": ["use_default", "with_additional_permissions", "require_escalated"], "description": "Sandbox override; require_escalated needs approval, with_additional_permissions needs additional_permissions."},
                     "additional_permissions": {"type": "object", "description": "Extra access for this command; needs with_additional_permissions.", "properties": {"network": {"type": "object", "properties": {"enabled": {"type": "boolean"}}}, "file_system": {"type": "object", "properties": {"read": {"type": "array", "items": {"type": "string"}}, "write": {"type": "array", "items": {"type": "string"}}}}}},
-                    "justification": {"type": "string", "description": "Approval question for require_escalated."},
-                    "prefix_rule": {"type": "array", "items": {"type": "string"}, "description": "Reusable approval prefix for cmd."}
+                    "justification": {"type": "string", "description": "Question shown with the approval request; required for require_escalated."},
+                    "prefix_rule": {"type": "array", "items": {"type": "string"}, "description": "Categorical argv prefix to remember; never for interpreters, rm, or heredocs."}
                 },
                 "required": ["cmd"]
             }),
         ),
         ToolDefinition::function(
             "write_stdin",
-            "Writes characters to an existing exec_command session and returns recent output. An empty chars polls without writing.",
+            "Write characters to an existing exec_command session and return recent output. Empty chars polls.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string", "description": "Running exec_command session id."},
-                    "chars": {"type": "string", "description": "Bytes to write; empty polls."},
-                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding. Defaults to 1000 ms (250-30000)."},
+                    "chars": {"type": "string", "description": "Bytes to write; omit or empty to poll."},
+                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding. Defaults to 5000 ms for an empty poll and 1000 ms for a write (250-30000)."},
                     "max_output_tokens": {"type": "integer", "description": "Output token budget."}
                 },
                 "required": ["session_id"]
@@ -199,7 +199,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "view_image",
-            "Load a workspace image so you can inspect it visually.",
+            "Load a workspace image for inspection.",
             json!({
                 "type": "object",
                 "properties": {
@@ -211,7 +211,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "use_skill",
-            "Load an installed skill's full instructions before matching work.",
+            "Load a skill's full instructions before matching work.",
             json!({
                 "type": "object",
                 "properties": {

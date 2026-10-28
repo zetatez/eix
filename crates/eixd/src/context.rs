@@ -49,6 +49,20 @@ pub struct StaticContext {
     workspace: Option<String>,
 }
 
+/// Synthesized sections that are not derived from the event log.
+///
+/// `skills`, `workspace` and `memory` are stable within a turn and stay in the
+/// cached prefix. `tasks` and `environment` change between tool rounds, so
+/// [`Ledger`] appends them after history instead of rewriting the prefix.
+#[derive(Debug, Clone, Default)]
+pub struct Sections {
+    pub skills: Option<String>,
+    pub workspace: Option<String>,
+    pub memory: Option<String>,
+    pub tasks: Option<String>,
+    pub environment: Option<String>,
+}
+
 impl StaticContext {
     pub async fn load(config: &Config, cwd: &Path) -> Self {
         let instructions = load_instructions(config, cwd).await;
@@ -184,7 +198,17 @@ impl Policy {
 impl Ledger {
     /// Load instructions and the workspace summary, then assemble the ledger.
     pub async fn build(config: &Config, system: String, cwd: &Path, events: &[Event]) -> Self {
-        Self::build_with_state(config, system, cwd, events, None, None, None, &[], 1.0).await
+        Self::build_with_state(
+            config,
+            system,
+            cwd,
+            events,
+            None,
+            Sections::default(),
+            &[],
+            1.0,
+        )
+        .await
     }
 
     /// Like [`build`](Self::build), but resolves image blob references so
@@ -196,7 +220,17 @@ impl Ledger {
         events: &[Event],
         blobs: Option<&BlobStore>,
     ) -> Self {
-        Self::build_with_state(config, system, cwd, events, blobs, None, None, &[], 1.0).await
+        Self::build_with_state(
+            config,
+            system,
+            cwd,
+            events,
+            blobs,
+            Sections::default(),
+            &[],
+            1.0,
+        )
+        .await
     }
 
     /// Full assembly used by the daemon: instructions, workspace summary,
@@ -210,8 +244,7 @@ impl Ledger {
         cwd: &Path,
         events: &[Event],
         blobs: Option<&BlobStore>,
-        memory: Option<String>,
-        tasks: Option<String>,
+        sections: Sections,
         tools: &[ToolDefinition],
         token_scale: f64,
     ) -> Self {
@@ -220,10 +253,9 @@ impl Ledger {
             config,
             system,
             &static_context,
+            sections,
             events,
             blobs,
-            memory,
-            tasks,
             tools,
             token_scale,
             config.context.budget_tokens,
@@ -239,10 +271,9 @@ impl Ledger {
         config: &Config,
         system: String,
         static_context: &StaticContext,
+        sections: Sections,
         events: &[Event],
         blobs: Option<&BlobStore>,
-        memory: Option<String>,
-        tasks: Option<String>,
         tools: &[ToolDefinition],
         token_scale: f64,
         budget_tokens: usize,
@@ -250,12 +281,14 @@ impl Ledger {
         let images = load_images(events, blobs).await;
         let budget_tokens = budget_tokens.max(1);
         let system = cap_system(system, budget_tokens);
+        let mut sections = sections;
+        if sections.workspace.is_none() {
+            sections.workspace = static_context.workspace.clone();
+        }
         Self::assemble_full(
             system,
             static_context.instructions.clone(),
-            static_context.workspace.clone(),
-            memory,
-            tasks,
+            sections,
             events,
             budget_tokens,
             config.context.tool_output_tokens,
@@ -276,9 +309,10 @@ impl Ledger {
         Self::assemble_full(
             system,
             instructions,
-            workspace,
-            None,
-            None,
+            Sections {
+                workspace,
+                ..Sections::default()
+            },
             events,
             budget_tokens,
             DEFAULT_TOOL_OUTPUT_TOKENS,
@@ -292,9 +326,7 @@ impl Ledger {
     fn assemble_full(
         system: String,
         instructions: Vec<(String, String)>,
-        workspace: Option<String>,
-        memory: Option<String>,
-        tasks: Option<String>,
+        sections: Sections,
         events: &[Event],
         budget_tokens: usize,
         tool_output_tokens: usize,
@@ -303,17 +335,22 @@ impl Ledger {
         token_scale: f64,
     ) -> Self {
         let policy = Policy::from_events(events);
-        let mut entries = fixed_entries(
+        let mut entries = stable_entries(
             system,
             &instructions,
-            workspace.as_deref(),
-            memory,
-            tasks,
+            sections.skills.as_deref(),
+            sections.workspace.as_deref(),
+            sections.memory,
             tools,
             &policy,
         );
         let (event_entries, _) = event_entries_with_claimed(events, images, tool_output_tokens);
         entries.extend(event_entries);
+        entries.extend(volatile_entries(
+            sections.tasks.as_deref(),
+            sections.environment.as_deref(),
+            &policy,
+        ));
 
         let mut entries = apply_compactions(entries, &policy.compactions);
         prepare_entries(&mut entries, &policy, token_scale);
@@ -340,8 +377,7 @@ impl Ledger {
         tool_output_tokens: usize,
         system: String,
         static_context: &StaticContext,
-        memory: Option<String>,
-        tasks: Option<String>,
+        sections: Sections,
         tools: &[ToolDefinition],
         token_scale: f64,
         budget_tokens: usize,
@@ -387,16 +423,25 @@ impl Ledger {
             history.append(&mut appended);
         }
 
-        let mut entries = fixed_entries(
+        let workspace = sections
+            .workspace
+            .as_deref()
+            .or(static_context.workspace.as_deref());
+        let mut entries = stable_entries(
             system,
             &static_context.instructions,
-            static_context.workspace.as_deref(),
-            memory,
-            tasks,
+            sections.skills.as_deref(),
+            workspace,
+            sections.memory,
             tools,
             &policy,
         );
         entries.extend(history);
+        entries.extend(volatile_entries(
+            sections.tasks.as_deref(),
+            sections.environment.as_deref(),
+            &policy,
+        ));
         let mut entries = apply_compactions(entries, &policy.compactions);
         prepare_entries(&mut entries, &policy, token_scale);
         let trimmed = trim(&mut entries, budget_tokens);
@@ -404,6 +449,31 @@ impl Ledger {
         self.entries = entries;
         self.compactions = policy.compactions;
         true
+    }
+
+    /// Add a short pressure notice just before auto-compaction would trigger.
+    /// It is volatile (appended after history) and replaced on every call, so
+    /// it never rewrites the cached prefix.
+    pub fn set_context_pressure(&mut self, fraction: f64) {
+        self.entries.retain(|entry| entry.info.kind != "pressure");
+        let budget = self.result.budget_tokens;
+        let total = active_tokens(&self.entries);
+        if budget > 0 && total as f64 >= fraction * budget as f64 {
+            let percent = ((total as f64 / budget as f64) * 100.0).round() as usize;
+            let entry = volatile(
+                "pressure",
+                Sector::System,
+                "pressure",
+                format!(
+                    "<context>Context is at ~{percent}% of the window. Prefer targeted reads, \
+                     finish the current step, and avoid re-reading files.</context>"
+                ),
+                &Policy::default(),
+            );
+            self.entries.push(entry);
+        }
+        let trimmed = self.entries.iter().filter(|entry| entry.info.auto).count();
+        self.result = summarize(&self.entries, budget, trimmed);
     }
 
     /// Active compaction summaries, used as the starting point for the next
@@ -598,16 +668,16 @@ impl Ledger {
     }
 }
 
-/// Build the fixed sectors (system, instructions, workspace, tools, memory and
-/// tasks). These do not depend on the event log, so an incremental refresh can
-/// rebuild them without touching history entries.
+/// Build the stable prefix (system, instructions, skills, workspace, memory and
+/// tool schemas). These come before history, so they must not change between
+/// tool rounds or the provider's prefix cache is wasted.
 #[allow(clippy::too_many_arguments)]
-fn fixed_entries(
+fn stable_entries(
     system: String,
     instructions: &[(String, String)],
+    skills: Option<&str>,
     workspace: Option<&str>,
     memory: Option<String>,
-    tasks: Option<String>,
     tools: &[ToolDefinition],
     policy: &Policy,
 ) -> Vec<Entry> {
@@ -625,8 +695,18 @@ fn fixed_entries(
             &format!("instructions:{label}"),
             Sector::Instructions,
             "instructions",
-            text.clone(),
+            instructions_block(label, text),
             true,
+            policy,
+        ));
+    }
+    if let Some(text) = skills {
+        entries.push(synthesized(
+            "skills",
+            Sector::Instructions,
+            "skills",
+            text.to_string(),
+            false,
             policy,
         ));
     }
@@ -655,17 +735,69 @@ fn fixed_entries(
             policy,
         ));
     }
+    entries
+}
+
+/// Sections that change between tool rounds go after append-only history. They
+/// use the user role so providers that only allow a leading system message do
+/// not reject the request; the XML tag keeps them distinct from user input.
+fn volatile_entries(tasks: Option<&str>, environment: Option<&str>, policy: &Policy) -> Vec<Entry> {
+    let mut entries = Vec::new();
     if let Some(text) = tasks {
-        entries.push(synthesized(
+        entries.push(volatile(
             "tasks",
             Sector::Memory,
             "tasks",
-            text,
-            true,
+            format!("<tasks>\n{text}\n</tasks>"),
+            policy,
+        ));
+    }
+    if let Some(text) = environment {
+        entries.push(volatile(
+            "environment",
+            Sector::Environment,
+            "environment",
+            text.to_string(),
             policy,
         ));
     }
     entries
+}
+
+fn volatile(id: &str, sector: Sector, kind: &str, text: String, policy: &Policy) -> Entry {
+    let mut entry = make_entry(
+        id.to_string(),
+        sector,
+        kind.to_string(),
+        vec![ChatMessage::user(text)],
+        None,
+        false,
+    );
+    entry.info.pinned = policy.pinned.contains(id);
+    entry.info.dropped = policy.dropped.contains(id);
+    entry
+}
+
+/// Instruction text needs a visible source and scope: eix loads one file per
+/// directory level, and the model has to know which one wins. Global files
+/// apply to every workspace, so they get `scope="user"` instead of a
+/// directory derived from their label.
+fn instructions_block(label: &str, text: &str) -> String {
+    let scope = if label.starts_with("global ") {
+        "user".to_string()
+    } else {
+        Path::new(label)
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .map(|parent| parent.display().to_string())
+            .unwrap_or_else(|| ".".to_string())
+    };
+    format!(
+        "<instructions file=\"{}\" scope=\"{}\">\n{}\n</instructions>",
+        label.replace('"', "'"),
+        scope.replace('"', "'"),
+        text
+    )
 }
 
 fn tool_schema_entry(tools: &[ToolDefinition]) -> Entry {
@@ -1259,7 +1391,12 @@ fn trim(entries: &mut [Entry], budget: usize) -> usize {
     // Fixed sectors are normally protected, but a huge instruction file or
     // workspace summary must not defeat the budget entirely. Drop them
     // oldest-first and mark them `auto` so the UI can explain the loss.
-    for sector in [Sector::Instructions, Sector::Workspace, Sector::Memory] {
+    for sector in [
+        Sector::Instructions,
+        Sector::Workspace,
+        Sector::Memory,
+        Sector::Environment,
+    ] {
         while total > budget {
             let Some(dropped) = drop_fixed(entries, sector) else {
                 break;
@@ -1471,36 +1608,79 @@ async fn workspace_summary(cwd: &Path) -> Option<String> {
     }
     names.sort();
 
+    // Git state lives in the volatile environment fragment instead: it
+    // changes between tool rounds and would otherwise invalidate the prefix.
     let mut out = String::new();
     out.push_str(&format!("workspace: {}\n", cwd.display()));
     out.push_str("top-level: ");
     out.push_str(&names.join("  "));
     out.push('\n');
-
-    if cwd.join(".git").exists() {
-        // Run both queries together; `git status` can be slow on big repos.
-        let (branch, status) = tokio::join!(
-            git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
-            git(cwd, &["status", "--porcelain"]),
-        );
-        if let Some(branch) = branch {
-            out.push_str(&format!("git branch: {}\n", branch.trim()));
-        }
-        if let Some(status) = status {
-            let lines: Vec<&str> = status.lines().take(20).collect();
-            if lines.is_empty() {
-                out.push_str("git status: clean\n");
-            } else {
-                out.push_str("git status:\n");
-                out.push_str(&lines.join("\n"));
-                if status.lines().count() > lines.len() {
-                    out.push_str("\n…");
-                }
-                out.push('\n');
-            }
-        }
-    }
     Some(out)
+}
+
+/// Volatile environment facts, re-rendered for every ledger build. Kept short
+/// (about 60-80 tokens) so refreshing it after history does not cost much.
+pub async fn environment_summary(cwd: &Path, mode: &str, sandbox: &str, network: bool) -> String {
+    let mut out = String::from("<environment>\n");
+    out.push_str(&format!("cwd: {}\n", cwd.display()));
+    out.push_str(&format!(
+        "os: {} ({})\n",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    ));
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "sh".to_string());
+    out.push_str(&format!("shell: {shell}\n"));
+    out.push_str(&format!(
+        "date: {}\n",
+        chrono::Local::now().format("%Y-%m-%d %A")
+    ));
+    out.push_str(&format!(
+        "timezone: {}\n",
+        chrono::Local::now().format("%Z (%:z)")
+    ));
+    if let Some(git) = git_summary(cwd).await {
+        out.push_str(&format!("git: {git}\n"));
+    }
+    out.push_str(&format!("sandbox: {sandbox}\n"));
+    out.push_str(&format!(
+        "network: {}\n",
+        if network {
+            "allowed"
+        } else {
+            "blocked in sandbox"
+        }
+    ));
+    out.push_str(&format!("mode: {mode}\n"));
+    out.push_str("</environment>");
+    out
+}
+
+async fn git_summary(cwd: &Path) -> Option<String> {
+    if !cwd.join(".git").exists() {
+        return None;
+    }
+    // Run both queries together; `git status` can be slow on big repos.
+    let (branch, status) = tokio::join!(
+        git(cwd, &["rev-parse", "--abbrev-ref", "HEAD"]),
+        git(cwd, &["status", "--porcelain"]),
+    );
+    let branch = branch?;
+    let changed = status
+        .map(|status| {
+            status
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count()
+        })
+        .unwrap_or(0);
+    Some(if changed == 0 {
+        format!("{}; clean", branch.trim())
+    } else {
+        format!("{}; {changed} changed", branch.trim())
+    })
 }
 
 async fn git(cwd: &Path, args: &[&str]) -> Option<String> {
@@ -1691,6 +1871,89 @@ mod tests {
     }
 
     #[test]
+    fn stable_prefix_stays_before_history_and_volatile_sections_follow_it() {
+        let events = vec![user(1, "do it")];
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![("sub/AGENTS.md".into(), "inner rule".into())],
+            Sections {
+                skills: Some("<available_skills>\n- review (path: /s)\n</available_skills>".into()),
+                tasks: Some("1. fix it".into()),
+                environment: Some("<environment>\nmode: build\n</environment>".into()),
+                ..Sections::default()
+            },
+            &events,
+            10_000,
+            4_000,
+            &HashMap::new(),
+            &[],
+            1.0,
+        );
+        let messages = ledger.messages();
+        assert_eq!(messages.len(), 6);
+        assert!(messages[0].content.contains("sys"));
+        // Instructions carry their source and scope instead of an anonymous
+        // system blob.
+        assert!(messages[1]
+            .content
+            .contains("<instructions file=\"sub/AGENTS.md\" scope=\"sub\">"));
+        assert!(messages[2].content.contains("<available_skills>"));
+        assert_eq!(messages[3].role, Role::User);
+        assert_eq!(messages[3].content, "do it");
+        // Volatile sections follow append-only history.
+        assert_eq!(messages[4].role, Role::User);
+        assert!(messages[4].content.contains("<tasks>"));
+        assert_eq!(messages[5].role, Role::User);
+        assert!(messages[5].content.contains("<environment>"));
+    }
+
+    #[test]
+    fn instruction_blocks_name_their_source_and_scope() {
+        let local = instructions_block("crates/eixd/AGENTS.md", "use tabs");
+        assert!(local
+            .starts_with("<instructions file=\"crates/eixd/AGENTS.md\" scope=\"crates/eixd\">"));
+        assert!(local.ends_with("use tabs\n</instructions>"));
+        let global = instructions_block("global AGENTS.md", "be kind");
+        assert!(global.contains("scope=\"user\""));
+        let root = instructions_block("AGENTS.md", "root");
+        assert!(root.contains("scope=\".\""));
+    }
+
+    #[test]
+    fn context_pressure_is_injected_before_the_compaction_threshold() {
+        let events = vec![user(1, "do it")];
+        let mut ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            Sections::default(),
+            &events,
+            1_000,
+            4_000,
+            &HashMap::new(),
+            &[],
+            1.0,
+        );
+        ledger.set_context_pressure(0.0);
+        assert!(ledger
+            .info()
+            .entries
+            .iter()
+            .any(|entry| entry.id == "pressure"));
+        let last = ledger.messages().pop().expect("pressure message");
+        assert!(last.content.contains("Context is at ~"));
+        assert!(last.content.contains("avoid re-reading files"));
+
+        // Below the threshold the notice is removed again, so the ledger keeps
+        // matching a fresh build.
+        ledger.set_context_pressure(2.0);
+        assert!(!ledger
+            .info()
+            .entries
+            .iter()
+            .any(|entry| entry.id == "pressure"));
+    }
+
+    #[test]
     fn message_estimate_counts_tool_arguments_and_images() {
         let plain = ChatMessage::assistant("");
         let mut call = call("call_1");
@@ -1728,9 +1991,7 @@ mod tests {
         let ledger = Ledger::assemble_full(
             "sys".into(),
             vec![],
-            None,
-            None,
-            None,
+            Sections::default(),
             &events,
             10_000,
             4_000,
@@ -1757,9 +2018,7 @@ mod tests {
         let tight = Ledger::assemble_full(
             "sys".into(),
             vec![],
-            None,
-            None,
-            None,
+            Sections::default(),
             &events,
             1_000,
             400,
@@ -1782,9 +2041,7 @@ mod tests {
         let base = Ledger::assemble_full(
             "sys".into(),
             vec![],
-            None,
-            None,
-            None,
+            Sections::default(),
             &events,
             10_000,
             4_000,
@@ -1795,9 +2052,7 @@ mod tests {
         let scaled = Ledger::assemble_full(
             "sys".into(),
             vec![],
-            None,
-            None,
-            None,
+            Sections::default(),
             &events,
             10_000,
             4_000,
@@ -2185,8 +2440,7 @@ mod tests {
             DEFAULT_TOOL_OUTPUT_TOKENS,
             "sys".into(),
             &static_context,
-            None,
-            None,
+            Sections::default(),
             &[],
             1.0,
             10_000,
@@ -2368,9 +2622,7 @@ mod tests {
         let ledger = Ledger::assemble_full(
             "sys".into(),
             vec![],
-            None,
-            None,
-            None,
+            Sections::default(),
             &events,
             100_000,
             100,
@@ -2394,14 +2646,16 @@ mod tests {
     }
 
     #[test]
-    fn memory_and_task_state_are_fixed_context_entries() {
+    fn memory_stays_fixed_and_tasks_are_volatile() {
         let events = vec![user(1, "do it")];
         let ledger = Ledger::assemble_full(
             "sys".into(),
             vec![],
-            None,
-            Some("prefers focused diffs".into()),
-            Some("Current task list:\n[ ] fix it".into()),
+            Sections {
+                memory: Some("prefers focused diffs".into()),
+                tasks: Some("Current task list:\n[ ] fix it".into()),
+                ..Sections::default()
+            },
             &events,
             10_000,
             4_000,
@@ -2419,6 +2673,18 @@ mod tests {
             .unwrap();
         assert_eq!(memory.entries, 2);
         assert!(memory.tokens > 0);
+
+        // Memory is part of the cacheable prefix; tasks follow history so a
+        // task update does not invalidate the prefix.
+        let messages = ledger.messages();
+        let position = |needle: &str| {
+            messages
+                .iter()
+                .position(|message| message.content.contains(needle))
+                .unwrap_or_else(|| panic!("missing {needle:?}"))
+        };
+        assert!(position("prefers focused diffs") < position("do it"));
+        assert!(position("<tasks>") > position("do it"));
     }
 
     #[test]
@@ -2436,9 +2702,7 @@ mod tests {
         let ledger = Ledger::assemble_full(
             "sys".into(),
             vec![],
-            None,
-            None,
-            None,
+            Sections::default(),
             &events,
             1_500,
             400,
