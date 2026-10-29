@@ -6,7 +6,7 @@
 //! re-attaching and replaying the event log.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -471,6 +471,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         classifier_cache: Mutex::new(HashMap::new()),
         prompt_cache: Mutex::new(PromptCache::default()),
         config_rev: AtomicUsize::new(0),
+        self_config_write: AtomicBool::new(false),
         pairing: std::sync::Mutex::new(HashMap::new()),
         pairing_failures: std::sync::Mutex::new(PairingFailures::default()),
     });
@@ -529,6 +530,13 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
                 tokio::time::sleep(Duration::from_secs(2)).await;
                 let now = watcher.config_mtimes();
                 if now == last {
+                    continue;
+                }
+                // `plugin.settings.set` sets this before it writes the config.
+                // Only consume the marker for an actual change, so a stale flag
+                // cannot swallow the next external edit.
+                if watcher.self_config_write.swap(false, Ordering::SeqCst) {
+                    last = now;
                     continue;
                 }
                 match watcher.reload_config().await {
@@ -804,6 +812,10 @@ pub(crate) struct Daemon {
     /// Incremented on every successful config reload so the prompt cache cannot
     /// keep serving a previous `[compat]` / skill configuration.
     config_rev: AtomicUsize,
+    /// Set after `plugin.settings.set` writes the config file itself. The
+    /// watcher consumes it once so our own write does not trigger a full
+    /// plugin restart.
+    self_config_write: AtomicBool,
     /// One-time pairing codes created by `pair.create`, keyed by the
     /// canonical (lowercase, dash-free) code. Redeemed codes are removed.
     pairing: std::sync::Mutex<HashMap<String, PairingCode>>,
@@ -3327,6 +3339,7 @@ impl Daemon {
                 let list: PluginCommandList = self.plugins.commands().await;
                 Ok(serde_json::to_value(list)?)
             }
+            "plugin.ui.list" => Ok(serde_json::to_value(self.plugins.ui_surfaces().await)?),
             "plugin.command.run" => {
                 let params: PluginCommandRunParams = parse_params(request.params.clone())?;
                 let session = self.require_session(&params.session_id)?;
@@ -3349,6 +3362,49 @@ impl Daemon {
                     .ok_or_else(|| rpc("invalid_params", "plugin.settings needs `name`"))?;
                 let config = self.config.load_full();
                 let result: PluginSettingsResult = self.plugins.settings(name, &config).await?;
+                Ok(serde_json::to_value(result)?)
+            }
+            "plugin.settings.set" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.settings.set needs `name`"))?;
+                let values = request
+                    .params
+                    .get("values")
+                    .or_else(|| request.params.get("settings"))
+                    .cloned()
+                    .ok_or_else(|| rpc("invalid_params", "plugin.settings.set needs `values`"))?;
+                let config = self.config.load_full();
+                // Flagged before the write: the watcher polls from another
+                // task, so setting it afterwards could race with a tick and
+                // trigger a full reload of every plugin.
+                self.self_config_write.store(true, Ordering::SeqCst);
+                let result = match self.plugins.set_settings(name, &values, &config).await {
+                    Ok(result) => result,
+                    Err(err) => {
+                        // Validation happens before the write; a failed write
+                        // may or may not have touched the file, so let the
+                        // watcher observe it normally.
+                        self.self_config_write.store(false, Ordering::SeqCst);
+                        return Err(err);
+                    }
+                };
+                // Mirror the write in memory so `plugin.settings` and the next
+                // turn see it without waiting for the file watcher.
+                let merged: BTreeMap<String, Value> = serde_json::from_value(result.values.clone())
+                    .context("plugin settings are not an object")?;
+                let mut next = (*config).clone();
+                if let Some(plugin) = next.plugins.get_mut(name) {
+                    plugin.settings = merged;
+                }
+                self.config.store(Arc::new(next));
+                self.config_rev.fetch_add(1, Ordering::Relaxed);
+                self.emit_value(
+                    "plugin.settings.changed",
+                    json!({"plugin": name, "values": result.values}),
+                );
                 Ok(serde_json::to_value(result)?)
             }
             "plugin.restart" => {

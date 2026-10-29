@@ -587,16 +587,20 @@ impl App {
             Event::PluginCommands(commands) => {
                 self.set_plugin_commands(commands);
             }
-            Event::Plugins { list, settings } => {
+            Event::Plugins {
+                list,
+                settings,
+                surfaces,
+            } => {
                 let (title, text, status) = match &settings {
                     Some(settings) => (
                         format!("plugin · {}", settings.plugin),
-                        render_plugin_settings(settings),
+                        render_plugin_settings(settings, &surfaces),
                         "plugin settings · Esc closes".to_string(),
                     ),
                     None => (
                         "plugins".to_string(),
-                        render_plugin_list(&list),
+                        render_plugin_list(&list, &surfaces),
                         format!("{} plugin(s)", list.plugins.len()),
                     ),
                 };
@@ -1631,7 +1635,10 @@ impl App {
     }
 }
 
-fn render_plugin_list(list: &eix_core::PluginListResult) -> String {
+fn render_plugin_list(
+    list: &eix_core::PluginListResult,
+    surfaces: &[eix_core::PluginUiSurface],
+) -> String {
     if list.plugins.is_empty() {
         return "no plugins configured\n\nAdd [plugins.<name>] to the global config.".into();
     }
@@ -1661,6 +1668,26 @@ fn render_plugin_list(list: &eix_core::PluginListResult) -> String {
         if !plugin.events.is_empty() {
             lines.push(format!("  events: {}", plugin.events.join(", ")));
         }
+        if plugin.failures > 0 {
+            lines.push(format!("  consecutive failures: {}", plugin.failures));
+        }
+        let declared: Vec<_> = surfaces
+            .iter()
+            .filter(|surface| surface.plugin == plugin.name)
+            .collect();
+        if !declared.is_empty() {
+            lines.push(format!(
+                "  surfaces: {}",
+                declared
+                    .iter()
+                    .map(|surface| format!(
+                        "{} {} ({})",
+                        surface.surface, surface.id, surface.title
+                    ))
+                    .collect::<Vec<_>>()
+                    .join(" · ")
+            ));
+        }
         if let Some(error) = &plugin.error {
             lines.push(format!("  error: {error}"));
         }
@@ -1670,7 +1697,10 @@ fn render_plugin_list(list: &eix_core::PluginListResult) -> String {
     lines.join("\n")
 }
 
-fn render_plugin_settings(settings: &eix_core::PluginSettingsResult) -> String {
+fn render_plugin_settings(
+    settings: &eix_core::PluginSettingsResult,
+    surfaces: &[eix_core::PluginUiSurface],
+) -> String {
     let mut lines = vec![format!("plugin: {}", settings.plugin), String::new()];
     let values = settings.values.as_object().cloned().unwrap_or_default();
     match settings
@@ -1727,6 +1757,24 @@ fn render_plugin_settings(settings: &eix_core::PluginSettingsResult) -> String {
                 lines.push(String::new());
                 lines.push(serde_json::to_string_pretty(&settings.values).unwrap_or_default());
             }
+        }
+    }
+    let declared: Vec<_> = surfaces
+        .iter()
+        .filter(|surface| surface.plugin == settings.plugin)
+        .collect();
+    if !declared.is_empty() {
+        lines.push(String::new());
+        lines.push("surfaces".into());
+        for surface in declared {
+            let hint = match surface.surface.as_str() {
+                "picker" => "picker (opens when the plugin submits it)",
+                _ => "text panel",
+            };
+            lines.push(format!(
+                "  {} {} · {} — {}",
+                surface.surface, surface.id, surface.title, hint
+            ));
         }
     }
     lines.push(String::new());

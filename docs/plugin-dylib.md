@@ -1,11 +1,11 @@
 # eix dylib 插件系统设计（ABI v1）
 
-- 状态：**P1 已落地**。`eix-plugin-abi` / `eix-plugin-sdk` 骨架、`eixd` 的 `ExtensionBackend` 抽象、`ProcessBackend` 适配与 `DylibBackend` 加载器均已实现；`describe` / `tool.call` / `command.run` 可在真实插件路径中调用。
+- 状态：**P1 已落地，P2 部分落地**。`eix-plugin-abi` / `eix-plugin-sdk` 骨架、`eixd` 的 `ExtensionBackend` 抽象、`ProcessBackend` 适配与 `DylibBackend` 加载器均已实现；`describe` / `tool.call` / `command.run` 可在真实插件路径中调用，`hook.run` / `rpc.call` / `event.notify` / `config.changed` 也已接通。
 - 目标：原生性能、极深扩展点、新增能力不需要修改 ABI
 - 关联代码：`crates/eix-plugin-abi/`、`crates/eix-plugin-sdk/`、`crates/eixd/src/plugin/{backend,process,dylib}.rs`、`examples/plugins/hello-dylib/`
 - 现有实现：`crates/eixd/src/plugin/` 同时支持进程外 JSON-RPC（`ProcessBackend`）与进程内 dylib（`DylibBackend`），共享同一套注册表、能力校验与 hook 路由。
 
-本文描述如何用 **dylib（动态链接库）** 实现一个比现有进程外 JSON-RPC 插件更深、更快、更原生的扩展系统，同时保留可演进性。P1 只覆盖 `describe` / `tool.call` / `command.run`；其余方法表是后续阶段的目标，不替代 [`plugins.md`](plugins.md) 中已落地的 v2 协议。
+本文描述如何用 **dylib（动态链接库）** 实现一个比现有进程外 JSON-RPC 插件更深、更快、更原生的扩展系统，同时保留可演进性。当前已覆盖 `describe` / `tool.call` / `command.run` / `hook.run` / `rpc.call` / `event.notify` / `config.changed`，以及同步安全的 host API（log / storage / secrets / fs / session 读 / blob）；`net` / `ui` / `job` / `host.rpc.call` 需要 async 桥接，仍是后续阶段目标。本文不替代 [`plugins.md`](plugins.md) 中已落地的 v2 协议。
 
 ### 1.0 P1 使用方式
 
@@ -289,17 +289,19 @@ pub const EIX_ERR_INTERNAL: i32 = -8;
 | `host.notify` | 已支持 | toast / `plugin.notify` 事件 |
 | `host.storage.get/set/delete/list` | 已支持 | KV，`global` / `workspace` 作用域 |
 | `host.secrets.get` | 已支持 | 环境变量白名单；只允许 `plugins.<name>.secrets` |
-| `host.fs.read/list/write` | 暂不支持 | 返回 `EIX_ERR_DENIED`；需要 hosted/process 模式 |
-| `host.net.request` | 暂不支持 | 同上 |
-| `host.session.get/list` | 暂不支持 | 同上 |
-| `host.ui.open/update/close` | 暂不支持 | 同上 |
-| `host.rpc.call` | 暂不支持 | 同上 |
-| `host.blob.put/get` | 暂不支持 | 同上 |
-| `host.job.register/trigger/unregister` | 暂不支持 | 同上 |
+| `host.fs.read/list/write` | 已支持 | 与进程后端共用 `WorkspaceFs`：canonicalize、拒绝 `..` 与符号链接、单文件 ≤1 MiB |
+| `host.net.request` | 暂不支持 | 需要 async 桥接 |
+| `host.session.get/list` | 已支持 | 只读，需 `sessions_read` 能力 |
+| `host.ui.open/update/close` | 暂不支持 | 需要 UI 事件桥接 |
+| `host.rpc.call` | 暂不支持 | 需要 async 桥接 |
+| `host.blob.put/get` | 已支持 | 与进程后端共用内容寻址实现，单个 ≤8 MiB |
+| `host.job.register/trigger/unregister` | 暂不支持 | 需要 async 桥接 |
 | `host.register/unregister` | 设计目标 | 动态贡献 |
 | `host.config.get` | 设计目标 | 当前设置 |
 
-P1 只实现同步安全的 host 方法。fs / net / rpc / job / session / ui 需要在 async 运行时里 await，而 dylib `dispatch` 是同步调用；在 P2 之前这些方法明确返回 `EIX_ERR_DENIED`，并提示改用 hosted/process 模式。
+同步安全的方法（log / storage / secrets / fs / session 读 / blob）直接实现；net / ui / rpc / job 需要 await 或回到 daemon 事件循环，在 P2 之前明确返回 `EIX_ERR_DENIED`，并提示改用 hosted/process 模式。
+
+`config.changed` 是唯一的非事件通知：`DylibBackend::notify` 把它翻译成 `config.changed` dispatch，SDK 收到后更新缓存并调用 `Plugin::config_changed`。其余通知仍包成 `event.notify {method, params}` 交给 `Plugin::event`。
 
 新增 host 方法只需在 host 侧加一个字符串分支；ABI 不变。
 
@@ -710,7 +712,7 @@ pub trait ExtensionBackend: Send + Sync {
 | --- | --- | --- |
 | P0 ✅ | `eix-plugin-abi` + `eix-plugin-sdk` 骨架、示例 dylib 可编译 | `cargo check --workspace --all-targets` |
 | P1 ✅ | `DylibBackend` 加载器、`describe`、`tool.call`、`command.run` | 插件工具可在真实 turn 中调用 |
-| P2 | hooks、events、UI 文本表面、RPC 与 async host 方法 | 与现有 JSON-RPC 后端功能对齐 |
+| P2 🚧 | hooks、events、`rpc.call`、`config.changed`、同步 host API（fs/session/blob）已落地；UI 面板与 async host 方法待做 | 与现有 JSON-RPC 后端功能对齐 |
 | P3 | UI 节点树、provider 流式、agent/skill/theme/keymap/MCP 贡献 | 高自定义场景可用 |
 | P4 | hosted 模式、签名校验、安装分发 | 第三方插件可安全分发 |
 | P5 | 可选 WASM backend | 不可信插件沙箱 |
@@ -722,13 +724,14 @@ pub trait ExtensionBackend: Send + Sync {
 | 位置 | 现状 |
 | --- | --- |
 | `crates/eix-plugin-abi/src/lib.rs` | `EixStr` / `EixBuf` / `HostApiV1` / 5 个插件函数类型 / 状态码 |
-| `crates/eix-plugin-sdk/src/lib.rs` | `Plugin` trait、`Descriptor` builder、`Ctx`、`eix_plugin!` 宏、FFI 包装；路由 `describe` / `tool.call` / `command.run` / `hook.run` / `event.notify` / `lifecycle.*` |
+| `crates/eix-plugin-sdk/src/lib.rs` | `Plugin` trait、`Descriptor` builder、`Ctx`、`RpcCall`、`eix_plugin!` 宏、FFI 包装；路由 `describe` / `tool.call` / `command.run` / `hook.run` / `rpc.call` / `event.notify` / `config.changed` / `lifecycle.*` |
 | `crates/eixd/src/plugin/backend.rs` | `ExtensionBackend` trait 与 `BackendFuture` |
 | `crates/eixd/src/plugin/process.rs` | `ProcessBackend`：现有 JSON-RPC 子进程的适配器 |
 | `crates/eixd/src/plugin/dylib.rs` | `DylibBackend`：加载、ABI 校验、方法翻译、超时、dylib host API |
-| `crates/eixd/src/plugin/mod.rs` | `PluginManager` 按 `spec.library` 选择 backend，注册表与 hook/tool/command/RPC/event 路由共用 |
-| `crates/eix-core/src/plugin.rs` | `components.dylib`、`abi`、`library`、`PLUGIN_DYLIB_ABI_VERSION` 与校验 |
+| `crates/eixd/src/plugin/host_api.rs` | 共享的 `WorkspaceFs` 与 blob 实现，供进程与 dylib 后端复用 |
+| `crates/eixd/src/plugin/mod.rs` | `PluginManager` 按 `spec.library` 选择 backend，注册表与 hook/tool/command/RPC/event 路由共用；连续失败计数与 `degraded` |
+| `crates/eix-core/src/plugin.rs` | `components.dylib`、`abi`、`library`、`PLUGIN_DYLIB_ABI_VERSION`、settings schema 校验与 UI 表面类型 |
 | `examples/plugins/hello-dylib/` | 最小 cdylib 示例（`echo` 工具 + `sync` 命令）与 `eix-plugin.toml` |
 | `docs/plugins.md` | 已落地的 v2 进程外插件系统 |
 
-P1 已打通：`PluginManager::start_backend` 依据 `spec.library` 选择 `DylibBackend`，`describe` 注册工具/命令，`tools/call` 与 `commands/run` 经 trait 分发，`shutdown` 销毁实例但不 `dlclose`。
+P1 已打通：`PluginManager::start_backend` 依据 `spec.library` 选择 `DylibBackend`，`describe` 注册工具/命令，`tools/call` / `commands/run` / `hooks/run` / `rpc.call` 经 trait 分发，`shutdown` 销毁实例但不 `dlclose`。P2 补上了同步 host API、`config.changed` 热更新与 `degraded` 计数。

@@ -510,11 +510,41 @@ impl<'a> Ctx<'a> {
     }
 
     pub fn rpc_call(&self, plugin: &str, method: &str, arguments: Value) -> Result<Value> {
+        self.rpc_call_with_depth(plugin, method, arguments, 0)
+    }
+
+    /// Forward an inbound RPC call. Pass the [`RpcCall::depth`] the host gave
+    /// you so the `MAX_RPC_DEPTH` guard keeps working across hops.
+    pub fn rpc_call_with_depth(
+        &self,
+        plugin: &str,
+        method: &str,
+        arguments: Value,
+        depth: u32,
+    ) -> Result<Value> {
         self.call(
             "host.rpc.call",
-            json!({"plugin": plugin, "method": method, "arguments": arguments}),
+            json!({
+                "plugin": plugin,
+                "method": method,
+                "arguments": arguments,
+                "depth": depth,
+            }),
         )
     }
+}
+
+/// One inbound cross-plugin RPC call, as delivered by the host.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RpcCall {
+    /// Method name exported through `Descriptor::rpc`.
+    pub method: String,
+    /// Caller-supplied arguments. Opaque to the host.
+    pub arguments: Value,
+    /// Plugin that started the chain.
+    pub caller: String,
+    /// Host-side hop count. Forward it with [`Ctx::rpc_call_with_depth`].
+    pub depth: u32,
 }
 
 /// The trait a dylib plugin implements.
@@ -542,6 +572,12 @@ pub trait Plugin: Default + 'static {
 
     fn run_hook(&mut self, _ctx: &mut Ctx<'_>, point: &str, _payload: Value) -> Result<Value> {
         Err(Error::UnknownMethod(format!("hook {point}")))
+    }
+
+    /// Handle a method exported through [`Descriptor::rpc`]. The default
+    /// rejects every method, so a plugin only opts in by overriding this.
+    fn rpc(&mut self, _ctx: &mut Ctx<'_>, call: RpcCall) -> Result<Value> {
+        Err(Error::UnknownMethod(format!("rpc {}", call.method)))
     }
 
     fn render_ui(&mut self, _ctx: &mut Ctx<'_>, view: &str, _revision: u64) -> Result<Value> {
@@ -623,6 +659,24 @@ impl<P: Plugin> Instance<P> {
                     .map(str::to_string)
                     .ok_or_else(|| Error::Invalid("hook.run needs `point`".into()))?;
                 self.plugin.run_hook(&mut ctx, &point, params)
+            }
+            "rpc.call" => {
+                let method = params
+                    .get("method")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Error::Invalid("rpc.call needs `method`".into()))?
+                    .to_string();
+                let call = RpcCall {
+                    method,
+                    arguments: params.get("arguments").cloned().unwrap_or(Value::Null),
+                    caller: params
+                        .get("caller")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    depth: params.get("depth").and_then(Value::as_u64).unwrap_or(0) as u32,
+                };
+                self.plugin.rpc(&mut ctx, call)
             }
             "ui.render" => {
                 let view = params
@@ -877,6 +931,15 @@ mod tests {
                 other => Err(Error::UnknownMethod(other.to_string())),
             }
         }
+
+        fn rpc(&mut self, _ctx: &mut Ctx<'_>, call: RpcCall) -> Result<Value> {
+            Ok(json!({
+                "method": call.method,
+                "arguments": call.arguments,
+                "caller": call.caller,
+                "depth": call.depth,
+            }))
+        }
     }
 
     #[derive(Default)]
@@ -994,6 +1057,34 @@ mod tests {
 
         let (code, _) = dispatch::<Echo>(instance, "tool.missing", json!({}));
         assert_eq!(code, abi::EIX_ERR_UNKNOWN_METHOD);
+
+        // SAFETY: the instance is destroyed exactly once.
+        unsafe { ffi::destroy::<Echo>(instance) };
+    }
+
+    #[test]
+    fn ffi_round_trips_rpc_calls() {
+        let host = host();
+        let mut instance = std::ptr::null_mut();
+        // SAFETY: the host table is valid for the duration of the call.
+        let code = unsafe { ffi::create::<Echo>(&host, abi::EixStr::EMPTY, &mut instance) };
+        assert_eq!(code, abi::EIX_OK);
+
+        let (code, result) = dispatch::<Echo>(
+            instance,
+            "rpc.call",
+            json!({
+                "method": "issues.search",
+                "arguments": {"query": "bug"},
+                "caller": "acme",
+                "depth": 2,
+            }),
+        );
+        assert_eq!(code, abi::EIX_OK);
+        assert_eq!(result["method"], "issues.search");
+        assert_eq!(result["arguments"]["query"], "bug");
+        assert_eq!(result["caller"], "acme");
+        assert_eq!(result["depth"], 2);
 
         // SAFETY: the instance is destroyed exactly once.
         unsafe { ffi::destroy::<Echo>(instance) };

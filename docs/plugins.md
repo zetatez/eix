@@ -14,25 +14,26 @@
 | 能力       | 实现                                                                                                   |
 | ---        | ---                                                                                                    |
 | Manifest   | `schema = 2`、`api_version = 2`、`[components.server]` / `[components.ui]` / `[components.dylib]`、`abi`、`[[contributes.commands]]`、`[package]` |
-| 原生 dylib | `ExtensionBackend` + `DylibBackend`；`describe` / `tool.call` / `command.run` 已接入，与进程插件共用注册表 |
+| 原生 dylib | `ExtensionBackend` + `DylibBackend`；`describe` / `tool.call` / `command.run` / `hook.run` / `rpc.call` 已接入，与进程插件共用注册表 |
 | 协议       | JSON-RPC 2.0 over NDJSON；`initialize`、`tools/call`、`commands/run`、`hooks/run`、`rpc.call`、host 反向请求、通知 |
 | 多路复用   | writer task + reader task + 每请求 oneshot；超时发送 `$/cancel`                                        |
 | 注册表     | tools / commands / events / hooks / ui / rpc；启动时做命名空间与能力校验                               |
-| 生命周期   | `disabled` / `starting` / `ready` / `degraded` / `failed` / `stopped`                                  |
+| 生命周期   | `disabled` / `starting` / `ready` / `degraded` / `failed` / `stopped`；连续 3 次后端失败进入 `degraded`，成功一次恢复 |
 | Host API   | `host.log/info/ping`、`storage.*`、`fs.*`、`net.request`、`secrets.get`、`session.*`、`ui.*`、`notify`、`rpc.call`、`blob.*`、`job.*` |
 | Hooks      | `tool.before` / `tool.after` / `prompt.build` / `turn.end`，按 priority + 插件名排序                  |
 | Action 命令 | manifest 或运行时 `commands` 的 `action`；host 调用 `commands/run`，可返回 prompt 或文本输出          |
 | 声明式插件 | 仅含 `[[contributes.commands]]` 的包不启动进程                                                         |
 | 工具结果   | content blocks（text/image/resource/diff/json）+ `structured` + `is_error`                             |
-| Settings   | manifest `settings = "schema.json"` 必须是包内、`type: object`、≤256 KiB；TUI `/plugins <name>` 只读展示 |
+| Settings   | manifest `settings = "schema.json"` 必须是包内、`type: object`、≤256 KiB；`plugin.settings.set` 校验后写回配置并通知插件 |
+| UI 表面    | `plugin.ui.list` 返回已声明的 `panel` / `status` / `picker`；TUI `/plugins [name]` 展示                       |
 | 分发       | `eix plugin pack/verify/install/trust/untrust`；detached Ed25519 签名 + SHA-256 checksums              |
 | 示例       | `examples/plugins/echo/` 已迁移到 v2，并演示 action 命令                                               |
 
 尚未实现：
 
-- dylib 插件的 hooks / events / UI 文本表面虽复用同一路由，但内建 host API 只覆盖同步安全的 `log/info/ping/notify/storage.*/secrets.get`；fs / net / rpc / jobs / sessions / ui 仍返回 `EIX_ERR_DENIED`，详见 [`plugin-dylib.md`](plugin-dylib.md)。
-- 插件提交自定义视图树（`pane` / `picker` 等）；当前 UI 贡献是文本 `panel` / `status` 表面。
-- TUI 内直接编辑 settings；目前展示 schema 与当前值，修改仍走全局配置。
+- dylib 插件的 host API 覆盖同步安全的 `log/info/ping/notify/storage.*/secrets.get/fs.*/session.*/blob.*`；`net` / `ui` / `rpc` / `jobs` 仍返回 `EIX_ERR_DENIED`，详见 [`plugin-dylib.md`](plugin-dylib.md)。
+- 插件提交自定义视图树（`pane` / `picker` 等）；`picker` 表面可以被声明和列出，实际渲染仍复用文本面板。
+- TUI 内直接编辑 settings；`plugin.settings.set` 已可用，但 TUI 仍只读展示。
 - lockfile、registry、lazy start、ring buffer 审计表和 OS sandbox。
 
 ---
@@ -474,7 +475,8 @@ host     -> plugin A: result
 - 调用方必须获得 `rpc` 能力，且目标在 `plugins.<caller>.rpc_allow` 中。
 - 目标插件必须在 `initialize.rpc` 中导出该方法；方法名使用插件内命名空间。
 - 调用链深度上限 8；每次调用超时 60s。
-- 目标插件若要继续调用其他插件，应把收到的 `depth` 原样传回 `host.rpc.call`。
+- 目标插件若要继续调用其他插件，应把收到的 `depth` 原样传回 `host.rpc.call`（Rust SDK 用 `Ctx::rpc_call_with_depth`）。
+- 进程与 dylib 后端都实现了 `rpc.call`；dylib 侧由 `Plugin::rpc` 处理 `RpcCall { method, arguments, caller, depth }`。
 - 每次调用记录 caller / callee 与失败原因到 daemon 日志（不记录参数内容）。
 
 ---
@@ -535,7 +537,7 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 ### 9.1 已实现的文本表面
 
 - 插件不输出 ANSI、不直接操作终端。
-- `initialize.ui` 声明 `panel` / `status`；`picker` 预留给后续实现。
+- `initialize.ui` 可声明 `panel` / `status` / `picker`；`plugin.ui.list` 把它们暴露给前端。
 - `host.ui.open` / `update` 发送 `{plugin, id, surface, title, body}`，TUI 打开或更新文本面板。
 - `host.ui.close` 关闭匹配插件的前缀面板。
 - `host.notify` 发送 `{plugin, level, message}`，TUI 显示 toast。
@@ -547,8 +549,10 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 | --- | --- | --- |
 | `panel` | 已实现 | 全屏文本面板，Esc 关闭 |
 | `status` | 已实现 | 目前作为文本面板打开，不常驻 statusline |
-| `picker` | 预留 | 声明后不会渲染 |
+| `picker` | 声明/列出 | `plugin.ui.list` 可见，`/plugins <name>` 会标注；实际交互仍待 `ui.render` / `ui.action` |
 | `notification` | 已实现 | `host.notify` toast |
+
+`plugin.ui.list` 返回 `{surfaces: [{plugin, surface, id, title}]}`。TUI 在 `/plugins` 和 `/plugins <name>` 中展示声明，并据此解释 `plugin.ui.open` 事件；真正由插件驱动选择器还需要下一步的自定义视图树。
 
 ### 9.3 自定义视图树（后续）
 
@@ -581,8 +585,10 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 
 - schema 必须位于插件目录内、`type: object`、≤256 KiB。
 - `/plugins <name>` 调用 `plugin.settings`，展示 schema、当前值、类型、必填项与 enum 选项。
-- 当前不提供 TUI 内编辑；修改 `[plugins.<name>.settings]` 后执行 `/reload`。
-- 设置值随 `initialize` 传给插件；目前没有 `config.changed` 通知。
+- `plugin.settings.set {name, values}` 做浅合并（`null` 删除键），按 schema 校验后写回全局/显式配置文件；注释与无关键由 `toml_edit` 保留。
+- 写入成功后运行中的插件收到 `config.changed`（dylib 走 `Plugin::config_changed`），daemon 自身写文件不会触发全量 `/reload`。
+- 当前不提供 TUI 内编辑；修改仍可通过 `plugin.settings.set` 或直接编辑 `[plugins.<name>.settings]`。
+- 设置值随 `initialize` 传给插件；`config.changed` 让运行中的插件立即看到新值。
 
 ---
 
@@ -661,16 +667,14 @@ disabled -> installed -> starting -> ready
                       stopped
 ```
 
-- `degraded`：部分贡献可用，某个 hook/tool 连续失败。
+- `degraded`：连续 3 次后端调用失败（工具 / 命令 / hook），插件仍可用，成功一次自动回到 `ready`；`plugin.list` 暴露 `failures` 计数与最后一次错误。
 - `failed`：启动失败或崩溃，保留错误并允许 restart。
 - `stopped`：用户禁用或 daemon 退出。
 
 ### 11.2 启动与重启
 
-- `lazy = true`：首次使用其贡献时启动。
-- 事件订阅者和关键 hook 默认 eager。
-- 独立退避：1s、2s、4s… 上限 60s；连续失败进入 circuit breaker。
-- `/reload` 做配置 diff，只重启变化的插件。
+- 已实现：启动失败标记 `failed`、`plugin.restart`、崩溃检测（`exit_reason`）。
+- 规划中：`lazy = true` 惰性启动、事件订阅者 eager 除外、1s/2s/4s 退避与 circuit breaker、`/reload` 配置 diff 只重启变化的插件。
 
 ### 11.3 并发与背压
 
@@ -775,8 +779,9 @@ pub struct PluginConfig {
 ### 13.1 运维
 
 - 每插件 ring buffer（最近 500 行）、`plugin.logs {name, since}`：规划中。
-- `plugin.list` 已返回 state / tools / commands / hooks / ui / rpc / events / capabilities / error。
-- `plugin.settings {name}` 返回 schema 与当前值。
+- `plugin.list` 已返回 state / tools / commands / hooks / ui / rpc / events / capabilities / failures / error。
+- `plugin.settings {name}` 返回 schema 与当前值；`plugin.settings.set {name, values}` 校验并写回配置。
+- `plugin.ui.list` 返回已声明的 `{plugin, surface, id, title}` 表面，供 TUI 预知面板与 picker。
 - `plugin.doctor`：规划中。
 - TUI `/plugins [name]`：列表、贡献计数、错误；带 name 时展示 settings schema。
 - `/reload` 仍会重启全部插件；按 diff 重启尚未实现。
@@ -822,12 +827,13 @@ pub struct PluginConfig {
 - hook 点、顺序、超时、失败策略已落地；审计表尚未实现。
 - `commands` 支持 action。
 - 声明式 themes / keymaps / agents / skills / mcp_servers 仍未实现。
-- settings schema 已解析并在 TUI 只读展示；热更新尚未实现。
+- settings schema 已解析，`plugin.settings.set` 校验后写回配置并通过 `config.changed` 热更新；TUI 仍只读展示。
+- 连续失败 3 次进入 `degraded`，成功一次恢复。
 
 ### Phase 3：UI 贡献（文本表面已完成）
 
-- `panel` / `status` / `notification` 已落地；自定义 `UiNode` 与 `picker` 待实现。
-- `/plugins [name]` 管理器已落地。
+- `panel` / `status` / `notification` 已落地；`picker` 可声明并通过 `plugin.ui.list` 列出，自定义 `UiNode`、`ui.render` / `ui.action` 待实现。
+- `/plugins [name]` 管理器已落地，并展示插件声明的 UI 表面。
 - 验收：插件能打开/更新/关闭文本面板，JSON 不被当作 ANSI 执行。
 
 ### Phase 4：安全与分发（核心已完成）
@@ -875,13 +881,13 @@ pub struct PluginConfig {
 | ---                                  | ---                                                                      |
 | `crates/eix-core/src/plugin.rs`      | manifest v2、配置、JSON-RPC、content blocks、hooks/ui/rpc、action/settings 类型 |
 | `crates/eix-core/src/plugin_package.rs` | `pack` / `verify` / `install`、checksums、Ed25519、trust store             |
-| `crates/eixd/src/plugin/mod.rs`      | `PluginManager`、注册表、生命周期、hooks 管线、RPC 路由、声明式/action 命令、backend 选择 |
+| `crates/eixd/src/plugin/mod.rs`      | `PluginManager`、注册表、生命周期、hooks 管线、RPC 路由、声明式/action 命令、backend 选择、`degraded` 计数、settings 写入 |
 | `crates/eixd/src/plugin/backend.rs`  | `ExtensionBackend` trait 与 `BackendFuture`                                |
 | `crates/eixd/src/plugin/process.rs`  | `ProcessBackend`：JSON-RPC 子进程适配器                                    |
 | `crates/eixd/src/plugin/dylib.rs`    | `DylibBackend`、ABI 校验、方法翻译、超时、dylib host API                    |
 | `crates/eixd/src/plugin/client.rs`   | 进程 spawn、writer/reader、请求多路复用、超时取消、事件投递、features       |
-| `crates/eixd/src/plugin/host_api.rs` | `HostContext`、fs/net/secrets/session/ui/rpc/blob/job 与能力校验            |
-| `crates/eixd/src/server.rs`          | `plugin.command.run` / `plugin.settings`、turn/tool/prompt hook 接入       |
+| `crates/eixd/src/plugin/host_api.rs` | `HostContext`、共享 `WorkspaceFs`/blob、fs/net/secrets/session/ui/rpc/job 与能力校验 |
+| `crates/eixd/src/server.rs`          | `plugin.command.run` / `plugin.settings[.set]` / `plugin.ui.list`、watcher 自写抑制、turn/tool/prompt hook 接入 |
 | `crates/eixd/src/classifier.rs`      | `RiskCategory::Plugin` 保留；插件工具默认审批                              |
 | `crates/eix-tui/src/main.rs`         | `eix plugin pack/verify/install/trust/untrust` CLI                         |
 | `crates/eix-tui/src/tui/app/`        | `/plugins [name]`、action 命令分发、`plugin.ui.*` 文本面板与 toast          |
@@ -896,5 +902,5 @@ hooks / UI / RPC 的接入点见第 7、8、9 节；未实现的只有自定义�
 1. 审计与可观测性：`plugin_audit`、ring buffer、`plugin.logs`。
 2. 更多声明式贡献：skills / agents / themes / keymaps / MCP。
 3. Python / TypeScript SDK 与协议一致性测试。
-4. 自定义 UI 视图树、picker provider、settings 可持久化编辑。
+4. 自定义 UI 视图树、picker provider、TUI 内 settings 编辑（`plugin.settings.set` 已可用）。
 5. lockfile、registry、按 diff 重启与可选 OS sandbox。

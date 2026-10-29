@@ -55,8 +55,8 @@ pub use plugin::{
     ContentBlock, PluginCapability, PluginCommandInfo, PluginCommandList, PluginCommandRunParams,
     PluginCommandRunResult, PluginConfig, PluginInfo, PluginListResult, PluginManifest,
     PluginPackage, PluginSettingsResult, PluginState, PluginToolCallParams, PluginToolCallResult,
-    RpcError, RpcNotification, RpcRequest, RpcResponse, PLUGIN_API_VERSION, PLUGIN_COMMAND_PREFIX,
-    PLUGIN_TOOL_PREFIX,
+    PluginUiListResult, PluginUiSurface, RpcError, RpcNotification, RpcRequest, RpcResponse,
+    PLUGIN_API_VERSION, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
 };
 pub use plugin_package::{
     install as install_plugin, pack as pack_plugin, verify as verify_plugin, InstalledPlugin,

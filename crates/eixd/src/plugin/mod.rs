@@ -26,7 +26,8 @@ use eix_core::plugin::{
     PluginCapability, PluginCommand, PluginCommandInfo, PluginCommandList, PluginCommandRunResult,
     PluginConfig, PluginHook, PluginInfo, PluginInitializeResult, PluginListResult, PluginManifest,
     PluginRpc, PluginSettingsResult, PluginState, PluginTool, PluginToolCallParams,
-    PluginToolCallResult, PluginUi, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
+    PluginToolCallResult, PluginUi, PluginUiListResult, PluginUiSurface, PLUGIN_COMMAND_PREFIX,
+    PLUGIN_TOOL_PREFIX,
 };
 use eix_core::redact::redact;
 use eix_core::{Config, Notification, ToolDefinition};
@@ -46,6 +47,10 @@ const MAX_TOOL_DESCRIPTION: usize = 2048;
 const MAX_COMMAND_PROMPT: usize = 256 * 1024;
 const MAX_EVENT_PATTERN: usize = 128;
 const MAX_SETTINGS_SCHEMA: usize = 256 * 1024;
+/// Consecutive backend failures before `plugin.list` reports `degraded`.
+/// A plugin that returns a normal tool `is_error` result is not counted: only
+/// transport/protocol failures mean the backend itself is unhealthy.
+const DEGRADED_AFTER_FAILURES: u32 = 3;
 
 #[derive(Debug, Clone)]
 struct PluginEvent {
@@ -153,6 +158,8 @@ struct PluginStatus {
     rpc: usize,
     events: Vec<String>,
     capabilities: Vec<PluginCapability>,
+    /// Consecutive backend failures; reset by a successful call.
+    failures: u32,
     error: Option<String>,
     settings_schema: Option<Value>,
 }
@@ -173,6 +180,7 @@ impl PluginStatus {
             rpc: self.rpc,
             events: self.events.clone(),
             capabilities: self.capabilities.clone(),
+            failures: self.failures,
             error: self.error.clone(),
         }
     }
@@ -314,6 +322,7 @@ impl PluginManager {
                     rpc: 0,
                     events: Vec::new(),
                     capabilities: plugin.capabilities.clone(),
+                    failures: 0,
                     error: None,
                     settings_schema: None,
                 },
@@ -457,6 +466,7 @@ impl PluginManager {
                 rpc: 0,
                 events: Vec::new(),
                 capabilities: spec.capabilities.clone(),
+                failures: 0,
                 error: None,
                 settings_schema: spec.settings_schema.clone(),
             },
@@ -565,6 +575,7 @@ impl PluginManager {
                 rpc: rpc_count,
                 events,
                 capabilities: spec.capabilities.clone(),
+                failures: 0,
                 error: None,
                 settings_schema: spec.settings_schema.clone(),
             },
@@ -615,6 +626,7 @@ impl PluginManager {
             status.error = Some(message);
             status.tools = 0;
             status.commands = 0;
+            status.failures = 0;
         } else {
             self.statuses.lock().await.insert(
                 name.to_string(),
@@ -632,10 +644,35 @@ impl PluginManager {
                     rpc: 0,
                     events: Vec::new(),
                     capabilities: plugin.capabilities.clone(),
+                    failures: 0,
                     error: Some(message),
                     settings_schema: None,
                 },
             );
+        }
+    }
+
+    /// Track consecutive backend failures and move a plugin between `ready`
+    /// and `degraded`. Never overrides `failed`, `stopped` or `disabled`.
+    async fn record_result(&self, name: &str, ok: bool, error: Option<&str>) {
+        let mut statuses = self.statuses.lock().await;
+        let Some(status) = statuses.get_mut(name) else {
+            return;
+        };
+        if ok {
+            status.failures = 0;
+            if status.state == PluginState::Degraded {
+                status.state = PluginState::Ready;
+                status.error = None;
+            }
+            return;
+        }
+        status.failures = status.failures.saturating_add(1);
+        if matches!(status.state, PluginState::Ready | PluginState::Degraded)
+            && status.failures >= DEGRADED_AFTER_FAILURES
+        {
+            status.state = PluginState::Degraded;
+            status.error = Some(cap(error.unwrap_or("repeated backend failures"), 4096));
         }
     }
 
@@ -692,6 +729,7 @@ impl PluginManager {
             status.hooks = 0;
             status.ui = 0;
             status.rpc = 0;
+            status.failures = 0;
             status.events.clear();
         }
         true
@@ -760,21 +798,22 @@ impl PluginManager {
 
     /// Declared text surfaces. The TUI uses these to label plugin panels and
     /// to decide whether a `plugin.ui.open` event is expected.
-    pub async fn ui_surfaces(&self) -> Vec<Value> {
+    pub async fn ui_surfaces(&self) -> PluginUiListResult {
         self.refresh().await;
-        self.ui
-            .lock()
-            .await
-            .iter()
-            .map(|surface| {
-                serde_json::json!({
-                    "plugin": surface.plugin,
-                    "surface": surface.surface,
-                    "id": surface.id,
-                    "title": surface.title,
+        PluginUiListResult {
+            surfaces: self
+                .ui
+                .lock()
+                .await
+                .iter()
+                .map(|surface| PluginUiSurface {
+                    plugin: surface.plugin.clone(),
+                    surface: surface.surface.clone(),
+                    id: surface.id.clone(),
+                    title: surface.title.clone(),
                 })
-            })
-            .collect()
+                .collect(),
+        }
     }
 
     pub async fn run_command(
@@ -803,7 +842,7 @@ impl PluginManager {
             .get(&command.plugin)
             .cloned()
             .with_context(|| format!("plugin {} is not running", command.plugin))?;
-        let value = backend
+        let value = match backend
             .request(
                 "commands/run",
                 serde_json::json!({
@@ -815,9 +854,27 @@ impl PluginManager {
                 }),
             )
             .await
-            .with_context(|| format!("plugin {} command {name} failed", command.plugin))?;
-        let mut result: PluginCommandRunResult =
-            serde_json::from_value(value).context("invalid plugin command result")?;
+        {
+            Ok(value) => {
+                self.record_result(&command.plugin, true, None).await;
+                value
+            }
+            Err(err) => {
+                let message = redact(&format!("{err:#}"));
+                self.record_result(&command.plugin, false, Some(&message))
+                    .await;
+                return Err(err)
+                    .with_context(|| format!("plugin {} command {name} failed", command.plugin));
+            }
+        };
+        let mut result: PluginCommandRunResult = match serde_json::from_value(value) {
+            Ok(result) => result,
+            Err(err) => {
+                self.record_result(&command.plugin, false, Some("invalid command result"))
+                    .await;
+                return Err(err).context("invalid plugin command result");
+            }
+        };
         if let Some(prompt) = &result.prompt {
             if prompt.len() > MAX_COMMAND_PROMPT {
                 bail!("plugin command {name:?} returned an oversized prompt");
@@ -853,6 +910,66 @@ impl PluginManager {
         })
     }
 
+    /// Apply a shallow settings update, persist it and notify the running
+    /// plugin. `null` removes a key; validation uses the manifest schema.
+    pub async fn set_settings(
+        &self,
+        name: &str,
+        updates: &Value,
+        config: &Config,
+    ) -> Result<PluginSettingsResult> {
+        let status = self
+            .statuses
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .with_context(|| format!("unknown plugin {name:?}"))?;
+        let plugin = config
+            .plugins
+            .get(name)
+            .with_context(|| format!("unknown plugin {name:?}"))?;
+        let updates = updates
+            .as_object()
+            .context("plugin.settings.set needs an object `values`")?;
+        let mut merged = plugin.settings.clone();
+        for (key, value) in updates {
+            if value.is_null() {
+                merged.remove(key);
+            } else {
+                merged.insert(key.clone(), value.clone());
+            }
+        }
+        let values = serde_json::to_value(&merged)?;
+        if let Some(schema) = &status.settings_schema {
+            let values_for_validation = values.clone();
+            eix_core::plugin::validate_plugin_settings(schema, &values_for_validation)
+                .map_err(|err| anyhow::anyhow!("invalid settings for {name}: {err}"))?;
+        }
+        let path = config.write_plugin_settings(name, &merged)?;
+
+        if let Some(backend) = self.backends.lock().await.get(name).cloned() {
+            let notification = serde_json::json!({
+                "plugin": name,
+                "settings": values,
+                "path": path,
+            });
+            if let Err(err) = backend.notify("config.changed", notification).await {
+                // Persisting succeeded; a plugin that cannot take the update
+                // will pick it up on the next restart.
+                eprintln!(
+                    "eixd: plugin {name} config.changed failed: {}",
+                    redact(&format!("{err:#}"))
+                );
+            }
+        }
+        Ok(PluginSettingsResult {
+            plugin: name.to_string(),
+            schema: status.settings_schema,
+            values,
+        })
+    }
+
     /// Run `tool.before` hooks. Returns a denial reason when a hook vetoes the
     /// call. Hooks can never approve a tool that normal policy asks about.
     pub async fn run_tool_before(
@@ -882,6 +999,7 @@ impl PluginManager {
             });
             match call_hook(&backend, &hook, request).await {
                 Ok(value) => {
+                    self.record_result(&hook.plugin, true, None).await;
                     let deny = value.get("action").and_then(Value::as_str) == Some("deny")
                         || value.get("decision").and_then(Value::as_str) == Some("deny")
                         || value.get("deny").and_then(Value::as_bool) == Some(true)
@@ -896,11 +1014,13 @@ impl PluginManager {
                     }
                 }
                 Err(err) => {
+                    let message = redact(&format!("{err:#}"));
                     eprintln!(
-                        "eixd: plugin {} hook tool.before failed: {}",
-                        hook.plugin,
-                        redact(&format!("{err:#}"))
+                        "eixd: plugin {} hook tool.before failed: {message}",
+                        hook.plugin
                     );
+                    self.record_result(&hook.plugin, false, Some(&message))
+                        .await;
                     if hook.on_error == "deny" {
                         return Some(format!("plugin {} hook failed", hook.plugin));
                     }
@@ -945,17 +1065,20 @@ impl PluginManager {
             });
             match call_hook(&backend, &hook, request).await {
                 Ok(value) => {
+                    self.record_result(&hook.plugin, true, None).await;
                     if let Some(output) = value.get("output").and_then(Value::as_str) {
                         current = cap(output, MAX_PLUGIN_OUTPUT);
                         replaced = true;
                     }
                 }
                 Err(err) => {
+                    let message = redact(&format!("{err:#}"));
                     eprintln!(
-                        "eixd: plugin {} hook tool.after failed: {}",
-                        hook.plugin,
-                        redact(&format!("{err:#}"))
+                        "eixd: plugin {} hook tool.after failed: {message}",
+                        hook.plugin
                     );
+                    self.record_result(&hook.plugin, false, Some(&message))
+                        .await;
                 }
             }
         }
@@ -980,6 +1103,7 @@ impl PluginManager {
             });
             match call_hook(&backend, &hook, request).await {
                 Ok(value) => {
+                    self.record_result(&hook.plugin, true, None).await;
                     if let Some(prompt) = value.get("prompt").and_then(Value::as_str) {
                         if prompt.trim().is_empty() {
                             continue;
@@ -995,11 +1119,13 @@ impl PluginManager {
                     }
                 }
                 Err(err) => {
+                    let message = redact(&format!("{err:#}"));
                     eprintln!(
-                        "eixd: plugin {} hook prompt.build failed: {}",
-                        hook.plugin,
-                        redact(&format!("{err:#}"))
+                        "eixd: plugin {} hook prompt.build failed: {message}",
+                        hook.plugin
                     );
+                    self.record_result(&hook.plugin, false, Some(&message))
+                        .await;
                 }
             }
         }
@@ -1033,12 +1159,18 @@ impl PluginManager {
                     "ok": ok,
                     "error": error,
                 });
-                if let Err(err) = call_hook(&backend, &hook, request).await {
-                    eprintln!(
-                        "eixd: plugin {} hook turn.end failed: {}",
-                        hook.plugin,
-                        redact(&format!("{err:#}"))
-                    );
+                match call_hook(&backend, &hook, request).await {
+                    Ok(_) => manager.record_result(&hook.plugin, true, None).await,
+                    Err(err) => {
+                        let message = redact(&format!("{err:#}"));
+                        eprintln!(
+                            "eixd: plugin {} hook turn.end failed: {message}",
+                            hook.plugin
+                        );
+                        manager
+                            .record_result(&hook.plugin, false, Some(&message))
+                            .await;
+                    }
                 }
             }
         });
@@ -1112,22 +1244,32 @@ impl PluginManager {
         let duration_ms = started.elapsed().as_millis() as u64;
         match result {
             Ok(value) => match serde_json::from_value::<PluginToolCallResult>(value) {
-                Ok(result) => ToolOutcome {
-                    ok: result.ok && !result.is_error,
-                    output: cap(&result.to_text(), max_output_bytes.min(MAX_PLUGIN_OUTPUT)),
-                    duration_ms,
-                },
-                Err(err) => ToolOutcome {
-                    ok: false,
-                    output: format!(
+                Ok(result) => {
+                    self.record_result(&tool.plugin, true, None).await;
+                    ToolOutcome {
+                        ok: result.ok && !result.is_error,
+                        output: cap(&result.to_text(), max_output_bytes.min(MAX_PLUGIN_OUTPUT)),
+                        duration_ms,
+                    }
+                }
+                Err(err) => {
+                    let message = format!(
                         "plugin {} returned an invalid tool result: {err}",
                         tool.plugin
-                    ),
-                    duration_ms,
-                },
+                    );
+                    self.record_result(&tool.plugin, false, Some(&message))
+                        .await;
+                    ToolOutcome {
+                        ok: false,
+                        output: message,
+                        duration_ms,
+                    }
+                }
             },
             Err(err) => {
                 let message = redact(&format!("plugin {} failed: {err:#}", tool.plugin));
+                self.record_result(&tool.plugin, false, Some(&message))
+                    .await;
                 // A per-call timeout cancels the request but leaves the
                 // plugin running; only a closed backend removes it.
                 if let Some(reason) = backend.exit_reason().await {
@@ -1183,6 +1325,7 @@ impl PluginManager {
                     rpc: 0,
                     events: Vec::new(),
                     capabilities: plugin.capabilities.clone(),
+                    failures: 0,
                     error: None,
                     settings_schema: None,
                 },
@@ -1914,5 +2057,171 @@ mod tests {
             ..command.clone()
         };
         assert!(validate_commands(&server, &[both]).is_err());
+    }
+
+    #[test]
+    fn declared_ui_surfaces_are_listed_with_their_kind() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let manager = PluginManager::new(
+                Arc::new(crate::store::Store::in_memory().unwrap()),
+                PathBuf::from("/tmp"),
+                tokio::sync::broadcast::channel(8).0,
+            );
+            manager.ui.lock().await.push(UiRef {
+                plugin: "acme".into(),
+                surface: "picker".into(),
+                id: "issues".into(),
+                title: "Issues".into(),
+            });
+            let list = manager.ui_surfaces().await;
+            assert_eq!(list.surfaces.len(), 1);
+            assert_eq!(list.surfaces[0].plugin, "acme");
+            assert_eq!(list.surfaces[0].surface, "picker");
+            assert_eq!(list.surfaces[0].id, "issues");
+            assert_eq!(list.surfaces[0].title, "Issues");
+        });
+    }
+
+    #[test]
+    fn repeated_failures_mark_a_plugin_degraded_and_recover() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let manager = PluginManager::new(
+                Arc::new(crate::store::Store::in_memory().unwrap()),
+                PathBuf::from("/tmp"),
+                tokio::sync::broadcast::channel(8).0,
+            );
+            manager.statuses.lock().await.insert(
+                "acme".to_string(),
+                PluginStatus {
+                    name: "acme".into(),
+                    version: String::new(),
+                    description: String::new(),
+                    enabled: true,
+                    command: String::new(),
+                    state: PluginState::Ready,
+                    tools: 0,
+                    commands: 0,
+                    hooks: 0,
+                    ui: 0,
+                    rpc: 0,
+                    events: Vec::new(),
+                    capabilities: Vec::new(),
+                    failures: 0,
+                    error: None,
+                    settings_schema: None,
+                },
+            );
+
+            manager.record_result("acme", false, Some("timeout")).await;
+            manager.record_result("acme", false, Some("timeout")).await;
+            let status = manager.statuses.lock().await["acme"].clone();
+            assert_eq!(status.state, PluginState::Ready);
+            assert_eq!(status.failures, 2);
+
+            manager.record_result("acme", false, Some("timeout")).await;
+            let status = manager.statuses.lock().await["acme"].clone();
+            assert_eq!(status.state, PluginState::Degraded);
+            assert_eq!(status.failures, 3);
+            assert_eq!(status.error.as_deref(), Some("timeout"));
+            assert_eq!(manager.list().await.plugins[0].failures, 3);
+
+            manager.record_result("acme", true, None).await;
+            let status = manager.statuses.lock().await["acme"].clone();
+            assert_eq!(status.state, PluginState::Ready);
+            assert_eq!(status.failures, 0);
+            assert!(status.error.is_none());
+        });
+    }
+
+    #[test]
+    fn settings_updates_validate_and_persist() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let dir = std::env::temp_dir().join(format!(
+                "eix-plugin-settings-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+            std::fs::write(
+                &path,
+                "[plugins.acme]\ncommand = \"python3\"\n\n[plugins.acme.settings]\nrepo = \"old\"\n",
+            )
+            .unwrap();
+            let config = Config::load_for(Some(&path), &dir).unwrap();
+
+            let manager = PluginManager::new(
+                Arc::new(crate::store::Store::in_memory().unwrap()),
+                dir.clone(),
+                tokio::sync::broadcast::channel(8).0,
+            );
+            manager.statuses.lock().await.insert(
+                "acme".to_string(),
+                PluginStatus {
+                    name: "acme".into(),
+                    version: String::new(),
+                    description: String::new(),
+                    enabled: true,
+                    command: String::new(),
+                    state: PluginState::Ready,
+                    tools: 0,
+                    commands: 0,
+                    hooks: 0,
+                    ui: 0,
+                    rpc: 0,
+                    events: Vec::new(),
+                    capabilities: Vec::new(),
+                    failures: 0,
+                    error: None,
+                    settings_schema: Some(serde_json::json!({
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["repo"],
+                        "properties": {
+                            "repo": {"type": "string"},
+                            "auto_sync": {"type": "boolean"}
+                        }
+                    })),
+                },
+            );
+
+            let result = manager
+                .set_settings(
+                    "acme",
+                    &serde_json::json!({"repo": "acme", "auto_sync": true}),
+                    &config,
+                )
+                .await
+                .expect("valid settings");
+            assert_eq!(result.values["repo"], "acme");
+            assert_eq!(result.values["auto_sync"], true);
+            assert_eq!(result.schema.as_ref().unwrap()["type"], "object");
+
+            // Rejected before touching the file.
+            assert!(manager
+                .set_settings("acme", &serde_json::json!({"auto_sync": "yes"}), &config)
+                .await
+                .is_err());
+            let reloaded = Config::load_for(Some(&path), &dir).unwrap();
+            assert_eq!(reloaded.plugins["acme"].settings["auto_sync"], true);
+
+            // `null` removes a key and the table is rewritten in place. The
+            // daemon mirrors the write in memory; reload to do the same here.
+            let config = reloaded;
+            manager
+                .set_settings("acme", &serde_json::json!({"auto_sync": null}), &config)
+                .await
+                .expect("remove setting");
+            let reloaded = Config::load_for(Some(&path), &dir).unwrap();
+            assert_eq!(reloaded.plugins["acme"].settings["repo"], "acme");
+            assert!(!reloaded.plugins["acme"].settings.contains_key("auto_sync"));
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 }

@@ -425,6 +425,7 @@ pub enum Event {
     Plugins {
         list: eix_core::PluginListResult,
         settings: Option<eix_core::PluginSettingsResult>,
+        surfaces: Vec<eix_core::PluginUiSurface>,
     },
     PluginCommandResult {
         session_id: String,
@@ -784,6 +785,12 @@ async fn dispatch(
         Command::ListPlugins { name } => {
             let value = requester.request("plugin.list", Value::Null).await?;
             let list: eix_core::PluginListResult = decode(value)?;
+            let surfaces = match requester.request("plugin.ui.list", Value::Null).await {
+                Ok(value) => decode::<eix_core::PluginUiListResult>(value)?.surfaces,
+                // Older daemons do not expose the surface list; the plugin
+                // panels themselves still work through `plugin.ui.open`.
+                Err(_) => Vec::new(),
+            };
             let settings = match name {
                 Some(name) => {
                     let value = requester
@@ -793,7 +800,14 @@ async fn dispatch(
                 }
                 None => None,
             };
-            send(events, Event::Plugins { list, settings })
+            send(
+                events,
+                Event::Plugins {
+                    list,
+                    settings,
+                    surfaces,
+                },
+            )
         }
         Command::RunPluginCommand {
             session_id,

@@ -262,171 +262,15 @@ impl HostContext {
     // ---- filesystem -----------------------------------------------------
 
     fn fs_read(&self, params: &Value) -> Result<Value> {
-        let path = self.resolve_existing(params, "path")?;
-        let meta =
-            std::fs::metadata(&path).with_context(|| format!("cannot stat {}", path.display()))?;
-        if !meta.is_file() {
-            bail!("{} is not a regular file", path.display());
-        }
-        if meta.len() as usize > MAX_FS_FILE {
-            bail!("file exceeds {MAX_FS_FILE} bytes");
-        }
-        let bytes =
-            std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
-        Ok(match String::from_utf8(bytes) {
-            Ok(text) => json!({
-                "path": self.relative(&path),
-                "content": text,
-                "encoding": "utf8",
-                "bytes": text.len(),
-            }),
-            Err(err) => {
-                let bytes = err.into_bytes();
-                json!({
-                    "path": self.relative(&path),
-                    "content": base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    "encoding": "base64",
-                    "bytes": bytes.len(),
-                })
-            }
-        })
+        WorkspaceFs::new(&self.workspace).read(params)
     }
 
     fn fs_write(&self, params: &Value) -> Result<Value> {
-        let raw = params
-            .get("path")
-            .and_then(Value::as_str)
-            .context("host.fs.write needs a string `path`")?;
-        let path = self.resolve_for_write(raw)?;
-        let content = params
-            .get("content")
-            .and_then(Value::as_str)
-            .context("host.fs.write needs a string `content`")?;
-        let bytes = match params.get("encoding").and_then(Value::as_str) {
-            None | Some("utf8") => content.as_bytes().to_vec(),
-            Some("base64") => base64::engine::general_purpose::STANDARD
-                .decode(content)
-                .context("invalid base64 content")?,
-            Some(other) => bail!("unknown encoding {other:?}; use utf8 or base64"),
-        };
-        if bytes.len() > MAX_FS_FILE {
-            bail!("content exceeds {MAX_FS_FILE} bytes");
-        }
-        std::fs::write(&path, &bytes)
-            .with_context(|| format!("cannot write {}", path.display()))?;
-        Ok(json!({
-            "path": self.relative(&path),
-            "bytes": bytes.len(),
-        }))
+        WorkspaceFs::new(&self.workspace).write(params)
     }
 
     fn fs_list(&self, params: &Value) -> Result<Value> {
-        let path = match params.get("path").and_then(Value::as_str) {
-            Some(raw) if !raw.trim().is_empty() => self.resolve_existing(params, "path")?,
-            _ => self.canonical_workspace()?,
-        };
-        if !path.is_dir() {
-            bail!("{} is not a directory", path.display());
-        }
-        let mut entries = Vec::new();
-        for entry in std::fs::read_dir(&path)
-            .with_context(|| format!("cannot list {}", path.display()))?
-            .take(MAX_FS_LIST)
-        {
-            let Ok(entry) = entry else { continue };
-            let Ok(meta) = entry.metadata() else {
-                // `metadata` follows symlinks; broken links are still listed.
-                entries.push(json!({
-                    "name": entry.file_name().to_string_lossy(),
-                    "kind": "unknown",
-                }));
-                continue;
-            };
-            let kind = if meta.is_dir() {
-                "dir"
-            } else if meta.is_file() {
-                "file"
-            } else {
-                "other"
-            };
-            entries.push(json!({
-                "name": entry.file_name().to_string_lossy(),
-                "kind": kind,
-                "size": meta.len(),
-            }));
-        }
-        entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
-        Ok(json!({
-            "path": self.relative(&path),
-            "entries": entries,
-        }))
-    }
-
-    fn canonical_workspace(&self) -> Result<PathBuf> {
-        self.workspace
-            .canonicalize()
-            .with_context(|| format!("cannot resolve workspace {}", self.workspace.display()))
-    }
-
-    fn resolve_existing(&self, params: &Value, key: &str) -> Result<PathBuf> {
-        let raw = params
-            .get(key)
-            .and_then(Value::as_str)
-            .with_context(|| format!("host.fs method needs a string `{key}`"))?;
-        let path = self.resolve_for_write(raw)?;
-        if !path.exists() {
-            bail!("{} does not exist", path.display());
-        }
-        let path = path
-            .canonicalize()
-            .with_context(|| format!("cannot resolve {}", path.display()))?;
-        self.ensure_inside(&path)?;
-        Ok(path)
-    }
-
-    fn resolve_for_write(&self, raw: &str) -> Result<PathBuf> {
-        if raw.trim().is_empty() {
-            bail!("path must not be empty");
-        }
-        let raw_path = Path::new(raw);
-        if raw_path
-            .components()
-            .any(|part| matches!(part, Component::ParentDir))
-        {
-            bail!("path must not contain `..`");
-        }
-        let path = if raw_path.is_absolute() {
-            raw_path.to_path_buf()
-        } else {
-            self.workspace.join(raw_path)
-        };
-        let parent = path.parent().context("path has no parent")?;
-        let parent = parent
-            .canonicalize()
-            .with_context(|| format!("cannot resolve {}", parent.display()))?;
-        self.ensure_inside(&parent)?;
-        let path = parent.join(path.file_name().context("path has no file name")?);
-        if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            if meta.file_type().is_symlink() {
-                bail!("refusing to follow symlink {}", path.display());
-            }
-        }
-        Ok(path)
-    }
-
-    fn ensure_inside(&self, path: &Path) -> Result<()> {
-        let root = self.canonical_workspace()?;
-        if !path.starts_with(&root) {
-            bail!("path {} is outside the workspace", path.display());
-        }
-        Ok(())
-    }
-
-    fn relative(&self, path: &Path) -> String {
-        path.strip_prefix(&self.workspace)
-            .unwrap_or(path)
-            .display()
-            .to_string()
+        WorkspaceFs::new(&self.workspace).list(params)
     }
 
     // ---- network --------------------------------------------------------
@@ -756,65 +600,11 @@ impl HostContext {
     // ---- blobs ----------------------------------------------------------
 
     fn blob_put(&self, params: &Value) -> Result<Value> {
-        let content = params
-            .get("data")
-            .or_else(|| params.get("content"))
-            .and_then(Value::as_str)
-            .context("host.blob.put needs a string `data`")?;
-        let bytes = match params.get("encoding").and_then(Value::as_str) {
-            None | Some("utf8") => content.as_bytes().to_vec(),
-            Some("base64") => base64::engine::general_purpose::STANDARD
-                .decode(content)
-                .context("invalid base64 data")?,
-            Some(other) => bail!("unknown encoding {other:?}; use utf8 or base64"),
-        };
-        if bytes.len() > MAX_BLOB {
-            bail!("blob exceeds {MAX_BLOB} bytes");
-        }
-        let id = hex_digest(&bytes);
-        let path = self.blob_path(&id)?;
-        if !path.exists() {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .with_context(|| format!("cannot create {}", parent.display()))?;
-            }
-            let temp = path.with_extension("tmp");
-            std::fs::write(&temp, &bytes)
-                .with_context(|| format!("cannot write {}", temp.display()))?;
-            std::fs::rename(&temp, &path)
-                .with_context(|| format!("cannot commit {}", path.display()))?;
-        }
-        Ok(json!({"id": id, "bytes": bytes.len()}))
+        blob_put(&self.data_dir, params)
     }
 
     fn blob_get(&self, params: &Value) -> Result<Value> {
-        let id = params
-            .get("id")
-            .and_then(Value::as_str)
-            .context("host.blob.get needs a string `id`")?;
-        let path = self.blob_path(id)?;
-        let meta = std::fs::metadata(&path).with_context(|| format!("unknown blob {id:?}"))?;
-        if meta.len() as usize > MAX_BLOB {
-            bail!("blob exceeds {MAX_BLOB} bytes");
-        }
-        let bytes = std::fs::read(&path).with_context(|| format!("cannot read blob {id:?}"))?;
-        Ok(json!({
-            "id": id,
-            "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
-            "encoding": "base64",
-            "bytes": bytes.len(),
-        }))
-    }
-
-    fn blob_path(&self, id: &str) -> Result<PathBuf> {
-        if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            bail!("blob id must be a 64 character SHA-256 hex digest");
-        }
-        Ok(self
-            .data_dir
-            .join("blobs")
-            .join(&id[..2])
-            .join(id.to_ascii_lowercase()))
+        blob_get(&self.data_dir, params)
     }
 
     // ---- jobs -----------------------------------------------------------
@@ -897,6 +687,252 @@ impl HostContext {
         }
         Ok(json!({"removed": had}))
     }
+}
+
+/// Workspace-scoped file access shared by the process and dylib hosts.
+///
+/// Every path is resolved inside the canonical workspace, `..` is rejected and
+/// symlinks are never followed. Both backends must apply the same rules.
+pub(super) struct WorkspaceFs {
+    root: PathBuf,
+}
+
+impl WorkspaceFs {
+    pub(super) fn new(root: &Path) -> Self {
+        Self {
+            root: root.to_path_buf(),
+        }
+    }
+
+    pub(super) fn read(&self, params: &Value) -> Result<Value> {
+        let path = self.resolve_existing(params, "path")?;
+        let meta =
+            std::fs::metadata(&path).with_context(|| format!("cannot stat {}", path.display()))?;
+        if !meta.is_file() {
+            bail!("{} is not a regular file", path.display());
+        }
+        if meta.len() as usize > MAX_FS_FILE {
+            bail!("file exceeds {MAX_FS_FILE} bytes");
+        }
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        Ok(match String::from_utf8(bytes) {
+            Ok(text) => json!({
+                "path": self.relative(&path),
+                "content": text,
+                "encoding": "utf8",
+                "bytes": text.len(),
+            }),
+            Err(err) => {
+                let bytes = err.into_bytes();
+                json!({
+                    "path": self.relative(&path),
+                    "content": base64::engine::general_purpose::STANDARD.encode(&bytes),
+                    "encoding": "base64",
+                    "bytes": bytes.len(),
+                })
+            }
+        })
+    }
+
+    pub(super) fn write(&self, params: &Value) -> Result<Value> {
+        let raw = params
+            .get("path")
+            .and_then(Value::as_str)
+            .context("host.fs.write needs a string `path`")?;
+        let path = self.resolve_for_write(raw)?;
+        let content = params
+            .get("content")
+            .and_then(Value::as_str)
+            .context("host.fs.write needs a string `content`")?;
+        let bytes = match params.get("encoding").and_then(Value::as_str) {
+            None | Some("utf8") => content.as_bytes().to_vec(),
+            Some("base64") => base64::engine::general_purpose::STANDARD
+                .decode(content)
+                .context("invalid base64 content")?,
+            Some(other) => bail!("unknown encoding {other:?}; use utf8 or base64"),
+        };
+        if bytes.len() > MAX_FS_FILE {
+            bail!("content exceeds {MAX_FS_FILE} bytes");
+        }
+        std::fs::write(&path, &bytes)
+            .with_context(|| format!("cannot write {}", path.display()))?;
+        Ok(json!({
+            "path": self.relative(&path),
+            "bytes": bytes.len(),
+        }))
+    }
+
+    pub(super) fn list(&self, params: &Value) -> Result<Value> {
+        let path = match params.get("path").and_then(Value::as_str) {
+            Some(raw) if !raw.trim().is_empty() => self.resolve_existing(params, "path")?,
+            _ => self.canonical_workspace()?,
+        };
+        if !path.is_dir() {
+            bail!("{} is not a directory", path.display());
+        }
+        let mut entries = Vec::new();
+        for entry in std::fs::read_dir(&path)
+            .with_context(|| format!("cannot list {}", path.display()))?
+            .take(MAX_FS_LIST)
+        {
+            let Ok(entry) = entry else { continue };
+            let Ok(meta) = entry.metadata() else {
+                // `metadata` follows symlinks; broken links are still listed.
+                entries.push(json!({
+                    "name": entry.file_name().to_string_lossy(),
+                    "kind": "unknown",
+                }));
+                continue;
+            };
+            let kind = if meta.is_dir() {
+                "dir"
+            } else if meta.is_file() {
+                "file"
+            } else {
+                "other"
+            };
+            entries.push(json!({
+                "name": entry.file_name().to_string_lossy(),
+                "kind": kind,
+                "size": meta.len(),
+            }));
+        }
+        entries.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+        Ok(json!({
+            "path": self.relative(&path),
+            "entries": entries,
+        }))
+    }
+
+    fn canonical_workspace(&self) -> Result<PathBuf> {
+        self.root
+            .canonicalize()
+            .with_context(|| format!("cannot resolve workspace {}", self.root.display()))
+    }
+
+    fn resolve_existing(&self, params: &Value, key: &str) -> Result<PathBuf> {
+        let raw = params
+            .get(key)
+            .and_then(Value::as_str)
+            .with_context(|| format!("host.fs method needs a string `{key}`"))?;
+        let path = self.resolve_for_write(raw)?;
+        if !path.exists() {
+            bail!("{} does not exist", path.display());
+        }
+        let path = path
+            .canonicalize()
+            .with_context(|| format!("cannot resolve {}", path.display()))?;
+        self.ensure_inside(&path)?;
+        Ok(path)
+    }
+
+    fn resolve_for_write(&self, raw: &str) -> Result<PathBuf> {
+        if raw.trim().is_empty() {
+            bail!("path must not be empty");
+        }
+        let raw_path = Path::new(raw);
+        if raw_path
+            .components()
+            .any(|part| matches!(part, Component::ParentDir))
+        {
+            bail!("path must not contain `..`");
+        }
+        let path = if raw_path.is_absolute() {
+            raw_path.to_path_buf()
+        } else {
+            self.root.join(raw_path)
+        };
+        let parent = path.parent().context("path has no parent")?;
+        let parent = parent
+            .canonicalize()
+            .with_context(|| format!("cannot resolve {}", parent.display()))?;
+        self.ensure_inside(&parent)?;
+        let path = parent.join(path.file_name().context("path has no file name")?);
+        if let Ok(meta) = std::fs::symlink_metadata(&path) {
+            if meta.file_type().is_symlink() {
+                bail!("refusing to follow symlink {}", path.display());
+            }
+        }
+        Ok(path)
+    }
+
+    fn ensure_inside(&self, path: &Path) -> Result<()> {
+        let root = self.canonical_workspace()?;
+        if !path.starts_with(&root) {
+            bail!("path {} is outside the workspace", path.display());
+        }
+        Ok(())
+    }
+
+    fn relative(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+    }
+}
+
+/// Content-addressed blob storage shared by both backends.
+pub(super) fn blob_put(data_dir: &Path, params: &Value) -> Result<Value> {
+    let content = params
+        .get("data")
+        .or_else(|| params.get("content"))
+        .and_then(Value::as_str)
+        .context("host.blob.put needs a string `data`")?;
+    let bytes = match params.get("encoding").and_then(Value::as_str) {
+        None | Some("utf8") => content.as_bytes().to_vec(),
+        Some("base64") => base64::engine::general_purpose::STANDARD
+            .decode(content)
+            .context("invalid base64 data")?,
+        Some(other) => bail!("unknown encoding {other:?}; use utf8 or base64"),
+    };
+    if bytes.len() > MAX_BLOB {
+        bail!("blob exceeds {MAX_BLOB} bytes");
+    }
+    let id = hex_digest(&bytes);
+    let path = blob_path(data_dir, &id)?;
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("cannot create {}", parent.display()))?;
+        }
+        let temp = path.with_extension("tmp");
+        std::fs::write(&temp, &bytes)
+            .with_context(|| format!("cannot write {}", temp.display()))?;
+        std::fs::rename(&temp, &path)
+            .with_context(|| format!("cannot commit {}", path.display()))?;
+    }
+    Ok(json!({"id": id, "bytes": bytes.len()}))
+}
+
+pub(super) fn blob_get(data_dir: &Path, params: &Value) -> Result<Value> {
+    let id = params
+        .get("id")
+        .and_then(Value::as_str)
+        .context("host.blob.get needs a string `id`")?;
+    let path = blob_path(data_dir, id)?;
+    let meta = std::fs::metadata(&path).with_context(|| format!("unknown blob {id:?}"))?;
+    if meta.len() as usize > MAX_BLOB {
+        bail!("blob exceeds {MAX_BLOB} bytes");
+    }
+    let bytes = std::fs::read(&path).with_context(|| format!("cannot read blob {id:?}"))?;
+    Ok(json!({
+        "id": id,
+        "data": base64::engine::general_purpose::STANDARD.encode(&bytes),
+        "encoding": "base64",
+        "bytes": bytes.len(),
+    }))
+}
+
+fn blob_path(data_dir: &Path, id: &str) -> Result<PathBuf> {
+    if id.len() != 64 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("blob id must be a 64 character SHA-256 hex digest");
+    }
+    Ok(data_dir
+        .join("blobs")
+        .join(&id[..2])
+        .join(id.to_ascii_lowercase()))
 }
 
 fn known_host_method(method: &str) -> bool {

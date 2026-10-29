@@ -732,6 +732,23 @@ pub struct PluginUi {
     pub title: String,
 }
 
+/// One UI surface a running plugin declared at `initialize`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginUiSurface {
+    pub plugin: String,
+    /// One of [`PLUGIN_UI_SURFACES`].
+    pub surface: String,
+    pub id: String,
+    pub title: String,
+}
+
+/// `plugin.ui.list` result. Declared surfaces only: the TUI still receives
+/// the actual body through `plugin.ui.open`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginUiListResult {
+    pub surfaces: Vec<PluginUiSurface>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginRpc {
@@ -866,6 +883,11 @@ pub struct PluginInfo {
     pub events: Vec<String>,
     #[serde(default)]
     pub capabilities: Vec<PluginCapability>,
+    /// Consecutive backend failures since the last successful call. Repeated
+    /// failures move the plugin to `degraded`; the counter is exposed so the
+    /// UI can explain why.
+    #[serde(default)]
+    pub failures: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -1019,6 +1041,110 @@ pub fn valid_hook_point(point: &str) -> bool {
 
 pub fn valid_ui_surface(surface: &str) -> bool {
     PLUGIN_UI_SURFACES.contains(&surface)
+}
+
+/// Validate a plugin settings object against the subset of JSON Schema the
+/// settings form understands.
+///
+/// Supported keywords: `type` (`null`/`boolean`/`integer`/`number`/`string`/
+/// `array`/`object`, or a list of those), `required`, `properties`,
+/// `additionalProperties = false`, `enum`, `minimum`/`maximum` and
+/// `minLength`/`maxLength`. Unknown keywords are ignored: a richer schema still
+/// loads, the host simply does not enforce it.
+pub fn validate_plugin_settings(schema: &Value, values: &Value) -> Result<(), String> {
+    let Some(object) = values.as_object() else {
+        return Err("settings must be an object".into());
+    };
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for key in required.iter().filter_map(Value::as_str) {
+            if object.get(key).is_none_or(Value::is_null) {
+                return Err(format!("missing required setting {key:?}"));
+            }
+        }
+    }
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let deny_unknown = schema.get("additionalProperties") == Some(&Value::Bool(false));
+    for (key, value) in object {
+        if value.is_null() {
+            continue;
+        }
+        match properties.and_then(|properties| properties.get(key)) {
+            Some(rule) => validate_setting_value(key, value, rule)?,
+            None if deny_unknown => return Err(format!("unknown setting {key:?}")),
+            None => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_setting_value(key: &str, value: &Value, rule: &Value) -> Result<(), String> {
+    if let Some(kind) = rule.get("type") {
+        let allowed: Vec<&str> = match kind {
+            Value::String(kind) => vec![kind.as_str()],
+            Value::Array(kinds) => kinds.iter().filter_map(Value::as_str).collect(),
+            _ => Vec::new(),
+        };
+        if !allowed.is_empty() && !allowed.iter().any(|kind| value_matches_type(value, kind)) {
+            return Err(format!("setting {key:?} must be {}", allowed.join(" or ")));
+        }
+    }
+    if let Some(options) = rule.get("enum").and_then(Value::as_array) {
+        if !options.iter().any(|option| option == value) {
+            let options = options
+                .iter()
+                .map(|option| option.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!("setting {key:?} must be one of {options}"));
+        }
+    }
+    match value {
+        Value::Number(number) => {
+            let number = number.as_f64().unwrap_or(f64::NAN);
+            if let Some(minimum) = rule.get("minimum").and_then(Value::as_f64) {
+                if number < minimum {
+                    return Err(format!("setting {key:?} must be >= {minimum}"));
+                }
+            }
+            if let Some(maximum) = rule.get("maximum").and_then(Value::as_f64) {
+                if number > maximum {
+                    return Err(format!("setting {key:?} must be <= {maximum}"));
+                }
+            }
+        }
+        Value::String(text) => {
+            let length = text.chars().count() as u64;
+            if let Some(minimum) = rule.get("minLength").and_then(Value::as_u64) {
+                if length < minimum {
+                    return Err(format!(
+                        "setting {key:?} must be at least {minimum} character(s)"
+                    ));
+                }
+            }
+            if let Some(maximum) = rule.get("maxLength").and_then(Value::as_u64) {
+                if length > maximum {
+                    return Err(format!(
+                        "setting {key:?} must be at most {maximum} character(s)"
+                    ));
+                }
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn value_matches_type(value: &Value, kind: &str) -> bool {
+    match kind {
+        "null" => value.is_null(),
+        "boolean" => value.is_boolean(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "string" => value.is_string(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => true,
+    }
 }
 
 fn validate_relative_path(path: &Path, label: &str) -> Result<(), String> {
@@ -1320,5 +1446,47 @@ mod tests {
         manifest.package.as_mut().unwrap().signature = Some(PathBuf::from("eix-plugin.sig"));
         manifest.settings = Some(PathBuf::from("/etc/settings.json"));
         assert!(manifest.validate().is_err());
+    }
+
+    #[test]
+    fn plugin_settings_are_validated_against_the_schema() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["repo"],
+            "properties": {
+                "repo": {"type": "string", "minLength": 2},
+                "auto_sync": {"type": "boolean"},
+                "level": {"type": "integer", "minimum": 1, "maximum": 5},
+                "mode": {"type": "string", "enum": ["fast", "safe"]}
+            }
+        });
+        assert!(validate_plugin_settings(
+            &schema,
+            &serde_json::json!({"repo": "acme", "auto_sync": true, "level": 3})
+        )
+        .is_ok());
+        assert!(validate_plugin_settings(&schema, &serde_json::json!({})).is_err());
+        assert!(validate_plugin_settings(
+            &schema,
+            &serde_json::json!({"repo": "acme", "auto_sync": "yes"})
+        )
+        .is_err());
+        assert!(validate_plugin_settings(
+            &schema,
+            &serde_json::json!({"repo": "acme", "level": 9})
+        )
+        .is_err());
+        assert!(validate_plugin_settings(
+            &schema,
+            &serde_json::json!({"repo": "acme", "mode": "turbo"})
+        )
+        .is_err());
+        assert!(validate_plugin_settings(
+            &schema,
+            &serde_json::json!({"repo": "acme", "unknown": 1})
+        )
+        .is_err());
+        assert!(validate_plugin_settings(&schema, &serde_json::json!({"repo": "a"})).is_err());
     }
 }

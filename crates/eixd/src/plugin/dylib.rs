@@ -34,7 +34,7 @@ use tokio::sync::broadcast;
 use crate::store::Store;
 
 use super::backend::{BackendFuture, ExtensionBackend};
-use super::host_api::required_capability;
+use super::host_api::{blob_get, blob_put, required_capability, WorkspaceFs};
 use super::PluginSpec;
 
 const MAX_LOG: usize = 4096;
@@ -180,8 +180,14 @@ impl ExtensionBackend for DylibBackend {
 
     fn notify<'a>(&'a self, method: &'a str, params: Value) -> BackendFuture<'a, Result<()>> {
         Box::pin(async move {
-            self.request("event.notify", json!({"method": method, "params": params}))
-                .await?;
+            if method == "config.changed" {
+                // The SDK has a dedicated arm so `Plugin::config_changed` runs
+                // and the instance can update its cached settings.
+                self.request(method, params).await?;
+            } else {
+                self.request("event.notify", json!({"method": method, "params": params}))
+                    .await?;
+            }
             Ok(())
         })
     }
@@ -336,6 +342,8 @@ fn translate_method(method: &str) -> &str {
         "tools/call" => "tool.call",
         "commands/run" => "command.run",
         "hooks/run" => "hook.run",
+        // Same name in both protocols; listed so the ABI surface is explicit.
+        "rpc.call" => "rpc.call",
         other => other,
     }
 }
@@ -431,9 +439,11 @@ struct Contributions {
 
 /// Host services exposed to an in-process plugin.
 ///
-/// Only methods that are safe to call synchronously are implemented. Async
-/// host services (fs, net, rpc, jobs, sessions) require the hosted/process
-/// backend, where the host can await without blocking the plugin thread.
+/// Only methods that are safe to call synchronously are implemented: logging,
+/// storage, secrets, workspace files, session reads and blobs. Async host
+/// services (network, UI panels, jobs, inter-plugin RPC) still require the
+/// hosted/process backend, where the host can await without blocking the
+/// plugin thread.
 struct DylibHost {
     name: String,
     capabilities: BTreeSet<PluginCapability>,
@@ -542,25 +552,31 @@ impl DylibHost {
                 Ok(json!({"items": items}))
             }
             "host.secrets.get" => self.secret_get(params),
-            "host.fs.read"
-            | "host.fs.write"
-            | "host.fs.list"
-            | "host.net.request"
-            | "host.session.get"
-            | "host.session.list"
+            "host.fs.read" => WorkspaceFs::new(&self.workspace)
+                .read(params)
+                .map_err(invalid),
+            "host.fs.write" => WorkspaceFs::new(&self.workspace)
+                .write(params)
+                .map_err(invalid),
+            "host.fs.list" => WorkspaceFs::new(&self.workspace)
+                .list(params)
+                .map_err(invalid),
+            "host.session.get" => self.session_get(params).map_err(invalid),
+            "host.session.list" => self.session_list(params).map_err(invalid),
+            "host.blob.put" => blob_put(&self.data_dir, params).map_err(invalid),
+            "host.blob.get" => blob_get(&self.data_dir, params).map_err(invalid),
+            "host.net.request"
             | "host.ui.open"
             | "host.ui.update"
             | "host.ui.close"
             | "host.rpc.call"
-            | "host.blob.put"
-            | "host.blob.get"
             | "host.job.register"
             | "host.job.trigger"
             | "host.job.unregister" => Err(HostError::new(
                 abi::EIX_ERR_DENIED,
                 format!(
                     "{method} is not available to in-process dylib plugins yet; \
-                         use hosted mode for filesystem, network and inter-plugin RPC"
+                         use hosted mode for network, UI panels, jobs and inter-plugin RPC"
                 ),
             )),
             other => Err(HostError::new(
@@ -678,6 +694,48 @@ impl DylibHost {
         eprintln!("eix-plugin[{}] secret read: {name}", self.name);
         Ok(json!({"name": name, "value": value}))
     }
+    // ---- sessions -------------------------------------------------------
+
+    fn session_get(&self, params: &Value) -> Result<Value> {
+        let id = params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .context("host.session.get needs a string `session_id`")?;
+        let session = self
+            .store
+            .get_session(id)?
+            .with_context(|| format!("unknown session {id:?}"))?;
+        serde_json::to_value(session).context("cannot encode session")
+    }
+
+    fn session_list(&self, params: &Value) -> Result<Value> {
+        let include_archived = params
+            .get("include_archived")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let sessions = self.store.list_sessions_including(include_archived)?;
+        let rows = sessions
+            .into_iter()
+            .take(500)
+            .map(|session| {
+                json!({
+                    "id": session.id,
+                    "name": session.name,
+                    "cwd": session.cwd,
+                    "status": session.status,
+                    "origin": session.origin,
+                    "mode": session.mode,
+                    "archived": session.archived,
+                    "updated_at": session.updated_at,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({"sessions": rows}))
+    }
+}
+
+fn invalid(err: anyhow::Error) -> HostError {
+    HostError::new(abi::EIX_ERR_INVALID, format!("{err:#}"))
 }
 
 fn internal(err: anyhow::Error) -> HostError {
@@ -785,6 +843,7 @@ mod tests {
         assert_eq!(translate_method("tools/call"), "tool.call");
         assert_eq!(translate_method("commands/run"), "command.run");
         assert_eq!(translate_method("hooks/run"), "hook.run");
+        assert_eq!(translate_method("rpc.call"), "rpc.call");
         assert_eq!(translate_method("custom.method"), "custom.method");
     }
 

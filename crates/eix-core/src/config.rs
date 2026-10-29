@@ -23,6 +23,11 @@ pub enum ConfigError {
         path: PathBuf,
         source: std::io::Error,
     },
+    #[error("cannot write config {path}: {source}")]
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("invalid config {path}: {source}")]
     Parse {
         path: PathBuf,
@@ -2184,6 +2189,97 @@ impl Config {
         Self::load_for(self.explicit_path.as_deref(), &self.load_cwd)
     }
 
+    /// Persist `[plugins.<name>.settings]` to the writable config file.
+    ///
+    /// Only the global file (or the explicit `--config`/`EIX_CONFIG` file) is
+    /// written, never a project layer. `toml_edit` keeps comments, ordering and
+    /// unrelated keys intact; the write is atomic and preserves the previous
+    /// file mode.
+    pub fn write_plugin_settings(
+        &self,
+        name: &str,
+        settings: &BTreeMap<String, Value>,
+    ) -> Result<PathBuf, ConfigError> {
+        let path = self
+            .explicit_path
+            .clone()
+            .unwrap_or_else(default_config_path);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.clone(),
+                    source,
+                })
+            }
+        };
+        let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
+            ConfigError::Invalid(format!("cannot parse {}: {err}", path.display()))
+        })?;
+        let plugins = doc
+            .as_table_mut()
+            .entry("plugins")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let plugins = plugins.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!("`plugins` in {} must be a table", path.display()))
+        })?;
+        let plugin = plugins
+            .entry(name)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let plugin = plugin.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "`plugins.{name}` in {} must be a table",
+                path.display()
+            ))
+        })?;
+        if settings.is_empty() {
+            plugin.remove("settings");
+        } else {
+            let mut table = toml_edit::Table::new();
+            for (key, value) in settings {
+                if value.is_null() {
+                    continue;
+                }
+                table.insert(
+                    key,
+                    json_to_toml_item(value).map_err(|err| {
+                        ConfigError::Invalid(format!("cannot encode setting {key:?}: {err}"))
+                    })?,
+                );
+            }
+            plugin.insert("settings", toml_edit::Item::Table(table));
+        }
+
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+                path: path.clone(),
+                source,
+            })?;
+        }
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".into());
+        let temp = path.with_file_name(format!("{file_name}.tmp"));
+        let permissions = fs::metadata(&path).ok().map(|meta| meta.permissions());
+        fs::write(&temp, doc.to_string()).map_err(|source| ConfigError::Write {
+            path: temp.clone(),
+            source,
+        })?;
+        if let Some(permissions) = permissions {
+            let _ = fs::set_permissions(&temp, permissions);
+        }
+        fs::rename(&temp, &path).map_err(|source| ConfigError::Write {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(path)
+    }
+
     fn apply_env(&mut self) {
         // Keep only provider entry-point overrides. Every other setting is
         // configured in the config file so a stale shell export cannot silently
@@ -3399,6 +3495,62 @@ pub fn default_config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
+/// Convert a JSON settings value into a TOML item.
+///
+/// Objects become tables so nested settings stay readable; objects nested
+/// inside arrays become inline tables, which is the only TOML representation
+/// available for them.
+fn json_to_toml_item(value: &Value) -> Result<toml_edit::Item, String> {
+    if let Value::Object(map) = value {
+        let mut table = toml_edit::Table::new();
+        for (key, value) in map {
+            if value.is_null() {
+                continue;
+            }
+            table.insert(key, json_to_toml_item(value)?);
+        }
+        return Ok(toml_edit::Item::Table(table));
+    }
+    Ok(toml_edit::Item::Value(json_to_toml_value(value)?))
+}
+
+fn json_to_toml_value(value: &Value) -> Result<toml_edit::Value, String> {
+    Ok(match value {
+        Value::Null => return Err("null is not representable in TOML".into()),
+        Value::Bool(value) => (*value).into(),
+        Value::Number(number) => {
+            if let Some(value) = number.as_i64() {
+                value.into()
+            } else if let Some(value) = number.as_u64() {
+                // TOML integers are signed 64-bit.
+                i64::try_from(value)
+                    .map_err(|_| format!("{value} does not fit a TOML integer"))?
+                    .into()
+            } else {
+                number
+                    .as_f64()
+                    .ok_or_else(|| "invalid number".to_string())?
+                    .into()
+            }
+        }
+        Value::String(text) => text.as_str().into(),
+        Value::Array(items) => {
+            let mut array = toml_edit::Array::new();
+            for item in items {
+                array.push(json_to_toml_value(item)?);
+            }
+            toml_edit::Value::Array(array)
+        }
+        Value::Object(map) => {
+            let mut table = toml_edit::InlineTable::new();
+            for (key, value) in map {
+                table.insert(key, json_to_toml_value(value)?);
+            }
+            toml_edit::Value::InlineTable(table)
+        }
+    })
+}
+
 /// TOML project config at `.eix/config.toml`.
 fn project_config_path(dir: &Path) -> PathBuf {
     dir.join(".eix").join("config.toml")
@@ -4216,6 +4368,50 @@ capabilities = ["tools"]
         )
         .unwrap();
         assert!(Config::load_for(Some(&path), &dir).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plugin_settings_writes_preserve_the_rest_of_the_file() {
+        let dir = config_temp_dir("settings-write");
+        let path = dir.join("config.toml");
+        std::fs::write(
+            &path,
+            r#"# keep this comment
+[plugins.acme]
+command = "python3"
+args = ["plugin.py"]
+
+[plugins.acme.settings]
+repo = "old"
+"#,
+        )
+        .unwrap();
+        let config = Config::load_for(Some(&path), &dir).expect("plugin config");
+        let mut settings = BTreeMap::new();
+        settings.insert("repo".to_string(), serde_json::json!("acme"));
+        settings.insert("auto_sync".to_string(), serde_json::json!(true));
+        settings.insert("labels".to_string(), serde_json::json!(["bug", "ui"]));
+        let written = config
+            .write_plugin_settings("acme", &settings)
+            .expect("write settings");
+        assert_eq!(written, path);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("# keep this comment"), "{text}");
+        assert!(text.contains("command = \"python3\""), "{text}");
+
+        let reloaded = Config::load_for(Some(&path), &dir).expect("reload");
+        let plugin = reloaded.plugins.get("acme").unwrap();
+        assert_eq!(plugin.settings["repo"], serde_json::json!("acme"));
+        assert_eq!(plugin.settings["auto_sync"], serde_json::json!(true));
+        assert_eq!(plugin.settings["labels"], serde_json::json!(["bug", "ui"]));
+
+        // An empty map removes the table instead of leaving `settings = {}`.
+        config
+            .write_plugin_settings("acme", &BTreeMap::new())
+            .unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("[plugins.acme.settings]"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
