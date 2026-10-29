@@ -1068,6 +1068,7 @@ fn push_bubble(
     out: &mut Transcript,
     mut content: Vec<Line<'static>>,
     mut sources: Vec<(usize, String)>,
+    mut placements: Vec<math_image::Placement>,
     width: usize,
     theme: Theme,
 ) {
@@ -1084,7 +1085,15 @@ fn push_bubble(
         return;
     }
 
-    let content_width = content.iter().map(Line::width).max().unwrap_or(0).max(1);
+    let mut content_width = content.iter().map(Line::width).max().unwrap_or(0);
+    for placement in &placements {
+        let column = usize::from(placement.column);
+        let cols = usize::from(placement.image.cols);
+        // The formula was centred inside the Markdown render width, so keep
+        // that width; otherwise shrinking to the text would right-align it.
+        content_width = content_width.max(column + cols).max(2 * column + cols);
+    }
+    let content_width = content_width.max(1);
     let box_width = content_width + 2 * (BUBBLE_PAD + 1);
     let body_pad = width.saturating_sub(box_width);
 
@@ -1122,10 +1131,18 @@ fn push_bubble(
         out.push(Line::from(spans), None);
     }
 
-    // The top border occupies one line; content starts below it.
+    // The top border occupies one line; content starts below it. The bubble
+    // adds `body_pad`, the left border and its inner padding before content.
     sources.retain(|(line, _)| *line >= removed);
     for (line, source) in sources {
         out.copy.push((base + 1 + line - removed, source));
+    }
+    let left = body_pad + 1 + BUBBLE_PAD;
+    placements.retain(|placement| placement.line >= removed);
+    for mut placement in placements {
+        placement.line = base + 1 + placement.line - removed;
+        placement.column = (left + usize::from(placement.column)).min(u16::MAX as usize) as u16;
+        out.math.push(placement);
     }
 
     let mut bottom = Vec::new();
@@ -1152,13 +1169,14 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
     }
     let image_lines = content.len();
     let mut sources = Vec::new();
+    let mut placements = Vec::new();
     let text = text.trim_end();
     if !text.is_empty() {
         // The bubble supplies its own horizontal padding, so render without
-        // the transcript's usual two-cell left gutter. Keep the copy metadata
-        // even though the bubble does not draw images.
+        // the transcript's usual two-cell left gutter. Display math still uses
+        // a LaTeX image; `push_bubble` translates its anchors into the box.
         let rendered =
-            markdown::render_with_indent_detailed(text, content_width.max(1), theme, "", false);
+            markdown::render_with_indent_detailed(text, content_width.max(1), theme, "", true);
         content.extend(rendered.lines);
         sources.extend(
             rendered
@@ -1166,8 +1184,12 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
                 .into_iter()
                 .map(|(line, source)| (image_lines + line, source)),
         );
+        placements.extend(rendered.images.into_iter().map(|mut placement| {
+            placement.line += image_lines;
+            placement
+        }));
     }
-    push_bubble(out, content, sources, width, theme);
+    push_bubble(out, content, sources, placements, width, theme);
     out.blank();
 }
 
@@ -2002,5 +2024,51 @@ fn push_diff(out: &mut Transcript, path: &str, diff: &str, width: usize, theme: 
                 Some(fold),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::layout::Size;
+    use ratatui_image::picker::Picker;
+    use ratatui_image::Resize;
+
+    fn test_image(cols: u16, rows: u16) -> math_image::MathImage {
+        let picker = Picker::halfblocks();
+        let decoded = image::DynamicImage::new_rgba8(u32::from(cols) * 10, u32::from(rows) * 20);
+        let protocol = picker
+            .new_protocol(decoded, Size::new(cols, rows), Resize::Fit(None))
+            .expect("protocol");
+        math_image::MathImage {
+            protocol: std::sync::Arc::new(protocol),
+            cols,
+            rows,
+        }
+    }
+
+    #[test]
+    fn bubble_shifts_math_images_into_the_box() {
+        let mut out = Transcript::new();
+        let content = vec![Line::from("text"), Line::from(" ")];
+        let placement = math_image::Placement {
+            line: 1,
+            column: 2,
+            image: test_image(2, 1),
+        };
+        push_bubble(
+            &mut out,
+            content,
+            Vec::new(),
+            vec![placement],
+            40,
+            Theme::default(),
+        );
+        let placement = out.math.first().expect("placement");
+        // Top border at line 0, so the content image lands on line 2.
+        assert_eq!(placement.line, 2);
+        // content_width(6) leaves body_pad(30); then left border, bubble
+        // padding and the original column(2).
+        assert_eq!(placement.column, 34);
     }
 }

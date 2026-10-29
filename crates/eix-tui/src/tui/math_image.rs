@@ -1,9 +1,10 @@
 //! Render display math through the terminal's graphics protocol.
 //!
-//! The renderer shells out to a local LaTeX installation (`latex` + `dvipng`),
-//! then hands the PNG to `ratatui-image`, which speaks Kitty, Sixel or iTerm2.
-//! When no protocol is available, or the external tools are missing, callers
-//! fall back to the character-grid renderer in [`super::math`].
+//! The renderer shells out to a local LaTeX installation (`latex` + `dvipng`,
+//! with an `xelatex` fallback for UTF-8/CJK formulas), then hands the PNG to
+//! `ratatui-image`, which speaks Kitty, Sixel or iTerm2. When no protocol is
+//! available, or the external tools are missing, callers fall back to the
+//! character-grid renderer in [`super::math`].
 //!
 //! Images are cached by formula, available width and colour so scrolling and
 //! redraws do not re-run LaTeX.
@@ -154,56 +155,242 @@ impl Service {
     }
 }
 
+/// Optional packages shared by both engines. Each one is only loaded when
+/// the local TeX installation provides it, so a minimal TeX Live still works.
+const OPTIONAL_PACKAGES: &[&str] = &[
+    "mathtools",
+    "bm",
+    "cancel",
+    "mathrsfs",
+    "mhchem",
+    "siunitx",
+    "dsfont",
+    "bbm",
+    "braket",
+];
+
 /// Compile one formula to a transparent PNG. The document uses `standalone`
 /// so the output is tightly cropped around the formula.
+///
+/// `latex` + `dvipng` is the fast path. A handful of formulas (CJK text,
+/// literal Unicode math symbols) cannot be typeset by that engine, so a
+/// failure retries through `xelatex` + `pdftocairo`, which understands UTF-8
+/// and can load a CJK font.
 fn latex_png(source: &str, color: Option<Color>) -> Option<Vec<u8>> {
     if source.trim().is_empty() || source.len() > 8_000 || unsafe_latex(source) {
         return None;
     }
     let dir = TempDir::create()?;
-    let document = format!(
-        "\\documentclass[border=1pt]{{standalone}}\n\
-         \\usepackage{{amsmath,amssymb}}\n\
-         \\usepackage{{xcolor}}\n\
-         \\begin{{document}}\n\
-         \\color[HTML]{{{color}}}$\\displaystyle {source}$\n\
-         \\end{{document}}\n",
-        color = color_hex(color),
-    );
-    fs::write(dir.path.join("formula.tex"), document).ok()?;
-    let latex = Command::new("latex")
-        .args([
-            "-interaction=nonstopmode",
-            "-halt-on-error",
-            "-no-shell-escape",
-            "formula.tex",
-        ])
-        .current_dir(&dir.path)
-        .output()
-        .ok()?;
-    if !latex.status.success() {
-        return None;
-    }
     let dpi = std::env::var("EIX_MATH_DPI").unwrap_or_else(|_| "200".into());
-    let dvipng = Command::new("dvipng")
-        .args([
-            "-T",
-            "tight",
-            "-D",
-            &dpi,
-            "-bg",
-            "Transparent",
-            "-o",
-            "formula.png",
-            "formula.dvi",
-        ])
-        .current_dir(&dir.path)
-        .output()
-        .ok()?;
-    if !dvipng.status.success() {
-        return None;
+    // `\[...\]` is a display environment, so `\tag`, `\label` and most
+    // constructs behave like they do in the model's own document. Raw display
+    // environments (`align`, `gather`, ...) cannot be nested inside it, so try
+    // those verbatim first.
+    let raw = source.trim();
+    let wrapped = format!("\\[ {raw} \\]");
+    let bodies = if is_display_environment(raw) {
+        [raw.to_string(), wrapped]
+    } else {
+        [wrapped, raw.to_string()]
+    };
+    let png = compile_dvi(&dir, &bodies, color, &dpi);
+    if png.is_some() || source.is_ascii() {
+        return png;
     }
-    fs::read(dir.path.join("formula.png")).ok()
+    // The classic engine only fails on Unicode/CJK input in practice, so
+    // avoid paying for a second TeX run when the source is plain ASCII.
+    compile_unicode(&dir, &bodies, color, &dpi)
+}
+
+/// LaTeX document preamble. `unicode` selects the `xelatex` variant, which
+/// swaps `amssymb` for `unicode-math` and adds CJK font support.
+fn preamble(color: Option<Color>, unicode: bool) -> String {
+    let mut preamble = String::from("\\documentclass[border=1pt,varwidth]{standalone}\n");
+    if unicode {
+        preamble.push_str("\\usepackage{amsmath}\n\\usepackage{unicode-math}\n");
+        // `bm` is incompatible with `unicode-math`, so provide the command
+        // through its bold-symbol equivalent. The same applies to the
+        // `doublestroke`/`bbm` blackboard-bold spellings.
+        preamble.push_str("\\providecommand{\\bm}[1]{\\symbf{#1}}\n");
+        preamble.push_str("\\providecommand{\\mathds}[1]{\\symbb{#1}}\n");
+        preamble.push_str("\\providecommand{\\mathbbm}[1]{\\symbb{#1}}\n");
+    } else {
+        preamble.push_str("\\usepackage{amsmath,amssymb}\n");
+    }
+    preamble.push_str("\\usepackage{xcolor}\n");
+    for package in OPTIONAL_PACKAGES {
+        // `bm`, `dsfont` and `bbm` clash with `unicode-math`; the preamble
+        // above already supplies compatible aliases for their commands.
+        if unicode && matches!(*package, "bm" | "dsfont" | "bbm") {
+            continue;
+        }
+        preamble.push_str(&format!(
+            "\\IfFileExists{{{package}.sty}}{{\\usepackage{{{package}}}}}{{}}\n"
+        ));
+    }
+    if unicode {
+        // CJK text in `\text{...}` needs an explicit font. Pick the first
+        // common Noto/Source Han family available on the system.
+        preamble.push_str(
+            "\\IfFileExists{xeCJK.sty}{\\usepackage{xeCJK}\
+             \\IfFontExistsTF{Noto Sans CJK SC}{\\setCJKmainfont{Noto Sans CJK SC}}{\
+             \\IfFontExistsTF{Noto Sans CJK TC}{\\setCJKmainfont{Noto Sans CJK TC}}{\
+             \\IfFontExistsTF{Source Han Sans CN}{\\setCJKmainfont{Source Han Sans CN}}{\
+             \\IfFontExistsTF{Source Han Sans SC}{\\setCJKmainfont{Source Han Sans SC}}{}}}}}{}\n",
+        );
+        // `amssymb` aliases that `unicode-math` spells differently.
+        preamble.push_str(
+            "\\providecommand{\\square}{\\mdlgwhtsquare}\n\
+             \\providecommand{\\blacksquare}{\\smblksquare}\n\
+             \\providecommand{\\lozenge}{\\mdlgwhtlozenge}\n\
+             \\providecommand{\\blacklozenge}{\\mdlgblklozenge}\n\
+             \\providecommand{\\centerdot}{\\mathbin{\\cdot}}\n\
+             \\providecommand{\\smallsetminus}{\\setminus}\n\
+             \\providecommand{\\nleqslant}{\\nleq}\n\
+             \\providecommand{\\ngeqslant}{\\ngeq}\n\
+             \\providecommand{\\ntriangleleft}{\\not\\triangleleft}\n\
+             \\providecommand{\\shortmid}{\\mid}\n\
+             \\providecommand{\\shortparallel}{\\parallel}\n\
+             \\providecommand{\\circledR}{\\textregistered}\n\
+             \\providecommand{\\yen}{\\mathyen}\n",
+        );
+    }
+    preamble.push_str(&format!(
+        "\\begin{{document}}\n\\color[HTML]{{{}}}\n",
+        color_hex(color)
+    ));
+    preamble
+}
+
+/// Fast path: `latex` + `dvipng`.
+fn compile_dvi(
+    dir: &TempDir,
+    bodies: &[String],
+    color: Option<Color>,
+    dpi: &str,
+) -> Option<Vec<u8>> {
+    let preamble = preamble(color, false);
+    for body in bodies {
+        let document = format!("{preamble}{body}\n\\end{{document}}\n");
+        if fs::write(dir.path.join("formula.tex"), document).is_err() {
+            continue;
+        }
+        let _ = fs::remove_file(dir.path.join("formula.png"));
+        let latex = Command::new("latex")
+            .args([
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-no-shell-escape",
+                "formula.tex",
+            ])
+            .current_dir(&dir.path)
+            .output()
+            .ok()?;
+        if !latex.status.success() {
+            continue;
+        }
+        let dvipng = Command::new("dvipng")
+            .args([
+                "-T",
+                "tight",
+                "-D",
+                dpi,
+                "-bg",
+                "Transparent",
+                "-o",
+                "formula.png",
+                "formula.dvi",
+            ])
+            .current_dir(&dir.path)
+            .output()
+            .ok()?;
+        if !dvipng.status.success() {
+            continue;
+        }
+        if let Ok(png) = fs::read(dir.path.join("formula.png")) {
+            return Some(png);
+        }
+    }
+    None
+}
+
+/// UTF-8 path: `xelatex` + PDF-to-PNG conversion. Used only when the classic
+/// engine cannot typeset the source.
+fn compile_unicode(
+    dir: &TempDir,
+    bodies: &[String],
+    color: Option<Color>,
+    dpi: &str,
+) -> Option<Vec<u8>> {
+    let preamble = preamble(color, true);
+    for body in bodies {
+        let document = format!("{preamble}{body}\n\\end{{document}}\n");
+        if fs::write(dir.path.join("formula.tex"), document).is_err() {
+            continue;
+        }
+        let _ = fs::remove_file(dir.path.join("formula.png"));
+        let xelatex = Command::new("xelatex")
+            .args([
+                "-interaction=nonstopmode",
+                "-halt-on-error",
+                "-no-shell-escape",
+                "formula.tex",
+            ])
+            .current_dir(&dir.path)
+            .output()
+            .ok()?;
+        if !xelatex.status.success() {
+            continue;
+        }
+        // poppler is the usual provider; prefer `pdftocairo` and fall back to
+        // `pdftoppm` for lean installations.
+        let converted = ["pdftocairo", "pdftoppm"].iter().any(|tool| {
+            Command::new(tool)
+                .args([
+                    "-png",
+                    "-transp",
+                    "-singlefile",
+                    "-r",
+                    dpi,
+                    "formula.pdf",
+                    "formula",
+                ])
+                .current_dir(&dir.path)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        });
+        if !converted {
+            continue;
+        }
+        if let Ok(png) = fs::read(dir.path.join("formula.png")) {
+            return Some(png);
+        }
+    }
+    None
+}
+
+/// Display environments that must be emitted directly instead of inside
+/// `\[...\]`. `aligned`, `cases` and matrix environments still need the math
+/// wrapper and deliberately are not listed here.
+fn is_display_environment(source: &str) -> bool {
+    const ENVIRONMENTS: &[&str] = &[
+        "align",
+        "align*",
+        "equation",
+        "equation*",
+        "gather",
+        "gather*",
+        "multline",
+        "multline*",
+        "eqnarray",
+        "eqnarray*",
+        "displaymath",
+        "math",
+    ];
+    let source = source.trim_start();
+    ENVIRONMENTS
+        .iter()
+        .any(|environment| source.starts_with(&format!("\\begin{{{environment}}}")))
 }
 
 /// Formula text is model output. Keep it from escaping the math expression or
@@ -269,6 +456,71 @@ mod tests {
     fn formats_rgb_colors_for_xcolor() {
         assert_eq!(color_hex(Some(Color::Rgb(1, 2, 3))), "010203");
         assert_eq!(color_hex(None), "D8DEE9");
+    }
+
+    #[test]
+    fn latex_pipeline_handles_common_math_constructs() {
+        let ok = Command::new("latex")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        if !ok {
+            return;
+        }
+        let samples = [
+            r"\frac{a}{b}",
+            r"\begin{align} a &= b \\ c &= d \end{align}",
+            r"\begin{aligned} a &= b \\ c &= d \end{aligned}",
+            r"\bm{x} + \operatorname{rank}(A)",
+            r"\cancel{x}",
+            r"\ce{H2O}",
+            r"\SI{5}{\meter}",
+            r"\tag{1} x = 1",
+            r"\mathds{1} + \square + \blacksquare",
+            r"\braket{a|b}",
+        ];
+        for sample in samples {
+            assert!(
+                latex_png(sample, Some(Color::Rgb(220, 223, 228))).is_some(),
+                "failed to render {sample}"
+            );
+        }
+    }
+
+    #[test]
+    fn latex_pipeline_handles_unicode_and_cjk_text() {
+        let has_xelatex = Command::new("xelatex")
+            .arg("--version")
+            .output()
+            .is_ok_and(|output| output.status.success());
+        let has_convert = ["pdftocairo", "pdftoppm"].iter().any(|tool| {
+            Command::new(tool)
+                .arg("-v")
+                .output()
+                .is_ok_and(|output| output.status.success())
+        });
+        if !has_xelatex || !has_convert {
+            return;
+        }
+        let mut samples = vec![
+            r"x \le y \text{ and } z \ge 0".to_string(),
+            r"\begin{align} \alpha &= \beta \\ \gamma &= \delta \end{align}".to_string(),
+            r"\bm{x} + \mathds{1}".to_string(),
+        ];
+        let has_cjk = Command::new("fc-list")
+            .args([":lang=zh", "family"])
+            .output()
+            .is_ok_and(|output| output.status.success() && !output.stdout.is_empty());
+        if has_cjk {
+            samples.push(r"\zeta(s)=\prod_{p\ \text{为素数}}\frac{1}{1-p^{-s}}".to_string());
+            samples.push(r"f(x) \le 1 \text{ 当 } x \to 0".to_string());
+        }
+        for sample in samples {
+            assert!(
+                latex_png(&sample, Some(Color::Rgb(220, 223, 228))).is_some(),
+                "failed to render {sample}"
+            );
+        }
     }
 
     #[test]
