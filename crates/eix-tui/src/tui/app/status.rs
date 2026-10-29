@@ -339,21 +339,8 @@ impl App {
                 }
             }
         }
-        // Graphics support is a startup probe, so make the effective mode
-        // visible: images are easy to miss when a terminal silently falls back
-        // to ASCII.
-        // Only advertise the graphics protocol when it is actually active;
-        // ASCII fallback stays quiet and `/math status` explains the reason.
-        let math_status = super::super::math_image::status();
-        if self.math_config.images && math_status.enabled {
-            if !spans.is_empty() {
-                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
-            }
-            spans.push(Span::styled(
-                format!("img {}", math_status.protocol),
-                Style::default().fg(muted).bg(panel),
-            ));
-        }
+        // Graphics support is a startup probe; the status bar stays quiet and
+        // `/math status` reports the protocol or why images were not used.
         if !self.pending_images.is_empty() {
             if !spans.is_empty() {
                 spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
