@@ -5217,6 +5217,9 @@ impl Daemon {
     /// cannot strand the rest; losing a race to another submit puts it back
     /// at the head of the queue instead.
     async fn pump_queued(self: &Arc<Self>, session_id: &str) {
+        // Bounded retries for the window where the turn that beat us ends
+        // after we lost the claim but before it drains the queue.
+        let mut busy_retries = 0u8;
         loop {
             let Some(prompt) = self.take_queued(session_id).await else {
                 return;
@@ -5233,22 +5236,53 @@ impl Daemon {
             };
             match self.start_turn(params, false, prompt.origin).await {
                 Ok((session, turn_id, cancel)) => {
+                    busy_retries = 0;
                     Arc::clone(self).run_turn(session.id, turn_id, cancel).await;
                 }
-                Err(err)
-                    if is_busy_error(&err) && self.turns.lock().await.contains_key(session_id) =>
-                {
-                    // Another submit claimed the session first. Leave the
-                    // prompt for the turn that won; it drains on completion.
+                Err(err) if is_busy_error(&err) => {
+                    if self.turns.lock().await.contains_key(session_id) {
+                        // Another submit claimed the session first. Leave the
+                        // prompt for the turn that won; it drains the queue
+                        // when it ends.
+                        self.queued
+                            .lock()
+                            .await
+                            .entry(session_id.to_string())
+                            .or_default()
+                            .push_front(prompt);
+                        return;
+                    }
+                    if busy_retries >= 2 {
+                        // Not a turn: an active integration (queued, rebasing,
+                        // testing, ...) will not clear by itself, so report it
+                        // instead of retrying forever.
+                        busy_retries = 0;
+                        self.emit_value(
+                            "prompt.failed",
+                            json!({
+                                "session_id": session_id,
+                                "error": format!("{err:#}"),
+                            }),
+                        );
+                        continue;
+                    }
+                    // The winning turn finished between its claim and this
+                    // check and may already have drained the queue. Put the
+                    // prompt back at the head and retry at once instead of
+                    // dropping it; if a new turn claimed the session in the
+                    // meantime, the check above parks it for that turn.
+                    busy_retries += 1;
                     self.queued
                         .lock()
                         .await
                         .entry(session_id.to_string())
                         .or_default()
                         .push_front(prompt);
-                    return;
+                    tokio::task::yield_now().await;
+                    continue;
                 }
                 Err(err) => {
+                    busy_retries = 0;
                     self.emit_value(
                         "prompt.failed",
                         json!({
@@ -5999,6 +6033,7 @@ impl Daemon {
                 let mut allow_prefetch = true;
                 let prefetch_daemon = Arc::clone(self);
                 let prefetch_session = session.clone();
+                let prefetch_cancel = Arc::clone(cancel);
                 let outcome = provider
                     .stream_chat(
                         &messages,
@@ -6031,10 +6066,13 @@ impl Daemon {
                             }
                             let daemon = Arc::clone(&prefetch_daemon);
                             let session_id = prefetch_session.id.clone();
+                            // The prefetched command must observe a cancelled
+                            // turn, just like the normal read-only path.
+                            let cancel = Arc::clone(&prefetch_cancel);
                             prefetched.insert(
                                 call.id.clone(),
                                 tokio::spawn(async move {
-                                    daemon.prefetch_tool(&session_id, call).await
+                                    daemon.prefetch_tool(&session_id, call, cancel).await
                                 }),
                             );
                         },
@@ -6823,7 +6861,12 @@ impl Daemon {
     /// Run a read-only tool while the response is still streaming. Returns
     /// `None` unless the normal permission pipeline would auto-allow it, so
     /// the batch still records the decision and no approval card opens early.
-    async fn prefetch_tool(&self, session_id: &str, call: ToolCall) -> Option<tools::ToolOutcome> {
+    async fn prefetch_tool(
+        &self,
+        session_id: &str,
+        call: ToolCall,
+        cancel: Arc<AtomicBool>,
+    ) -> Option<tools::ToolOutcome> {
         let session = self.require_session(session_id).ok()?;
         match self.parallel_call_kind(&session, &call).await? {
             ParallelCall::Read(_) => {}
@@ -6835,7 +6878,7 @@ impl Daemon {
                 &args,
                 &session.cwd,
                 &self.config.load(),
-                None,
+                Some(cancel.as_ref()),
                 session.worktree.as_deref(),
             )
             .await,
