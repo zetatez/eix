@@ -152,7 +152,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
             "apply_patch",
-            "Edit files with one patch in `input`: *** Begin Patch, Add/Update/Delete File hunks (Update may include *** Move to:), *** End Patch. Requires approval.",
+            "Edit files with one patch in `input`: *** Begin Patch, Add/Update/Delete File hunks (Move to ok), *** End Patch. Workspace edits apply immediately; external writes may need approval.",
             json!({
                 "type": "object",
                 "properties": {
@@ -223,7 +223,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "update_plan",
-            "Update the task plan for multi-phase or ambiguous work. Skip straightforward and single-step tasks. At most one step can be in_progress.",
+            "Update the task plan for multi-phase or ambiguous work. Skip straightforward or single-step tasks. At most one step in_progress.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2513,8 +2513,7 @@ pub(crate) fn cap_output(text: String, max: usize) -> String {
         format!("… [truncated at {max} bytes: the first line is longer than the limit]")
     } else {
         format!(
-            "… [truncated: showed lines 1-{shown} of {total}; continue from line {} with a narrower range]",
-            shown + 1
+            "… [truncated: showed lines 1-{shown} of {total}. Read only the range you still need; do not page through the whole file]"
         )
     };
     format!("{kept}\n{hint}")
@@ -3506,13 +3505,20 @@ mod tests {
         let text: String = (1..=50).map(|n| format!("line {n}\n")).collect();
         let capped = cap_output(text, 100);
         assert!(capped.contains("showed lines 1-13 of 50"), "{capped}");
-        assert!(capped.contains("continue from line 14"), "{capped}");
+        assert!(
+            capped.contains("Read only the range you still need"),
+            "{capped}"
+        );
+        assert!(
+            capped.contains("do not page through the whole file"),
+            "{capped}"
+        );
         assert!(capped.starts_with("line 1\n"));
 
         // A single over-long line has no useful range to resume from.
         let one_line = cap_output("x".repeat(200), 50);
         assert!(one_line.contains("first line is longer"), "{one_line}");
-        assert!(!one_line.contains("continue from line"));
+        assert!(!one_line.contains("Read only the range"));
     }
 
     #[test]

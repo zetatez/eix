@@ -50,15 +50,16 @@ impl Sector {
         }
     }
 
-    /// Share of the total budget this sector is allowed to use.
+    /// Share of the total budget this sector may use when the request is over
+    /// budget. Free budget is not redistributed away from recent tool output.
     pub fn budget_percent(self) -> f64 {
         match self {
             Self::System => 0.05,
             Self::Instructions => 0.05,
             Self::Workspace => 0.12,
             Self::Environment => 0.03,
-            Self::History => 0.60,
-            Self::Tools => 0.10,
+            Self::History => 0.30,
+            Self::Tools => 0.40,
             Self::Memory => 0.05,
         }
     }

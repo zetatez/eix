@@ -678,8 +678,8 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 | instructions | AGENTS.md（仓库根 → cwd）、项目约定、技能目录 | 5% |
 | workspace | 文件树、选中文件 | 12% |
 | environment | cwd、OS、shell、日期/时区、git 状态、sandbox、mode | 3% |
-| history | 对话历史 | 60% |
-| tools | 工具输出（可截断/引用 blob） | 10% |
+| history | 对话历史 | 30% |
+| tools | 工具输出（可截断/引用 blob） | 40% |
 | memory | 跨 session 记忆 + 当前任务列表 | 5% |
 
 - 请求布局固定为“稳定前缀 → 历史 → 易变后缀”：system、instructions（含 `<available_skills>`，
@@ -695,8 +695,13 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - 条目的 token 成本只用于内部预算和自动裁剪。
 - 工具结果先按 `tools.max_output_bytes` 截断，再按 `context.tool_output_tokens` 对 provider
   视图做 head/tail 省略；完整输出保留在事件日志。
-- `tools` / `history` 超预算时保留最新 4 条；若总预算仍超，emergency trim 只保护当前 user
-  消息和最新工具结果，避免一轮大输出让后续请求永久失败。
+- 运行时另有 inspection 守卫：同一文件第 3 次读取，或连续 10 次只读调用 / 5 轮没有编辑时，
+  在下一轮请求注入 `Action check` 提醒，要求模型直接用 `apply_patch` 修改或说明缺失的事实。
+  它只提醒、不终止 turn，因此问题、review 和 Plan 这类只读任务仍可正常结束；编辑成功后计数清零。
+  这补上了 doomloop 只识别“完全相同批次”的盲区：不断换参数重读同一文件的模型不会被原守卫拦住。
+- `tools` / `history` 的 sector 比例只在**总预算超限时**生效；请求仍有空闲预算时不会把
+  工具输出裁到 10%，否则模型会反复重读刚看过的文件。超预算时保留最新 4 条；若总预算仍超，
+  emergency trim 只保护当前 user 消息和最新工具结果，避免一轮大输出让后续请求永久失败。
 - 压缩是**显式事件**：历史里出现 `compacted 12 messages → summary`，可展开查看原文。
 - 自动压缩在每个工具批次后也会检查；provider 报 context-length / 413 时强制压缩并重试。
   压缩只由上下文压力触发，不按轮数定期执行。保留窗口优先按
@@ -707,7 +712,7 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
   `kind`，TUI 用简短标签显示原因。
 - 删除/pin 是 session 级策略，可保存为项目默认。
-- 系统提示按“紧凑基座 + 条件 fragment”组织。基座保持 <800 tokens，并直接采用 codex 的
+- 系统提示按“紧凑基座 + 条件 fragment”组织。基座保持 <840 tokens，并直接采用 codex 的
   工作契约：端到端完成、默认用户要的是实现而不是提案、不猜、验证先窄后宽、ambition vs
   precision（新项目放开、存量代码外科手术式）、脏工作区与意外改动保护、AGENTS.md 作用域、
   不重复读已 patch 的文件；规划沿用 codex 的门槛（多阶段或模糊任务，跳过直接任务和单步计划）。
@@ -901,7 +906,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 是唯一豁免），输出按字节截断，`exec_command` 带超时并可为长任务返回后台会话 id。
 > provider 侧支持 OpenAI `tools` / `tool_calls` 的流式增量累积，
 > 一次 turn 不设固定工具往返上限：模型返回不含工具调用的回答即结束，用户可随时中断；
-> 重复相同的工具批次会被 doomloop 守卫提前终止。每轮写入
+> 重复相同的工具批次会被 doomloop 守卫提前终止；只读检查过多（重读同一文件或长时间不编辑）
+> 会先收到 `Action check` 提醒，但不会强制终止只读任务。每轮写入
 > `tool_call` / `approval_required` / `tool_result` 事件并广播
 > `tool.approval_required` / `tool.started` / `tool.completed`。TUI 渲染工具卡片，
 > 聚焦 pane 有 `[y]/[n]` 审批卡片，`eix approve/deny` 可无头处理（`--hunks 0,2` 只应用

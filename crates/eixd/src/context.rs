@@ -5,13 +5,14 @@
 //! from. Policies (drop / pin / compact) are ordinary events; replaying them is
 //! deterministic, so a restart never changes what a session sends.
 //!
-//! Budgets are enforced in two stages. `tools` and `history` are trimmed
-//! oldest-first to their share of `context.budget_tokens`, but the newest few
-//! entries (and anything pinned) always survive. If those are not enough,
-//! instructions, workspace and memory are dropped oldest-first and marked
-//! `auto` in the ledger; this is visible rather than silently hiding an
-//! `AGENTS.md`. The system prompt is never dropped, but it is capped at 25% of
-//! the budget with an explicit truncation marker.
+//! Budgets are enforced in two stages. When a request is over
+//! `context.budget_tokens`, `tools` and `history` are trimmed oldest-first to
+//! their share of the budget, but the newest few entries (and anything pinned)
+//! always survive. If that is not enough, instructions, workspace and memory
+//! are dropped oldest-first and marked `auto` in the ledger; this is visible
+//! rather than silently hiding an `AGENTS.md`. The system prompt is never
+//! dropped, but it is capped at 25% of the budget with an explicit truncation
+//! marker.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -1363,18 +1364,25 @@ fn drop_fixed(entries: &mut [Entry], sector: Sector) -> Option<usize> {
 }
 
 fn trim(entries: &mut [Entry], budget: usize) -> usize {
-    trim_sector(
-        entries,
-        Sector::Tools,
-        (budget as f64 * Sector::Tools.budget_percent()) as usize,
-    );
-    trim_sector(
-        entries,
-        Sector::History,
-        (budget as f64 * Sector::History.budget_percent()) as usize,
-    );
-
+    // Sector shares are a *pressure* policy, not a per-round target. Trimming
+    // tools to their share while most of the request budget was free discarded
+    // results the model had just read, so it read them again. Only enforce the
+    // shares when the whole request is over budget.
     let mut total = active_tokens(entries);
+    if total > budget {
+        trim_sector(
+            entries,
+            Sector::Tools,
+            (budget as f64 * Sector::Tools.budget_percent()) as usize,
+        );
+        trim_sector(
+            entries,
+            Sector::History,
+            (budget as f64 * Sector::History.budget_percent()) as usize,
+        );
+        total = active_tokens(entries);
+    }
+
     if total > budget {
         // Drop the oldest tool entries first, then history, keeping the newest
         // `KEEP_NEWEST` in each sector. Candidates are computed once and the
@@ -2341,6 +2349,34 @@ mod tests {
         assert!(dropped > 0, "expected tool entries to be trimmed");
         assert!(dropped < tools.len(), "newest tools must survive");
         assert!(ledger.info().trimmed > 0);
+    }
+
+    #[test]
+    fn free_budget_keeps_recent_tool_results() {
+        let mut events = Vec::new();
+        let mut seq = 1;
+        for index in 0..10 {
+            events.push(user(seq, "run it"));
+            seq += 1;
+            events.push(tool_step(seq, "", vec![call(&format!("c{index}"))]));
+            seq += 1;
+            events.push(tool_result(seq, &format!("c{index}"), &"x".repeat(400)));
+            seq += 1;
+        }
+        // The request is far below budget, so the tools sector must not be
+        // cut down to its pressure share just because it is larger than it.
+        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 8_000);
+        let info = ledger.info();
+        let tools: Vec<&ContextEntryInfo> = info
+            .entries
+            .iter()
+            .filter(|entry| entry.sector == Sector::Tools && entry.kind != "tool_schema")
+            .collect();
+        assert_eq!(tools.len(), 10);
+        assert!(
+            tools.iter().all(|entry| !entry.dropped),
+            "free budget dropped tool output: {tools:?}"
+        );
     }
 
     #[test]

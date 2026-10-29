@@ -667,6 +667,62 @@ async fn progressing_tool_provider(
     }
 }
 
+/// Answers each round with a *different* read of the same file, so the
+/// identical-batch guard never fires while the inspection guard should.
+async fn rereading_tool_provider(
+    listener: TcpListener,
+    bodies: Arc<Mutex<Vec<String>>>,
+    rounds: usize,
+) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let round = {
+                let mut bodies = bodies.lock().await;
+                bodies.push(body);
+                bodies.len() - 1
+            };
+            let chunk = if round < rounds {
+                json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": format!("call_{round}"),
+                                "type": "function",
+                                "function": {
+                                    "name": "exec_command",
+                                    "arguments": format!(
+                                        "{{\"cmd\":\"sed -n '{}p' notes.txt\"}}",
+                                        round + 1
+                                    ),
+                                },
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            } else {
+                json!({
+                    "model": "mock-tools",
+                    "choices": [{
+                        "delta": {"content": "finished"},
+                        "finish_reason": "stop",
+                    }],
+                })
+            };
+            write_sse(&mut socket, &format!("data: {chunk}\n\ndata: [DONE]\n\n")).await;
+        });
+    }
+}
+
 /// There is no fixed round cap: the model keeps going past the old 64-round
 /// limit and ends the turn by returning a normal answer.
 #[tokio::test]
@@ -786,6 +842,83 @@ async fn daemon_stops_a_repeating_tool_batch() -> anyhow::Result<()> {
     assert!(error.contains("identical"), "unexpected error: {error}");
     // Five identical batches: the guard fired long before the 40-round budget.
     assert_eq!(bodies.lock().await.len(), 5);
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn daemon_reminds_a_model_that_keeps_rereading_the_same_file() -> anyhow::Result<()> {
+    let dir = temp_dir("reread");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("notes.txt"), "1\n2\n3\n4\n5\n6\n")?;
+
+    const ROUNDS: usize = 6;
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(rereading_tool_provider(
+        listener,
+        Arc::clone(&bodies),
+        ROUNDS,
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "reread", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "edit the notes"}),
+        )
+        .await?;
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["session_id"] == session_id.as_str()
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            break notification.params.clone();
+        }
+    };
+
+    assert!(
+        completed["error"].is_null(),
+        "unexpected error: {}",
+        completed["error"]
+    );
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), ROUNDS + 1);
+    // The third read of the same file trips the guard, and the reminder stays
+    // in the next requests while the model keeps re-reading.
+    assert!(
+        bodies[3].contains("Action check"),
+        "third read did not warn: {}",
+        bodies[3]
+    );
+    assert!(bodies[3].contains("notes.txt"), "{}", bodies[3]);
+    assert!(
+        bodies[ROUNDS - 1].contains("Action check"),
+        "reminder did not persist: {}",
+        bodies[ROUNDS - 1]
+    );
 
     daemon.abort();
     mock.abort();
