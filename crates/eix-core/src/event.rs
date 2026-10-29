@@ -175,10 +175,14 @@ pub struct ImageAttachment {
 pub struct AssistantMessagePayload {
     pub text: String,
     pub model: String,
-    /// Streamed chain-of-thought, when the provider exposed it. Display-only:
-    /// it is never sent back as a chat message.
+    /// Streamed chain-of-thought, when the provider exposed it. Display-only
+    /// for routes that do not accept thinking blocks; replayed as a signed
+    /// thinking block on routes that declare reasoning replay.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<String>,
+    /// Opaque provider signature paired with `reasoning`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
     /// True when the turn was cancelled and only a partial answer was kept.
     #[serde(default)]
     pub cancelled: bool,
@@ -532,6 +536,7 @@ mod tests {
             text: "yo".into(),
             model: "m".into(),
             reasoning: None,
+            reasoning_signature: None,
             cancelled: false,
             usage: None,
             tool_calls: Vec::new(),

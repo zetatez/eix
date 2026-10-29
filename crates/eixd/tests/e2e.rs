@@ -2493,17 +2493,14 @@ async fn plan_mode_refuses_writes_and_mode_is_logged() -> anyhow::Result<()> {
         result.payload
     );
     assert_eq!(std::fs::read_to_string(dir.join("out.txt"))?, "before");
-    // The provider never got a directly mutating tool in its advertised
-    // list. `exec_command` stays visible so harmless commands like `git
-    // status` work; the permission engine rejects anything that writes.
+    // Plan mode keeps the Build tool catalog so the provider cache survives
+    // mode switches. Mutating calls are denied by policy, not by hiding
+    // schemas.
     let first: Value = serde_json::from_str(&bodies.lock().await[0])?;
     assert!(
-        first["tools"]
-            .as_array()
-            .is_some_and(|tools| tools.iter().all(|tool| !matches!(
-                tool["function"]["name"].as_str(),
-                Some("apply_patch" | "write_stdin")
-            ))),
+        first["tools"].as_array().is_some_and(|tools| tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "apply_patch")),
         "read-only tools were: {}",
         first["tools"]
     );

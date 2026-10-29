@@ -71,7 +71,7 @@ async fn fetch_source(
         .get(&url)
         .header(reqwest::header::ACCEPT, "application/json");
     match (source.kind, secret) {
-        (ProviderKind::Anthropic, Some(Secret::ApiKey(key))) => {
+        (ProviderKind::Anthropic | ProviderKind::DeepSeek, Some(Secret::ApiKey(key))) => {
             request = request
                 .header("x-api-key", key)
                 .header("anthropic-version", "2023-06-01");
@@ -101,7 +101,7 @@ fn parse_models(value: &Value, source: &ProviderSource, default_id: &str) -> Vec
     let items = match source.kind {
         ProviderKind::Anthropic => value.get("data").and_then(Value::as_array),
         ProviderKind::Gemini => value.get("models").and_then(Value::as_array),
-        ProviderKind::OpenAi => value
+        ProviderKind::OpenAi | ProviderKind::DeepSeek => value
             .get("data")
             .and_then(Value::as_array)
             .or_else(|| value.get("models").and_then(Value::as_array))
@@ -150,7 +150,9 @@ fn parse_models(value: &Value, source: &ProviderSource, default_id: &str) -> Vec
         let name = match source.kind {
             ProviderKind::Anthropic => item.get("display_name").and_then(Value::as_str),
             ProviderKind::Gemini => item.get("displayName").and_then(Value::as_str),
-            ProviderKind::OpenAi => item.get("name").and_then(Value::as_str),
+            ProviderKind::OpenAi | ProviderKind::DeepSeek => {
+                item.get("name").and_then(Value::as_str)
+            }
         }
         .map(str::trim)
         .filter(|name| !name.is_empty())

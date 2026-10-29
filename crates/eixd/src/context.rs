@@ -48,6 +48,7 @@ const MAX_SUMMARY_CHARS: usize = 12_000;
 pub struct StaticContext {
     instructions: Vec<(String, String)>,
     workspace: Option<String>,
+    image_tokens: usize,
 }
 
 /// Synthesized sections that are not derived from the event log.
@@ -76,6 +77,15 @@ impl StaticContext {
         Self {
             instructions,
             workspace,
+            image_tokens: config.context.image_tokens,
+        }
+    }
+
+    fn image_tokens(&self) -> usize {
+        if self.image_tokens == 0 {
+            IMAGE_TOKEN_ESTIMATE
+        } else {
+            self.image_tokens
         }
     }
 }
@@ -294,6 +304,7 @@ impl Ledger {
             events,
             budget_tokens,
             config.context.tool_output_tokens,
+            static_context.image_tokens(),
             &images,
             tools,
             token_scale,
@@ -318,6 +329,7 @@ impl Ledger {
             events,
             budget_tokens,
             DEFAULT_TOOL_OUTPUT_TOKENS,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             1.0,
@@ -332,6 +344,7 @@ impl Ledger {
         events: &[Event],
         budget_tokens: usize,
         tool_output_tokens: usize,
+        image_tokens: usize,
         images: &HashMap<String, ImagePart>,
         tools: &[ToolDefinition],
         token_scale: f64,
@@ -346,7 +359,8 @@ impl Ledger {
             tools,
             &policy,
         );
-        let (event_entries, _) = event_entries_with_claimed(events, images, tool_output_tokens);
+        let (event_entries, _) =
+            event_entries_with_claimed(events, images, tool_output_tokens, image_tokens);
         entries.extend(event_entries);
         entries.extend(volatile_entries(
             sections.tasks.as_deref(),
@@ -397,8 +411,12 @@ impl Ledger {
         let appended = if new_events.is_empty() {
             None
         } else {
-            let (entries, claimed) =
-                event_entries_with_claimed(new_events, images, tool_output_tokens);
+            let (entries, claimed) = event_entries_with_claimed(
+                new_events,
+                images,
+                tool_output_tokens,
+                static_context.image_tokens(),
+            );
             // An unclaimed result belongs to a tool call from an earlier
             // round. Only a full rebuild can attach it to that assistant
             // message; appending it alone would leave a bare tool message.
@@ -602,6 +620,26 @@ impl Ledger {
         messages
     }
 
+    /// Messages strictly before an inclusive source range, including the
+    /// stable system/instructions/tools prefix. Compaction replays this exact
+    /// prefix so the auxiliary summarization call can reuse the provider's
+    /// warm cache up to the range boundary.
+    pub fn prefix_before(&self, from_seq: u64) -> Vec<ChatMessage> {
+        let mut messages = Vec::new();
+        for entry in &self.entries {
+            if entry.info.dropped || entry.info.compacted {
+                continue;
+            }
+            if let Some(seq) = entry.seq {
+                if seq >= from_seq {
+                    break;
+                }
+            }
+            messages.extend(entry.messages.iter().cloned());
+        }
+        messages
+    }
+
     /// Range an auto-compaction should summarize, keeping roughly
     /// `keep_tokens` of the newest conversation and at least `keep_turns` user
     /// turns. Cutting happens on a user-turn boundary so a tool call is never
@@ -790,6 +828,7 @@ fn volatile(id: &str, sector: Sector, kind: &str, text: String, policy: &Policy)
         vec![ChatMessage::user(text)],
         None,
         false,
+        IMAGE_TOKEN_ESTIMATE,
     );
     entry.info.pinned = policy.pinned.contains(id);
     entry.info.dropped = policy.dropped.contains(id);
@@ -827,6 +866,7 @@ fn tool_schema_entry(tools: &[ToolDefinition]) -> Entry {
         Vec::new(),
         None,
         false,
+        IMAGE_TOKEN_ESTIMATE,
     );
     entry.info.tokens = tokens;
     entry.base_tokens = tokens;
@@ -854,6 +894,7 @@ fn synthesized(
         vec![message],
         None,
         editable,
+        IMAGE_TOKEN_ESTIMATE,
     );
     entry.info.pinned = policy.pinned.contains(id);
     entry.info.dropped = policy.dropped.contains(id);
@@ -903,6 +944,7 @@ fn event_entries_with_claimed(
     events: &[Event],
     blob_images: &HashMap<String, ImagePart>,
     tool_output_tokens: usize,
+    image_tokens: usize,
 ) -> (Vec<Entry>, HashSet<u64>) {
     // Tool results are matched to the assistant message that requested them so
     // a dropped or compacted step never produces a `tool` message without its
@@ -958,6 +1000,7 @@ fn event_entries_with_claimed(
                     vec![message],
                     Some(event.seq),
                     true,
+                    image_tokens,
                 );
                 entry.info.preview = snippet(&first_line(&payload.text), MAX_PREVIEW_CHARS);
                 entries.push(entry);
@@ -989,15 +1032,31 @@ fn event_entries_with_claimed(
                             call.id.clone(),
                             truncate_tool_output(&output, tool_output_tokens),
                         ));
+                    } else {
+                        // A crash or cancellation can leave an assistant turn
+                        // with calls whose outcomes were never written. Keep
+                        // the call/result pair valid and make the uncertainty
+                        // explicit instead of silently dropping the call.
+                        let output = format!(
+                            "Error: tool call `{}` ({}) has no recorded result. Its outcome is \
+                             unknown. Verify external state before retrying; only retry if the \
+                             operation is read-only or idempotent.",
+                            call.function.name, call.id
+                        );
+                        completed.push(call.clone());
+                        tool_previews.push(format!("{}: outcome unknown", call.function.name));
+                        tool_messages.push(ChatMessage::tool(call.id.clone(), output));
                     }
                 }
                 let used_tools = !completed.is_empty();
                 let mut messages = Vec::new();
                 if used_tools {
                     let call_count = completed.len();
-                    messages.push(ChatMessage::assistant_with_tools(
+                    messages.push(ChatMessage::assistant_with_reasoning(
                         payload.text.clone(),
-                        completed,
+                        Some(completed),
+                        payload.reasoning.clone(),
+                        payload.reasoning_signature.clone(),
                     ));
                     messages.extend(tool_messages);
                     let preview = format!("{call_count} call(s) · {}", tool_previews.join(" · "));
@@ -1008,6 +1067,7 @@ fn event_entries_with_claimed(
                         messages,
                         Some(event.seq),
                         true,
+                        image_tokens,
                     );
                     entry.info.preview = snippet(&preview, MAX_PREVIEW_CHARS);
                     entries.push(entry);
@@ -1020,9 +1080,15 @@ fn event_entries_with_claimed(
                         format!("e{}", event.seq),
                         Sector::History,
                         "assistant".to_string(),
-                        vec![ChatMessage::assistant(payload.text.clone())],
+                        vec![ChatMessage::assistant_with_reasoning(
+                            payload.text.clone(),
+                            None,
+                            payload.reasoning.clone(),
+                            payload.reasoning_signature.clone(),
+                        )],
                         Some(event.seq),
                         true,
+                        image_tokens,
                     );
                     entry.info.preview = snippet(&first_line(&payload.text), MAX_PREVIEW_CHARS);
                     entries.push(entry);
@@ -1046,6 +1112,7 @@ fn event_entries_with_claimed(
                     vec![message],
                     Some(event.seq),
                     true,
+                    image_tokens,
                 );
                 entry.info.preview = snippet(
                     &format!("{}: {}", payload.tool, first_line(&payload.output)),
@@ -1063,6 +1130,13 @@ fn event_entries_with_claimed(
 /// The old implementation only counted `content`, which made a tool-heavy
 /// request look much smaller than the JSON the provider actually receives.
 pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
+    estimate_message_tokens_with_images(message, IMAGE_TOKEN_ESTIMATE)
+}
+
+/// Estimate one message with an explicit image-token budget. Vision pricing is
+/// model-specific, so callers that know the selected route should pass its
+/// configured estimate instead of the conservative fallback.
+pub fn estimate_message_tokens_with_images(message: &ChatMessage, image_tokens: usize) -> usize {
     let mut tokens = estimate_tokens(&message.content) + 4;
     if let Some(name) = &message.name {
         tokens += estimate_tokens(name) + 2;
@@ -1078,12 +1152,28 @@ pub fn estimate_message_tokens(message: &ChatMessage) -> usize {
                 + 8;
         }
     }
-    tokens += message.images.len() * IMAGE_TOKEN_ESTIMATE;
+    tokens += message.images.len() * image_tokens;
+    if let Some(reasoning) = &message.reasoning {
+        tokens += estimate_tokens(reasoning) + 4;
+    }
+    if let Some(signature) = &message.reasoning_signature {
+        tokens += estimate_tokens(signature) + 4;
+    }
     tokens
 }
 
 pub fn estimate_messages_tokens(messages: &[ChatMessage]) -> usize {
-    messages.iter().map(estimate_message_tokens).sum()
+    estimate_messages_tokens_with_images(messages, IMAGE_TOKEN_ESTIMATE)
+}
+
+pub fn estimate_messages_tokens_with_images(
+    messages: &[ChatMessage],
+    image_tokens: usize,
+) -> usize {
+    messages
+        .iter()
+        .map(|message| estimate_message_tokens_with_images(message, image_tokens))
+        .sum()
 }
 
 /// Tool definitions are part of every request even though they are not chat
@@ -1141,6 +1231,7 @@ fn make_entry(
     messages: Vec<ChatMessage>,
     seq: Option<u64>,
     editable: bool,
+    image_tokens: usize,
 ) -> Entry {
     let mut tokens = 0;
     let mut chars = 0;
@@ -1148,7 +1239,7 @@ fn make_entry(
     let mut detail_chars = 0usize;
     let mut preview = String::new();
     for message in &messages {
-        tokens += estimate_message_tokens(message);
+        tokens += estimate_message_tokens_with_images(message, image_tokens);
         chars += message.content.chars().count();
         if message.content.is_empty() {
             continue;
@@ -1264,6 +1355,7 @@ fn summary_entry(compaction: &Compaction) -> Entry {
         vec![ChatMessage::system(text)],
         None,
         false,
+        IMAGE_TOKEN_ESTIMATE,
     );
     entry.summary = true;
     entry.trimmable = false;
@@ -1880,6 +1972,7 @@ mod tests {
                 text: text.into(),
                 model: "m".into(),
                 reasoning: None,
+                reasoning_signature: None,
                 cancelled: false,
                 usage: None,
                 tool_calls: Vec::new(),
@@ -1910,6 +2003,7 @@ mod tests {
             &events,
             10_000,
             4_000,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             1.0,
@@ -1954,6 +2048,7 @@ mod tests {
             &events,
             1_000,
             4_000,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             1.0,
@@ -2020,6 +2115,7 @@ mod tests {
             &events,
             10_000,
             4_000,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &tools,
             1.0,
@@ -2047,6 +2143,7 @@ mod tests {
             &events,
             1_000,
             400,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &tools,
             1.0,
@@ -2070,6 +2167,7 @@ mod tests {
             &events,
             10_000,
             4_000,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             1.0,
@@ -2081,6 +2179,7 @@ mod tests {
             &events,
             10_000,
             4_000,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             2.0,
@@ -2312,6 +2411,7 @@ mod tests {
                     text: String::new(),
                     model: "m".into(),
                     reasoning: None,
+                    reasoning_signature: None,
                     cancelled: false,
                     usage: None,
                     tool_calls: vec![eix_core::ToolCall {
@@ -2459,6 +2559,7 @@ mod tests {
                 text: text.into(),
                 model: "m".into(),
                 reasoning: None,
+                reasoning_signature: None,
                 cancelled: false,
                 usage: None,
                 tool_calls: calls,
@@ -2586,8 +2687,9 @@ mod tests {
     }
 
     #[test]
-    fn dangling_tool_calls_never_emit_an_invalid_request() {
-        // One of two calls produced output: keep only the completed call.
+    fn dangling_tool_calls_are_closed_with_an_unknown_result() {
+        // One of two calls produced output: keep both calls paired, and mark
+        // the missing one as outcome-unknown instead of dropping it.
         let events = vec![
             user(1, "do it"),
             tool_step(2, "working", vec![call("a"), call("b")]),
@@ -2599,24 +2701,45 @@ mod tests {
             .find(|message| message.role == Role::Assistant)
             .unwrap();
         let calls = assistant.tool_calls.as_ref().expect("tool calls");
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 2);
         assert_eq!(calls[0].id, "a");
-        assert!(messages
+        assert_eq!(calls[1].id, "b");
+        let unknown = messages
             .iter()
-            .all(|message| message.tool_call_id.as_deref() != Some("b")));
+            .find(|message| message.tool_call_id.as_deref() == Some("b"))
+            .expect("synthetic result for b");
+        assert!(unknown.content.contains("outcome is unknown"));
 
-        // No results and no text: drop the step instead of sending a bare
-        // `tool_calls` block.
+        // No results and no text: keep the step but close the call with a
+        // synthetic result so the provider never sees a bare `tool_calls`.
         let events = vec![
             user(1, "do it"),
             tool_step(2, "", vec![call("a")]),
             user(3, "next"),
         ];
         let messages = Ledger::assemble("sys".into(), vec![], None, &events, 10_000).messages();
-        // system prompt + the two user messages; the empty step is gone.
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[2].content, "next");
-        assert!(messages.iter().all(|message| message.tool_calls.is_none()));
+        let assistant = messages
+            .iter()
+            .find(|message| message.role == Role::Assistant)
+            .expect("assistant step kept");
+        assert_eq!(assistant.tool_calls.as_ref().unwrap().len(), 1);
+        assert!(messages
+            .iter()
+            .any(|message| message.tool_call_id.as_deref() == Some("a")));
+    }
+
+    #[test]
+    fn compaction_prefix_is_an_exact_request_prefix() {
+        let events = vec![
+            user(1, "one"),
+            assistant(2, "a1"),
+            user(3, "two"),
+            assistant(4, "a2"),
+        ];
+        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 10_000);
+        let mut replay = ledger.prefix_before(3);
+        replay.extend(ledger.messages_in_range(3, 4));
+        assert_eq!(replay, ledger.messages());
     }
 
     #[test]
@@ -2679,6 +2802,7 @@ mod tests {
             &events,
             100_000,
             100,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             1.0,
@@ -2713,6 +2837,7 @@ mod tests {
             &events,
             10_000,
             4_000,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             1.0,
@@ -2763,6 +2888,7 @@ mod tests {
             &events,
             1_500,
             400,
+            IMAGE_TOKEN_ESTIMATE,
             &HashMap::new(),
             &[],
             1.0,

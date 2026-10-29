@@ -118,12 +118,56 @@ impl ProviderError {
     }
 }
 
+/// Parse an OpenAI-compatible usage object, including the nested cache and
+/// reasoning details newer providers expose.
+fn usage_from_openai(value: &Value) -> Option<Usage> {
+    let prompt = value
+        .get("prompt_tokens")
+        .or_else(|| value.get("input_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let completion = value
+        .get("completion_tokens")
+        .or_else(|| value.get("output_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let total = value
+        .get("total_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| prompt.saturating_add(completion));
+    let cache_read = value
+        .pointer("/prompt_tokens_details/cached_tokens")
+        .and_then(Value::as_u64)
+        .or_else(|| value.get("cache_read_input_tokens").and_then(Value::as_u64))
+        .unwrap_or_default();
+    let cache_creation = value
+        .get("cache_creation_input_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    let reasoning = value
+        .pointer("/completion_tokens_details/reasoning_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or_default();
+    (prompt > 0 || completion > 0 || total > 0).then_some(Usage {
+        prompt_tokens: prompt,
+        completion_tokens: completion,
+        total_tokens: total,
+        cache_read_tokens: cache_read,
+        cache_creation_tokens: cache_creation,
+        reasoning_tokens: reasoning,
+    })
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Completion {
     pub text: String,
     /// Streamed chain-of-thought (`reasoning_content` / `reasoning`), when the
-    /// provider exposes it. Never fed back as a chat message.
+    /// provider exposes it. The daemon may replay it on routes that require
+    /// thinking blocks for multi-turn tool use.
     pub reasoning: String,
+    /// Opaque provider signature for the reasoning block (Anthropic/DeepSeek
+    /// thinking). Replayed verbatim when the route supports it.
+    pub reasoning_signature: Option<String>,
     pub model: String,
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
@@ -202,7 +246,7 @@ impl Provider {
                 self.stream_openai(&sanitized, route, tools, cancel, &mut on_delta)
                     .await
             }
-            ProviderKind::Anthropic => {
+            ProviderKind::Anthropic | ProviderKind::DeepSeek => {
                 self.stream_anthropic(&sanitized, route, tools, cancel, &mut on_delta)
                     .await
             }
@@ -365,14 +409,13 @@ impl Provider {
         Ok(Completion {
             text: content,
             reasoning,
+            reasoning_signature: None,
             model: value
                 .get("model")
                 .and_then(Value::as_str)
                 .unwrap_or(model)
                 .to_string(),
-            usage: value
-                .get("usage")
-                .and_then(|u| serde_json::from_value(u.clone()).ok()),
+            usage: value.get("usage").and_then(usage_from_openai),
             finish_reason: value
                 .pointer("/choices/0/finish_reason")
                 .and_then(Value::as_str)
@@ -410,7 +453,7 @@ impl Provider {
             return Err(ProviderError::Cancelled);
         }
         let model = route.model.as_str();
-        let body = anthropic_body(messages, model, tools, self.max_output_tokens)?;
+        let body = anthropic_body(messages, route, model, tools, self.max_output_tokens)?;
         let mut request = self
             .client
             .post(&route.endpoint)
@@ -607,7 +650,7 @@ fn apply_auth(
 ) -> reqwest::RequestBuilder {
     use crate::auth::Secret;
     match (kind, secret) {
-        (ProviderKind::Anthropic, Secret::ApiKey(key)) => request
+        (ProviderKind::Anthropic | ProviderKind::DeepSeek, Secret::ApiKey(key)) => request
             .header("x-api-key", key)
             .header("anthropic-version", "2023-06-01"),
         (ProviderKind::Gemini, Secret::ApiKey(key)) => request.header("x-goog-api-key", key),
@@ -692,6 +735,7 @@ impl Accumulator {
         Completion {
             text: self.text,
             reasoning: self.reasoning,
+            reasoning_signature: None,
             model: self.model,
             usage: self.usage,
             finish_reason: self.finish_reason,
@@ -707,16 +751,30 @@ impl Accumulator {
 /// Convert the provider-agnostic transcript into an Anthropic Messages body.
 fn anthropic_body(
     messages: &[ChatMessage],
+    route: &ModelRoute,
     model: &str,
     tools: &[ToolDefinition],
     max_tokens: u32,
 ) -> Result<Value, ProviderError> {
     let mut system = Vec::new();
     let mut wire: Vec<Value> = Vec::new();
+    let mut in_history = false;
     for message in messages {
         match message.role {
             Role::System => {
-                if !message.content.trim().is_empty() {
+                if message.content.trim().is_empty() {
+                    continue;
+                }
+                // DeepSeek accepts a later system message as an in-place
+                // prompt/tool update. Keeping it at its original position
+                // preserves the preceding cache prefix.
+                if route.kind.deepseek_messages() && in_history {
+                    push_anthropic(
+                        &mut wire,
+                        "system",
+                        vec![json!({"type": "text", "text": message.content})],
+                    );
+                } else {
                     system.push(message.content.clone());
                 }
             }
@@ -739,6 +797,21 @@ fn anthropic_body(
             }
             Role::Assistant => {
                 let mut blocks = Vec::new();
+                if route.kind.reasoning_replay()
+                    && (message.reasoning_signature.is_some() || route.kind.deepseek_messages())
+                {
+                    if let Some(reasoning) = message
+                        .reasoning
+                        .as_deref()
+                        .filter(|text| !text.trim().is_empty())
+                    {
+                        let mut thinking = json!({"type": "thinking", "thinking": reasoning});
+                        if let Some(signature) = message.reasoning_signature.as_deref() {
+                            thinking["signature"] = json!(signature);
+                        }
+                        blocks.push(thinking);
+                    }
+                }
                 if !message.content.is_empty() {
                     blocks.push(json!({"type": "text", "text": message.content}));
                 }
@@ -767,6 +840,9 @@ fn anthropic_body(
                 push_anthropic(&mut wire, "user", vec![block]);
             }
         }
+        if message.role != Role::System {
+            in_history = true;
+        }
     }
 
     let mut body = json!({
@@ -788,6 +864,22 @@ fn anthropic_body(
             }))
             .collect::<Vec<_>>());
         body["tool_choice"] = json!({"type": "auto"});
+    }
+    if route.kind.deepseek_messages() {
+        if let Some(effort) = route.reasoning_effort.as_deref() {
+            if effort == "off" {
+                body["thinking"] = json!({"type": "disabled"});
+            } else {
+                let effort = match effort {
+                    "low" | "high" | "max" => effort,
+                    // eix's generic default is `medium`; DeepSeek's closest
+                    // quality-neutral level is `high`.
+                    _ => "high",
+                };
+                body["thinking"] = json!({"type": "enabled"});
+                body["output_config"] = json!({"effort": effort});
+            }
+        }
     }
     Ok(body)
 }
@@ -812,9 +904,12 @@ fn push_anthropic(wire: &mut Vec<Value>, role: &str, blocks: Vec<Value>) {
 struct AnthropicAccumulator {
     text: String,
     reasoning: String,
+    reasoning_signature: String,
     model: String,
     input_tokens: u64,
     output_tokens: u64,
+    cache_read_tokens: u64,
+    cache_creation_tokens: u64,
     finish_reason: Option<String>,
     saw_event: bool,
     done: bool,
@@ -826,9 +921,12 @@ impl AnthropicAccumulator {
         Self {
             text: String::new(),
             reasoning: String::new(),
+            reasoning_signature: String::new(),
             model: model.to_string(),
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_tokens: 0,
+            cache_creation_tokens: 0,
             finish_reason: None,
             saw_event: false,
             done: false,
@@ -843,18 +941,43 @@ impl AnthropicAccumulator {
         if let Some(tokens) = usage.get("output_tokens").and_then(Value::as_u64) {
             self.output_tokens = tokens;
         }
+        if let Some(tokens) = usage.get("cache_read_input_tokens").and_then(Value::as_u64) {
+            self.cache_read_tokens = tokens;
+        }
+        if let Some(tokens) = usage
+            .get("cache_creation_input_tokens")
+            .and_then(Value::as_u64)
+        {
+            self.cache_creation_tokens = tokens;
+        }
     }
 
     fn finish(self) -> Completion {
         let tool_calls = finish_tool_calls(self.tool_calls);
-        let usage = (self.input_tokens > 0 || self.output_tokens > 0).then_some(Usage {
-            prompt_tokens: self.input_tokens,
-            completion_tokens: self.output_tokens,
-            total_tokens: self.input_tokens.saturating_add(self.output_tokens),
-        });
+        let usage = (self.input_tokens > 0
+            || self.output_tokens > 0
+            || self.cache_read_tokens > 0
+            || self.cache_creation_tokens > 0)
+            .then_some(Usage {
+                prompt_tokens: self
+                    .input_tokens
+                    .saturating_add(self.cache_read_tokens)
+                    .saturating_add(self.cache_creation_tokens),
+                completion_tokens: self.output_tokens,
+                total_tokens: self
+                    .input_tokens
+                    .saturating_add(self.cache_read_tokens)
+                    .saturating_add(self.cache_creation_tokens)
+                    .saturating_add(self.output_tokens),
+                cache_read_tokens: self.cache_read_tokens,
+                cache_creation_tokens: self.cache_creation_tokens,
+                reasoning_tokens: 0,
+            });
         Completion {
             text: self.text,
             reasoning: self.reasoning,
+            reasoning_signature: (!self.reasoning_signature.is_empty())
+                .then_some(self.reasoning_signature),
             model: self.model,
             usage,
             finish_reason: self.finish_reason,
@@ -955,6 +1078,11 @@ where
                         }
                     }
                 }
+                "signature_delta" => {
+                    if let Some(signature) = delta.get("signature").and_then(Value::as_str) {
+                        acc.reasoning_signature.push_str(signature);
+                    }
+                }
                 "input_json_delta" => {
                     if let Some(partial) = delta.get("partial_json").and_then(Value::as_str) {
                         ensure_tool_slot(acc, index);
@@ -1017,6 +1145,9 @@ where
                 if let Some(text) = block.get("thinking").and_then(Value::as_str) {
                     acc.reasoning.push_str(text);
                     on_delta(StreamDelta::Reasoning(text));
+                }
+                if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                    acc.reasoning_signature.push_str(signature);
                 }
             }
             "tool_use" => {
@@ -1234,11 +1365,22 @@ impl GeminiAccumulator {
             .get("totalTokenCount")
             .and_then(Value::as_u64)
             .unwrap_or(prompt.saturating_add(completion));
+        let cache_read = usage
+            .get("cachedContentTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
+        let reasoning = usage
+            .get("thoughtsTokenCount")
+            .and_then(Value::as_u64)
+            .unwrap_or_default();
         if prompt > 0 || completion > 0 || total > 0 {
             self.usage = Some(Usage {
                 prompt_tokens: prompt,
                 completion_tokens: completion,
                 total_tokens: total,
+                cache_read_tokens: cache_read,
+                cache_creation_tokens: 0,
+                reasoning_tokens: reasoning,
             });
         }
     }
@@ -1247,6 +1389,7 @@ impl GeminiAccumulator {
         Completion {
             text: self.text,
             reasoning: self.reasoning,
+            reasoning_signature: None,
             model: self.model,
             usage: self.usage,
             finish_reason: self.finish_reason,
@@ -1433,7 +1576,13 @@ where
         acc.model = model.to_string();
     }
     if let Some(usage) = value.get("usage").filter(|u| !u.is_null()) {
-        acc.usage = serde_json::from_value(usage.clone()).ok();
+        let update = usage_from_openai(usage);
+        if let Some(update) = update {
+            match &mut acc.usage {
+                Some(existing) => existing.merge(&update),
+                None => acc.usage = Some(update),
+            }
+        }
     }
     if let Some(choice) = value.pointer("/choices/0") {
         if let Some(reasoning) = choice
@@ -1958,6 +2107,78 @@ mod tests {
         )
     }
 
+    fn test_route(kind: ProviderKind, model: &str) -> ModelRoute {
+        ModelRoute {
+            provider: "test".into(),
+            kind,
+            model: model.into(),
+            endpoint: String::new(),
+            api_key: None,
+            reasoning_effort: Some("high".into()),
+            input_cost: None,
+            output_cost: None,
+            context_tokens: None,
+        }
+    }
+
+    #[test]
+    fn parses_openai_cache_and_reasoning_usage() {
+        let usage = usage_from_openai(&json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 40,
+            "total_tokens": 140,
+            "prompt_tokens_details": {"cached_tokens": 80},
+            "completion_tokens_details": {"reasoning_tokens": 12}
+        }))
+        .unwrap();
+        assert_eq!(usage.prompt_tokens, 100);
+        assert_eq!(usage.cache_read_tokens, 80);
+        assert_eq!(usage.uncached_prompt_tokens(), 20);
+        assert_eq!(usage.reasoning_tokens, 12);
+        assert_eq!(usage.total_tokens, 140);
+    }
+
+    #[test]
+    fn deepseek_body_replays_signed_thinking_and_in_history_system_updates() {
+        let route = test_route(ProviderKind::DeepSeek, "deepseek-v4-flash");
+        let messages = vec![
+            ChatMessage::system("initial prompt"),
+            ChatMessage::user("do it"),
+            ChatMessage::assistant_with_reasoning(
+                "calling",
+                None,
+                Some("I should read the file".into()),
+                Some("sig-1".into()),
+            ),
+            ChatMessage::system("new instruction"),
+        ];
+        let body = anthropic_body(&messages, &route, "deepseek-v4-flash", &[], 4096).unwrap();
+        assert_eq!(body["system"], "initial prompt");
+        assert_eq!(body["thinking"]["type"], "enabled");
+        assert_eq!(body["output_config"]["effort"], "high");
+        let assistant = body["messages"][1]["content"].as_array().unwrap();
+        assert_eq!(assistant[0]["type"], "thinking");
+        assert_eq!(assistant[0]["signature"], "sig-1");
+        let last = body["messages"].as_array().unwrap().last().unwrap();
+        assert_eq!(last["role"], "system");
+        assert_eq!(last["content"][0]["text"], "new instruction");
+    }
+
+    #[test]
+    fn anthropic_body_does_not_send_deepseek_fields() {
+        let route = test_route(ProviderKind::Anthropic, "claude-sonnet");
+        let body = anthropic_body(
+            &[ChatMessage::user("hi")],
+            &route,
+            "claude-sonnet",
+            &[],
+            4096,
+        )
+        .unwrap();
+        assert!(body.get("thinking").is_none());
+        assert!(body.get("output_config").is_none());
+    }
+
     #[test]
     fn anthropic_body_splits_system_and_merges_tool_results() {
         let call = ToolCall {
@@ -1975,7 +2196,25 @@ mod tests {
             ChatMessage::tool("toolu_1", "contents"),
             ChatMessage::tool("toolu_2", "more"),
         ];
-        let body = anthropic_body(&messages, "claude-sonnet", &[tool_definition()], 4096).unwrap();
+        let route = ModelRoute {
+            provider: "test".into(),
+            kind: ProviderKind::Anthropic,
+            model: "claude-sonnet".into(),
+            endpoint: String::new(),
+            api_key: None,
+            reasoning_effort: None,
+            input_cost: None,
+            output_cost: None,
+            context_tokens: None,
+        };
+        let body = anthropic_body(
+            &messages,
+            &route,
+            "claude-sonnet",
+            &[tool_definition()],
+            4096,
+        )
+        .unwrap();
         assert_eq!(body["system"], "be brief");
         assert_eq!(body["max_tokens"], 4096);
         assert_eq!(body["messages"][0]["role"], "user");

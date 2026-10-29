@@ -30,6 +30,14 @@ api_key = ""
 # model = "deepseek-chat"
 # api_key_env = "DEEPSEEK_API_KEY"
 
+# DeepSeek native Messages protocol: signed thinking replay, effort control
+# (off/low/high/max), in-history prompt updates, and cache-token accounting.
+# [providers.deepseek-native]
+# kind = "deepseek"
+# base_url = "https://api.deepseek.com/anthropic"
+# model = "deepseek-v4-flash"
+# api_key_env = "DEEPSEEK_API_KEY"
+
 # [providers.openrouter]
 # base_url = "https://openrouter.ai/api/v1"
 # model = "anthropic/claude-sonnet-4"
@@ -178,6 +186,7 @@ auto_commit = true
 # auto_compact_keep_tokens = 8000
 # auto_compact_keep_turns = 2
 # tool_output_tokens = 4000
+# image_tokens = 1024
 # max_tool_schema_tokens = 12000
 # instructions_files = ["AGENTS.md"]
 # workspace_summary = true
