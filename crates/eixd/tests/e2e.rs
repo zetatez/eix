@@ -3694,18 +3694,19 @@ async fn recovers_sessions_left_running() -> anyhow::Result<()> {
     let attached: AttachResult = client
         .request("session.attach", json!({"session_id": "stale"}))
         .await?;
-    assert_eq!(attached.session.status, eix_core::SessionStatus::Error);
+    assert_eq!(attached.session.status, eix_core::SessionStatus::Paused);
     let error = attached
         .events
         .iter()
         .find(|event| event.kind == EventKind::Error)
         .expect("interrupted session error event");
-    // A turn that was actually running can be continued by the TUI.
+    // A turn that was actually running can be continued by the TUI, and the
+    // paused status lets a fresh client discover it from the session list.
     assert_eq!(error.payload["interrupted"], true);
     assert!(attached
         .events
         .iter()
-        .any(|e| { e.kind == EventKind::StatusChanged && e.payload["to"] == "error" }));
+        .any(|e| { e.kind == EventKind::StatusChanged && e.payload["to"] == "paused" }));
 
     // A turn waiting on the user cannot be continued without bypassing that
     // decision, so it gets a plain (non-resumable) error marker.

@@ -354,6 +354,22 @@ impl App {
                         // instead of attaching to an unrelated one.
                         None => self.create_session(tx, None),
                     }
+                    // Startup recovery leaves a turn that was running across a
+                    // daemon restart as `paused`. Resume every such user
+                    // session, not only the panes restored from the previous
+                    // workspace, so a reboot does not strand work in a session
+                    // that was closed (or on another cwd) at shutdown.
+                    let interrupted: Vec<String> = self
+                        .sessions
+                        .iter()
+                        .filter(|session| {
+                            !session.is_agent() && session.status == SessionStatus::Paused
+                        })
+                        .map(|session| session.id.clone())
+                        .collect();
+                    for session_id in interrupted {
+                        self.queue_resume(&session_id);
+                    }
                 } else {
                     self.reselect_current();
                 }

@@ -439,11 +439,11 @@ impl App {
         self.upsert_session(attached.session.clone(), false);
         let session_id = attached.session.id.clone();
         let is_subagent = attached.session.is_agent();
-        // A daemon restart marks an in-flight turn as interrupted. Its event
-        // log is intact, so an ordinary user session can be continued without
-        // asking the user to retype the prompt. Waiting-for-approval and
-        // waiting-for-input turns are not marked this way.
-        let resume = !is_subagent && interrupted_turn(&attached.events);
+        // Recovery marks a turn that was running when the daemon restarted as
+        // `paused`. Its event log is intact, so an ordinary user session can
+        // be continued without asking the user to retype the prompt.
+        // Waiting-for-approval and waiting-for-input turns stay errored.
+        let resume = !is_subagent && attached.session.status == SessionStatus::Paused;
         let has_more = attached.has_more;
         let mut view = SessionView::new(attached.session, attached.events);
         view.history_has_more = has_more;
@@ -595,18 +595,4 @@ impl App {
             Err(_) => (!self.sessions.is_empty()).then_some(0),
         }
     }
-}
-
-/// True when the last event says the daemon restarted mid-turn. The event log
-/// (user request, completed tool results) is persisted, so such a turn can be
-/// continued by sending a follow-up prompt.
-fn interrupted_turn(events: &[SessionEvent]) -> bool {
-    let Some(last) = events.last() else {
-        return false;
-    };
-    if last.kind != EventKind::Error {
-        return false;
-    }
-    serde_json::from_value::<ErrorPayload>(last.payload.clone())
-        .is_ok_and(|payload| payload.interrupted)
 }

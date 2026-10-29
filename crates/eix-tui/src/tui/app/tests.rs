@@ -3931,7 +3931,7 @@ fn an_interrupted_turn_resumes_after_attach() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     let mut session = Session::new("s1", "one", "/tmp");
-    session.status = SessionStatus::Error;
+    session.status = SessionStatus::Paused;
     app.sessions = vec![session.clone()];
     app.pending_attach = Some(PendingAttach {
         session_id: "s1".into(),
@@ -3981,12 +3981,15 @@ fn an_interrupted_turn_resumes_after_attach() {
 }
 
 #[test]
-fn non_interrupted_errors_and_agent_sessions_do_not_resume() {
-    for (interrupted, agent) in [(false, false), (true, true)] {
+fn errors_and_agent_sessions_do_not_resume() {
+    for (status, agent) in [
+        (SessionStatus::Error, false),
+        (SessionStatus::Paused, true),
+    ] {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         let mut session = Session::new("s1", "one", "/tmp");
-        session.status = SessionStatus::Error;
+        session.status = status;
         if agent {
             session.origin = eix_core::SessionOrigin::Agent;
         }
@@ -3995,19 +3998,10 @@ fn non_interrupted_errors_and_agent_sessions_do_not_resume() {
             session_id: "s1".into(),
             slot: AttachSlot::New,
         });
-        let events = vec![SessionEvent::new(
-            "s1",
-            1,
-            EventKind::Error,
-            serde_json::json!({
-                "message": "turn failed",
-                "interrupted": interrupted,
-            }),
-        )];
         app.handle_event(
             Event::Attached(AttachResult {
                 session,
-                events,
+                events: Vec::new(),
                 has_more: false,
             }),
             &tx,
@@ -4015,9 +4009,35 @@ fn non_interrupted_errors_and_agent_sessions_do_not_resume() {
         app.tick(&tx);
         assert!(
             find_command(&mut rx, |command| matches!(command, Command::Submit { .. })).is_none(),
-            "interrupted={interrupted} agent={agent}"
+            "status={status:?} agent={agent}"
         );
     }
+}
+
+#[test]
+fn startup_resumes_every_paused_session() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    let mut paused = Session::new("paused", "paused", "/tmp/eix-paused-workspace");
+    paused.status = SessionStatus::Paused;
+    let mut child = Session::new("child", "child", "/tmp/eix-paused-workspace");
+    child.status = SessionStatus::Paused;
+    child.origin = eix_core::SessionOrigin::Agent;
+    let idle = Session::new("idle", "idle", "/tmp/eix-paused-workspace");
+
+    app.handle_event(Event::Sessions(vec![paused, child, idle]), &tx);
+    app.tick(&tx);
+    let Some(Command::Submit {
+        session_id, text, ..
+    }) = find_command(&mut rx, |command| matches!(command, Command::Submit { .. }))
+    else {
+        panic!("paused session was not resumed");
+    };
+    assert_eq!(session_id, "paused");
+    assert!(text.contains("Continue from where you left off"), "{text}");
+    // Only the one paused user session is resumed.
+    app.tick(&tx);
+    assert!(find_command(&mut rx, |command| matches!(command, Command::Submit { .. })).is_none());
 }
 
 #[test]

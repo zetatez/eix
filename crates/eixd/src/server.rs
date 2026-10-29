@@ -2515,8 +2515,9 @@ impl Daemon {
         for session in running {
             // Only a turn that was actually running can be continued: an
             // approval or question is gone after a restart, so continuing
-            // would skip the user's decision. Those sessions keep the plain
-            // error marker.
+            // would skip the user's decision. A resumed turn is `paused` so
+            // every frontend can find it in the session list; the others keep
+            // the plain error marker.
             let interrupted = session.status == SessionStatus::Running;
             let message = if interrupted {
                 "daemon restarted while this turn was running".to_string()
@@ -2536,7 +2537,12 @@ impl Daemon {
             ) {
                 self.emit_event(&event);
             }
-            if let Err(err) = self.transition(&session.id, SessionStatus::Error) {
+            let target = if interrupted {
+                SessionStatus::Paused
+            } else {
+                SessionStatus::Error
+            };
+            if let Err(err) = self.transition(&session.id, target) {
                 eprintln!(
                     "eixd: cannot recover {}: {}",
                     session.id,
