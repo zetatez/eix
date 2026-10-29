@@ -2980,6 +2980,9 @@ impl Daemon {
                     .store
                     .set_session_archived(&params.session_id, params.archived)?
                     .ok_or_else(|| rpc("not_found", "unknown session"))?;
+                // A prompt queued behind the session's turn has nowhere to go
+                // once it is archived; drop it instead of retaining it.
+                self.queued.lock().await.remove(&params.session_id);
                 self.emit_value("session.updated", serde_json::to_value(&session)?);
                 Ok(serde_json::to_value(SessionResult { session })?)
             }
@@ -2993,6 +2996,7 @@ impl Daemon {
                     return Err(rpc("not_found", "unknown session"));
                 }
                 self.todos.lock().await.remove(&params.session_id);
+                self.queued.lock().await.remove(&params.session_id);
                 self.emit_value(
                     "session.deleted",
                     json!({ "session_id": params.session_id }),
@@ -3014,6 +3018,7 @@ impl Daemon {
                 let deleted = self.store.delete_session_if_unused(&params.session_id)?;
                 if deleted {
                     self.todos.lock().await.remove(&params.session_id);
+                    self.queued.lock().await.remove(&params.session_id);
                     self.emit_value(
                         "session.deleted",
                         json!({ "session_id": params.session_id }),
@@ -3956,15 +3961,26 @@ impl Daemon {
                 let flag = self.turns.lock().await.get(&params.session_id).cloned();
                 // Cancelling also discards prompts queued behind the running
                 // turn, so `cancelled` reflects both.
-                let had_queue = self
+                let dropped = self
                     .queued
                     .lock()
                     .await
                     .remove(&params.session_id)
-                    .is_some();
-                let cancelled = flag.is_some() || had_queue;
+                    .map_or(0, |queue| queue.len());
+                let cancelled = flag.is_some() || dropped > 0;
                 if let Some(flag) = flag {
                     flag.store(true, Ordering::SeqCst);
+                }
+                if dropped > 0 {
+                    // Other clients may be showing "queued"; tell them the
+                    // queue is gone instead of leaving them waiting.
+                    self.emit_value(
+                        "prompt.cancelled",
+                        json!({
+                            "session_id": params.session_id,
+                            "dropped": dropped,
+                        }),
+                    );
                 }
                 // Unblock a turn waiting on approval; it will notice the flag.
                 if let Some(pending) = self.approvals.lock().await.remove(&params.session_id) {
@@ -6009,10 +6025,7 @@ impl Daemon {
             // Prefetched read-only results for the attempt that succeeds. A
             // retried attempt throws its own map away, so stale results never
             // reach the batch.
-            let batch_prefetched: HashMap<
-                String,
-                tokio::task::JoinHandle<Option<tools::ToolOutcome>>,
-            >;
+            let batch_prefetched: PrefetchBatch;
             let completion = loop {
                 let bus = self.bus.clone();
                 let sid = session_id.to_string();
@@ -6023,13 +6036,10 @@ impl Daemon {
                 let estimated_prompt =
                     estimate_messages_tokens_with_images(&messages, config.context.image_tokens)
                         + tool_schema_tokens;
-                // Only a leading run of provably read-only calls is
+                // Only a leading run of single-path read-only calls is
                 // prefetched. A write, interactive call or malformed argument
                 // ends the prefix, because later reads may depend on it.
-                let mut prefetched: HashMap<
-                    String,
-                    tokio::task::JoinHandle<Option<tools::ToolOutcome>>,
-                > = HashMap::new();
+                let mut prefetched = PrefetchBatch::default();
                 let mut allow_prefetch = true;
                 let prefetch_daemon = Arc::clone(self);
                 let prefetch_session = session.clone();
@@ -6055,12 +6065,14 @@ impl Daemon {
                             if !allow_prefetch {
                                 return;
                             }
-                            let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments)
-                            else {
+                            // Malformed arguments end the prefix, and later
+                            // calls may depend on an earlier one, so nothing
+                            // after a barrier may start early.
+                            if serde_json::from_str::<Value>(&call.function.arguments).is_err() {
                                 allow_prefetch = false;
                                 return;
-                            };
-                            if !prefetch_safe(&call.function.name, &args, &prefetch_session.cwd) {
+                            }
+                            if !prefetch_safe(&call.function.name) {
                                 allow_prefetch = false;
                                 return;
                             }
@@ -6245,9 +6257,9 @@ impl Daemon {
             {
                 let dropped = completion.tool_calls.len();
                 completion.tool_calls.clear();
-                // The calls were discarded, so drop the work started for
-                // their possibly-partial arguments.
-                batch_prefetched.clear();
+                // The calls were discarded; dropping the batch aborts the
+                // work started for their possibly-partial arguments.
+                drop(std::mem::take(&mut batch_prefetched));
                 notices.push(format!(
                     "The previous response hit the output token limit and {dropped} tool call(s) \
                      were discarded because their arguments may be incomplete. Continue with a \
@@ -6408,7 +6420,6 @@ impl Daemon {
                 &mut batch_prefetched,
             )
             .await?;
-            batch_prefetched.clear();
             tool_calls_run += completion.tool_calls.len();
             if cancel.load(Ordering::SeqCst) {
                 self.finish_cancelled(session_id, turn_id, "", "", &model)?;
@@ -6473,7 +6484,7 @@ impl Daemon {
         messages: &mut Vec<ChatMessage>,
         tools: &mut Vec<ToolDefinition>,
         cancel: &Arc<AtomicBool>,
-        prefetched: &mut HashMap<String, tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
+        prefetched: &mut PrefetchBatch,
     ) -> Result<()> {
         let session = self.require_session(session_id)?;
         let agent_calls: Vec<ToolCall> = calls
@@ -6525,7 +6536,7 @@ impl Daemon {
             }
 
             let Some(kind) = self.parallel_call_kind(&session, call).await else {
-                let prefetched = take_prefetched(prefetched, &call.id);
+                let prefetched = prefetched.take(&call.id);
                 if let Err(err) = self
                     .run_tool_call(
                         session_id,
@@ -6550,7 +6561,7 @@ impl Daemon {
                     // command, interactive call, agent, or call needing
                     // approval. A read after a write therefore never joins the
                     // earlier read segment.
-                    let first_prefetched = take_prefetched(prefetched, &call.id);
+                    let first_prefetched = prefetched.take(&call.id);
                     let mut segment = vec![(call.clone(), decision, first_prefetched)];
                     index += 1;
                     while index < calls.len() {
@@ -6560,7 +6571,7 @@ impl Daemon {
                         }
                         match self.parallel_call_kind(&session, next).await {
                             Some(ParallelCall::Read(decision)) => {
-                                let ready = take_prefetched(prefetched, &next.id);
+                                let ready = prefetched.take(&next.id);
                                 segment.push((next.clone(), decision, ready));
                                 index += 1;
                             }
@@ -6758,6 +6769,9 @@ impl Daemon {
         prefetched: Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
     ) -> Result<ChatMessage> {
         let tool = call.function.name.as_str();
+        // A read-only call may be rejected by policy or cancelled before it
+        // reaches execution; abort its prefetched task in that case.
+        let mut prefetched = PrefetchedCall(prefetched);
         let args: Value = match serde_json::from_str(&call.function.arguments) {
             Ok(args) => args,
             Err(err) => {
@@ -6821,7 +6835,7 @@ impl Daemon {
                 "tool": tool,
             }),
         );
-        let outcome = match prefetched {
+        let outcome = match prefetched.take() {
             // Started while the response was still streaming. Awaiting it
             // here keeps `tool.started` and policy checks in call order.
             Some(handle) => handle.await.ok().flatten(),
@@ -7184,6 +7198,10 @@ impl Daemon {
         prefetched: Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
     ) -> Result<()> {
         let tool = call.function.name.as_str();
+        // Keep ownership of any prefetched task for the whole call: every
+        // early return (bad arguments, unknown tool, policy denial, approval
+        // error) aborts it instead of letting it run detached.
+        let mut prefetched = PrefetchedCall(prefetched);
         let args: Value = match serde_json::from_str(&call.function.arguments) {
             Ok(args) => args,
             Err(err) => {
@@ -7571,7 +7589,7 @@ impl Daemon {
                         "tool": tool,
                     }),
                 );
-                let prefetched = match prefetched {
+                let prefetched = match prefetched.take() {
                     // Started while the response was still streaming. Await
                     // it here so `tool.started` and policy checks stay in
                     // call order.
@@ -10654,26 +10672,73 @@ fn todo_context(items: &[eix_core::TodoItem]) -> String {
 }
 
 /// Whether a tool call can start while the model is still streaming the rest
-/// of the response. Only provably read-only tools qualify: `view_image` and
-/// the other daemon-handled tools need per-call state, so they stay on the
-/// normal path. A write or approval-gated call ends the prefetch prefix
-/// because a later read may depend on it.
-fn prefetch_safe(tool: &str, args: &Value, cwd: &Path) -> bool {
-    match tool {
-        "web_fetch" | "web_search" => true,
-        "exec_command" => command_is_parallel_readonly(args, cwd),
-        _ => false,
+/// of the response. Only tools with a single execution path qualify:
+/// `web_fetch` and `web_search` always run through `tools::execute_in`, so a
+/// prefetched result is byte-for-byte what the batch would have produced.
+///
+/// `exec_command` is deliberately excluded: the single-call path runs it
+/// through the daemon's process registry (`exec_command_outcome`), which owns
+/// output formatting, background continuation and sandbox escalation, while
+/// `tools::execute_in` reports differently and cannot escalate. `view_image`
+/// and the other daemon-handled tools need per-call state. A write or
+/// approval-gated call ends the prefetch prefix because a later read may
+/// depend on it.
+fn prefetch_safe(tool: &str) -> bool {
+    matches!(tool, "web_fetch" | "web_search")
+}
+
+/// Read-only calls started while the response streamed, keyed by call id.
+///
+/// Dropping the batch aborts whatever is still running, so a retry, a
+/// truncated response, or an early batch error cannot leave detached work
+/// behind. Results are taken one at a time and awaited at the execution
+/// point, after policy checks and `tool.started`.
+#[derive(Default)]
+struct PrefetchBatch(HashMap<String, tokio::task::JoinHandle<Option<tools::ToolOutcome>>>);
+
+impl PrefetchBatch {
+    fn insert(
+        &mut self,
+        call_id: String,
+        handle: tokio::task::JoinHandle<Option<tools::ToolOutcome>>,
+    ) {
+        self.0.insert(call_id, handle);
+    }
+
+    fn take(
+        &mut self,
+        call_id: &str,
+    ) -> Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>> {
+        self.0.remove(call_id)
     }
 }
 
-/// Take one prefetched handle out of the batch. The caller awaits it only at
-/// the execution point, after policy checks and `tool.started`, so a slow
-/// read can never hide the fact that the tool started.
-fn take_prefetched(
-    prefetched: &mut HashMap<String, tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
-    call_id: &str,
-) -> Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>> {
-    prefetched.remove(call_id)
+impl Drop for PrefetchBatch {
+    fn drop(&mut self) {
+        for (_, handle) in self.0.drain() {
+            handle.abort();
+        }
+    }
+}
+
+/// One prefetched call handed to `run_tool_call`. If the call is never
+/// awaited (policy denial, approval failure, or an earlier error), dropping
+/// this aborts the task instead of detaching it.
+#[derive(Default)]
+struct PrefetchedCall(Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>>);
+
+impl PrefetchedCall {
+    fn take(&mut self) -> Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>> {
+        self.0.take()
+    }
+}
+
+impl Drop for PrefetchedCall {
+    fn drop(&mut self) {
+        if let Some(handle) = self.0.take() {
+            handle.abort();
+        }
+    }
 }
 
 /// Largest diff rendered in the `/diff` overlay. Beyond this the tail is cut;

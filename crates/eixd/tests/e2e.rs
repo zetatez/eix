@@ -327,6 +327,84 @@ async fn a_prompt_submitted_while_busy_is_queued_and_started() -> anyhow::Result
 }
 
 #[tokio::test]
+async fn cancelling_a_session_drops_its_queued_prompts_and_broadcasts() -> anyhow::Result<()> {
+    let dir = temp_dir("queue-cancel");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider_delayed(
+        listener,
+        Arc::clone(&bodies),
+        Duration::from_millis(600),
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "queue-cancel", "cwd": dir}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "first"}),
+        )
+        .await?;
+    let second: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "second"}),
+        )
+        .await?;
+    assert!(second.queued, "the second prompt should be queued");
+    while client.next_notification().await?.method != "prompt.queued" {}
+
+    client
+        .request::<Value>("prompt.cancel", json!({"session_id": session_id}))
+        .await?;
+    let mut dropped = None;
+    loop {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "prompt.cancelled" => {
+                dropped = notification.params["dropped"].as_u64();
+            }
+            "turn.completed" => break,
+            _ => {}
+        }
+    }
+    assert_eq!(dropped, Some(1), "the queued prompt was dropped");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let users = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::UserMessage)
+        .count();
+    assert_eq!(users, 1, "the dropped prompt never started");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn auto_names_an_unnamed_session_after_two_turns() -> anyhow::Result<()> {
     let dir = temp_dir("auto-name");
     std::fs::create_dir_all(&dir)?;

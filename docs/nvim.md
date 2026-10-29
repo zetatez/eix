@@ -89,8 +89,8 @@ connect
 | `session.get` | `{session_id}` | 单个 session 详情 |
 | `session.subscribe` | `{session_ids?: string[] \| null}` | 收窄/恢复广播 |
 | `session.events` | `{session_id, after_seq?, before_seq?, limit?}` | 分页读取持久化事件，用于重连/补洞 |
-| `prompt.submit` | `{session_id, text, images?}` | 提交一轮 prompt |
-| `prompt.cancel` | `{session_id}` | 取消当前 turn |
+| `prompt.submit` | `{session_id, text, images?}` | 提交一轮 prompt；若该 session 已有 turn 在跑则入队并返回 `queued: true` 与空 `turn_id` |
+| `prompt.cancel` | `{session_id}` | 取消当前 turn，同时清空该 session 的排队 prompt |
 | `approval.respond` | `{session_id, approval_id, decision, reason?, hunks?, scope?}` | 审批；`decision` 为 `approve` / `deny` / `always` |
 | `input.respond` | `{session_id, input_id, option_index}` | 回答模型的提问 |
 | `session.mode` | `{session_id, mode, temporary?}` | 切换 plan/build/auto/full |
@@ -111,7 +111,10 @@ connect
 | `tool.started` / `tool.completed` | 工具调用生命周期 |
 | `tool.approval_required` | 需要审批；用 `approval.respond` 回复 |
 | `input.required` | 模型提问；用 `input.respond` 回复 |
-| `turn.completed` | 一轮结束，带 `cancelled` / `error` / `usage` / `cost` |
+| `turn.completed` | 一轮结束，带 `cancelled` / `error` / `usage` / `cost` / `rounds` |
+| `prompt.queued` | prompt 已入队，带 `session_id` / `position`（从 1 开始） |
+| `prompt.failed` | 排队 prompt 无法启动，带 `session_id` / `error`；不会静默丢弃 |
+| `prompt.cancelled` | 队列被 `prompt.cancel` 清空，带 `session_id` / `dropped`（丢弃条数） |
 | `session.event` | 持久化事件（transcript 的权威来源），`kind` 为 snake_case |
 | `session.updated` | session 元数据或状态变化 |
 | `process.output` / `process.exited` | 后台进程输出与退出 |
@@ -246,7 +249,9 @@ end)
 
 ## 注意事项
 
-- 同一 session 同时只应有一个 turn；重复 `prompt.submit` 会返回 busy 错误，插件应排队或提示。
+- 同一 session 同时只应有一个 turn；turn 运行期间再次 `prompt.submit` 会由 daemon 入队，
+  返回 `queued: true` 且 `turn_id` 为空。插件不需要自己排队，但应处理 `prompt.queued` /
+  `prompt.failed` / `prompt.cancelled` 通知来更新界面。
 - 每个 Neovim 进程是独立 client；多个窗口共享同一 daemon，不要假设自己是唯一写入者。
 - 不要在 libuv 回调里直接调用 `vim.api.nvim_*`；用 `vim.schedule` 切回主循环（上面的示例已处理）。
 - 插件关闭时关闭 pipe；重连后重新 `hello` + `session.subscribe` + `session.events` 补历史。

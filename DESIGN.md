@@ -751,13 +751,17 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - **daemon 侧 prompt 队列**：`prompt.submit` 在 session 已有 turn 运行时不再返回 `busy`，而是把
   输入放进该 session 的 FIFO 队列并立即返回 `queued: true`（`turn_id` 为空）。当前 turn 结束后
   由 daemon 依次启动排队项，每轮都重新做权限、worktree 与 context 准备；`prompt.cancel` 同时
-  清空队列。TUI 自己的客户端队列仍保留，daemon 队列主要覆盖跨客户端与 turn 边界竞态。
-  `prompt.queued` 通知带队列位置，启动失败时发 `prompt.failed` 而不是静默丢弃。
+  清空队列并广播 `prompt.cancelled`（带 `dropped`），让其他客户端结束“排队中”的界面。TUI
+  自己的客户端队列仍保留，daemon 队列主要覆盖跨客户端与 turn 边界竞态。
+  `prompt.queued` 通知带队列位置，启动失败时发 `prompt.failed` 而不是静默丢弃。TUI 消费这三个
+  通知：更新排队位置、在失败时显示错误、在队列被清空时退出排队状态。
 - **流式工具预取**：OpenAI 兼容流里，某个 tool call 的 `index` 升高或收到 `finish_reason` 时，
-  其参数已经完整。daemon 对**连续只读前缀**（`web_fetch` / `web_search` 与权限放行的只读
-  `exec_command`）立即启动执行，等流结束、工具批次开始时再按调用顺序回收结果；写入、交互、
-  审批类调用或参数解析失败会截断前缀。预取只执行策略已自动放行的调用，不写事件、不开审批卡；
-  重试或 `finish_reason=length` 丢弃该次尝试的结果。事件仍由正常批次路径统一记录。
+  其参数已经完整。daemon 对**连续只读前缀**（`web_fetch` / `web_search`）立即启动执行，等流
+  结束、工具批次开始时再按调用顺序回收结果；写入、交互、审批类调用或参数解析失败会截断前缀。
+  只预取单调用与并行读都走 `tools::execute_in` 的工具；`exec_command` 因单调用走进程注册表
+  （输出格式、后台续跑、沙箱升级不同）而不预取。预取只执行策略已自动放行的调用，不写事件、
+  不开审批卡；重试或 `finish_reason=length` 丢弃该次尝试的结果，剩余任务随批次 drop 一并
+  `abort`，不会留下后台工作。事件仍由正常批次路径统一记录。
 - **沙箱拒绝后的升级重试**：`exec_command` 在 `SandboxMode::Auto` 下被 `bwrap` 拒绝（`bwrap:`
   或 `Read-only file system` 且非零退出）时，daemon 弹一次审批；批准后以
   `sandbox_permissions=require_escalated` 免沙箱重试一次，拒绝则保留原始沙箱错误。`Required`
@@ -781,7 +785,7 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - `session.created|updated|status`、`session.attention`
 - `integration.updated`、`integration.merged`、`integration.attention`
 - `turn.started`、`message.delta`、`reasoning.delta`、`message.reset`、`turn.retrying`、`message.completed`
-- `turn.diff`、`turn.metrics`、`prompt.queued`、`prompt.failed`
+- `turn.diff`、`turn.metrics`、`prompt.queued`、`prompt.failed`、`prompt.cancelled`
 - `tool.requested`、`tool.approval_required`、`input.required`、`tool.started`、`tool.output`、`tool.completed`
 - `patch.proposed`、`patch.applied`、`patch.rejected`、`patch.conflict`
 - `process.started|output|exited`

@@ -156,6 +156,71 @@ impl App {
                     }
                 }
             }
+            "prompt.queued" => {
+                // The submit response also sets a queued status; a later
+                // position from another enqueue may arrive while it is shown.
+                if let Ok(queued) = serde_json::from_value::<PromptQueued>(notification.params) {
+                    let focused = self
+                        .views
+                        .iter()
+                        .position(|view| view.session.id == queued.session_id)
+                        .is_some_and(|index| index == self.focused);
+                    if focused && self.status.starts_with("queued") {
+                        self.status = format!(
+                            "queued · position {} · waiting for the running turn",
+                            queued.position.max(1)
+                        );
+                    }
+                }
+            }
+            "prompt.failed" => {
+                // A queued prompt can fail to start (e.g. the session entered
+                // integration). Without this the pane would keep showing the
+                // queued status forever.
+                if let Ok(failed) = serde_json::from_value::<PromptFailed>(notification.params) {
+                    let message = if failed.error.is_empty() {
+                        "queued prompt failed to start".to_string()
+                    } else {
+                        failed.error
+                    };
+                    match self
+                        .views
+                        .iter()
+                        .position(|view| view.session.id == failed.session_id)
+                    {
+                        Some(index) if index != self.focused => {
+                            self.views[index].unread = true;
+                        }
+                        Some(_) => {
+                            self.error = Some(message);
+                            self.status = "error".into();
+                        }
+                        None => {
+                            self.push_toast(message, ToastTone::Warning, ATTENTION_TOAST_DISPLAY)
+                        }
+                    }
+                }
+            }
+            "prompt.cancelled" => {
+                // Cancelling a session drops its queue on the daemon side;
+                // clear the status here so the pane does not wait forever.
+                if let Ok(cancelled) =
+                    serde_json::from_value::<PromptCancelled>(notification.params)
+                {
+                    let focused = self
+                        .views
+                        .iter()
+                        .position(|view| view.session.id == cancelled.session_id)
+                        .is_some_and(|index| index == self.focused);
+                    if focused && self.status.starts_with("queued") {
+                        self.status = if cancelled.dropped > 1 {
+                            format!("cancelled · {} queued prompts dropped", cancelled.dropped)
+                        } else {
+                            "cancelled · queued prompt dropped".into()
+                        };
+                    }
+                }
+            }
             "session.attention" => {
                 if let Ok(params) = serde_json::from_value::<AttentionParams>(notification.params) {
                     let mut alert = false;

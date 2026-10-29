@@ -2412,6 +2412,27 @@ struct TurnRef {
 }
 
 #[derive(Deserialize)]
+struct PromptQueued {
+    session_id: String,
+    #[serde(default)]
+    position: usize,
+}
+
+#[derive(Deserialize)]
+struct PromptFailed {
+    session_id: String,
+    #[serde(default)]
+    error: String,
+}
+
+#[derive(Deserialize)]
+struct PromptCancelled {
+    session_id: String,
+    #[serde(default)]
+    dropped: usize,
+}
+
+#[derive(Deserialize)]
 struct TurnRetrying {
     session_id: String,
     turn_id: String,
