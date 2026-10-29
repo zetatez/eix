@@ -703,7 +703,13 @@ pub struct PluginInitializeResult {
 
 /// Hook points understood by the host. Unknown points are rejected so a typo
 /// cannot silently disable a security-relevant hook.
-pub const PLUGIN_HOOK_POINTS: &[&str] = &["tool.before", "tool.after", "prompt.build", "turn.end"];
+pub const PLUGIN_HOOK_POINTS: &[&str] = &[
+    "tool.before",
+    "tool.after",
+    "prompt.build",
+    "turn.stop",
+    "turn.end",
+];
 
 /// UI surfaces the host knows how to render. `panel` and `status` are text
 /// surfaces; `picker` is reserved for a later milestone.
@@ -1401,6 +1407,7 @@ mod tests {
     #[test]
     fn hook_and_ui_names_are_closed_sets() {
         assert!(valid_hook_point("tool.before"));
+        assert!(valid_hook_point("turn.stop"));
         assert!(valid_hook_point("turn.end"));
         assert!(!valid_hook_point("tool.exec"));
         assert!(valid_ui_surface("panel"));

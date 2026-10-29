@@ -746,6 +746,34 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   回滚目录，但实际文件写入仍可并发。结果始终按调用顺序回填。
   内置工具描述保持短句；`tests` 用 token 上限防止提示词和 schema 重新膨胀。
 
+### 10.1 turn 循环增强（借鉴 Codex）
+
+- **daemon 侧 prompt 队列**：`prompt.submit` 在 session 已有 turn 运行时不再返回 `busy`，而是把
+  输入放进该 session 的 FIFO 队列并立即返回 `queued: true`（`turn_id` 为空）。当前 turn 结束后
+  由 daemon 依次启动排队项，每轮都重新做权限、worktree 与 context 准备；`prompt.cancel` 同时
+  清空队列。TUI 自己的客户端队列仍保留，daemon 队列主要覆盖跨客户端与 turn 边界竞态。
+  `prompt.queued` 通知带队列位置，启动失败时发 `prompt.failed` 而不是静默丢弃。
+- **流式工具预取**：OpenAI 兼容流里，某个 tool call 的 `index` 升高或收到 `finish_reason` 时，
+  其参数已经完整。daemon 对**连续只读前缀**（`web_fetch` / `web_search` 与权限放行的只读
+  `exec_command`）立即启动执行，等流结束、工具批次开始时再按调用顺序回收结果；写入、交互、
+  审批类调用或参数解析失败会截断前缀。预取只执行策略已自动放行的调用，不写事件、不开审批卡；
+  重试或 `finish_reason=length` 丢弃该次尝试的结果。事件仍由正常批次路径统一记录。
+- **沙箱拒绝后的升级重试**：`exec_command` 在 `SandboxMode::Auto` 下被 `bwrap` 拒绝（`bwrap:`
+  或 `Read-only file system` 且非零退出）时，daemon 弹一次审批；批准后以
+  `sandbox_permissions=require_escalated` 免沙箱重试一次，拒绝则保留原始沙箱错误。`Required`
+  模式永不升级。
+- **`turn.stop` 插件钩子**：模型给出最终回答后、`turn.completed` 之前运行；返回
+  `block` 时把 `reason` 作为提醒注入下一轮，同一 turn 最多阻塞 2 次，子 agent 不运行。
+  用于“测试必须通过才能停”这类团队策略。
+- **预算软提醒**：ledger 用量达到 `context.budget_tokens` 的 75% 时，每 turn 注入一次提醒，
+  让模型在旧工具输出被裁剪前主动收敛。
+- **`turn.diff`**：turn 开始时用 `git stash create` 生成一个 dangling commit 作为基线（不修改
+  index 与工作区；干净树退回 HEAD），结束时广播相对基线的 tracked 文件 unified diff，
+  超过 256 KiB 截断。untracked 文件不在其中。
+- **`turn.metrics`**：结构化广播 `rounds` / `tool_calls` / `tokens` / `auto_compactions` /
+  `context_recoveries` / `context_tokens` / `context_budget` / `duration_ms`，`turn.completed`
+  也带 `rounds`，便于外部前端做统计与回归对比。
+
 ## 11. 事件与协议（草案）
 
 **daemon → client（notification）**
@@ -753,6 +781,7 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - `session.created|updated|status`、`session.attention`
 - `integration.updated`、`integration.merged`、`integration.attention`
 - `turn.started`、`message.delta`、`reasoning.delta`、`message.reset`、`turn.retrying`、`message.completed`
+- `turn.diff`、`turn.metrics`、`prompt.queued`、`prompt.failed`
 - `tool.requested`、`tool.approval_required`、`input.required`、`tool.started`、`tool.output`、`tool.completed`
 - `patch.proposed`、`patch.applied`、`patch.rejected`、`patch.conflict`
 - `process.started|output|exited`

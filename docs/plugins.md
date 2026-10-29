@@ -20,7 +20,7 @@
 | 注册表     | tools / commands / events / hooks / ui / rpc；启动时做命名空间与能力校验                               |
 | 生命周期   | `disabled` / `starting` / `ready` / `degraded` / `failed` / `stopped`；连续 3 次后端失败进入 `degraded`，成功一次恢复 |
 | Host API   | `host.log/info/ping`、`storage.*`、`fs.*`、`net.request`、`secrets.get`、`session.*`、`ui.*`、`notify`、`rpc.call`、`blob.*`、`job.*` |
-| Hooks      | `tool.before` / `tool.after` / `prompt.build` / `turn.end`，按 priority + 插件名排序                  |
+| Hooks      | `tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end`，按 priority + 插件名排序                  |
 | Action 命令 | manifest 或运行时 `commands` 的 `action`；host 调用 `commands/run`，可返回 prompt 或文本输出          |
 | 声明式插件 | 仅含 `[[contributes.commands]]` 的包不启动进程                                                         |
 | 工具结果   | content blocks（text/image/resource/diff/json）+ `structured` + `is_error`                             |
@@ -54,7 +54,7 @@ v1 使用 `schema = 1`、`PLUGIN_API_VERSION = 1`、顶层 `[server]`，工具�
 
 已在后续里程碑解决：
 
-4. hooks：`tool.before` / `tool.after` / `prompt.build` / `turn.end` 已接入 turn 与工具管线。
+4. hooks：`tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end` 已接入 turn 与工具管线。
 5. UI 贡献：文本 `panel` / `status` 表面与 `host.notify` 已接入 TUI；自定义视图树仍待实现。
 6. 包管理：提供 `pack` / `verify` / `install`、SHA-256 checksums、Ed25519 签名和本地 trust store。
 7. settings schema：manifest 可声明 JSON Schema，`/plugins <name>` 展示 schema 与当前值。
@@ -492,6 +492,7 @@ host     -> plugin A: result
 | `tool.before` | 正常权限判定之后、审批与执行之前 | 返回 `deny` 否决工具；不能批准 | `on_error` = `allow` / `deny` / `ignore` |
 | `tool.after` | 工具执行完成、记录结果之前 | 用 `output` 替换工具输出 | 记录错误并继续 |
 | `prompt.build` | 用户 prompt 提交、写入事件之前 | 用 `prompt` 替换用户消息 | 记录错误并继续 |
+| `turn.stop` | 模型给出最终回答、turn 完成之前 | 返回 `block` 阻止完成，`reason` 会作为提醒进入下一轮 | `on_error` = `allow` / `deny` / `ignore`；`deny` 视为阻塞 |
 | `turn.end` | turn 成功或失败之后 | 只读通知；作为 `hooks/run` 请求发送 | 记录错误并继续 |
 
 hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力：
@@ -509,6 +510,7 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 {"deny":true,"reason":"generated file"}
 {"output":"redacted tool output"}
 {"prompt":"rewritten user prompt"}
+{"block":true,"reason":"tests are still failing"}
 ```
 
 规则：
@@ -516,6 +518,7 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 - `tool.before` 的 `deny` / `action: "deny"` / `decision: "deny"` / `allow: false` 都表示否决；`reason` 会进入工具结果。
 - `tool.after` 的 `output` 替换当前输出，并受插件输出上限约束。
 - `prompt.build` 的 `prompt` 为空或超限时忽略；其余 hook 看到的是上一条 hook 的结果。
+- `turn.stop` 的 `block` / `action: "block"` / `decision: "block"` 会阻止 turn 结束；`reason` 作为系统提醒注入下一轮。同一 turn 最多阻塞 2 次，避免插件把 turn 永久挂起。子 agent 的 turn 不运行该 hook。
 - `turn.end` 的返回值被忽略，hooks 不能改变 turn 结果。
 
 ### 8.3 顺序、超时与并发
@@ -524,6 +527,7 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 - 超时：每个 hook 可单独设置；超时后按 `on_error` 处理，`tool.before` 的 `deny` 策略会否决工具。
 - 预算：没有跨 hook 的总预算；每个插件受自身请求超时与 hook 超时约束。
 - `turn.end` 在后台任务中发送，不阻塞 turn 完成。
+- `turn.stop` 会阻塞 turn 完成，因此超时会计入用户等待；保持 hook 快速。
 - hook 内触发的工具调用不会再触发同类 hook（调用来自插件进程，不进入 turn 工具管线）。
 
 ### 8.4 审批权

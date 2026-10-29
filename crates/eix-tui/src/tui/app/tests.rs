@@ -582,6 +582,7 @@ fn sending_and_status_changes_keep_the_session_order() {
     let submitted = SubmitResult {
         session: app.views[2].session.clone(),
         turn_id: "turn-c".into(),
+        queued: false,
     };
     app.submitted(submitted);
     assert_eq!(view_order(&app), vec!["a", "b", "c"]);

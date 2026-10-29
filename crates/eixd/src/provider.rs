@@ -228,23 +228,41 @@ impl Provider {
     /// placeholders the model echoes back are restored before the caller sees
     /// the completion. This covers normal turns, `/btw`, and automatic context
     /// summaries because they all go through this method.
-    pub async fn stream_chat<F>(
+    pub async fn stream_chat<F, G>(
         &self,
         messages: &[ChatMessage],
         route: &ModelRoute,
         tools: &[ToolDefinition],
         cancel: &AtomicBool,
         mut on_delta: F,
+        mut on_tool_call: G,
     ) -> Result<Completion, ProviderError>
     where
         F: FnMut(StreamDelta<'_>) + Send,
+        G: FnMut(ToolCall) + Send,
     {
         let mut redactor = SecretRedactor::new(self.redaction_salt.clone());
         let sanitized = redactor.redact_messages(messages);
+        // Tool-call arguments are restored here, so the prefetch callback sees
+        // the same bytes the caller will execute later.
+        let mut emit_tool_call = |call: ToolCall| {
+            let mut call = call;
+            if restore_tool_arguments(&call.function.name) {
+                call.function.arguments = redactor.restore_json(&call.function.arguments);
+            }
+            on_tool_call(call);
+        };
         let mut result = match route.kind {
             ProviderKind::OpenAi => {
-                self.stream_openai(&sanitized, route, tools, cancel, &mut on_delta)
-                    .await
+                self.stream_openai(
+                    &sanitized,
+                    route,
+                    tools,
+                    cancel,
+                    &mut on_delta,
+                    &mut emit_tool_call,
+                )
+                .await
             }
             ProviderKind::Anthropic | ProviderKind::DeepSeek => {
                 self.stream_anthropic(&sanitized, route, tools, cancel, &mut on_delta)
@@ -267,16 +285,18 @@ impl Provider {
         result
     }
 
-    async fn stream_openai<F>(
+    async fn stream_openai<F, G>(
         &self,
         messages: &[ChatMessage],
         route: &ModelRoute,
         tools: &[ToolDefinition],
         cancel: &AtomicBool,
         mut on_delta: F,
+        on_tool_call: &mut G,
     ) -> Result<Completion, ProviderError>
     where
         F: FnMut(StreamDelta<'_>) + Send,
+        G: FnMut(ToolCall),
     {
         if cancel.load(Ordering::Relaxed) {
             return Err(ProviderError::Cancelled);
@@ -337,13 +357,13 @@ impl Provider {
             }
             let chunk = chunk.map_err(|e| ProviderError::Http(e.to_string()))?;
             for data in decoder.feed(&chunk) {
-                if apply_data(&data, &mut acc, &mut on_delta)? {
+                if apply_data_with_tools(&data, &mut acc, &mut on_delta, on_tool_call)? {
                     return Ok(acc.finish());
                 }
             }
         }
         for data in decoder.finish() {
-            if apply_data(&data, &mut acc, &mut on_delta)? {
+            if apply_data_with_tools(&data, &mut acc, &mut on_delta, on_tool_call)? {
                 return Ok(acc.finish());
             }
         }
@@ -686,9 +706,11 @@ struct Accumulator {
     finish_reason: Option<String>,
     saw_event: bool,
     tool_calls: Vec<PartialToolCall>,
+    /// Number of leading tool calls already handed to the prefetch callback.
+    emitted: usize,
 }
 
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct PartialToolCall {
     id: String,
     kind: String,
@@ -706,6 +728,7 @@ impl Accumulator {
             finish_reason: None,
             saw_event: false,
             tool_calls: Vec::new(),
+            emitted: 0,
         }
     }
 
@@ -1549,15 +1572,34 @@ fn finish_tool_calls(calls: Vec<PartialToolCall>) -> Vec<ToolCall> {
 }
 
 /// Apply one SSE `data:` payload. Returns `true` when the stream is done.
+/// Test-only: production goes through [`apply_data_with_tools`].
+#[cfg(test)]
 fn apply_data<F>(data: &str, acc: &mut Accumulator, on_delta: &mut F) -> Result<bool, ProviderError>
 where
     F: FnMut(StreamDelta<'_>),
+{
+    apply_data_with_tools(data, acc, on_delta, &mut |_| {})
+}
+
+/// Like [`apply_data`], but hands tool calls whose arguments are complete to
+/// `on_tool_call` before the stream ends. The callback may start read-only
+/// work early; it must be cheap because it runs inside the SSE loop.
+fn apply_data_with_tools<F, G>(
+    data: &str,
+    acc: &mut Accumulator,
+    on_delta: &mut F,
+    on_tool_call: &mut G,
+) -> Result<bool, ProviderError>
+where
+    F: FnMut(StreamDelta<'_>),
+    G: FnMut(ToolCall),
 {
     let data = data.trim();
     if data.is_empty() {
         return Ok(false);
     }
     if data == "[DONE]" {
+        emit_remaining_tool_calls(acc, on_tool_call);
         return Ok(true);
     }
 
@@ -1608,6 +1650,9 @@ where
                     .get("index")
                     .and_then(Value::as_u64)
                     .unwrap_or(acc.tool_calls.len() as u64) as usize;
+                // A new index means every lower one has all of its argument
+                // fragments; hand those to the prefetch callback now.
+                emit_tool_calls_before(acc, index, on_tool_call);
                 if acc.tool_calls.len() <= index {
                     acc.tool_calls
                         .resize_with(index + 1, PartialToolCall::default);
@@ -1631,9 +1676,58 @@ where
         }
         if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
             acc.finish_reason = Some(reason.to_string());
+            // Arguments are complete once a finish reason arrives.
+            emit_remaining_tool_calls(acc, on_tool_call);
         }
     }
     Ok(false)
+}
+
+/// Convert one accumulated slot into a [`ToolCall`], using the same fallbacks
+/// as [`finish_tool_calls`].
+fn tool_call_from_partial(index: usize, call: PartialToolCall) -> ToolCall {
+    ToolCall {
+        id: if call.id.is_empty() {
+            format!("call_{index}")
+        } else {
+            call.id
+        },
+        kind: if call.kind.is_empty() {
+            "function".to_string()
+        } else {
+            call.kind
+        },
+        function: FunctionCall {
+            name: call.name,
+            arguments: call.arguments,
+        },
+    }
+}
+
+/// Emit tool calls below `index` whose name is known. Stops at the first slot
+/// still waiting for its name; the next higher index (or the end of the
+/// stream) will retry it.
+fn emit_tool_calls_before<G>(acc: &mut Accumulator, index: usize, on_tool_call: &mut G)
+where
+    G: FnMut(ToolCall),
+{
+    while acc.emitted < index.min(acc.tool_calls.len()) {
+        let slot = acc.emitted;
+        if acc.tool_calls[slot].name.is_empty() {
+            break;
+        }
+        acc.emitted += 1;
+        let call = acc.tool_calls[slot].clone();
+        on_tool_call(tool_call_from_partial(slot, call));
+    }
+}
+
+fn emit_remaining_tool_calls<G>(acc: &mut Accumulator, on_tool_call: &mut G)
+where
+    G: FnMut(ToolCall),
+{
+    let len = acc.tool_calls.len();
+    emit_tool_calls_before(acc, len, on_tool_call);
 }
 
 /// Reasoning-capable providers expose the chain of thought under different
@@ -1960,6 +2054,57 @@ mod tests {
         assert_eq!(done.tool_calls.len(), 2);
         assert_eq!(done.tool_calls[0].function.name, "exec_command");
         assert_eq!(done.tool_calls[1].function.name, "apply_patch");
+    }
+
+    #[test]
+    fn emits_complete_tool_calls_before_the_stream_ends() {
+        let mut acc = Accumulator::new("m");
+        let mut on_delta = |_: StreamDelta<'_>| {};
+        let mut emitted = Vec::new();
+
+        // Call 0 is complete once index 1 appears.
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"exec_command","arguments":"{\"cmd\":\"ls\"}"}},{"index":1,"id":"b","function":{"name":"web_fetch","arguments":"{\"url\":\"x\"}"}}]}}]}"#;
+        apply_data_with_tools(first, &mut acc, &mut on_delta, &mut |call: ToolCall| {
+            emitted.push(call.function.name);
+        })
+        .unwrap();
+        assert_eq!(emitted, vec!["exec_command"]);
+
+        // The finish reason completes the trailing call and keeps both calls
+        // in the returned completion.
+        let last = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        apply_data_with_tools(last, &mut acc, &mut on_delta, &mut |call: ToolCall| {
+            emitted.push(call.function.name);
+        })
+        .unwrap();
+        assert_eq!(emitted, vec!["exec_command", "web_fetch"]);
+
+        let done = acc.finish();
+        assert_eq!(done.tool_calls.len(), 2);
+        assert_eq!(done.tool_calls[0].id, "a");
+        assert_eq!(done.tool_calls[1].function.name, "web_fetch");
+        assert_eq!(done.tool_calls[1].function.arguments, r#"{"url":"x"}"#);
+    }
+
+    #[test]
+    fn emits_remaining_tool_calls_on_done() {
+        let mut acc = Accumulator::new("m");
+        let mut on_delta = |_: StreamDelta<'_>| {};
+        let mut emitted = 0;
+        let chunk = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"a","function":{"name":"web_search","arguments":"{}"}}]}}]}"#;
+        apply_data_with_tools(chunk, &mut acc, &mut on_delta, &mut |_: ToolCall| {
+            emitted += 1;
+        })
+        .unwrap();
+        assert_eq!(emitted, 0);
+        assert!(
+            apply_data_with_tools("[DONE]", &mut acc, &mut on_delta, &mut |_: ToolCall| {
+                emitted += 1
+            })
+            .unwrap()
+        );
+        assert_eq!(emitted, 1);
+        assert_eq!(acc.finish().tool_calls.len(), 1);
     }
 
     #[test]

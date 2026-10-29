@@ -503,12 +503,29 @@ impl App {
             .find(|view| view.session.id == submitted.session.id)
         {
             view.session = submitted.session.clone();
-            view.stream = Some(StreamState::new(submitted.turn_id));
-            view.folds.remove(&FoldId::Live);
-            view.follow = true;
+            if submitted.queued {
+                // The daemon queued the prompt behind a running turn. Its
+                // `turn.started` notification carries the real turn id; a
+                // stream keyed on an empty id would drop every delta.
+                view.folds.remove(&FoldId::Live);
+                view.follow = true;
+                self.status = "queued · waiting for the running turn".into();
+            } else {
+                // Older deltas may already have created the stream through
+                // `turn.started`; keep them instead of resetting the text.
+                if view
+                    .stream
+                    .as_ref()
+                    .is_none_or(|stream| stream.turn_id != submitted.turn_id)
+                {
+                    view.stream = Some(StreamState::new(submitted.turn_id));
+                }
+                view.folds.remove(&FoldId::Live);
+                view.follow = true;
+                self.status = "running".into();
+            }
         }
         self.error = None;
-        self.status = "running".into();
     }
 
     /// Hide the `<Space>` leader hint as soon as the next key arrives. The

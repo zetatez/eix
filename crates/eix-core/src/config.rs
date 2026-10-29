@@ -689,6 +689,9 @@ pub struct ToolsConfig {
     pub sandbox_writable_roots: Vec<String>,
     /// Copy what a mutating tool can change before it runs.
     pub snapshots: bool,
+    /// Emit a `turn.diff` notification with the tracked-file diff a turn
+    /// produced. The baseline is captured without touching the working tree.
+    pub turn_diff: bool,
     /// Explicit permission rules. All matching rules are considered; `deny`
     /// wins, then the most specific `ask`/`allow`/`sandbox` rule.
     pub rules: Vec<PermissionRule>,
@@ -779,6 +782,7 @@ impl Default for ToolsConfig {
             ],
             sandbox_writable_roots: Vec::new(),
             snapshots: true,
+            turn_diff: true,
             rules: Vec::new(),
             external_directory: Vec::new(),
             network_allow: Vec::new(),

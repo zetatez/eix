@@ -1132,6 +1132,56 @@ impl PluginManager {
         current
     }
 
+    /// Run `turn.stop` hooks before a turn is allowed to finish. A hook that
+    /// returns `{"block": true, "reason": "..."}` keeps the turn alive: the
+    /// daemon feeds the reason back to the model and samples again. This is
+    /// for team policies such as "tests must pass before you stop".
+    pub async fn run_turn_stop(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        message: &str,
+        cwd: &Path,
+    ) -> Option<String> {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return None;
+        }
+        for hook in self.hook_refs("turn.stop").await {
+            let Some(backend) = self.hook_backend(&hook).await else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "point": "turn.stop",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "message": message,
+                "workspace": cwd,
+                "cwd": cwd,
+            });
+            match call_hook(&backend, &hook, request).await {
+                Ok(value) => {
+                    self.record_result(&hook.plugin, true, None).await;
+                    if let Some(reason) = turn_stop_reason(&value) {
+                        return Some(cap(&reason, 4096));
+                    }
+                }
+                Err(err) => {
+                    let message = redact(&format!("{err:#}"));
+                    eprintln!(
+                        "eixd: plugin {} hook turn.stop failed: {message}",
+                        hook.plugin
+                    );
+                    self.record_result(&hook.plugin, false, Some(&message))
+                        .await;
+                    if hook.on_error == "deny" {
+                        return Some(format!("plugin {} hook failed", hook.plugin));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Fire-and-forget `turn.end` notification. Turn completion must not wait
     /// on plugin bookkeeping.
     pub fn run_turn_end(
@@ -1895,6 +1945,22 @@ async fn route_rpc(
         .map_err(|err| redact(&format!("{err:#}")))
 }
 
+/// Parse a `turn.stop` hook response. A block may use `block`, `action` or
+/// `decision` so plugins can share the `tool.before` vocabulary.
+fn turn_stop_reason(value: &Value) -> Option<String> {
+    let block = value.get("block").and_then(Value::as_bool) == Some(true)
+        || value.get("action").and_then(Value::as_str) == Some("block")
+        || value.get("decision").and_then(Value::as_str) == Some("block");
+    block.then(|| {
+        value
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("a turn.stop hook blocked the turn")
+            .to_string()
+    })
+}
+
 fn cap(text: &str, max: usize) -> String {
     if text.len() <= max {
         return text.to_string();
@@ -1938,6 +2004,24 @@ mod tests {
             has_server: false,
             declarative_commands: Vec::new(),
         }
+    }
+
+    #[test]
+    fn turn_stop_blocks_on_any_decision_spelling() {
+        assert_eq!(
+            turn_stop_reason(&json!({"block": true, "reason": "tests failing"})),
+            Some("tests failing".to_string())
+        );
+        assert_eq!(
+            turn_stop_reason(&json!({"action": "block"})),
+            Some("a turn.stop hook blocked the turn".to_string())
+        );
+        assert_eq!(
+            turn_stop_reason(&json!({"decision": "block", "reason": " "})),
+            Some("a turn.stop hook blocked the turn".to_string())
+        );
+        assert_eq!(turn_stop_reason(&json!({"block": false})), None);
+        assert_eq!(turn_stop_reason(&json!({"action": "allow"})), None);
     }
 
     #[test]

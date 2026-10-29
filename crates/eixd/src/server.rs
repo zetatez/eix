@@ -6,7 +6,7 @@
 //! re-attaching and replaying the event log.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io;
@@ -457,6 +457,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         lsp: Mutex::new(crate::lsp::LspSet::new()),
         todos: Mutex::new(HashMap::new()),
         turns: Mutex::new(HashMap::new()),
+        queued: Mutex::new(HashMap::new()),
         worktree_creating: Mutex::new(HashSet::new()),
         integration_lock: Mutex::new(()),
         approvals: Mutex::new(HashMap::new()),
@@ -773,6 +774,10 @@ pub(crate) struct Daemon {
     todos: Mutex<HashMap<SessionId, Vec<eix_core::TodoItem>>>,
     /// In-flight turns, used for busy checks and cancellation.
     turns: Mutex<HashMap<SessionId, Arc<AtomicBool>>>,
+    /// Prompts accepted while a turn was already running. The next turn starts
+    /// automatically when the current one finishes, so a client that races the
+    /// turn boundary gets queued instead of `busy`.
+    queued: Mutex<HashMap<SessionId, VecDeque<QueuedPrompt>>>,
     /// Sessions whose first prompt is currently creating a worktree, so two
     /// concurrent prompts cannot create two branches.
     worktree_creating: Mutex<HashSet<SessionId>>,
@@ -882,6 +887,25 @@ struct ModelCatalogCache {
     fetched_at: Option<Instant>,
     models: Vec<eix_core::ModelInfo>,
     warnings: Vec<String>,
+}
+
+/// A prompt accepted while the session was busy. Only the inputs are kept;
+/// permission, worktree and context setup happen when the turn actually
+/// starts, so a queued prompt sees the state left by the previous turn.
+#[derive(Clone)]
+struct QueuedPrompt {
+    text: String,
+    images: Vec<String>,
+    origin: Origin,
+}
+
+/// Outcome of offering to re-run a sandbox-denied command with more
+/// permissions.
+enum Escalated {
+    /// The user approved and the command ran again outside the sandbox.
+    Retried(tools::ToolOutcome),
+    /// The user declined (or the turn was cancelled); keep the sandbox error.
+    Declined,
 }
 
 struct PendingApproval {
@@ -1075,7 +1099,7 @@ impl Daemon {
         let cancel = AtomicBool::new(false);
         let provider = self.provider.load_full();
         match provider
-            .stream_chat(&messages, &route, &[], &cancel, |_| {})
+            .stream_chat(&messages, &route, &[], &cancel, |_| {}, |_| {})
             .await
         {
             Ok(completion) => {
@@ -3923,12 +3947,22 @@ impl Daemon {
             }
             "prompt.submit" => {
                 let params: SubmitParams = parse_params(request.params.clone())?;
-                Ok(serde_json::to_value(self.submit(params, origin).await?)?)
+                Ok(serde_json::to_value(
+                    self.submit_or_queue(params, origin).await?,
+                )?)
             }
             "prompt.cancel" => {
                 let params: SessionRef = parse_params(request.params.clone())?;
                 let flag = self.turns.lock().await.get(&params.session_id).cloned();
-                let cancelled = flag.is_some();
+                // Cancelling also discards prompts queued behind the running
+                // turn, so `cancelled` reflects both.
+                let had_queue = self
+                    .queued
+                    .lock()
+                    .await
+                    .remove(&params.session_id)
+                    .is_some();
+                let cancelled = flag.is_some() || had_queue;
                 if let Some(flag) = flag {
                     flag.store(true, Ordering::SeqCst);
                 }
@@ -4572,19 +4606,26 @@ impl Daemon {
         let route = self.config.load().route(model);
         let provider = self.provider.load_full();
         let completion = provider
-            .stream_chat(&messages, &route, &[], cancel, |delta| {
-                if let crate::provider::StreamDelta::Content(chunk) = delta {
-                    text.push_str(chunk);
-                    let _ = bus.send(Notification::from_value(
-                        "btw.delta",
-                        json!({
-                            "session_id": sid,
-                            "btw_id": id,
-                            "delta": chunk,
-                        }),
-                    ));
-                }
-            })
+            .stream_chat(
+                &messages,
+                &route,
+                &[],
+                cancel,
+                |delta| {
+                    if let crate::provider::StreamDelta::Content(chunk) = delta {
+                        text.push_str(chunk);
+                        let _ = bus.send(Notification::from_value(
+                            "btw.delta",
+                            json!({
+                                "session_id": sid,
+                                "btw_id": id,
+                                "delta": chunk,
+                            }),
+                        ));
+                    }
+                },
+                |_| {},
+            )
             .await
             .map_err(|err| anyhow::anyhow!("{err}"))?;
         if cancel.load(Ordering::SeqCst) {
@@ -5093,14 +5134,146 @@ impl Daemon {
         self.submit_inner(params, false, origin).await
     }
 
+    /// Submit a prompt, or queue it when the session's turn is still running.
+    ///
+    /// The daemon owns this queue so that a client racing the turn boundary
+    /// gets its prompt accepted instead of a `busy` error it has to retry.
+    /// Queued prompts keep only their inputs: permissions, worktree and
+    /// context are resolved when the turn actually starts.
+    async fn submit_or_queue(
+        self: &Arc<Self>,
+        params: SubmitParams,
+        origin: Origin,
+    ) -> Result<SubmitResult> {
+        let session_id = params.session_id.clone();
+        if self.turns.lock().await.contains_key(&session_id) {
+            return self.enqueue_prompt(params, origin).await;
+        }
+        match self.submit_inner(params.clone(), false, origin).await {
+            Ok(result) => Ok(result),
+            Err(err) => {
+                // Only a turn that started between the check above and the
+                // claim inside `submit_inner` is queued. Other errors (active
+                // integration, bad images, ...) keep their failure.
+                let racing = self.turns.lock().await.contains_key(&session_id);
+                if racing && is_busy_error(&err) {
+                    self.enqueue_prompt(params, origin).await
+                } else {
+                    Err(err)
+                }
+            }
+        }
+    }
+
+    async fn enqueue_prompt(
+        self: &Arc<Self>,
+        params: SubmitParams,
+        origin: Origin,
+    ) -> Result<SubmitResult> {
+        let text = params.text.trim().to_string();
+        if text.is_empty() && params.images.is_empty() {
+            return Err(rpc("invalid_params", "prompt must not be empty"));
+        }
+        let session = self.require_session(&params.session_id)?;
+        let prompt = QueuedPrompt {
+            text,
+            images: params.images,
+            origin,
+        };
+        let position = {
+            let mut queued = self.queued.lock().await;
+            let queue = queued.entry(session.id.clone()).or_default();
+            queue.push_back(prompt);
+            queue.len()
+        };
+        self.emit_value(
+            "prompt.queued",
+            json!({
+                "session_id": session.id,
+                "position": position,
+            }),
+        );
+        Ok(SubmitResult {
+            session,
+            turn_id: String::new(),
+            queued: true,
+        })
+    }
+
+    /// Remove and return the next queued prompt for `session_id`.
+    async fn take_queued(&self, session_id: &str) -> Option<QueuedPrompt> {
+        let mut queued = self.queued.lock().await;
+        let queue = queued.get_mut(session_id)?;
+        let prompt = queue.pop_front();
+        if queue.is_empty() {
+            queued.remove(session_id);
+        }
+        prompt
+    }
+
+    /// Start queued prompts in order. Runs each turn to completion before
+    /// taking the next one, so a session never has two turns at once. A
+    /// prompt that fails to start is reported and skipped so one bad item
+    /// cannot strand the rest; losing a race to another submit puts it back
+    /// at the head of the queue instead.
+    async fn pump_queued(self: &Arc<Self>, session_id: &str) {
+        loop {
+            let Some(prompt) = self.take_queued(session_id).await else {
+                return;
+            };
+            if self.require_session(session_id).is_err() {
+                // The session was deleted; drop the rest of its queue.
+                self.queued.lock().await.remove(session_id);
+                return;
+            }
+            let params = SubmitParams {
+                session_id: session_id.to_string(),
+                text: prompt.text.clone(),
+                images: prompt.images.clone(),
+            };
+            match self.start_turn(params, false, prompt.origin).await {
+                Ok((session, turn_id, cancel)) => {
+                    Arc::clone(self).run_turn(session.id, turn_id, cancel).await;
+                }
+                Err(err)
+                    if is_busy_error(&err) && self.turns.lock().await.contains_key(session_id) =>
+                {
+                    // Another submit claimed the session first. Leave the
+                    // prompt for the turn that won; it drains on completion.
+                    self.queued
+                        .lock()
+                        .await
+                        .entry(session_id.to_string())
+                        .or_default()
+                        .push_front(prompt);
+                    return;
+                }
+                Err(err) => {
+                    self.emit_value(
+                        "prompt.failed",
+                        json!({
+                            "session_id": session_id,
+                            "error": format!("{err:#}"),
+                        }),
+                    );
+                }
+            }
+        }
+    }
+
     /// `internal` repair turns keep the integration state in `repairing`
     /// instead of resetting it to `pending` like a normal user prompt.
-    async fn submit_inner(
+    ///
+    /// Returns the claimed turn without running it, so both the RPC path and
+    /// the daemon queue can start the same turn. Keeping the spawn out of
+    /// this future lets the queue drain loop await a turn without creating a
+    /// recursive `Send` bound.
+    async fn start_turn(
         self: &Arc<Self>,
         params: SubmitParams,
         internal: bool,
         origin: Origin,
-    ) -> Result<SubmitResult> {
+    ) -> Result<(Session, String, Arc<AtomicBool>)> {
         let text = params.text.trim().to_string();
         if text.is_empty() && params.images.is_empty() {
             return Err(rpc("invalid_params", "prompt must not be empty"));
@@ -5200,14 +5373,35 @@ impl Daemon {
             }),
         );
 
-        let daemon = Arc::clone(self);
-        let session_id = session.id.clone();
-        let spawned_turn = turn_id.clone();
-        tokio::spawn(async move {
-            daemon.run_turn(session_id, spawned_turn, cancel).await;
-        });
+        Ok((session, turn_id, cancel))
+    }
 
-        Ok(SubmitResult { session, turn_id })
+    async fn submit_inner(
+        self: &Arc<Self>,
+        params: SubmitParams,
+        internal: bool,
+        origin: Origin,
+    ) -> Result<SubmitResult> {
+        let (session, turn_id, cancel) = self.start_turn(params, internal, origin).await?;
+        self.spawn_turn(session.id.clone(), turn_id.clone(), cancel);
+        Ok(SubmitResult {
+            session,
+            turn_id,
+            queued: false,
+        })
+    }
+
+    /// Run one claimed turn in the background, then drain any prompts that
+    /// arrived while it was running.
+    fn spawn_turn(self: &Arc<Self>, session_id: String, turn_id: String, cancel: Arc<AtomicBool>) {
+        let daemon = Arc::clone(self);
+        let pump_session = session_id.clone();
+        tokio::spawn(async move {
+            Arc::clone(&daemon)
+                .run_turn(session_id, turn_id, cancel)
+                .await;
+            daemon.pump_queued(&pump_session).await;
+        });
     }
 
     /// Modification times of every config layer, used by the reload watcher.
@@ -5670,6 +5864,21 @@ impl Daemon {
         // Cumulative provider tokens for this turn, used in failure
         // diagnostics.
         let mut turn_tokens = 0u64;
+        let mut tool_calls_run = 0usize;
+        // The budget notice is advisory: one per turn, so it nudges the model
+        // to stay compact without becoming repeated prompt noise.
+        let mut budget_notice_sent = false;
+        // A `turn.stop` hook may block completion; cap how many times it can
+        // do so to keep a misbehaving plugin from pinning the turn open.
+        let mut stop_blocks = 0u32;
+        // Worktree state at turn start. `git stash create` writes a dangling
+        // commit without touching the index or working tree, so the diff at
+        // the end describes this turn rather than every local edit.
+        let turn_baseline = if config.tools.turn_diff && session.origin != SessionOrigin::Agent {
+            capture_turn_baseline(&session.cwd).await
+        } else {
+            None
+        };
 
         for round in 0usize.. {
             if cancel.load(Ordering::SeqCst) {
@@ -5732,6 +5941,23 @@ impl Daemon {
                 self.emit_context(session_id, &ledger);
             }
 
+            // Warn once when the request is close to the configured budget.
+            // Trimming drops the oldest tool output first, so the model should
+            // know before a result it still needs disappears.
+            if !budget_notice_sent {
+                let info = ledger.info();
+                if info.budget_tokens > 0 && info.total_tokens * 4 >= info.budget_tokens * 3 {
+                    budget_notice_sent = true;
+                    let percent = (info.total_tokens * 100 / info.budget_tokens).min(100);
+                    notices.push(format!(
+                        "Context is at {percent}% of the {} token budget. Older tool output may be \
+                         trimmed soon; keep results narrow, summarize before moving on, and avoid \
+                         re-reading files you already inspected.",
+                        info.budget_tokens
+                    ));
+                }
+            }
+
             // The model stops by returning an answer without tool calls, and
             // the user can interrupt at any time. There is no fixed round cap.
             // Reminders are rebuilt with the request, so a still-active
@@ -5746,6 +5972,13 @@ impl Daemon {
 
             let provider = self.provider.load_full();
             let mut attempt = 0u32;
+            // Prefetched read-only results for the attempt that succeeds. A
+            // retried attempt throws its own map away, so stale results never
+            // reach the batch.
+            let batch_prefetched: HashMap<
+                String,
+                tokio::task::JoinHandle<Option<tools::ToolOutcome>>,
+            >;
             let completion = loop {
                 let bus = self.bus.clone();
                 let sid = session_id.to_string();
@@ -5756,16 +5989,56 @@ impl Daemon {
                 let estimated_prompt =
                     estimate_messages_tokens_with_images(&messages, config.context.image_tokens)
                         + tool_schema_tokens;
+                // Only a leading run of provably read-only calls is
+                // prefetched. A write, interactive call or malformed argument
+                // ends the prefix, because later reads may depend on it.
+                let mut prefetched: HashMap<
+                    String,
+                    tokio::task::JoinHandle<Option<tools::ToolOutcome>>,
+                > = HashMap::new();
+                let mut allow_prefetch = true;
+                let prefetch_daemon = Arc::clone(self);
+                let prefetch_session = session.clone();
                 let outcome = provider
-                    .stream_chat(&messages, &route, request_tools, cancel.as_ref(), |delta| {
-                        match delta {
-                            crate::provider::StreamDelta::Content(text) => streamed.push_str(text),
-                            crate::provider::StreamDelta::Reasoning(text) => {
-                                streamed_reasoning.push_str(text);
+                    .stream_chat(
+                        &messages,
+                        &route,
+                        request_tools,
+                        cancel.as_ref(),
+                        |delta| {
+                            match delta {
+                                crate::provider::StreamDelta::Content(text) => {
+                                    streamed.push_str(text)
+                                }
+                                crate::provider::StreamDelta::Reasoning(text) => {
+                                    streamed_reasoning.push_str(text);
+                                }
                             }
-                        }
-                        batcher.push(delta);
-                    })
+                            batcher.push(delta);
+                        },
+                        |call| {
+                            if !allow_prefetch {
+                                return;
+                            }
+                            let Ok(args) = serde_json::from_str::<Value>(&call.function.arguments)
+                            else {
+                                allow_prefetch = false;
+                                return;
+                            };
+                            if !prefetch_safe(&call.function.name, &args, &prefetch_session.cwd) {
+                                allow_prefetch = false;
+                                return;
+                            }
+                            let daemon = Arc::clone(&prefetch_daemon);
+                            let session_id = prefetch_session.id.clone();
+                            prefetched.insert(
+                                call.id.clone(),
+                                tokio::spawn(async move {
+                                    daemon.prefetch_tool(&session_id, call).await
+                                }),
+                            );
+                        },
+                    )
                     .await;
                 batcher.flush();
 
@@ -5803,7 +6076,10 @@ impl Daemon {
                             "empty_response",
                         )
                     }
-                    Ok(completion) => break completion,
+                    Ok(completion) => {
+                        batch_prefetched = prefetched;
+                        break completion;
+                    }
                     Err(ProviderError::Cancelled) => {
                         self.finish_cancelled(
                             session_id,
@@ -5922,6 +6198,7 @@ impl Daemon {
             };
 
             let mut completion = completion;
+            let mut batch_prefetched = batch_prefetched;
             // A length-truncated response may contain a syntactically partial
             // tool call. Never execute it: drop the whole batch and ask the
             // model for a smaller step on the next round.
@@ -5930,6 +6207,9 @@ impl Daemon {
             {
                 let dropped = completion.tool_calls.len();
                 completion.tool_calls.clear();
+                // The calls were discarded, so drop the work started for
+                // their possibly-partial arguments.
+                batch_prefetched.clear();
                 notices.push(format!(
                     "The previous response hit the output token limit and {dropped} tool call(s) \
                      were discarded because their arguments may be incomplete. Continue with a \
@@ -5957,6 +6237,7 @@ impl Daemon {
                         completion.finish_reason
                     ));
                 }
+                let final_text = completion.text.clone();
                 let event = self.store.append_event(
                     session_id,
                     EventKind::AssistantMessage,
@@ -5972,12 +6253,48 @@ impl Daemon {
                     }),
                 )?;
                 self.emit_event(&event);
+                // A stop hook can hand the turn back with a reason; the model
+                // then gets another round instead of finishing prematurely.
+                if stop_blocks < 2 && session.origin != SessionOrigin::Agent {
+                    if let Some(reason) = self
+                        .plugins
+                        .run_turn_stop(session_id, turn_id, &final_text, &session.cwd)
+                        .await
+                    {
+                        stop_blocks += 1;
+                        notices.push(format!(
+                            "A turn.stop hook blocked this turn: {reason}\nAddress this before \
+                             finishing; if it cannot be resolved, explain what is still missing."
+                        ));
+                        continue;
+                    }
+                }
                 self.transition(session_id, SessionStatus::Idle)?;
                 let duration_ms = turn_started.elapsed().as_millis() as u64;
                 let cost = completion
                     .usage
                     .as_ref()
                     .and_then(|usage| route.cost(usage.prompt_tokens, usage.completion_tokens));
+                if let Some(baseline) = turn_baseline.as_deref() {
+                    self.emit_turn_diff(session_id, turn_id, &session.cwd, baseline)
+                        .await;
+                }
+                let info = ledger.info();
+                self.emit_value(
+                    "turn.metrics",
+                    json!({
+                        "session_id": session_id,
+                        "turn_id": turn_id,
+                        "rounds": round + 1,
+                        "tool_calls": tool_calls_run,
+                        "tokens": turn_tokens,
+                        "auto_compactions": auto_compactions,
+                        "context_recoveries": context_recoveries,
+                        "context_tokens": info.total_tokens,
+                        "context_budget": info.budget_tokens,
+                        "duration_ms": duration_ms,
+                    }),
+                );
                 self.emit_value(
                     "turn.completed",
                     json!({
@@ -5988,6 +6305,7 @@ impl Daemon {
                         "usage": completion.usage,
                         "cost": cost,
                         "duration_ms": duration_ms,
+                        "rounds": round + 1,
                     }),
                 );
                 return Ok(());
@@ -6049,14 +6367,45 @@ impl Daemon {
                 &mut messages,
                 &mut tools,
                 cancel,
+                &mut batch_prefetched,
             )
             .await?;
+            batch_prefetched.clear();
+            tool_calls_run += completion.tool_calls.len();
             if cancel.load(Ordering::SeqCst) {
                 self.finish_cancelled(session_id, turn_id, "", "", &model)?;
                 return Ok(());
             }
         }
         Ok(())
+    }
+
+    /// Emit the tracked-file diff produced since `baseline` (a commit or the
+    /// tree created by `git stash create` at turn start). Untracked files are
+    /// not included; the model is told to `git add -N` when it needs them.
+    async fn emit_turn_diff(&self, session_id: &str, turn_id: &str, cwd: &Path, baseline: &str) {
+        let Some((mut diff, files)) = turn_diff(cwd, baseline).await else {
+            return;
+        };
+        let truncated = diff.len() > MAX_DIFF_BYTES;
+        if truncated {
+            diff.truncate(MAX_DIFF_BYTES);
+            // Keep the cut on a line boundary so the unified diff stays
+            // parseable by the viewer.
+            if let Some(cut) = diff.rfind('\n') {
+                diff.truncate(cut + 1);
+            }
+        }
+        self.emit_value(
+            "turn.diff",
+            json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "diff": diff,
+                "files": files,
+                "truncated": truncated,
+            }),
+        );
     }
 
     /// Run one assistant tool batch in two kinds of concurrent segments:
@@ -6086,6 +6435,7 @@ impl Daemon {
         messages: &mut Vec<ChatMessage>,
         tools: &mut Vec<ToolDefinition>,
         cancel: &Arc<AtomicBool>,
+        prefetched: &mut HashMap<String, tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
     ) -> Result<()> {
         let session = self.require_session(session_id)?;
         let agent_calls: Vec<ToolCall> = calls
@@ -6137,8 +6487,17 @@ impl Daemon {
             }
 
             let Some(kind) = self.parallel_call_kind(&session, call).await else {
+                let prefetched = take_prefetched(prefetched, &call.id);
                 if let Err(err) = self
-                    .run_tool_call(session_id, turn_id, call, messages, tools, cancel.as_ref())
+                    .run_tool_call(
+                        session_id,
+                        turn_id,
+                        call,
+                        messages,
+                        tools,
+                        cancel.as_ref(),
+                        prefetched,
+                    )
                     .await
                 {
                     tool_error = Some(err);
@@ -6153,7 +6512,8 @@ impl Daemon {
                     // command, interactive call, agent, or call needing
                     // approval. A read after a write therefore never joins the
                     // earlier read segment.
-                    let mut segment = vec![(call.clone(), decision)];
+                    let first_prefetched = take_prefetched(prefetched, &call.id);
+                    let mut segment = vec![(call.clone(), decision, first_prefetched)];
                     index += 1;
                     while index < calls.len() {
                         let next = &calls[index];
@@ -6162,7 +6522,8 @@ impl Daemon {
                         }
                         match self.parallel_call_kind(&session, next).await {
                             Some(ParallelCall::Read(decision)) => {
-                                segment.push((next.clone(), decision));
+                                let ready = take_prefetched(prefetched, &next.id);
+                                segment.push((next.clone(), decision, ready));
                                 index += 1;
                             }
                             _ => break,
@@ -6170,7 +6531,7 @@ impl Daemon {
                     }
 
                     if segment.len() == 1 {
-                        let (call, _) = segment.pop().expect("one call");
+                        let (call, _, prefetched) = segment.pop().expect("one call");
                         if let Err(err) = self
                             .run_tool_call(
                                 session_id,
@@ -6179,6 +6540,7 @@ impl Daemon {
                                 messages,
                                 tools,
                                 cancel.as_ref(),
+                                prefetched,
                             )
                             .await
                         {
@@ -6189,7 +6551,7 @@ impl Daemon {
 
                     let limit = Arc::new(Semaphore::new(PARALLEL_TOOL_CONCURRENCY));
                     let results = futures_util::future::join_all(segment.into_iter().map(
-                        |(call, decision)| {
+                        |(call, decision, prefetched)| {
                             let daemon = Arc::clone(self);
                             let limit = Arc::clone(&limit);
                             let cancel = Arc::clone(cancel);
@@ -6202,6 +6564,7 @@ impl Daemon {
                                         &call,
                                         &decision,
                                         cancel.as_ref(),
+                                        prefetched,
                                     )
                                     .await
                             }
@@ -6354,6 +6717,7 @@ impl Daemon {
         call: &ToolCall,
         decision: &PermissionDecision,
         cancel: &AtomicBool,
+        prefetched: Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
     ) -> Result<ChatMessage> {
         let tool = call.function.name.as_str();
         let args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -6419,15 +6783,26 @@ impl Daemon {
                 "tool": tool,
             }),
         );
-        let outcome = tools::execute_in(
-            tool,
-            &args,
-            &session.cwd,
-            &self.config.load(),
-            Some(cancel),
-            session.worktree.as_deref(),
-        )
-        .await;
+        let outcome = match prefetched {
+            // Started while the response was still streaming. Awaiting it
+            // here keeps `tool.started` and policy checks in call order.
+            Some(handle) => handle.await.ok().flatten(),
+            None => None,
+        };
+        let outcome = match outcome {
+            Some(outcome) => outcome,
+            None => {
+                tools::execute_in(
+                    tool,
+                    &args,
+                    &session.cwd,
+                    &self.config.load(),
+                    Some(cancel),
+                    session.worktree.as_deref(),
+                )
+                .await
+            }
+        };
         let (ok, output, duration_ms) = (outcome.ok, outcome.output, outcome.duration_ms);
         self.record_tool_result(session_id, call, ok, false, &output, duration_ms)?;
         self.emit_value(
@@ -6443,6 +6818,28 @@ impl Daemon {
             }),
         );
         Ok(ChatMessage::tool(call.id.clone(), output))
+    }
+
+    /// Run a read-only tool while the response is still streaming. Returns
+    /// `None` unless the normal permission pipeline would auto-allow it, so
+    /// the batch still records the decision and no approval card opens early.
+    async fn prefetch_tool(&self, session_id: &str, call: ToolCall) -> Option<tools::ToolOutcome> {
+        let session = self.require_session(session_id).ok()?;
+        match self.parallel_call_kind(&session, &call).await? {
+            ParallelCall::Read(_) => {}
+        }
+        let args: Value = serde_json::from_str(&call.function.arguments).ok()?;
+        Some(
+            tools::execute_in(
+                &call.function.name,
+                &args,
+                &session.cwd,
+                &self.config.load(),
+                None,
+                session.worktree.as_deref(),
+            )
+            .await,
+        )
     }
 
     /// Start one sub-agent and return its final answer as tool output.
@@ -6732,6 +7129,7 @@ impl Daemon {
     }
 
     /// Record, gate, execute and feed back a single tool call.
+    #[allow(clippy::too_many_arguments)]
     async fn run_tool_call(
         &self,
         session_id: &str,
@@ -6740,6 +7138,7 @@ impl Daemon {
         messages: &mut Vec<ChatMessage>,
         tools: &mut Vec<ToolDefinition>,
         cancel: &AtomicBool,
+        prefetched: Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
     ) -> Result<()> {
         let tool = call.function.name.as_str();
         let args: Value = match serde_json::from_str(&call.function.arguments) {
@@ -7116,7 +7515,8 @@ impl Daemon {
             self.capture_snapshot(session_id, tool, call, &decision.risk, snapshot_targets)
                 .await?
         };
-        let (ok, mut output, duration_ms) = match denial {
+        let mut sandboxed = false;
+        let (mut ok, mut output, mut duration_ms) = match denial {
             Some(reason) => (false, reason, 0),
             None => {
                 self.emit_value(
@@ -7128,40 +7528,82 @@ impl Daemon {
                         "tool": tool,
                     }),
                 );
-                let outcome = match patch_ops.as_deref() {
-                    Some(ops) => tools::apply_patch_ops(ops).await,
-                    None if tool == "exec_command" => self.exec_command(session_id, &args).await,
-                    None if tool == "write_stdin" => self.write_stdin(session_id, &args).await,
-                    None if is_mcp_meta(tool) => self.call_mcp_meta(tool, &args).await,
-                    None if mcp_known => self.call_mcp(tool, &args).await,
-                    None if plugin_known => {
-                        let session = self.require_session(session_id)?;
-                        self.plugins
-                            .call(
+                let prefetched = match prefetched {
+                    // Started while the response was still streaming. Await
+                    // it here so `tool.started` and policy checks stay in
+                    // call order.
+                    Some(handle) => handle.await.ok().flatten(),
+                    None => None,
+                };
+                let outcome = match prefetched {
+                    Some(outcome) => outcome,
+                    None => match patch_ops.as_deref() {
+                        Some(ops) => tools::apply_patch_ops(ops).await,
+                        None if tool == "exec_command" => {
+                            let (outcome, ran_sandboxed) =
+                                self.exec_command(session_id, &args).await;
+                            sandboxed = ran_sandboxed;
+                            outcome
+                        }
+                        None if tool == "write_stdin" => self.write_stdin(session_id, &args).await,
+                        None if is_mcp_meta(tool) => self.call_mcp_meta(tool, &args).await,
+                        None if mcp_known => self.call_mcp(tool, &args).await,
+                        None if plugin_known => {
+                            let session = self.require_session(session_id)?;
+                            self.plugins
+                                .call(
+                                    tool,
+                                    &args,
+                                    session_id,
+                                    &session.cwd,
+                                    self.config.load().tools.max_output_bytes,
+                                )
+                                .await
+                        }
+                        None => {
+                            let session = self.require_session(session_id)?;
+                            tools::execute_in(
                                 tool,
                                 &args,
-                                session_id,
                                 &session.cwd,
-                                self.config.load().tools.max_output_bytes,
+                                &self.config.load(),
+                                Some(cancel),
+                                session.worktree.as_deref(),
                             )
                             .await
-                    }
-                    None => {
-                        let session = self.require_session(session_id)?;
-                        tools::execute_in(
-                            tool,
-                            &args,
-                            &session.cwd,
-                            &self.config.load(),
-                            Some(cancel),
-                            session.worktree.as_deref(),
-                        )
-                        .await
-                    }
+                        }
+                    },
                 };
                 (outcome.ok, outcome.output, outcome.duration_ms)
             }
         };
+        // A sandboxed command that choked on the sandbox (not on its own
+        // logic) may be retried once with explicit approval to run outside it.
+        // `SandboxMode::Required` is enforced on purpose and never escalates.
+        if tool == "exec_command"
+            && sandboxed
+            && !args
+                .get("sandbox_permissions")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value == "require_escalated")
+            && self.config.load().tools.sandbox == eix_core::SandboxMode::Auto
+            && tools::sandbox_denial(&output)
+        {
+            match self
+                .escalate_exec(session_id, turn_id, call, &args, &decision, cancel)
+                .await?
+            {
+                Escalated::Retried(retried) => {
+                    ok = retried.ok;
+                    output = retried.output;
+                    duration_ms = retried.duration_ms;
+                }
+                Escalated::Declined => output.push_str(
+                    "\n[sandbox denied this command; escalation was declined, so it did not run \
+                     outside the sandbox]",
+                ),
+            }
+        }
         if ok && tool == "use_skill" {
             self.remember_skill(session_id, &args).await;
         }
@@ -7787,7 +8229,7 @@ impl Daemon {
         let route = config.route(&model);
         let provider = self.provider.load_full();
         let completion = provider
-            .stream_chat(&messages, &route, tools, &cancel, |_| {})
+            .stream_chat(&messages, &route, tools, &cancel, |_| {}, |_| {})
             .await
             .map_err(|err| rpc("provider", format!("summary failed: {err}")))?;
         let summary = completion.text.trim().to_string();
@@ -8304,8 +8746,42 @@ impl Daemon {
     }
 
     /// `exec_command`: start a command, wait up to `yield_time_ms`, and return
-    /// its output or a session id for `write_stdin`.
-    async fn exec_command(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
+    /// its output or a session id for `write_stdin`. The flag is true when the
+    /// command was wrapped in `bwrap`, so the caller can offer an escalation
+    /// retry after a sandbox denial.
+    async fn exec_command(&self, session_id: &str, args: &Value) -> (tools::ToolOutcome, bool) {
+        let sandboxed = self.command_runs_sandboxed(session_id, args);
+        (self.exec_command_outcome(session_id, args).await, sandboxed)
+    }
+
+    /// Recompute only the sandbox decision for a command. `command_plan_with`
+    /// is cheap and pure apart from path canonicalization, so this avoids
+    /// threading a flag through every early return in the executor.
+    fn command_runs_sandboxed(&self, session_id: &str, args: &Value) -> bool {
+        let Ok(session) = self.require_session(session_id) else {
+            return false;
+        };
+        let command = args
+            .get("cmd")
+            .or_else(|| args.get("command"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let cwd = args
+            .get("workdir")
+            .or_else(|| args.get("cwd"))
+            .and_then(Value::as_str);
+        tools::command_plan_with(
+            command,
+            cwd,
+            &session.cwd,
+            session.worktree.as_deref(),
+            &self.config.load(),
+            tools::command_options(args),
+        )
+        .is_ok_and(|plan| plan.sandboxed)
+    }
+
+    async fn exec_command_outcome(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
         let started = Instant::now();
         let command = args
             .get("cmd")
@@ -8566,7 +9042,7 @@ impl Daemon {
         let provider = self.provider.load_full();
         let verdict = match tokio::time::timeout(
             crate::classifier::TIMEOUT,
-            provider.stream_chat(&prompt, &route, &[], cancel, |_| {}),
+            provider.stream_chat(&prompt, &route, &[], cancel, |_| {}, |_| {}),
         )
         .await
         {
@@ -9290,6 +9766,35 @@ impl Daemon {
         Ok(reply)
     }
 
+    /// Offer to re-run a sandboxed `exec_command` outside the sandbox after its
+    /// first attempt was denied by `bwrap`. The approval card is the same one
+    /// used for a normal gated call, so the user sees the command that failed.
+    async fn escalate_exec(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        call: &ToolCall,
+        args: &Value,
+        decision: &PermissionDecision,
+        cancel: &AtomicBool,
+    ) -> Result<Escalated> {
+        let reply = self
+            .wait_for_approval(session_id, turn_id, call, args, decision, cancel)
+            .await?;
+        if reply.decision == ApprovalDecision::Deny {
+            return Ok(Escalated::Declined);
+        }
+        let mut escalated = args.clone();
+        escalated["sandbox_permissions"] = json!("require_escalated");
+        escalated["justification"] = json!("the bubblewrap sandbox blocked the command");
+        let (mut outcome, _) = self.exec_command(session_id, &escalated).await;
+        outcome.output = format!(
+            "[sandbox blocked this command; re-ran outside the sandbox after approval]\n{}",
+            outcome.output
+        );
+        Ok(Escalated::Retried(outcome))
+    }
+
     fn finish_cancelled(
         &self,
         session_id: &str,
@@ -9974,6 +10479,12 @@ fn rpc(code: impl Into<String>, message: impl Into<String>) -> anyhow::Error {
     })
 }
 
+/// Whether an error is the `busy` refusal from [`Daemon::submit_inner`].
+fn is_busy_error(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<RpcError>()
+        .is_some_and(|err| err.code == "busy")
+}
+
 /// Compare two secrets without short-circuiting on the first differing byte.
 /// This is not a hardened constant-time primitive, but it removes the trivial
 /// timing signal of `==` for the remote-attach token.
@@ -10099,9 +10610,85 @@ fn todo_context(items: &[eix_core::TodoItem]) -> String {
     out.trim_end().to_string()
 }
 
+/// Whether a tool call can start while the model is still streaming the rest
+/// of the response. Only provably read-only tools qualify: `view_image` and
+/// the other daemon-handled tools need per-call state, so they stay on the
+/// normal path. A write or approval-gated call ends the prefetch prefix
+/// because a later read may depend on it.
+fn prefetch_safe(tool: &str, args: &Value, cwd: &Path) -> bool {
+    match tool {
+        "web_fetch" | "web_search" => true,
+        "exec_command" => command_is_parallel_readonly(args, cwd),
+        _ => false,
+    }
+}
+
+/// Take one prefetched handle out of the batch. The caller awaits it only at
+/// the execution point, after policy checks and `tool.started`, so a slow
+/// read can never hide the fact that the tool started.
+fn take_prefetched(
+    prefetched: &mut HashMap<String, tokio::task::JoinHandle<Option<tools::ToolOutcome>>>,
+    call_id: &str,
+) -> Option<tokio::task::JoinHandle<Option<tools::ToolOutcome>>> {
+    prefetched.remove(call_id)
+}
+
 /// Largest diff rendered in the `/diff` overlay. Beyond this the tail is cut;
 /// the full diff is still available through the shell.
 const MAX_DIFF_BYTES: usize = 256 * 1024;
+
+/// A commit describing the current working tree, produced without modifying
+/// the index or the working tree. `git stash create` writes a dangling commit
+/// (later pruned by `git gc`), which lets the daemon diff exactly the changes a
+/// turn made even when the user already had local edits. A clean tree has no
+/// stash commit, so HEAD is the baseline instead.
+async fn capture_turn_baseline(cwd: &Path) -> Option<String> {
+    let head = git_stdout_line(cwd, &["rev-parse", "HEAD"]).await?;
+    let stash = git_stdout_line(cwd, &["stash", "create", "eix turn baseline"]).await;
+    let baseline = stash
+        .map(|stash| stash.trim().to_string())
+        .filter(|stash| !stash.is_empty())
+        .unwrap_or_else(|| head.trim().to_string());
+    (!baseline.is_empty()).then_some(baseline)
+}
+
+async fn git_stdout_line(cwd: &Path, args: &[&str]) -> Option<String> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .await
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+/// Diff the tracked working tree against `baseline`, returning the unified
+/// diff and the number of files it touches.
+async fn turn_diff(cwd: &Path, baseline: &str) -> Option<(String, usize)> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(["diff", baseline, "--no-color", "--no-ext-diff"])
+        .output()
+        .await
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+    if diff.trim().is_empty() {
+        return None;
+    }
+    let files = diff
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count();
+    Some((diff, files))
+}
 
 async fn workspace_diff(cwd: &Path, staged: bool) -> Result<WorkspaceDiffResult> {
     let mut command = tokio::process::Command::new("git");
@@ -10706,7 +11293,7 @@ impl Daemon {
         let cancel = AtomicBool::new(false);
         let provider = self.provider.load_full();
         let completion = provider
-            .stream_chat(&messages, &route, &[], &cancel, |_| {})
+            .stream_chat(&messages, &route, &[], &cancel, |_| {}, |_| {})
             .await
             .ok()?;
         Some(completion.text)
@@ -12139,5 +12726,61 @@ mod tests {
         assert!(text.contains("only the tail is shown"), "{text}");
         assert!(text.contains("sed -n 'a,bp'"), "{text}");
         assert!(text.contains("write_stdin"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn turn_diff_excludes_edits_made_before_the_turn() {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("eix-turn-diff-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&[
+            "-c",
+            "user.name=eix",
+            "-c",
+            "user.email=eix@example.invalid",
+            "commit",
+            "-qm",
+            "init",
+        ]);
+
+        // A clean tree uses HEAD and has no diff.
+        let head = git_stdout_line(&dir, &["rev-parse", "HEAD"]).await.unwrap();
+        let baseline = capture_turn_baseline(&dir).await.unwrap();
+        assert_eq!(baseline.trim(), head.trim());
+        assert!(turn_diff(&dir, &baseline).await.is_none());
+
+        // A dirty tree gets a stash-commit baseline, so only edits made after
+        // it appear in the turn diff.
+        std::fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        let baseline = capture_turn_baseline(&dir).await.unwrap();
+        std::fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let (diff, files) = turn_diff(&dir, &baseline).await.unwrap();
+        assert_eq!(files, 1);
+        assert!(diff.contains("+three"), "{diff}");
+        assert!(
+            !diff.contains("+two"),
+            "an edit from before the turn leaked into the diff: {diff}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

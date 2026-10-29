@@ -2017,6 +2017,9 @@ pub struct CommandPlan {
     pub program: std::ffi::OsString,
     pub args: Vec<std::ffi::OsString>,
     pub cwd: PathBuf,
+    /// Whether the plan wraps the command in `bwrap`. The daemon uses this to
+    /// tell a sandbox denial apart from an ordinary command failure.
+    pub sandboxed: bool,
 }
 
 /// Codex-compatible `exec_command` options that change how the shell line is
@@ -2088,6 +2091,25 @@ pub fn command_options(args: &Value) -> CommandOptions<'_> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
     }
+}
+
+/// Whether a failed command output looks like the bubblewrap sandbox denied
+/// it, rather than the command itself failing. Deliberately conservative:
+/// only bwrap's own diagnostics and a read-only mount count. The caller must
+/// also know the command actually ran sandboxed.
+pub fn sandbox_denial(output: &str) -> bool {
+    let exit_code = output
+        .rsplit("exit code: ")
+        .next()
+        .and_then(|tail| tail.lines().next())
+        .and_then(|code| code.trim().parse::<i32>().ok());
+    // A still-running command has no exit code, and a success that merely
+    // printed the phrase is not a denial.
+    if !matches!(exit_code, Some(code) if code != 0) {
+        return false;
+    }
+    let lower = output.to_ascii_lowercase();
+    output.contains("bwrap:") || lower.contains("read-only file system")
 }
 
 /// Whether this call asks for permissions beyond the session defaults and
@@ -2278,6 +2300,7 @@ pub fn command_plan_with(
             program: "script".into(),
             args: vec!["-qefc".into(), script.into(), "/dev/null".into()],
             cwd: command_cwd,
+            sandboxed,
         });
     }
 
@@ -2286,6 +2309,7 @@ pub fn command_plan_with(
         program,
         args: argv,
         cwd: command_cwd,
+        sandboxed,
     })
 }
 
@@ -2568,6 +2592,24 @@ mod tests {
         // Every request pays for these schemas. Keep room for a few additions,
         // but fail before descriptions drift back into paragraphs.
         assert!(tokens < 2_400, "built-in tool schemas are {tokens} tokens");
+    }
+
+    #[test]
+    fn sandbox_denial_only_matches_bwrap_failures() {
+        assert!(sandbox_denial(
+            "bwrap: Can't create file at /x: Read-only file system\n\nexit code: 1"
+        ));
+        assert!(sandbox_denial(
+            "touch: cannot touch 'x': Read-only file system\n\nexit code: 1"
+        ));
+        // A command that succeeded but printed the phrase is not a denial.
+        assert!(!sandbox_denial(
+            "Read-only file system (documented)\n\nexit code: 0"
+        ));
+        // Ordinary failures keep their own error.
+        assert!(!sandbox_denial(
+            "cat: missing: No such file\n\nexit code: 1"
+        ));
     }
 
     #[test]

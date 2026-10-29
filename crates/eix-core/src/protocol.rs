@@ -1012,7 +1012,12 @@ pub struct AttachResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SubmitResult {
     pub session: Session,
+    /// The started turn. Empty when `queued` is true.
     pub turn_id: String,
+    /// A turn was already running, so the daemon queued this prompt and will
+    /// start it automatically. `turn.started` arrives with the real turn id.
+    #[serde(default)]
+    pub queued: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

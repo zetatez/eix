@@ -132,6 +132,30 @@ impl App {
                     self.upsert_session(session, false);
                 }
             }
+            "turn.started" => {
+                // The daemon queue starts the next turn without a submit RPC,
+                // so adopt its id here; otherwise the stream stays keyed on
+                // the previous turn and drops every delta.
+                if let Ok(started) = serde_json::from_value::<TurnRef>(notification.params) {
+                    if let Some(view) = self
+                        .views
+                        .iter_mut()
+                        .find(|view| view.session.id == started.session_id)
+                    {
+                        if view
+                            .stream
+                            .as_ref()
+                            .is_none_or(|stream| stream.turn_id != started.turn_id)
+                        {
+                            view.stream = Some(StreamState::new(started.turn_id));
+                        }
+                        view.unread = false;
+                    }
+                    if self.status.starts_with("queued") {
+                        self.status = "running".into();
+                    }
+                }
+            }
             "session.attention" => {
                 if let Ok(params) = serde_json::from_value::<AttentionParams>(notification.params) {
                     let mut alert = false;

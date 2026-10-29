@@ -232,6 +232,101 @@ async fn disconnecting_a_client_does_not_cancel_the_turn() -> anyhow::Result<()>
 }
 
 #[tokio::test]
+async fn a_prompt_submitted_while_busy_is_queued_and_started() -> anyhow::Result<()> {
+    let dir = temp_dir("queue");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    // Delay every answer so the second submit reliably races the first turn.
+    let mock = tokio::spawn(mock_provider_delayed(
+        listener,
+        Arc::clone(&bodies),
+        Duration::from_millis(300),
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "queue", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let first: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "first"}),
+        )
+        .await?;
+    assert!(!first.queued);
+    assert!(!first.turn_id.is_empty());
+
+    let second: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "second"}),
+        )
+        .await?;
+    assert!(second.queued, "the second prompt should be queued");
+    assert!(
+        second.turn_id.is_empty(),
+        "a queued prompt has no turn yet: {}",
+        second.turn_id
+    );
+
+    // The queued prompt starts on its own after the first turn finishes.
+    let mut started = Vec::new();
+    let mut completed = 0;
+    let mut saw_queued = false;
+    while completed < 2 {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "prompt.queued" => saw_queued = true,
+            "turn.started" => started.push(
+                notification.params["turn_id"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+            "turn.completed" => completed += 1,
+            _ => {}
+        }
+    }
+    assert!(saw_queued, "prompt.queued was not emitted");
+    assert_eq!(started.len(), 2, "{started:?}");
+    assert_ne!(started[0], started[1], "each prompt runs its own turn");
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let users = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::UserMessage)
+        .count();
+    let answers = attached
+        .events
+        .iter()
+        .filter(|event| event.kind == EventKind::AssistantMessage)
+        .count();
+    assert_eq!(users, 2, "both prompts are recorded");
+    assert!(answers >= 2, "both turns produced an answer");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn auto_names_an_unnamed_session_after_two_turns() -> anyhow::Result<()> {
     let dir = temp_dir("auto-name");
     std::fs::create_dir_all(&dir)?;
@@ -5920,6 +6015,16 @@ async fn read_message(reader: &mut ClientReader) -> anyhow::Result<ServerMessage
 }
 
 async fn mock_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    mock_provider_delayed(listener, bodies, Duration::ZERO).await
+}
+
+/// Like `mock_provider`, but waits before answering a chat request so a test
+/// can submit the next prompt while a turn is still running.
+async fn mock_provider_delayed(
+    listener: TcpListener,
+    bodies: Arc<Mutex<Vec<String>>>,
+    delay: Duration,
+) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
@@ -5971,6 +6076,9 @@ async fn mock_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
             let body = String::from_utf8_lossy(&buf[header_end..header_end + length]).to_string();
             bodies.lock().await.push(body);
 
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
             let events = concat!(
                 "data: {\"model\":\"mock-1\",\"choices\":[{\"delta\":{\"content\":\"Hello \"}}]}\n\n",
                 "data: {\"choices\":[{\"delta\":{\"content\":\"from \"}}]}\n\n",
