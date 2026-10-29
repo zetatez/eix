@@ -3895,6 +3895,38 @@ fn file_picker_draws_the_lazy_preview_on_the_right() {
 }
 
 #[test]
+fn file_picker_wraps_long_preview_lines() {
+    let mut app = app_with_panes(&["s1"]);
+    app.picker = Some(Picker {
+        kind: PickerKind::Files,
+        query: String::new(),
+        selected: 0,
+        provider: None,
+        items: vec![PickerItem::new("src/a.rs")],
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
+        loading: false,
+        preview: PickerPreview {
+            key: Some("src/a.rs".into()),
+            text: Some(format!("   1 │ {}", "x".repeat(300))),
+            rendered: None,
+            rendered_width: 0,
+            error: None,
+            loading: false,
+        },
+        preview_request: None,
+    });
+
+    let rendered = render_text(&mut app, 100, 24);
+    let wrapped = rendered
+        .lines()
+        .filter(|line| line.contains("xxxx"))
+        .count();
+    assert!(wrapped > 1, "preview did not wrap: {rendered}");
+}
+
+#[test]
 fn session_picker_preview_requests_the_selected_session_history() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
