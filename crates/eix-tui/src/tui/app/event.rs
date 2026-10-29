@@ -1753,6 +1753,18 @@ impl App {
             }
             Outcome::Ignored | Outcome::Action(_) => {}
         }
+
+        // A prompt yank (`y`, `yy`, `Y`, visual `y`) fills the Vim register
+        // and also mirrors to the desktop clipboard, like a transcript
+        // selection; the event loop drains `pending_clipboard`.
+        if let Some(text) = self.input.take_yanked() {
+            self.push_toast(
+                format!("Copied {} chars", text.chars().count()),
+                ToastTone::Success,
+                COPY_TOAST_DISPLAY,
+            );
+            self.pending_clipboard = Some(text);
+        }
     }
 
     pub(super) fn focus_input(&mut self) {
@@ -2124,6 +2136,16 @@ fn render_context_ledger(info: &eix_core::ContextLedgerResult, all: bool) -> Str
         "total  {:>8} / {} tokens  ({percent}%)",
         info.total_tokens, info.budget_tokens
     )];
+    if let Some(rate) = info.cache.hit_rate() {
+        lines.push(format!(
+            "cache  {:>5.1}% reused · {} read / {} written / {} prompt over {} step(s)",
+            rate * 100.0,
+            info.cache.cache_read_tokens,
+            info.cache.cache_creation_tokens,
+            info.cache.prompt_tokens,
+            info.cache.steps
+        ));
+    }
     if info.trimmed > 0 {
         lines.push(format!(
             "       {} entr(ies) dropped automatically to fit the budget",

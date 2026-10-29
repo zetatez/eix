@@ -184,6 +184,10 @@ pub struct Editor {
     anchor: Option<Pos>,
     last_find: Option<(FindKind, char)>,
     register: Register,
+    /// Text yanked by the latest key, waiting for the host to copy it to the
+    /// system clipboard. Cleared on every key so a stale yank is never copied
+    /// twice.
+    yanked: Option<String>,
     undo: Vec<Snapshot>,
     redo: Vec<Snapshot>,
 }
@@ -213,6 +217,7 @@ impl Editor {
             anchor: None,
             last_find: None,
             register: Register::default(),
+            yanked: None,
             undo: Vec::new(),
             redo: Vec::new(),
         }
@@ -253,6 +258,13 @@ impl Editor {
         if let Some(register) = register_from_text(text) {
             self.register = register;
         }
+    }
+
+    /// Take the text yanked by the last key so the host can mirror it to the
+    /// system clipboard. Only `y`/`yy`/`Y` and visual `y` report here; delete
+    /// and change keep filling the register without touching the clipboard.
+    pub fn take_yanked(&mut self) -> Option<String> {
+        self.yanked.take()
     }
 
     /// Paste external text (the system clipboard) at the cursor without
@@ -357,6 +369,7 @@ impl Editor {
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Outcome {
+        self.yanked = None;
         if key.code == KeyCode::Esc {
             self.cancel();
             return Outcome::Ignored;
@@ -1084,6 +1097,15 @@ impl Editor {
 
     fn apply_operator(&mut self, op: Op, range: Range) {
         let (text, linewise, start) = self.range_snapshot(range);
+        if op == Op::Yank {
+            let mut yanked = text.join("\n");
+            // Vim's linewise yank ends with a newline, so pasting it into the
+            // system clipboard keeps whole-line semantics.
+            if linewise {
+                yanked.push('\n');
+            }
+            self.yanked = Some(yanked);
+        }
         self.register = Register {
             lines: text,
             linewise,
@@ -2034,6 +2056,33 @@ mod tests {
         assert_eq!(editor.text(), "aab");
         press(&mut editor, "u");
         assert_eq!(editor.text(), "ab");
+    }
+
+    #[test]
+    fn yanks_are_offered_for_the_system_clipboard() {
+        let mut editor = editor_with("one\ntwo");
+        press(&mut editor, "yy");
+        assert_eq!(editor.take_yanked().as_deref(), Some("one\n"));
+        assert_eq!(editor.take_yanked(), None);
+
+        press(&mut editor, "j");
+        press(&mut editor, "Vy");
+        assert_eq!(editor.take_yanked().as_deref(), Some("two\n"));
+
+        let mut editor = editor_with("hello");
+        press(&mut editor, "vll");
+        press(&mut editor, "y");
+        assert_eq!(editor.take_yanked().as_deref(), Some("hel"));
+
+        // Delete/change still fill the register but stay out of the clipboard.
+        let mut editor = editor_with("abc");
+        press(&mut editor, "dd");
+        assert_eq!(editor.take_yanked(), None);
+        assert!(editor.has_register_text());
+
+        let mut editor = editor_with("abc");
+        press(&mut editor, "dw");
+        assert_eq!(editor.take_yanked(), None);
     }
 
     #[test]

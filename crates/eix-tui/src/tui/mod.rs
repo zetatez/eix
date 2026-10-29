@@ -130,7 +130,12 @@ pub async fn run(
 
         tokio::select! {
             maybe = events.next() => match maybe {
-                Some(Ok(TermEvent::Key(key))) => app.handle_key(key, &cmd_tx),
+                Some(Ok(TermEvent::Key(key))) => {
+                    app.handle_key(key, &cmd_tx);
+                    if let Some(text) = app.take_clipboard() {
+                        copy_to_clipboard(&text);
+                    }
+                }
                 Some(Ok(TermEvent::Paste(text))) => app.handle_paste(&text),
                 Some(Ok(TermEvent::Mouse(mouse))) => {
                     app.handle_mouse(mouse, &cmd_tx);

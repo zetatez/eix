@@ -196,6 +196,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - 撤销是快照栈：一次 insert 会话、一次 `dd`/`p` 各算一步；`u` / `Ctrl-r`。
 - 未命名寄存器保存最近一次 yank/delete；`p`/`P` 区分字符与整行；寄存器为空时读取
   系统剪贴板（鼠标选中的转录文本可直接粘贴），且外部粘贴不覆盖内部寄存器。
+  `y`/`yy`/`Y`/visual `y` 同时自动写入系统剪贴板（native helper，失败时 OSC 52）。
 - leader 前缀默认 `<Space>`，可通过 `[keys].leader` 修改；输入框 normal 与转录区共用同一映射：
   `n` 新建 session 并开新 pane（当前 session 有 worktree 时复用）、`W` 当前 session 移入 worktree、
   `o` 打开 session picker（已有 session 放进新 pane；只列普通/worktree session，
@@ -2018,7 +2019,7 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 
 - [x] 设计文档 v0.1
 - [x] workspace 骨架
-- [x] 自研 Vim 风格输入框（normal / insert / visual、motion + operator + count、undo/redo、leader `<Space>xx`，无子进程）
+- [x] 自研 Vim 风格输入框（normal / insert / visual、motion + operator + count、undo/redo、leader `<Space>xx`，无子进程；`y`/`yy` 自动复制到系统剪贴板）
 - [x] daemon + OpenAI 兼容 provider（流式 SSE、取消、错误处理）
 - [x] session 事件日志 + SQLite 持久化 + attach 协议（事件流广播）
 - [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve[--hunks] / deny / answer / doctor）

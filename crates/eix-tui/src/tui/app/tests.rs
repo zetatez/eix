@@ -2684,6 +2684,28 @@ fn dragging_the_transcript_copies_the_selected_cells() {
 }
 
 #[test]
+fn yanking_in_the_prompt_copies_to_the_system_clipboard() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.input.set_text("hello");
+    app.input.enter_normal();
+    app.focus = Focus::Input;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE), &tx);
+
+    assert_eq!(app.take_clipboard().as_deref(), Some("hello\n"));
+    assert_eq!(
+        app.toasts.last().map(|toast| toast.text.as_str()),
+        Some("Copied 6 chars")
+    );
+
+    // A later movement key does not re-copy the old yank.
+    app.handle_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE), &tx);
+    assert_eq!(app.take_clipboard(), None);
+}
+
+#[test]
 fn toasts_stack_and_expire_independently() {
     let mut app = App::new(None);
     app.push_toast("first".into(), ToastTone::Success, Duration::from_secs(10));
@@ -9842,6 +9864,7 @@ fn context_command_requests_the_ledger_and_renders_it() {
         total_tokens: 12,
         budget_tokens: 100,
         trimmed: 0,
+        cache: eix_core::ContextCacheInfo::default(),
     };
     app.handle_event(
         Event::ContextInfo {
