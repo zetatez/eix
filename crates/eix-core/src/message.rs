@@ -64,6 +64,13 @@ pub struct ChatMessage {
     /// Attached images for multimodal user messages.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<ImagePart>,
+    /// Assistant thinking text. Not part of the OpenAI wire shape; adapters
+    /// that support signed thinking blocks serialize it explicitly.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    /// Opaque signature paired with `reasoning` for providers that verify it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_signature: Option<String>,
 }
 
 impl ChatMessage {
@@ -91,6 +98,20 @@ impl ChatMessage {
         message
     }
 
+    /// Assistant message carrying provider reasoning metadata for replay.
+    pub fn assistant_with_reasoning(
+        content: impl Into<String>,
+        tool_calls: Option<Vec<ToolCall>>,
+        reasoning: Option<String>,
+        reasoning_signature: Option<String>,
+    ) -> Self {
+        let mut message = Self::new(Role::Assistant, content);
+        message.tool_calls = tool_calls;
+        message.reasoning = reasoning;
+        message.reasoning_signature = reasoning_signature;
+        message
+    }
+
     pub fn tool(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
         let mut message = Self::new(Role::Tool, content);
         message.tool_call_id = Some(tool_call_id.into());
@@ -105,6 +126,8 @@ impl ChatMessage {
             tool_calls: None,
             tool_call_id: None,
             images: Vec::new(),
+            reasoning: None,
+            reasoning_signature: None,
         }
     }
 
@@ -175,12 +198,62 @@ impl ToolDefinition {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
+    /// Total prompt tokens reported by the provider, including cache hits.
     #[serde(default, alias = "prompt_tokens")]
     pub prompt_tokens: u64,
     #[serde(default, alias = "completion_tokens")]
     pub completion_tokens: u64,
     #[serde(default, alias = "total_tokens")]
     pub total_tokens: u64,
+    /// Prompt tokens served from the provider's prefix cache (a subset of
+    /// `prompt_tokens`). Kept separate so callers can report cache efficiency.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to the provider's cache this request (a subset of
+    /// `prompt_tokens` for providers that bill cache writes separately).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub cache_creation_tokens: u64,
+    /// Reasoning tokens included in `completion_tokens`, when reported.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub reasoning_tokens: u64,
+}
+
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+
+impl Usage {
+    /// Prompt tokens that were not served from cache. Saturating so malformed
+    /// provider metrics can never underflow the estimate.
+    pub fn uncached_prompt_tokens(&self) -> u64 {
+        self.prompt_tokens
+            .saturating_sub(self.cache_read_tokens)
+            .saturating_sub(self.cache_creation_tokens)
+    }
+
+    /// Merge a later usage snapshot (for example a `message_delta` after
+    /// `message_start`) without dropping cache metrics that only one event
+    /// carried.
+    pub fn merge(&mut self, later: &Usage) {
+        if later.prompt_tokens > 0 {
+            self.prompt_tokens = later.prompt_tokens;
+        }
+        if later.completion_tokens > 0 {
+            self.completion_tokens = later.completion_tokens;
+        }
+        if later.total_tokens > 0 {
+            self.total_tokens = later.total_tokens;
+        }
+        if later.cache_read_tokens > 0 {
+            self.cache_read_tokens = later.cache_read_tokens;
+        }
+        if later.cache_creation_tokens > 0 {
+            self.cache_creation_tokens = later.cache_creation_tokens;
+        }
+        if later.reasoning_tokens > 0 {
+            self.reasoning_tokens = later.reasoning_tokens;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -246,5 +319,31 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 3);
         assert_eq!(usage.completion_tokens, 5);
         assert_eq!(usage.total_tokens, 0);
+    }
+
+    #[test]
+    fn usage_keeps_cache_and_reasoning_buckets() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "cache_read_tokens": 80,
+            "cache_creation_tokens": 10,
+            "reasoning_tokens": 5
+        }))
+        .unwrap();
+        assert_eq!(usage.uncached_prompt_tokens(), 10);
+        assert_eq!(usage.cache_read_tokens, 80);
+        assert_eq!(usage.reasoning_tokens, 5);
+
+        let mut merged = usage.clone();
+        merged.merge(&Usage {
+            completion_tokens: 25,
+            total_tokens: 125,
+            ..Usage::default()
+        });
+        assert_eq!(merged.prompt_tokens, 100);
+        assert_eq!(merged.completion_tokens, 25);
+        assert_eq!(merged.cache_read_tokens, 80);
     }
 }

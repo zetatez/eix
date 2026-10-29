@@ -59,7 +59,7 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex, RwLock, Semaphore};
 use uuid::Uuid;
 
 use crate::context::{
-    environment_summary, estimate_messages_tokens, estimate_tool_schema_tokens,
+    environment_summary, estimate_messages_tokens_with_images, estimate_tool_schema_tokens,
     load_images as load_event_images, Ledger, Sections, StaticContext,
 };
 use crate::permissions::{
@@ -5472,27 +5472,25 @@ impl Daemon {
         turn_id: String,
         cancel: Arc<AtomicBool>,
     ) {
-        // A read-only session is never shown mutating tools, even if the model
-        // would otherwise call one; `run_tool_call` enforces it again.
-        let read_only = self
-            .require_session(&session_id)
-            .map(|session| self.session_mode(&session) == SessionMode::Plan)
-            .unwrap_or(true);
         let sub_agent = self
             .require_session(&session_id)
             .map(|session| session.origin == SessionOrigin::Agent)
             .unwrap_or(true);
-        let mut definitions = if read_only || sub_agent {
+        let mut definitions = if sub_agent {
             tools::definitions()
                 .into_iter()
                 .filter(|tool| !tools::hard_mutating(&tool.function.name))
                 .collect::<Vec<_>>()
         } else {
+            // Plan mode keeps the same catalog as Build mode. The read-only
+            // contract is enforced by the permission pipeline, not by hiding
+            // schemas, so switching modes does not invalidate the provider's
+            // cached tool prefix.
             tools::definitions()
         };
-        // MCP tools always need approval, so a read-only session does not see
-        // them. Starting the servers lazily keeps startup cheap. Resource and
-        // prompt helpers are also hidden unless at least one server is enabled.
+        // MCP tools always need approval. Starting the servers lazily keeps
+        // startup cheap. Resource and prompt helpers remain visible when
+        // configured so the meta-tool catalog is mode-stable.
         let mcp_configured = self
             .config
             .load()
@@ -5500,7 +5498,7 @@ impl Daemon {
             .servers
             .values()
             .any(|server| server.enabled);
-        if !mcp_configured || read_only || sub_agent {
+        if !mcp_configured || sub_agent {
             definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
         }
         // `ready` is only meaningful inside an enabled integration worktree.
@@ -5514,8 +5512,8 @@ impl Daemon {
         }
         // MCP and plugin tools are deferred: `tool_search` pulls the ones the
         // model actually needs into a later request instead of paying for every
-        // schema on every round.
-        if read_only || sub_agent {
+        // schema on every round. Sub-agents do not get the search tool.
+        if sub_agent {
             definitions.retain(|tool| tool.function.name != "tool_search");
         }
         if let Err(err) = self
@@ -5604,9 +5602,11 @@ impl Daemon {
         let mut repeats = RepeatGuard::default();
         // Only sessions that can edit get the action contract. Plan turns and
         // sub-agents are read-only by design, so nagging them would be wrong.
-        let can_edit = allowed_tools
-            .iter()
-            .any(|tool| tool.function.name == "apply_patch");
+        let can_edit = session.origin != SessionOrigin::Agent
+            && self.session_mode(&session) != SessionMode::Plan
+            && allowed_tools
+                .iter()
+                .any(|tool| tool.function.name == "apply_patch");
         let mut inspections = InspectionGuard::default();
         // Reminders for the next request. Rebuilt every round from the event
         // log, so they are re-emitted while the condition still holds.
@@ -5697,7 +5697,9 @@ impl Daemon {
                 let mut streamed = String::new();
                 let mut streamed_reasoning = String::new();
                 let mut batcher = DeltaBatcher::new(&bus, &sid, &tid);
-                let estimated_prompt = estimate_messages_tokens(&messages) + tool_schema_tokens;
+                let estimated_prompt =
+                    estimate_messages_tokens_with_images(&messages, config.context.image_tokens)
+                        + tool_schema_tokens;
                 let outcome = provider
                     .stream_chat(&messages, &route, request_tools, cancel.as_ref(), |delta| {
                         match delta {
@@ -5863,6 +5865,28 @@ impl Daemon {
                 }
             };
 
+            let mut completion = completion;
+            // A length-truncated response may contain a syntactically partial
+            // tool call. Never execute it: drop the whole batch and ask the
+            // model for a smaller step on the next round.
+            if completion.finish_reason.as_deref() == Some("length")
+                && !completion.tool_calls.is_empty()
+            {
+                let dropped = completion.tool_calls.len();
+                completion.tool_calls.clear();
+                notices.push(format!(
+                    "The previous response hit the output token limit and {dropped} tool call(s) \
+                     were discarded because their arguments may be incomplete. Continue with a \
+                     smaller step."
+                ));
+                if completion.text.trim().is_empty() {
+                    completion.text = "The previous response was truncated by the output token \
+                                        limit before any complete tool call. Continue with a \
+                                        smaller step."
+                        .to_string();
+                }
+            }
+
             if let Some(usage) = completion.usage.as_ref() {
                 turn_tokens += usage
                     .total_tokens
@@ -5885,6 +5909,7 @@ impl Daemon {
                         model: completion.model,
                         reasoning: (!completion.reasoning.is_empty())
                             .then_some(completion.reasoning),
+                        reasoning_signature: completion.reasoning_signature,
                         cancelled: false,
                         usage: completion.usage.clone(),
                         tool_calls: Vec::new(),
@@ -5946,15 +5971,18 @@ impl Daemon {
                     model: completion.model.clone(),
                     reasoning: (!completion.reasoning.is_empty())
                         .then_some(completion.reasoning.clone()),
+                    reasoning_signature: completion.reasoning_signature.clone(),
                     cancelled: false,
                     usage: completion.usage.clone(),
                     tool_calls: completion.tool_calls.clone(),
                 }),
             )?;
             self.emit_event(&event);
-            messages.push(ChatMessage::assistant_with_tools(
+            messages.push(ChatMessage::assistant_with_reasoning(
                 completion.text,
-                completion.tool_calls.clone(),
+                Some(completion.tool_calls.clone()),
+                (!completion.reasoning.is_empty()).then_some(completion.reasoning.clone()),
+                completion.reasoning_signature.clone(),
             ));
 
             self.run_tool_batch(
@@ -7270,9 +7298,8 @@ impl Daemon {
     /// reads outside the turn use the built-in set and MCP meta-tools. Plugin
     /// tools are already initialized, so they can be included exactly.
     async fn standard_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
-        let read_only = self.session_mode(session) == SessionMode::Plan;
         let sub_agent = session.origin == SessionOrigin::Agent;
-        let mut definitions = if read_only || sub_agent {
+        let mut definitions = if sub_agent {
             tools::definitions()
                 .into_iter()
                 .filter(|tool| !tools::hard_mutating(&tool.function.name))
@@ -7287,10 +7314,10 @@ impl Daemon {
             .servers
             .values()
             .any(|server| server.enabled);
-        if !mcp_configured || read_only || sub_agent {
+        if !mcp_configured || sub_agent {
             definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
         }
-        if !read_only && !sub_agent {
+        if !sub_agent {
             definitions.extend(self.plugins.tool_definitions().await);
         }
         let worktree_ready = session.has_worktree() && self.config.load().integration.enabled;
@@ -7301,11 +7328,11 @@ impl Daemon {
     }
 
     /// MCP and plugin tool schemas that stay out of the base request and are
-    /// exposed on demand by `tool_search`. Plan and sub-agent sessions never
-    /// see them because they may mutate state.
+    /// exposed on demand by `tool_search`. Sub-agents never see them because
+    /// they may mutate state; Plan mode keeps the same deferred catalog and
+    /// relies on the permission pipeline to reject mutations.
     async fn deferred_tool_definitions(&self, session: &Session) -> Vec<ToolDefinition> {
-        if self.session_mode(session) == SessionMode::Plan || session.origin == SessionOrigin::Agent
-        {
+        if session.origin == SessionOrigin::Agent {
             return Vec::new();
         }
         let config = self.config.load_full();
@@ -7639,18 +7666,22 @@ impl Daemon {
     /// Ask the model to summarize the conversation so far. Used by `/compact`;
     /// the result replaces the history in the provider request.
     async fn generate_summary(&self, session_id: &str, ledger: &Ledger) -> Result<String> {
-        self.summarize_messages(session_id, ledger.messages(), None)
+        let session = self.require_session(session_id)?;
+        let tools = self.standard_tool_definitions(&session).await;
+        self.summarize_messages(session_id, ledger.messages(), None, &tools)
             .await
     }
 
-    /// Summarize only the messages that are about to leave the context. When
-    /// `previous` is present, produce a rolling handoff that also retains the
-    /// earlier summary's decisions and task state.
+    /// Summarize the provided prefix + range. The conversation prefix is
+    /// replayed byte-for-byte and the instruction is appended as the final
+    /// user message, so the auxiliary call reuses the provider's warm prefix
+    /// cache instead of rewriting the system prompt at the head.
     async fn summarize_messages(
         &self,
         session_id: &str,
         mut messages: Vec<ChatMessage>,
         previous: Option<&str>,
+        tools: &[ToolDefinition],
     ) -> Result<String> {
         let todos = self
             .todos
@@ -7659,10 +7690,10 @@ impl Daemon {
             .get(session_id)
             .cloned()
             .unwrap_or_default();
-        let mut system = String::from(
-            "You are compacting a coding-agent conversation. The summary replaces the older \
-             messages, so preserve everything needed to continue the task without re-reading \
-             the log. Use these sections:\n\
+        let mut instruction = String::from(
+            "You are compacting a coding-agent conversation. The earlier messages above are the \
+             exact conversation prefix. Write a summary that replaces the older messages, so the \
+             agent can continue without re-reading the log. Use these sections:\n\
              1. Goal and constraints (including explicit user preferences)\n\
              2. Decisions and rejected alternatives\n\
              3. Files, symbols, and code changes (exact paths)\n\
@@ -7675,24 +7706,24 @@ impl Daemon {
              updated by later compactions. Do not invent facts or add commentary.",
         );
         if !todos.is_empty() {
-            system.push_str("\n\nCurrent task list (preserve it):\n");
-            system.push_str(&todo_context(&todos));
+            instruction.push_str("\n\nCurrent task list (preserve it):\n");
+            instruction.push_str(&todo_context(&todos));
         }
-        messages.insert(0, ChatMessage::system(system));
         if let Some(previous) = previous.map(str::trim).filter(|text| !text.is_empty()) {
-            messages.insert(
-                1,
-                ChatMessage::system(format!(
-                    "Previous rolling summary. Update it with the new conversation; keep still-valid \
-                     goals, decisions, file paths and next steps, and remove stale details:\n\n{}",
-                    cap_text(previous, 12_000)
-                )),
+            instruction.push_str(
+                "\n\nPrevious rolling summary. Update it with the new conversation; keep \
+                 still-valid goals, decisions, file paths and next steps, and remove stale \
+                 details:\n\n",
             );
+            instruction.push_str(&cap_text(previous, 12_000));
         }
-        messages.push(ChatMessage::user(
-            "Summarize the conversation so far for a fresh context window. Write the compacted \
-             summary now. Return only the summary.",
-        ));
+        instruction.push_str(
+            "\n\nSummarize the conversation so far for a fresh context window. Write the \
+             compacted summary now. Return only the summary.",
+        );
+        // Keep the conversation as the exact prefix and append the instruction
+        // as a user turn. This is deliberately not a new system message.
+        messages.push(ChatMessage::user(instruction));
         let config = self.config.load();
         let session = self.require_session(session_id)?;
         let model = self.model_for_background(&session);
@@ -7700,7 +7731,7 @@ impl Daemon {
         let route = config.route(&model);
         let provider = self.provider.load_full();
         let completion = provider
-            .stream_chat(&messages, &route, &[], &cancel, |_| {})
+            .stream_chat(&messages, &route, tools, &cancel, |_| {})
             .await
             .map_err(|err| rpc("provider", format!("summary failed: {err}")))?;
         let summary = completion.text.trim().to_string();
@@ -7766,11 +7797,14 @@ impl Daemon {
             return (ledger, false);
         }
         let previous_summary = ledger.latest_summary();
+        let mut summary_input = ledger.prefix_before(from_seq);
+        summary_input.extend(ledger.messages_in_range(from_seq, to_seq));
         let summary = match self
             .summarize_messages(
                 session_id,
-                ledger.messages_in_range(from_seq, to_seq),
+                summary_input,
                 previous_summary.as_deref(),
+                tools,
             )
             .await
         {
@@ -9216,6 +9250,7 @@ impl Daemon {
                     text: streamed.to_string(),
                     model: model.to_string(),
                     reasoning: (!reasoning.is_empty()).then(|| reasoning.to_string()),
+                    reasoning_signature: None,
                     cancelled: true,
                     usage: None,
                     tool_calls: Vec::new(),

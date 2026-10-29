@@ -34,7 +34,7 @@ daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的
 | 工具 | `apply_patch` 编辑、`exec_command` / `write_stdin` shell、`update_plan` 计划、`tool_search` 按需发现 MCP/插件工具、web、LSP、图片、子 agent |
 | 上下文 | sector 预算、AGENTS.md、workspace summary、自动 compact、memory / plan |
 | 扩展 | Skills、Markdown 命令、Markdown agent、MCP stdio / HTTP、out-of-process 插件 |
-| Provider | 多 endpoint（OpenAI 兼容 / Anthropic / Gemini 原生协议）、API key + OAuth 登录、自动拉取模型列表、重试/退避、运行时模型切换与 reasoning 强度 |
+| Provider | 多 endpoint（OpenAI 兼容 / Anthropic / Gemini / DeepSeek Messages 原生协议）、API key + OAuth 登录、自动拉取模型列表、重试/退避、运行时模型切换与 reasoning 强度、thinking 回放与 cache/reasoning token 计量 |
 | 前端 | TUI、chat/send CLI、HTTP + SSE + `eix-sdk`、TCP，以及外部编辑器插件接口 |
 
 ## 快速开始
@@ -99,6 +99,14 @@ api_key_env = "ANTHROPIC_API_KEY"
 kind = "gemini"
 base_url = "https://generativelanguage.googleapis.com/v1beta"
 model = "gemini-2.5-pro"
+
+# DeepSeek native Messages protocol: signed thinking replay, effort control
+# (off/low/high/max), in-history prompt updates, and cache-token accounting.
+[providers.deepseek-native]
+kind = "deepseek"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "DEEPSEEK_API_KEY"
 ```
 
 单个 `[[models]]` 可以用 `kind` 覆盖所属 provider 的协议。模型目录（`/model`、`eix model --all`）

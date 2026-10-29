@@ -1262,6 +1262,9 @@ pub struct ContextConfig {
     /// The full output remains in the event log; older/short results are left
     /// untouched. This prevents one noisy command from crowding out the task.
     pub tool_output_tokens: usize,
+    /// Conservative token estimate for one image. Vision pricing varies by
+    /// model; override this when a route's documented grid is known.
+    pub image_tokens: usize,
     /// Hard cap for the tool schemas sent in one request. Built-in schemas are
     /// always kept; MCP tools that would exceed the cap are omitted until the
     /// user narrows them with `mcp.servers.*.allowed_tools`.
@@ -1279,6 +1282,7 @@ impl Default for ContextConfig {
             auto_compact_keep_tokens: 8_000,
             auto_compact_keep_turns: 2,
             tool_output_tokens: 4_000,
+            image_tokens: 1_024,
             max_tool_schema_tokens: 12_000,
         }
     }
@@ -1322,6 +1326,11 @@ pub enum ProviderKind {
     Anthropic,
     #[serde(alias = "google")]
     Gemini,
+    /// DeepSeek's native Messages endpoint (`/anthropic`), which is wire
+    /// compatible with Anthropic but adds thinking, effort and in-history
+    /// system/tool updates.
+    #[serde(alias = "deepseek-messages", alias = "deepseek-anthropic")]
+    DeepSeek,
 }
 
 impl ProviderKind {
@@ -1331,7 +1340,19 @@ impl ProviderKind {
             Self::OpenAi => "openai",
             Self::Anthropic => "anthropic",
             Self::Gemini => "gemini",
+            Self::DeepSeek => "deepseek",
         }
+    }
+
+    /// Whether the native Messages API accepts signed thinking blocks.
+    pub fn reasoning_replay(self) -> bool {
+        matches!(self, Self::Anthropic | Self::DeepSeek)
+    }
+
+    /// Whether the route supports DeepSeek's `thinking` / `output_config.effort`
+    /// request fields and mid-conversation system/tool updates.
+    pub fn deepseek_messages(self) -> bool {
+        matches!(self, Self::DeepSeek)
     }
 
     /// Full chat URL for this protocol. Gemini builds the URL per model, so it
@@ -1340,7 +1361,7 @@ impl ProviderKind {
         let base = base_url.trim_end_matches('/');
         match self {
             Self::OpenAi => chat_endpoint(base),
-            Self::Anthropic => {
+            Self::Anthropic | Self::DeepSeek => {
                 if base.ends_with("/messages") {
                     base.to_string()
                 } else if base.ends_with("/v1") {
@@ -1368,6 +1389,15 @@ impl ProviderKind {
                     format!("{base}/models")
                 } else {
                     format!("{base}/v1/models")
+                }
+            }
+            Self::DeepSeek => {
+                let base = base_url.trim_end_matches('/');
+                let base = base.strip_suffix("/anthropic").unwrap_or(base);
+                if base.ends_with("/models") {
+                    base.to_string()
+                } else {
+                    format!("{base}/models")
                 }
             }
             Self::Gemini => format!("{}/models", gemini_root(base_url.trim_end_matches('/'))),
@@ -2648,6 +2678,11 @@ impl Config {
         if self.context.tool_output_tokens == 0 {
             return Err(ConfigError::Invalid(
                 "context.tool_output_tokens must be > 0".into(),
+            ));
+        }
+        if self.context.image_tokens == 0 {
+            return Err(ConfigError::Invalid(
+                "context.image_tokens must be > 0".into(),
             ));
         }
         if self.context.max_tool_schema_tokens == 0 {
@@ -4003,6 +4038,35 @@ model = "gemini-2.5-pro"
         assert_eq!(
             ProviderKind::Gemini.models_endpoint("https://example.test"),
             "https://example.test/v1beta/models"
+        );
+    }
+
+    #[test]
+    fn routes_deepseek_native_messages_protocol() {
+        let config: Config = toml::from_str(
+            r#"
+[providers.deepseek]
+default = true
+kind = "deepseek"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-flash"
+"#,
+        )
+        .unwrap();
+        let route = config.route("deepseek-v4-flash#max");
+        assert_eq!(route.kind, ProviderKind::DeepSeek);
+        assert_eq!(
+            route.endpoint,
+            "https://api.deepseek.com/anthropic/v1/messages"
+        );
+        assert_eq!(route.reasoning_effort.as_deref(), Some("max"));
+        assert!(route.kind.reasoning_replay());
+        assert!(route.kind.deepseek_messages());
+        assert_eq!(
+            route
+                .kind
+                .models_endpoint("https://api.deepseek.com/anthropic"),
+            "https://api.deepseek.com/models"
         );
     }
 
