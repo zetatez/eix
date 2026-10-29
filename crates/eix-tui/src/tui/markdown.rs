@@ -829,7 +829,8 @@ impl Renderer {
     }
 
     /// Inline math becomes a single-row image when the terminal can paint one;
-    /// otherwise it stays as the literal `$...$` Markdown source.
+    /// without a graphics protocol it falls back to a compact one-line form.
+    /// `/math off` keeps the literal `$...$` source instead.
     fn inline_math(&mut self, source: &str) {
         let real_math = looks_like_math(source);
         if self.cell.is_some() || !real_math || self.raw {

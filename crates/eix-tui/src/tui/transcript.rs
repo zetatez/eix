@@ -1138,12 +1138,25 @@ fn push_bubble(
     width: usize,
     theme: Theme,
 ) {
+    // Keep zero-width placeholder rows that an image is painted over. Trimming
+    // them would drop an image-only turn (or the leading image of a turn that
+    // also has text) before `push_bubble` transfers its placement.
+    let image_covers = |line: usize| {
+        placements.iter().any(|placement| {
+            line >= placement.line
+                && line < placement.line + usize::from(placement.image.rows.max(1))
+        })
+    };
     let mut removed = 0;
-    while content.first().is_some_and(|line| line.width() == 0) {
+    while content.first().is_some_and(|line| line.width() == 0) && !image_covers(removed) {
         content.remove(0);
         removed += 1;
     }
     while content.last().is_some_and(|line| line.width() == 0) {
+        let line = removed + content.len() - 1;
+        if image_covers(line) {
+            break;
+        }
         content.pop();
     }
     if content.is_empty() {

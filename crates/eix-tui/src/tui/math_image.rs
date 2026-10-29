@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::SystemTime;
 
+use base64::Engine as _;
 use eix_core::config::MathConfig;
 use image::{imageops, DynamicImage, Rgba, RgbaImage};
 use ratatui::layout::Size;
