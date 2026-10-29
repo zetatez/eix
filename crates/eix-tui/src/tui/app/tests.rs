@@ -3927,6 +3927,100 @@ fn file_picker_wraps_long_preview_lines() {
 }
 
 #[test]
+fn an_interrupted_turn_resumes_after_attach() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    let mut session = Session::new("s1", "one", "/tmp");
+    session.status = SessionStatus::Error;
+    app.sessions = vec![session.clone()];
+    app.pending_attach = Some(PendingAttach {
+        session_id: "s1".into(),
+        slot: AttachSlot::New,
+    });
+    let events = vec![
+        SessionEvent::new(
+            "s1",
+            1,
+            EventKind::UserMessage,
+            serde_json::json!({"text": "do the thing"}),
+        ),
+        SessionEvent::new(
+            "s1",
+            2,
+            EventKind::Error,
+            serde_json::json!({
+                "message": "daemon restarted while this turn was running",
+                "interrupted": true,
+            }),
+        ),
+    ];
+    app.handle_event(
+        Event::Attached(AttachResult {
+            session,
+            events,
+            has_more: false,
+        }),
+        &tx,
+    );
+    // The resume prompt is sent on the next tick, not while attaching.
+    assert!(find_command(&mut rx, |command| matches!(command, Command::Submit { .. })).is_none());
+
+    app.tick(&tx);
+    let Some(Command::Submit {
+        session_id, text, ..
+    }) = find_command(&mut rx, |command| matches!(command, Command::Submit { .. }))
+    else {
+        panic!("interrupted turn did not resume");
+    };
+    assert_eq!(session_id, "s1");
+    assert!(text.contains("Continue from where you left off"), "{text}");
+
+    // One resume per run: a second tick must not submit again.
+    app.tick(&tx);
+    assert!(find_command(&mut rx, |command| matches!(command, Command::Submit { .. })).is_none());
+}
+
+#[test]
+fn non_interrupted_errors_and_agent_sessions_do_not_resume() {
+    for (interrupted, agent) in [(false, false), (true, true)] {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(None);
+        let mut session = Session::new("s1", "one", "/tmp");
+        session.status = SessionStatus::Error;
+        if agent {
+            session.origin = eix_core::SessionOrigin::Agent;
+        }
+        app.sessions = vec![session.clone()];
+        app.pending_attach = Some(PendingAttach {
+            session_id: "s1".into(),
+            slot: AttachSlot::New,
+        });
+        let events = vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::Error,
+            serde_json::json!({
+                "message": "turn failed",
+                "interrupted": interrupted,
+            }),
+        )];
+        app.handle_event(
+            Event::Attached(AttachResult {
+                session,
+                events,
+                has_more: false,
+            }),
+            &tx,
+        );
+        app.tick(&tx);
+        assert!(
+            find_command(&mut rx, |command| matches!(command, Command::Submit { .. })).is_none(),
+            "interrupted={interrupted} agent={agent}"
+        );
+    }
+}
+
+#[test]
 fn session_picker_preview_requests_the_selected_session_history() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);

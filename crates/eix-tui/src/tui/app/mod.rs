@@ -12,10 +12,11 @@ use crossterm::event::{
 };
 use eix_core::{
     theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
-    Event as SessionEvent, EventKind, HelloResult, HunkInfo, InputAnsweredPayload, InputQuestion,
-    InputRequiredPayload, IntegrationState, IntegrationStatus, ModelInfo, PatchProposedPayload,
-    PickerItem, ProcessInfo, ProcessList, ProcessOutput, ProcessStatus, Session, SessionMode,
-    SessionStatus, SubmitResult, TodoItem, ToolResultPayload, UserMessagePayload, THEME_PRESETS,
+    ErrorPayload, Event as SessionEvent, EventKind, HelloResult, HunkInfo, InputAnsweredPayload,
+    InputQuestion, InputRequiredPayload, IntegrationState, IntegrationStatus, ModelInfo,
+    PatchProposedPayload, PickerItem, ProcessInfo, ProcessList, ProcessOutput, ProcessStatus,
+    Session, SessionMode, SessionStatus, SubmitResult, TodoItem, ToolResultPayload,
+    UserMessagePayload, THEME_PRESETS,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -2180,6 +2181,12 @@ pub struct App {
     /// Prompts submitted while their session was busy, keyed by session id.
     /// `tick` drains one at a time as sessions go idle.
     queues: HashMap<String, VecDeque<String>>,
+    /// Interrupted turns noticed while attaching. `tick` continues them one at
+    /// a time once no other submit is in flight.
+    pending_resumes: VecDeque<String>,
+    /// Sessions an interrupted turn was already resumed for during this run,
+    /// so a failed attempt cannot retry on every tick.
+    resumed_sessions: HashSet<String>,
     /// A queued prompt whose `prompt.submit` is in flight, kept so a `busy`
     /// race can put it back at the head of the queue.
     queued_inflight: Option<(String, String)>,

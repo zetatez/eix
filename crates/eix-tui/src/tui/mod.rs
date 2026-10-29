@@ -73,8 +73,8 @@ pub async fn run(
     app.theme_config = loaded.theme.clone();
     app.keybinds = Keybinds::from_config(&loaded.keys);
     let cli_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    let saved_workspace = workspace::load(&data_dir, &cli_cwd);
-    app.restore_workspace(saved_workspace);
+    let mut saved_workspace = workspace::load(&data_dir, &cli_cwd);
+    app.restore_workspace(saved_workspace.clone());
     if let Ok(Some(defaults)) = eix_core::load_cli_config(&cli_cwd) {
         app.default_model = defaults.model;
         app.default_agent = defaults.agent;
@@ -164,7 +164,22 @@ pub async fn run(
                 }
                 None => break,
             },
-            _ = tokio::time::sleep(tick) => app.tick(&cmd_tx),
+            _ = tokio::time::sleep(tick) => {
+                app.tick(&cmd_tx);
+                // Persist the open panes as they change. A clean quit writes
+                // the same state again, but a crash, power loss or forced
+                // shutdown otherwise leaves a stale file and the next launch
+                // cannot reopen (and resume) the sessions that were running.
+                let current = app.workspace_state();
+                if !current.sessions.is_empty() && current != saved_workspace {
+                    match workspace::save(&data_dir, &cli_cwd, &current) {
+                        Ok(()) => saved_workspace = current,
+                        Err(err) => {
+                            eprintln!("eix: cannot save active sessions: {err:#}");
+                        }
+                    }
+                }
+            }
         }
     }
 

@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Follow-up sent when a daemon restart interrupted a running turn. The
+/// transcript already holds the original request and every tool result, so
+/// this only asks the model to pick up where it stopped.
+const RESUME_PROMPT: &str = "The previous turn was interrupted by a daemon restart. \
+Continue from where you left off. Do not repeat work that is already complete; \
+verify the outcome of any tool call whose result is unknown before retrying it.";
+
 impl App {
     /// `/clear`: the daemon deleted this session's stored history, so drop
     /// every cached transcript and streaming artifact for its pane.
@@ -353,6 +360,37 @@ impl App {
 
     pub(super) fn queue_len(&self, session_id: &str) -> usize {
         self.queues.get(session_id).map(VecDeque::len).unwrap_or(0)
+    }
+
+    /// Schedule an interrupted turn for automatic continuation. The session
+    /// is only queued once per TUI run so a failed submit cannot retry forever.
+    pub(super) fn queue_resume(&mut self, session_id: &str) {
+        if self.resumed_sessions.insert(session_id.to_string()) {
+            self.pending_resumes.push_back(session_id.to_string());
+        }
+    }
+
+    /// Continue one interrupted turn per tick, once no other submit is in
+    /// flight. A live session is left alone: the daemon survived and the
+    /// attach stream already resumes it.
+    pub(super) fn flush_resumes(&mut self, tx: &UnboundedSender<Command>) {
+        if self.submitting || self.pending_resumes.is_empty() {
+            return;
+        }
+        let Some(session_id) = self.pending_resumes.pop_front() else {
+            return;
+        };
+        if self.session_busy(&session_id) {
+            return;
+        }
+        self.submitting = true;
+        self.submitting_session = Some(session_id.clone());
+        self.status = "resuming interrupted turn…".into();
+        let _ = tx.send(Command::Submit {
+            session_id,
+            text: RESUME_PROMPT.to_string(),
+            images: Vec::new(),
+        });
     }
 
     pub(super) fn session_busy(&self, session_id: &str) -> bool {

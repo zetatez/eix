@@ -480,6 +480,11 @@ pub struct ProcessExitedPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorPayload {
     pub message: String,
+    /// The turn was still running when the daemon restarted. Its event log is
+    /// intact, so a frontend may continue the turn instead of treating it as a
+    /// normal failure. Always false for errors raised during a live turn.
+    #[serde(default)]
+    pub interrupted: bool,
 }
 
 /// Build a `serde_json::Value` for an event payload.

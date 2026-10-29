@@ -3680,6 +3680,9 @@ async fn recovers_sessions_left_running() -> anyhow::Result<()> {
         let session = eix_core::Session::new("stale", "stale session", "/tmp");
         store.create_session(&session)?;
         store.set_status("stale", eix_core::SessionStatus::Running)?;
+        let waiting = eix_core::Session::new("waiting", "waiting session", "/tmp");
+        store.create_session(&waiting)?;
+        store.set_status("waiting", eix_core::SessionStatus::AwaitingApproval)?;
     }
 
     let mut config = Config::default();
@@ -3692,11 +3695,30 @@ async fn recovers_sessions_left_running() -> anyhow::Result<()> {
         .request("session.attach", json!({"session_id": "stale"}))
         .await?;
     assert_eq!(attached.session.status, eix_core::SessionStatus::Error);
-    assert!(attached.events.iter().any(|e| e.kind == EventKind::Error));
+    let error = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::Error)
+        .expect("interrupted session error event");
+    // A turn that was actually running can be continued by the TUI.
+    assert_eq!(error.payload["interrupted"], true);
     assert!(attached
         .events
         .iter()
         .any(|e| { e.kind == EventKind::StatusChanged && e.payload["to"] == "error" }));
+
+    // A turn waiting on the user cannot be continued without bypassing that
+    // decision, so it gets a plain (non-resumable) error marker.
+    let waiting: AttachResult = client
+        .request("session.attach", json!({"session_id": "waiting"}))
+        .await?;
+    assert_eq!(waiting.session.status, eix_core::SessionStatus::Error);
+    let error = waiting
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::Error)
+        .expect("waiting session error event");
+    assert_eq!(error.payload["interrupted"], false);
 
     daemon.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;

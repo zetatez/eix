@@ -2513,12 +2513,25 @@ impl Daemon {
             }
         };
         for session in running {
-            let message = "daemon restarted while this turn was running".to_string();
+            // Only a turn that was actually running can be continued: an
+            // approval or question is gone after a restart, so continuing
+            // would skip the user's decision. Those sessions keep the plain
+            // error marker.
+            let interrupted = session.status == SessionStatus::Running;
+            let message = if interrupted {
+                "daemon restarted while this turn was running".to_string()
+            } else {
+                format!(
+                    "daemon restarted while the session was {}",
+                    session.status.as_str()
+                )
+            };
             if let Ok(event) = self.store.append_event(
                 &session.id,
                 EventKind::Error,
                 payload(&ErrorPayload {
                     message: message.clone(),
+                    interrupted,
                 }),
             ) {
                 self.emit_event(&event);
@@ -10231,6 +10244,7 @@ impl Daemon {
             EventKind::Error,
             payload(&ErrorPayload {
                 message: message.to_string(),
+                interrupted: false,
             }),
         ) {
             self.emit_event(&event);
