@@ -70,6 +70,11 @@ const TOOL_SPECS: &[ToolSpec] = &[
         parallel_safe: false,
     },
     ToolSpec {
+        name: "get_context_remaining",
+        subagent_allowed: true,
+        parallel_safe: false,
+    },
+    ToolSpec {
         name: "memory",
         subagent_allowed: false,
         parallel_safe: false,
@@ -242,6 +247,14 @@ fn build_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["plan"]
+            }),
+        ),
+        ToolDefinition::function(
+            "get_context_remaining",
+            "Report the tokens left in the context budget.",
+            json!({
+                "type": "object",
+                "properties": {}
             }),
         ),
         ToolDefinition::function(
@@ -2591,7 +2604,7 @@ mod tests {
         let tokens = crate::context::estimate_tool_schema_tokens(&definitions());
         // Every request pays for these schemas. Keep room for a few additions,
         // but fail before descriptions drift back into paragraphs.
-        assert!(tokens < 2_400, "built-in tool schemas are {tokens} tokens");
+        assert!(tokens < 2_500, "built-in tool schemas are {tokens} tokens");
     }
 
     #[test]

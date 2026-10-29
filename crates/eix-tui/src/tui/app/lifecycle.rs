@@ -15,6 +15,7 @@ impl App {
             hello: None,
             subagent_concurrency: eix_core::DEFAULT_MAX_PARALLEL_SUBAGENTS,
             models: Vec::new(),
+            mcp_servers: Vec::new(),
             sessions: Vec::new(),
             selected: 0,
             views: Vec::new(),
@@ -38,7 +39,6 @@ impl App {
             help_scope: None,
             help_query: String::new(),
             help_selected: 0,
-            pending_delete: None,
             pending_rewind: None,
             created_sessions: HashSet::new(),
             pending_images: Vec::new(),
@@ -96,6 +96,7 @@ impl App {
             queued_inflight: None,
             submitting_session: None,
             command_cursor: 0,
+            cd_prefix_snapshot: None,
             // Custom commands are loaded once by `set_compat` at startup.
             commands: builtin_commands(),
             plugin_commands: Vec::new(),

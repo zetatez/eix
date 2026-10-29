@@ -48,7 +48,7 @@ pub use message::{
 };
 pub use picker::{
     is_data_kind, PickerItem, PickerParams, PickerPreviewParams, PickerPreviewResult, PickerResult,
-    DATA_KINDS, KIND_BRANCHES, KIND_FILES, KIND_GIT, KIND_GREP, KIND_SESSION_PREVIEW,
+    DATA_KINDS, KIND_BRANCHES, KIND_FILES, KIND_GIT, KIND_GREP, KIND_IMAGES, KIND_SESSION_PREVIEW,
     KIND_WORKTREES,
 };
 pub use plugin::{

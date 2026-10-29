@@ -74,6 +74,9 @@ impl App {
 
     /// Scroll or dismiss a read-only text overlay.
     pub(super) fn handle_text_view_key(&mut self, key: KeyEvent) {
+        // C-j/C-k/C-n/C-p scroll like j/k so every list-like surface uses the
+        // same next/previous gestures.
+        let key = next_prev_key(key);
         let mut close = false;
         if let Some(view) = self.text_view.as_mut() {
             let last = view.lines.len().saturating_sub(1);
@@ -108,6 +111,15 @@ impl App {
         // `/plugins act` must not keep targeting a hidden panel.
         self.plugin_panel = None;
         self.text_view = Some(TextView::new(title, text));
+    }
+
+    /// `/doctor` uses the same scrollable overlay with section styling.
+    pub(super) fn open_doctor_view(&mut self, lines: &[String]) {
+        self.plugin_panel = None;
+        let report = crate::tui::doctor::DoctorReport::parse(lines);
+        let mut view = TextView::new("doctor", &report.plain());
+        view.doctor = Some(report);
+        self.text_view = Some(view);
     }
 
     pub(super) fn open_processes(&mut self, tx: &UnboundedSender<Command>) {
@@ -165,12 +177,12 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if let Some(inbox) = self.inbox.as_mut() {
-                    inbox.cursor = (cursor + 1).min(len.saturating_sub(1));
+                    inbox.cursor = wrap_step(cursor, len, 1);
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if let Some(inbox) = self.inbox.as_mut() {
-                    inbox.cursor = cursor.saturating_sub(1);
+                    inbox.cursor = wrap_step(cursor, len, -1);
                 }
             }
             KeyCode::Char('b') | KeyCode::Char('B')
@@ -240,16 +252,14 @@ impl App {
         let len = view.processes.len();
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if view.cursor + 1 < len {
-                    view.cursor += 1;
-                }
+                view.cursor = wrap_step(view.cursor, len, 1);
                 if let Some(process) = view.selected() {
                     let process_id = process.id.clone();
                     let _ = tx.send(Command::ProcessOutput { process_id });
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                view.cursor = view.cursor.saturating_sub(1);
+                view.cursor = wrap_step(view.cursor, len, -1);
                 if let Some(process) = view.selected() {
                     let process_id = process.id.clone();
                     let _ = tx.send(Command::ProcessOutput { process_id });
@@ -321,6 +331,12 @@ impl App {
                     self.move_picker(10);
                     return;
                 }
+                // Terminals without kitty keyboard disambiguation report
+                // Ctrl-J as Ctrl-Enter, so treat it as "next" too.
+                KeyCode::Enter => {
+                    self.move_picker(1);
+                    return;
+                }
                 _ => {}
             }
         }
@@ -336,6 +352,29 @@ impl App {
             KeyCode::Up => self.move_picker(-1),
             KeyCode::Down => self.move_picker(1),
             KeyCode::Enter => self.picker_enter(kind, tx),
+            KeyCode::Char(' ')
+                if kind == PickerKind::Mcp
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                // Space flips the highlighted server; typing still filters.
+                if let Some(server) = self.selected_mcp_server() {
+                    let enabled = !server.enabled;
+                    let name = server.name;
+                    let _ = tx.send(Command::SetMcpEnabled {
+                        name: name.clone(),
+                        enabled,
+                    });
+                    self.status = format!(
+                        "mcp: {name} {}",
+                        if enabled {
+                            "enabling…"
+                        } else {
+                            "disabling…"
+                        }
+                    );
+                }
+            }
             KeyCode::Backspace => {
                 if let Some(picker) = &mut self.picker {
                     picker.query.pop();
@@ -378,8 +417,13 @@ impl App {
             if len == 0 {
                 picker.selected = 0;
             } else {
-                let current = picker.selected.min(len - 1) as i32;
-                picker.selected = (current + delta).clamp(0, len as i32 - 1) as usize;
+                let current = picker.selected.min(len - 1);
+                picker.selected = if delta.unsigned_abs() == 1 {
+                    // Step navigation cycles; page jumps still stop at the ends.
+                    wrap_step(current, len, delta as isize)
+                } else {
+                    (current as i32 + delta).clamp(0, len as i32 - 1) as usize
+                };
             }
         }
         self.preview_theme_selection();
@@ -585,6 +629,33 @@ impl App {
         hits.into_iter().map(|(_, index)| index).collect()
     }
 
+    /// `value` of the row under the cursor in the current filtered order.
+    pub(super) fn selected_picker_value(&self) -> Option<String> {
+        let filtered = self.filtered_items();
+        let selected = self.picker.as_ref()?.selected;
+        let index = *filtered.get(selected)?;
+        self.picker
+            .as_ref()?
+            .items
+            .get(index)
+            .map(|item| item.value.clone())
+    }
+
+    /// MCP server row under the picker cursor, if the MCP picker is open.
+    fn selected_mcp_server(&mut self) -> Option<eix_core::McpServerInfo> {
+        if self.picker.as_ref().map(|picker| picker.kind) != Some(PickerKind::Mcp) {
+            return None;
+        }
+        let filtered = self.picker_filtered();
+        let selected = self.picker.as_ref()?.selected;
+        let index = *filtered.get(selected)?;
+        let name = self.picker.as_ref()?.items.get(index)?.value.clone();
+        self.mcp_servers
+            .iter()
+            .find(|server| server.name == name)
+            .cloned()
+    }
+
     pub(super) fn picker_enter(&mut self, kind: PickerKind, tx: &UnboundedSender<Command>) {
         let filtered = self.picker_filtered();
         let Some(selected) = self.picker.as_ref().map(|picker| picker.selected) else {
@@ -627,6 +698,19 @@ impl App {
                 if let Some(value) = value {
                     self.picker = None;
                     self.insert_prompt(&format!("@{value}"));
+                }
+            }
+            PickerKind::Images => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    self.insert_prompt(&format!("@{value}"));
+                    if !self.pending_images.contains(&value) {
+                        self.pending_images.push(value.clone());
+                    }
+                    self.status = format!(
+                        "attached {value} · {} image(s) for the next prompt",
+                        self.pending_images.len()
+                    );
                 }
             }
             PickerKind::Git => {
@@ -672,6 +756,14 @@ impl App {
                         let model = (value != "@default").then_some(value);
                         let _ = tx.send(Command::SetPlanModel { session_id, model });
                         self.status = "switching Plan model…".into();
+                    }
+                }
+            }
+            PickerKind::Effort => {
+                if let Some(value) = value {
+                    self.picker = None;
+                    if self.set_reasoning(&value, tx) {
+                        self.status = format!("effort: {value}");
                     }
                 }
             }
@@ -723,16 +815,12 @@ impl App {
             }
             PickerKind::Skills => {
                 if let Some(value) = value {
-                    let cwd = self
-                        .focused_view()
-                        .map(|view| view.session.cwd.clone())
-                        .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                    if let Some(skill) = eix_core::find_skill(&cwd, &value, &self.compat) {
-                        self.picker = None;
-                        self.input.set_text(&skill.body);
-                        self.focus = Focus::Input;
-                        self.status = format!("inserted skill {}", skill.name);
-                    }
+                    // Insert a mention like the file picker; the model resolves
+                    // the skill through `available_skills` / `use_skill`.
+                    self.picker = None;
+                    self.input.insert_text(&format!("@{value}"));
+                    self.focus = Focus::Input;
+                    self.status = format!("inserted @{value}");
                 }
             }
             PickerKind::Themes => {
@@ -750,6 +838,20 @@ impl App {
                         }
                         Err(_) => self.error = Some("invalid checkpoint".into()),
                     }
+                }
+            }
+            PickerKind::Fork => {
+                let Some(value) = value else {
+                    return;
+                };
+                self.picker = None;
+                if value == "@all" {
+                    self.fork_focused(tx, None);
+                    return;
+                }
+                match value.parse::<u64>() {
+                    Ok(seq) => self.fork_focused(tx, Some(seq)),
+                    Err(_) => self.error = Some("invalid fork point".into()),
                 }
             }
             PickerKind::RewindScope => {
@@ -775,6 +877,19 @@ impl App {
                     }
                 }
             }
+            PickerKind::Diff => {
+                if let Some(value) = value {
+                    let preview = self
+                        .picker
+                        .as_ref()
+                        .and_then(|picker| picker.items.get(index))
+                        .and_then(|item| item.preview.clone())
+                        .unwrap_or_default();
+                    self.picker = None;
+                    self.open_text_view(format!("diff · {value}"), &preview);
+                    self.status = "diff · j/k scroll · Esc close".into();
+                }
+            }
             PickerKind::Mcp | PickerKind::Todos => {
                 self.picker = None;
             }
@@ -790,19 +905,7 @@ impl App {
             self.theme_config = config;
             self.theme = theme;
         }
-        let mut picker = Picker {
-            kind,
-            query: String::new(),
-            selected: 0,
-            provider: None,
-            items: Vec::new(),
-            items_rev: 0,
-            filter: PickerFilterCache::default(),
-            scroll: 0,
-            loading: false,
-            preview: PickerPreview::default(),
-            preview_request: None,
-        };
+        let mut picker = Picker::new(kind);
         if kind == PickerKind::Grep {
             if self.focused_view().is_none() {
                 self.status = "attach a session first".into();
@@ -885,6 +988,16 @@ impl App {
                     ""
                 }
             );
+        } else if kind == PickerKind::Effort {
+            let (_, current) = split_model_variant(self.model());
+            let current = current.unwrap_or("medium");
+            picker.set_items(effort_picker_items());
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| item.value == current)
+                .unwrap_or(1);
+            self.status = format!("effort: {current}");
         } else if kind == PickerKind::Timeline {
             let Some(view) = self.focused_view() else {
                 self.status = "attach a session first".into();
@@ -899,6 +1012,33 @@ impl App {
             };
             picker.set_items(timeline_picker_items(&view.events));
             self.status = format!("rewind: {} checkpoint(s)", picker.items.len());
+        } else if kind == PickerKind::Fork {
+            let Some(view) = self.focused_view() else {
+                self.status = "attach a session first".into();
+                return;
+            };
+            let mut items: Vec<_> = timeline_picker_items(&view.events)
+                .into_iter()
+                .map(|item| {
+                    let label = format!("e{}  {}", item.value, item.label);
+                    item.with_label(label)
+                })
+                .collect();
+            if items.is_empty() {
+                self.status = "fork: no user message to pick from".into();
+                self.picker = None;
+                return;
+            }
+            items.push(
+                PickerItem::new("@all")
+                    .with_label("entire conversation")
+                    .with_detail("copy every message as it is now"),
+            );
+            picker.set_items(items);
+            self.status = format!(
+                "fork before a message · {} user message(s)",
+                picker.items.len() - 1
+            );
         } else if kind == PickerKind::RewindScope {
             picker.set_items(rewind_scope_picker_items());
             self.status = "rewind: choose what to restore".into();
@@ -916,6 +1056,9 @@ impl App {
             picker.loading = true;
             self.status = "mcp: loading…".into();
             let _ = tx.send(Command::ListMcp);
+        } else if kind == PickerKind::Diff {
+            picker.loading = true;
+            self.status = "diff: loading…".into();
         } else if kind == PickerKind::Todos {
             let Some(session_id) = self.focused_session_id() else {
                 self.status = "attach a session first".into();
@@ -1027,6 +1170,7 @@ impl App {
             "sessions" => self.open_picker(PickerKind::Sessions, tx),
             "new-pane" => self.open_picker(PickerKind::NewPane, tx),
             "files" => self.open_picker(PickerKind::Files, tx),
+            "image" | "images" => self.open_picker(PickerKind::Images, tx),
             "grep" => self.open_grep_picker("", tx),
             "git" | "worktrees" | "branches" => self.open_picker(PickerKind::Git, tx),
             "model" => self.open_picker(PickerKind::Models, tx),

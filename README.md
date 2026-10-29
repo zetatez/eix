@@ -170,6 +170,7 @@ runtime dir 时回退到平台 cache 目录（Linux 通常 `~/.cache/eix/eix.soc
 
 一个 session 是一条 append-only 事件日志，包含对话、工具调用、审批、补丁、压缩和状态变化。
 TUI 可以把多个 session 同时开在不同 pane；同一 session 只会在一个 pane 中出现。`fork` 复制历史，
+`/fork` 不填名字时会打开 picker，选中某条用户消息后只复制它之前的历史（也可显式选 “entire conversation”）；
 `rewind` 还会按执行前快照回滚工作区（尽力而为，并明确报告无法恢复的改动）。
 
 ### 执行模式
@@ -236,9 +237,9 @@ session 固定 Plan 模式模型，`/model-plan default` 清除并回退到 `mod
 `/rewind` 打开 checkpoint picker，选中后再选择回滚范围（对话、文件或两者）；也可以直接
 `/rewind <n> [both|chat|files]`，`n` 从最新 user turn 倒数。`/undo` 是 `/rewind` 的兼容别名，
 `/redo` 恢复最近一次 rewind。`/context` 在 overlay 中显示 token 预算与各 sector 占用
-（`/context all` 附带逐条 entry）；`/effort low|medium|high` 调整当前 session 的 reasoning；
+（`/context all` 附带逐条 entry）；`/effort` 打开 low/medium/high picker（`/effort high` 仍可直接设置）；
 `/branch` 分叉当前对话并把当前 pane 切到新分支（原 session 仍保留在 session picker）。
-`/diff` 和 `/doctor` 在可滚动 overlay 中展示仓库 diff 与 daemon 诊断；`/goal` 设置跨轮注入的
+`/diff` 打开 changed-files picker（右侧预览每个文件的 diff）；`/doctor` 在可滚动 overlay 中按 paths / runtime / model / tools / context 分区展示 daemon 诊断（与 `eix doctor` 共用渲染）；`/goal` 设置跨轮注入的
 持久目标，`/loop` / `/schedule` 在 session 空闲时按间隔或指定时间再次发送 prompt；
 `/code-review`、`/security-review`、`/simplify`、`/verify` 是内置的审查与验证 prompt 模板。
 

@@ -1076,12 +1076,25 @@ fn event_entries_with_claimed(
                     if payload.text.trim().is_empty() {
                         continue;
                     }
+                    // A cancelled turn keeps what streamed before the
+                    // interruption, but that text is incomplete. Mark it so a
+                    // later request cannot read a truncated answer as the
+                    // finished result.
+                    let text = if payload.cancelled {
+                        format!(
+                            "{}\n\n[turn cancelled by the user; this response was cut off \
+                             mid-stream]",
+                            payload.text.trim_end()
+                        )
+                    } else {
+                        payload.text.clone()
+                    };
                     let mut entry = make_entry(
                         format!("e{}", event.seq),
                         Sector::History,
                         "assistant".to_string(),
                         vec![ChatMessage::assistant_with_reasoning(
-                            payload.text.clone(),
+                            text.clone(),
                             None,
                             payload.reasoning.clone(),
                             payload.reasoning_signature.clone(),
@@ -1090,7 +1103,7 @@ fn event_entries_with_claimed(
                         true,
                         image_tokens,
                     );
-                    entry.info.preview = snippet(&first_line(&payload.text), MAX_PREVIEW_CHARS);
+                    entry.info.preview = snippet(&first_line(&text), MAX_PREVIEW_CHARS);
                     entries.push(entry);
                 }
             }
@@ -1978,6 +1991,45 @@ mod tests {
                 tool_calls: Vec::new(),
             }),
         )
+    }
+
+    #[test]
+    fn cancelled_assistant_output_is_marked_in_history() {
+        let events = vec![
+            user(1, "go"),
+            event(
+                2,
+                EventKind::AssistantMessage,
+                payload(&AssistantMessagePayload {
+                    text: "half an answer".into(),
+                    model: "m".into(),
+                    reasoning: None,
+                    reasoning_signature: None,
+                    cancelled: true,
+                    usage: None,
+                    tool_calls: Vec::new(),
+                }),
+            ),
+        ];
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            Vec::new(),
+            Sections::default(),
+            &events,
+            10_000,
+            4_000,
+            IMAGE_TOKEN_ESTIMATE,
+            &HashMap::new(),
+            &[],
+            1.0,
+        );
+        let last = ledger.messages().pop().expect("assistant message");
+        assert!(last.content.contains("half an answer"));
+        assert!(
+            last.content.contains("cut off mid-stream"),
+            "{}",
+            last.content
+        );
     }
 
     #[test]

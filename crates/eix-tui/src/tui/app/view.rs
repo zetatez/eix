@@ -41,6 +41,8 @@ impl App {
         }
         if self.command_menu_open() {
             self.draw_command_menu(frame, chunks[1]);
+        } else if self.cd_menu_open() {
+            self.draw_cd_menu(frame, chunks[1]);
         }
         if self.btw.is_some() {
             self.draw_btw(frame, chunks[0]);
@@ -280,6 +282,18 @@ impl App {
             + u16::from(borders.contains(Borders::BOTTOM));
         let inner_width = area.width.saturating_sub(border_cols) as usize;
         let inner_height = area.height.saturating_sub(border_rows) as usize;
+        // A formula that finished compiling since the last frame becomes an
+        // image only after a re-layout. Use the previous viewport, since the
+        // caches below are about to be refreshed.
+        let prev_scroll = self.views[index].scroll;
+        let prev_history_len = self.views[index]
+            .history_cache
+            .as_ref()
+            .map(|cache| cache.lines.len())
+            .unwrap_or(0);
+        let prev_total = prev_history_len + self.views[index].tail.lines.len();
+        let prev_end = (prev_scroll + inner_height).min(prev_total);
+        self.views[index].bump_math_if_ready(prev_scroll, prev_end, prev_history_len);
         // Stored history is rendered once and cached; only the live tail is
         // rebuilt on each frame. This keeps streaming cheap for long sessions.
         self.views[index].ensure_history(inner_width.max(1), theme);
@@ -356,6 +370,9 @@ impl App {
         // work, this keeps the paragraph independent of the full line vector.
         let scroll = self.views[index].scroll;
         let end = (scroll + inner_height).min(total);
+        // Queue only formulas in or near the viewport; the rest waits for the
+        // prewarm pass or for the user to scroll to them.
+        self.views[index].request_visible_math(scroll, end, history_len);
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(end.saturating_sub(scroll));
         {
             let view = &self.views[index];

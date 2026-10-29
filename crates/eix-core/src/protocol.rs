@@ -652,8 +652,9 @@ pub struct SessionCdParams {
     pub path: String,
 }
 
-/// `context.clear`: make the model start from a clean context. Earlier events
-/// stay in the log (and the transcript); they are simply not sent again.
+/// `context.clear`: reset a session to an empty conversation. Stored events,
+/// drafts, goals, schedules, undo snapshots, pending patches and the workspace
+/// memory are deleted; the session row (cwd, model, worktree) stays.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ContextClearParams {
     pub session_id: SessionId,

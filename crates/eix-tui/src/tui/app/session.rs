@@ -3,6 +3,21 @@
 use super::*;
 
 impl App {
+    /// `/clear`: the daemon deleted this session's stored history, so drop
+    /// every cached transcript and streaming artifact for its pane.
+    pub(super) fn session_reset(&mut self, session_id: &str) {
+        if let Some(view) = self
+            .views
+            .iter_mut()
+            .find(|view| view.session.id == session_id)
+        {
+            view.reset();
+        }
+        self.queues.remove(session_id);
+        self.status = "session cleared · history and memory removed".into();
+        self.error = None;
+    }
+
     /// True while the focused turn can still be interrupted.
     pub(super) fn focused_session_busy(&self) -> bool {
         self.submitting_session.is_some()

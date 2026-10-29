@@ -1520,6 +1520,12 @@ pub struct ProviderRuntimeConfig {
     pub system_prompt: Option<String>,
     /// Built-in prompt variant used when `system_prompt` is unset.
     pub prompt_profile: PromptProfile,
+    /// Extra instructions appended to the built-in prompt for matching
+    /// models. Keys are matched as substrings of the model id, and the
+    /// longest match wins, so a family entry (`claude`) and a specific entry
+    /// (`claude-opus`) can coexist. Ignored when `system_prompt` replaces the
+    /// built-in prompt.
+    pub model_prompts: std::collections::BTreeMap<String, String>,
     /// Tell the model how to behave when it is sampled again without a new
     /// user message. Off by default: eix turns end when the task is done, so
     /// the extra contract would otherwise be noise. Enable it for schedules,
@@ -1538,8 +1544,23 @@ impl Default for ProviderRuntimeConfig {
             max_output_tokens: 8_192,
             system_prompt: None,
             prompt_profile: PromptProfile::Default,
+            model_prompts: std::collections::BTreeMap::new(),
             persistent_mode: false,
         }
+    }
+}
+
+impl ProviderRuntimeConfig {
+    /// Extra instructions for `model`, matched by the longest key that appears
+    /// in the model id. Empty values are skipped so a commented-out entry in
+    /// TOML cannot inject a blank section.
+    pub fn model_prompt(&self, model: &str) -> Option<&str> {
+        self.model_prompts
+            .iter()
+            .filter(|(key, prompt)| !key.is_empty() && !prompt.trim().is_empty())
+            .filter(|(key, _)| model.contains(key.as_str()))
+            .max_by_key(|(key, _)| key.len())
+            .map(|(_, prompt)| prompt.as_str())
     }
 }
 
@@ -2372,6 +2393,46 @@ impl Config {
             ))
         })?;
         plugin["enabled"] = toml_edit::value(enabled);
+        self.save_document(&path, &doc)?;
+        Ok(path)
+    }
+
+    /// Persist `mcp.servers.<name>.enabled`. Runtime `mcp.set_enabled` uses
+    /// this so a picker toggle survives a daemon restart. Only the flag is
+    /// written, so a server defined in a project layer keeps its command,
+    /// args and filters.
+    pub fn write_mcp_server_enabled(
+        &self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<PathBuf, ConfigError> {
+        let (path, mut doc) = self.edit_document()?;
+        let mcp = doc
+            .as_table_mut()
+            .entry("mcp")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let mcp = mcp.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!("`mcp` in {} must be a table", path.display()))
+        })?;
+        let servers = mcp
+            .entry("servers")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let servers = servers.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "`mcp.servers` in {} must be a table",
+                path.display()
+            ))
+        })?;
+        let server = servers
+            .entry(name)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let server = server.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "`mcp.servers.{name}` in {} must be a table",
+                path.display()
+            ))
+        })?;
+        server["enabled"] = toml_edit::value(enabled);
         self.save_document(&path, &doc)?;
         Ok(path)
     }

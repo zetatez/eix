@@ -40,6 +40,11 @@ const LOG_CAP_BYTES: u64 = 16 * 1024 * 1024;
 const STREAM_CAP_BYTES: u64 = 8 * 1024 * 1024;
 /// Finished processes kept in memory per session.
 const KEEP_FINISHED: usize = 32;
+/// Running processes allowed per session. Without a cap a long-lived daemon
+/// accumulates a shell, pipes and file descriptors for every command the
+/// model leaves running; refused calls name the oldest ones so the model can
+/// stop them.
+const MAX_RUNNING: usize = 16;
 /// How long a killed process gets to exit before SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(2);
 
@@ -80,6 +85,7 @@ impl ProcessRegistry {
         command: &str,
         plan: CommandPlan,
     ) -> Result<ProcessInfo> {
+        self.check_running_cap(session_id)?;
         let mut cmd = plan.command();
         cmd.stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
@@ -426,6 +432,48 @@ impl ProcessRegistry {
             .with_context(|| format!("no processes in session {session_id:?}"))
     }
 
+    /// Refuse a new long-running process once a session is holding too many.
+    ///
+    /// The message names the oldest ones because the model has no kill tool:
+    /// it can stop a process with `kill <pid>` from a one-shot command, and a
+    /// tty session also accepts Ctrl-C through `write_stdin`.
+    fn check_running_cap(&self, session_id: &str) -> Result<()> {
+        let mut running: Vec<(i64, String, u32, String)> = {
+            let entries = self.entries.lock().expect("process mutex poisoned");
+            entries
+                .values()
+                .filter_map(|entry| {
+                    let info = entry.info.lock().expect("process mutex poisoned");
+                    (info.status.is_running() && info.session_id == session_id).then(|| {
+                        (
+                            info.started_ms,
+                            info.id.clone(),
+                            info.pid,
+                            info.command.clone(),
+                        )
+                    })
+                })
+                .collect()
+        };
+        if running.len() < MAX_RUNNING {
+            return Ok(());
+        }
+        running.sort();
+        let listing = running
+            .iter()
+            .take(5)
+            .map(|(_, id, pid, command)| {
+                format!("{id} (pid {pid}) `{}`", truncate_command(command, 60))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!(
+            "session already has {MAX_RUNNING} running background processes; stop one with \
+             `kill <pid>`, send Ctrl-C to a tty session through `write_stdin`, or wait for it to \
+             exit, then retry. Running: {listing}"
+        )
+    }
+
     /// Drop the oldest finished processes once a session accumulates many.
     fn prune_finished(&self, session_id: &str) {
         let mut entries = self.entries.lock().expect("process mutex poisoned");
@@ -445,6 +493,15 @@ impl ProcessRegistry {
             entries.remove(id);
         }
     }
+}
+
+/// Shorten a command for an error message without splitting a character.
+fn truncate_command(command: &str, max_chars: usize) -> String {
+    let mut out: String = command.chars().take(max_chars).collect();
+    if command.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
 }
 
 /// Spawn a pipe reader, if the pipe exists.

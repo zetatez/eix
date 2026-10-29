@@ -765,6 +765,9 @@ pub const PLUGIN_HOOK_POINTS: &[&str] = &[
     "prompt.build",
     "turn.stop",
     "turn.end",
+    "compact.before",
+    "compact.after",
+    "session.start",
 ];
 
 /// UI surfaces the host knows how to render.

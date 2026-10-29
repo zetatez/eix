@@ -2778,13 +2778,14 @@ async fn daemon(cli: &Cli) -> Result<()> {
 }
 
 async fn doctor(cli: &Cli) -> Result<()> {
-    println!("socket   {}", cli.socket.display());
-    println!("data     {}", cli.data_dir.display());
+    let mut lines: Vec<String> = Vec::new();
+    lines.push(format!("socket   {}", cli.socket.display()));
+    lines.push(format!("data     {}", cli.data_dir.display()));
     let config_path = cli
         .config_path
         .clone()
         .unwrap_or_else(core_config::default_config_path);
-    println!(
+    lines.push(format!(
         "config   {}{}",
         config_path.display(),
         if config_path.exists() {
@@ -2792,36 +2793,84 @@ async fn doctor(cli: &Cli) -> Result<()> {
         } else {
             " (missing, defaults)"
         }
-    );
+    ));
+    if let Some(exe) = std::env::current_exe().ok() {
+        let eixd = exe.with_file_name("eixd");
+        lines.push(format!(
+            "eixd     {}{}",
+            eixd.display(),
+            if eixd.exists() {
+                ""
+            } else {
+                " (missing; run `cargo build`)"
+            }
+        ));
+    }
 
     let config = Config::load(cli.config_path.as_deref());
+
+    // Ask the daemon first: its model and endpoint are what sessions actually
+    // use. A missing daemon is a diagnostic, not a reason to fail the command.
+    let hello = match cli.connect().await {
+        Ok(mut client) => match client.request("hello", Value::Null).await {
+            Ok(value) => match serde_json::from_value::<HelloResult>(value) {
+                Ok(hello) => Some(hello),
+                Err(err) => {
+                    lines.push(format!("warning  cannot decode daemon hello: {err}"));
+                    None
+                }
+            },
+            Err(err) => {
+                lines.push(format!("warning  daemon request failed: {err:#}"));
+                None
+            }
+        },
+        Err(err) => {
+            lines.push("daemon   unreachable".to_string());
+            lines.push(format!("warning  cannot start or reach eixd: {err:#}"));
+            None
+        }
+    };
+
     match &config {
         Ok(config) => {
-            println!("model    {}", config.default_model());
-            println!("api      {}", config.chat_endpoint());
-            println!(
+            lines.push(format!(
+                "model    {}",
+                hello
+                    .as_ref()
+                    .map(|hello| hello.model.clone())
+                    .unwrap_or_else(|| config.default_model().to_string())
+            ));
+            lines.push(format!(
+                "api      {}",
+                hello
+                    .as_ref()
+                    .map(|hello| hello.base_url.clone())
+                    .unwrap_or_else(|| config.chat_endpoint())
+            ));
+            lines.push(format!(
                 "key      {}",
                 if config.api_key().is_some() {
                     "present"
                 } else {
                     "absent (set EIX_API_KEY or the configured env var)"
                 }
-            );
-            println!(
+            ));
+            lines.push(format!(
                 "sandbox  {} ({})",
                 config.tools.sandbox.as_str(),
                 core_sandbox::status()
-            );
-            println!("input    native (built-in Vim editor)");
-            println!(
+            ));
+            lines.push("input    native (built-in Vim editor)".to_string());
+            lines.push(format!(
                 "snapshot {}",
                 if config.tools.snapshots {
                     "on (before apply_patch/exec_command)"
                 } else {
                     "off"
                 }
-            );
-            println!(
+            ));
+            lines.push(format!(
                 "rules    {} · network {}",
                 config.tools.rules.len(),
                 if config.tools.sandbox_network {
@@ -2829,8 +2878,8 @@ async fn doctor(cli: &Cli) -> Result<()> {
                 } else {
                     "blocked"
                 }
-            );
-            println!("classify auto in auto mode · session model");
+            ));
+            lines.push("classify auto in auto mode · session model".to_string());
             let mut compat = Vec::new();
             if config.compations.claude_code {
                 compat.push("claude");
@@ -2847,19 +2896,19 @@ async fn doctor(cli: &Cli) -> Result<()> {
             if config.compations.pi {
                 compat.push("pi");
             }
-            println!(
+            lines.push(format!(
                 "compations {}",
                 if compat.is_empty() {
                     "off (native .eix only)".to_string()
                 } else {
                     compat.join(", ")
                 }
-            );
+            ));
             let agents = std::env::current_dir()
                 .ok()
                 .map(|cwd| cwd.join("AGENTS.md"))
                 .is_some_and(|path| path.exists());
-            println!(
+            lines.push(format!(
                 "context  {} tokens · AGENTS.md {} · workspace summary {}",
                 config.context.budget_tokens,
                 if agents { "found" } else { "missing" },
@@ -2868,37 +2917,24 @@ async fn doctor(cli: &Cli) -> Result<()> {
                 } else {
                     "off"
                 }
-            );
+            ));
             for warning in &config.security_warnings {
-                println!("warning  {warning}");
+                lines.push(format!("warning  {warning}"));
             }
         }
-        Err(err) => println!("config   ERROR: {err}"),
+        Err(err) => lines.push(format!("warning  cannot load config: {err:#}")),
     }
 
-    let exe = std::env::current_exe().ok();
-    if let Some(exe) = exe {
-        let eixd = exe.with_file_name("eixd");
-        println!(
-            "eixd     {}{}",
-            eixd.display(),
-            if eixd.exists() {
-                ""
-            } else {
-                " (missing; run `cargo build`)"
-            }
-        );
+    if let Some(hello) = hello {
+        lines.push(format!(
+            "daemon   eixd {} pid {} protocol {}",
+            hello.version, hello.pid, hello.protocol
+        ));
+        lines.push(format!("sessions {}", hello.sessions));
     }
 
-    let mut client = cli.connect().await?;
-    let hello: HelloResult = serde_json::from_value(client.request("hello", Value::Null).await?)?;
-    println!(
-        "daemon   eixd {} pid {} protocol {}",
-        hello.version, hello.pid, hello.protocol
-    );
-    println!("model    {}", hello.model);
-    println!("api      {}", hello.base_url);
-    println!("sessions {}", hello.sessions);
+    let colors = io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none();
+    print!("{}", tui::doctor::DoctorReport::parse(&lines).ansi(colors));
     Ok(())
 }
 

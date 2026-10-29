@@ -8,23 +8,32 @@
 //!
 //! Images are cached by formula, available width and colour so scrolling and
 //! redraws do not re-run LaTeX.
+//!
+//! Compilation is asynchronous: [`render`] only consumes PNGs that are already
+//! in memory or on disk and returns `None` on a miss, so the first frame shows
+//! the ASCII fallback. A small worker pool compiles visible formulas first,
+//! then the rest of the session at low priority. [`displayable`] tells the UI
+//! when a re-layout would replace a fallback with its image.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::SystemTime;
 
 use eix_core::config::MathConfig;
+use image::{imageops, DynamicImage, Rgba, RgbaImage};
 use ratatui::layout::Size;
 use ratatui::style::Color;
 #[cfg(unix)]
 use ratatui_image::picker::cap_parser::{Parser, QueryStdioOptions, Response};
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::Protocol;
-use ratatui_image::{FontSize, Resize};
+use ratatui_image::{FilterType, FontSize, Resize};
+use sha2::{Digest, Sha256};
 
 /// An image encoded for the active terminal protocol. Despite the name it is
 /// also used for user attachments and `view_image` thumbnails, not only math.
@@ -44,11 +53,35 @@ pub struct Placement {
     pub image: MathImage,
 }
 
+/// A formula waiting for its PNG. The transcript keeps these so the viewport
+/// can request renders and notice when an image becomes available.
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub line: usize,
+    pub source: String,
+    pub width: usize,
+    pub color: Option<Color>,
+    /// Inline images are scaled to a single row; display math keeps its own
+    /// vertical size.
+    pub inline: bool,
+}
+
+/// Background work ordering. Formulas inside or near the viewport go first;
+/// the rest is warmed after the first frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Priority {
+    Visible,
+    Prewarm,
+}
+
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CacheKey {
     source: String,
     width: usize,
     color: Option<Color>,
+    /// Inline math is scaled to one row, so it cannot share an encoded image
+    /// with the same formula rendered as display math.
+    inline: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -61,8 +94,21 @@ struct FileKey {
     modified: Option<u128>,
 }
 
-type LatexKey = (String, Option<Color>);
+/// `(source, colour, inline)`. Inline math is compiled in text style with a
+/// baseline strut, so it needs its own PNG.
+type LatexKey = (String, Option<Color>, bool);
 type LatexCache = HashMap<LatexKey, Result<Vec<u8>, String>>;
+
+/// Bump when the generated PNG changes for the same source (preamble layout,
+/// package list, engine flags, ...). The digest is part of every cache file
+/// name, so old entries are simply ignored and pruned later.
+const CACHE_VERSION: u32 = 3;
+
+/// Upper bound for `~/.cache/eix/math`. A typical formula PNG is a few KiB,
+/// so this holds thousands of renders.
+const CACHE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+static CACHE_PRUNED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct Settings {
@@ -73,6 +119,9 @@ struct Settings {
     min_scale: f64,
     max_rows: u32,
     preamble: String,
+    /// Persist rendered PNGs across runs. `EIX_MATH_CACHE=0` disables both
+    /// reading and writing the on-disk cache.
+    cache: bool,
 }
 
 impl Settings {
@@ -84,6 +133,12 @@ impl Settings {
             .and_then(|value| value.parse::<u32>().ok())
             .filter(|dpi| (50..=1200).contains(dpi))
             .unwrap_or(config.dpi);
+        let cache = !std::env::var("EIX_MATH_CACHE").is_ok_and(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no"
+            )
+        });
         Self {
             math_images: config.images,
             dpi,
@@ -91,6 +146,7 @@ impl Settings {
             min_scale: f64::from(config.min_scale),
             max_rows: config.max_rows,
             preamble: config.preamble.clone(),
+            cache,
         }
     }
 }
@@ -113,17 +169,248 @@ pub struct Status {
     pub last_error: Option<String>,
 }
 
+struct Job {
+    source: String,
+    color: Option<Color>,
+    inline: bool,
+}
+
+/// Background compile queue. Visible formulas are always taken before warmed
+/// ones, and `active` deduplicates requests across panes and redraws.
+#[derive(Default)]
+struct Queue {
+    visible: VecDeque<Job>,
+    prewarm: VecDeque<Job>,
+    active: HashSet<LatexKey>,
+    shutdown: bool,
+}
+
+/// State shared with the compiler threads: the PNG cache and the queue. The
+/// terminal picker stays on the UI thread; workers only produce PNG bytes.
+struct Shared {
+    settings: Settings,
+    latex: Mutex<LatexCache>,
+    known: Mutex<HashSet<LatexKey>>,
+    /// Formulas discovered by the renderer and not yet offered to the warm
+    /// queue. Draining this per frame keeps `prewarm` proportional to new
+    /// formulas instead of the whole session.
+    discovered: Mutex<VecDeque<LatexKey>>,
+    /// Formulas whose compile failed. The ASCII fallback stays and the next
+    /// frame does not retry them.
+    failed: Mutex<HashSet<LatexKey>>,
+    queue: Mutex<Queue>,
+    wake: Condvar,
+}
+
+impl Shared {
+    fn new(settings: Settings) -> Self {
+        Self {
+            settings,
+            latex: Mutex::new(HashMap::new()),
+            known: Mutex::new(HashSet::new()),
+            discovered: Mutex::new(VecDeque::new()),
+            failed: Mutex::new(HashSet::new()),
+            queue: Mutex::new(Queue::default()),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// PNG bytes from memory or disk. Missing means "needs a compile".
+    fn cached_png(
+        &self,
+        source: &str,
+        color: Option<Color>,
+        inline: bool,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let key = (source.to_string(), color, inline);
+        if let Ok(cache) = self.latex.lock() {
+            if let Some(cached) = cache.get(&key) {
+                return Some(cached.clone());
+            }
+        }
+        let path = disk_path(&self.settings, source, color, inline)?;
+        let png = read_cached_png(&path)?;
+        let cached = Ok(png);
+        if let Ok(mut cache) = self.latex.lock() {
+            cache.insert(key, cached.clone());
+        }
+        Some(cached)
+    }
+
+    fn is_ready(&self, source: &str, color: Option<Color>, inline: bool) -> bool {
+        self.latex
+            .lock()
+            .ok()
+            .and_then(|cache| {
+                cache
+                    .get(&(source.to_string(), color, inline))
+                    .map(Result::is_ok)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Queue one formula. Returns whether new work was added.
+    fn enqueue(
+        &self,
+        source: &str,
+        color: Option<Color>,
+        inline: bool,
+        priority: Priority,
+    ) -> bool {
+        let key = (source.to_string(), color, inline);
+        if !self.settings.math_images || self.is_ready(source, color, inline) {
+            return false;
+        }
+        if self
+            .failed
+            .lock()
+            .map(|failed| failed.contains(&key))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let Ok(mut queue) = self.queue.lock() else {
+            return false;
+        };
+        if queue.shutdown {
+            return false;
+        }
+        if queue.active.contains(&key) {
+            // A visible request must not sit behind warmed formulas.
+            if priority == Priority::Visible {
+                if let Some(index) = queue.prewarm.iter().position(|job| {
+                    job.source == source && job.color == color && job.inline == inline
+                }) {
+                    if let Some(job) = queue.prewarm.remove(index) {
+                        queue.visible.push_back(job);
+                    }
+                }
+            }
+            return false;
+        }
+        queue.active.insert(key);
+        let job = Job {
+            source: source.to_string(),
+            color,
+            inline,
+        };
+        match priority {
+            Priority::Visible => queue.visible.push_back(job),
+            Priority::Prewarm => queue.prewarm.push_back(job),
+        }
+        drop(queue);
+        self.wake.notify_one();
+        true
+    }
+}
+
+/// Owns the compiler threads. Dropping the service (for example `/math
+/// reload`) asks them to stop after the current formula.
+struct Workers {
+    shared: Arc<Shared>,
+}
+
+impl Workers {
+    fn spawn(shared: Arc<Shared>) -> Self {
+        let count = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(1)
+            .clamp(1, 4);
+        for index in 0..count {
+            let worker = Arc::clone(&shared);
+            let _ = std::thread::Builder::new()
+                .name(format!("eix-math-{index}"))
+                .spawn(move || compile_worker(worker));
+        }
+        Self { shared }
+    }
+}
+
+impl Drop for Workers {
+    fn drop(&mut self) {
+        if let Ok(mut queue) = self.shared.queue.lock() {
+            queue.shutdown = true;
+            queue.visible.clear();
+            queue.prewarm.clear();
+        }
+        self.shared.wake.notify_all();
+    }
+}
+
+fn compile_worker(shared: Arc<Shared>) {
+    loop {
+        let job = {
+            let Ok(mut queue) = shared.queue.lock() else {
+                return;
+            };
+            loop {
+                if queue.shutdown {
+                    return;
+                }
+                if let Some(job) = queue
+                    .visible
+                    .pop_front()
+                    .or_else(|| queue.prewarm.pop_front())
+                {
+                    break job;
+                }
+                queue = match shared.wake.wait(queue) {
+                    Ok(queue) => queue,
+                    Err(_) => return,
+                };
+            }
+        };
+        let key = (job.source.clone(), job.color, job.inline);
+        if shared
+            .cached_png(&job.source, job.color, job.inline)
+            .is_none()
+        {
+            let rendered = latex_png(&job.source, job.color, &shared.settings, job.inline);
+            match &rendered {
+                Ok(png) => {
+                    if let Some(path) =
+                        disk_path(&shared.settings, &job.source, job.color, job.inline)
+                    {
+                        store_cached_png(&path, png);
+                    }
+                }
+                Err(error) => {
+                    record_error(&job.source, error);
+                    if let Ok(mut failed) = shared.failed.lock() {
+                        failed.insert(key.clone());
+                    }
+                }
+            }
+            if let Ok(mut cache) = shared.latex.lock() {
+                cache.insert(key.clone(), rendered);
+            }
+        } else if !shared.is_ready(&job.source, job.color, job.inline) {
+            // A cached failure (for example a corrupt on-disk entry) must not
+            // be retried on every frame.
+            if let Ok(mut failed) = shared.failed.lock() {
+                failed.insert(key.clone());
+            }
+        }
+        if let Ok(mut queue) = shared.queue.lock() {
+            queue.active.remove(&key);
+        }
+    }
+}
+
 struct Service {
     picker: Picker,
     settings: Settings,
     cache: Mutex<HashMap<CacheKey, Option<MathImage>>>,
     files: Mutex<HashMap<FileKey, Option<MathImage>>>,
-    /// PNG bytes keyed by formula and colour. Width only affects how the image
-    /// is scaled, so resizing the terminal must not re-run LaTeX.
-    latex: Mutex<LatexCache>,
+    shared: Arc<Shared>,
+    _workers: Workers,
 }
 
 static SERVICE: OnceLock<Mutex<Option<Service>>> = OnceLock::new();
+/// The user disabled math (`/math off` or `[math] images = false`) or the
+/// `EIX_MATH_IMAGES=0` kill switch is set. Formulas keep their literal TeX
+/// instead of using an image or the 2D ASCII grid.
+static RAW_SOURCE: AtomicBool = AtomicBool::new(false);
 static STATUS: Mutex<Status> = Mutex::new(Status {
     enabled: false,
     protocol: String::new(),
@@ -143,6 +430,7 @@ pub fn init(config: &MathConfig) -> bool {
             "0" | "off" | "false" | "no"
         )
     });
+    RAW_SOURCE.store(env_disabled || !config.images, Ordering::Relaxed);
     let settings = Settings::from_config(config);
     let dpi = settings.dpi;
 
@@ -189,6 +477,12 @@ pub fn enabled() -> bool {
         .get()
         .and_then(|slot| slot.lock().ok().map(|slot| slot.is_some()))
         .unwrap_or(false)
+}
+
+/// True when the user turned math off, so formulas should stay as literal
+/// TeX (`$...$`, `$$...$$`) instead of an image or the 2D ASCII grid.
+pub fn raw_source() -> bool {
+    RAW_SOURCE.load(Ordering::Relaxed)
 }
 
 pub fn status() -> Status {
@@ -383,9 +677,25 @@ impl Drop for RawMode {
     }
 }
 
-/// Lay out `source` as an image that fits in `width` cells. Returns `None`
-/// when images are disabled or rendering failed, so the caller can use ASCII.
+/// Lay out `source` as a display-math image that fits in `width` cells. Only
+/// cached PNGs are used: a miss returns `None` immediately and queues
+/// background work, so the caller keeps the ASCII fallback for this frame.
 pub fn render(source: &str, width: usize, color: Option<Color>) -> Option<MathImage> {
+    render_mode(source, width, color, false)
+}
+
+/// Lay out `source` as a single-row image embedded in a text line. Returns
+/// `None` when the formula would be too tall or too wide to fit.
+pub fn render_inline(source: &str, width: usize, color: Option<Color>) -> Option<MathImage> {
+    render_mode(source, width, color, true)
+}
+
+fn render_mode(
+    source: &str,
+    width: usize,
+    color: Option<Color>,
+    inline: bool,
+) -> Option<MathImage> {
     let slot = SERVICE.get()?.lock().ok()?;
     let service = slot.as_ref()?;
     if !service.settings.math_images {
@@ -395,11 +705,29 @@ pub fn render(source: &str, width: usize, color: Option<Color>) -> Option<MathIm
         source: source.to_string(),
         width,
         color,
+        inline,
     };
     if let Some(cached) = service.cache.lock().ok()?.get(&key) {
         return cached.clone();
     }
-    let rendered = match service.render_uncached(source, width, color) {
+    let Some(png) = service.shared.cached_png(source, color, inline) else {
+        // Remember the formula so `prewarm` can fill it after the first
+        // frame without blocking the layout that discovered it.
+        let latex_key = (source.to_string(), color, inline);
+        let fresh = service
+            .shared
+            .known
+            .lock()
+            .map(|mut known| known.insert(latex_key.clone()))
+            .unwrap_or(false);
+        if fresh {
+            if let Ok(mut discovered) = service.shared.discovered.lock() {
+                discovered.push_back(latex_key);
+            }
+        }
+        return None;
+    };
+    let rendered = match png.and_then(|bytes| service.encode_png(&bytes, width, inline)) {
         Ok(image) => Some(image),
         Err(error) => {
             record_error(source, &error);
@@ -410,6 +738,99 @@ pub fn render(source: &str, width: usize, color: Option<Color>) -> Option<MathIm
         cache.insert(key, rendered.clone());
     }
     rendered
+}
+
+/// True when a re-layout would now draw this formula: either its PNG is ready
+/// and this width is not encoded yet, or another pane already encoded it while
+/// this pane still holds the ASCII fallback.
+pub fn displayable(source: &str, width: usize, color: Option<Color>, inline: bool) -> bool {
+    let Some(slot) = SERVICE.get() else {
+        return false;
+    };
+    let Ok(slot) = slot.lock() else {
+        return false;
+    };
+    let Some(service) = slot.as_ref() else {
+        return false;
+    };
+    let key = CacheKey {
+        source: source.to_string(),
+        width,
+        color,
+        inline,
+    };
+    let encoded = service
+        .cache
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned());
+    match encoded {
+        Some(Some(_)) => true,
+        // A cached failure would only fall back to ASCII again.
+        Some(None) => false,
+        None => service.shared.is_ready(source, color, inline),
+    }
+}
+
+/// True when a miss for this exact layout is still waiting for a compile, so
+/// the transcript should keep a pending entry for it.
+pub fn pending(source: &str, width: usize, color: Option<Color>, inline: bool) -> bool {
+    let Some(slot) = SERVICE.get() else {
+        return false;
+    };
+    let Ok(slot) = slot.lock() else {
+        return false;
+    };
+    let Some(service) = slot.as_ref() else {
+        return false;
+    };
+    if !service.settings.math_images {
+        return false;
+    }
+    let key = CacheKey {
+        source: source.to_string(),
+        width,
+        color,
+        inline,
+    };
+    service
+        .cache
+        .lock()
+        .map(|cache| !cache.contains_key(&key))
+        .unwrap_or(false)
+}
+
+/// Queue a formula for background compilation.
+pub fn request(source: &str, color: Option<Color>, inline: bool, priority: Priority) {
+    let Some(shared) = current_shared() else {
+        return;
+    };
+    shared.enqueue(source, color, inline, priority);
+}
+
+/// Offer formulas discovered by the last render to the low-priority queue.
+/// Called after every frame; only newly seen formulas cost anything, so the
+/// first frame can paint immediately and the rest follow in the background.
+pub fn prewarm() {
+    let Some(shared) = current_shared() else {
+        return;
+    };
+    if !shared.settings.math_images {
+        return;
+    }
+    let discovered: Vec<LatexKey> = shared
+        .discovered
+        .lock()
+        .map(|mut discovered| discovered.drain(..).collect())
+        .unwrap_or_default();
+    for (source, color, inline) in discovered {
+        shared.enqueue(&source, color, inline, Priority::Prewarm);
+    }
+}
+
+fn current_shared() -> Option<Arc<Shared>> {
+    let slot = SERVICE.get()?.lock().ok()?;
+    slot.as_ref().map(|service| Arc::clone(&service.shared))
 }
 
 const THUMBNAIL_COLS: u16 = 40;
@@ -548,63 +969,254 @@ fn log_failure(source: &str, error: &str) {
     let _ = writeln!(file, "[{seconds}] {error}\n  {first}");
 }
 
+/// Rendered PNGs live in the OS cache directory, so reopening a session can
+/// skip both TeX and `dvipng`. The file name is a digest of everything that
+/// affects the PNG, which makes the cache safe to share between panes,
+/// processes and terminal sizes.
+fn math_cache_dir() -> Option<PathBuf> {
+    dirs::cache_dir()
+        .or_else(dirs::data_dir)
+        .map(|dir| dir.join("eix").join("math"))
+}
+
+fn cache_digest(source: &str, color: Option<Color>, inline: bool, settings: &Settings) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(CACHE_VERSION.to_le_bytes());
+    hasher.update([u8::from(inline)]);
+    hasher.update(settings.dpi.to_le_bytes());
+    hasher.update((source.len() as u64).to_le_bytes());
+    hasher.update(source.as_bytes());
+    hasher.update((settings.preamble.len() as u64).to_le_bytes());
+    hasher.update(settings.preamble.as_bytes());
+    hasher.update(color_hex(color).as_bytes());
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
+}
+
+fn cache_path(
+    source: &str,
+    color: Option<Color>,
+    inline: bool,
+    settings: &Settings,
+) -> Option<PathBuf> {
+    let dir = math_cache_dir()?;
+    Some(dir.join(format!(
+        "{}.png",
+        cache_digest(source, color, inline, settings)
+    )))
+}
+
+/// Cache file for a formula, or `None` when persistence is disabled.
+fn disk_path(
+    settings: &Settings,
+    source: &str,
+    color: Option<Color>,
+    inline: bool,
+) -> Option<PathBuf> {
+    settings
+        .cache
+        .then(|| cache_path(source, color, inline, settings))
+        .flatten()
+}
+
+/// Read a cached PNG, discarding entries that are not complete PNG files
+/// (for example left behind by an interrupted older version).
+fn read_cached_png(path: &Path) -> Option<Vec<u8>> {
+    const PNG_SIGNATURE: &[u8] = b"\x89PNG\r\n\x1a\n";
+    let bytes = fs::read(path).ok()?;
+    if !bytes.starts_with(PNG_SIGNATURE) {
+        let _ = fs::remove_file(path);
+        return None;
+    }
+    Some(bytes)
+}
+
+/// Write through a unique temporary file so a concurrent reader never sees a
+/// partial PNG.
+fn store_cached_png(path: &Path, png: &[u8]) {
+    let Some(dir) = path.parent() else {
+        return;
+    };
+    if fs::create_dir_all(dir).is_err() {
+        return;
+    }
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let temp = dir.join(format!(".{}.{}.tmp", std::process::id(), seq));
+    if fs::write(&temp, png).is_err() {
+        let _ = fs::remove_file(&temp);
+        return;
+    }
+    if fs::rename(&temp, path).is_err() {
+        let _ = fs::remove_file(&temp);
+        return;
+    }
+    if !CACHE_PRUNED.swap(true, Ordering::Relaxed) {
+        prune_cache(dir);
+    }
+}
+
+/// Keep the cache under [`CACHE_MAX_BYTES`], dropping the oldest entries.
+/// Runs once per process after the first new render.
+fn prune_cache(dir: &Path) {
+    fn modified(path: &Path) -> SystemTime {
+        fs::metadata(path)
+            .and_then(|meta| meta.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    }
+
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut files: Vec<(SystemTime, u64, PathBuf)> = Vec::new();
+    let mut total: u64 = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        total += meta.len();
+        files.push((modified(&path), meta.len(), path));
+    }
+    if total <= CACHE_MAX_BYTES {
+        return;
+    }
+    files.sort_by_key(|(time, _, _)| *time);
+    let target = CACHE_MAX_BYTES / 4 * 3;
+    for (_, len, path) in files {
+        if total <= target {
+            break;
+        }
+        if fs::remove_file(&path).is_ok() {
+            total = total.saturating_sub(len);
+        }
+    }
+}
+
 impl Service {
     fn new(settings: Settings) -> Result<Self, String> {
         let picker = probe_picker()?;
         if matches!(picker.protocol_type(), ProtocolType::Halfblocks) {
             return Err("no Kitty/Sixel/iTerm2 graphics protocol detected".into());
         }
+        let shared = Arc::new(Shared::new(settings.clone()));
+        let workers = Workers::spawn(Arc::clone(&shared));
         Ok(Self {
             picker,
             settings,
             cache: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
-            latex: Mutex::new(HashMap::new()),
+            shared,
+            _workers: workers,
         })
     }
 
-    /// Compile a formula once per colour, independently of the pane width.
-    fn latex_cached(&self, source: &str, color: Option<Color>) -> Result<Vec<u8>, String> {
-        let key = (source.to_string(), color);
-        if let Ok(cache) = self.latex.lock() {
-            if let Some(cached) = cache.get(&key) {
-                return cached.clone();
-            }
+    /// Decode a compiled PNG and encode it for this terminal and width.
+    fn encode_png(&self, image: &[u8], width: usize, inline: bool) -> Result<MathImage, String> {
+        let width = width.clamp(1, u16::MAX as usize) as u16;
+        let decoded = image::load_from_memory(image)
+            .map_err(|error| format!("could not decode LaTeX PNG: {error}"))?;
+        if inline {
+            return self.encode_inline(decoded.to_rgba8(), width);
         }
-        let rendered = latex_png(source, color, &self.settings);
-        if let Ok(mut cache) = self.latex.lock() {
-            cache.insert(key, rendered.clone());
-        }
-        rendered
+        self.fit(
+            decoded,
+            width,
+            self.settings.max_rows,
+            self.settings.min_scale,
+            self.settings.min_scale,
+        )
     }
 
-    fn render_uncached(
-        &self,
-        source: &str,
-        width: usize,
-        color: Option<Color>,
-    ) -> Result<MathImage, String> {
-        let width = width.clamp(1, u16::MAX as usize) as u16;
-        let image = self.latex_cached(source, color)?;
-        let decoded = image::load_from_memory(&image)
-            .map_err(|error| format!("could not decode LaTeX PNG: {error}"))?;
-        self.fit(decoded, width, self.settings.max_rows, true)
+    /// Compose an inline formula onto a transparent canvas the size of one
+    /// text row. The formula is scaled to the surrounding prose and placed so
+    /// its baseline matches the text baseline; letting `ratatui-image` fit the
+    /// bare PNG would top-align it and make short formulas float.
+    fn encode_inline(&self, decoded: RgbaImage, max_cols: u16) -> Result<MathImage, String> {
+        let font = self.picker.font_size();
+        let cell_w = f64::from(font.width.max(1));
+        let cell_h = f64::from(font.height.max(1));
+        let font_width = u32::from(font.width.max(1));
+        let font_height = u32::from(font.height.max(1));
+
+        // The marker rule is ordinary ink, so the tight crop keeps it; its top
+        // edge is the TeX baseline. Without it a descender-less formula would
+        // be aligned by its ink bottom and sit too low.
+        let (formula, baseline) = match inline_marker(&decoded, self.settings.dpi)
+            .and_then(|marker| strip_inline_marker(&decoded, &marker))
+        {
+            Some((formula, baseline)) => (formula, f64::from(baseline)),
+            None => {
+                // A formula compiled through the display fallback has no
+                // marker; bottom-align it so it still sits on the baseline.
+                let formula = crop_ink(&decoded).unwrap_or(decoded);
+                let baseline = f64::from(formula.height());
+                (formula, baseline)
+            }
+        };
+
+        // `standalone` uses a 10pt base font; one em in the PNG is this many
+        // pixels. Terminals normally set the cell height to about 1.2 em, so
+        // 0.84 of a cell makes the formula match the surrounding prose text.
+        let em_px = f64::from(self.settings.dpi) * 10.0 / 72.27;
+        let mut scale = (cell_h * 0.84 / em_px).min(1.0);
+        scale = scale.min(f64::from(max_cols) * cell_w / f64::from(formula.width().max(1)));
+        scale = scale.min(cell_h / f64::from(formula.height().max(1)));
+        if scale <= 0.0 {
+            return Err("formula does not fit on one text row".into());
+        }
+        let width = (f64::from(formula.width()) * scale).round().max(1.0) as u32;
+        let height = (f64::from(formula.height()) * scale).round().max(1.0) as u32;
+        let cols = width.div_ceil(font_width).max(1);
+        let mut canvas = RgbaImage::from_pixel(cols * font_width, font_height, Rgba([0, 0, 0, 0]));
+        let resized = imageops::resize(&formula, width, height, FilterType::Lanczos3);
+        // Center the ink in its cell-aligned canvas. Reserving cells is
+        // unavoidable, and splitting the leftover pixels keeps the formula
+        // from looking detached from the text that follows it.
+        let x = i64::from((cols * font_width).saturating_sub(width) / 2);
+        let cell_baseline = (cell_h * 0.8).round();
+        let top = (cell_baseline - baseline * scale).round();
+        let top = top.clamp(0.0, (cell_h - f64::from(height)).max(0.0));
+        imageops::overlay(&mut canvas, &resized, x, top as i64);
+        let protocol = self
+            .picker
+            .new_protocol(
+                DynamicImage::ImageRgba8(canvas),
+                Size::new(cols as u16, 1),
+                Resize::Fit(Some(FilterType::Lanczos3)),
+            )
+            .map_err(|error| format!("terminal protocol: {error}"))?;
+        let size = protocol.size();
+        Ok(MathImage {
+            protocol: Arc::new(protocol),
+            cols: size.width.max(1),
+            rows: 1,
+        })
     }
 
     fn render_file_uncached(&self, path: &Path, max_cols: u16, max_rows: u16) -> Option<MathImage> {
         let bytes = fs::read(path).ok()?;
         let decoded = image::load_from_memory(&bytes).ok()?;
-        self.fit(decoded, max_cols, max_rows.into(), false).ok()
+        self.fit(decoded, max_cols, max_rows.into(), 0.0, 0.0).ok()
     }
 
-    /// Scale `decoded` into the cell box. Formula images are width-limited and
-    /// refuse to shrink below `min_scale`; raster thumbnails fit both axes.
+    /// Scale `decoded` into the cell box. Formula images refuse to shrink below
+    /// `min_width_scale` so a very wide expression falls back to the character
+    /// renderer; `min_height_scale` guards the vertical shrink. Raster
+    /// thumbnails pass `0.0` for both and fit freely.
     fn fit(
         &self,
         decoded: image::DynamicImage,
         max_cols: u16,
         max_rows: u32,
-        math: bool,
+        min_width_scale: f64,
+        min_height_scale: f64,
     ) -> Result<MathImage, String> {
         let font = self.picker.font_size();
         let font_width = u32::from(font.width.max(1));
@@ -616,11 +1228,16 @@ impl Service {
             natural_rows,
             max_cols,
             max_rows,
-            if math { self.settings.min_scale } else { 0.0 },
+            min_width_scale,
+            min_height_scale,
         )?;
         let protocol = self
             .picker
-            .new_protocol(decoded, Size::new(cols, rows), Resize::Fit(None))
+            .new_protocol(
+                decoded,
+                Size::new(cols, rows),
+                Resize::Fit(Some(FilterType::Lanczos3)),
+            )
             .map_err(|error| format!("terminal protocol: {error}"))?;
         let size = protocol.size();
         Ok(MathImage {
@@ -633,35 +1250,36 @@ impl Service {
 
 /// Fit a natural cell size into `max_cols` x `max_rows`.
 ///
-/// Raster thumbnails shrink freely. Formula images additionally refuse to
-/// shrink below `min_scale` (physical width) so a very wide expression falls
-/// back to the character renderer instead of becoming unreadable, and bail out
-/// when even the scaled image is taller than `max_rows`.
+/// Raster thumbnails shrink freely. Formula images refuse to shrink below
+/// `min_width_scale`/`min_height_scale` so an over-wide or over-tall
+/// expression falls back to the character renderer instead of becoming
+/// unreadable.
 fn layout_size(
     natural_cols: u32,
     natural_rows: u32,
     max_cols: u16,
     max_rows: u32,
-    min_scale: f64,
+    min_width_scale: f64,
+    min_height_scale: f64,
 ) -> Result<(u16, u16), String> {
     let natural_cols = f64::from(natural_cols.max(1));
     let natural_rows = f64::from(natural_rows.max(1));
     let mut scale = (f64::from(max_cols) / natural_cols).min(1.0);
-    if min_scale > 0.0 && scale < min_scale && natural_cols > f64::from(max_cols) {
+    if min_width_scale > 0.0 && scale < min_width_scale && natural_cols > f64::from(max_cols) {
         return Err(format!(
             "formula is {natural_cols:.0} cells wide; would shrink below {:.0}%",
-            min_scale * 100.0
+            min_width_scale * 100.0
         ));
     }
     // Very tall formulas are scaled to the pane height. If that would take
-    // them below `min_scale`, keep the character renderer instead of drawing
-    // an unreadable thumbnail.
+    // them below `min_height_scale`, keep the character renderer instead of
+    // drawing an unreadable thumbnail.
     if max_rows > 0 && natural_rows * scale > f64::from(max_rows) {
         let height_scale = f64::from(max_rows) / natural_rows;
-        if min_scale > 0.0 && height_scale < min_scale {
+        if min_height_scale > 0.0 && height_scale < min_height_scale {
             return Err(format!(
                 "formula is {natural_rows:.0} cells tall; would shrink below {:.0}%",
-                min_scale * 100.0
+                min_height_scale * 100.0
             ));
         }
         scale = height_scale;
@@ -704,7 +1322,12 @@ fn conditional_packages(source: &str) -> Vec<&'static str> {
 /// `latex` + `dvipng` is the fast path. When it fails (CJK, literal Unicode,
 /// TikZ, or a macro from the configured preamble) retry through `xelatex` +
 /// `pdftocairo`, which understands UTF-8 and CJK fonts.
-fn latex_png(source: &str, color: Option<Color>, settings: &Settings) -> Result<Vec<u8>, String> {
+fn latex_png(
+    source: &str,
+    color: Option<Color>,
+    settings: &Settings,
+    inline: bool,
+) -> Result<Vec<u8>, String> {
     if source.trim().is_empty() {
         return Err("empty formula".into());
     }
@@ -720,16 +1343,27 @@ fn latex_png(source: &str, color: Option<Color>, settings: &Settings) -> Result<
     }
     let dir = TempDir::create().ok_or_else(|| "could not create a temp directory".to_string())?;
     let dpi = settings.dpi.to_string();
-    // `\[...\]` is a display environment, so `\tag`, `\label` and most
-    // constructs behave like they do in the model's own document. Raw display
-    // environments (`align`, `gather`, TikZ, ...) cannot be nested inside it,
-    // so try those verbatim first.
     let raw = source.trim();
-    let wrapped = format!("\\[ {raw} \\]");
-    let bodies = if is_display_environment(raw) {
-        [raw.to_string(), wrapped]
+    let bodies = if inline {
+        // Text style keeps fractions and operators at prose size. The short
+        // rule before the formula is rendered as ordinary ink, so the tight
+        // crop keeps it: its top edge marks the TeX baseline and lets the UI
+        // align the PNG with the surrounding text. A zero-width strut would
+        // be cropped away. The display form below is only a fallback for
+        // constructs that reject inline math.
+        let body = format!(
+            "$\\rule[-0.22em]{{1pt}}{{0.22em}}{}$",
+            inline_math_source(raw)
+        );
+        vec![body, format!("\\[ {} \\]", inline_math_source(raw))]
+    } else if is_display_environment(raw) {
+        // `\[...\]` is a display environment, so `\tag`, `\label` and most
+        // constructs behave like they do in the model's own document. Raw
+        // display environments (`align`, `gather`, TikZ, ...) cannot be
+        // nested inside it, so try those verbatim first.
+        vec![raw.to_string(), format!("\\[ {raw} \\]")]
     } else {
-        [wrapped, raw.to_string()]
+        vec![format!("\\[ {raw} \\]"), raw.to_string()]
     };
     let classic = compile_dvi(&dir, &bodies, color, &dpi, settings);
     match classic {
@@ -739,6 +1373,121 @@ fn latex_png(source: &str, color: Option<Color>, settings: &Settings) -> Result<
             Err(unicode_error) => Err(format!("latex: {classic_error}; xelatex: {unicode_error}")),
         },
     }
+}
+
+/// The baseline marker prepended to inline formulas by [`latex_png`]. It is a
+/// solid rule whose top edge is the TeX baseline; `dvipng -T tight` crops to
+/// ink, so a zero-width strut would disappear while this rule survives.
+struct InlineMarker {
+    /// Horizontal position of the rule's left edge.
+    left: u32,
+    /// Rule width in pixels.
+    width: u32,
+    /// Baseline row in the full PNG.
+    baseline: u32,
+}
+
+/// Find the inline baseline marker at the left edge of a compiled PNG.
+///
+/// Returns `None` when the image has no marker (for example a display-style
+/// fallback), so the caller can fall back to bottom alignment.
+fn inline_marker(image: &RgbaImage, dpi: u32) -> Option<InlineMarker> {
+    let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let alpha = |x: u32, y: u32| image.get_pixel(x, y)[3];
+    let left = (0..width).find(|&x| (0..height).any(|y| alpha(x, y) > 0))?;
+    let baseline = (0..height).find(|&y| alpha(left, y) > 0)?;
+    let bottom = (0..height).rev().find(|&y| alpha(left, y) > 0)?;
+    // The rule is 0.22em tall. Rasterization rounds its edges, so allow a few
+    // pixels of slack and reject anything that is clearly a glyph instead.
+    let expected_height = (f64::from(dpi) * 0.22 * 10.0 / 72.27).round().max(1.0) as u32;
+    let marker_height = bottom - baseline + 1;
+    if marker_height + 1 < expected_height || marker_height > expected_height + 3 {
+        return None;
+    }
+    let mut marker_width = 0;
+    while left + marker_width < width
+        && (baseline..=bottom).all(|y| alpha(left + marker_width, y) > 0)
+    {
+        marker_width += 1;
+    }
+    let expected_width = (f64::from(dpi) / 72.27).ceil().max(1.0) as u32;
+    if marker_width == 0 || marker_width > expected_width + 3 {
+        return None;
+    }
+    Some(InlineMarker {
+        left,
+        width: marker_width,
+        baseline,
+    })
+}
+
+/// Crop the marker off and trim to the formula's ink, keeping the row that
+/// `baseline` refers to. Returns the formula image and its baseline row.
+fn strip_inline_marker(image: &RgbaImage, marker: &InlineMarker) -> Option<(RgbaImage, u32)> {
+    let (width, height) = image.dimensions();
+    let start = marker.left + marker.width;
+    if start >= width {
+        return None;
+    }
+    let mut top = height;
+    let mut bottom = 0;
+    let mut right = 0;
+    let mut found = false;
+    for y in 0..height {
+        for x in start..width {
+            if image.get_pixel(x, y)[3] > 0 {
+                found = true;
+                top = top.min(y);
+                bottom = bottom.max(y);
+                right = right.max(x);
+            }
+        }
+    }
+    if !found || marker.baseline < top || marker.baseline > bottom + 1 {
+        return None;
+    }
+    let cropped =
+        imageops::crop_imm(image, start, top, right + 1 - start, bottom + 1 - top).to_image();
+    Some((cropped, marker.baseline - top))
+}
+
+/// Trim transparent edges from an image that has no baseline marker.
+fn crop_ink(image: &RgbaImage) -> Option<RgbaImage> {
+    let (width, height) = image.dimensions();
+    let mut left = width;
+    let mut top = height;
+    let mut right = 0;
+    let mut bottom = 0;
+    let mut found = false;
+    for y in 0..height {
+        for x in 0..width {
+            if image.get_pixel(x, y)[3] > 0 {
+                found = true;
+                left = left.min(x);
+                top = top.min(y);
+                right = right.max(x);
+                bottom = bottom.max(y);
+            }
+        }
+    }
+    if !found {
+        return None;
+    }
+    Some(imageops::crop_imm(image, left, top, right + 1 - left, bottom + 1 - top).to_image())
+}
+
+/// Rewrite display-only TeX so an inline formula keeps text metrics: display
+/// fractions and binomials become their `t...` variants and forced limits are
+/// dropped.
+fn inline_math_source(source: &str) -> String {
+    source
+        .replace("\\displaystyle", "")
+        .replace("\\dfrac", "\\tfrac")
+        .replace("\\dbinom", "\\tbinom")
+        .replace("\\limits", "\\nolimits")
 }
 
 /// LaTeX document preamble. `unicode` selects the `xelatex` variant, which
@@ -1077,15 +1826,21 @@ mod tests {
     #[test]
     fn layout_refuses_unreadable_formulas() {
         // A 200-cell-wide formula in a 40-cell pane would be 20% scale.
-        let error = layout_size(200, 5, 40, 60, 0.5).unwrap_err();
+        let error = layout_size(200, 5, 40, 60, 0.5, 0.5).unwrap_err();
         assert!(error.contains("wide"), "{error}");
         // Tall formulas shrink to the height limit instead of being clipped.
-        assert_eq!(layout_size(10, 100, 40, 60, 0.5).unwrap(), (6, 60));
+        assert_eq!(layout_size(10, 100, 40, 60, 0.5, 0.5).unwrap(), (6, 60));
         // But not below the minimum readable scale.
-        let error = layout_size(10, 100, 40, 10, 0.5).unwrap_err();
+        let error = layout_size(10, 100, 40, 10, 0.5, 0.5).unwrap_err();
         assert!(error.contains("tall"), "{error}");
         // Thumbnails have no minimum scale and fit both axes.
-        assert_eq!(layout_size(100, 100, 40, 10, 0.0).unwrap(), (10, 10));
+        assert_eq!(layout_size(100, 100, 40, 10, 0.0, 0.0).unwrap(), (10, 10));
+        // Inline math has no height floor: a two-row fraction is compressed
+        // into the single text row instead of falling back to raw `$...$`.
+        assert_eq!(layout_size(10, 2, 40, 1, 0.5, 0.0).unwrap(), (5, 1));
+        // A too-wide inline formula still keeps the width floor.
+        let error = layout_size(200, 2, 40, 1, 0.5, 0.0).unwrap_err();
+        assert!(error.contains("wide"), "{error}");
     }
 
     #[test]
@@ -1103,6 +1858,43 @@ mod tests {
     fn formats_rgb_colors_for_xcolor() {
         assert_eq!(color_hex(Some(Color::Rgb(1, 2, 3))), "010203");
         assert_eq!(color_hex(None), "D8DEE9");
+    }
+
+    #[test]
+    fn cache_key_tracks_render_inputs() {
+        let base = Settings::default();
+        let source = r"\frac{a}{b}";
+        let color = Some(Color::Rgb(1, 2, 3));
+        let digest = cache_digest(source, color, false, &base);
+        assert_eq!(digest, cache_digest(source, color, false, &base));
+        assert_ne!(digest, cache_digest(r"\frac{a}{c}", color, false, &base));
+        assert_ne!(
+            digest,
+            cache_digest(source, Some(Color::Rgb(1, 2, 4)), false, &base)
+        );
+        // Inline math is compiled differently, so it must not share a file.
+        assert_ne!(digest, cache_digest(source, color, true, &base));
+
+        let mut changed = base.clone();
+        changed.dpi += 1;
+        assert_ne!(digest, cache_digest(source, color, false, &changed));
+
+        let mut changed = base.clone();
+        changed.preamble.push_str("\\newcommand{\\R}{\\mathbb{R}}");
+        assert_ne!(digest, cache_digest(source, color, false, &changed));
+    }
+
+    #[test]
+    fn disk_cache_round_trips_and_rejects_junk() {
+        let dir = TempDir::create().expect("temp dir");
+        let path = dir.path.join("formula.png");
+        let png = b"\x89PNG\r\n\x1a\nrendered";
+        store_cached_png(&path, png);
+        assert_eq!(read_cached_png(&path).as_deref(), Some(png.as_slice()));
+
+        fs::write(&path, b"junk").expect("write");
+        assert!(read_cached_png(&path).is_none());
+        assert!(!path.exists(), "corrupt entries must be removed");
     }
 
     #[test]
@@ -1127,7 +1919,8 @@ mod tests {
                 latex_png(
                     sample,
                     Some(Color::Rgb(220, 223, 228)),
-                    &Settings::default()
+                    &Settings::default(),
+                    false,
                 )
                 .is_ok(),
                 "failed to render {sample}"
@@ -1160,12 +1953,84 @@ mod tests {
                 latex_png(
                     &sample,
                     Some(Color::Rgb(220, 223, 228)),
-                    &Settings::default()
+                    &Settings::default(),
+                    false,
                 )
                 .is_ok(),
                 "failed to render {sample}"
             );
         }
+    }
+
+    #[test]
+    fn inline_math_source_uses_text_metrics() {
+        let source = inline_math_source(
+            r"\displaystyle \dfrac{a}{b} + \dbinom{n}{k} + \sum_{i=1}^n x_i \limits",
+        );
+        assert!(!source.contains("\\displaystyle"), "{source}");
+        assert!(!source.contains("\\dfrac"), "{source}");
+        assert!(!source.contains("\\dbinom"), "{source}");
+        assert!(!source.contains("\\limits"), "{source}");
+        assert!(source.contains("\\tfrac"), "{source}");
+        assert!(source.contains("\\tbinom"), "{source}");
+    }
+
+    #[test]
+    fn inline_marker_locates_the_baseline_and_is_stripped() {
+        let mut image = RgbaImage::from_pixel(40, 30, Rgba([0, 0, 0, 0]));
+        // Baseline marker: two pixels wide, rows 20..=26 below the baseline.
+        for y in 20..=26 {
+            for x in 0..2 {
+                image.put_pixel(x, y, Rgba([255, 255, 255, 255]));
+            }
+        }
+        // Formula ink: a glyph above the baseline and a descender below it.
+        for y in 8..=22 {
+            image.put_pixel(5, y, Rgba([255, 255, 255, 255]));
+        }
+        let marker = inline_marker(&image, 200).expect("marker");
+        assert_eq!(marker.left, 0);
+        assert_eq!(marker.width, 2);
+        assert_eq!(marker.baseline, 20);
+
+        let (formula, baseline) = strip_inline_marker(&image, &marker).expect("strip");
+        assert_eq!(formula.dimensions(), (4, 15));
+        assert_eq!(baseline, 12);
+    }
+
+    #[test]
+    fn inline_png_carries_a_baseline_marker() {
+        if !require_tool(&["latex", "dvipng"]) {
+            return;
+        }
+        let png = latex_png(
+            r"\frac{a}{b}+x^2",
+            Some(Color::Rgb(220, 223, 228)),
+            &Settings::default(),
+            true,
+        )
+        .expect("inline png");
+        let image = image::load_from_memory(&png).expect("decode").to_rgba8();
+        assert!(inline_marker(&image, Settings::default().dpi).is_some());
+    }
+
+    #[test]
+    fn inline_math_is_shorter_than_display_math() {
+        if !require_tool(&["latex"]) {
+            return;
+        }
+        let settings = Settings::default();
+        let source = r"\frac{a}{b} + \sum_{i=1}^n x_i";
+        let display = latex_png(source, None, &settings, false).expect("display png");
+        let inline = latex_png(source, None, &settings, true).expect("inline png");
+        let display = image::load_from_memory(&display).expect("decode display");
+        let inline = image::load_from_memory(&inline).expect("decode inline");
+        assert!(
+            inline.height() < display.height(),
+            "inline {}px should be shorter than display {}px",
+            inline.height(),
+            display.height()
+        );
     }
 
     #[test]
@@ -1177,6 +2042,7 @@ mod tests {
             "\\frac{a}{b}",
             Some(Color::Rgb(220, 223, 228)),
             &Settings::default(),
+            false,
         );
         assert!(
             png.is_ok_and(|bytes| bytes.starts_with(b"\x89PNG")),

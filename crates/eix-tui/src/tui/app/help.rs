@@ -8,8 +8,8 @@ impl App {
         self.open_help_scoped(None, "");
     }
 
-    /// Open only the key map. `/keys [query]` keeps the same interactive
-    /// filter/selection as the full help overlay.
+    /// Open only the key map. Used by the key-map action and palette, and keeps
+    /// the same interactive filter/selection as the full help overlay.
     pub(super) fn open_keys_help(&mut self, query: &str) {
         self.open_help_scoped(Some("keys"), query);
     }
@@ -52,6 +52,9 @@ impl App {
             KeyCode::Char('f') | KeyCode::Char('F') if control => self.move_help_selection(8),
             KeyCode::Char('k') | KeyCode::Char('p') if control => self.move_help_selection(-1),
             KeyCode::Char('j') | KeyCode::Char('n') if control => self.move_help_selection(1),
+            // Terminals without kitty keyboard disambiguation report Ctrl-J as
+            // Ctrl-Enter, so keep it as "next" here too.
+            KeyCode::Enter if control => self.move_help_selection(1),
             KeyCode::Home => self.help_selected = 0,
             KeyCode::End => {
                 self.help_selected =
@@ -71,7 +74,12 @@ impl App {
             self.help_selected = 0;
             return;
         }
-        let selected = self.help_selected.min(count - 1) as isize;
-        self.help_selected = (selected + delta).clamp(0, count as isize - 1) as usize;
+        if delta.unsigned_abs() <= 1 {
+            // Single steps cycle, matching the pickers.
+            self.help_selected = wrap_step(self.help_selected, count, delta);
+        } else {
+            let selected = self.help_selected.min(count - 1) as isize;
+            self.help_selected = (selected + delta).clamp(0, count as isize - 1) as usize;
+        }
     }
 }

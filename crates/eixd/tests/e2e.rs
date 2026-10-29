@@ -282,14 +282,23 @@ async fn a_prompt_submitted_while_busy_is_queued_and_started() -> anyhow::Result
         second.turn_id
     );
 
-    // The queued prompt starts on its own after the first turn finishes.
+    // The queued prompt steers the running turn instead of waiting for a new
+    // one: the turn folds it in at the next step and answers both together.
     let mut started = Vec::new();
     let mut completed = 0;
     let mut saw_queued = false;
-    while completed < 2 {
+    let mut saw_steered = false;
+    while completed < 1 {
         let notification = client.next_notification().await?;
         match notification.method.as_str() {
-            "prompt.queued" => saw_queued = true,
+            "prompt.queued" => {
+                saw_queued = true;
+                assert_eq!(notification.params["steering"], true);
+            }
+            "prompt.steered" => {
+                saw_steered = true;
+                assert_eq!(notification.params["count"], 1);
+            }
             "turn.started" => started.push(
                 notification.params["turn_id"]
                     .as_str()
@@ -301,8 +310,8 @@ async fn a_prompt_submitted_while_busy_is_queued_and_started() -> anyhow::Result
         }
     }
     assert!(saw_queued, "prompt.queued was not emitted");
-    assert_eq!(started.len(), 2, "{started:?}");
-    assert_ne!(started[0], started[1], "each prompt runs its own turn");
+    assert!(saw_steered, "prompt.steered was not emitted");
+    assert_eq!(started.len(), 1, "{started:?}");
 
     let attached: AttachResult = client
         .request("session.attach", json!({"session_id": session_id}))
@@ -1170,6 +1179,12 @@ async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
         .await?;
     let session_id = created.session.id.clone();
 
+    // A workspace memory file is part of the context `/clear` promises to drop.
+    let memory = eixd::memory::MemoryStore::new(dir.join("data").join("memory"));
+    let memory_path = memory.path_for(&dir);
+    std::fs::create_dir_all(memory_path.parent().unwrap())?;
+    std::fs::write(&memory_path, "remember this")?;
+
     client
         .request::<SubmitResult>(
             "prompt.submit",
@@ -1182,11 +1197,16 @@ async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
         .request("context.clear", json!({"session_id": session_id}))
         .await?;
     assert!(
-        cleared
+        !cleared
             .entries
             .iter()
-            .any(|entry| entry.id.starts_with('e') && entry.dropped),
-        "earlier messages are marked dropped"
+            .any(|entry| entry.kind == "user" || entry.kind == "assistant"),
+        "clear removes the conversation from the ledger: {:?}",
+        cleared.entries
+    );
+    assert!(
+        !memory_path.exists(),
+        "clear removes the workspace memory file"
     );
 
     client
@@ -1213,16 +1233,14 @@ async fn context_clear_starts_a_fresh_context() -> anyhow::Result<()> {
     let attached: AttachResult = client
         .request("session.attach", json!({"session_id": session_id}))
         .await?;
-    assert!(attached
+    // Nothing from the previous conversation survives, not even a marker.
+    assert!(!attached
         .events
         .iter()
         .any(|event| event.kind == EventKind::ContextCleared));
-    // The log keeps the earlier turns for the transcript.
-    assert!(attached
-        .events
-        .iter()
-        .any(|event| event.kind == EventKind::UserMessage
-            && event.payload["text"] == "first question"));
+    assert!(!attached.events.iter().any(|event| {
+        event.kind == EventKind::UserMessage && event.payload["text"] == "first question"
+    }));
 
     daemon.abort();
     mock.abort();
@@ -1658,6 +1676,9 @@ for line in sys.stdin:
             ..eix_core::McpServerConfig::default()
         },
     );
+    // `mcp.set_enabled` persists the flag; keep it inside the test directory
+    // instead of the developer's real config file.
+    config.explicit_path = Some(dir.join("config.toml"));
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -1671,10 +1692,34 @@ for line in sys.stdin:
     let mcp: eix_core::McpListResult = client.request("mcp.list", Value::Null).await?;
     assert_eq!(mcp.servers.len(), 1);
     assert_eq!(mcp.servers[0].name, "mock");
+    assert!(mcp.servers[0].enabled);
     assert!(mcp.servers[0].error.is_none(), "{:?}", mcp.servers[0].error);
     assert_eq!(mcp.servers[0].tools, 1);
     assert_eq!(mcp.servers[0].resources, 1);
     assert_eq!(mcp.servers[0].prompts, 1);
+
+    // Disabling drops the live client and persists `enabled = false`.
+    let toggled: Value = client
+        .request("mcp.set_enabled", json!({"name": "mock", "enabled": false}))
+        .await?;
+    assert_eq!(toggled["enabled"], false);
+    let mcp: eix_core::McpListResult = client.request("mcp.list", Value::Null).await?;
+    assert!(!mcp.servers[0].enabled);
+    assert_eq!(mcp.servers[0].tools, 0);
+    let saved = std::fs::read_to_string(dir.join("config.toml"))?;
+    assert!(
+        saved.contains("enabled = false"),
+        "toggle was not persisted: {saved}"
+    );
+
+    // Re-enabling spawns the server again on the next listing.
+    client
+        .request::<Value>("mcp.set_enabled", json!({"name": "mock", "enabled": true}))
+        .await?;
+    let mcp: eix_core::McpListResult = client.request("mcp.list", Value::Null).await?;
+    assert!(mcp.servers[0].enabled);
+    assert_eq!(mcp.servers[0].tools, 1);
+    assert!(mcp.servers[0].error.is_none(), "{:?}", mcp.servers[0].error);
 
     let _: SubmitResult = client
         .request(
@@ -5793,6 +5838,7 @@ async fn picker_query_lists_workspace_files() -> anyhow::Result<()> {
     std::fs::create_dir_all(workspace.join("target/debug"))?;
     std::fs::write(workspace.join("src/main.rs"), "fn main() {}")?;
     std::fs::write(workspace.join("README.md"), "# eix")?;
+    std::fs::write(workspace.join("shot.png"), b"png")?;
     std::fs::write(workspace.join(".git/config"), "secret")?;
     std::fs::write(workspace.join("target/debug/eix"), "binary")?;
 
@@ -5821,7 +5867,7 @@ async fn picker_query_lists_workspace_files() -> anyhow::Result<()> {
         .iter()
         .map(|item| item.value.as_str())
         .collect();
-    assert_eq!(values, vec!["README.md", "src/main.rs"]);
+    assert_eq!(values, vec!["README.md", "shot.png", "src/main.rs"]);
 
     let filtered: eix_core::PickerResult = client
         .request(
@@ -5831,6 +5877,21 @@ async fn picker_query_lists_workspace_files() -> anyhow::Result<()> {
         .await?;
     assert_eq!(filtered.items.len(), 1);
     assert_eq!(filtered.items[0].value, "src/main.rs");
+
+    let images: eix_core::PickerResult = client
+        .request(
+            "picker.query",
+            json!({"kind": "images", "session_id": session_id}),
+        )
+        .await?;
+    assert_eq!(images.kind, eix_core::KIND_IMAGES);
+    let values: Vec<&str> = images
+        .items
+        .iter()
+        .map(|item| item.value.as_str())
+        .collect();
+    assert_eq!(values, vec!["shot.png"]);
+    assert!(images.items[0].detail.as_deref().unwrap().ends_with(" B"));
 
     let preview: eix_core::PickerPreviewResult = client
         .request(

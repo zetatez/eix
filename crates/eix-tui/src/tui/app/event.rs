@@ -561,11 +561,33 @@ impl App {
                 self.status = format!("{} agent(s)", agents.len());
             }
             Event::Mcp(servers) => {
-                if let Some(picker) = &mut self.picker {
-                    if picker.kind == PickerKind::Mcp {
+                // Keep the highlighted server across the post-toggle re-list;
+                // the query and the row positions may otherwise change.
+                let highlighted =
+                    if self.picker.as_ref().map(|picker| picker.kind) == Some(PickerKind::Mcp) {
+                        self.selected_picker_value()
+                    } else {
+                        None
+                    };
+                self.mcp_servers.clone_from(&servers);
+                if self.picker.as_ref().map(|picker| picker.kind) == Some(PickerKind::Mcp) {
+                    if let Some(picker) = &mut self.picker {
                         picker.set_items(mcp_picker_items(&servers));
-                        picker.selected = 0;
                         picker.loading = false;
+                    }
+                    let filtered = self.filtered_items();
+                    let selected = highlighted
+                        .and_then(|name| {
+                            filtered.iter().position(|index| {
+                                self.picker
+                                    .as_ref()
+                                    .and_then(|picker| picker.items.get(*index))
+                                    .is_some_and(|item| item.value == name)
+                            })
+                        })
+                        .unwrap_or(0);
+                    if let Some(picker) = &mut self.picker {
+                        picker.selected = selected.min(filtered.len().saturating_sub(1));
                     }
                 }
                 if servers.is_empty() {
@@ -911,27 +933,32 @@ impl App {
                     self.status = format!("{note} · history updated");
                 }
             }
-            Event::WorkspaceDiff(result) => {
-                let mut text = result.diff.clone();
-                for note in &result.notes {
-                    if !text.is_empty() {
-                        text.push_str("\n\n");
-                    }
-                    text.push_str(&format!("[{note}]"));
+            Event::WorkspaceDiff { result, staged } => {
+                // `/diff` opens the loading picker before the request. If the
+                // user already closed or replaced it, leave their overlay alone.
+                if self.picker.as_ref().map(|picker| picker.kind) != Some(PickerKind::Diff) {
+                    return;
                 }
-                if text.trim().is_empty() {
-                    text = "(no changes in the working tree)".to_string();
+                if let Some(picker) = &mut self.picker {
+                    picker.set_items(diff_picker_items(&result.diff, &result.notes));
+                    picker.loading = false;
                 }
-                self.open_text_view(format!("diff · {} file(s)", result.files), &text);
-                self.status = if result.truncated {
-                    "diff truncated · j/k scroll · Esc close".into()
+                let mut status = if staged {
+                    format!("diff (staged): {} file(s)", result.files)
                 } else {
-                    "diff · j/k scroll · Esc close".into()
+                    format!("diff: {} file(s)", result.files)
                 };
+                if result.truncated {
+                    status.push_str(" · truncated");
+                }
+                if !result.notes.is_empty() {
+                    status.push_str(" · notes at the end");
+                }
+                self.status = status;
             }
             Event::Doctor(lines) => {
-                self.open_text_view("doctor", &lines.join("\n"));
-                self.status = "doctor · Esc close".into();
+                self.open_doctor_view(&lines);
+                self.status = "doctor · j/k scroll · Esc close".into();
             }
             Event::Goal(goal) => {
                 self.status = match goal {
@@ -1028,16 +1055,8 @@ impl App {
                 self.upsert_session(session, false);
                 self.error = None;
             }
-            Event::ContextCleared { session_id } => {
-                if let Some(view) = self
-                    .views
-                    .iter_mut()
-                    .find(|view| view.session.id == session_id)
-                {
-                    view.stream = None;
-                }
-                self.status = "context cleared · earlier turns stay in the transcript".into();
-                self.error = None;
+            Event::Reset { session_id } => {
+                self.session_reset(&session_id);
             }
             Event::Compacted {
                 session_id,
@@ -1551,6 +1570,62 @@ impl App {
                 self.status = format!("pasted {chars} chars");
                 self.esc_at = None;
                 return;
+            }
+        }
+
+        // Reset the shared suggestion cursor when the typed path changes, so a
+        // stale command-menu row cannot make Enter pick the wrong directory.
+        let cd_prefix = self.cd_menu_prefix();
+        if cd_prefix != self.cd_prefix_snapshot {
+            self.cd_prefix_snapshot = cd_prefix;
+            self.command_cursor = 0;
+        }
+
+        // `/cd <prefix>` lists matching directories. Tab completes the row so
+        // the next level can be typed; Enter switches immediately.
+        if self.cd_menu_open() {
+            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                match key.code {
+                    KeyCode::Char('n') | KeyCode::Char('j') => {
+                        self.move_cd_cursor(1);
+                        return;
+                    }
+                    KeyCode::Char('p') | KeyCode::Char('k') => {
+                        self.move_cd_cursor(-1);
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            match key.code {
+                KeyCode::Down => {
+                    self.move_cd_cursor(1);
+                    return;
+                }
+                KeyCode::Up => {
+                    self.move_cd_cursor(-1);
+                    return;
+                }
+                KeyCode::Tab => {
+                    self.complete_cd_path();
+                    return;
+                }
+                KeyCode::Enter => {
+                    // A complete path switches as typed; a partial one accepts
+                    // the highlighted completion. An explicit Down/Up selection
+                    // still wins over the typed path.
+                    if self.cd_prefix_is_directory() && self.command_cursor == 0 {
+                        self.input.enter_normal();
+                        self.submit(tx);
+                        return;
+                    }
+                    if self.complete_cd_path() {
+                        self.input.enter_normal();
+                        self.submit(tx);
+                        return;
+                    }
+                }
+                _ => {}
             }
         }
 

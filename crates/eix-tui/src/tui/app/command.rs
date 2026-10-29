@@ -85,10 +85,6 @@ impl App {
                 self.open_help_scoped(None, args);
                 true
             }
-            "keys" => {
-                self.open_keys_help(args);
-                true
-            }
             "new" => {
                 let name = (!args.is_empty()).then(|| args.to_string());
                 self.new_session(tx, name);
@@ -150,10 +146,6 @@ impl App {
             }
             "approvals" => {
                 self.open_inbox();
-                true
-            }
-            "attention" => {
-                self.focus_next_attention();
                 true
             }
             "cancel" => {
@@ -250,13 +242,9 @@ impl App {
             }
             "effort" => {
                 if args.is_empty() {
-                    let (_, current) = split_model_variant(self.model());
-                    let current = current.unwrap_or("medium");
-                    self.status = format!("effort: {current} · low|medium|high");
-                } else {
-                    if self.set_reasoning(args, tx) {
-                        self.status = format!("effort: {args}");
-                    }
+                    self.open_picker(PickerKind::Effort, tx);
+                } else if self.set_reasoning(args, tx) {
+                    self.status = format!("effort: {args}");
                 }
                 true
             }
@@ -266,10 +254,6 @@ impl App {
             }
             "init" => {
                 self.command_init();
-                true
-            }
-            "queue" => {
-                self.command_queue(args);
                 true
             }
             "sessions" => {
@@ -501,8 +485,8 @@ impl App {
                     }
                     "status" => {
                         let status = super::super::math_image::status();
-                        self.status = if !self.math_config.images {
-                            "math: images off".into()
+                        self.status = if super::super::math_image::raw_source() {
+                            "math: off (raw TeX)".into()
                         } else if status.enabled {
                             format!("math: images {} @ {} dpi", status.protocol, status.dpi)
                         } else {
@@ -553,14 +537,8 @@ impl App {
                     self.status = "no session yet".into();
                     return true;
                 };
-                if self.pending_delete.as_deref() == Some(session_id.as_str()) {
-                    self.pending_delete = None;
-                    let _ = tx.send(Command::DeleteSession { session_id });
-                    self.status = "deleting…".into();
-                } else {
-                    self.pending_delete = Some(session_id);
-                    self.status = "run /delete again to delete this session permanently".into();
-                }
+                let _ = tx.send(Command::DeleteSession { session_id });
+                self.status = "deleting…".into();
                 true
             }
             "image" => {
@@ -568,11 +546,7 @@ impl App {
                     self.pending_images.clear();
                     self.status = "images cleared".into();
                 } else if args.is_empty() {
-                    self.status = if self.pending_images.is_empty() {
-                        "no images attached".into()
-                    } else {
-                        format!("attached: {}", self.pending_images.join(", "))
-                    };
+                    self.open_picker(PickerKind::Images, tx);
                 } else {
                     let cwd = self
                         .focused_view()
@@ -612,11 +586,15 @@ impl App {
                         .map(|(name, rest)| (name, rest.trim()))
                         .unwrap_or((args, ""));
                     if let Some(skill) = eix_core::find_skill(&cwd, name, &self.compat) {
-                        self.input
-                            .set_text(&eix_core::expand_command(&skill.body, arguments));
+                        let mention = if arguments.is_empty() {
+                            format!("@{}", skill.name)
+                        } else {
+                            format!("@{} {}", skill.name, arguments)
+                        };
+                        self.input.insert_text(&mention);
                         self.input.enter_insert();
                         self.focus = Focus::Input;
-                        self.status = format!("inserted skill {}", skill.name);
+                        self.status = format!("inserted @{}", skill.name);
                     } else {
                         self.error = Some(format!("unknown skill {name:?}"));
                     }
@@ -658,8 +636,13 @@ impl App {
                     self.error = Some("usage: /diff [staged]".into());
                     return true;
                 }
+                self.open_picker(PickerKind::Diff, tx);
                 let _ = tx.send(Command::WorkspaceDiff { session_id, staged });
-                self.status = "loading diff…".into();
+                self.status = if staged {
+                    "diff (staged): loading…".into()
+                } else {
+                    "diff: loading…".into()
+                };
                 true
             }
             "doctor" => {
@@ -785,12 +768,13 @@ impl App {
                 true
             }
             "fork" => {
-                let name = (!args.is_empty()).then(|| args.to_string());
-                if let Some(session_id) = self.focused_session_id() {
+                if args.is_empty() {
+                    self.open_picker(PickerKind::Fork, tx);
+                } else if let Some(session_id) = self.focused_session_id() {
                     let _ = tx.send(Command::Fork {
                         session_id,
                         at_seq: None,
-                        name,
+                        name: Some(args.to_string()),
                         branch: false,
                     });
                     self.status = "forking…".into();
@@ -889,7 +873,7 @@ impl App {
             self.error = Some("cancel the running turn before /clear".into());
             return;
         }
-        self.status = "clearing context…".into();
+        self.status = "clearing session…".into();
         let _ = tx.send(Command::ClearContext { session_id });
     }
 
@@ -945,88 +929,6 @@ already exists, update it in place rather than rewriting it from scratch.";
         self.focus = Focus::Input;
         self.reset_history();
         self.status = "review the /init prompt, then press Enter to run it".into();
-    }
-
-    pub(super) fn command_queue(&mut self, args: &str) {
-        let Some(session_id) = self.focused_session_id() else {
-            self.status = "no session".into();
-            return;
-        };
-        let mut parts = args.split_whitespace();
-        match parts.next() {
-            Some("clear") => {
-                let dropped = self
-                    .queues
-                    .remove(&session_id)
-                    .map_or(0, |queue| queue.len());
-                self.status = format!("cleared {dropped} queued prompt(s)");
-                return;
-            }
-            Some("rm" | "drop") => {
-                let index = match parts.next().and_then(|value| value.parse::<usize>().ok()) {
-                    Some(index) if index > 0 => index - 1,
-                    _ => {
-                        self.error = Some("usage: /queue rm <1-based index>".into());
-                        return;
-                    }
-                };
-                let removed = self
-                    .queues
-                    .get_mut(&session_id)
-                    .and_then(|queue| (index < queue.len()).then(|| queue.remove(index)).flatten());
-                self.status = match removed {
-                    Some(prompt) => format!("dropped queued prompt: {}", truncate(&prompt, 60)),
-                    None => "no queued prompt at that index".into(),
-                };
-                return;
-            }
-            Some("move") => {
-                let from = parts.next().and_then(|value| value.parse::<usize>().ok());
-                let to = parts.next().and_then(|value| value.parse::<usize>().ok());
-                let (Some(from), Some(to)) = (from, to) else {
-                    self.error = Some("usage: /queue move <from> <to>".into());
-                    return;
-                };
-                if from == 0 || to == 0 {
-                    self.error = Some("queue indices are 1-based".into());
-                    return;
-                }
-                let moved = self.queues.get_mut(&session_id).and_then(|queue| {
-                    if from > queue.len() || to > queue.len() {
-                        return None;
-                    }
-                    let prompt = queue.remove(from - 1)?;
-                    queue.insert(to - 1, prompt);
-                    Some(())
-                });
-                self.status = if moved.is_some() {
-                    format!("moved queued prompt {from} → {to}")
-                } else {
-                    "queue index out of range".into()
-                };
-                return;
-            }
-            _ => {}
-        }
-        let Some(queue) = self.queues.get(&session_id) else {
-            self.status = "no queued prompts".into();
-            return;
-        };
-        if queue.is_empty() {
-            self.status = "no queued prompts".into();
-            return;
-        }
-        let preview: Vec<String> = queue
-            .iter()
-            .take(3)
-            .enumerate()
-            .map(|(index, prompt)| format!("{}: {}", index + 1, truncate(prompt, 40)))
-            .collect();
-        self.status = format!(
-            "{} queued · {} · /queue rm N or /queue move N M",
-            queue.len(),
-            preview.join(" · ")
-        );
     }
 
     pub(super) fn command_mode(&mut self, args: &str, tx: &UnboundedSender<Command>) {
@@ -1144,8 +1046,8 @@ impl App {
         }
         self.force_clear = true;
         let status = super::super::math_image::status();
-        self.status = if !self.math_config.images {
-            "math: images off".into()
+        self.status = if super::super::math_image::raw_source() {
+            "math: off (raw TeX)".into()
         } else if enabled {
             format!("math: images {} @ {} dpi", status.protocol, status.dpi)
         } else {

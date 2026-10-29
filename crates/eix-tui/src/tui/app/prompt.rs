@@ -127,6 +127,103 @@ impl App {
         self.command_cursor = 0;
     }
 
+    /// The still-open path prefix after `/cd `, if the prompt is editing one.
+    pub(super) fn cd_menu_prefix(&self) -> Option<String> {
+        if self.command_dismissed || self.input.mode() != Mode::Insert {
+            return None;
+        }
+        let text = self.input.text();
+        let rest = text.strip_prefix("/cd ")?;
+        (!rest.contains('\n')).then(|| rest.to_string())
+    }
+
+    /// True when the typed `/cd` argument already names a directory, in which
+    /// case Enter should switch to exactly that path instead of jumping into
+    /// the first listed child.
+    pub(super) fn cd_prefix_is_directory(&self) -> bool {
+        let Some(prefix) = self.cd_menu_prefix() else {
+            return false;
+        };
+        let Some(cwd) = self.focused_view().map(|view| view.session.cwd.clone()) else {
+            return false;
+        };
+        resolve_cd_dir(&prefix, &cwd).is_dir()
+    }
+
+    /// Directory rows matching the path prefix typed after `/cd `. Only the
+    /// last component filters names; earlier components pick the parent
+    /// directory, so `/cd src/` lists `src/*/` and `/cd sr` lists `sr*/`.
+    pub(super) fn cd_matches(&self) -> Vec<String> {
+        let Some(prefix) = self.cd_menu_prefix() else {
+            return Vec::new();
+        };
+        let Some(cwd) = self.focused_view().map(|view| view.session.cwd.clone()) else {
+            return Vec::new();
+        };
+        let (base, needle) = match prefix.rfind('/') {
+            Some(index) => (&prefix[..=index], &prefix[index + 1..]),
+            None => ("", prefix.as_str()),
+        };
+        let dir = resolve_cd_dir(base, &cwd);
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let needle = needle.to_lowercase();
+        // Match shell completion: hidden directories stay out of the way
+        // until the user types a leading dot.
+        let show_hidden = needle.starts_with('.');
+        let mut names: Vec<String> = read
+            .flatten()
+            .filter(|entry| entry.path().is_dir())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter(|name| show_hidden || !name.starts_with('.'))
+            .filter(|name| name.to_lowercase().starts_with(&needle))
+            .collect();
+        names.sort();
+        names.truncate(50);
+        names
+            .into_iter()
+            .map(|name| format!("{base}{name}/"))
+            .collect()
+    }
+
+    /// True while `/cd <prefix>` has directory rows to offer.
+    pub(super) fn cd_menu_open(&self) -> bool {
+        !self.cd_matches().is_empty()
+    }
+
+    /// Directory completion under the menu cursor.
+    pub(super) fn selected_cd_match(&self) -> Option<String> {
+        let matches = self.cd_matches();
+        if matches.is_empty() {
+            return None;
+        }
+        matches
+            .get(self.command_cursor.min(matches.len() - 1))
+            .cloned()
+    }
+
+    pub(super) fn move_cd_cursor(&mut self, delta: isize) {
+        let len = self.cd_matches().len();
+        if len == 0 {
+            self.command_cursor = 0;
+            return;
+        }
+        let current = self.command_cursor.min(len - 1) as isize;
+        self.command_cursor = (current + delta).rem_euclid(len as isize) as usize;
+    }
+
+    /// Replace the typed prefix with the highlighted directory (keeping the
+    /// trailing slash so the next level can be completed immediately).
+    pub(super) fn complete_cd_path(&mut self) -> bool {
+        let Some(path) = self.selected_cd_match() else {
+            return false;
+        };
+        self.input.set_text(&format!("/cd {path}"));
+        self.command_cursor = 0;
+        true
+    }
+
     /// Whether the `:` command line should show its dynamic command list.
     pub(super) fn cmdline_menu_open(&self) -> bool {
         self.cmdline_menu_armed
@@ -647,5 +744,27 @@ impl App {
         self.input.insert_text(text);
         self.focus = Focus::Input;
         self.status = format!("inserted {text}");
+    }
+}
+
+/// Resolve the directory part of a `/cd` prefix against the session cwd.
+/// Supports the same `~` shorthand as `session.cd`.
+fn resolve_cd_dir(prefix: &str, cwd: &std::path::Path) -> std::path::PathBuf {
+    if prefix.is_empty() {
+        return cwd.to_path_buf();
+    }
+    if prefix == "~" {
+        return dirs::home_dir().unwrap_or_else(|| cwd.join(prefix));
+    }
+    if let Some(rest) = prefix.strip_prefix("~/") {
+        return dirs::home_dir()
+            .map(|home| home.join(rest))
+            .unwrap_or_else(|| cwd.join(prefix));
+    }
+    let path = std::path::Path::new(prefix);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
     }
 }

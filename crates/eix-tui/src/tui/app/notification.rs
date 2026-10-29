@@ -134,6 +134,15 @@ impl App {
                     self.ring = true;
                 }
             }
+            "session.reset" => {
+                if let Some(session_id) = notification
+                    .params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                {
+                    self.session_reset(session_id);
+                }
+            }
             "session.updated" => {
                 if let Ok(session) = serde_json::from_value::<Session>(notification.params) {
                     let id = session.id.clone();

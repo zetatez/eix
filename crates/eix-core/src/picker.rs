@@ -6,9 +6,10 @@
 //! selected row's body with `picker.preview`, and add their own fuzzy filtering
 //! and actions.
 //!
-//! Providers today: `files` (workspace paths), `grep` (workspace file
-//! contents as `path:line` rows), `git` (worktrees + branches), `worktrees`
-//! and `branches` (git), and `context` (the session's ledger).
+//! Providers today: `files` (workspace paths), `images` (workspace images),
+//! `grep` (workspace file contents as `path:line` rows), `git` (worktrees +
+//! branches), `worktrees` and `branches` (git), and `context` (the session's
+//! ledger).
 //! Frontends may also synthesize rows locally (the TUI command palette), so
 //! nothing here assumes the daemon sent every item.
 
@@ -26,16 +27,19 @@ pub const KIND_BRANCHES: &str = "branches";
 pub const KIND_GIT: &str = "git";
 /// Provider name for workspace file contents (`path:line` matches).
 pub const KIND_GREP: &str = "grep";
+/// Provider name for workspace image files (`png`, `jpg`, ...).
+pub const KIND_IMAGES: &str = "images";
 /// Preview provider name for a session's recent conversation.
 pub const KIND_SESSION_PREVIEW: &str = "sessions";
 
 /// Every provider the daemon answers for `picker.query`.
-pub const DATA_KINDS: [&str; 5] = [
+pub const DATA_KINDS: [&str; 6] = [
     KIND_FILES,
     KIND_WORKTREES,
     KIND_BRANCHES,
     KIND_GIT,
     KIND_GREP,
+    KIND_IMAGES,
 ];
 
 /// True when `kind` is a daemon-backed provider.

@@ -1928,8 +1928,45 @@ fn transcript_marks_context_events() {
     assert!(rendered.contains("context compacted · 1 message(s)"));
     assert!(rendered.contains("we talked"));
     assert!(rendered.contains("context cleared"));
-    // Clearing context never removes the transcript history.
+    // A legacy context-cleared event stays visible in the transcript.
     assert!(rendered.contains("old question"));
+}
+
+#[test]
+fn clear_resets_the_session_in_place() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let session = Session::new("s1", "ctx", "/tmp");
+    let events = vec![SessionEvent::new(
+        "s1",
+        1,
+        EventKind::UserMessage,
+        serde_json::json!({ "text": "old question" }),
+    )];
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(session, events));
+    app.focused = 0;
+    app.views[0].history_has_more = true;
+    app.views[0].scroll = 4;
+    app.views[0].follow = false;
+    render_text(&mut app, 60, 12);
+    assert!(app.views[0].history_cache.is_some());
+
+    app.handle_event(
+        Event::Reset {
+            session_id: "s1".into(),
+        },
+        &tx,
+    );
+
+    let view = &app.views[0];
+    assert!(view.events.is_empty());
+    assert!(view.history_cache.is_none());
+    assert!(!view.history_has_more);
+    assert!(view.tail.lines.is_empty());
+    assert_eq!(view.scroll, 0);
+    assert!(view.follow);
+    assert!(view.text_lines.is_empty());
+    assert_eq!(app.status, "session cleared · history and memory removed");
 }
 
 #[test]
@@ -3558,6 +3595,7 @@ fn normal_search_keys_open_the_command_line() {
 #[test]
 fn picker_kinds_map_to_daemon_providers() {
     assert_eq!(PickerKind::Files.data_kind(), Some(eix_core::KIND_FILES));
+    assert_eq!(PickerKind::Images.data_kind(), Some(eix_core::KIND_IMAGES));
     assert_eq!(PickerKind::Grep.data_kind(), Some(eix_core::KIND_GREP));
     assert_eq!(PickerKind::Git.data_kind(), Some(eix_core::KIND_GIT));
     assert!(PickerKind::Sessions.data_kind().is_none());
@@ -3600,6 +3638,93 @@ fn file_picker_inserts_at_path_into_the_native_prompt() {
     assert!(app.picker.is_none());
     assert_eq!(app.input.text(), "@src/main.rs");
     assert!(matches!(app.focus, Focus::Input));
+}
+
+#[test]
+fn skills_picker_inserts_a_mention_instead_of_the_body() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.input.set_text("please ");
+    app.picker = Some(Picker {
+        kind: PickerKind::Skills,
+        query: String::new(),
+        selected: 0,
+        provider: None,
+        items: vec![PickerItem::new("review")],
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
+        loading: false,
+        preview: PickerPreview::default(),
+        preview_request: None,
+    });
+    app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    assert!(app.picker.is_none());
+    assert_eq!(app.input.text(), "please @review");
+    assert!(matches!(app.focus, Focus::Input));
+    assert_eq!(app.status, "inserted @review");
+}
+
+#[test]
+fn skills_command_inserts_a_mention_and_keeps_arguments() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+
+    assert!(app.handle_command_text("/skills review src/lib.rs", &tx, true));
+    assert_eq!(app.input.text(), "@review src/lib.rs");
+    assert!(matches!(app.focus, Focus::Input));
+    assert_eq!(app.status, "inserted @review");
+}
+
+#[test]
+fn image_picker_searches_and_attaches_at_path() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+    assert!(app.handle_command_text("/image", &tx, true));
+    let picker = app.picker.as_ref().expect("image picker");
+    assert_eq!(picker.kind, PickerKind::Images);
+    assert!(picker.loading);
+
+    let mut query_command = None;
+    while let Ok(command) = rx.try_recv() {
+        if let Command::PickerData { .. } = command {
+            query_command = Some(command);
+            break;
+        }
+    }
+    match query_command.expect("image query") {
+        Command::PickerData {
+            session_id,
+            kind,
+            query,
+        } => {
+            assert_eq!(session_id, "s1");
+            assert_eq!(kind, eix_core::KIND_IMAGES);
+            assert!(query.is_none());
+        }
+        _ => unreachable!("matched PickerData above"),
+    }
+
+    app.handle_event(
+        Event::PickerData {
+            kind: eix_core::KIND_IMAGES.into(),
+            items: vec![
+                PickerItem::new("shots/one.png"),
+                PickerItem::new("shots/two.jpg"),
+            ],
+            query: None,
+        },
+        &tx,
+    );
+    assert_eq!(app.picker.as_ref().unwrap().items.len(), 2);
+
+    // Typing filters locally; Enter attaches the row and inserts `@path`.
+    app.picker.as_mut().unwrap().query = "two".into();
+    assert_eq!(app.filtered_items().len(), 1);
+    app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    assert!(app.picker.is_none());
+    assert_eq!(app.input.text(), "@shots/two.jpg");
+    assert_eq!(app.pending_images, vec!["shots/two.jpg".to_string()]);
 }
 
 #[test]
@@ -4083,6 +4208,17 @@ fn help_accepts_ctrl_j_k_and_ctrl_n_p() {
 }
 
 #[test]
+fn help_overlay_renders_section_rules() {
+    let mut app = App::new(None);
+    app.open_help();
+
+    let text = render_text(&mut app, 120, 40);
+    assert!(text.contains("▍ prompt commands"), "{text}");
+    assert!(text.contains("type to search"), "{text}");
+    assert!(text.contains("help ·"), "{text}");
+}
+
+#[test]
 fn help_search_renders_the_selected_match() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
@@ -4199,6 +4335,9 @@ fn picker_detail_columns_align_for_every_kind() {
         PickerKind::Subagents,
         PickerKind::Modes,
         PickerKind::Timeline,
+        PickerKind::Fork,
+        PickerKind::Effort,
+        PickerKind::Diff,
         PickerKind::Skills,
         PickerKind::Themes,
         PickerKind::Mcp,
@@ -5887,6 +6026,85 @@ fn picker_accepts_ctrl_j_and_ctrl_k() {
 }
 
 #[test]
+fn list_overlays_wrap_stepping_past_either_end() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let control = |ch| KeyEvent::new(KeyCode::Char(ch), KeyModifiers::CONTROL);
+
+    // Picker rows: k on the first row lands on the last, j on the last row
+    // comes back to the first.
+    let mut app = App::new(None);
+    app.sessions = vec![
+        Session::new("s1", "one", "/tmp"),
+        Session::new("s2", "two", "/tmp"),
+        Session::new("s3", "three", "/tmp"),
+    ];
+    app.open_picker(PickerKind::Sessions, &tx);
+    app.handle_picker_key(control('k'), &tx);
+    assert_eq!(app.picker.as_ref().unwrap().selected, 2);
+    app.handle_picker_key(control('j'), &tx);
+    assert_eq!(app.picker.as_ref().unwrap().selected, 0);
+    // Legacy terminals report Ctrl-J as Ctrl-Enter; it also steps forward.
+    app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL), &tx);
+    assert_eq!(app.picker.as_ref().unwrap().selected, 1);
+    app.picker = None;
+
+    // Help filter results.
+    app.open_help();
+    let last = help_entry_count("").saturating_sub(1);
+    app.handle_key(control('k'), &tx);
+    assert_eq!(app.help_selected, last);
+    app.handle_key(control('n'), &tx);
+    assert_eq!(app.help_selected, 0);
+    app.handle_key(control('p'), &tx);
+    assert_eq!(app.help_selected, last);
+    app.help = false;
+
+    // Cross-session approval inbox.
+    app.inbox = Some(InboxView {
+        items: (0..3)
+            .map(|i| InboxItem {
+                session_id: format!("s{i}"),
+                session_name: format!("s{i}"),
+                tool: "exec_command".into(),
+                summary: format!("item {i}"),
+                kind: PendingKind::Tool,
+            })
+            .collect(),
+        cursor: 0,
+    });
+    app.handle_key(control('k'), &tx);
+    assert_eq!(app.inbox.as_ref().unwrap().cursor, 2);
+    app.handle_key(control('j'), &tx);
+    assert_eq!(app.inbox.as_ref().unwrap().cursor, 0);
+    app.inbox = None;
+
+    // Background process list.
+    let mut processes = ProcessView::new("s1".into());
+    processes.processes = (0..3)
+        .map(|i| ProcessInfo {
+            id: format!("p{i}"),
+            session_id: "s1".into(),
+            command: format!("cmd {i}"),
+            cwd: "/tmp".into(),
+            pid: i as u32,
+            status: ProcessStatus::Running,
+            exit_code: None,
+            started_ms: 0,
+            ended_ms: None,
+            bytes: 0,
+            truncated: false,
+            log: String::new(),
+        })
+        .collect();
+    app.process_view = Some(processes);
+    app.handle_key(control('p'), &tx);
+    assert_eq!(app.process_view.as_ref().unwrap().cursor, 2);
+    app.handle_key(control('n'), &tx);
+    assert_eq!(app.process_view.as_ref().unwrap().cursor, 0);
+    app.process_view = None;
+}
+
+#[test]
 fn pane_title_omits_read_only_badge() {
     let mut app = app_with_panes(&["plan-pane"]);
     app.focused = 0;
@@ -7220,6 +7438,34 @@ fn slash_close_on_the_last_pane_quits_the_client() {
 }
 
 #[test]
+fn attention_queue_and_keys_are_no_longer_prompt_commands() {
+    let names: Vec<String> = builtin_commands()
+        .into_iter()
+        .map(|spec| spec.name)
+        .collect();
+    for removed in ["attention", "queue", "keys"] {
+        assert!(
+            !names.iter().any(|name| name == removed),
+            "/{removed} is still registered"
+        );
+    }
+
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    for removed in ["attention", "queue", "keys"] {
+        app.error = None;
+        assert!(app.handle_prompt_command(&format!("/{removed}"), &tx));
+        assert!(
+            app.error
+                .as_deref()
+                .is_some_and(|error| error.contains(&format!("unknown command /{removed}"))),
+            "expected /{removed} to be unknown, got {:?}",
+            app.error
+        );
+    }
+}
+
+#[test]
 fn command_palette_mirrors_the_slash_command_menu() {
     let commands = builtin_commands();
     let items = command_items(&commands);
@@ -7232,7 +7478,7 @@ fn command_palette_mirrors_the_slash_command_menu() {
 }
 
 #[test]
-fn slash_help_and_keys_open_filtered_interactive_references() {
+fn help_opens_filtered_references_and_scoped_keys_help() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
 
@@ -7243,7 +7489,7 @@ fn slash_help_and_keys_open_filtered_interactive_references() {
     assert!(help_entry_count_in(&app.help_query, app.help_scope) > 0);
 
     app.help = false;
-    assert!(app.handle_prompt_command("/keys space", &tx));
+    app.open_keys_help("space");
     assert!(app.help);
     assert_eq!(app.help_scope, Some("keys"));
     assert_eq!(app.help_query, "space");
@@ -7261,7 +7507,7 @@ fn slash_help_and_keys_open_filtered_interactive_references() {
 
 #[test]
 fn mcp_and_todos_commands_open_searchable_pickers() {
-    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(session_pane("s1", "one"));
     app.focused = 0;
@@ -7272,19 +7518,46 @@ fn mcp_and_todos_commands_open_searchable_pickers() {
         Some(PickerKind::Mcp)
     ));
     app.handle_event(
-        Event::Mcp(vec![eix_core::McpServerInfo {
-            name: "files".into(),
-            enabled: true,
-            command: "npx server".into(),
-            tools: 2,
-            resources: 0,
-            prompts: 0,
-            error: None,
-        }]),
+        Event::Mcp(vec![
+            eix_core::McpServerInfo {
+                name: "files".into(),
+                enabled: true,
+                command: "npx server".into(),
+                tools: 2,
+                resources: 0,
+                prompts: 0,
+                error: None,
+            },
+            eix_core::McpServerInfo {
+                name: "notes".into(),
+                enabled: false,
+                command: "npx notes".into(),
+                tools: 0,
+                resources: 0,
+                prompts: 0,
+                error: None,
+            },
+        ]),
         &tx,
     );
-    assert_eq!(app.picker.as_ref().unwrap().items.len(), 1);
+    assert_eq!(app.picker.as_ref().unwrap().items.len(), 2);
     assert!(!app.picker.as_ref().unwrap().loading);
+
+    // Typing filters the rows, and Space toggles the highlighted server.
+    for ch in "fil".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+    assert_eq!(app.picker_filtered().len(), 1);
+    // Drop `ListMcp` from opening the picker; only the toggle matters here.
+    while rx.try_recv().is_ok() {}
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Command::SetMcpEnabled {
+            name,
+            enabled: false,
+        }) if name == "files"
+    ));
 
     app.picker = None;
     assert!(app.handle_prompt_command("/todos", &tx));
@@ -7301,6 +7574,72 @@ fn mcp_and_todos_commands_open_searchable_pickers() {
     );
     assert_eq!(app.picker.as_ref().unwrap().items.len(), 1);
     assert!(!app.picker.as_ref().unwrap().loading);
+}
+
+#[test]
+fn mcp_picker_searches_and_space_toggles_the_highlighted_server() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(session_pane("s1", "one"));
+    app.focused = 0;
+
+    let server = |name: &str, enabled: bool| eix_core::McpServerInfo {
+        name: name.into(),
+        enabled,
+        command: format!("npx {name}"),
+        tools: 2,
+        resources: 0,
+        prompts: 0,
+        error: None,
+    };
+
+    assert!(app.handle_prompt_command("/mcp", &tx));
+    app.handle_event(
+        Event::Mcp(vec![server("files", true), server("search", false)]),
+        &tx,
+    );
+    let labels: Vec<String> = app
+        .picker
+        .as_ref()
+        .unwrap()
+        .items
+        .iter()
+        .map(|item| item.label.clone())
+        .collect();
+    assert_eq!(labels, vec!["[x] files", "[ ] search"]);
+
+    // Typing filters the rows; the marker keeps the state searchable too.
+    app.picker.as_mut().unwrap().query = "sea".into();
+    let filtered = app.filtered_items();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        app.picker.as_ref().unwrap().items[filtered[0]].value,
+        "search"
+    );
+
+    // Space flips the highlighted server instead of typing a space.
+    app.handle_picker_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    let sent = drain_commands(&mut rx);
+    assert!(
+        sent.iter().any(|command| matches!(
+            command,
+            Command::SetMcpEnabled { name, enabled } if name == "search" && *enabled
+        )),
+        "unexpected commands: {}",
+        sent.len()
+    );
+    assert_eq!(app.status, "mcp: search enabling…");
+
+    // The daemon re-lists after the toggle; keep the query and the row.
+    app.handle_event(
+        Event::Mcp(vec![server("files", true), server("search", true)]),
+        &tx,
+    );
+    let picker = app.picker.as_ref().unwrap();
+    assert_eq!(picker.query, "sea");
+    let filtered = app.filtered_items();
+    assert_eq!(picker.items[filtered[picker.selected]].value, "search");
+    assert_eq!(picker.items[filtered[picker.selected]].label, "[x] search");
 }
 
 #[test]
@@ -7644,6 +7983,67 @@ fn double_esc_in_normal_mode_interrupts_a_running_turn() {
     }
     assert_eq!(cancelled.as_deref(), Some("s1"));
     assert!(matches!(app.focus, Focus::Input));
+}
+
+#[test]
+fn cd_completion_lists_matching_directories() {
+    let dir = std::env::temp_dir().join(format!(
+        "eix-cd-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(dir.join("src/app")).unwrap();
+    std::fs::create_dir_all(dir.join("scripts")).unwrap();
+    std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+    std::fs::write(dir.join("src/main.rs"), "fn main() {}").unwrap();
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(
+        Session::new("s1", "one", dir.clone()),
+        Vec::new(),
+    ));
+    app.focused = 0;
+    app.focus = Focus::Input;
+
+    app.input.set_text("/cd s");
+    assert_eq!(app.cd_matches(), vec!["scripts/", "src/"]);
+    assert!(app.cd_menu_open());
+
+    // Tab accepts the first row; the trailing slash lists the next level.
+    app.handle_input_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE), &tx);
+    assert_eq!(app.input.text(), "/cd scripts/");
+
+    // Enter on an existing directory switches to exactly that path.
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    let mut cwd = None;
+    while let Ok(command) = rx.try_recv() {
+        if let Command::SetCwd { path, .. } = command {
+            cwd = Some(path);
+        }
+    }
+    assert_eq!(cwd.as_deref(), Some("scripts/"));
+
+    // Listing children must not make Enter jump into the first child.
+    app.input.set_text("/cd src/");
+    assert_eq!(app.cd_matches(), vec!["src/app/"]);
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    let mut cwd = None;
+    while let Ok(command) = rx.try_recv() {
+        if let Command::SetCwd { path, .. } = command {
+            cwd = Some(path);
+        }
+    }
+    assert_eq!(cwd.as_deref(), Some("src/"));
+
+    // Hidden directories only show after a leading dot.
+    app.input.set_text("/cd .");
+    assert_eq!(app.cd_matches(), vec![".hidden/"]);
+
+    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
@@ -8801,24 +9201,119 @@ fn builtin_review_commands_expand_into_prompts() {
 }
 
 #[test]
+fn diff_opens_a_searchable_picker_with_per_file_previews() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+    app.open_picker(PickerKind::Diff, &tx);
+    let diff = "\
+diff --git a/src/main.rs b/src/main.rs
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1 +1,2 @@
+ fn main() {}
++let added = 1;
+diff --git a/README.md b/README.md
+--- a/README.md
++++ b/README.md
+@@ -1 +1 @@
+-old
++new
+";
+    app.handle_event(
+        Event::WorkspaceDiff {
+            result: eix_core::WorkspaceDiffResult {
+                diff: diff.into(),
+                files: 2,
+                truncated: false,
+                notes: vec!["untracked: new.rs".into()],
+            },
+            staged: false,
+        },
+        &tx,
+    );
+    let picker = app.picker.as_ref().expect("diff picker");
+    assert_eq!(picker.kind, PickerKind::Diff);
+    assert!(!picker.loading);
+    let values: Vec<&str> = picker
+        .items
+        .iter()
+        .map(|item| item.value.as_str())
+        .collect();
+    assert_eq!(values, ["src/main.rs", "README.md", "<notes>"]);
+    assert_eq!(picker.items[0].detail.as_deref(), Some("+1 -0"));
+    assert_eq!(picker.items[1].detail.as_deref(), Some("+1 -1"));
+    assert!(picker.items[0]
+        .preview
+        .as_deref()
+        .is_some_and(|preview| preview.contains("+let added = 1;")));
+    assert!(picker.items[0]
+        .preview
+        .as_deref()
+        .is_some_and(|preview| !preview.contains("README")));
+    assert!(picker.items[2]
+        .preview
+        .as_deref()
+        .is_some_and(|preview| preview.contains("untracked: new.rs")));
+    assert_eq!(app.status, "diff: 2 file(s) · notes at the end");
+
+    // Typing searches file rows; notes stay in the list for the empty query.
+    app.picker.as_mut().unwrap().query = "read".into();
+    let filtered = app.filtered_items();
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        app.picker.as_ref().unwrap().items[filtered[0]].value,
+        "README.md"
+    );
+
+    // Enter opens the selected file in the scrollable full-screen view.
+    app.handle_picker_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    assert!(app.picker.is_none());
+    let view = app.text_view.as_ref().expect("file diff overlay");
+    assert!(view.title.contains("README.md"));
+    assert!(view.lines.iter().any(|line| line == "+new"));
+}
+
+#[test]
+fn diff_picker_parses_deleted_binary_and_quoted_paths() {
+    let diff = "\
+diff --git a/old.txt b/old.txt
+deleted file mode 100644
+--- a/old.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+diff --git a/logo.png b/logo.png
+Binary files a/logo.png and b/logo.png differ
+diff --git \"a/with space.txt\" \"b/with space.txt\"
+--- \"a/with space.txt\"
++++ \"b/with space.txt\"
+@@ -1 +1 @@
+-a
++b
+";
+    let items = diff_picker_items(diff, &[]);
+    let values: Vec<&str> = items.iter().map(|item| item.value.as_str()).collect();
+    assert_eq!(values, ["old.txt", "logo.png", "with space.txt"]);
+    assert_eq!(items[0].detail.as_deref(), Some("+0 -1"));
+    assert_eq!(items[1].detail.as_deref(), Some("binary"));
+
+    let empty = diff_picker_items("", &[]);
+    assert_eq!(empty[0].value, "<none>");
+    assert_eq!(empty[0].label, "no changes");
+}
+
+#[test]
 fn text_overlay_scrolls_and_closes() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["s1"]);
-    app.handle_event(
-        Event::WorkspaceDiff(eix_core::WorkspaceDiffResult {
-            diff: (1..=40)
-                .map(|line| format!("+line {line}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            files: 1,
-            truncated: false,
-            notes: vec!["untracked: new.rs".into()],
-        }),
-        &tx,
-    );
+    let text = (1..=40)
+        .map(|line| format!("+line {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.open_text_view("diff · s1", &text);
     let view = app.text_view.as_ref().expect("text overlay");
     assert!(view.title.contains("diff"));
-    assert_eq!(view.lines.len(), 42, "notes are appended");
+    assert_eq!(view.lines.len(), 40);
 
     app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::NONE), &tx);
     assert_eq!(app.text_view.as_ref().unwrap().scroll, usize::MAX);
@@ -8841,7 +9336,34 @@ fn doctor_results_open_in_the_text_overlay() {
     );
     let view = app.text_view.as_ref().expect("doctor overlay");
     assert_eq!(view.title, "doctor");
-    assert_eq!(view.lines.len(), 2);
+    assert!(view.doctor.is_some());
+    assert!(view.lines.iter().any(|line| line.contains("/tmp/eix.sock")));
+    assert!(view.lines.iter().any(|line| line.contains("snapshot")));
+    assert!(view.lines.iter().any(|line| line.contains("paths")));
+    assert!(view.lines.iter().any(|line| line.contains("tools")));
+}
+
+#[test]
+fn doctor_overlay_renders_sections_and_warns() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+    app.handle_event(
+        Event::Doctor(vec![
+            "socket   /tmp/eix.sock".into(),
+            "data     /tmp/data".into(),
+            "model    provider/model".into(),
+            "key      absent (set EIX_API_KEY)".into(),
+            "warning  api key is stored in plain text".into(),
+        ]),
+        &tx,
+    );
+    let text = render_text(&mut app, 120, 40);
+    assert!(text.contains("▍ paths"), "{text}");
+    assert!(text.contains("▍ model"), "{text}");
+    assert!(text.contains("▍ warnings"), "{text}");
+    assert!(text.contains("1 warning needs attention"), "{text}");
+    assert!(text.contains("! api key is stored"), "{text}");
+    assert!(text.contains("socket"), "{text}");
 }
 
 fn command_app_with_turns() -> App {
@@ -9050,6 +9572,83 @@ fn effort_sets_the_model_variant() {
 }
 
 #[test]
+fn effort_opens_a_picker_with_the_current_level_selected() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    app.views[0].session.model = Some("mock-model#high".into());
+
+    assert!(app.handle_command_text("/effort", &tx, true));
+    let picker = app.picker.as_ref().expect("effort picker");
+    assert_eq!(picker.kind, PickerKind::Effort);
+    assert_eq!(
+        picker
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["low", "medium", "high"]
+    );
+    // `high` is preselected, so moving up once lands on `medium`.
+    let high = picker.items.len() - 1;
+    assert_eq!(picker.selected, high);
+    assert!(!drain_commands(&mut rx)
+        .iter()
+        .any(|command| matches!(command, Command::SetModel { .. })));
+
+    app.picker.as_mut().unwrap().selected = 1;
+    app.picker_enter(PickerKind::Effort, &tx);
+    assert!(app.picker.is_none());
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::SetModel {
+            session_id,
+            model: Some(model),
+        } if session_id == "s1" && model == "mock-model"
+    )));
+    assert_eq!(app.status, "effort: medium");
+}
+
+#[test]
+fn diff_command_opens_a_loading_picker_and_requests_the_workspace_diff() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+
+    assert!(app.handle_command_text("/diff", &tx, true));
+    let picker = app.picker.as_ref().expect("diff picker");
+    assert_eq!(picker.kind, PickerKind::Diff);
+    assert!(picker.loading);
+    assert_eq!(app.status, "diff: loading…");
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::WorkspaceDiff { session_id, staged } if session_id == "s1" && !staged
+    )));
+
+    assert!(app.handle_command_text("/diff staged", &tx, true));
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::WorkspaceDiff { session_id, staged } if session_id == "s1" && *staged
+    )));
+    assert_eq!(app.status, "diff (staged): loading…");
+}
+
+#[test]
+fn delete_removes_the_session_without_a_second_confirmation() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/delete", &tx, true));
+
+    let sent = drain_commands(&mut rx);
+    assert!(sent.iter().any(|command| matches!(
+        command,
+        Command::DeleteSession { session_id } if session_id == "s1"
+    )));
+    assert_eq!(app.status, "deleting…");
+}
+
+#[test]
 fn branch_forks_and_replaces_the_focused_pane() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = command_app_with_turns();
@@ -9081,4 +9680,109 @@ fn branch_forks_and_replaces_the_focused_pane() {
     assert!(drain_commands(&mut rx)
         .iter()
         .any(|command| matches!(command, Command::Attach(id) if id == "s2")));
+}
+
+#[test]
+fn fork_opens_a_picker_of_user_messages() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/fork", &tx, true));
+
+    let picker = app.picker.as_ref().expect("fork picker");
+    assert_eq!(picker.kind, PickerKind::Fork);
+    assert_eq!(
+        picker
+            .items
+            .iter()
+            .map(|item| item.value.as_str())
+            .collect::<Vec<_>>(),
+        vec!["5", "3", "1", "@all"]
+    );
+    assert!(!drain_commands(&mut rx)
+        .iter()
+        .any(|command| matches!(command, Command::Fork { .. })));
+
+    // The newest message is selected first; Enter forks before it.
+    app.picker_enter(PickerKind::Fork, &tx);
+    let sent = drain_commands(&mut rx);
+    assert!(
+        sent.iter().any(|command| matches!(
+            command,
+            Command::Fork {
+                session_id,
+                at_seq: Some(5),
+                name: None,
+                branch: false,
+            } if session_id == "s1"
+        )),
+        "unexpected commands: {}",
+        sent.len()
+    );
+    assert!(app.picker.is_none());
+    assert!(app.status.contains("e5"));
+}
+
+#[test]
+fn fork_picker_reaches_older_messages_and_a_full_fork() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+
+    assert!(app.handle_command_text("/fork", &tx, true));
+    app.picker.as_mut().unwrap().selected = 1;
+    app.picker_enter(PickerKind::Fork, &tx);
+    assert!(drain_commands(&mut rx).iter().any(|command| matches!(
+        command,
+        Command::Fork {
+            at_seq: Some(3),
+            name: None,
+            ..
+        }
+    )));
+
+    assert!(app.handle_command_text("/fork", &tx, true));
+    let picker = app.picker.as_mut().unwrap();
+    picker.selected = picker.items.len() - 1;
+    app.picker_enter(PickerKind::Fork, &tx);
+    assert!(drain_commands(&mut rx).iter().any(|command| matches!(
+        command,
+        Command::Fork {
+            at_seq: None,
+            name: None,
+            ..
+        }
+    )));
+}
+
+#[test]
+fn fork_with_a_name_still_forks_everything() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = command_app_with_turns();
+    assert!(app.handle_command_text("/fork feature", &tx, true));
+    assert!(app.picker.is_none());
+    assert!(drain_commands(&mut rx).iter().any(|command| matches!(
+        command,
+        Command::Fork {
+            at_seq: None,
+            name: Some(name),
+            ..
+        } if name == "feature"
+    )));
+}
+
+#[test]
+fn fork_picker_needs_a_user_message() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(
+        Session::new("s1", "empty", "/tmp"),
+        Vec::new(),
+    ));
+    app.focused = 0;
+
+    assert!(app.handle_command_text("/fork", &tx, true));
+    assert!(app.picker.is_none());
+    assert!(app.status.contains("no user message"));
+    assert!(!drain_commands(&mut rx)
+        .iter()
+        .any(|command| matches!(command, Command::Fork { .. })));
 }

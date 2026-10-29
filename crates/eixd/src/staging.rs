@@ -230,6 +230,16 @@ impl Staging {
         self.pending(session_id).into_iter().next()
     }
 
+    /// Drop every pending patch for a session, both from the index and from
+    /// disk. Used by `/clear`, which resets the conversation completely.
+    pub fn clear_session(&self, session_id: &str) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(session_id);
+        let _ = std::fs::remove_dir_all(self.session_dir(session_id));
+    }
+
     /// The newest staged contents for an absolute path, used as the base of
     /// subsequent reads and writes.
     pub fn latest_content(&self, session_id: &str, path: &Path) -> Option<String> {

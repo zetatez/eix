@@ -1710,6 +1710,134 @@ impl PluginManager {
         current
     }
 
+    /// Run `compact.before` hooks. A denial keeps the history intact: the
+    /// caller skips this compaction and lets the ledger trim instead.
+    pub async fn run_compact_before(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        from_seq: u64,
+        to_seq: u64,
+        messages: usize,
+        tokens: usize,
+    ) -> Option<String> {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return None;
+        }
+        for hook in self.hook_refs("compact.before").await {
+            let Some(backend) = self.hook_backend(&hook).await else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "point": "compact.before",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "from_seq": from_seq,
+                "to_seq": to_seq,
+                "messages": messages,
+                "tokens": tokens,
+            });
+            match call_hook(&backend, &hook, request).await {
+                Ok(value) => {
+                    self.record_result(&hook.plugin, true, None).await;
+                    if let Some(reason) = hook_denial(&value) {
+                        return Some(cap(&reason, 4096));
+                    }
+                }
+                Err(err) => {
+                    let message = redact(&format!("{err:#}"));
+                    eprintln!(
+                        "eixd: plugin {} hook compact.before failed: {message}",
+                        hook.plugin
+                    );
+                    self.record_result(&hook.plugin, false, Some(&message))
+                        .await;
+                    if hook.on_error == "deny" {
+                        return Some(format!("plugin {} hook failed", hook.plugin));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Run `compact.after` hooks. The last non-empty `summary` replacement
+    /// wins, so a plugin can pin decisions the default prompt dropped.
+    pub async fn run_compact_after(
+        &self,
+        session_id: &str,
+        turn_id: &str,
+        summary: &str,
+    ) -> String {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return summary.to_string();
+        }
+        let mut current = summary.to_string();
+        for hook in self.hook_refs("compact.after").await {
+            let Some(backend) = self.hook_backend(&hook).await else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "point": "compact.after",
+                "session_id": session_id,
+                "turn_id": turn_id,
+                "summary": current,
+            });
+            match call_hook(&backend, &hook, request).await {
+                Ok(value) => {
+                    self.record_result(&hook.plugin, true, None).await;
+                    if let Some(replacement) = value.get("summary").and_then(Value::as_str) {
+                        if !replacement.trim().is_empty() {
+                            current = cap(replacement, MAX_PLUGIN_OUTPUT);
+                        }
+                    }
+                }
+                Err(err) => {
+                    let message = redact(&format!("{err:#}"));
+                    eprintln!(
+                        "eixd: plugin {} hook compact.after failed: {message}",
+                        hook.plugin
+                    );
+                    self.record_result(&hook.plugin, false, Some(&message))
+                        .await;
+                }
+            }
+        }
+        current
+    }
+
+    /// Run `session.start` hooks. Notification only: a plugin cannot veto a
+    /// session, but it can seed memory or log the workspace it was opened in.
+    pub async fn run_session_start(&self, session: &eix_core::Session) {
+        if !self.has_hooks.load(Ordering::Relaxed) {
+            return;
+        }
+        for hook in self.hook_refs("session.start").await {
+            let Some(backend) = self.hook_backend(&hook).await else {
+                continue;
+            };
+            let request = serde_json::json!({
+                "point": "session.start",
+                "session_id": session.id,
+                "workspace": session.cwd,
+                "cwd": session.cwd,
+                "mode": session.mode.as_str(),
+            });
+            match call_hook(&backend, &hook, request).await {
+                Ok(_) => self.record_result(&hook.plugin, true, None).await,
+                Err(err) => {
+                    let message = redact(&format!("{err:#}"));
+                    eprintln!(
+                        "eixd: plugin {} hook session.start failed: {message}",
+                        hook.plugin
+                    );
+                    self.record_result(&hook.plugin, false, Some(&message))
+                        .await;
+                }
+            }
+        }
+    }
+
     /// Run `turn.stop` hooks before a turn is allowed to finish. A hook that
     /// returns `{"block": true, "reason": "..."}` keeps the turn alive: the
     /// daemon feeds the reason back to the model and samples again. This is
@@ -2542,6 +2670,23 @@ fn turn_stop_reason(value: &Value) -> Option<String> {
             .and_then(Value::as_str)
             .filter(|reason| !reason.trim().is_empty())
             .unwrap_or("a turn.stop hook blocked the turn")
+            .to_string()
+    })
+}
+
+/// Shared denial vocabulary for hooks that can veto an action. Accepts the
+/// same keys `tool.before` uses so one plugin can gate tools and compaction.
+fn hook_denial(value: &Value) -> Option<String> {
+    let deny = value.get("action").and_then(Value::as_str) == Some("deny")
+        || value.get("decision").and_then(Value::as_str) == Some("deny")
+        || value.get("deny").and_then(Value::as_bool) == Some(true)
+        || value.get("allow").and_then(Value::as_bool) == Some(false);
+    deny.then(|| {
+        value
+            .get("reason")
+            .and_then(Value::as_str)
+            .filter(|reason| !reason.trim().is_empty())
+            .unwrap_or("denied by plugin hook")
             .to_string()
     })
 }

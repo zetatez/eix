@@ -280,11 +280,16 @@ MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
 # retention_days = 30
 # max_store_bytes = 2147483648
 
-# --- Display math -----------------------------------------------------------
+# --- Math --------------------------------------------------------------------
 # Display math is rendered as a terminal image (Kitty, Sixel or iTerm2) when
-# the terminal supports it, and as 2D ASCII text otherwise. The TUI shells out
-# to `latex`/`dvipng` (or `xelatex` + poppler for CJK). `/math status` reports
-# the detected mode and the reason for a fallback.
+# the terminal supports it, and as 2D ASCII text otherwise. Inline math uses a
+# single-row image; a formula too wide for one row keeps its `$...$` source.
+# `/math off` (or `images = false`) turns rendering off completely: formulas
+# stay as the literal `$...$` / `$$...$$` TeX instead of falling back to ASCII.
+# The TUI shells out to `latex`/`dvipng` (or `xelatex` + poppler for CJK).
+# `/math status` reports the detected mode and the reason for a fallback.
+# Rendered PNGs are cached under the OS cache directory (`~/.cache/eix/math`)
+# so reopening a session does not re-run TeX. EIX_MATH_CACHE=0 disables it.
 # [math]
 # images = true
 # dpi = 200

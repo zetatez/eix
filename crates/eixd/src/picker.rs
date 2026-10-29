@@ -10,7 +10,7 @@ use std::process::Stdio;
 use anyhow::{bail, Context};
 use eix_core::{
     Config, Event, EventKind, PickerItem, PickerPreviewResult, PickerResult, KIND_BRANCHES,
-    KIND_FILES, KIND_GIT, KIND_GREP, KIND_SESSION_PREVIEW, KIND_WORKTREES,
+    KIND_FILES, KIND_GIT, KIND_GREP, KIND_IMAGES, KIND_SESSION_PREVIEW, KIND_WORKTREES,
 };
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
@@ -73,6 +73,98 @@ pub async fn files(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> Picke
     PickerResult {
         kind: KIND_FILES.to_string(),
         items,
+    }
+}
+
+/// Image extensions accepted by `/image` and `prompt.submit`.
+const IMAGE_EXTENSIONS: [&str; 5] = ["png", "jpg", "jpeg", "gif", "webp"];
+
+fn is_image_file(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str()))
+        .unwrap_or(false)
+}
+
+/// List image files under `cwd`. Images are a much smaller subset than every
+/// workspace file, so the default window is wider before the frontend filters
+/// locally. Row values stay workspace-relative so `/image` can attach them and
+/// insert `@path` into the prompt.
+pub async fn images(cwd: &Path, query: Option<&str>, limit: Option<u32>) -> PickerResult {
+    let root = cwd.to_path_buf();
+    let needle = lower(query);
+    let limit = limit.map_or(MAX_ROWS, |value| clamp_rows(Some(value)));
+    let items = tokio::task::spawn_blocking(move || walk_images(&root, needle.as_deref(), limit))
+        .await
+        .unwrap_or_default();
+    PickerResult {
+        kind: KIND_IMAGES.to_string(),
+        items,
+    }
+}
+
+fn walk_images(root: &Path, needle: Option<&str>, limit: usize) -> Vec<PickerItem> {
+    let mut items = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        if items.len() >= limit {
+            break;
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in read.flatten() {
+            if items.len() >= limit {
+                break;
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            let path = entry.path();
+            if file_type.is_dir() {
+                if crate::snapshot::is_excluded_dir(&entry.file_name()) {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            if !file_type.is_file() || !is_image_file(&path) {
+                continue;
+            }
+            let Ok(relative) = path.strip_prefix(root) else {
+                continue;
+            };
+            let value = relative.to_string_lossy().replace('\\', "/");
+            if let Some(needle) = needle {
+                if !value.to_lowercase().contains(needle) {
+                    continue;
+                }
+            }
+            let detail = entry.metadata().ok().map(|meta| format_size(meta.len()));
+            let mut item = PickerItem::new(value);
+            if let Some(detail) = detail {
+                item = item.with_detail(detail);
+            }
+            items.push(item.with_preview(path.display().to_string()));
+        }
+    }
+    items.sort_by(|left, right| left.value.cmp(&right.value));
+    items
+}
+
+fn format_size(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= MIB {
+        format!("{:.1} MB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.1} KB", bytes / KIB)
+    } else {
+        format!("{} B", bytes as u64)
     }
 }
 
@@ -631,6 +723,29 @@ mod tests {
         assert_eq!(filtered.items.len(), 1);
         let missing = files(&dir, Some("nope"), None).await;
         assert!(missing.items.is_empty());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn lists_images_and_skips_other_files() {
+        let dir = temp_dir("images");
+        std::fs::create_dir_all(dir.join("shots")).unwrap();
+        std::fs::create_dir_all(dir.join("target")).unwrap();
+        std::fs::write(dir.join("shots/one.PNG"), "png").unwrap();
+        std::fs::write(dir.join("shots/two.jpeg"), "jpg").unwrap();
+        std::fs::write(dir.join("notes.txt"), "text").unwrap();
+        std::fs::write(dir.join("target/derived.png"), "png").unwrap();
+
+        let result = images(&dir, None, None).await;
+        assert_eq!(result.kind, KIND_IMAGES);
+        let values: Vec<&str> = result.items.iter().map(|i| i.value.as_str()).collect();
+        assert_eq!(values, vec!["shots/one.PNG", "shots/two.jpeg"]);
+        assert!(result.items[0].detail.as_deref().unwrap().ends_with(" B"));
+
+        let filtered = images(&dir, Some("JPEG"), None).await;
+        assert_eq!(filtered.items.len(), 1);
+        assert_eq!(filtered.items[0].value, "shots/two.jpeg");
 
         std::fs::remove_dir_all(&dir).ok();
     }

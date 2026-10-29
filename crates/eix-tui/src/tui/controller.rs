@@ -109,6 +109,11 @@ pub enum Command {
     },
     /// List configured MCP servers and their tool counts.
     ListMcp,
+    /// Enable or disable one configured MCP server and refresh the list.
+    SetMcpEnabled {
+        name: String,
+        enabled: bool,
+    },
     /// List prompt commands contributed by server plugins.
     ListPluginCommands,
     /// List plugins and optionally load one plugin's settings schema.
@@ -343,6 +348,7 @@ impl Command {
             Self::SetSubagentConcurrency { .. } => "subagents",
             Self::ListModels | Self::ListAgents { .. } => "catalog",
             Self::ListMcp => "mcp",
+            Self::SetMcpEnabled { .. } => "mcp toggle",
             Self::ListPluginCommands => "plugin commands",
             Self::ListPlugins { .. } => "plugins",
             Self::PluginHealth => "plugin health",
@@ -405,7 +411,9 @@ pub enum Event {
     Created(Session),
     /// A session's cwd or mode changed; the view replays it.
     Updated(Session),
-    ContextCleared {
+    /// `/clear` succeeded: the daemon deleted the session's history, so the
+    /// view must drop its cached transcript too.
+    Reset {
         session_id: String,
     },
     Compacted {
@@ -523,7 +531,11 @@ pub enum Event {
         session_id: String,
         note: String,
     },
-    WorkspaceDiff(eix_core::WorkspaceDiffResult),
+    WorkspaceDiff {
+        result: eix_core::WorkspaceDiffResult,
+        /// The request compared the index to HEAD instead of the working tree.
+        staged: bool,
+    },
     Doctor(Vec<String>),
     Goal(Option<eix_core::Goal>),
     Schedules {
@@ -737,7 +749,7 @@ async fn dispatch(
                 .request("context.clear", json!({ "session_id": session_id }))
                 .await?;
             let _: eix_core::ContextLedgerResult = decode(value)?;
-            send(events, Event::ContextCleared { session_id })
+            send(events, Event::Reset { session_id })
         }
         Command::CompactContext { session_id, notes } => {
             let value = requester
@@ -852,6 +864,19 @@ async fn dispatch(
             send(events, Event::Agents(result.agents))
         }
         Command::ListMcp => {
+            let value = requester.request("mcp.list", Value::Null).await?;
+            let result: eix_core::McpListResult = decode(value)?;
+            send(events, Event::Mcp(result.servers))
+        }
+        Command::SetMcpEnabled { name, enabled } => {
+            requester
+                .request(
+                    "mcp.set_enabled",
+                    json!({ "name": name, "enabled": enabled }),
+                )
+                .await?;
+            // Re-list so tool counts and startup errors reflect the new state
+            // instead of only flipping a local flag.
             let value = requester.request("mcp.list", Value::Null).await?;
             let result: eix_core::McpListResult = decode(value)?;
             send(events, Event::Mcp(result.servers))
@@ -1185,7 +1210,7 @@ async fn dispatch(
                 )
                 .await?;
             let result: eix_core::WorkspaceDiffResult = decode(value)?;
-            send(events, Event::WorkspaceDiff(result))
+            send(events, Event::WorkspaceDiff { result, staged })
         }
         Command::Doctor => {
             let value = requester.request("doctor.report", Value::Null).await?;

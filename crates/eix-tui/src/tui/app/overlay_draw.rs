@@ -37,95 +37,37 @@ impl App {
 
     /// `/` suggestion menu floated just above the prompt.
     pub(super) fn draw_command_menu(&mut self, frame: &mut Frame, input_area: Rect) {
-        if input_area.y < 3 {
-            return;
-        }
         let matches = self.command_matches();
-        if matches.is_empty() {
-            return;
-        }
-        let height = (matches.len() as u16 + 2)
-            .min(15)
-            .min(input_area.y.saturating_sub(1));
-        let visible = height.saturating_sub(2) as usize;
-        if visible == 0 {
-            return;
-        }
-        let cursor = self.command_cursor.min(matches.len() - 1);
-        let start = cursor.saturating_sub(visible.saturating_sub(1));
-        let width = input_area.width.min(88);
-        let rect = Rect::new(input_area.x, input_area.y - height, width, height);
-        frame.render_widget(Clear, rect);
-
-        let panel = composer_background(self.theme);
-        let muted = composer_muted(self.theme);
-        let text = composer_text(self.theme);
-        let accent = composer_accent(self.theme);
-        let inner = width.saturating_sub(2) as usize;
-        let marker_width = 3usize;
-        let name_width = COMMAND_NAME_WIDTH.min(inner.saturating_sub(marker_width + 2));
-        let desc_width = inner
-            .saturating_sub(marker_width + name_width)
-            .saturating_sub(2);
-        let mut lines = Vec::new();
-        for (offset, spec) in matches.iter().skip(start).take(visible).enumerate() {
-            let index = start + offset;
-            let selected = index == cursor;
-            let row_bg = if selected { COMPOSER_SELECTION } else { panel };
-            let marker_style = if selected {
-                Style::default()
-                    .fg(accent)
-                    .bg(row_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(muted).bg(row_bg)
-            };
-            let name_style = if selected {
-                Style::default()
-                    .fg(accent)
-                    .bg(row_bg)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(text).bg(row_bg)
-            };
-            let desc_style = if selected {
-                Style::default().fg(text).bg(row_bg)
-            } else {
-                Style::default().fg(muted).bg(row_bg)
-            };
-            let name = command_label(spec, "/");
-            let name = pad_to(&truncate(&name, name_width), name_width);
-            let description = pad_to(&truncate(&spec.description, desc_width), desc_width);
-            let gap = inner.saturating_sub(marker_width + name_width + desc_width);
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!(" {} ", if selected { "❯" } else { " " }),
-                    marker_style,
-                ),
-                Span::styled(name, name_style),
-                Span::styled(" ".repeat(gap), desc_style),
-                Span::styled(description, desc_style),
-            ]));
-        }
-        let title_left = Line::from(Span::styled(
+        let rows: Vec<(String, String)> = matches
+            .iter()
+            .map(|spec| (command_label(spec, "/"), spec.description.clone()))
+            .collect();
+        draw_suggestion_panel(
+            frame,
+            input_area,
             " / commands ",
-            Style::default()
-                .fg(accent)
-                .bg(panel)
-                .add_modifier(Modifier::BOLD),
-        ));
-        let block = Block::default()
-            .borders(Borders::ALL)
-            .border_type(BorderType::Rounded)
-            .border_style(Style::default().fg(accent).bg(panel))
-            .style(Style::default().bg(panel))
-            .title_style(Style::default().bg(panel))
-            .title_top(title_left);
-        frame.render_widget(
-            Paragraph::new(lines)
-                .block(block)
-                .style(Style::default().fg(text).bg(panel)),
-            rect,
+            &rows,
+            self.command_cursor,
+            COMMAND_NAME_WIDTH,
+            self.theme,
+        );
+    }
+
+    /// `/cd <prefix>` directory completion, floated like the command menu.
+    pub(super) fn draw_cd_menu(&mut self, frame: &mut Frame, input_area: Rect) {
+        let rows: Vec<(String, String)> = self
+            .cd_matches()
+            .into_iter()
+            .map(|path| (path, "directory".to_string()))
+            .collect();
+        draw_suggestion_panel(
+            frame,
+            input_area,
+            " / cd directories ",
+            &rows,
+            self.command_cursor,
+            40,
+            self.theme,
         );
     }
 
@@ -599,7 +541,10 @@ impl App {
     }
 
     pub(super) fn draw_text_view(&mut self, frame: &mut Frame, area: Rect) {
-        let dialog_bg = dialog_background(self.theme);
+        let theme = self.theme;
+        let dialog_bg = dialog_background(theme);
+        let accent = composer_accent(theme);
+        let muted = composer_muted(theme);
         let Some(view) = &mut self.text_view else {
             return;
         };
@@ -608,9 +553,14 @@ impl App {
         frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
         let block = Block::default()
             .borders(Borders::ALL)
-            .border_style(Style::default().fg(composer_accent(self.theme)))
+            .border_style(Style::default().fg(accent).bg(dialog_bg))
+            .title_style(Style::default().bg(dialog_bg).fg(accent))
+            .style(Style::default().bg(dialog_bg))
             .title(format!(" {} ", view.title))
-            .title_bottom(" j/k scroll · PgUp/PgDn · g/G · Esc close ");
+            .title_bottom(Span::styled(
+                " j/k scroll · PgUp/PgDn · g/G · Esc close ",
+                Style::default().fg(muted).bg(dialog_bg),
+            ));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let height = inner.height as usize;
@@ -620,16 +570,28 @@ impl App {
         } else {
             view.scroll = view.scroll.min(max_scroll);
         }
-        let body: Vec<Line> = view
-            .lines
-            .iter()
-            .skip(view.scroll)
-            .take(height)
-            .map(|line| Line::from(line.clone()))
-            .collect();
+        let styled = view.doctor.as_ref().map(|report| {
+            report.styled(crate::tui::doctor::Palette {
+                accent,
+                text: composer_text(theme),
+                muted,
+                ok: composer_success(theme),
+                warn: composer_warn(theme),
+                danger: composer_danger(theme),
+            })
+        });
+        let body: Vec<Line> = if let Some(styled) = styled {
+            styled.into_iter().skip(view.scroll).take(height).collect()
+        } else {
+            view.lines
+                .iter()
+                .skip(view.scroll)
+                .take(height)
+                .map(|line| Line::from(line.clone()))
+                .collect()
+        };
         frame.render_widget(
-            Paragraph::new(body)
-                .style(Style::default().fg(composer_text(self.theme)).bg(dialog_bg)),
+            Paragraph::new(body).style(Style::default().fg(composer_text(theme)).bg(dialog_bg)),
             inner,
         );
     }
@@ -1281,6 +1243,105 @@ impl App {
             }
         }
     }
+}
+
+/// Shared suggestion panel above the prompt. Used by the `/` command menu and
+/// the `/cd` directory completion, so both keep the same marker/selection
+/// styling and column alignment.
+fn draw_suggestion_panel(
+    frame: &mut Frame,
+    input_area: Rect,
+    title: &str,
+    rows: &[(String, String)],
+    cursor: usize,
+    name_width: usize,
+    theme: Theme,
+) {
+    if input_area.y < 3 || rows.is_empty() {
+        return;
+    }
+    let height = (rows.len() as u16 + 2)
+        .min(15)
+        .min(input_area.y.saturating_sub(1));
+    let visible = height.saturating_sub(2) as usize;
+    if visible == 0 {
+        return;
+    }
+    let cursor = cursor.min(rows.len() - 1);
+    let start = cursor.saturating_sub(visible.saturating_sub(1));
+    let width = input_area.width.min(88);
+    let rect = Rect::new(input_area.x, input_area.y - height, width, height);
+    frame.render_widget(Clear, rect);
+
+    let panel = composer_background(theme);
+    let muted = composer_muted(theme);
+    let text = composer_text(theme);
+    let accent = composer_accent(theme);
+    let inner = width.saturating_sub(2) as usize;
+    let marker_width = 3usize;
+    let name_width = name_width.min(inner.saturating_sub(marker_width + 2));
+    let desc_width = inner
+        .saturating_sub(marker_width + name_width)
+        .saturating_sub(2);
+    let mut lines = Vec::new();
+    for (offset, (name, description)) in rows.iter().skip(start).take(visible).enumerate() {
+        let index = start + offset;
+        let selected = index == cursor;
+        let row_bg = if selected { COMPOSER_SELECTION } else { panel };
+        let marker_style = if selected {
+            Style::default()
+                .fg(accent)
+                .bg(row_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(muted).bg(row_bg)
+        };
+        let name_style = if selected {
+            Style::default()
+                .fg(accent)
+                .bg(row_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(text).bg(row_bg)
+        };
+        let desc_style = if selected {
+            Style::default().fg(text).bg(row_bg)
+        } else {
+            Style::default().fg(muted).bg(row_bg)
+        };
+        let name = pad_to(&truncate(name, name_width), name_width);
+        let description = pad_to(&truncate(description, desc_width), desc_width);
+        let gap = inner.saturating_sub(marker_width + name_width + desc_width);
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {} ", if selected { "❯" } else { " " }),
+                marker_style,
+            ),
+            Span::styled(name, name_style),
+            Span::styled(" ".repeat(gap), desc_style),
+            Span::styled(description, desc_style),
+        ]));
+    }
+    let title_left = Line::from(Span::styled(
+        title.to_string(),
+        Style::default()
+            .fg(accent)
+            .bg(panel)
+            .add_modifier(Modifier::BOLD),
+    ));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(accent).bg(panel))
+        .style(Style::default().bg(panel))
+        .title_style(Style::default().bg(panel))
+        .title_top(title_left);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().fg(text).bg(panel)),
+        rect,
+    );
 }
 
 /// Rendered view of the selected child agent: identity/status plus its recent

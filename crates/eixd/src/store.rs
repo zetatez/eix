@@ -465,6 +465,42 @@ impl Store {
         Ok(changed > 0)
     }
 
+    /// Reset a session to an empty conversation. The row itself (id, name,
+    /// cwd, model, worktree) survives so the user keeps the same pane; events,
+    /// drafts, goals, schedules and undo snapshots are deleted so a reconnect
+    /// sees a brand-new session.
+    pub fn reset_session(&self, id: &str) -> Result<Option<Session>> {
+        let mut conn = self.conn();
+        let tx = conn.transaction()?;
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE id = ?1)",
+            params![id],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Ok(None);
+        }
+        for (table, column) in [
+            ("events", "session_id"),
+            ("drafts", "session_id"),
+            ("session_goals", "session_id"),
+            ("session_schedules", "session_id"),
+            ("undo_snapshots", "session_id"),
+        ] {
+            tx.execute(
+                &format!("DELETE FROM {table} WHERE {column} = ?1"),
+                params![id],
+            )?;
+        }
+        tx.execute(
+            "UPDATE sessions SET updated_at = ?1 WHERE id = ?2",
+            params![now_ms(), id],
+        )?;
+        tx.commit()?;
+        drop(conn);
+        self.get_session(id)
+    }
+
     /// Insert a previously exported event without re-numbering it. Export and
     /// import preserve sequence numbers so compaction ranges keep working.
     pub fn insert_event(&self, event: &Event) -> Result<()> {
@@ -2246,6 +2282,44 @@ mod tests {
         worktree.worktree = Some(PathBuf::from("/tmp/worktree"));
         store.create_session(&worktree).unwrap();
         assert!(!store.delete_session_if_unused("worktree").unwrap());
+    }
+
+    #[test]
+    fn reset_session_keeps_the_row_and_drops_conversation_state() {
+        let store = Store::in_memory().unwrap();
+        store.create_session(&session("reset")).unwrap();
+        store.set_draft("reset", "unsent").unwrap();
+        store.set_goal("reset", "ship it").unwrap();
+        store
+            .add_schedule("sch1", "reset", "loop", "again", 60, 1)
+            .unwrap();
+        store.record_undo_snapshot("reset", 1, "snap").unwrap();
+        store
+            .append_event(
+                "reset",
+                EventKind::UserMessage,
+                serde_json::json!({"text": "old"}),
+            )
+            .unwrap();
+
+        let updated = store.reset_session("reset").unwrap().unwrap();
+        assert_eq!(updated.id, "reset");
+        assert!(store.reset_session("missing").unwrap().is_none());
+
+        assert!(store.events("reset").unwrap().is_empty());
+        assert!(store.goal("reset").unwrap().is_none());
+        assert!(store.list_schedules(Some("reset")).unwrap().is_empty());
+        assert!(store.take_undo_snapshot("reset", 1).unwrap().is_none());
+        assert_eq!(store.get_draft("reset").unwrap().0, "");
+        // The next event starts a fresh sequence.
+        let event = store
+            .append_event(
+                "reset",
+                EventKind::UserMessage,
+                serde_json::json!({"text": "new"}),
+            )
+            .unwrap();
+        assert_eq!(event.seq, 1);
     }
 
     #[test]

@@ -157,6 +157,10 @@ pub struct Transcript {
     pub user_lines: Vec<(u64, usize)>,
     /// Display-math images, anchored to `lines`.
     pub math: Vec<math_image::Placement>,
+    /// Display math that is still waiting for its PNG. The viewport uses these
+    /// to request renders and to notice when an image can replace its ASCII
+    /// fallback.
+    pub math_pending: Vec<math_image::Pending>,
     /// Line -> LaTeX source, so copying a rendered formula yields the source.
     pub copy: Vec<(usize, String)>,
 }
@@ -263,6 +267,7 @@ pub fn render_events(
     let mut slots = Vec::new();
     let mut user_lines = Vec::new();
     let mut math = Vec::new();
+    let mut math_pending = Vec::new();
     let mut copy = Vec::new();
     for collected in blocks {
         let piece = render_block(
@@ -279,6 +284,7 @@ pub fn render_events(
             &mut slots,
             &mut user_lines,
             &mut math,
+            &mut math_pending,
             &mut copy,
             piece,
         );
@@ -288,6 +294,7 @@ pub fn render_events(
         slots,
         user_lines,
         math,
+        math_pending,
         copy,
     }
 }
@@ -326,6 +333,7 @@ pub fn render_tail(
         slots: Vec::new(),
         user_lines: Vec::new(),
         math: Vec::new(),
+        math_pending: Vec::new(),
         copy: Vec::new(),
     };
     append_tail(&mut out, live, queued, folds, width, theme, tick, base);
@@ -418,6 +426,7 @@ fn append_piece_parts(
     slots: &mut Vec<Option<Fold>>,
     user_lines: &mut Vec<(u64, usize)>,
     math: &mut Vec<math_image::Placement>,
+    math_pending: &mut Vec<math_image::Pending>,
     copy: &mut Vec<(usize, String)>,
     piece: Transcript,
 ) {
@@ -438,6 +447,13 @@ fn append_piece_parts(
         placement.line = base + placement.line - skip;
         math.push(placement);
     }
+    for mut pending in piece.math_pending {
+        if pending.line < skip {
+            continue;
+        }
+        pending.line = base + pending.line - skip;
+        math_pending.push(pending);
+    }
     for (line, source) in piece.copy {
         if line < skip {
             continue;
@@ -452,12 +468,14 @@ fn append_piece(dst: &mut Transcript, piece: Transcript) {
     let mut slots = std::mem::take(&mut dst.slots);
     let mut user_lines = std::mem::take(&mut dst.user_lines);
     let mut math = std::mem::take(&mut dst.math);
+    let mut math_pending = std::mem::take(&mut dst.math_pending);
     let mut copy = std::mem::take(&mut dst.copy);
     append_piece_parts(
         &mut lines,
         &mut slots,
         &mut user_lines,
         &mut math,
+        &mut math_pending,
         &mut copy,
         piece,
     );
@@ -465,6 +483,7 @@ fn append_piece(dst: &mut Transcript, piece: Transcript) {
     dst.slots = slots;
     dst.user_lines = user_lines;
     dst.math = math;
+    dst.math_pending = math_pending;
     dst.copy = copy;
 }
 
@@ -531,10 +550,15 @@ pub struct HistoryCache {
     pub slots: Vec<Option<Fold>>,
     pub user_lines: Vec<(u64, usize)>,
     pub math: Vec<math_image::Placement>,
+    pub math_pending: Vec<math_image::Pending>,
     pub copy: Vec<(usize, String)>,
+    /// Bumped by the viewport when a pending formula became displayable, so
+    /// the next render replaces its ASCII fallback with the image.
+    math_rev: u64,
 }
 
 impl HistoryCache {
+    #[allow(clippy::too_many_arguments)]
     pub fn needs_render(
         &self,
         width: usize,
@@ -543,6 +567,7 @@ impl HistoryCache {
         subagents_rev: u64,
         folds: &HashMap<FoldId, bool>,
         base: Option<&Path>,
+        math_rev: u64,
     ) -> bool {
         self.width == 0
             || self.width != width
@@ -551,6 +576,7 @@ impl HistoryCache {
             || self.events_rev != events_rev
             || self.subagents_rev != subagents_rev
             || self.folds != *folds
+            || self.math_rev != math_rev
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -564,6 +590,7 @@ impl HistoryCache {
         subagents_rev: u64,
         events_rev: u64,
         base: Option<&Path>,
+        math_rev: u64,
     ) {
         // Reuse collected blocks when the event log only grew. A history page
         // prepended at the front or a fork/truncation changes the prefix, so
@@ -592,7 +619,8 @@ impl HistoryCache {
             .iter()
             .map(|collected| block_key(&collected.block, collected.rev, folds, subagents_rev))
             .collect();
-        let mut common = if width != self.width || theme != self.theme {
+        let mut common = if width != self.width || theme != self.theme || math_rev != self.math_rev
+        {
             0
         } else {
             let mut common = 0;
@@ -604,8 +632,8 @@ impl HistoryCache {
             }
             common
         };
-        // A width/theme change invalidates every block; otherwise reuse the
-        // matching prefix and repair only the suffix.
+        // A width/theme change or a newly displayable image invalidates every
+        // block; otherwise reuse the matching prefix and repair only the suffix.
         if common > keys.len() {
             common = keys.len();
         }
@@ -615,6 +643,7 @@ impl HistoryCache {
             self.slots.truncate(cut);
             self.user_lines.retain(|(_, line)| *line < cut);
             self.math.retain(|placement| placement.line < cut);
+            self.math_pending.retain(|pending| pending.line < cut);
             self.copy.retain(|(line, _)| *line < cut);
             self.keys.truncate(common);
             self.starts.truncate(common);
@@ -628,6 +657,7 @@ impl HistoryCache {
                 &mut self.slots,
                 &mut self.user_lines,
                 &mut self.math,
+                &mut self.math_pending,
                 &mut self.copy,
                 piece,
             );
@@ -638,6 +668,7 @@ impl HistoryCache {
         self.events_rev = events_rev;
         self.subagents_rev = subagents_rev;
         self.folds = folds.clone();
+        self.math_rev = math_rev;
     }
 }
 
@@ -988,6 +1019,7 @@ impl Transcript {
             slots: Vec::new(),
             user_lines: Vec::new(),
             math: Vec::new(),
+            math_pending: Vec::new(),
             copy: Vec::new(),
         }
     }
@@ -1008,6 +1040,10 @@ impl Transcript {
         for mut placement in rendered.images {
             placement.line += base;
             self.math.push(placement);
+        }
+        for mut pending in rendered.pending {
+            pending.line += base;
+            self.math_pending.push(pending);
         }
         for (line, source) in rendered.sources {
             if line < len {
@@ -1098,6 +1134,7 @@ fn push_bubble(
     mut content: Vec<Line<'static>>,
     mut sources: Vec<(usize, String)>,
     mut placements: Vec<math_image::Placement>,
+    mut pending: Vec<math_image::Pending>,
     width: usize,
     theme: Theme,
 ) {
@@ -1173,6 +1210,11 @@ fn push_bubble(
         placement.column = (left + usize::from(placement.column)).min(u16::MAX as usize) as u16;
         out.math.push(placement);
     }
+    pending.retain(|pending| pending.line >= removed);
+    for mut pending in pending {
+        pending.line = base + 1 + pending.line - removed;
+        out.math_pending.push(pending);
+    }
 
     let mut bottom = Vec::new();
     if body_pad > 0 {
@@ -1199,6 +1241,7 @@ fn user_message(
     let (mut content, mut placements) = thumbnail_rows(images, content_width, theme, base);
     let image_lines = content.len();
     let mut sources = Vec::new();
+    let mut math_pending = Vec::new();
     let text = text.trim_end();
     if !text.is_empty() {
         // The bubble supplies its own horizontal padding, so render without
@@ -1223,8 +1266,20 @@ fn user_message(
             placement.line += image_lines;
             placement
         }));
+        math_pending.extend(rendered.pending.into_iter().map(|mut pending| {
+            pending.line += image_lines;
+            pending
+        }));
     }
-    push_bubble(out, content, sources, placements, width, theme);
+    push_bubble(
+        out,
+        content,
+        sources,
+        placements,
+        math_pending,
+        width,
+        theme,
+    );
     out.blank();
 }
 
@@ -1363,6 +1418,10 @@ fn thinking(
             placement.line += base_line;
             out.math.push(placement);
         }
+        for mut pending in rich.pending {
+            pending.line += base_line;
+            out.math_pending.push(pending);
+        }
         for (line, source) in rich.sources {
             out.copy.push((base_line + line, source));
         }
@@ -1418,54 +1477,17 @@ fn is_escaped(bytes: &[u8], index: usize) -> bool {
     backslashes % 2 == 1
 }
 
-/// Replace single-line `$...$` spans with compact ASCII math. Delimiters that
-/// do not look like math (`$PATH`, `$HOME`) stay literal.
-fn expand_inline_math(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut out = String::with_capacity(text.len());
-    let mut index = 0;
-    let mut plain_start = 0;
-    while index < bytes.len() {
-        if bytes[index] != b'$' || is_escaped(bytes, index) {
-            index += 1;
-            continue;
-        }
-        let opening = index;
-        index += 1;
-        if index >= bytes.len() || bytes[index].is_ascii_whitespace() || bytes[index] == b'$' {
-            continue;
-        }
-        let Some(close) = text[index..].find(['$', '\n']).map(|offset| index + offset) else {
-            break;
-        };
-        if bytes[close] == b'\n' || close == opening + 1 || bytes[close - 1].is_ascii_whitespace() {
-            index = close.max(opening + 1);
-            continue;
-        }
-        let source = &text[index..close];
-        if !markdown::looks_like_math(source) {
-            index = close + 1;
-            continue;
-        }
-        out.push_str(&text[plain_start..opening]);
-        out.push_str(&super::math::compact(source));
-        index = close + 1;
-        plain_start = index;
-    }
-    out.push_str(&text[plain_start..]);
-    out
-}
-
 struct Rich {
     lines: Vec<Line<'static>>,
     math: Vec<math_image::Placement>,
+    pending: Vec<math_image::Pending>,
     /// Line -> LaTeX source, so copying a formula in plain tool output or
     /// reasoning still yields the source rather than the ASCII approximation.
     sources: Vec<(usize, String)>,
 }
 
 /// Render plain text (tool output, reasoning) while turning `$$...$$` into a
-/// display-math image or the 2D character layout.
+/// display-math image or the 2D character layout. Inline `$...$` stays literal.
 fn rich_text(
     text: &str,
     width: usize,
@@ -1474,18 +1496,40 @@ fn rich_text(
     style: Style,
     images: bool,
 ) -> Rich {
+    rich_text_inner(
+        text,
+        width,
+        theme,
+        prefix,
+        style,
+        images,
+        math_image::raw_source(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn rich_text_inner(
+    text: &str,
+    width: usize,
+    theme: Theme,
+    prefix: &str,
+    style: Style,
+    images: bool,
+    raw: bool,
+) -> Rich {
     let prefix_width = UnicodeWidthStr::width(prefix);
     let avail = width.saturating_sub(prefix_width).max(1);
     let mut rich = Rich {
         lines: Vec::new(),
         math: Vec::new(),
+        pending: Vec::new(),
         sources: Vec::new(),
     };
+    let color = markdown::math_text_color(theme);
     for segment in math_segments(text) {
         match segment {
             MathSegment::Text(text) => {
-                let expanded = expand_inline_math(text);
-                for line in expanded.lines() {
+                for line in text.lines() {
                     for wrapped in wrap_text(line, avail) {
                         rich.lines.push(Line::from(vec![
                             Span::raw(prefix.to_string()),
@@ -1495,8 +1539,16 @@ fn rich_text(
                 }
             }
             MathSegment::Display(source) => {
-                let image = images
-                    .then(|| math_image::render(source, avail, markdown::math_text_color(theme)));
+                if raw {
+                    for line in markdown::raw_math_lines(source, avail) {
+                        rich.lines.push(Line::from(vec![
+                            Span::raw(prefix.to_string()),
+                            Span::styled(line, style),
+                        ]));
+                    }
+                    continue;
+                }
+                let image = images.then(|| math_image::render(source, avail, color));
                 let start = rich.lines.len();
                 if let Some(Some(image)) = image {
                     let rows = usize::from(image.rows.max(1));
@@ -1512,6 +1564,15 @@ fn rich_text(
                         image,
                     });
                 } else {
+                    if images && math_image::pending(source, avail, color, false) {
+                        rich.pending.push(math_image::Pending {
+                            line: start,
+                            source: source.to_string(),
+                            width: avail,
+                            color,
+                            inline: false,
+                        });
+                    }
                     for line in super::math::display(source, avail, style) {
                         let mut spans = vec![Span::raw(prefix.to_string())];
                         spans.extend(line.spans);
@@ -2188,6 +2249,11 @@ fn push_output(out: &mut Transcript, text: &str, width: usize, theme: Theme, fol
         placement.line += base;
         out.math.push(placement);
     }
+    rich.pending.retain(|pending| pending.line < limit);
+    for mut pending in rich.pending {
+        pending.line += base;
+        out.math_pending.push(pending);
+    }
     for (line, source) in rich.sources {
         if line < limit {
             out.copy.push((base + line, source));
@@ -2407,10 +2473,27 @@ mod tests {
     }
 
     #[test]
-    fn tool_output_expands_display_and_inline_math() {
-        let text = expand_inline_math("cost $x^2$ vs $PATH and $HOME");
-        assert!(!text.contains("$x^2$"), "{text}");
-        assert!(text.contains("x^2") || text.contains('²'), "{text}");
+    fn tool_output_keeps_inline_math_literal() {
+        let rich = rich_text(
+            "cost $x^2$ vs $PATH and $HOME",
+            60,
+            Theme::default(),
+            "",
+            Style::default(),
+            false,
+        );
+        let text = rich
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("$x^2$"), "{text}");
         assert!(text.contains("$PATH"), "{text}");
         assert!(text.contains("$HOME"), "{text}");
     }
@@ -2442,6 +2525,32 @@ mod tests {
     }
 
     #[test]
+    fn raw_math_keeps_display_math_literal() {
+        let rich = rich_text_inner(
+            "before\n$$x = 1$$\nafter",
+            40,
+            Theme::default(),
+            "    ",
+            Style::default(),
+            true,
+            true,
+        );
+        let text = rich
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("$$x = 1$$"), "{text}");
+        assert!(rich.math.is_empty(), "{text}");
+    }
+
+    #[test]
     fn bubble_shifts_math_images_into_the_box() {
         let mut out = Transcript::new();
         let content = vec![Line::from("text"), Line::from(" ")];
@@ -2455,6 +2564,7 @@ mod tests {
             content,
             Vec::new(),
             vec![placement],
+            Vec::new(),
             40,
             Theme::default(),
         );

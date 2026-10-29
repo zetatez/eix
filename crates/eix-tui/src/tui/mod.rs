@@ -6,6 +6,7 @@
 mod app;
 mod controller;
 mod diff;
+pub(crate) mod doctor;
 mod editor;
 mod keys;
 mod markdown;
@@ -96,6 +97,10 @@ pub async fn run(
             outcome = Err(err).context("cannot draw the tui");
             break;
         }
+        // The first frame already showed ASCII fallbacks for every formula, so
+        // the rest can compile in the background without delaying startup.
+        // Later frames only add formulas discovered since the last one.
+        math_image::prewarm();
         if let Some((session_id, before_seq)) = app.take_history_request() {
             let _ = cmd_tx.send(Command::LoadHistory {
                 session_id,

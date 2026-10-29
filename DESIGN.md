@@ -372,20 +372,18 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | 命令 | 行为 |
 |---|---|
 | `/help [query]` | 可搜索帮助（命令 / 快捷键 / notes），可带初始查询 |
-| `/keys [query]` | 只搜索快捷键章节 |
 | `/new [name]` | 新建 session；聚焦 session 有 worktree 时复用它，否则共享其 cwd（不建 worktree） |
 | `/new-pane` | session picker，把已有 session 放进新 pane |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示 |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
 | `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要，生成结果在 transcript 中展示 |
 | `/btw <question>` | 一次性旁支问答，不写事件日志；`btw.delta` / `btw.completed` 通知，`btw.cancel` 中断 |
-| `/cd [path]` | 切换 session cwd（`session.cd`，canonicalize 后校验在 worktree 内） |
+| `/cd [path]` | 切换 session cwd（`session.cd`，canonicalize 后校验在 worktree 内）；输入路径前缀时在输入框上方列出匹配的子目录，`Tab` 补全、`Enter` 切换 |
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
-| `/queue [clear]` | 查看/清空本 session 的待发送队列 |
 | `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
 | `/files` / `/grep` / `/git` | picker；`/files` 插入 `@路径`，`/grep [query]` 搜索内容并插入 `@路径:行号`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
-| `/processes` / `/approvals` / `/attention` | 进程 / 审批收件箱 / 下一个 attention |
-| `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览） |
+| `/processes` / `/approvals` | 进程 / 审批收件箱 |
+| `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览；`/mcp` 中 `Space` 启用/停用 server） |
 | `/cancel` | 取消运行 |
 | `/perm` | picker 搜索并选择 `plan` / `build` / `auto` / `full`；也可直接带 mode；与 `Space m` 相同；旧名 `/mode` 仍可用 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
@@ -478,7 +476,8 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     `<Space>f`（files）、`<Space>s`（grep，文件内容）、`<Space>i`（subagents，实时活动）、`Ctrl-P`（commands，命令面板；转录区与输入框
     normal 模式都可用）、`<Space>G`（git，统一列出 worktrees 和 branches；没有 linked worktree 时
     省略仓库主路径）、prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
-  - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`grep`
+  - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`images`
+    （按 png/jpg/jpeg/gif/webp 过滤的 workspace 图片，默认最多 5000 行）、`grep`
     （大小写不敏感的字面量内容搜索，返回 `path:line`，跳过二进制/派生目录/4 MiB 以上文件）、`git`
     （worktrees + branches，worktree 行在前，detail 标注 `worktree` / `branch`）、`worktrees`
     （`git worktree list --porcelain`）、`branches`（`git branch`）、`context`（值为 entry id）。
@@ -811,7 +810,7 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - `process.list|output|kill`
 - `model.list {null}`（配置模型 + 自动目录 + `warnings` + `default_model` + `providers`）
 - `model.use {model?}`（`null` / 空 / `default` 恢复配置默认；返回生效的模型）
-- `picker.query {kind, session_id?, query?, limit?}`（provider：`files` / `grep` / `git` / `worktrees` / `branches` / `context`；
+- `picker.query {kind, session_id?, query?, limit?}`（provider：`files` / `images` / `grep` / `git` / `worktrees` / `branches` / `context`；
   返回 `{value, label, detail?, preview?}` 行；`grep` 的 value 是 `path:line`；`context` 的 value 是 entry id）
 - `picker.preview {kind, session_id?, value, limit?}`（`files` 读取 workspace 文件内容；`sessions` 读取目标
   session 的最近对话事件；返回 `{kind, value, text}`，供 picker 右侧懒加载）
@@ -1144,7 +1143,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 每秒检查、仅在 session 空闲时提交（loop 先推进 `next_at`，once 先删除，避免失败后反复
 > 重试）。TUI 对应 `/rewind`（`/undo` 别名）、`/redo`、`/context`、`/effort`、`/branch`、
 > `/rename`、`/diff`、`/doctor`、`/goal`、`/loop`、`/schedule`、`/timeline`、`/archive`、
-> `/delete`（两次确认）、`/todos`，队列支持 `rm N` / `move N M`；JSON 导出/导入仅保留 CLI
+> `/delete`（立即删除）、`/todos`；JSON 导出/导入仅保留 CLI
 > 的 `eix export` / `eix import`。
 >
 > Skills：`eix-core/src/skills.rs` 始终加载内置 `frontend` / `engineering` / `review` 和原生
@@ -1338,7 +1337,6 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | 命令 | 行为 |
 | --- | --- |
 | `/help [query]` | 打开可搜索帮助（命令、快捷键、notes）；可带初始查询 |
-| `/keys [query]` | 只打开快捷键章节，同样支持即时搜索和上下选择 |
 | `/new [name]` | 新建 session：当前 session 有 worktree 时复用它，否则共享当前工作区（不建 worktree） |
 | `/new-pane` | 打开 session picker，把已有 session 放进新 pane |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示，不重复创建 |
@@ -1347,36 +1345,35 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/clear` | 清空模型上下文（更早的 turn 仍留在转录和事件日志里，只是不再发给模型） |
 | `/compact [notes]` | 让模型总结当前上下文，用摘要替换历史；生成的 summary 会显示在对话中，`notes` 直接作为摘要文本 |
 | `/btw <question>` | 用一次性上下文回答旁支问题；不写入事件日志，也不进入主对话；`Esc` 关闭 |
-| `/cd [path]` | 切换当前 session 的 cwd（支持 `~` 和相对路径）；省略时显示当前路径 |
+| `/cd [path]` | 切换当前 session 的 cwd（支持 `~` 和相对路径）；输入路径前缀时列出匹配的子目录，`Tab` 补全、`Enter` 切换；省略时显示当前路径 |
 | `/init` | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送 |
-| `/queue [clear]` | 查看队列；`clear` 清空，`rm N` 删除第 N 条，`move N M` 调整顺序 |
 | `/sessions` | 打开 session picker |
 | `/files` | 文件 picker，选中后插入 `@path` |
 | `/grep [query]` | 内容 picker：搜索 workspace 文件内容，选中后插入 `@path:line`；可直接带初始查询 |
 | `/git` | git picker：worktrees + branches，选中后插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
 | `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
-| `/attention` / `/cancel` | 跳到下一个需要 attention 的 pane / 取消运行 |
+| `/cancel` | 取消运行 |
 | `/model [id]` | 打开可搜索的模型 picker：合并默认 provider 的 model、所有 `providers.*` 自动拉取的 `/models` 和 `models:`（含变体行）；直接 `/model provider/model#variant` 可固定到某个模型 |
 | `/model-plan [id]` | 为当前 session 固定 Plan 模式模型（同样支持 picker 与 `id#variant`）；`default` 清除，回退到 `model_roles.plan` 或 `/model` |
 | `/agents [name]` | 选择当前 session 的 primary agent；`build` / `plan` 是内置的 |
 | `/subagents [n|limit]` | 有子 agent 时打开实时 picker（搜索 child，右侧预览事件/工具调用/流式 thinking 与 answer，`Enter` 在新 pane 打开）；`limit` 或 `<n>` 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 32，可选 2/4/8/16/32/64/128/256，仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
-| `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误） |
+| `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误；`Space` 在启用/停用之间切换并写回配置） |
 | `/reload` | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC），并重新加载自定义 Markdown 命令 |
 | `/colorscheme` | 打开 colorscheme picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原配色 |
-| `/skills [name] [args]` | 打开 skill picker（右侧预览正文）；带名字时把正文放进输入框并展开 `$ARGUMENTS` / `$1..$9` |
+| `/skills [name] [args]` | 打开 skill picker（右侧预览正文）；选中后插入 `@name`；带名字时插入 `@name`，额外参数附在后面 |
 | `/todos` | 打开任务列表 picker（搜索任务，显示状态和详情；内存态，daemon 重启后清空） |
-| `/image <path>` | 把图片挂到下一条 prompt（png / jpg / gif / webp，最多 4 张、每张 8 MB）；不带参数时显示已挂图片，`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI |
+| `/image [path|clear]` | 不带参数时打开可搜索的图片 picker（png / jpg / jpeg / gif / webp），`Enter` 把图片挂到下一条 prompt 并插入 `@路径`；带路径直接挂载（最多 4 张、每张 8 MB），`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI |
 | `/timeline` | 当前 session 用户输入历史，按时间倒序；带时间戳、搜索和完整预览，`Ctrl-J/K` 或 `Ctrl-N/P` 选择，`Enter` 跳到对应消息位置（`Space h` 同效） |
 | `/archive` | 归档当前 session（从 picker/列表隐藏，事件保留） |
-| `/delete` | 删除当前 session；需要连续执行两次确认 |
+| `/delete` | 立即删除当前 session（不再二次确认） |
 | `/rewind [n\|both\|chat\|files]` | 回滚到第 n 个 user turn（从最新倒数）或 `e<seq>`：`both` 隐藏对话并回滚工作区文件，`chat` 只隐藏对话，`files` 只恢复文件；不带参数打开 checkpoint picker，选中后再选范围。`/undo` 是兼容别名 |
 | `/redo` | 恢复最近一次 rewind 隐藏的对话和/或文件 |
 | `/context [all]` | 在 overlay 中显示 token 总量/预算、各 sector 占用和自动裁剪数；`all` 附带逐条 entry |
-| `/effort [low\|medium\|high]` | 设置当前 session 的 reasoning effort；不带参数显示当前值 |
+| `/effort [low\|medium\|high]` | 不带参数打开 low/medium/high picker 并预选当前档位；带参数直接设置当前 session 的 reasoning effort |
 | `/branch [name]` | 分叉当前 session 并把当前 pane 切到新分支（原 session 保留在 picker） |
 | `/rename <name>` | 重命名当前 session |
-| `/diff [staged]` | 在可滚动 overlay 中查看 `git diff HEAD`；`staged` 只比较 index 与 HEAD；untracked 文件与截断会给出提示 |
-| `/doctor` | 在 overlay 中显示 daemon socket / data / config、模型、沙箱、snapshot、规则和 session 数 |
+| `/diff [staged]` | 打开 changed-files picker：搜索文件，右侧预览该文件的 diff，`Enter` 在可滚动 overlay 中打开；`staged` 只比较 index 与 HEAD；untracked 文件与截断以 notes 行提示 |
+| `/doctor` | 在 overlay 中显示 daemon socket / data / config、模型、沙箱、snapshot、规则和 session 数；按 paths / runtime / model / tools / context 分区并对齐，与 `eix doctor` 共用渲染 |
 | `/goal [text\|done\|reopen\|clear]` | 设置一个跨轮持久化并注入上下文的 goal；`done` 后不再注入 |
 | `/loop <interval> <prompt>` | session 空闲时按间隔重复 prompt（`30s` / `10m` / `1h30m`）；`/loop stop` 清除 |
 | `/schedule <+duration\|HH:MM> <prompt>` | 在指定时间运行一次 prompt；`/schedule stop [id]` 清除 |
@@ -1384,7 +1381,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/security-review [focus]` | 内置 prompt：按注入、路径、secret、SSRF、授权等维度审计当前 diff |
 | `/simplify [scope]` | 内置 prompt：在不改变行为的前提下精简改动 |
 | `/verify [scope]` | 内置 prompt：跑格式化、构建、测试并实际验证改动，要求给出证据 |
-| `/fork [name]` | fork 当前 session（默认共享工作区；`worktree.auto = true` 时自动建 worktree） |
+| `/fork [name]` | 不带参数打开用户消息 picker，选中后 fork 到该消息之前（末行可选整段对话）；带名字时 fork 当前 session（默认共享工作区；`worktree.auto = true` 时自动建 worktree） |
 | `/perm` | 弹窗搜索并选择执行模式：`plan` / `build` / `auto` / `full`；也可直接 `/perm <mode>`；`Space m` 打开同一 picker；旧名 `/mode` 仍可用 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
@@ -1681,8 +1678,8 @@ skill；用户或项目里的同名 skill 会覆盖它们。frontmatter 支持 `
 `allowed-tools` 用逗号或空格分隔，支持 `*` / `?` 通配；加载该 skill 后，本 turn 内只允许
 这些工具（多个 skill 的允许列表取并集，`use_skill` 自身始终可用）。Claude 风格的工具名
 （`Read`、`Write`、`Edit`、`Bash`、`Grep`、`Glob`、`Task` 等）会映射到 eix 的对应工具。
-限制在下一轮 user prompt 时清空。TUI 里 `/skills` 打开带正文预览的 picker，
-`/skills <name> [args]` 直接把展开后的正文放进输入框。
+限制在下一轮 user prompt 时清空。TUI 里 `/skills` 打开带正文预览的 picker，选中后插入
+`@skill-name`（不再展开正文）；`/skills <name> [args]` 同样插入 `@name` 和额外参数。
 
 #### 自定义命令与 agent
 
@@ -1791,7 +1788,8 @@ resource 只报告 MIME 和大小，不会把 base64 塞进上下文。server �
 `notifications/{tools,resources,prompts}/list_changed` 会标记缓存失效，下一次 turn 或
 `/mcp` 时重新读取。每个 server 可用 `allowed_tools` / `denied_tools` 过滤工具（`*` 和 `?`
 通配，deny 优先；allowed 为空表示全部）；被过滤的工具既不出现在模型工具表里，也无法调用。
-`/mcp` 显示 server 状态、工具/资源/prompt 数量和错误。
+`/mcp` 显示 server 状态、工具/资源/prompt 数量和错误；`Space` 调用 `mcp.set_enabled`
+启用或停用选中的 server，写入 `enabled` 并清空连接缓存，下一次 turn 或列表刷新时重新加载。
 
 #### 插件（out-of-process）
 

@@ -4,9 +4,12 @@
 //! `ratatui` lines instead of showing raw `**`, backticks and `[](...)`. The
 //! renderer deliberately stays terminal-friendly: links show their target,
 //! local images become thumbnails when the terminal speaks Kitty, Sixel or
-//! iTerm2 (and a labelled placeholder otherwise), and inline math is shown in
-//! a compact ASCII form. Display math uses a character-grid layout, or a real
-//! LaTeX image when a graphics protocol is available.
+//! iTerm2 (and a labelled placeholder otherwise). Math uses a real LaTeX
+//! image when a graphics protocol is available: display math on its own
+//! block, inline math scaled to a single text row. When no image can be
+//! drawn, display math falls back to the character-grid layout and inline
+//! math to its literal `$...$` source; with math turned off both stay as the
+//! literal TeX the message contained.
 //!
 //! It intentionally only covers the constructs that make a chat transcript
 //! readable: headings, emphasis, inline/fenced code, lists, quotes, rules,
@@ -19,6 +22,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+use super::app::wrap_text;
 use super::math;
 use super::math_image;
 use super::syntax::{light_background, CodeHighlighter};
@@ -57,6 +61,8 @@ pub(crate) fn render_with_indent(
 pub(crate) struct Rendered {
     pub lines: Vec<Line<'static>>,
     pub images: Vec<math_image::Placement>,
+    /// Display math that needed a background render when the layout was built.
+    pub pending: Vec<math_image::Pending>,
     /// `(line index, LaTeX source)`.
     pub sources: Vec<(usize, String)>,
 }
@@ -73,15 +79,17 @@ pub(crate) fn render_with_indent_detailed(
     base: Option<&Path>,
 ) -> Rendered {
     let mut renderer = Renderer::new(width, theme, indent, images, base);
-    let options = Options::ENABLE_TABLES
-        | Options::ENABLE_STRIKETHROUGH
-        | Options::ENABLE_TASKLISTS
-        | Options::ENABLE_MATH
-        | Options::ENABLE_FOOTNOTES;
-    for event in Parser::new_ext(text, options) {
-        renderer.event(event);
-    }
+    renderer.run(text);
     renderer.finish()
+}
+
+/// Render with math forced to literal TeX, matching `/math off`.
+#[cfg(test)]
+fn render_raw(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
+    let mut renderer = Renderer::new(width, theme, "  ", true, None);
+    renderer.raw = true;
+    renderer.run(text);
+    renderer.finish().lines
 }
 
 struct Renderer {
@@ -89,12 +97,18 @@ struct Renderer {
     theme: Theme,
     indent: String,
     images: bool,
+    /// Keep formulas as literal TeX instead of an image or the 2D grid.
+    raw: bool,
     /// Session cwd for relative image paths.
     base: Option<PathBuf>,
     lines: Vec<Line<'static>>,
     placements: Vec<math_image::Placement>,
+    pending: Vec<math_image::Pending>,
     sources: Vec<(usize, String)>,
     inline: Vec<Span<'static>>,
+    /// Inline math images in source order. `flush` resolves each marker in the
+    /// wrapped lines to its final line and column.
+    inline_slots: Vec<math_image::MathImage>,
     style: Style,
     style_stack: Vec<Style>,
     quote: usize,
@@ -117,6 +131,9 @@ struct ItemState {
     marker: String,
     first: bool,
 }
+
+/// Zero-width prefix that makes an inline-image span atomic while wrapping.
+const INLINE_IMAGE_MARK: char = '\u{200B}';
 
 struct CodeState {
     buffer: String,
@@ -147,11 +164,14 @@ impl Renderer {
             theme,
             indent: indent.to_string(),
             images,
+            raw: math_image::raw_source(),
             base: base.map(PathBuf::from),
             lines: Vec::new(),
             placements: Vec::new(),
+            pending: Vec::new(),
             sources: Vec::new(),
             inline: Vec::new(),
+            inline_slots: Vec::new(),
             style: Style::default(),
             style_stack: Vec::new(),
             quote: 0,
@@ -167,6 +187,17 @@ impl Renderer {
         renderer
     }
 
+    fn run(&mut self, text: &str) {
+        let options = Options::ENABLE_TABLES
+            | Options::ENABLE_STRIKETHROUGH
+            | Options::ENABLE_TASKLISTS
+            | Options::ENABLE_MATH
+            | Options::ENABLE_FOOTNOTES;
+        for event in Parser::new_ext(text, options) {
+            self.event(event);
+        }
+    }
+
     fn event(&mut self, event: Event<'_>) {
         match event {
             Event::Start(tag) => self.start(tag),
@@ -178,17 +209,7 @@ impl Renderer {
                 self.capture(&text);
             }
             Event::InlineMath(text) => {
-                // `$PATH and $HOME` in a shell snippet parses as math. Treat a
-                // span without any math syntax (and longer than one letter) as
-                // a literal dollar-quoted word instead of mangling it.
-                if looks_like_math(&text) {
-                    let style = Style::default()
-                        .fg(accent(self.theme))
-                        .add_modifier(Modifier::ITALIC);
-                    self.append_styled(&math::compact(&text), style);
-                } else {
-                    self.append_styled(&format!("${text}$"), self.style);
-                }
+                self.inline_math(&text);
                 self.capture(&text);
             }
             Event::DisplayMath(text) => self.display_math(&text),
@@ -588,14 +609,46 @@ impl Renderer {
         let avail = self.width.saturating_sub(prefix_width).max(1);
         let wrapped = wrap_spans(&self.inline, avail);
         self.inline.clear();
+        let mut slots = std::mem::take(&mut self.inline_slots).into_iter();
         for (index, spans) in wrapped.into_iter().enumerate() {
+            let line_no = self.lines.len();
             let prefix = if index == 0 {
                 first_prefix.clone()
             } else {
                 cont_prefix.clone()
             };
+            let mut column = Self::prefix_width(&prefix);
             let mut line = prefix;
-            line.extend(spans);
+            for span in spans {
+                let mut rest = span.content.as_ref();
+                while let Some(pos) = rest.find(INLINE_IMAGE_MARK) {
+                    let before = &rest[..pos];
+                    if !before.is_empty() {
+                        line.push(Span::styled(before.to_string(), span.style));
+                        column += UnicodeWidthStr::width(before);
+                    }
+                    rest = &rest[pos + INLINE_IMAGE_MARK.len_utf8()..];
+                    let Some(image) = slots.next() else {
+                        continue;
+                    };
+                    let cols = usize::from(image.cols.max(1));
+                    self.placements.push(math_image::Placement {
+                        line: line_no,
+                        column: column.min(u16::MAX as usize) as u16,
+                        image,
+                    });
+                    line.push(Span::raw(" ".repeat(cols)));
+                    column += cols;
+                    // The marker is followed by exactly `cols` spaces that
+                    // reserve the image's cells. They have just been emitted,
+                    // so skip them instead of printing them a second time.
+                    rest = skip_placeholder(rest, cols);
+                }
+                if !rest.is_empty() {
+                    line.push(Span::styled(rest.to_string(), span.style));
+                    column += UnicodeWidthStr::width(rest);
+                }
+            }
             self.lines.push(Line::from(line));
         }
         if let Some(item) = self.items.last_mut() {
@@ -694,9 +747,26 @@ impl Renderer {
         let prefix_width = Self::prefix_width(&first_prefix);
         let avail = self.width.saturating_sub(prefix_width).max(1);
         let start = self.lines.len();
+        let color = math_text_color(self.theme);
+        if self.raw {
+            for (index, line) in raw_math_lines(source, avail).into_iter().enumerate() {
+                let mut spans = if index == 0 {
+                    first_prefix.clone()
+                } else {
+                    cont_prefix.clone()
+                };
+                spans.push(Span::styled(line, self.style));
+                self.lines.push(Line::from(spans));
+            }
+            if let Some(item) = self.items.last_mut() {
+                item.first = false;
+            }
+            self.ensure_blank();
+            return;
+        }
         let image = self
             .images
-            .then(|| math_image::render(source, avail, math_text_color(self.theme)));
+            .then(|| math_image::render(source, avail, color));
         if let Some(Some(image)) = image {
             // Reserve the cells the terminal protocol paints over. The
             // placeholder keeps a non-zero width so block spacing and
@@ -725,6 +795,15 @@ impl Renderer {
                 self.sources.push((index, source.to_string()));
             }
         } else {
+            if self.images && math_image::pending(source, avail, color, false) {
+                self.pending.push(math_image::Pending {
+                    line: start,
+                    source: source.to_string(),
+                    width: avail,
+                    color,
+                    inline: false,
+                });
+            }
             let style = Style::default()
                 .fg(accent(self.theme))
                 .add_modifier(Modifier::BOLD);
@@ -747,6 +826,49 @@ impl Renderer {
             item.first = false;
         }
         self.ensure_blank();
+    }
+
+    /// Inline math becomes a single-row image when the terminal can paint one;
+    /// otherwise it stays as the literal `$...$` Markdown source.
+    fn inline_math(&mut self, source: &str) {
+        if self.cell.is_some() {
+            self.append_styled(&format!("${source}$"), self.style);
+            return;
+        }
+        let color = math_text_color(self.theme);
+        let width = self.inline_avail();
+        if self.images && !self.raw {
+            if let Some(image) = math_image::render_inline(source, width, color) {
+                let cols = usize::from(image.cols.max(1));
+                if image.rows == 1 && cols <= width {
+                    let mut content = String::with_capacity(cols + 1);
+                    content.push(INLINE_IMAGE_MARK);
+                    content.push_str(&" ".repeat(cols));
+                    self.inline.push(Span::styled(content, self.style));
+                    self.inline_slots.push(image);
+                    return;
+                }
+            } else if math_image::pending(source, width, color, true) {
+                self.pending.push(math_image::Pending {
+                    // The paragraph has not been flushed yet, so this is its
+                    // first line; close enough for viewport scheduling.
+                    line: self.lines.len(),
+                    source: source.to_string(),
+                    width,
+                    color,
+                    inline: true,
+                });
+            }
+        }
+        self.append_styled(&format!("${source}$"), self.style);
+    }
+
+    /// Width available to a paragraph after its list/quote/heading prefix.
+    fn inline_avail(&self) -> usize {
+        let first = self.prefix_spans(true);
+        let cont = self.prefix_spans(false);
+        let prefix = Self::prefix_width(&first).max(Self::prefix_width(&cont));
+        self.width.saturating_sub(prefix).max(1)
     }
 
     // ----- fenced code ----------------------------------------------------
@@ -955,10 +1077,12 @@ impl Renderer {
         }
         self.lines.truncate(len);
         self.placements.retain(|placement| placement.line < len);
+        self.pending.retain(|pending| pending.line < len);
         self.sources.retain(|(line, _)| *line < len);
         Rendered {
             lines: self.lines,
             images: self.placements,
+            pending: self.pending,
             sources: self.sources,
         }
     }
@@ -1017,6 +1141,13 @@ fn wrap_code_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'stati
     lines.into_iter().map(chars_to_spans).collect()
 }
 
+/// Drop the `cols` placeholder spaces that follow an inline-image marker.
+fn skip_placeholder(rest: &str, cols: usize) -> &str {
+    rest.char_indices()
+        .nth(cols)
+        .map_or("", |(index, _)| &rest[index..])
+}
+
 /// Wrap styled spans, preferring breaks at spaces while preserving styles.
 fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> {
     let width = width.max(1);
@@ -1025,6 +1156,20 @@ fn wrap_spans(spans: &[Span<'static>], width: usize) -> Vec<Vec<Span<'static>>> 
     let mut current_width = 0usize;
 
     for span in spans {
+        if span.content.starts_with(INLINE_IMAGE_MARK) {
+            // The placeholder must stay on one line: splitting it would leave
+            // half an image at the end of the previous row.
+            let span_width = UnicodeWidthStr::width(span.content.as_ref());
+            if current_width > 0 && current_width + span_width > width {
+                lines.push(std::mem::take(&mut current));
+                current_width = 0;
+            }
+            for ch in span.content.chars() {
+                current.push((ch, span.style));
+            }
+            current_width += span_width;
+            continue;
+        }
         for ch in span.content.chars() {
             if ch == '\n' {
                 lines.push(std::mem::take(&mut current));
@@ -1129,6 +1274,12 @@ fn accent(theme: Theme) -> Color {
     theme.function.unwrap_or(ACCENT)
 }
 
+/// Literal TeX lines for display math when math rendering is off. The
+/// delimiters stay so the source round-trips exactly when copied.
+pub(crate) fn raw_math_lines(source: &str, width: usize) -> Vec<String> {
+    wrap_text(&format!("$${}$$", source.trim()), width)
+}
+
 /// Text colour for a LaTeX image. The image is painted over the terminal
 /// background, so a transparent theme needs an explicit foreground rather
 /// than `Reset`.
@@ -1159,41 +1310,7 @@ fn dim(theme: Theme) -> Style {
 
 // ----- TeX to Unicode -----------------------------------------------------
 
-/// A pragmatic TeX-to-Unicode conversion for terminal display. It handles the
-/// math people actually put in chat answers (fractions, roots, scripts, Greek
-/// letters and common operators) and leaves anything else readable as text.
-/// Decide whether an inline `$...$` span is real math rather than shell syntax.
-pub(super) fn looks_like_math(source: &str) -> bool {
-    let trimmed = source.trim();
-    if trimmed.chars().count() == 1 && trimmed.chars().all(char::is_alphabetic) {
-        return true;
-    }
-    trimmed.chars().any(|ch| {
-        matches!(
-            ch,
-            '\\' | '^'
-                | '_'
-                | '{'
-                | '}'
-                | '['
-                | ']'
-                | '('
-                | ')'
-                | '='
-                | '<'
-                | '>'
-                | '+'
-                | '-'
-                | '*'
-                | '/'
-                | '|'
-                | '!'
-                | ','
-                | '\''
-        ) || ch.is_ascii_digit()
-    })
-}
-
+/// Map ASCII set letters (`R`, `N`, ...) to their blackboard-bold forms.
 pub(super) fn blackboard(text: &str) -> String {
     text.chars()
         .map(|ch| match ch {
@@ -1572,9 +1689,8 @@ mod tests {
             Theme::default(),
         ));
         assert!(output.contains("Inline"), "{output}");
-        assert!(output.contains("x^2 + y_1"), "{output}");
-        assert!(!output.contains('²'), "{output}");
-        assert!(!output.contains('₁'), "{output}");
+        // Inline math keeps its Markdown source unchanged.
+        assert!(output.contains("$x^2 + y_1$"), "{output}");
         assert!(output.contains("a + b"));
         assert!(output.contains("───────"));
         assert!(output.contains("≤"));
@@ -1583,20 +1699,49 @@ mod tests {
     }
 
     #[test]
-    fn inline_scripts_stay_on_one_line() {
+    fn inline_math_stays_on_one_line() {
         let rendered = render("before $x^2$ after", 80, Theme::default());
         let output = text(&rendered);
-        assert!(!output.contains('²'), "{output}");
         assert_eq!(output.lines().count(), 1, "{output}");
-        assert!(output.contains("before x^2 after"), "{output}");
+        assert!(output.contains("before $x^2$ after"), "{output}");
     }
 
     #[test]
-    fn inline_fraction_stays_on_one_line() {
+    fn inline_math_is_not_flattened() {
         let rendered = render("value $\\frac{a+b}{c}$ end", 80, Theme::default());
         let output = text(&rendered);
         assert_eq!(output.lines().count(), 1, "{output}");
-        assert!(output.contains("value (a+b)/c end"), "{output}");
+        assert!(output.contains("value $\\frac{a+b}{c}$ end"), "{output}");
+    }
+
+    #[test]
+    fn math_off_renders_display_math_as_tex() {
+        let output = text(&render_raw(
+            "before\n\n$$\nx^a+y^b=z^c\n$$\n\nafter",
+            60,
+            Theme::default(),
+        ));
+        assert!(output.contains("$$x^a+y^b=z^c$$"), "{output}");
+        assert!(output.contains("before"), "{output}");
+        assert!(output.contains("after"), "{output}");
+    }
+
+    #[test]
+    fn math_off_keeps_display_math_literal() {
+        assert_eq!(raw_math_lines(r"x^a+y^b=z^c", 80), vec![r"$$x^a+y^b=z^c$$"]);
+        let wrapped = raw_math_lines(&"x+y".repeat(10), 12);
+        assert!(wrapped.iter().all(|line| line.width() <= 12), "{wrapped:?}");
+        assert_eq!(wrapped.concat(), format!("$${}$$", "x+y".repeat(10)));
+    }
+
+    #[test]
+    fn inline_image_marker_spaces_are_skipped_once() {
+        let rest = " ".repeat(4);
+        assert_eq!(skip_placeholder(&rest, 4), "");
+        assert_eq!(skip_placeholder("    next", 4), "next");
+        // A short remainder (for example a clipped placeholder) is consumed
+        // whole rather than panicking.
+        assert_eq!(skip_placeholder("  ", 4), "");
     }
 
     #[test]
@@ -1650,8 +1795,8 @@ mod tests {
             Theme::default(),
         ));
         assert!(output.contains("$PATH and $HOME"));
-        assert!(output.contains("x"));
-        assert!(output.contains("E = mc^2"), "{output}");
+        assert!(output.contains("$x$"), "{output}");
+        assert!(output.contains("$E = mc^2$"), "{output}");
         assert!(!output.contains('²'), "{output}");
     }
 
@@ -1693,22 +1838,6 @@ mod tests {
                 assert!(output.contains(needle), "{formula}\n{output}");
             }
         }
-    }
-
-    #[test]
-    fn compact_math_handles_common_constructs() {
-        assert_eq!(math::compact("x^2 + y_1"), "x^2 + y_1");
-        assert_eq!(math::compact("\\alpha + \\beta"), "α + β");
-        assert_eq!(math::compact("\\frac{1}{2}"), "1/2");
-        assert_eq!(math::compact("\\sqrt{x^2+y^2}"), "√(x^2+y^2)");
-        assert_eq!(math::compact("\\mathbb{R}^n"), "ℝ^n");
-    }
-
-    #[test]
-    fn compact_math_supports_indexed_roots() {
-        assert_eq!(math::compact("\\sqrt[3]{x}"), "3√x");
-        assert_eq!(math::compact("\\sqrt[4]{x^2}"), "4√x^2");
-        assert_eq!(math::compact("\\sqrt[n]{x}"), "n√x");
     }
 
     #[test]

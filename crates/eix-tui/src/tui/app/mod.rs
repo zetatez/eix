@@ -34,6 +34,7 @@ use super::controller::{Command, Event};
 use super::diff::DiffRow;
 use super::editor::{Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
+use super::math_image;
 use super::theme::Theme;
 use super::transcript::{self, FoldId, Subagent, SubagentStatus};
 use super::workspace::{ActiveWorkspace, WorkspaceLayout};
@@ -169,7 +170,6 @@ fn command_alias(name: &str) -> Option<&'static str> {
 fn builtin_commands() -> Vec<CommandSpec> {
     vec![
         builtin("help", "[query]", "search the key and command reference"),
-        builtin("keys", "[query]", "search just the key map"),
         builtin(
             "new",
             "[name]",
@@ -200,9 +200,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("processes", "", "list and inspect background processes"),
         builtin("approvals", "", "open the approval inbox"),
-        builtin("attention", "", "jump to the next pane needing attention"),
         builtin("cancel", "", "cancel the focused session's running turn"),
-        builtin("clear", "", "forget this conversation's context"),
+        builtin("clear", "", "delete this session's history, context and memory"),
         builtin(
             "compact",
             "[notes]",
@@ -213,13 +212,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "<question>",
             "ask a one-off question without touching history",
         ),
-        builtin("cd", "[path]", "change this session's working directory"),
+        builtin("cd", "[path]", "change the session cwd, with directory completion"),
         builtin("init", "", "draft an AGENTS.md for this workspace"),
-        builtin(
-            "queue",
-            "[clear]",
-            "show or clear prompts waiting for the session",
-        ),
         builtin("sessions", "", "open the session picker"),
         builtin(
             "model",
@@ -237,7 +231,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "[n|limit]",
             "monitor live sub-agents or set the max parallel spawn_agent calls",
         ),
-        builtin("mcp", "", "browse MCP servers and their tools"),
+        builtin(
+            "mcp",
+            "",
+            "browse MCP servers; Space toggles the highlighted one on or off",
+        ),
         builtin(
             "plugins",
             "[name|logs|doctor|start|stop|restart|enable|disable|uninstall|set|open|action|act|pick]",
@@ -255,7 +253,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "search this session's user input history and jump",
         ),
         builtin("archive", "", "hide this session from the picker"),
-        builtin("delete", "", "delete this session (run twice to confirm)"),
+        builtin("delete", "", "delete the focused session immediately"),
         builtin(
             "rewind",
             "[n|chat|files]",
@@ -274,13 +272,13 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin(
             "effort",
             "[low|medium|high]",
-            "set the reasoning effort for this session",
+            "set reasoning effort; empty opens a picker",
         ),
         builtin("rename", "<name>", "rename this session"),
         builtin(
             "diff",
             "[staged]",
-            "review the workspace diff in a scrollable overlay",
+            "browse changed files with per-file diff previews",
         ),
         builtin("doctor", "", "show daemon and config diagnostics"),
         builtin(
@@ -325,17 +323,25 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin(
             "skills",
             "[name] [args]",
-            "browse skills with a preview, or insert one",
+            "browse skills; Enter inserts @name instead of the body",
         ),
         builtin("todos", "", "browse the model's task list"),
-        builtin("image", "<path>", "attach an image to the next prompt"),
+        builtin(
+            "image",
+            "[path|clear]",
+            "search images to attach, or attach a path directly",
+        ),
         builtin("colorscheme", "", "choose a colorscheme with live preview"),
         builtin(
             "perm",
             "[plan|build|auto|full]",
             "choose the session permission mode in a search picker",
         ),
-        builtin("fork", "[name]", "fork this session into a new pane"),
+        builtin(
+            "fork",
+            "[name]",
+            "fork this session; empty opens a picker to fork before a user message",
+        ),
         builtin(
             "branch",
             "[name]",
@@ -541,6 +547,8 @@ struct TailKey {
     /// Waiting dots advance with the 200 ms tick and only matter while the
     /// model has produced nothing yet.
     dots: Option<&'static str>,
+    /// Bumped when a tail formula became drawable.
+    math_rev: u64,
 }
 
 struct SessionView {
@@ -552,6 +560,10 @@ struct SessionView {
     subagents: HashMap<String, Subagent>,
     /// Bumped whenever a child agent's state changes.
     subagents_rev: u64,
+    /// Bumped when a display-math image in the history became drawable.
+    math_rev: u64,
+    /// Same as `math_rev`, but for the live tail.
+    tail_math_rev: u64,
     history_cache: Option<transcript::HistoryCache>,
     /// Cached live tail (streaming text, reasoning and queued prompts).
     tail: transcript::Transcript,
@@ -602,6 +614,8 @@ impl SessionView {
             events_rev: 0,
             subagents: HashMap::new(),
             subagents_rev: 0,
+            math_rev: 0,
+            tail_math_rev: 0,
             history_cache: None,
             tail: transcript::Transcript::new(),
             tail_key: None,
@@ -624,6 +638,37 @@ impl SessionView {
         }
     }
 
+    /// Drop everything `/clear` removes: stored events, subagent cards, render
+    /// caches, streaming tail, folds, selection and scroll position. The
+    /// session metadata itself is kept.
+    fn reset(&mut self) {
+        self.events.clear();
+        self.events_rev = self.events_rev.wrapping_add(1);
+        self.subagents.clear();
+        self.subagents_rev = self.subagents_rev.wrapping_add(1);
+        self.math_rev = self.math_rev.wrapping_add(1);
+        self.tail_math_rev = self.tail_math_rev.wrapping_add(1);
+        self.history_cache = None;
+        self.tail = transcript::Transcript::new();
+        self.tail_key = None;
+        self.line_count = 0;
+        self.text_lines_valid = false;
+        self.history_has_more = false;
+        self.history_loading = false;
+        self.history_armed = true;
+        self.history_anchor = None;
+        self.stream = None;
+        self.scroll = 0;
+        self.follow = true;
+        self.folds.clear();
+        self.slots.clear();
+        self.text_lines.clear();
+        self.copy_overrides.clear();
+        self.user_lines.clear();
+        self.selection = None;
+        self.unread = false;
+    }
+
     /// Rebuild the cached history when its inputs changed. The cache compares
     /// per-block identities, so a new event or a single fold toggle only
     /// re-renders the blocks it actually touched.
@@ -636,6 +681,7 @@ impl SessionView {
                 self.subagents_rev,
                 &self.folds,
                 Some(self.session.cwd.as_path()),
+                self.math_rev,
             )
         });
         if !stale {
@@ -653,6 +699,7 @@ impl SessionView {
             self.subagents_rev,
             self.events_rev,
             Some(self.session.cwd.as_path()),
+            self.math_rev,
         );
         self.slots = cache.slots.clone();
         self.user_lines = cache.user_lines.clone();
@@ -701,6 +748,7 @@ impl SessionView {
                 && key.reasoning_open == reasoning_open
                 && key.dots == dots
                 && key.queued.as_slice() == queued
+                && key.math_rev == self.tail_math_rev
             {
                 return;
             }
@@ -728,8 +776,80 @@ impl SessionView {
             reasoning_open,
             queued: queued.to_vec(),
             dots,
+            math_rev: self.tail_math_rev,
         });
         self.text_lines_valid = false;
+    }
+
+    /// Queue the pending formulas that intersect the visible line range. The
+    /// viewport is known only after layout, so this runs at the end of a pane
+    /// draw rather than inside the Markdown renderer.
+    fn request_visible_math(&self, start: usize, end: usize, history_len: usize) {
+        if start >= end {
+            return;
+        }
+        if let Some(cache) = self.history_cache.as_ref() {
+            for pending in &cache.math_pending {
+                if pending.line >= start && pending.line < end {
+                    math_image::request(
+                        &pending.source,
+                        pending.color,
+                        pending.inline,
+                        math_image::Priority::Visible,
+                    );
+                }
+            }
+        }
+        for pending in &self.tail.math_pending {
+            let line = history_len + pending.line;
+            if line >= start && line < end {
+                math_image::request(
+                    &pending.source,
+                    pending.color,
+                    pending.inline,
+                    math_image::Priority::Visible,
+                );
+            }
+        }
+    }
+
+    /// Re-layout when a formula in the viewport can now be drawn. Images that
+    /// finished off-screen stay pending until they are scrolled into view,
+    /// which keeps prewarming from causing invisible redraws.
+    fn bump_math_if_ready(&mut self, start: usize, end: usize, history_len: usize) -> bool {
+        if start >= end {
+            return false;
+        }
+        let history_ready = self.history_cache.as_ref().is_some_and(|cache| {
+            cache.math_pending.iter().any(|pending| {
+                pending.line >= start
+                    && pending.line < end
+                    && math_image::displayable(
+                        &pending.source,
+                        pending.width,
+                        pending.color,
+                        pending.inline,
+                    )
+            })
+        });
+        let tail_ready = self.tail.math_pending.iter().any(|pending| {
+            let line = history_len + pending.line;
+            line >= start
+                && line < end
+                && math_image::displayable(
+                    &pending.source,
+                    pending.width,
+                    pending.color,
+                    pending.inline,
+                )
+        });
+        if history_ready {
+            self.math_rev = self.math_rev.wrapping_add(1);
+        }
+        if tail_ready {
+            self.tail_math_rev = self.tail_math_rev.wrapping_add(1);
+        }
+        history_ready || tail_ready
     }
 
     /// Plain text for search/copy/fold clicks. Building it on demand keeps the
@@ -1079,6 +1199,8 @@ enum PickerKind {
     NewPane,
     /// Insert a workspace file after `@` in the prompt.
     Files,
+    /// Attach a workspace image and insert it as `@path` in the prompt.
+    Images,
     /// Search workspace file contents and insert `@path:line`.
     Grep,
     /// Insert a git worktree path or branch name into the prompt.
@@ -1113,6 +1235,12 @@ enum PickerKind {
     Todos,
     /// Rows provided by a plugin through `ui/pick`.
     Plugin,
+    /// Pick the user message to fork before.
+    Fork,
+    /// Pick the reasoning effort for the current model.
+    Effort,
+    /// Browse the workspace diff, one row per changed file.
+    Diff,
 }
 
 /// Provider behind an open `PickerKind::Plugin` overlay.
@@ -1137,6 +1265,7 @@ impl PickerKind {
     fn data_kind(self) -> Option<&'static str> {
         match self {
             Self::Files => Some(eix_core::KIND_FILES),
+            Self::Images => Some(eix_core::KIND_IMAGES),
             Self::Grep => Some(eix_core::KIND_GREP),
             Self::Git => Some(eix_core::KIND_GIT),
             Self::Sessions
@@ -1155,7 +1284,10 @@ impl PickerKind {
             | Self::Themes
             | Self::Mcp
             | Self::Todos
-            | Self::Plugin => None,
+            | Self::Plugin
+            | Self::Fork
+            | Self::Effort
+            | Self::Diff => None,
         }
     }
 
@@ -1173,6 +1305,7 @@ impl PickerKind {
             Self::Sessions => "sessions — switch focused pane",
             Self::NewPane => "sessions — open in a new pane",
             Self::Files => "files — insert after @",
+            Self::Images => "images — attach and insert after @",
             Self::Grep => "grep — file contents",
             Self::Git => "git — worktree/branch",
             Self::Commands => "commands",
@@ -1185,11 +1318,14 @@ impl PickerKind {
             Self::Timeline => "timeline — user input history",
             Self::Rewind => "rewind — pick a checkpoint",
             Self::RewindScope => "rewind — what to restore",
-            Self::Skills => "skills — preview and insert",
+            Self::Skills => "skills — preview and insert @mention",
             Self::Themes => "colorschemes — live preview",
             Self::Mcp => "mcp — servers and tools",
             Self::Todos => "todos — model task list",
             Self::Plugin => "plugin picker",
+            Self::Fork => "fork — pick a user message",
+            Self::Effort => "effort — reasoning level",
+            Self::Diff => "diff — changed files",
         }
     }
 
@@ -1198,6 +1334,9 @@ impl PickerKind {
             Self::Sessions => "Enter open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::NewPane => "Enter split · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Files => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
+            Self::Images => {
+                "type to search · Enter attach and insert @path · ↑/↓ or C-j/C-k/C-n/C-p · Esc close"
+            }
             Self::Grep => "type to search · Enter insert @path:line · Esc close",
             Self::Git => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Commands => "Enter run · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
@@ -1212,11 +1351,14 @@ impl PickerKind {
             Self::Timeline => "type to search · C-j/C-k or C-n/C-p · Enter jump · Esc close",
             Self::Rewind => "type to search · Enter choose checkpoint · Esc close",
             Self::RewindScope => "Enter rewind · ↑/↓ choose scope · Esc close",
-            Self::Skills => "Enter insert · preview on the right · Esc close",
+            Self::Skills => "Enter insert @name · preview on the right · Esc close",
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
-            Self::Mcp => "Enter close · ↑/↓ or C-j/C-k/C-n/C-p select · Esc close",
+            Self::Mcp => "type to search · Space toggle · Enter close · ↑/↓ or C-j/C-k/C-n/C-p select · Esc close",
             Self::Todos => "Enter close · ↑/↓ or C-j/C-k/C-n/C-p select · Esc close",
             Self::Plugin => "type to search · Enter choose · Esc close",
+            Self::Fork => "type to search · Enter fork before it · Esc close",
+            Self::Effort => "Enter apply · ↑/↓ or C-j/C-k/C-n/C-p select · Esc close",
+            Self::Diff => "type to search · Enter open · preview on the right · Esc close",
         }
     }
 }
@@ -1297,6 +1439,22 @@ struct Picker {
 }
 
 impl Picker {
+    fn new(kind: PickerKind) -> Self {
+        Self {
+            kind,
+            query: String::new(),
+            selected: 0,
+            provider: None,
+            items: Vec::new(),
+            items_rev: 0,
+            filter: PickerFilterCache::default(),
+            scroll: 0,
+            loading: false,
+            preview: PickerPreview::default(),
+            preview_request: None,
+        }
+    }
+
     fn set_items(&mut self, items: Vec<PickerItem>) {
         self.items = items;
         self.items_rev = self.items_rev.wrapping_add(1);
@@ -1691,6 +1849,9 @@ struct TextView {
     /// Lines scrolled from the top. `usize::MAX` means "stay at the end";
     /// drawing clamps it to the last page.
     scroll: usize,
+    /// Structured diagnostics, when this is the `/doctor` overlay. The plain
+    /// `lines` stay authoritative for scrolling; drawing swaps in styled rows.
+    doctor: Option<crate::tui::doctor::DoctorReport>,
 }
 
 impl TextView {
@@ -1703,6 +1864,7 @@ impl TextView {
             title: title.into(),
             lines,
             scroll: 0,
+            doctor: None,
         }
     }
 }
@@ -1867,6 +2029,8 @@ pub struct App {
     /// Latest `model.list` catalog, kept for the prompt header's model,
     /// provider and variant labels.
     models: Vec<ModelInfo>,
+    /// Latest `mcp.list` rows, used by the MCP picker's Space toggle.
+    mcp_servers: Vec<eix_core::McpServerInfo>,
     sessions: Vec<Session>,
     selected: usize,
     /// Open panes in a stable order. Focus moves to the previous/next pane or
@@ -1903,8 +2067,6 @@ pub struct App {
     help_query: String,
     /// Selected row in the filtered help list.
     help_selected: usize,
-    /// First `/delete` arms a confirmation; the second one deletes.
-    pending_delete: Option<String>,
     /// Checkpoint chosen in the `/rewind` picker, waiting for a scope choice.
     pending_rewind: Option<u64>,
     /// Sessions created by this client during this run. On quit, unused ones
@@ -2025,6 +2187,10 @@ pub struct App {
     submitting_session: Option<String>,
     /// Selected row in the `/` command menu.
     command_cursor: usize,
+    /// Last `/cd` prefix seen by the keyboard handler. When it changes, the
+    /// shared suggestion cursor resets so a stale selection cannot switch to an
+    /// unexpected directory.
+    cd_prefix_snapshot: Option<String>,
     /// Built-in and user-defined Markdown commands, in menu order.
     commands: Vec<CommandSpec>,
     /// Prompt commands advertised by server plugins.
@@ -2149,6 +2315,23 @@ fn timeline_picker_items(events: &[SessionEvent]) -> Vec<PickerItem> {
             )
         })
         .collect()
+}
+
+/// Rows for `/effort`; the values match `App::set_reasoning`'s accepted set.
+fn effort_picker_items() -> Vec<PickerItem> {
+    [
+        ("low", "minimum reasoning; fastest"),
+        ("medium", "default; the model's base variant"),
+        ("high", "more reasoning; slower"),
+    ]
+    .into_iter()
+    .map(|(value, detail)| {
+        PickerItem::new(value)
+            .with_label(value)
+            .with_detail(detail)
+            .with_preview(format!("{value}\n\n{detail}"))
+    })
+    .collect()
 }
 
 /// What `/rewind` restores after a checkpoint is chosen.
@@ -2329,6 +2512,105 @@ fn agent_picker_items(agents: &[eix_core::AgentSpec]) -> Vec<PickerItem> {
         .collect()
 }
 
+/// Rows for `/diff`: one per file, with that file's unified diff as preview.
+fn diff_picker_items(diff: &str, notes: &[String]) -> Vec<PickerItem> {
+    let mut items = Vec::new();
+    let mut section: Vec<&str> = Vec::new();
+    for line in diff.lines() {
+        if line.starts_with("diff --git ") && !section.is_empty() {
+            push_diff_item(&mut items, &section);
+            section.clear();
+        }
+        section.push(line);
+    }
+    if !section.is_empty() {
+        push_diff_item(&mut items, &section);
+    }
+    if !notes.is_empty() {
+        items.push(
+            PickerItem::new("<notes>")
+                .with_label("diff notes")
+                .with_detail(format!("{} note(s)", notes.len()))
+                .with_preview(notes.join("\n")),
+        );
+    }
+    if items.is_empty() {
+        items.push(
+            PickerItem::new("<none>")
+                .with_label("no changes")
+                .with_detail("working tree clean")
+                .with_preview("(no changes in the working tree)"),
+        );
+    }
+    items
+}
+
+fn push_diff_item(items: &mut Vec<PickerItem>, section: &[&str]) {
+    let header = section.first().copied().unwrap_or_default();
+    let path = diff_section_path(section, header);
+    let added = section
+        .iter()
+        .filter(|line| line.starts_with('+') && !line.starts_with("+++"))
+        .count();
+    let removed = section
+        .iter()
+        .filter(|line| line.starts_with('-') && !line.starts_with("---"))
+        .count();
+    let binary = section.iter().any(|line| line.starts_with("Binary files "));
+    let detail = if binary && added == 0 && removed == 0 {
+        "binary".to_string()
+    } else {
+        format!("+{added} -{removed}")
+    };
+    items.push(
+        PickerItem::new(path.clone())
+            .with_label(path)
+            .with_detail(detail)
+            .with_preview(section.join("\n")),
+    );
+}
+
+fn diff_section_path(section: &[&str], header: &str) -> String {
+    for line in section {
+        if let Some(path) = diff_path_line(line, "+++ ", "b/") {
+            return path;
+        }
+    }
+    for line in section {
+        if let Some(path) = diff_path_line(line, "--- ", "a/") {
+            return path;
+        }
+    }
+    header
+        .strip_prefix("diff --git ")
+        .and_then(diff_header_path)
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// Extract `b/...` (or `a/...`) from a `+++` / `---` line, including git's
+/// quoted form for paths with spaces.
+fn diff_path_line(line: &str, prefix: &str, strip: &str) -> Option<String> {
+    let rest = line.strip_prefix(prefix)?.trim();
+    let rest = rest
+        .strip_prefix('"')
+        .and_then(|rest| rest.strip_suffix('"'))
+        .unwrap_or(rest);
+    let path = rest.strip_prefix(strip)?;
+    (!path.is_empty() && path != "dev/null").then(|| path.to_string())
+}
+
+/// Fallback for binary sections, which carry no `+++` / `---` lines.
+fn diff_header_path(rest: &str) -> Option<String> {
+    if let Some(rest) = rest.strip_prefix('"') {
+        let end = rest.find('"')?;
+        let after = rest[end + 1..].trim();
+        let path = after.strip_prefix('"')?;
+        let path = path.strip_suffix('"').unwrap_or(path);
+        return Some(path.strip_prefix("b/").unwrap_or(path).to_string());
+    }
+    rest.rsplit_once(" b/").map(|(_, path)| path.to_string())
+}
+
 fn mcp_picker_items(servers: &[eix_core::McpServerInfo]) -> Vec<PickerItem> {
     servers
         .iter()
@@ -2340,6 +2622,7 @@ fn mcp_picker_items(servers: &[eix_core::McpServerInfo]) -> Vec<PickerItem> {
             } else {
                 format!("{} tool(s)", server.tools)
             };
+            let mark = if server.enabled { "[x]" } else { "[ ]" };
             let mut preview = vec![
                 server.name.clone(),
                 format!("command   {}", server.command),
@@ -2357,6 +2640,7 @@ fn mcp_picker_items(servers: &[eix_core::McpServerInfo]) -> Vec<PickerItem> {
                 preview.push(format!("error: {error}"));
             }
             PickerItem::new(&server.name)
+                .with_label(format!("{mark} {}", server.name))
                 .with_detail(state)
                 .with_preview(preview.join("\n"))
         })
@@ -2735,10 +3019,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "search the command and key reference",
             },
             HelpEntry {
-                key: "/keys",
-                description: "search just the key map",
-            },
-            HelpEntry {
                 key: "/new",
                 description: "start a session; reuse the focused session's worktree if present",
             },
@@ -2752,7 +3032,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/clear",
-                description: "forget the conversation context (transcript stays)",
+                description: "delete this session's history, context and memory",
             },
             HelpEntry {
                 key: "/compact",
@@ -2764,15 +3044,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/cd",
-                description: "change the working directory (/cd <path>); alone shows it",
+                description: "change the working directory (/cd <path>); lists matching subdirectories while typing",
             },
             HelpEntry {
                 key: "/init",
                 description: "draft AGENTS.md; you review before sending",
-            },
-            HelpEntry {
-                key: "/queue",
-                description: "list queued prompts (/queue clear | rm N | move N M)",
             },
             HelpEntry {
                 key: "/sessions",
@@ -2807,10 +3083,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "browse the model's current task list",
             },
             HelpEntry {
-                key: "/attention",
-                description: "jump to the next pane needing attention",
-            },
-            HelpEntry {
                 key: "/cancel",
                 description: "cancel the focused session's running turn",
             },
@@ -2824,7 +3096,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/delete",
-                description: "delete the session permanently (confirm twice)",
+                description: "delete the focused session immediately",
             },
             HelpEntry {
                 key: "/rewind [n|both|chat|files]",
@@ -2848,7 +3120,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/diff [staged]",
-                description: "review the workspace diff in a scrollable overlay",
+                description: "search changed files, with a per-file diff preview on the right",
             },
             HelpEntry {
                 key: "/doctor",
@@ -2887,8 +3159,8 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "browse skills with a preview, or insert one with arguments",
             },
             HelpEntry {
-                key: "/image <path>",
-                description: "attach images (paste/drop a path or file:// URI); png/jpg/gif/webp",
+                key: "/image [path|clear]",
+                description: "search images to attach and insert @path; paste/drop also attaches",
             },
             HelpEntry {
                 key: "/colorscheme",
@@ -2900,7 +3172,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/fork",
-                description: "fork this session into a new pane (/fork optional-name)",
+                description: "pick a user message to fork before (/fork name forks everything)",
             },
             HelpEntry {
                 key: "/branch",
@@ -3210,6 +3482,10 @@ fn draw_help(
     theme: Theme,
 ) {
     let dialog_bg = dialog_background(theme);
+    let accent = composer_accent(theme);
+    let text = composer_text(theme);
+    let muted = composer_muted(theme);
+    let selection = composer_selection(theme);
     let rows = help_rows_in(query, scope);
     let matches = help_entry_count_in(query, scope);
     let total: usize = HELP_SECTIONS
@@ -3230,30 +3506,30 @@ fn draw_help(
 
     let rect = search_dialog_rect(area);
     frame.render_widget(Clear, rect);
-    frame.render_widget(Block::default().style(Style::default().bg(dialog_bg)), rect);
     let title = if scope.is_some() {
-        format!(" keys ({matches}/{total}) ")
+        format!(" keys · {matches}/{total} ")
     } else {
-        format!(" help ({matches}/{total}) ")
+        format!(" help · {matches}/{total} ")
     };
-    frame.render_widget(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .style(Style::default().bg(dialog_bg)),
-        rect,
-    );
-
-    let inner = rect.inner(ratatui::layout::Margin::new(1, 1));
-    let list_area = draw_search_field(
-        frame,
-        inner,
-        query,
-        composer_accent(theme),
-        composer_text(theme),
-        composer_muted(theme),
-        dialog_bg,
-    );
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent).bg(dialog_bg))
+        .title_style(
+            Style::default()
+                .fg(accent)
+                .bg(dialog_bg)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(dialog_bg))
+        .title(title)
+        .title_bottom(Span::styled(
+            " type to search · ↑/↓ select · Esc close ",
+            Style::default().fg(muted).bg(dialog_bg),
+        ));
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let list_area = draw_search_field(frame, inner, query, accent, text, muted, dialog_bg);
+    let width = list_area.width as usize;
 
     let selected_row = rows
         .iter()
@@ -3273,36 +3549,57 @@ fn draw_help(
         .count();
     let lines: Vec<Line> = if rows.is_empty() {
         vec![Line::from(Span::styled(
-            "no matching key help",
-            Style::default().fg(composer_muted(theme)),
+            format!("  no matching help for {:?}", query.trim()),
+            Style::default().fg(muted),
         ))]
     } else {
         rows.iter()
+            .enumerate()
             .skip(start)
-            .map(|row| match row {
+            .map(|(index, row)| match row {
                 HelpRow::Blank => Line::from(""),
-                HelpRow::Section(title) => Line::from(Span::styled(
-                    *title,
-                    Style::default().add_modifier(Modifier::BOLD),
-                )),
+                HelpRow::Section(title) => {
+                    let count = rows[index + 1..]
+                        .iter()
+                        .take_while(|row| !matches!(row, HelpRow::Section(_)))
+                        .filter(|row| matches!(row, HelpRow::Entry(_)))
+                        .count();
+                    let used = 2 + UnicodeWidthStr::width(*title) + 2;
+                    let rule = width.saturating_sub(used + count.to_string().len() + 1);
+                    Line::from(vec![
+                        Span::styled("▍ ", Style::default().fg(accent)),
+                        Span::styled(
+                            *title,
+                            Style::default().fg(accent).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::styled(format!("  {} ", count), Style::default().fg(muted)),
+                        Span::styled("─".repeat(rule), Style::default().fg(muted)),
+                    ])
+                }
                 HelpRow::Entry(entry) => {
                     let is_selected = ordinal == selected;
                     ordinal += 1;
+                    let key = pad_to(&truncate(entry.key, key_width), key_width);
+                    let used = 2 + key_width + 1 + UnicodeWidthStr::width(entry.description);
                     let mut line = Line::from(vec![
                         Span::styled(
                             if is_selected { "› " } else { "  " },
-                            Style::default().fg(composer_muted(theme)),
+                            Style::default().fg(if is_selected { accent } else { muted }),
                         ),
                         Span::styled(
-                            format!("{} ", pad_to(&truncate(entry.key, key_width), key_width)),
-                            Style::default()
-                                .fg(composer_accent(theme))
-                                .add_modifier(Modifier::BOLD),
+                            format!("{key} "),
+                            Style::default().fg(accent).add_modifier(Modifier::BOLD),
                         ),
-                        Span::styled(entry.description, Style::default().fg(composer_text(theme))),
+                        Span::styled(entry.description, Style::default().fg(text)),
                     ]);
                     if is_selected {
-                        line = line.style(Style::default().bg(composer_selection(theme)));
+                        if width > used {
+                            line.spans.push(Span::styled(
+                                " ".repeat(width - used),
+                                Style::default().bg(selection),
+                            ));
+                        }
+                        line = line.style(Style::default().bg(selection));
                     }
                     line
                 }
@@ -3312,7 +3609,7 @@ fn draw_help(
     frame.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
-            .style(Style::default().fg(composer_text(theme)).bg(dialog_bg)),
+            .style(Style::default().fg(text).bg(dialog_bg)),
         list_area,
     );
 }
@@ -3616,6 +3913,16 @@ fn next_prev_key(key: KeyEvent) -> KeyEvent {
         }
         _ => key,
     }
+}
+
+/// Step a list cursor by `delta`, wrapping past either end. Picker-style
+/// overlays browse as a cycle: after the last row comes the first one, and
+/// `k`/`p` on the first row lands on the last.
+fn wrap_step(current: usize, len: usize, delta: isize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    (current.min(len - 1) as isize + delta).rem_euclid(len as isize) as usize
 }
 
 impl App {

@@ -96,7 +96,8 @@ connect
 | `session.mode` | `{session_id, mode, temporary?}` | 切换 plan/build/auto/full |
 | `draft.get` / `draft.set` | `{session_id}` / `{session_id, text}` | 读写未发送输入 |
 | `process.list` / `process.output` / `process.kill` | `{session_id?}` / `{process_id, ...}` / `{process_id}` | 后台进程 |
-| `picker.query` / `picker.preview` | `{kind, session_id?, query?, limit?}` / `{kind, session_id?, value, limit?}` | 文件、git、session、context 选择器数据 |
+| `picker.query` / `picker.preview` | `{kind, session_id?, query?, limit?}` / `{kind, session_id?, value, limit?}` | 文件、图片、git、session、context 选择器数据 |
+| `mcp.list` / `mcp.set_enabled` | `null` / `{name, enabled}` | 列出 MCP server，或启用/停用并在配置中持久化 |
 
 完整参数以 [`crates/eix-core/src/protocol.rs`](../crates/eix-core/src/protocol.rs) 为准。
 

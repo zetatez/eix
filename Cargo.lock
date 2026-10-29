@@ -560,6 +560,7 @@ dependencies = [
  "ratatui-image",
  "serde",
  "serde_json",
+ "sha2",
  "syntect",
  "tokio",
  "unicode-width",

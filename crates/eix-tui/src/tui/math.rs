@@ -1766,12 +1766,6 @@ fn negate_text(text: &str) -> Option<String> {
     })
 }
 
-/// A single-line, script-free rendering used where a 2D box cannot fit,
-/// such as inside a table cell.
-pub(super) fn compact(source: &str) -> String {
-    flatten(&Parser::new(source).parse())
-}
-
 pub fn display(source: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
