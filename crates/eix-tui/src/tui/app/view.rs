@@ -139,7 +139,14 @@ impl App {
                 && (view.session.status.needs_attention()
                     || self.approvals.contains_key(&view.session.id)
                     || self.inputs.contains_key(&view.session.id));
-            let marker = if attention { "!" } else { "" };
+            let unread = !active && view.unread;
+            let marker = if attention {
+                "!"
+            } else if unread {
+                "•"
+            } else {
+                ""
+            };
             // Reserve enough room for the index and marker; the Paragraph
             // clips the rest when more tabs are open than fit.
             let name = truncate(&view.session.name, 24);
@@ -161,6 +168,10 @@ impl App {
                     .add_modifier(Modifier::BOLD)
             } else if attention {
                 Style::default().fg(composer_warn(theme))
+            } else if unread {
+                // Green is reserved for "finished, waiting for you": it reads
+                // as progress rather than as a warning.
+                Style::default().fg(composer_success(theme))
             } else {
                 Style::default().fg(composer_muted(theme))
             };
@@ -213,6 +224,9 @@ impl App {
             return;
         }
         self.focused = self.focused.min(self.views.len() - 1);
+        // A focused pane counts as viewed, so its finished-unread hint is
+        // dropped as soon as it is drawn.
+        self.views[self.focused].unread = false;
         let layout = self.effective_layout(area);
         if layout == PaneLayout::Tabby {
             // Only the active tab is visible; leave zero-sized hit boxes for
@@ -251,6 +265,7 @@ impl App {
             && (self.views[index].session.status.needs_attention()
                 || self.approvals.contains_key(&session_id)
                 || self.inputs.contains_key(&session_id));
+        let unread = !focused && self.views[index].unread;
         let theme = self.theme;
         let borders = if self.effective_layout(area) == PaneLayout::Tabby {
             let mut borders = Borders::ALL;
@@ -385,7 +400,13 @@ impl App {
             &view.session.name,
             inner_width.saturating_sub(6).clamp(1, 18),
         );
-        let marker = if attention { "!" } else { "" };
+        let marker = if attention {
+            "!"
+        } else if unread {
+            "•"
+        } else {
+            ""
+        };
         let border_color = if focused {
             // The active pane needs to read as the input target at a glance;
             // the muted border used for inactive panes is too subtle once
@@ -393,12 +414,14 @@ impl App {
             composer_focus(theme)
         } else if attention {
             composer_warn(theme)
+        } else if unread {
+            composer_success(theme)
         } else {
             composer_inactive_border(theme)
         };
         let mut border_style = Style::default().fg(border_color);
         let mut title_style = Style::default().fg(border_color);
-        if focused {
+        if focused || unread {
             title_style = title_style.add_modifier(Modifier::BOLD);
         } else {
             title_style = title_style.add_modifier(Modifier::DIM);

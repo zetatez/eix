@@ -854,6 +854,7 @@ impl App {
                     .iter()
                     .map(|&index| {
                         let session = &self.sessions[index];
+                        let unread = open_panes[index].is_some_and(|pane| self.views[pane].unread);
                         let pane = match open_panes[index] {
                             Some(pane) => Span::styled(
                                 format!("{} ", pane + 1),
@@ -862,6 +863,13 @@ impl App {
                             None => {
                                 Span::styled("· ", Style::default().fg(composer_muted(self.theme)))
                             }
+                        };
+                        // A background pane that finished its turn is green
+                        // here too, so the picker matches the tab strip.
+                        let name_color = if unread {
+                            composer_success(self.theme)
+                        } else {
+                            composer_text(self.theme)
                         };
                         ListItem::new(Line::from(vec![
                             pane,
@@ -872,9 +880,7 @@ impl App {
                             ),
                             Span::styled(
                                 pad_to(&truncate(&session.name, 28), 28),
-                                Style::default()
-                                    .fg(composer_text(self.theme))
-                                    .add_modifier(Modifier::BOLD),
+                                Style::default().fg(name_color).add_modifier(Modifier::BOLD),
                             ),
                             Span::styled(
                                 pad_to(origin_marker(session), 1),

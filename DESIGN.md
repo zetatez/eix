@@ -306,6 +306,8 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 - 焦点：`<` / `>`（`Shift+,` / `Shift+.`）线性切换 pane；转录区按 `i` 聚焦输入并进入 insert；
   `Ctrl-1` … `Ctrl-9` 直接跳到对应 session。聚焦 pane 使用
   更亮的单格虚线边框、标题加粗；非聚焦 pane 保持低对比实线灰，attention 仍用警示色。
+  后台 session 的 turn 正常结束时，其 tab / pane 标题改用成功色并追加 `•`，直到用户聚焦该
+  pane 才清除；失败和取消不置位（分别由 attention 标记和用户主动中断表达）。
 - `Esc`：insert/visual 下先回到 normal 并保持输入框焦点；normal 模式下 500ms 内连按两次才把
   焦点交回转录区（已实现）。
 - 输入条默认显示 3 行内容（加边框共 5 行；短终端优先让给转录区），长草稿会向上生长到

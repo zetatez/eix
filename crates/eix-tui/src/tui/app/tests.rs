@@ -871,6 +871,125 @@ fn line_text(line: &Line<'_>) -> String {
         .collect()
 }
 
+fn turn_completed(
+    session_id: &str,
+    error: Option<&str>,
+    cancelled: bool,
+) -> eix_core::Notification {
+    eix_core::Notification::new(
+        "turn.completed",
+        serde_json::json!({
+            "session_id": session_id,
+            "turn_id": format!("turn-{session_id}"),
+            "cancelled": cancelled,
+            "error": error,
+        }),
+    )
+}
+
+#[test]
+fn a_finished_background_turn_marks_its_session_unread() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["a", "b"]);
+    app.focused = 0;
+
+    app.notification(turn_completed("b", None, false), &tx);
+
+    assert!(app.views[1].unread, "background pane should stay marked");
+    assert!(!app.views[0].unread, "the focused pane was already seen");
+}
+
+#[test]
+fn failed_or_cancelled_turns_do_not_mark_unread() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["a", "b"]);
+    app.focused = 0;
+
+    app.notification(turn_completed("b", Some("boom"), false), &tx);
+    assert!(!app.views[1].unread, "errors use the attention marker");
+
+    app.notification(turn_completed("b", None, true), &tx);
+    assert!(!app.views[1].unread, "a cancelled turn is not unread");
+}
+
+#[test]
+fn a_new_turn_clears_a_stale_finished_hint() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["a", "b"]);
+    app.focused = 0;
+    app.notification(turn_completed("b", None, false), &tx);
+    assert!(app.views[1].unread);
+
+    let mut running = app.views[1].session.clone();
+    running.status = SessionStatus::Running;
+    app.notification(
+        eix_core::Notification::new("session.updated", serde_json::to_value(&running).unwrap()),
+        &tx,
+    );
+    assert!(!app.views[1].unread);
+}
+
+#[test]
+fn focusing_a_finished_tab_clears_its_unread_hint() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["a", "b"]);
+    app.layout = PaneLayout::Tabby;
+    app.focused = 0;
+    app.notification(turn_completed("b", None, false), &tx);
+    assert!(app.views[1].unread);
+
+    app.focus_pane(1);
+    // The hint clears when the pane is actually drawn, not on focus alone.
+    let _ = render_text(&mut app, 80, 20);
+    assert!(!app.views[1].unread);
+}
+
+#[test]
+fn an_unread_tab_uses_the_success_colour_and_a_dot() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["a", "b"]);
+    app.layout = PaneLayout::Tabby;
+    app.focused = 0;
+    app.notification(turn_completed("b", None, false), &tx);
+
+    let backend = ratatui::backend::TestBackend::new(80, 20);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    terminal.draw(|frame| app.draw(frame)).unwrap();
+    let buffer = terminal.backend().buffer();
+
+    let row = (0..buffer.area.height)
+        .find(|y| row_text(buffer, *y).contains("session b"))
+        .expect("tab strip row");
+    let text = row_text(buffer, row);
+    let start = text.find("session b").expect("tab label") as u16;
+    assert!(text.contains("session b•"), "missing unread marker: {text}");
+    assert_eq!(
+        buffer[(start, row)].fg,
+        composer_success(app.theme),
+        "unread tab should be green: {text}"
+    );
+    // The active tab keeps its accent colour and no dot.
+    let active = text.find("session a").expect("active tab") as u16;
+    assert_eq!(buffer[(active, row)].fg, composer_accent(app.theme));
+}
+
+#[test]
+fn an_unread_pane_title_uses_the_success_colour_and_a_dot() {
+    let mut app = app_with_panes(&["a", "b"]);
+    app.layout = PaneLayout::Grid;
+    app.focused = 0;
+    app.views[1].unread = true;
+
+    let rendered = render_text(&mut app, 80, 24);
+    assert!(rendered.contains("• session b"), "{rendered}");
+}
+
+fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+    (0..buffer.area.width)
+        .map(|x| buffer[(x, y)].symbol())
+        .collect()
+}
+
 fn render_transcript_at(view: &SessionView, width: usize, tick: u64) -> String {
     let live = view.live();
     transcript::render_with_subagents(

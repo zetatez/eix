@@ -582,6 +582,10 @@ struct SessionView {
     user_lines: Vec<(u64, usize)>,
     /// Active mouse selection, if any.
     selection: Option<TextSelection>,
+    /// A turn completed while this session was in the background and the user
+    /// has not focused it since. Drawn as a green title so a finished pane is
+    /// easy to spot without opening a notification.
+    unread: bool,
 }
 
 impl SessionView {
@@ -610,6 +614,7 @@ impl SessionView {
             copy_overrides: HashMap::new(),
             user_lines: Vec::new(),
             selection: None,
+            unread: false,
         }
     }
 

@@ -120,6 +120,11 @@ impl App {
                     let index = self.views.iter().position(|view| view.session.id == id);
                     if let Some(index) = index {
                         self.views[index].session = session.clone();
+                        // A queued prompt can start the next turn immediately;
+                        // the old "finished" hint no longer applies.
+                        if session.status.is_busy() {
+                            self.views[index].unread = false;
+                        }
                         if index != self.focused && self.pane_needs_attention(index) {
                             self.status = format!("{} needs attention", session.name);
                         }
@@ -585,19 +590,24 @@ impl App {
                     }
                     // A question cannot outlive its turn.
                     self.inputs.remove(&done.session_id);
-                    let Some(view) = self
+                    let Some(index) = self
                         .views
-                        .iter_mut()
-                        .find(|view| view.session.id == done.session_id)
+                        .iter()
+                        .position(|view| view.session.id == done.session_id)
                     else {
                         return;
                     };
-                    if let Some(stream) = &view.stream {
+                    if let Some(stream) = &self.views[index].stream {
                         if stream.turn_id != done.turn_id {
                             return;
                         }
                     }
-                    view.stream = None;
+                    // A completed turn in a background pane stays marked until
+                    // the user focuses that pane; a cancelled or failed turn is
+                    // covered by the attention marker instead.
+                    let finished = done.error.is_none() && !done.cancelled;
+                    let background = index != self.focused;
+                    self.views[index].stream = None;
                     if let Some(error) = done.error {
                         self.error = Some(error);
                         self.status = "error".into();
@@ -609,6 +619,9 @@ impl App {
                     } else {
                         self.status = turn_summary(&done);
                         self.clear_pending_draft(&done.session_id);
+                    }
+                    if finished && background {
+                        self.views[index].unread = true;
                     }
                 }
             }
