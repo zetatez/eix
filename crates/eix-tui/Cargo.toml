@@ -21,6 +21,8 @@ ratatui = { workspace = true, default-features = false, features = [
     "layout-cache",
     "macros",
 ] }
+ratatui-image = { workspace = true }
+image = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 futures-util = { workspace = true }
 tokio = { workspace = true }

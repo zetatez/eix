@@ -10,6 +10,7 @@ mod editor;
 mod keys;
 mod markdown;
 mod math;
+mod math_image;
 pub(crate) mod net;
 mod syntax;
 mod theme;
@@ -57,6 +58,10 @@ pub async fn run(
     }
 
     let mut terminal = init_terminal()?;
+    // Probe for Kitty/Sixel/iTerm2 before the event stream starts reading
+    // stdin. Without a graphics protocol display math stays on the
+    // character grid.
+    math_image::init();
     let mut app = App::new(initial_session);
     app.bell = bell;
     let loaded = eix_core::Config::load(config.as_deref()).unwrap_or_default();

@@ -162,7 +162,8 @@ impl App {
                     };
                     selection.dragging = false;
                     if selection.moved {
-                        let text = selection_text(&view.text_lines, selection);
+                        let text =
+                            selection_text(&view.text_lines, &view.copy_overrides, selection);
                         if !text.is_empty() {
                             copied = Some(text);
                         }

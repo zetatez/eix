@@ -3,8 +3,9 @@
 //! Messages are Markdown, so the transcript renders them into styled
 //! `ratatui` lines instead of showing raw `**`, backticks and `[](...)`. The
 //! renderer deliberately stays terminal-friendly: links show their target,
-//! images become a labelled placeholder, and TeX math is approximated with
-//! Unicode glyphs (no typesetting engine is involved).
+//! images become a labelled placeholder, and inline math is shown in a compact
+//! ASCII form. Display math uses a character-grid layout, or a real LaTeX
+//! image when the terminal speaks Kitty, Sixel or iTerm2.
 //!
 //! It intentionally only covers the constructs that make a chat transcript
 //! readable: headings, emphasis, inline/fenced code, lists, quotes, rules,
@@ -16,6 +17,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::math;
+use super::math_image;
 use super::syntax::{light_background, CodeHighlighter};
 use super::theme::Theme;
 
@@ -31,17 +33,42 @@ const INLINE_CODE_DARK: Color = Color::Rgb(81, 168, 216);
 
 /// Render a transcript message. Lines are indented by two cells, matching the
 /// transcript's left gutter.
+#[cfg(test)]
 pub fn render(text: &str, width: usize, theme: Theme) -> Vec<Line<'static>> {
     render_with_indent(text, width, theme, "  ")
 }
 
+#[cfg(test)]
 pub(crate) fn render_with_indent(
     text: &str,
     width: usize,
     theme: Theme,
     indent: &str,
 ) -> Vec<Line<'static>> {
-    let mut renderer = Renderer::new(width, theme, indent);
+    render_with_indent_detailed(text, width, theme, indent, false).lines
+}
+
+/// Rendered Markdown plus the metadata the transcript needs beyond the text:
+/// display-math image placements and, for every rendered math line, the LaTeX
+/// source to copy instead of the character approximation.
+pub(crate) struct Rendered {
+    pub lines: Vec<Line<'static>>,
+    pub images: Vec<math_image::Placement>,
+    /// `(line index, LaTeX source)`.
+    pub sources: Vec<(usize, String)>,
+}
+
+/// `images` is false for callers that discard the metadata (for example the
+/// user-message bubble), so they keep the ASCII renderer instead of reserving
+/// blank lines for an image nobody draws.
+pub(crate) fn render_with_indent_detailed(
+    text: &str,
+    width: usize,
+    theme: Theme,
+    indent: &str,
+    images: bool,
+) -> Rendered {
+    let mut renderer = Renderer::new(width, theme, indent, images);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -57,7 +84,10 @@ struct Renderer {
     width: usize,
     theme: Theme,
     indent: String,
+    images: bool,
     lines: Vec<Line<'static>>,
+    placements: Vec<math_image::Placement>,
+    sources: Vec<(usize, String)>,
     inline: Vec<Span<'static>>,
     style: Style,
     style_stack: Vec<Style>,
@@ -102,12 +132,15 @@ struct Capture {
 }
 
 impl Renderer {
-    fn new(width: usize, theme: Theme, indent: &str) -> Self {
+    fn new(width: usize, theme: Theme, indent: &str, images: bool) -> Self {
         let mut renderer = Self {
             width: width.max(1),
             theme,
             indent: indent.to_string(),
+            images,
             lines: Vec::new(),
+            placements: Vec::new(),
+            sources: Vec::new(),
             inline: Vec::new(),
             style: Style::default(),
             style_stack: Vec::new(),
@@ -139,13 +172,10 @@ impl Renderer {
                 // span without any math syntax (and longer than one letter) as
                 // a literal dollar-quoted word instead of mangling it.
                 if looks_like_math(&text) {
-                    let rendered = latex_to_unicode(&text);
-                    self.append_styled(
-                        &rendered,
-                        Style::default()
-                            .fg(accent(self.theme))
-                            .add_modifier(Modifier::ITALIC),
-                    );
+                    let style = Style::default()
+                        .fg(accent(self.theme))
+                        .add_modifier(Modifier::ITALIC);
+                    self.append_styled(&math::compact(&text), style);
                 } else {
                     self.append_styled(&format!("${text}$"), self.style);
                 }
@@ -586,17 +616,62 @@ impl Renderer {
     fn display_math(&mut self, source: &str) {
         self.flush();
         self.ensure_blank();
-        let prefix = self.prefix_spans(true);
-        let prefix_width = Self::prefix_width(&prefix);
+        let first_prefix = self.prefix_spans(true);
+        let cont_prefix = self.prefix_spans(false);
+        let prefix_width = Self::prefix_width(&first_prefix);
         let avail = self.width.saturating_sub(prefix_width).max(1);
-        let style = Style::default()
-            .fg(accent(self.theme))
-            .add_modifier(Modifier::BOLD);
-        let rendered = math::display(source, avail, style);
-        for line in rendered {
-            let mut spans = prefix.clone();
-            spans.extend(line.spans);
-            self.lines.push(Line::from(spans));
+        let start = self.lines.len();
+        let image = self
+            .images
+            .then(|| math_image::render(source, avail, math_text_color(self.theme)));
+        if let Some(Some(image)) = image {
+            // Reserve the cells the terminal protocol paints over. The
+            // placeholder keeps a non-zero width so block spacing and
+            // selection still treat it as a real line.
+            let rows = usize::from(image.rows.max(1));
+            let cols = usize::from(image.cols);
+            let pad = avail.saturating_sub(cols) / 2;
+            let column = (prefix_width + pad).min(u16::MAX as usize) as u16;
+            for row in 0..rows {
+                let mut spans = if row == 0 {
+                    first_prefix.clone()
+                } else {
+                    cont_prefix.clone()
+                };
+                if spans.is_empty() {
+                    spans.push(Span::raw(" "));
+                }
+                self.lines.push(Line::from(spans));
+            }
+            self.placements.push(math_image::Placement {
+                line: start,
+                column,
+                image,
+            });
+            for index in start..self.lines.len() {
+                self.sources.push((index, source.to_string()));
+            }
+        } else {
+            let style = Style::default()
+                .fg(accent(self.theme))
+                .add_modifier(Modifier::BOLD);
+            for (row, line) in math::display(source, avail, style).into_iter().enumerate() {
+                let mut spans = if row == 0 {
+                    first_prefix.clone()
+                } else {
+                    cont_prefix.clone()
+                };
+                spans.extend(line.spans);
+                self.lines.push(Line::from(spans));
+            }
+            // Every physical line of a formula copies back as the formula
+            // source; the selection deduplicates consecutive copies.
+            for index in start..self.lines.len() {
+                self.sources.push((index, source.to_string()));
+            }
+        }
+        if let Some(item) = self.items.last_mut() {
+            item.first = false;
         }
         self.ensure_blank();
     }
@@ -785,7 +860,7 @@ impl Renderer {
         self.ensure_blank();
     }
 
-    fn finish(mut self) -> Vec<Line<'static>> {
+    fn finish(mut self) -> Rendered {
         self.flush();
         if self.table.is_some() {
             self.finish_table();
@@ -798,10 +873,21 @@ impl Renderer {
                 }
             }
         }
-        while self.lines.last().is_some_and(|line| line.width() == 0) {
-            self.lines.pop();
+        let mut len = self.lines.len();
+        while self.lines[..len]
+            .last()
+            .is_some_and(|line| line.width() == 0)
+        {
+            len -= 1;
         }
-        self.lines
+        self.lines.truncate(len);
+        self.placements.retain(|placement| placement.line < len);
+        self.sources.retain(|(line, _)| *line < len);
+        Rendered {
+            lines: self.lines,
+            images: self.placements,
+            sources: self.sources,
+        }
     }
 }
 
@@ -970,6 +1056,22 @@ fn accent(theme: Theme) -> Color {
     theme.function.unwrap_or(ACCENT)
 }
 
+/// Text colour for a LaTeX image. The image is painted over the terminal
+/// background, so a transparent theme needs an explicit foreground rather
+/// than `Reset`.
+fn math_text_color(theme: Theme) -> Option<Color> {
+    if let Some(color) = theme.normal {
+        if !matches!(color, Color::Reset) {
+            return Some(color);
+        }
+    }
+    if light_background(theme) {
+        Some(Color::Rgb(30, 34, 42))
+    } else {
+        None
+    }
+}
+
 fn inline_code(theme: Theme) -> Color {
     if light_background(theme) {
         INLINE_CODE_LIGHT
@@ -987,123 +1089,6 @@ fn dim(theme: Theme) -> Style {
 /// A pragmatic TeX-to-Unicode conversion for terminal display. It handles the
 /// math people actually put in chat answers (fractions, roots, scripts, Greek
 /// letters and common operators) and leaves anything else readable as text.
-pub fn latex_to_unicode(source: &str) -> String {
-    let chars: Vec<char> = source.chars().collect();
-    let mut out = String::new();
-    let mut index = 0;
-    while index < chars.len() {
-        match chars[index] {
-            '\\' => {
-                index += 1;
-                if index >= chars.len() {
-                    out.push('\\');
-                    break;
-                }
-                if chars[index].is_ascii_alphabetic() {
-                    let start = index;
-                    while index < chars.len() && chars[index].is_ascii_alphabetic() {
-                        index += 1;
-                    }
-                    let command: String = chars[start..index].iter().collect();
-                    match command.as_str() {
-                        "frac" | "dfrac" | "tfrac" => {
-                            let (numerator, next) = take_arg(&chars, index);
-                            let (denominator, next) = take_arg(&chars, next);
-                            index = next;
-                            out.push_str(&format_fraction(&numerator, &denominator));
-                        }
-                        "sqrt" => {
-                            let (argument, next) = take_arg(&chars, index);
-                            index = next;
-                            out.push_str(&format_root(&argument));
-                        }
-                        "text" | "textrm" | "mathrm" | "mathbf" | "mathit" | "mathbb"
-                        | "mathcal" | "operatorname" => {
-                            let (argument, next) = take_arg(&chars, index);
-                            index = next;
-                            let rendered = latex_to_unicode(&argument);
-                            if command == "mathbb" {
-                                out.push_str(&blackboard(&rendered));
-                            } else {
-                                out.push_str(&rendered);
-                            }
-                        }
-                        "vec" | "hat" | "bar" | "tilde" | "dot" | "ddot" => {
-                            let (argument, next) = take_arg(&chars, index);
-                            index = next;
-                            let rendered = latex_to_unicode(&argument);
-                            let combining = match command.as_str() {
-                                "vec" => '\u{20d7}',
-                                "hat" => '\u{0302}',
-                                "bar" => '\u{0304}',
-                                "tilde" => '\u{0303}',
-                                "dot" => '\u{0307}',
-                                _ => '\u{0308}',
-                            };
-                            if let Some(last) = rendered.chars().last() {
-                                if rendered.chars().count() == 1 {
-                                    out.push(last);
-                                    out.push(combining);
-                                } else {
-                                    out.push_str(&rendered);
-                                }
-                            }
-                        }
-                        "left" | "right" | "middle" => {
-                            if index < chars.len() {
-                                out.push(map_delimiter(chars[index]));
-                                index += 1;
-                            }
-                        }
-                        "begin" | "end" => {
-                            let (_environment, next) = take_arg(&chars, index);
-                            index = next;
-                        }
-                        "quad" => out.push_str("  "),
-                        "qquad" => out.push_str("    "),
-                        "," | ";" | ":" | "!" | " " => out.push(' '),
-                        _ => {
-                            if let Some(symbol) = symbol(&command) {
-                                out.push_str(symbol);
-                            } else {
-                                out.push_str(&command);
-                            }
-                        }
-                    }
-                } else {
-                    match chars[index] {
-                        '\\' => out.push('\n'),
-                        ',' | ';' | '!' => out.push(' '),
-                        '{' | '}' | '$' | '%' | '&' | '#' | '_' => out.push(chars[index]),
-                        _ => out.push(chars[index]),
-                    }
-                    index += 1;
-                }
-            }
-            '^' => {
-                let (argument, next) = take_arg(&chars, index + 1);
-                index = next;
-                out.push_str(&script(&argument, true));
-            }
-            '_' => {
-                let (argument, next) = take_arg(&chars, index + 1);
-                index = next;
-                out.push_str(&script(&argument, false));
-            }
-            '{' | '}' => index += 1,
-            '&' => {
-                out.push_str("  ");
-                index += 1;
-            }
-            ch => {
-                out.push(ch);
-                index += 1;
-            }
-        }
-    }
-    out.trim().to_string()
-}
-
 /// Decide whether an inline `$...$` span is real math rather than shell syntax.
 fn looks_like_math(source: &str) -> bool {
     let trimmed = source.trim();
@@ -1136,197 +1121,6 @@ fn looks_like_math(source: &str) -> bool {
     })
 }
 
-fn take_arg(chars: &[char], mut index: usize) -> (String, usize) {
-    while index < chars.len() && chars[index].is_whitespace() {
-        index += 1;
-    }
-    if index >= chars.len() {
-        return (String::new(), index);
-    }
-    if chars[index] == '[' {
-        // Optional argument such as \sqrt[3]{x}; drop the index but keep the
-        // following group as the argument.
-        index += 1;
-        while index < chars.len() && chars[index] != ']' {
-            index += 1;
-        }
-        if index < chars.len() {
-            index += 1;
-        }
-        return take_arg(chars, index);
-    }
-    if chars[index] == '{' {
-        let start = index + 1;
-        let mut depth = 1;
-        index += 1;
-        while index < chars.len() {
-            match chars[index] {
-                '{' => depth += 1,
-                '}' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        break;
-                    }
-                }
-                _ => {}
-            }
-            index += 1;
-        }
-        let argument: String = chars[start..index.min(chars.len())].iter().collect();
-        return (argument, (index + 1).min(chars.len()));
-    }
-    if chars[index] == '\\' {
-        let start = index;
-        index += 1;
-        while index < chars.len() && chars[index].is_ascii_alphabetic() {
-            index += 1;
-        }
-        if index == start + 1 {
-            index += 1;
-        }
-        return (chars[start..index.min(chars.len())].iter().collect(), index);
-    }
-    (chars[index].to_string(), index + 1)
-}
-
-fn format_fraction(numerator: &str, denominator: &str) -> String {
-    let numerator = latex_to_unicode(numerator);
-    let denominator = latex_to_unicode(denominator);
-    let simple =
-        |text: &str| text.chars().count() <= 1 || text.chars().all(|ch| ch.is_alphanumeric());
-    let numerator = if simple(&numerator) {
-        numerator
-    } else {
-        format!("({numerator})")
-    };
-    let denominator = if simple(&denominator) {
-        denominator
-    } else {
-        format!("({denominator})")
-    };
-    format!("{numerator}/{denominator}")
-}
-
-fn format_root(argument: &str) -> String {
-    let argument = latex_to_unicode(argument);
-    if argument.chars().count() <= 1 || argument.chars().all(|ch| ch.is_alphanumeric()) {
-        format!("√{argument}")
-    } else {
-        format!("√({argument})")
-    }
-}
-
-fn script(argument: &str, superscript: bool) -> String {
-    let rendered = latex_to_unicode(argument);
-    let mut out = String::new();
-    let mut mapped = true;
-    for ch in rendered.chars() {
-        let mapped_char = if superscript {
-            superscript_char(ch)
-        } else {
-            subscript_char(ch)
-        };
-        match mapped_char {
-            Some(ch) => out.push(ch),
-            None => {
-                mapped = false;
-                break;
-            }
-        }
-    }
-    if mapped && !out.is_empty() {
-        out
-    } else if superscript {
-        format!("^({rendered})")
-    } else {
-        format!("_({rendered})")
-    }
-}
-
-pub(super) fn superscript_char(ch: char) -> Option<char> {
-    Some(match ch {
-        '0' => '⁰',
-        '1' => '¹',
-        '2' => '²',
-        '3' => '³',
-        '4' => '⁴',
-        '5' => '⁵',
-        '6' => '⁶',
-        '7' => '⁷',
-        '8' => '⁸',
-        '9' => '⁹',
-        '+' => '⁺',
-        '-' => '⁻',
-        '=' => '⁼',
-        '(' => '⁽',
-        ')' => '⁾',
-        'n' => 'ⁿ',
-        'i' => 'ⁱ',
-        'a' => 'ᵃ',
-        'b' => 'ᵇ',
-        'c' => 'ᶜ',
-        'd' => 'ᵈ',
-        'e' => 'ᵉ',
-        'f' => 'ᶠ',
-        'g' => 'ᵍ',
-        'h' => 'ʰ',
-        'j' => 'ʲ',
-        'k' => 'ᵏ',
-        'l' => 'ˡ',
-        'm' => 'ᵐ',
-        'o' => 'ᵒ',
-        'p' => 'ᵖ',
-        'r' => 'ʳ',
-        's' => 'ˢ',
-        't' => 'ᵗ',
-        'u' => 'ᵘ',
-        'v' => 'ᵛ',
-        'w' => 'ʷ',
-        'x' => 'ˣ',
-        'y' => 'ʸ',
-        'z' => 'ᶻ',
-        _ => return None,
-    })
-}
-
-pub(super) fn subscript_char(ch: char) -> Option<char> {
-    Some(match ch {
-        '0' => '₀',
-        '1' => '₁',
-        '2' => '₂',
-        '3' => '₃',
-        '4' => '₄',
-        '5' => '₅',
-        '6' => '₆',
-        '7' => '₇',
-        '8' => '₈',
-        '9' => '₉',
-        '+' => '₊',
-        '-' => '₋',
-        '=' => '₌',
-        '(' => '₍',
-        ')' => '₎',
-        'a' => 'ₐ',
-        'e' => 'ₑ',
-        'h' => 'ₕ',
-        'i' => 'ᵢ',
-        'j' => 'ⱼ',
-        'k' => 'ₖ',
-        'l' => 'ₗ',
-        'm' => 'ₘ',
-        'n' => 'ₙ',
-        'o' => 'ₒ',
-        'p' => 'ₚ',
-        'r' => 'ᵣ',
-        's' => 'ₛ',
-        't' => 'ₜ',
-        'u' => 'ᵤ',
-        'v' => 'ᵥ',
-        'x' => 'ₓ',
-        _ => return None,
-    })
-}
-
 pub(super) fn blackboard(text: &str) -> String {
     text.chars()
         .map(|ch| match ch {
@@ -1340,13 +1134,6 @@ pub(super) fn blackboard(text: &str) -> String {
             _ => ch,
         })
         .collect()
-}
-
-fn map_delimiter(ch: char) -> char {
-    match ch {
-        '.' => ' ',
-        _ => ch,
-    }
 }
 
 pub(super) fn symbol(command: &str) -> Option<&'static str> {
@@ -1471,6 +1258,87 @@ pub(super) fn symbol(command: &str) -> Option<&'static str> {
         "therefore" => "∴",
         "because" => "∵",
         "checkmark" => "✓",
+        "varkappa" => "ϰ",
+        "digamma" => "ϝ",
+        "hslash" => "ℏ",
+        "imath" => "ı",
+        "jmath" => "ȷ",
+        "wp" => "℘",
+        "complement" => "∁",
+        "cong" => "≅",
+        "simeq" => "≃",
+        "asymp" => "≍",
+        "approxeq" => "≊",
+        "doteq" => "≐",
+        "ll" => "≪",
+        "gg" => "≫",
+        "prec" => "≺",
+        "succ" => "≻",
+        "preceq" => "≼",
+        "succeq" => "≽",
+        "subsetneq" => "⊊",
+        "supsetneq" => "⊋",
+        "nsubseteq" => "⊈",
+        "nsupseteq" => "⊉",
+        "sqsubset" => "⊏",
+        "sqsupset" => "⊐",
+        "sqsubseteq" => "⊑",
+        "sqsupseteq" => "⊒",
+        "nleq" => "≰",
+        "ngeq" => "≱",
+        "nparallel" => "∦",
+        "nmid" => "∤",
+        "mid" => "∣",
+        "implies" => "⟹",
+        "impliedby" => "⟸",
+        "iff" => "⟺",
+        "longrightarrow" => "⟶",
+        "longleftarrow" => "⟵",
+        "longleftrightarrow" => "⟷",
+        "updownarrow" => "↕",
+        "Uparrow" => "⇑",
+        "Downarrow" => "⇓",
+        "Updownarrow" => "⇕",
+        "ominus" => "⊖",
+        "odot" => "⊙",
+        "oslash" => "⊘",
+        "uplus" => "⊎",
+        "sqcup" => "⊔",
+        "sqcap" => "⊓",
+        "amalg" => "⨿",
+        "dagger" => "†",
+        "ddagger" => "‡",
+        "S" => "§",
+        "P" => "¶",
+        "copyright" => "©",
+        "pounds" => "£",
+        "euro" => "€",
+        "yen" => "¥",
+        "triangle" => "△",
+        "triangledown" => "▽",
+        "triangleleft" => "◁",
+        "triangleright" => "▷",
+        "square" => "□",
+        "blacksquare" => "■",
+        "diamond" => "⋄",
+        "lozenge" => "◊",
+        "measuredangle" => "∡",
+        "sphericalangle" => "∢",
+        "top" => "⊤",
+        "bot" => "⊥",
+        "vdash" => "⊢",
+        "dashv" => "⊣",
+        "models" => "⊨",
+        "smile" => "⌣",
+        "frown" => "⌢",
+        "lgroup" => "⟮",
+        "rgroup" => "⟯",
+        "lbrace" => "{",
+        "rbrace" => "}",
+        "lbrack" => "[",
+        "rbrack" => "]",
+        "backslash" => "∖",
+        "dotsb" | "dotsc" | "dotsm" | "dotsi" | "dotso" => "…",
         _ => return None,
     })
 }
@@ -1611,18 +1479,51 @@ mod tests {
     }
 
     #[test]
-    fn renders_math_as_unicode() {
+    fn display_math_without_a_protocol_records_copy_sources() {
+        let rendered =
+            render_with_indent_detailed("$$\\frac{a}{b}$$", 40, Theme::default(), "  ", true);
+        assert!(rendered.images.is_empty());
+        assert!(!rendered.lines.is_empty());
+        assert_eq!(rendered.sources.len(), rendered.lines.len());
+        assert!(rendered
+            .sources
+            .iter()
+            .all(|(_, source)| source == "\\frac{a}{b}"));
+    }
+
+    #[test]
+    fn renders_inline_and_display_math() {
         let output = text(&render(
             "Inline $x^2 + y_1$ and display:\n\n$$\\frac{a+b}{c} \\le \\sqrt{x} \\to \\infty$$",
             80,
             Theme::default(),
         ));
-        assert!(output.contains("x² + y₁"));
-        assert!(output.contains("a+b"));
-        assert!(output.contains("─────"));
+        assert!(output.contains("Inline"), "{output}");
+        assert!(output.contains("x^2 + y_1"), "{output}");
+        assert!(!output.contains('²'), "{output}");
+        assert!(!output.contains('₁'), "{output}");
+        assert!(output.contains("a + b"));
+        assert!(output.contains("───────"));
         assert!(output.contains("≤"));
         assert!(output.contains("√x"));
         assert!(output.contains("→ ∞"));
+    }
+
+    #[test]
+    fn inline_scripts_stay_on_one_line() {
+        let rendered = render("before $x^2$ after", 80, Theme::default());
+        let output = text(&rendered);
+        assert!(!output.contains('²'), "{output}");
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert!(output.contains("before x^2 after"), "{output}");
+    }
+
+    #[test]
+    fn inline_fraction_stays_on_one_line() {
+        let rendered = render("value $\\frac{a+b}{c}$ end", 80, Theme::default());
+        let output = text(&rendered);
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert!(output.contains("value (a+b)/c end"), "{output}");
     }
 
     #[test]
@@ -1677,7 +1578,8 @@ mod tests {
         ));
         assert!(output.contains("$PATH and $HOME"));
         assert!(output.contains("x"));
-        assert!(output.contains("E = mc²"));
+        assert!(output.contains("E = mc^2"), "{output}");
+        assert!(!output.contains('²'), "{output}");
     }
 
     #[test]
@@ -1693,7 +1595,7 @@ mod tests {
     #[test]
     fn display_math_uses_two_dimensional_layout() {
         let cases = [
-            ("\\frac{a+b}{c}", vec!["a+b", "─────", "c"]),
+            ("\\frac{a+b}{c}", vec!["a + b", "───────", "c"]),
             ("\\sqrt{\\frac{a}{b}}", vec!["√", "─"]),
             (
                 "\\begin{pmatrix} a & b \\\\ c & d \\end{pmatrix}",
@@ -1703,8 +1605,8 @@ mod tests {
                 "\\lim_{x \\to 0} \\frac{\\sin x}{x} = 1",
                 vec!["lim", "x → 0", "sin x"],
             ),
-            ("\\sum_{i=1}^{n} i", vec!["∑", "i=1"]),
-            ("\\int_0^1 x^2 \\, dx", vec!["∫₀¹", "x²"]),
+            ("\\sum_{i=1}^{n} i", vec!["∑", "i = 1"]),
+            ("\\int_0^1 x^2 \\, dx", vec!["∫", "0", "1", "x"]),
             ("\\left( \\frac{a}{b} \\right)", vec!["⎛", "⎞"]),
         ];
         for (formula, needles) in cases {
@@ -1721,11 +1623,47 @@ mod tests {
     }
 
     #[test]
-    fn latex_handles_common_constructs() {
-        assert_eq!(latex_to_unicode("x^2 + y_1"), "x² + y₁");
-        assert_eq!(latex_to_unicode("\\alpha + \\beta"), "α + β");
-        assert_eq!(latex_to_unicode("\\frac{1}{2}"), "1/2");
-        assert_eq!(latex_to_unicode("\\sqrt{x^2+y^2}"), "√(x²+y²)");
-        assert_eq!(latex_to_unicode("\\mathbb{R}^n"), "ℝⁿ");
+    fn compact_math_handles_common_constructs() {
+        assert_eq!(math::compact("x^2 + y_1"), "x^2 + y_1");
+        assert_eq!(math::compact("\\alpha + \\beta"), "α + β");
+        assert_eq!(math::compact("\\frac{1}{2}"), "1/2");
+        assert_eq!(math::compact("\\sqrt{x^2+y^2}"), "√(x^2+y^2)");
+        assert_eq!(math::compact("\\mathbb{R}^n"), "ℝ^n");
+    }
+
+    #[test]
+    fn compact_math_supports_indexed_roots() {
+        assert_eq!(math::compact("\\sqrt[3]{x}"), "3√x");
+        assert_eq!(math::compact("\\sqrt[4]{x^2}"), "4√x^2");
+        assert_eq!(math::compact("\\sqrt[n]{x}"), "n√x");
+    }
+
+    #[test]
+    fn display_math_inserts_tex_spacing() {
+        let output = text(&render("$$E=mc^2, \\quad x=-1$$", 40, Theme::default()));
+        assert!(output.contains("E = mc"), "{output}");
+        assert!(!output.contains('²'), "{output}");
+        assert!(output.contains("x = -1"), "{output}");
+    }
+
+    #[test]
+    fn display_math_renders_alignment_environments() {
+        let aligned = text(&render(
+            "$$\\begin{aligned} x &= 1 \\\\ 100 &= 2 \\end{aligned}$$",
+            60,
+            Theme::default(),
+        ));
+        assert!(aligned.contains("  x = 1"), "{aligned}");
+        assert!(aligned.contains("100 = 2"), "{aligned}");
+
+        let cases = text(&render(
+            "$$\\begin{cases} x & x > 0 \\\\ -x & x \\le 0 \\end{cases}$$",
+            60,
+            Theme::default(),
+        ));
+        assert!(cases.contains('⎧'), "{cases}");
+        assert!(cases.contains('⎩'), "{cases}");
+        assert!(cases.contains("x > 0"), "{cases}");
+        assert!(cases.contains("x ≤ 0"), "{cases}");
     }
 }

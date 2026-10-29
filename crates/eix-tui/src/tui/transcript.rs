@@ -22,6 +22,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::app::{tool_call_summary, truncate, wrap_text};
 use super::markdown;
+use super::math_image;
 use super::theme::Theme;
 
 /// Tool output is capped so a verbose command cannot flood the transcript.
@@ -153,6 +154,10 @@ pub struct Transcript {
     pub slots: Vec<Option<Fold>>,
     /// Stored user-message sequence -> first rendered line.
     pub user_lines: Vec<(u64, usize)>,
+    /// Display-math images, anchored to `lines`.
+    pub math: Vec<math_image::Placement>,
+    /// Line -> LaTeX source, so copying a rendered formula yields the source.
+    pub copy: Vec<(usize, String)>,
 }
 
 /// Fold target for a line: which block, and whether it is currently open.
@@ -250,14 +255,32 @@ pub fn render_events(events: &[SessionEvent], width: usize, theme: Theme) -> Tra
     let mut lines = Vec::new();
     let mut slots = Vec::new();
     let mut user_lines = Vec::new();
+    let mut math = Vec::new();
+    let mut copy = Vec::new();
     for collected in blocks {
-        let piece = render_block(&collected.block, &no_folds, width, theme, &no_subagents);
-        append_piece_parts(&mut lines, &mut slots, &mut user_lines, piece);
+        let piece = render_block(
+            &collected.block,
+            &no_folds,
+            width,
+            theme,
+            &no_subagents,
+            false,
+        );
+        append_piece_parts(
+            &mut lines,
+            &mut slots,
+            &mut user_lines,
+            &mut math,
+            &mut copy,
+            piece,
+        );
     }
     Transcript {
         lines,
         slots,
         user_lines,
+        math,
+        copy,
     }
 }
 
@@ -292,6 +315,8 @@ pub fn render_tail(
         lines: Vec::new(),
         slots: Vec::new(),
         user_lines: Vec::new(),
+        math: Vec::new(),
+        copy: Vec::new(),
     };
     append_tail(&mut out, live, queued, folds, width, theme, tick);
     out
@@ -307,7 +332,7 @@ fn render_blocks(
 ) -> Transcript {
     let mut out = Transcript::new();
     for collected in blocks {
-        let piece = render_block(&collected.block, folds, width, theme, subagents);
+        let piece = render_block(&collected.block, folds, width, theme, subagents, true);
         append_piece(&mut out, piece);
     }
     out
@@ -321,6 +346,7 @@ fn render_block(
     width: usize,
     theme: Theme,
     subagents: &HashMap<String, Subagent>,
+    images: bool,
 ) -> Transcript {
     let mut out = Transcript::new();
     match block {
@@ -347,7 +373,7 @@ fn render_block(
                 );
             }
             if !text.is_empty() {
-                assistant_message(&mut out, text, *cancelled, width, theme);
+                assistant_message(&mut out, text, *cancelled, width, theme, images);
             }
         }
         Block::Tool(block) => {
@@ -365,7 +391,7 @@ fn render_block(
         }
         Block::Note { text } => note(&mut out, '◇', text, comment(theme), width),
         Block::Compaction { messages, summary } => {
-            compaction_summary(&mut out, *messages, summary, width, theme)
+            compaction_summary(&mut out, *messages, summary, width, theme, images)
         }
         Block::Error { text } => note(&mut out, '!', text, theme.error.unwrap_or(DANGER), width),
     }
@@ -378,6 +404,8 @@ fn append_piece_parts(
     lines: &mut Vec<Line<'static>>,
     slots: &mut Vec<Option<Fold>>,
     user_lines: &mut Vec<(u64, usize)>,
+    math: &mut Vec<math_image::Placement>,
+    copy: &mut Vec<(usize, String)>,
     piece: Transcript,
 ) {
     let skip = usize::from(
@@ -390,6 +418,19 @@ fn append_piece_parts(
     for (seq, line) in piece.user_lines {
         user_lines.push((seq, base + line.saturating_sub(skip)));
     }
+    for mut placement in piece.math {
+        if placement.line < skip {
+            continue;
+        }
+        placement.line = base + placement.line - skip;
+        math.push(placement);
+    }
+    for (line, source) in piece.copy {
+        if line < skip {
+            continue;
+        }
+        copy.push((base + line - skip, source));
+    }
 }
 
 #[cfg(test)]
@@ -397,10 +438,21 @@ fn append_piece(dst: &mut Transcript, piece: Transcript) {
     let mut lines = std::mem::take(&mut dst.lines);
     let mut slots = std::mem::take(&mut dst.slots);
     let mut user_lines = std::mem::take(&mut dst.user_lines);
-    append_piece_parts(&mut lines, &mut slots, &mut user_lines, piece);
+    let mut math = std::mem::take(&mut dst.math);
+    let mut copy = std::mem::take(&mut dst.copy);
+    append_piece_parts(
+        &mut lines,
+        &mut slots,
+        &mut user_lines,
+        &mut math,
+        &mut copy,
+        piece,
+    );
     dst.lines = lines;
     dst.slots = slots;
     dst.user_lines = user_lines;
+    dst.math = math;
+    dst.copy = copy;
 }
 
 /// Identity of a block's rendered output. `rev` changes whenever the block's
@@ -464,6 +516,8 @@ pub struct HistoryCache {
     pub lines: Vec<Line<'static>>,
     pub slots: Vec<Option<Fold>>,
     pub user_lines: Vec<(u64, usize)>,
+    pub math: Vec<math_image::Placement>,
+    pub copy: Vec<(usize, String)>,
 }
 
 impl HistoryCache {
@@ -543,17 +597,21 @@ impl HistoryCache {
             self.lines.truncate(cut);
             self.slots.truncate(cut);
             self.user_lines.retain(|(_, line)| *line < cut);
+            self.math.retain(|placement| placement.line < cut);
+            self.copy.retain(|(line, _)| *line < cut);
             self.keys.truncate(common);
             self.starts.truncate(common);
         }
         for (index, collected) in self.blocks.iter().enumerate().skip(common) {
             self.starts.push(self.lines.len());
             self.keys.push(keys[index]);
-            let piece = render_block(&collected.block, folds, width, theme, subagents);
+            let piece = render_block(&collected.block, folds, width, theme, subagents, true);
             append_piece_parts(
                 &mut self.lines,
                 &mut self.slots,
                 &mut self.user_lines,
+                &mut self.math,
+                &mut self.copy,
                 piece,
             );
         }
@@ -591,9 +649,9 @@ fn append_tail(
             thinking(out, FoldId::Live, live.reasoning, true, width, theme, folds);
         }
         if !live.text.is_empty() {
-            assistant_message(out, live.text, false, width, theme);
+            assistant_message(out, live.text, false, width, theme, true);
         } else if live.reasoning.is_empty() {
-            assistant_message(out, waiting_dots(tick), false, width, theme);
+            assistant_message(out, waiting_dots(tick), false, width, theme, true);
         }
     }
     if !queued.is_empty() {
@@ -900,12 +958,33 @@ impl Transcript {
             lines: Vec::new(),
             slots: Vec::new(),
             user_lines: Vec::new(),
+            math: Vec::new(),
+            copy: Vec::new(),
         }
     }
 
     fn push(&mut self, line: Line<'static>, slot: Option<Fold>) {
         self.lines.push(line);
         self.slots.push(slot);
+    }
+
+    /// Append a Markdown render, shifting its image anchors and copy sources
+    /// onto this transcript's existing line numbers.
+    fn push_rendered(&mut self, rendered: markdown::Rendered) {
+        let base = self.lines.len();
+        let len = rendered.lines.len();
+        for line in rendered.lines {
+            self.push(line, None);
+        }
+        for mut placement in rendered.images {
+            placement.line += base;
+            self.math.push(placement);
+        }
+        for (line, source) in rendered.sources {
+            if line < len {
+                self.copy.push((base + line, source));
+            }
+        }
     }
 
     /// One blank separator, never two in a row.
@@ -985,9 +1064,17 @@ fn bubble_border_style(theme: Theme) -> Style {
 /// Draw a right-aligned rounded bubble around the rendered content. Padding
 /// and borders are normal spans, so click selection, search, and horizontal
 /// positioning all see exactly what is drawn.
-fn push_bubble(out: &mut Transcript, mut content: Vec<Line<'static>>, width: usize, theme: Theme) {
+fn push_bubble(
+    out: &mut Transcript,
+    mut content: Vec<Line<'static>>,
+    mut sources: Vec<(usize, String)>,
+    width: usize,
+    theme: Theme,
+) {
+    let mut removed = 0;
     while content.first().is_some_and(|line| line.width() == 0) {
         content.remove(0);
+        removed += 1;
     }
     while content.last().is_some_and(|line| line.width() == 0) {
         content.pop();
@@ -1004,6 +1091,7 @@ fn push_bubble(out: &mut Transcript, mut content: Vec<Line<'static>>, width: usi
     let border = bubble_border_style(theme);
     let panel = with_panel(Style::default(), theme.panel);
 
+    let base = out.lines.len();
     let mut top = Vec::new();
     if body_pad > 0 {
         top.push(Span::raw(" ".repeat(body_pad)));
@@ -1034,6 +1122,12 @@ fn push_bubble(out: &mut Transcript, mut content: Vec<Line<'static>>, width: usi
         out.push(Line::from(spans), None);
     }
 
+    // The top border occupies one line; content starts below it.
+    sources.retain(|(line, _)| *line >= removed);
+    for (line, source) in sources {
+        out.copy.push((base + 1 + line - removed, source));
+    }
+
     let mut bottom = Vec::new();
     if body_pad > 0 {
         bottom.push(Span::raw(" ".repeat(body_pad)));
@@ -1056,18 +1150,24 @@ fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usiz
             Style::default().fg(theme.comment.unwrap_or(MUTED)),
         )));
     }
+    let image_lines = content.len();
+    let mut sources = Vec::new();
     let text = text.trim_end();
     if !text.is_empty() {
         // The bubble supplies its own horizontal padding, so render without
-        // the transcript's usual two-cell left gutter.
-        content.extend(markdown::render_with_indent(
-            text,
-            content_width.max(1),
-            theme,
-            "",
-        ));
+        // the transcript's usual two-cell left gutter. Keep the copy metadata
+        // even though the bubble does not draw images.
+        let rendered =
+            markdown::render_with_indent_detailed(text, content_width.max(1), theme, "", false);
+        content.extend(rendered.lines);
+        sources.extend(
+            rendered
+                .sources
+                .into_iter()
+                .map(|(line, source)| (image_lines + line, source)),
+        );
     }
-    push_bubble(out, content, width, theme);
+    push_bubble(out, content, sources, width, theme);
     out.blank();
 }
 
@@ -1079,19 +1179,24 @@ fn assistant_message(
     cancelled: bool,
     width: usize,
     theme: Theme,
+    images: bool,
 ) {
-    let mut lines = markdown::render(text.trim_end_matches('\n'), width.max(1), theme);
-    if lines.is_empty() {
-        lines.push(Line::from("  "));
+    let mut rendered = markdown::render_with_indent_detailed(
+        text.trim_end_matches('\n'),
+        width.max(1),
+        theme,
+        "  ",
+        images,
+    );
+    if rendered.lines.is_empty() {
+        rendered.lines.push(Line::from("  "));
     }
     if cancelled {
-        if let Some(last) = lines.last_mut() {
+        if let Some(last) = rendered.lines.last_mut() {
             last.spans.push(Span::styled("  · cancelled", dim(theme)));
         }
     }
-    for line in lines {
-        out.push(line, None);
-    }
+    out.push_rendered(rendered);
     out.blank();
 }
 
@@ -1121,6 +1226,7 @@ fn compaction_summary(
     summary: &str,
     width: usize,
     theme: Theme,
+    images: bool,
 ) {
     note(
         out,
@@ -1131,9 +1237,9 @@ fn compaction_summary(
     );
     let indent = "    ";
     let content_width = width.saturating_sub(indent.len()).max(1);
-    for line in markdown::render_with_indent(summary, content_width, theme, indent) {
-        out.push(line, None);
-    }
+    let rendered =
+        markdown::render_with_indent_detailed(summary, content_width, theme, indent, images);
+    out.push_rendered(rendered);
     out.blank();
 }
 

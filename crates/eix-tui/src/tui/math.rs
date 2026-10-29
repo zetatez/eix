@@ -1,16 +1,22 @@
 //! Terminal-native display-math layout.
 //!
-//! This is not a TeX engine. It parses the subset of LaTeX that agent replies
-//! actually use and lays it out on a character grid: fractions get a real
-//! horizontal bar, roots get an overline, big operators put limits above and
-//! below, matrices keep their columns, and delimiters grow with their body.
-//! Inline math still uses the compact Unicode conversion in `markdown.rs`.
+//! This is the fallback used when the terminal cannot display images. It is
+//! not a TeX engine: it parses the subset of LaTeX that agent replies actually
+//! use and lays it out on a character grid: fractions get a real horizontal
+//! bar, roots get an overline, big operators put limits above and below,
+//! matrices keep their columns, and delimiters grow with their body. It also
+//! applies TeX-style inter-atom spacing, honours font commands such as
+//! `\mathbf`/`\mathit`, aligns `aligned`/`cases`/`array` columns, and draws
+//! frames for `\boxed`, `\overbrace` and `\underbrace`.
+//! Inline math stays on one line in a compact ASCII form (`x^2`, `1/(1+e^-x)`)
+//! so prose keeps its normal line height. Display math is rendered as a LaTeX
+//! image by [`super::math_image`] when a graphics protocol is available.
 
-use ratatui::style::Style;
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::markdown::{blackboard, subscript_char, superscript_char, symbol};
+use super::markdown::{blackboard, symbol};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AtomKind {
@@ -19,18 +25,60 @@ enum AtomKind {
     Function { limits: bool },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct Font {
+    bold: bool,
+    italic: bool,
+}
+
+impl Font {
+    fn merge(self, other: Font) -> Font {
+        Font {
+            bold: self.bold || other.bold,
+            italic: self.italic || other.italic,
+        }
+    }
+
+    fn style(self, base: Style) -> Style {
+        let mut modifier = Modifier::empty();
+        if self.bold {
+            modifier |= Modifier::BOLD;
+        }
+        if self.italic {
+            modifier |= Modifier::ITALIC;
+        }
+        base.add_modifier(modifier)
+    }
+}
+
+const BOLD: Font = Font {
+    bold: true,
+    italic: false,
+};
+const ITALIC: Font = Font {
+    bold: false,
+    italic: true,
+};
+
 #[derive(Clone)]
 enum Node {
     Row(Vec<Node>),
     Atom {
         text: String,
         kind: AtomKind,
+        font: Font,
     },
-    Text(String),
+    Text {
+        text: String,
+        font: Font,
+    },
     Space(usize),
     LineBreak,
     Fraction(Box<Node>, Box<Node>),
-    Sqrt(Box<Node>),
+    Sqrt {
+        body: Box<Node>,
+        index: Option<Box<Node>>,
+    },
     Script {
         base: Box<Node>,
         sup: Option<Box<Node>>,
@@ -47,6 +95,7 @@ enum Node {
     },
     Matrix {
         env: String,
+        spec: String,
         rows: Vec<Vec<Node>>,
     },
     OverUnder {
@@ -56,6 +105,7 @@ enum Node {
     },
     Binom(Box<Node>, Box<Node>),
     Negated(Box<Node>),
+    Boxed(Box<Node>),
 }
 
 #[derive(Clone, Copy)]
@@ -68,6 +118,8 @@ enum AccentKind {
     Tilde,
     Dot,
     Ddot,
+    OverBrace,
+    UnderBrace,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -76,6 +128,7 @@ struct Stop {
     amp: bool,
     row: bool,
     end: bool,
+    bracket: bool,
 }
 
 struct Parser {
@@ -157,6 +210,22 @@ impl Parser {
         }
     }
 
+    fn parse_optional_bracket(&mut self) -> Option<Node> {
+        self.skip_ws();
+        if self.peek() != Some('[') {
+            return None;
+        }
+        self.pos += 1;
+        let node = self.parse_row(Stop {
+            bracket: true,
+            ..Stop::default()
+        });
+        if self.peek() == Some(']') {
+            self.pos += 1;
+        }
+        Some(node)
+    }
+
     fn parse_raw_group(&mut self) -> String {
         self.skip_ws();
         if self.peek() != Some('{') {
@@ -212,6 +281,7 @@ impl Parser {
                 Node::Atom {
                     text: ch.to_string(),
                     kind: AtomKind::Normal,
+                    font: Font::default(),
                 }
             }
             None => Node::Row(Vec::new()),
@@ -242,6 +312,9 @@ impl Parser {
                 break;
             }
             if stop.amp && ch == '&' {
+                break;
+            }
+            if stop.bracket && ch == ']' {
                 break;
             }
             if ch == '\\' {
@@ -302,6 +375,7 @@ impl Parser {
                     nodes.push(Node::Atom {
                         text: ch.to_string(),
                         kind: AtomKind::Normal,
+                        font: Font::default(),
                     });
                 }
             }
@@ -344,9 +418,11 @@ impl Parser {
     }
 
     fn parse_matrix(&mut self, env: &str) -> Node {
-        if matches!(env, "array" | "tabular" | "array*" | "tabular*") {
-            let _ = self.parse_raw_group();
-        }
+        let spec = if matches!(env, "array" | "tabular" | "array*" | "tabular*") {
+            self.parse_raw_group()
+        } else {
+            String::new()
+        };
         let mut rows = Vec::new();
         let mut row = Vec::new();
         loop {
@@ -382,6 +458,7 @@ impl Parser {
         });
         Node::Matrix {
             env: env.to_string(),
+            spec,
             rows,
         }
     }
@@ -394,28 +471,35 @@ impl Parser {
                 Node::Fraction(Box::new(numerator), Box::new(denominator))
             }
             "sqrt" => {
-                self.skip_optional_bracket();
-                Node::Sqrt(Box::new(self.parse_arg()))
+                let index = self.parse_optional_bracket();
+                Node::Sqrt {
+                    body: Box::new(self.parse_arg()),
+                    index: index.map(Box::new),
+                }
             }
             "binom" | "dbinom" | "tbinom" => {
                 let n = self.parse_arg();
                 let k = self.parse_arg();
                 Node::Binom(Box::new(n), Box::new(k))
             }
-            "text" | "textrm" | "textnormal" | "mbox" => {
-                Node::Text(unescape_text(&self.parse_raw_group()))
-            }
+            "text" | "textrm" | "textnormal" | "mbox" => Node::Text {
+                text: unescape_text(&self.parse_raw_group()),
+                font: Font::default(),
+            },
             "operatorname" => Node::Atom {
                 text: unescape_text(&self.parse_raw_group()),
                 kind: AtomKind::Function { limits: false },
+                font: Font::default(),
             },
             "mathbb" => Node::Atom {
                 text: blackboard(&unescape_text(&self.parse_raw_group())),
                 kind: AtomKind::Normal,
+                font: Font::default(),
             },
-            "mathrm" | "mathbf" | "mathit" | "mathsf" | "mathtt" | "boldsymbol" | "bm"
-            | "mathcal" | "mathfrak" | "mathop" | "mathrel" | "mathbin" | "mathord"
-            | "mathopen" | "mathclose" | "mathpunct" | "mathinner" => self.parse_arg(),
+            "mathbf" | "boldsymbol" | "bm" => apply_font(self.parse_arg(), BOLD),
+            "mathit" | "mathcal" => apply_font(self.parse_arg(), ITALIC),
+            "mathrm" | "mathsf" | "mathtt" | "mathfrak" | "mathop" | "mathrel" | "mathbin"
+            | "mathord" | "mathopen" | "mathclose" | "mathpunct" | "mathinner" => self.parse_arg(),
             "overline" => Node::Accent {
                 kind: AccentKind::Overline,
                 body: Box::new(self.parse_arg()),
@@ -448,7 +532,14 @@ impl Parser {
                 kind: AccentKind::Ddot,
                 body: Box::new(self.parse_arg()),
             },
-            "overbrace" | "underbrace" => self.parse_arg(),
+            "overbrace" => Node::Accent {
+                kind: AccentKind::OverBrace,
+                body: Box::new(self.parse_arg()),
+            },
+            "underbrace" => Node::Accent {
+                kind: AccentKind::UnderBrace,
+                body: Box::new(self.parse_arg()),
+            },
             "overset" | "stackrel" => {
                 let over = self.parse_arg();
                 let body = self.parse_arg();
@@ -486,6 +577,7 @@ impl Parser {
             "middle" => Node::Atom {
                 text: self.parse_delimiter(),
                 kind: AtomKind::Normal,
+                font: Font::default(),
             },
             "begin" => {
                 let env = unescape_text(&self.parse_raw_group());
@@ -506,29 +598,34 @@ impl Parser {
             ";" => Node::Space(2),
             "!" => Node::Space(0),
             "newline" | "cr" => Node::LineBreak,
-            "mod" => Node::Text(" mod ".to_string()),
+            "mod" => Node::Text {
+                text: " mod ".to_string(),
+                font: Font::default(),
+            },
             "bmod" => Node::Row(vec![
                 Node::Space(1),
-                Node::Text("mod".to_string()),
+                Node::Text {
+                    text: "mod".to_string(),
+                    font: Font::default(),
+                },
                 Node::Space(1),
             ]),
             "pmod" => {
                 let arg = self.parse_arg();
                 Node::Row(vec![
                     Node::Space(1),
-                    Node::Text("(mod ".to_string()),
+                    Node::Text {
+                        text: "(mod ".to_string(),
+                        font: Font::default(),
+                    },
                     arg,
-                    Node::Text(")".to_string()),
+                    Node::Text {
+                        text: ")".to_string(),
+                        font: Font::default(),
+                    },
                 ])
             }
-            "boxed" | "fbox" => {
-                let body = self.parse_arg();
-                Node::Delimited {
-                    left: "[".to_string(),
-                    right: "]".to_string(),
-                    body: Box::new(body),
-                }
-            }
+            "boxed" | "fbox" => Node::Boxed(Box::new(self.parse_arg())),
             "phantom" | "hphantom" | "vphantom" => {
                 let _ = self.parse_arg();
                 Node::Space(1)
@@ -571,10 +668,12 @@ impl Parser {
             "{" | "}" | "$" | "%" | "&" | "#" | "_" | "[" | "]" | "(" | ")" => Node::Atom {
                 text: command.to_string(),
                 kind: AtomKind::Normal,
+                font: Font::default(),
             },
             "|" => Node::Atom {
                 text: "‖".to_string(),
                 kind: AtomKind::Normal,
+                font: Font::default(),
             },
             _ => {
                 if let Some(text) = big_operator(command) {
@@ -583,6 +682,7 @@ impl Parser {
                         kind: AtomKind::Operator {
                             limits: !matches!(command, "int" | "iint" | "iiint" | "oint"),
                         },
+                        font: Font::default(),
                     };
                 }
                 if let Some(text) = math_function(command) {
@@ -601,19 +701,24 @@ impl Parser {
                                     | "det"
                                     | "gcd"
                                     | "Pr"
+                                    | "argmax"
+                                    | "argmin"
                             ),
                         },
+                        font: Font::default(),
                     };
                 }
                 if let Some(text) = symbol(command) {
                     return Node::Atom {
                         text: text.to_string(),
                         kind: AtomKind::Normal,
+                        font: Font::default(),
                     };
                 }
                 Node::Atom {
                     text: command.to_string(),
                     kind: AtomKind::Normal,
+                    font: Font::default(),
                 }
             }
         }
@@ -663,6 +768,75 @@ fn attach_script(nodes: &mut Vec<Node>, sup: Option<Box<Node>>, sub: Option<Box<
             sup,
             sub,
         }),
+    }
+}
+
+fn apply_font(node: Node, font: Font) -> Node {
+    match node {
+        Node::Atom {
+            text,
+            kind,
+            font: existing,
+        } => Node::Atom {
+            text,
+            kind,
+            font: existing.merge(font),
+        },
+        Node::Text {
+            text,
+            font: existing,
+        } => Node::Text {
+            text,
+            font: existing.merge(font),
+        },
+        Node::Row(nodes) => Node::Row(
+            nodes
+                .into_iter()
+                .map(|node| apply_font(node, font))
+                .collect(),
+        ),
+        Node::Fraction(numerator, denominator) => Node::Fraction(
+            Box::new(apply_font(*numerator, font)),
+            Box::new(apply_font(*denominator, font)),
+        ),
+        Node::Sqrt { body, index } => Node::Sqrt {
+            body: Box::new(apply_font(*body, font)),
+            index: index.map(|node| Box::new(apply_font(*node, font))),
+        },
+        Node::Script { base, sup, sub } => Node::Script {
+            base: Box::new(apply_font(*base, font)),
+            sup: sup.map(|node| Box::new(apply_font(*node, font))),
+            sub: sub.map(|node| Box::new(apply_font(*node, font))),
+        },
+        Node::Delimited { left, right, body } => Node::Delimited {
+            left,
+            right,
+            body: Box::new(apply_font(*body, font)),
+        },
+        Node::Accent { kind, body } => Node::Accent {
+            kind,
+            body: Box::new(apply_font(*body, font)),
+        },
+        Node::Matrix { env, spec, rows } => Node::Matrix {
+            env,
+            spec,
+            rows: rows
+                .into_iter()
+                .map(|row| row.into_iter().map(|node| apply_font(node, font)).collect())
+                .collect(),
+        },
+        Node::OverUnder { over, under, body } => Node::OverUnder {
+            over: over.map(|node| Box::new(apply_font(*node, font))),
+            under: under.map(|node| Box::new(apply_font(*node, font))),
+            body: Box::new(apply_font(*body, font)),
+        },
+        Node::Binom(numerator, denominator) => Node::Binom(
+            Box::new(apply_font(*numerator, font)),
+            Box::new(apply_font(*denominator, font)),
+        ),
+        Node::Negated(body) => Node::Negated(Box::new(apply_font(*body, font))),
+        Node::Boxed(body) => Node::Boxed(Box::new(apply_font(*body, font))),
+        other @ (Node::Space(_) | Node::LineBreak) => other,
     }
 }
 
@@ -732,6 +906,14 @@ fn math_function(command: &str) -> Option<&'static str> {
         "deg" => "deg",
         "gcd" => "gcd",
         "Pr" => "Pr",
+        "sgn" => "sgn",
+        "tr" => "tr",
+        "rank" => "rank",
+        "diag" => "diag",
+        "erf" => "erf",
+        "lcm" => "lcm",
+        "argmax" => "arg max",
+        "argmin" => "arg min",
         _ => return None,
     })
 }
@@ -920,17 +1102,26 @@ fn layout(node: &Node, style: Style) -> MBox {
     match node {
         Node::Row(nodes) => {
             let mut groups: Vec<Vec<MBox>> = vec![Vec::new()];
-            let mut previous: Option<&Node> = None;
+            let mut previous: Option<SpaceClass> = None;
+            let mut pending = 0usize;
             for node in nodes {
-                if matches!(node, Node::LineBreak) {
-                    groups.push(Vec::new());
-                    previous = None;
-                } else {
-                    if previous.is_some_and(function_like) && needs_space_before(node) {
-                        groups.last_mut().unwrap().push(MBox::space(1, style));
+                match node {
+                    Node::LineBreak => {
+                        groups.push(Vec::new());
+                        previous = None;
+                        pending = 0;
                     }
-                    groups.last_mut().unwrap().push(layout(node, style));
-                    previous = Some(node);
+                    Node::Space(width) => pending = pending.max(*width),
+                    node => {
+                        let gap = pending.max(spacing(previous, node));
+                        let group = groups.last_mut().expect("row group");
+                        if gap > 0 {
+                            group.push(MBox::space(gap, style));
+                        }
+                        group.push(layout(node, style));
+                        pending = 0;
+                        previous = Some(effective_class(space_class(node), previous));
+                    }
                 }
             }
             let boxes: Vec<MBox> = groups
@@ -943,13 +1134,19 @@ fn layout(node: &Node, style: Style) -> MBox {
                 vcat(boxes, 0, style)
             }
         }
-        Node::Atom { text, .. } | Node::Text(text) => MBox::from_text(text, style),
+        Node::Atom { text, font, .. } | Node::Text { text, font } => {
+            MBox::from_text(text, font.style(style))
+        }
         Node::Space(width) => MBox::space(*width, style),
         Node::LineBreak => MBox::empty(),
         Node::Fraction(numerator, denominator) => {
             layout_fraction(layout(numerator, style), layout(denominator, style), style)
         }
-        Node::Sqrt(body) => layout_sqrt(layout(body, style), style),
+        Node::Sqrt { body, index } => layout_sqrt(
+            index.as_deref().map(|node| layout(node, style)),
+            layout(body, style),
+            style,
+        ),
         Node::Script { base, sup, sub } => {
             layout_script(base, sup.as_deref(), sub.as_deref(), style)
         }
@@ -958,7 +1155,7 @@ fn layout(node: &Node, style: Style) -> MBox {
             wrap_delimited(left, right, body, style)
         }
         Node::Accent { kind, body } => layout_accent(*kind, layout(body, style), style),
-        Node::Matrix { env, rows } => layout_matrix(env, rows, style),
+        Node::Matrix { env, spec, rows } => layout_matrix(env, spec, rows, style),
         Node::OverUnder { over, under, body } => layout_over_under(
             over.as_deref().map(|node| layout(node, style)),
             under.as_deref().map(|node| layout(node, style)),
@@ -970,6 +1167,7 @@ fn layout(node: &Node, style: Style) -> MBox {
             let denominator = layout(denominator, style);
             layout_binom(numerator, denominator, style)
         }
+        Node::Boxed(body) => layout_boxed(layout(body, style), style),
         Node::Negated(body) => {
             if let Some(text) = plain_text(body) {
                 if let Some(negated) = negate_text(&text) {
@@ -985,28 +1183,98 @@ fn layout(node: &Node, style: Style) -> MBox {
     }
 }
 
-fn function_like(node: &Node) -> bool {
-    match node {
-        Node::Atom {
-            kind: AtomKind::Operator { .. } | AtomKind::Function { .. },
-            ..
-        } => true,
-        Node::Script { base, .. } => function_like(base),
-        _ => false,
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SpaceClass {
+    Ordinary,
+    Operator,
+    Function,
+    Binary,
+    Relation,
+    Punctuation,
+    Open,
+    Close,
+}
+
+/// TeX-style inter-atom spacing on a character grid. Explicit source spaces
+/// are kept by the caller; this only adds the minimum LaTeX would insert.
+fn spacing(left: Option<SpaceClass>, next: &Node) -> usize {
+    let right = effective_class(space_class(next), left);
+    let Some(left) = left else {
+        return 0;
+    };
+    if right == SpaceClass::Punctuation || right == SpaceClass::Close {
+        return 0;
+    }
+    if left == SpaceClass::Open || right == SpaceClass::Open {
+        return 0;
+    }
+    if left == SpaceClass::Function || left == SpaceClass::Operator {
+        return 1;
+    }
+    if left == SpaceClass::Punctuation {
+        return 1;
+    }
+    if matches!(
+        (left, right),
+        (SpaceClass::Binary | SpaceClass::Relation, _)
+            | (_, SpaceClass::Binary | SpaceClass::Relation)
+    ) {
+        return 1;
+    }
+    0
+}
+
+/// A binary operator with no left operand is unary ("-x", "(-1)"), so it
+/// keeps its ordinary spacing instead of opening a gap on both sides.
+fn effective_class(class: SpaceClass, left: Option<SpaceClass>) -> SpaceClass {
+    if class == SpaceClass::Binary
+        && matches!(
+            left,
+            None | Some(
+                SpaceClass::Open
+                    | SpaceClass::Binary
+                    | SpaceClass::Relation
+                    | SpaceClass::Punctuation
+                    | SpaceClass::Function
+                    | SpaceClass::Operator
+            )
+        )
+    {
+        SpaceClass::Ordinary
+    } else {
+        class
     }
 }
 
-fn needs_space_before(node: &Node) -> bool {
-    !matches!(node, Node::Space(_) | Node::LineBreak)
-        && !matches!(
-            node,
-            Node::Atom { text, .. }
-                if matches!(
-                    text.as_str(),
-                    "," | ";" | ":" | ")" | "]" | "}" | "+" | "-" | "=" | "<" | ">"
-                        | "≤" | "≥" | "≠" | "≈"
-                )
-        )
+fn space_class(node: &Node) -> SpaceClass {
+    match node {
+        Node::Atom {
+            kind: AtomKind::Operator { .. },
+            ..
+        } => SpaceClass::Operator,
+        Node::Atom {
+            kind: AtomKind::Function { .. },
+            ..
+        } => SpaceClass::Function,
+        Node::Atom { text, .. } | Node::Text { text, .. } => text_class(text),
+        Node::Script { base, .. } => space_class(base),
+        Node::Negated(body) => space_class(body),
+        _ => SpaceClass::Ordinary,
+    }
+}
+
+fn text_class(text: &str) -> SpaceClass {
+    match text.trim() {
+        "," | ";" | ":" => SpaceClass::Punctuation,
+        "(" | "[" | "{" | "⟨" | "⌈" | "⌊" => SpaceClass::Open,
+        ")" | "]" | "}" | "⟩" | "⌉" | "⌋" => SpaceClass::Close,
+        "=" | "<" | ">" | "≤" | "≥" | "≠" | "≈" | "≡" | "∼" | "≅" | "≃" | "≍" | "∝" | "⊂" | "⊃"
+        | "⊆" | "⊇" | "∈" | "∉" | "∋" | "→" | "←" | "↔" | "⇒" | "⇐" | "⇔" | "↦" | "≪" | "≫"
+        | "≺" | "≻" | "⪯" | "⪰" | "⊥" | "∥" | "∣" => SpaceClass::Relation,
+        "+" | "-" | "−" | "±" | "∓" | "×" | "÷" | "·" | "∗" | "⋆" | "∘" | "•" | "∪" | "∩" | "∖"
+        | "⊕" | "⊖" | "⊗" | "⊙" | "∧" | "∨" => SpaceClass::Binary,
+        _ => SpaceClass::Ordinary,
+    }
 }
 
 fn layout_fraction(numerator: MBox, denominator: MBox, style: Style) -> MBox {
@@ -1022,30 +1290,40 @@ fn layout_fraction(numerator: MBox, denominator: MBox, style: Style) -> MBox {
     }
 }
 
-fn layout_sqrt(body: MBox, style: Style) -> MBox {
+fn layout_sqrt(index: Option<MBox>, body: MBox, style: Style) -> MBox {
     if body.rows.is_empty() {
         return MBox::from_text("√", style);
     }
-    let width = body.width + 1;
+    let index_height = index.as_ref().map_or(0, |part| part.rows.len());
+    let index_width = index.as_ref().map_or(0, |part| part.width);
+    let width = index_width + body.width + 1;
     let mut rows = Vec::new();
-    let mut top = vec![Cell::blank(style)];
+    if let Some(index) = &index {
+        for row in &index.rows {
+            let mut line = row.clone();
+            pad_row(&mut line, width, style);
+            rows.push(line);
+        }
+    }
+    let mut top = blank_row(index_width + 1, style);
     top.push(Cell::new("─".repeat(body.width), style));
     pad_row(&mut top, width, style);
     rows.push(top);
-    for (index, row) in body.rows.iter().enumerate() {
-        let prefix = if index + 1 == body.rows.len() {
+    for (line_index, row) in body.rows.iter().enumerate() {
+        let prefix = if line_index + 1 == body.rows.len() {
             "√"
         } else {
             "│"
         };
-        let mut line = vec![Cell::new(prefix, style)];
+        let mut line = blank_row(index_width, style);
+        line.push(Cell::new(prefix, style));
         line.extend(row.iter().cloned());
         pad_row(&mut line, width, style);
         rows.push(line);
     }
     MBox {
         rows,
-        baseline: body.baseline + 1,
+        baseline: index_height + body.baseline + 1,
         width,
     }
 }
@@ -1061,42 +1339,6 @@ fn layout_script(base: &Node, sup: Option<&Node>, sub: Option<&Node>, style: Sty
             ..
         }
     );
-    if !limits {
-        if let Some(base_text) = plain_text(base) {
-            let sup_text = sup.and_then(|node| script_text(node, true));
-            let sub_text = sub.and_then(|node| script_text(node, false));
-            let both = sup.is_some() && sub.is_some();
-            let integral = matches!(
-                base,
-                Node::Atom {
-                    kind: AtomKind::Operator { limits: false },
-                    ..
-                }
-            );
-            let complete =
-                (sup.is_none() || sup_text.is_some()) && (sub.is_none() || sub_text.is_some());
-            if (!both || integral) && complete {
-                let mut text = base_text;
-                if integral {
-                    if let Some(sub) = sub_text {
-                        text.push_str(&sub);
-                    }
-                    if let Some(sup) = sup_text {
-                        text.push_str(&sup);
-                    }
-                } else {
-                    if let Some(sup) = sup_text {
-                        text.push_str(&sup);
-                    }
-                    if let Some(sub) = sub_text {
-                        text.push_str(&sub);
-                    }
-                }
-                return MBox::from_text(&text, style);
-            }
-        }
-    }
-
     let base = layout(base, style);
     let sup = sup.map(|node| layout(node, style));
     let sub = sub.map(|node| layout(node, style));
@@ -1132,7 +1374,7 @@ fn layout_side_script(base: MBox, sup: Option<MBox>, sub: Option<MBox>, style: S
         baseline,
         width: script_width,
     };
-    hcat(vec![base, script], 0, style)
+    hcat(vec![base, script], usize::from(base_height > 1), style)
 }
 
 fn layout_limits(base: MBox, sup: Option<MBox>, sub: Option<MBox>, style: Style) -> MBox {
@@ -1231,8 +1473,10 @@ fn layout_accent(kind: AccentKind, body: MBox, style: Style) -> MBox {
         return body;
     }
     match kind {
-        AccentKind::Overline => accent_row(body, style, true),
-        AccentKind::Underline => accent_row(body, style, false),
+        AccentKind::Overline => accent_row(body, style, "─", true),
+        AccentKind::Underline => accent_row(body, style, "─", false),
+        AccentKind::OverBrace => accent_row(body, style, "⏞", true),
+        AccentKind::UnderBrace => accent_row(body, style, "⏟", false),
         AccentKind::Hat
         | AccentKind::Bar
         | AccentKind::Vec
@@ -1273,8 +1517,30 @@ fn layout_accent(kind: AccentKind, body: MBox, style: Style) -> MBox {
     }
 }
 
-fn accent_row(mut body: MBox, style: Style, over: bool) -> MBox {
-    let bar = vec![Cell::new("─".repeat(body.width.max(1)), style)];
+fn layout_boxed(body: MBox, style: Style) -> MBox {
+    if body.rows.is_empty() {
+        return MBox::empty();
+    }
+    let inner = body.width.max(1);
+    let mut rows = vec![vec![Cell::new(format!("┌{}┐", "─".repeat(inner)), style)]];
+    for row in &body.rows {
+        let mut line = vec![Cell::new("│", style)];
+        let mut row = row.clone();
+        pad_row(&mut row, inner, style);
+        line.extend(row);
+        line.push(Cell::new("│", style));
+        rows.push(line);
+    }
+    rows.push(vec![Cell::new(format!("└{}┘", "─".repeat(inner)), style)]);
+    MBox {
+        rows,
+        baseline: body.baseline + 1,
+        width: inner + 2,
+    }
+}
+
+fn accent_row(mut body: MBox, style: Style, mark: &str, over: bool) -> MBox {
+    let bar = vec![Cell::new(mark.repeat(body.width.max(1)), style)];
     if over {
         let mut rows = vec![bar];
         rows.extend(body.rows);
@@ -1301,7 +1567,40 @@ fn center_text_row(text: &str, width: usize, style: Style) -> Vec<Cell> {
     row
 }
 
-fn layout_matrix(env: &str, rows: &[Vec<Node>], style: Style) -> MBox {
+#[derive(Clone, Copy)]
+enum Align {
+    Left,
+    Center,
+    Right,
+}
+
+fn column_aligns(env: &str, spec: &str, columns: usize) -> Vec<Align> {
+    let env = env.trim_end_matches('*');
+    (0..columns)
+        .map(|index| match env {
+            "cases" => Align::Left,
+            "aligned" | "align" | "split" | "alignedat" | "alignat" => {
+                if index % 2 == 0 {
+                    Align::Right
+                } else {
+                    Align::Left
+                }
+            }
+            "array" | "tabular" => match spec
+                .chars()
+                .filter(|ch| matches!(ch, 'l' | 'c' | 'r'))
+                .nth(index)
+            {
+                Some('l') => Align::Left,
+                Some('r') => Align::Right,
+                _ => Align::Center,
+            },
+            _ => Align::Center,
+        })
+        .collect()
+}
+
+fn layout_matrix(env: &str, spec: &str, rows: &[Vec<Node>], style: Style) -> MBox {
     if rows.is_empty() {
         return MBox::empty();
     }
@@ -1319,7 +1618,15 @@ fn layout_matrix(env: &str, rows: &[Vec<Node>], style: Style) -> MBox {
             widths[index] = widths[index].max(cell.width);
         }
     }
-    let gap = 2usize;
+    let aligns = column_aligns(env, spec, columns);
+    let gap = if matches!(
+        env.trim_end_matches('*'),
+        "matrix" | "pmatrix" | "bmatrix" | "Bmatrix" | "vmatrix" | "Vmatrix" | "smallmatrix"
+    ) {
+        2
+    } else {
+        1
+    };
     let total_width = widths.iter().sum::<usize>() + gap * columns.saturating_sub(1);
     let mut row_boxes = Vec::new();
     for row in &cells {
@@ -1347,14 +1654,19 @@ fn layout_matrix(env: &str, rows: &[Vec<Node>], style: Style) -> MBox {
                 } else {
                     Vec::new()
                 };
-                let pad = width.saturating_sub(row_width(&piece)) / 2;
-                let mut centered = Vec::new();
+                let free = width.saturating_sub(row_width(&piece));
+                let pad = match aligns.get(index).copied().unwrap_or(Align::Center) {
+                    Align::Left => 0,
+                    Align::Right => free,
+                    Align::Center => free / 2,
+                };
+                let mut aligned = Vec::new();
                 for _ in 0..pad {
-                    centered.push(Cell::blank(style));
+                    aligned.push(Cell::blank(style));
                 }
-                centered.append(&mut piece);
-                pad_row(&mut centered, *width, style);
-                output.extend(centered);
+                aligned.append(&mut piece);
+                pad_row(&mut aligned, *width, style);
+                output.extend(aligned);
             }
             pad_row(&mut output, total_width, style);
             lines.push(output);
@@ -1418,40 +1730,8 @@ fn layout_binom(numerator: MBox, denominator: MBox, style: Style) -> MBox {
 
 fn plain_text(node: &Node) -> Option<String> {
     match node {
-        Node::Atom { text, .. } | Node::Text(text) => Some(text.clone()),
+        Node::Atom { text, .. } | Node::Text { text, .. } => Some(text.clone()),
         Node::Row(nodes) if nodes.len() == 1 => plain_text(&nodes[0]),
-        _ => None,
-    }
-}
-
-fn script_text(node: &Node, superscript: bool) -> Option<String> {
-    match node {
-        Node::Atom { text, .. } | Node::Text(text) => {
-            let mut out = String::new();
-            for ch in text.chars() {
-                let mapped = if superscript {
-                    superscript_char(ch)
-                } else {
-                    subscript_char(ch)
-                };
-                if let Some(ch) = mapped {
-                    out.push(ch);
-                } else if script_passthrough(ch) {
-                    out.push(ch);
-                } else {
-                    return None;
-                }
-            }
-            Some(out)
-        }
-        Node::Row(nodes) => {
-            let mut out = String::new();
-            for node in nodes {
-                out.push_str(&script_text(node, superscript)?);
-            }
-            Some(out)
-        }
-        Node::Space(width) => Some(" ".repeat(*width)),
         _ => None,
     }
 }
@@ -1486,32 +1766,10 @@ fn negate_text(text: &str) -> Option<String> {
     })
 }
 
-fn script_passthrough(ch: char) -> bool {
-    matches!(
-        ch,
-        '∞' | '→'
-            | '←'
-            | '↔'
-            | '⇒'
-            | '⇐'
-            | '⇔'
-            | '↦'
-            | '∈'
-            | '∉'
-            | ','
-            | ';'
-            | ':'
-            | '·'
-            | '±'
-            | '∓'
-            | '≤'
-            | '≥'
-            | '≠'
-            | '≈'
-            | '≡'
-            | '∼'
-            | '∝'
-    )
+/// A single-line, script-free rendering used where a 2D box cannot fit,
+/// such as inside a table cell.
+pub(super) fn compact(source: &str) -> String {
+    flatten(&Parser::new(source).parse())
 }
 
 pub fn display(source: &str, width: usize, style: Style) -> Vec<Line<'static>> {
@@ -1581,7 +1839,7 @@ fn rows_to_lines(rows: Vec<Vec<Cell>>, default_style: Style) -> Vec<Line<'static
 fn flatten(node: &Node) -> String {
     match node {
         Node::Row(nodes) => nodes.iter().map(flatten).collect(),
-        Node::Atom { text, .. } | Node::Text(text) => text.clone(),
+        Node::Atom { text, .. } | Node::Text { text, .. } => text.clone(),
         Node::Space(width) => " ".repeat(*width),
         Node::LineBreak => " ".to_string(),
         Node::Fraction(numerator, denominator) => {
@@ -1599,24 +1857,30 @@ fn flatten(node: &Node) -> String {
             };
             format!("{numerator}/{denominator}")
         }
-        Node::Sqrt(body) => {
+        Node::Sqrt { body, index } => {
             let body = flatten(body);
-            if needs_paren(&body) {
-                format!("√({body})")
+            let body = if needs_paren(&body) {
+                format!("({body})")
             } else {
-                format!("√{body}")
+                body
+            };
+            match index {
+                Some(index) => format!("{}√{body}", flatten(index)),
+                None => format!("√{body}"),
             }
         }
         Node::Script { base, sup, sub } => {
             let base = flatten(base);
-            let sup = sup
-                .as_deref()
-                .and_then(|node| script_text(node, true))
-                .or_else(|| sup.as_deref().map(|node| format!("^({})", flatten(node))));
-            let sub = sub
-                .as_deref()
-                .and_then(|node| script_text(node, false))
-                .or_else(|| sub.as_deref().map(|node| format!("_({})", flatten(node))));
+            let simple = |node: &Node| {
+                let text = flatten(node);
+                if text.chars().count() <= 1 || text.chars().all(|ch| ch.is_alphanumeric()) {
+                    text
+                } else {
+                    format!("({text})")
+                }
+            };
+            let sup = sup.as_deref().map(|node| format!("^{}", simple(node)));
+            let sub = sub.as_deref().map(|node| format!("_{}", simple(node)));
             let mut out = base;
             if let Some(sup) = sup {
                 out.push_str(&sup);
@@ -1630,7 +1894,7 @@ fn flatten(node: &Node) -> String {
             format!("{left}{}{right}", flatten(body))
         }
         Node::Accent { body, .. } => flatten(body),
-        Node::Matrix { env, rows } => {
+        Node::Matrix { env, rows, .. } => {
             let (left, right) = match env.trim_end_matches('*') {
                 "pmatrix" => ("(", ")"),
                 "bmatrix" => ("[", "]"),
@@ -1660,6 +1924,7 @@ fn flatten(node: &Node) -> String {
         Node::Binom(numerator, denominator) => {
             format!("C({},{})", flatten(numerator), flatten(denominator))
         }
+        Node::Boxed(body) => format!("[{}]", flatten(body)),
         Node::Negated(body) => {
             if let Some(text) = plain_text(body) {
                 if let Some(negated) = negate_text(&text) {
@@ -1725,4 +1990,126 @@ fn wrap_plain(text: &str, width: usize) -> Vec<String> {
         out.push(String::new());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn render(source: &str, width: usize) -> String {
+        display(source, width, Style::default())
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn trimmed(source: &str, width: usize) -> String {
+        render(source, width)
+            .lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn spacing_follows_tex_atom_classes() {
+        assert_eq!(trimmed("a+b=c", 40), "a + b = c");
+        assert_eq!(trimmed("x=-1", 40), "x = -1");
+        assert_eq!(trimmed("-x", 40), "-x");
+        assert_eq!(trimmed("(-1)", 40), "(-1)");
+        assert_eq!(trimmed("\\sin x", 40), "sin x");
+        assert_eq!(trimmed("\\sin(x)", 40), "sin(x)");
+        assert_eq!(trimmed("f(x, y)", 40), "f(x, y)");
+    }
+
+    #[test]
+    fn font_commands_add_modifiers() {
+        let lines = display("\\mathbf{v} + \\mathit{x}", 40, Style::default());
+        let mut bold = false;
+        let mut italic = false;
+        for span in lines.iter().flat_map(|line| line.spans.iter()) {
+            match span.content.as_ref() {
+                "v" => bold = span.style.add_modifier.contains(Modifier::BOLD),
+                "x" => italic = span.style.add_modifier.contains(Modifier::ITALIC),
+                _ => {}
+            }
+        }
+        assert!(bold, "\\mathbf did not bold its argument");
+        assert!(italic, "\\mathit did not italicise its argument");
+    }
+
+    #[test]
+    fn indexed_root_puts_the_index_above_the_radical() {
+        let output = render("\\sqrt[3]{x}", 20);
+        let lines: Vec<&str> = output.lines().map(str::trim).collect();
+        assert_eq!(lines.first().copied(), Some("3"), "{output}");
+        assert!(output.contains("√x"), "{output}");
+    }
+
+    #[test]
+    fn array_spec_controls_column_alignment() {
+        let output = render("\\begin{array}{lr} a & b \\\\ ccc & d \\end{array}", 40);
+        assert!(output.contains("a   b"), "{output}");
+        assert!(output.contains("ccc d"), "{output}");
+    }
+
+    #[test]
+    fn scripts_on_tall_bases_stack_above_and_below() {
+        let matrix = render("\\begin{pmatrix}1&2\\\\3&4\\end{pmatrix}^{-1}", 40);
+        assert!(!matrix.contains("⁻¹"), "{matrix}");
+        assert!(
+            matrix
+                .lines()
+                .next()
+                .is_some_and(|line| line.contains("-1")),
+            "{matrix}"
+        );
+
+        let bracket = render("\\left[\\frac{a}{b}\\right]_k", 40);
+        assert!(!bracket.contains("ₖ"), "{bracket}");
+        assert!(
+            bracket
+                .lines()
+                .last()
+                .is_some_and(|line| line.contains('k')),
+            "{bracket}"
+        );
+    }
+
+    #[test]
+    fn display_scripts_do_not_use_unicode_super_or_subscripts() {
+        let output = render("x^2 + y_1", 40);
+        assert!(!output.contains('²'), "{output}");
+        assert!(!output.contains('₁'), "{output}");
+        assert!(output.lines().count() > 1, "{output}");
+    }
+
+    #[test]
+    fn boxed_and_braced_expressions_get_frames() {
+        let boxed = render("\\boxed{x+1}", 20);
+        assert!(boxed.contains("┌─────┐"), "{boxed}");
+        assert!(boxed.contains("│x + 1│"), "{boxed}");
+        assert!(boxed.contains("└─────┘"), "{boxed}");
+        let brace = render("\\overbrace{a+b}^{n}", 30);
+        assert!(brace.contains('⏞'), "{brace}");
+    }
+
+    #[test]
+    fn extended_symbols_and_functions_render() {
+        let output = render(
+            "\\forall x \\in \\mathbb{R}: \\nabla f(x) = \\argmax_{y} g(y)",
+            80,
+        );
+        for needle in ["∀", "∈", "ℝ", "∇", "arg max"] {
+            assert!(output.contains(needle), "{needle}\n{output}");
+        }
+    }
 }

@@ -2603,7 +2603,10 @@ fn selection_text_spans_lines_and_respects_wide_glyphs() {
         dragging: false,
         moved: true,
     };
-    assert_eq!(selection_text(&lines, &selection), "world\nsecond");
+    assert_eq!(
+        selection_text(&lines, &HashMap::new(), &selection),
+        "world\nsecond"
+    );
 
     let wide = vec!["你a".to_string()];
     let selection = TextSelection {
@@ -2612,14 +2615,39 @@ fn selection_text_spans_lines_and_respects_wide_glyphs() {
         dragging: false,
         moved: true,
     };
-    assert_eq!(selection_text(&wide, &selection), "你");
+    assert_eq!(selection_text(&wide, &HashMap::new(), &selection), "你");
     let selection = TextSelection {
         anchor: (0, 0),
         cursor: (0, 3),
         dragging: false,
         moved: true,
     };
-    assert_eq!(selection_text(&wide, &selection), "你a");
+    assert_eq!(selection_text(&wide, &HashMap::new(), &selection), "你a");
+}
+
+#[test]
+fn selection_copies_display_math_as_latex_once() {
+    let lines = vec![
+        "before".to_string(),
+        "  a + b".to_string(),
+        "  ─────".to_string(),
+        "    c".to_string(),
+        "after".to_string(),
+    ];
+    let mut copy = HashMap::new();
+    for line in 1..=3 {
+        copy.insert(line, "\\frac{a+b}{c}".to_string());
+    }
+    let selection = TextSelection {
+        anchor: (0, 0),
+        cursor: (4, 5),
+        dragging: false,
+        moved: true,
+    };
+    assert_eq!(
+        selection_text(&lines, &copy, &selection),
+        "before\n\\frac{a+b}{c}\nafter"
+    );
 }
 
 #[test]

@@ -425,17 +425,79 @@ impl App {
             .title(title)
             .border_style(border_style)
             .title_style(title_style);
+        let pane_inner = block.inner(area);
         let mut paragraph = Paragraph::new(lines).block(block);
         if let Some(background) = theme.background {
             paragraph = paragraph.style(Style::default().bg(background));
         }
         frame.render_widget(paragraph, area);
 
+        // Graphics protocols paint over cells, so draw them after the text
+        // paragraph that reserved their placeholder rows.
+        self.draw_math_images(frame, pane_inner, index, scroll, end);
+
         if focused {
             self.draw_approval_card(frame, area, &session_id);
             if let Some(pending) = self.inputs.get(&session_id) {
                 draw_input_card(frame, area, pending, theme);
             }
+        }
+    }
+
+    /// Paint display-math images that intersect the visible transcript window.
+    /// The paragraph already reserved their cells, so this only overlays the
+    /// graphics; clipping keeps scrolled images inside the pane.
+    fn draw_math_images(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        index: usize,
+        scroll: usize,
+        end: usize,
+    ) {
+        if !crate::tui::math_image::enabled() {
+            return;
+        }
+        let view = &self.views[index];
+        let history_len = view
+            .history_cache
+            .as_ref()
+            .map(|cache| cache.lines.len())
+            .unwrap_or(0);
+        let mut images = Vec::new();
+        if let Some(cache) = view.history_cache.as_ref() {
+            images.extend(
+                cache
+                    .math
+                    .iter()
+                    .map(|placement| (placement.line, placement.column, placement.image.clone())),
+            );
+        }
+        images.extend(view.tail.math.iter().map(|placement| {
+            (
+                history_len + placement.line,
+                placement.column,
+                placement.image.clone(),
+            )
+        }));
+        for (line, column, image) in images {
+            if line < scroll || line >= end {
+                continue;
+            }
+            let rect = Rect {
+                x: area.x.saturating_add(column),
+                y: area.y.saturating_add((line - scroll) as u16),
+                width: image.cols,
+                height: image.rows,
+            }
+            .intersection(area);
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            frame.render_widget(
+                ratatui_image::Image::new(&image.protocol).allow_clipping(true),
+                rect,
+            );
         }
     }
 

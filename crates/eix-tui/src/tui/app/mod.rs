@@ -575,6 +575,9 @@ struct SessionView {
     /// Plain text for every transcript line from the last draw, used when a
     /// mouse selection is copied.
     text_lines: Vec<String>,
+    /// Line -> LaTeX source for rendered display math, merged from the history
+    /// cache and the live tail.
+    copy_overrides: HashMap<usize, String>,
     /// Stored user-message sequence -> first rendered line, for `/timeline`.
     user_lines: Vec<(u64, usize)>,
     /// Active mouse selection, if any.
@@ -604,6 +607,7 @@ impl SessionView {
             folds: HashMap::new(),
             slots: Vec::new(),
             text_lines: Vec::new(),
+            copy_overrides: HashMap::new(),
             user_lines: Vec::new(),
             selection: None,
         }
@@ -714,11 +718,22 @@ impl SessionView {
             return;
         }
         let mut lines = Vec::with_capacity(self.line_count);
+        let mut copy = HashMap::new();
+        let mut history_len = 0;
         if let Some(cache) = self.history_cache.as_ref() {
+            history_len = cache.lines.len();
             lines.extend(cache.lines.iter().map(text_line));
+            copy.extend(cache.copy.iter().cloned());
         }
         lines.extend(self.tail.lines.iter().map(text_line));
+        copy.extend(
+            self.tail
+                .copy
+                .iter()
+                .map(|(line, source)| (history_len + line, source.clone())),
+        );
         self.text_lines = lines;
+        self.copy_overrides = copy;
         self.text_lines_valid = true;
     }
 
@@ -4350,19 +4365,36 @@ fn normalize_selection(selection: &TextSelection) -> ((usize, usize), (usize, us
 /// Extract the selected cells from the plain transcript lines. Cell columns
 /// make the result line up with the reverse-video highlight, including for
 /// wide glyphs.
-fn selection_text(lines: &[String], selection: &TextSelection) -> String {
+///
+/// Rendered display math is copied as its LaTeX source. A formula spans
+/// several physical lines, so consecutive lines with the same source are
+/// emitted once.
+fn selection_text(
+    lines: &[String],
+    copy: &HashMap<usize, String>,
+    selection: &TextSelection,
+) -> String {
     let ((start_line, start_col), (end_line, end_col)) = normalize_selection(selection);
     if start_line >= lines.len() || start_line > end_line {
         return String::new();
     }
     let end_line = end_line.min(lines.len().saturating_sub(1));
     let mut selected = Vec::new();
+    let mut last_source: Option<&str> = None;
     for (index, line) in lines
         .iter()
         .enumerate()
         .skip(start_line)
         .take(end_line + 1 - start_line)
     {
+        if let Some(source) = copy.get(&index) {
+            if last_source != Some(source.as_str()) {
+                selected.push(source.clone());
+                last_source = Some(source.as_str());
+            }
+            continue;
+        }
+        last_source = None;
         let from = if index == start_line { start_col } else { 0 };
         let to = if index == end_line {
             end_col
