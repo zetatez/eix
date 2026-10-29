@@ -486,6 +486,15 @@ impl App {
         self.picker = None;
     }
 
+    /// Preset to persist for the next launch: the applied colorscheme, or the
+    /// "default" sentinel when the user cleared it.
+    pub(crate) fn theme_pref(&self) -> String {
+        self.theme_config
+            .preset
+            .clone()
+            .unwrap_or_else(|| THEME_DEFAULT_VALUE.to_string())
+    }
+
     /// Rows for the open picker: session indices or item indices. The result is
     /// cached until the query or the source rows change, because both the draw
     /// path and key handling ask for it more than once per keystroke.
@@ -591,6 +600,9 @@ impl App {
             session.id.hash(&mut hasher);
             session.name.hash(&mut hasher);
             session.cwd.hash(&mut hasher);
+            // Scoped project pickers order by `updated_at`; a live session
+            // update must invalidate the cached row order.
+            session.updated_at.hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -615,13 +627,26 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
-                let haystack = format!(
+                let mut haystack = format!(
                     "{} {} {}",
                     item.label,
                     item.value,
                     item.detail.as_deref().unwrap_or_default()
                 )
                 .to_lowercase();
+                // Project rows are paths; let a session name find its project
+                // even when the directory is the only thing shown.
+                if picker.kind == PickerKind::Projects {
+                    for session in self
+                        .sessions
+                        .iter()
+                        .filter(|session| !session.is_agent())
+                        .filter(|session| session.cwd.to_string_lossy() == item.value)
+                    {
+                        haystack.push(' ');
+                        haystack.push_str(&session.name.to_lowercase());
+                    }
+                }
                 fuzzy_score(&query, &haystack).map(|score| (score, index))
             })
             .collect();
@@ -693,6 +718,35 @@ impl App {
             PickerKind::NewPane => {
                 self.picker = None;
                 self.open_in_new_pane(index, tx);
+            }
+            PickerKind::Projects => {
+                let Some(value) = value else {
+                    return;
+                };
+                let Some(group) = self
+                    .project_groups()
+                    .into_iter()
+                    .find(|group| group.cwd.to_string_lossy() == value)
+                else {
+                    self.picker = None;
+                    return;
+                };
+                self.picker = None;
+                let count = group.sessions.len();
+                let cwd = group.cwd;
+                // Drill into the project's own sessions, newest first, so the
+                // user can search and pick one instead of being forced onto
+                // the most recent session.
+                self.open_picker(PickerKind::Sessions, tx);
+                if let Some(picker) = self.picker.as_mut() {
+                    picker.scope = Some(cwd.clone());
+                    picker.selected = 0;
+                }
+                self.status = format!(
+                    "project · {} · {count} session{}",
+                    cwd.display(),
+                    if count == 1 { "" } else { "s" }
+                );
             }
             PickerKind::Files | PickerKind::Grep => {
                 if let Some(value) = value {
@@ -1077,6 +1131,17 @@ impl App {
                 .unwrap_or(0);
             self.theme_picker_backup = Some((self.theme_config.clone(), self.theme));
             self.status = "colorscheme preview · Enter apply · Esc cancel".into();
+        } else if kind == PickerKind::Projects {
+            picker.set_items(self.project_picker_items());
+            let count = picker.items.len();
+            self.status = if count == 0 {
+                "projects: no sessions yet".into()
+            } else {
+                format!(
+                    "projects: {count} working director{} · newest session first",
+                    if count == 1 { "y" } else { "ies" }
+                )
+            };
         } else {
             // Subagent sessions are intentionally absent from the picker.
             // Resolve the focused session against the visible rows instead of
@@ -1123,6 +1188,7 @@ impl App {
                 id: id.to_string(),
                 title: title.clone(),
             }),
+            scope: None,
             items: Vec::new(),
             items_rev: 0,
             filter: PickerFilterCache::default(),
@@ -1168,7 +1234,7 @@ impl App {
             "commands" | "palette" => self.open_picker(PickerKind::Commands, tx),
             "keys" => self.open_keys_help(""),
             "sessions" => self.open_picker(PickerKind::Sessions, tx),
-            "new-pane" => self.open_picker(PickerKind::NewPane, tx),
+            "new" => self.open_picker(PickerKind::NewPane, tx),
             "files" => self.open_picker(PickerKind::Files, tx),
             "image" | "images" => self.open_picker(PickerKind::Images, tx),
             "grep" => self.open_grep_picker("", tx),
@@ -1184,7 +1250,7 @@ impl App {
             "approvals" => self.open_inbox(),
             "mcp" => self.open_picker(PickerKind::Mcp, tx),
             "todos" => self.open_picker(PickerKind::Todos, tx),
-            "new" => self.new_session(tx, None),
+            "new-session" => self.new_session(tx),
             "new-worktree" => self.new_worktree(tx, None),
             "fork" => self.fork_focused(tx, None),
             "cancel" => self.cancel(tx),

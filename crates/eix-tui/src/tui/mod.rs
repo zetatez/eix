@@ -13,6 +13,7 @@ mod markdown;
 mod math;
 mod math_image;
 pub(crate) mod net;
+mod prefs;
 mod syntax;
 mod theme;
 mod transcript;
@@ -59,7 +60,13 @@ pub async fn run(
     }
 
     let mut terminal = init_terminal()?;
-    let loaded = eix_core::Config::load(config.as_deref()).unwrap_or_default();
+    let mut loaded = eix_core::Config::load(config.as_deref()).unwrap_or_default();
+    // A colorscheme picked in a previous run outranks `[theme] preset`, so the
+    // TUI reopens with the palette the user last saw.
+    let saved_prefs = prefs::load(&data_dir);
+    if let Some(preset) = saved_prefs.preset_override() {
+        loaded.theme.preset = preset;
+    }
     // Probe for Kitty/Sixel/iTerm2 before the event stream starts reading
     // stdin. Without a graphics protocol display math stays on the
     // character grid.
@@ -194,6 +201,16 @@ pub async fn run(
         workspace::save(&data_dir, &cli_cwd, &active)
     };
 
+    // Persist the colorscheme on every exit path, so Ctrl-C / Ctrl-D reopen
+    // with the same palette even when the palette came from the picker rather
+    // than from config.
+    let theme_result = prefs::save(
+        &data_dir,
+        &prefs::Prefs {
+            theme: Some(app.theme_pref()),
+        },
+    );
+
     // Give queued commands (in particular the final draft save) a chance to
     // reach the daemon before the runtime is torn down.
     drop(cmd_tx);
@@ -202,6 +219,9 @@ pub async fn run(
     restore_terminal(&mut terminal)?;
     if let Err(err) = workspace_result {
         eprintln!("eix: cannot save active sessions: {err:#}");
+    }
+    if let Err(err) = theme_result {
+        eprintln!("eix: cannot save colorscheme: {err:#}");
     }
     if let Some(message) = app.exit_message.take() {
         eprintln!("eix: {message}");

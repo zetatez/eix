@@ -1829,10 +1829,10 @@ impl App {
         match action {
             KeyAction::Quit => self.run_action("quit", tx),
             KeyAction::Help => self.open_help(),
-            KeyAction::NewSession => self.run_action("new", tx),
+            KeyAction::NewSession => self.run_action("new-session", tx),
             KeyAction::NewWorktree => self.run_action("new-worktree", tx),
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
-            KeyAction::NewPane => self.run_action("new-pane", tx),
+            KeyAction::NewPane => self.run_action("new", tx),
             KeyAction::Palette => self.run_action("commands", tx),
             KeyAction::Files => self.run_action("files", tx),
             KeyAction::Grep => self.run_action("grep", tx),

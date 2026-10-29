@@ -3626,6 +3626,7 @@ fn file_picker_inserts_at_path_into_the_native_prompt() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: vec![PickerItem::new("src/main.rs"), PickerItem::new("README.md")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3650,6 +3651,7 @@ fn skills_picker_inserts_a_mention_instead_of_the_body() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: vec![PickerItem::new("review")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3818,6 +3820,7 @@ fn file_picker_preview_requests_the_selected_file() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: vec![PickerItem::new("src/a.rs"), PickerItem::new("src/b.rs")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3874,6 +3877,7 @@ fn file_picker_draws_the_lazy_preview_on_the_right() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: vec![PickerItem::new("src/a.rs")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3895,13 +3899,40 @@ fn file_picker_draws_the_lazy_preview_on_the_right() {
 }
 
 #[test]
-fn file_picker_wraps_long_preview_lines() {
+fn file_preview_highlights_by_extension() {
+    let rendered = super::overlay_draw::file_preview_rendered(
+        "src/lib.rs",
+        "   1 │ fn main() { let x = \"hello\"; }",
+        Theme::default(),
+    );
+    let colors: std::collections::HashSet<_> = rendered.lines[0]
+        .spans
+        .iter()
+        .map(|span| span.style.fg)
+        .collect();
+    assert!(
+        colors.len() > 2,
+        "expected syntax colors beyond the gutter: {:?}",
+        rendered.lines[0]
+    );
+
+    // Long source lines stay on one row; the pane clips them on the right
+    // instead of wrapping into continuation rows.
+    let long = format!("   1 │ {}", "x".repeat(200));
+    let clipped = super::overlay_draw::file_preview_rendered("src/a.rs", &long, Theme::default());
+    assert_eq!(clipped.lines.len(), 1, "{:?}", clipped.lines);
+    assert!(clipped.lines[0].spans[0].content.starts_with("   1 │"));
+}
+
+#[test]
+fn file_picker_clips_long_preview_lines() {
     let mut app = app_with_panes(&["s1"]);
     app.picker = Some(Picker {
         kind: PickerKind::Files,
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: vec![PickerItem::new("src/a.rs")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3919,11 +3950,14 @@ fn file_picker_wraps_long_preview_lines() {
     });
 
     let rendered = render_text(&mut app, 100, 24);
-    let wrapped = rendered
+    let clipped = rendered
         .lines()
         .filter(|line| line.contains("xxxx"))
         .count();
-    assert!(wrapped > 1, "preview did not wrap: {rendered}");
+    assert_eq!(
+        clipped, 1,
+        "preview wrapped instead of clipping: {rendered}"
+    );
 }
 
 #[test]
@@ -3982,10 +4016,7 @@ fn an_interrupted_turn_resumes_after_attach() {
 
 #[test]
 fn errors_and_agent_sessions_do_not_resume() {
-    for (status, agent) in [
-        (SessionStatus::Error, false),
-        (SessionStatus::Paused, true),
-    ] {
+    for (status, agent) in [(SessionStatus::Error, false), (SessionStatus::Paused, true)] {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(None);
         let mut session = Session::new("s1", "one", "/tmp");
@@ -4053,6 +4084,7 @@ fn session_picker_preview_requests_the_selected_session_history() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: Vec::new(),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -4093,6 +4125,7 @@ fn session_picker_preview_renders_markdown_and_display_math() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: Vec::new(),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -4162,6 +4195,101 @@ fn session_picker_hides_subagents_and_marks_worktrees_before_ids() {
 }
 
 #[test]
+fn projects_picker_groups_by_cwd_and_sorts_by_newest_session() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    let mut alpha_old = Session::new("a1", "alpha-old", "/tmp/eix-project-a");
+    alpha_old.updated_at = 1_000;
+    let mut alpha_new = Session::new("a2", "alpha-new", "/tmp/eix-project-a");
+    alpha_new.updated_at = 3_000;
+    let mut beta = Session::new("b1", "beta", "/tmp/eix-project-b");
+    beta.updated_at = 2_000;
+    let mut child = Session::new("c1", "hidden-child", "/tmp/eix-project-c");
+    child.origin = eix_core::SessionOrigin::Agent;
+    child.updated_at = 9_999;
+    app.sessions = vec![alpha_old, alpha_new, beta, child];
+
+    app.open_picker(PickerKind::Projects, &tx);
+    let items = &app.picker.as_ref().unwrap().items;
+    assert_eq!(items.len(), 2, "subagents must not form projects");
+    assert_eq!(items[0].value, "/tmp/eix-project-a");
+    assert_eq!(items[1].value, "/tmp/eix-project-b");
+    assert!(items[0].detail.as_deref().unwrap().contains("2 sessions"));
+    assert!(items[1].detail.as_deref().unwrap().contains("1 session"));
+
+    let preview = items[0].preview.as_deref().unwrap();
+    let newest = preview.find("alpha-new").expect("newest session");
+    let older = preview.find("alpha-old").expect("older session");
+    assert!(newest < older, "{preview}");
+
+    // Searching by a session name finds the project that contains it.
+    app.picker.as_mut().unwrap().query = "alpha-new".into();
+    assert_eq!(app.picker_filtered(), vec![0]);
+    app.picker.as_mut().unwrap().query = "project-b".into();
+    assert_eq!(app.picker_filtered(), vec![1]);
+}
+
+#[test]
+fn projects_picker_drills_into_scoped_sessions_and_opens_one() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    let mut alpha_new = Session::new("a2", "alpha-new", "/tmp/eix-project-a");
+    alpha_new.updated_at = 3_000;
+    let mut alpha_old = Session::new("a1", "alpha-old", "/tmp/eix-project-a");
+    alpha_old.updated_at = 1_000;
+    let mut beta = Session::new("b1", "beta", "/tmp/eix-project-b");
+    beta.updated_at = 9_000;
+    // Deliberately not in daemon order: the scoped picker must sort by time.
+    app.sessions = vec![alpha_old, alpha_new, beta];
+
+    app.open_picker(PickerKind::Projects, &tx);
+    // The newest project is selected first; move to project A explicitly.
+    app.picker.as_mut().unwrap().selected = 1;
+    app.picker_enter(PickerKind::Projects, &tx);
+
+    let picker = app.picker.as_ref().expect("scoped session picker");
+    assert_eq!(picker.kind, PickerKind::Sessions);
+    assert_eq!(
+        picker.scope.as_deref(),
+        Some(std::path::Path::new("/tmp/eix-project-a"))
+    );
+    // Only this project's sessions remain, newest first even though the
+    // session list arrived in the opposite order.
+    assert_eq!(app.picker_filtered(), vec![1, 0]);
+
+    // Search stays inside the project.
+    app.picker.as_mut().unwrap().query = "alpha-old".into();
+    assert_eq!(app.picker_filtered(), vec![0]);
+    app.picker.as_mut().unwrap().query.clear();
+
+    // Select the older session and confirm its global index reaches Attach.
+    app.picker.as_mut().unwrap().selected = 1;
+    app.picker_enter(PickerKind::Sessions, &tx);
+    assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "a1"));
+}
+
+#[test]
+fn projects_command_opens_the_project_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.sessions = vec![Session::new("s1", "one", "/tmp/eix-project-a")];
+    assert!(app.handle_command_text("/projects", &tx, true));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Projects)
+    );
+}
+
+#[test]
+fn projects_picker_reports_when_there_is_nothing_to_show() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.open_picker(PickerKind::Projects, &tx);
+    assert!(app.picker_filtered().is_empty());
+    assert_eq!(app.status, "projects: no sessions yet");
+}
+
+#[test]
 fn command_palette_enter_runs_the_command() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
@@ -4212,6 +4340,24 @@ fn colorscheme_command_opens_picker_and_escape_restores() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("usage: /colorscheme")));
+}
+
+#[test]
+fn applied_theme_is_what_gets_persisted_for_the_next_launch() {
+    let mut app = App::new(None);
+    app.theme_config.preset = Some("dark-github".into());
+    app.theme = Theme::from_config(&app.theme_config);
+    assert_eq!(app.theme_pref(), "dark-github");
+
+    // The picker path updates both the live theme and the persisted preset.
+    app.apply_theme_picker("light-github");
+    assert_eq!(app.theme.preset, Some("light-github"));
+    assert_eq!(app.theme_pref(), "light-github");
+
+    // Clearing the preset must be remembered too, not fall back to config.
+    app.apply_theme_picker(THEME_DEFAULT_VALUE);
+    assert_eq!(app.theme.preset, None);
+    assert_eq!(app.theme_pref(), THEME_DEFAULT_VALUE);
 }
 
 #[test]
@@ -4442,6 +4588,7 @@ fn command_palette_aligns_descriptions() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: command_items(&commands),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -4488,6 +4635,7 @@ fn picker_detail_columns_align_for_every_kind() {
         PickerKind::Themes,
         PickerKind::Mcp,
         PickerKind::Todos,
+        PickerKind::Projects,
     ];
     for kind in kinds {
         let mut app = App::new(None);
@@ -4496,6 +4644,7 @@ fn picker_detail_columns_align_for_every_kind() {
             query: String::new(),
             selected: 0,
             provider: None,
+            scope: None,
             items: vec![
                 PickerItem::new("a").with_label("a").with_detail("first"),
                 PickerItem::new("b")
@@ -4541,6 +4690,7 @@ fn session_picker_metadata_columns_align() {
         query: String::new(),
         selected: 0,
         provider: None,
+        scope: None,
         items: Vec::new(),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -5444,7 +5594,7 @@ fn new_session_reuses_the_focused_worktree_without_creating_one() {
     app.views.push(SessionView::new(session, Vec::new()));
     app.focused = 0;
 
-    assert!(app.handle_command_text("/new feature", &tx, false));
+    app.new_session(&tx);
     match rx.try_recv().expect("create command") {
         Command::Create {
             worktree,
@@ -5457,7 +5607,7 @@ fn new_session_reuses_the_focused_worktree_without_creating_one() {
                 cwd,
                 Some(std::path::PathBuf::from("/tmp/repo/.worktrees/feat/src"))
             );
-            assert_eq!(name.as_deref(), Some("feature"));
+            assert_eq!(name, None);
         }
         _ => panic!("expected a create command"),
     }
@@ -6145,6 +6295,28 @@ fn leader_o_opens_the_new_pane_picker() {
         app.picker.as_ref().map(|picker| picker.kind),
         Some(PickerKind::NewPane)
     ));
+}
+
+#[test]
+fn new_command_opens_the_new_pane_picker_instead_of_creating_a_session() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(session_pane("s1", "one"));
+    app.focused = 0;
+    app.focus = Focus::Input;
+
+    app.input.set_text("/new");
+    app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    assert!(matches!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::NewPane)
+    ));
+    while let Ok(command) = rx.try_recv() {
+        assert!(
+            !matches!(command, Command::Create { .. }),
+            "/new must not create a session"
+        );
+    }
 }
 
 #[test]

@@ -122,8 +122,8 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
 
 ### 4.6 worktree
 
-- 默认绑定 cwd 并共享当前工作区。`eix new --worktree` 新建隔离 session；TUI
-  `/new` 在当前 session 有 worktree 时于同一 worktree 新建 session（新 session 只共享
+- 默认绑定 cwd 并共享当前工作区。`eix new --worktree` 新建隔离 session；TUI 的
+  `<Space>n` 在当前 session 有 worktree 时于同一 worktree 新建 session（新 session 只共享
   目录，不持有 worktree 标记），否则共享其 cwd，不创建新 worktree；`/new-worktree` /
   `<Space>W` 则把**当前 session** 移入
   `.worktrees/<slug>`，已有 worktree 时只提示、不重复创建。
@@ -372,8 +372,7 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | 命令 | 行为 |
 |---|---|
 | `/help [query]` | 可搜索帮助（命令 / 快捷键 / notes），可带初始查询 |
-| `/new [name]` | 新建 session；聚焦 session 有 worktree 时复用它，否则共享其 cwd（不建 worktree） |
-| `/new-pane` | session picker，把已有 session 放进新 pane |
+| `/new` | session picker，把已有 session 放进新 pane（同 `<Space>o`） |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示 |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
 | `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要，生成结果在 transcript 中展示 |
@@ -381,6 +380,7 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `/cd [path]` | 切换 session cwd（`session.cd`，canonicalize 后校验在 worktree 内）；输入路径前缀时在输入框上方列出匹配的子目录，`Tab` 补全、`Enter` 切换 |
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
 | `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
+| `/projects` | 按工作目录聚合 session，项目与目录内 session 都按最新时间倒序；可搜索，`Enter` 进入该项目后选择 session |
 | `/files` / `/grep` / `/git` | picker；`/files` 插入 `@路径`，`/grep [query]` 搜索内容并插入 `@路径:行号`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
 | `/processes` / `/approvals` | 进程 / 审批收件箱 |
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览；`/mcp` 中 `Space` 启用/停用 server） |
@@ -419,6 +419,9 @@ Mariana、Gruvbox、Catppuccin、Rosé Pine 以及 Vim 的 Delek、Peach Puff、
 模式徽标会保留色相并自动压暗，保证至少 3:1 的对比度。预设里的 `background` 会同时应用到转录区、
 colorscheme picker 和其他浮层；默认配色和没有 `background` 的自定义配色继续使用终端背景。
 输入框不再使用独立的 `panel` 填充，始终跟随主题 `background`（默认即终端背景）。
+picker 里选定的 preset 会在退出（含 `Ctrl-C` / `Ctrl-D`）时写入 `<data_dir>/prefs.json`，下次启动
+自动恢复并覆盖 `[theme] preset`；选 `default` 也会被记住（清除 preset），不会回落到配置文件里的
+旧值。不直接改写 `config.toml`，避免破坏用户手写配置的注释与格式。
 转录渲染按 pane 缓存已存储事件：只有 live tail 和当前可见窗口每帧重绘，长会话的滚动、
 选择与流式输出不会反复解析整段历史；事件、宽度、主题或折叠状态变化时才重建缓存。
 attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加载更早的分页，合并后按新增行数
@@ -1337,8 +1340,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | 命令 | 行为 |
 | --- | --- |
 | `/help [query]` | 打开可搜索帮助（命令、快捷键、notes）；可带初始查询 |
-| `/new [name]` | 新建 session：当前 session 有 worktree 时复用它，否则共享当前工作区（不建 worktree） |
-| `/new-pane` | 打开 session picker，把已有 session 放进新 pane |
+| `/new` | 打开 session picker，把已有 session 放进新 pane（同 `<Space>o`） |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示，不重复创建 |
 | `/ready` | 把当前 worktree 交给 daemon 做 rebase / 测试 / ff merge |
 | `/integrate` | 显示当前 session 的集成队列状态与最近错误 |
@@ -1348,6 +1350,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/cd [path]` | 切换当前 session 的 cwd（支持 `~` 和相对路径）；输入路径前缀时列出匹配的子目录，`Tab` 补全、`Enter` 切换；省略时显示当前路径 |
 | `/init` | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送 |
 | `/sessions` | 打开 session picker |
+| `/projects` | 按工作目录浏览 session：项目按最新 session 时间倒序，进入项目后可在目录内搜索并选择 session |
 | `/files` | 文件 picker，选中后插入 `@path` |
 | `/grep [query]` | 内容 picker：搜索 workspace 文件内容，选中后插入 `@path:line`；可直接带初始查询 |
 | `/git` | git picker：worktrees + branches，选中后插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
@@ -1359,7 +1362,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/subagents [n|limit]` | 有子 agent 时打开实时 picker（搜索 child，右侧预览事件/工具调用/流式 thinking 与 answer，`Enter` 在新 pane 打开）；`limit` 或 `<n>` 调整 daemon 当前运行时的 `spawn_agent` 并发上限（默认 32，可选 2/4/8/16/32/64/128/256，仅本次 daemon 生命周期，`/reload` 或重启后回到配置文件默认值） |
 | `/mcp` | 打开 MCP server picker（搜索 server，右侧显示命令、工具数、错误；`Space` 在启用/停用之间切换并写回配置） |
 | `/reload` | 重新读取 daemon 的分层配置（等价于 `config.reload` RPC），并重新加载自定义 Markdown 命令 |
-| `/colorscheme` | 打开 colorscheme picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用，`Esc` 取消并恢复原配色 |
+| `/colorscheme` | 打开 colorscheme picker：`↑`/`↓` 或 `Ctrl-J`/`Ctrl-K` 实时预览，`Enter` 应用并在退出时保存，下次启动自动恢复，`Esc` 取消并恢复原配色 |
 | `/skills [name] [args]` | 打开 skill picker（右侧预览正文）；选中后插入 `@name`；带名字时插入 `@name`，额外参数附在后面 |
 | `/todos` | 打开任务列表 picker（搜索任务，显示状态和详情；内存态，daemon 重启后清空） |
 | `/image [path|clear]` | 不带参数时打开可搜索的图片 picker（png / jpg / jpeg / gif / webp），`Enter` 把图片挂到下一条 prompt 并插入 `@路径`；带路径直接挂载（最多 4 张、每张 8 MB），`/image clear` 清空；也支持直接粘贴或拖入路径 / `file://` URI |

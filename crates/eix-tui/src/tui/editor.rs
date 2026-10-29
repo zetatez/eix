@@ -1856,14 +1856,14 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
 /// used to install: plain letters stay native, TUI features live behind Space.
 pub(super) fn leader_action(ch: char) -> Option<&'static str> {
     Some(match ch {
-        'o' => "new-pane",
+        'o' => "new",
         'f' => "files",
         's' => "grep",
         'g' => "git",
         'c' => "close-pane",
         'p' => "processes",
         'a' => "approvals",
-        'n' => "new",
+        'n' => "new-session",
         'W' => "new-worktree",
         'v' => "layout-horizontal",
         't' => "layout-tabby",
@@ -2082,10 +2082,7 @@ mod tests {
     fn space_is_the_leader_in_normal_mode() {
         let mut editor = editor_with("");
         let _ = key(&mut editor, KeyCode::Char(' '));
-        assert_eq!(
-            key(&mut editor, KeyCode::Char('o')),
-            Outcome::Action("new-pane")
-        );
+        assert_eq!(key(&mut editor, KeyCode::Char('o')), Outcome::Action("new"));
         // Unknown leader chords are ignored.
         let _ = key(&mut editor, KeyCode::Char(' '));
         assert_eq!(key(&mut editor, KeyCode::Char('z')), Outcome::Ignored);

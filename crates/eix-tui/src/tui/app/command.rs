@@ -86,11 +86,6 @@ impl App {
                 true
             }
             "new" => {
-                let name = (!args.is_empty()).then(|| args.to_string());
-                self.new_session(tx, name);
-                true
-            }
-            "new-pane" => {
                 self.open_picker(PickerKind::NewPane, tx);
                 true
             }
@@ -258,6 +253,10 @@ impl App {
             }
             "sessions" => {
                 self.open_picker(PickerKind::Sessions, tx);
+                true
+            }
+            "projects" => {
+                self.open_picker(PickerKind::Projects, tx);
                 true
             }
             "model" => {

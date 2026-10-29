@@ -86,8 +86,9 @@ const PICKER_LABEL_MAX: usize = 28;
 /// Maximum key column in the searchable help/key reference.
 const HELP_KEY_MAX: usize = 28;
 
-/// Picker value for "no preset" (keep the terminal/default palette).
-const THEME_DEFAULT_VALUE: &str = "@default";
+/// Picker value for "no preset" (keep the terminal/default palette). Shared
+/// with [`super::prefs`], which stores the picked scheme across restarts.
+const THEME_DEFAULT_VALUE: &str = super::prefs::DEFAULT_THEME;
 
 /// Running sessions rotate a quadrant square clockwise; idle sessions show `⠶`.
 const RUNNING_SPINNER: [&str; 4] = ["◰", "◳", "◲", "◱"];
@@ -170,12 +171,7 @@ fn command_alias(name: &str) -> Option<&'static str> {
 fn builtin_commands() -> Vec<CommandSpec> {
     vec![
         builtin("help", "[query]", "search the key and command reference"),
-        builtin(
-            "new",
-            "[name]",
-            "start a session; reuse the focused session's worktree if present",
-        ),
-        builtin("new-pane", "", "open a session in a new pane"),
+        builtin("new", "", "open a session in a new pane"),
         builtin(
             "new-worktree",
             "[name]",
@@ -215,6 +211,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("cd", "[path]", "change the session cwd, with directory completion"),
         builtin("init", "", "draft an AGENTS.md for this workspace"),
         builtin("sessions", "", "open the session picker"),
+        builtin(
+            "projects",
+            "",
+            "browse sessions by working directory, newest first",
+        ),
         builtin(
             "model",
             "[id]",
@@ -1197,6 +1198,8 @@ enum PickerKind {
     Sessions,
     /// Open the chosen session in a new pane (or focus it if already open).
     NewPane,
+    /// Browse sessions grouped by working directory, newest project first.
+    Projects,
     /// Insert a workspace file after `@` in the prompt.
     Files,
     /// Attach a workspace image and insert it as `@path` in the prompt.
@@ -1270,6 +1273,7 @@ impl PickerKind {
             Self::Git => Some(eix_core::KIND_GIT),
             Self::Sessions
             | Self::NewPane
+            | Self::Projects
             | Self::Commands
             | Self::Models
             | Self::PlanModels
@@ -1304,6 +1308,7 @@ impl PickerKind {
         match self {
             Self::Sessions => "sessions — switch focused pane",
             Self::NewPane => "sessions — open in a new pane",
+            Self::Projects => "projects — newest sessions",
             Self::Files => "files — insert after @",
             Self::Images => "images — attach and insert after @",
             Self::Grep => "grep — file contents",
@@ -1333,6 +1338,9 @@ impl PickerKind {
         match self {
             Self::Sessions => "Enter open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::NewPane => "Enter split · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
+            Self::Projects => {
+                "type to search · Enter pick a session · ↑/↓ or C-j/C-k/C-n/C-p · Esc close"
+            }
             Self::Files => "Enter insert · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Images => {
                 "type to search · Enter attach and insert @path · ↑/↓ or C-j/C-k/C-n/C-p · Esc close"
@@ -1421,6 +1429,9 @@ struct Picker {
     selected: usize,
     /// Provider for `PickerKind::Plugin`; `None` for built-in kinds.
     provider: Option<PluginPickerProvider>,
+    /// Restrict a session picker to one working directory. Set when `/projects`
+    /// drills into a project, so the rows and search stay inside that project.
+    scope: Option<std::path::PathBuf>,
     /// Rows for data providers and the command palette. Session kinds read
     /// `App::sessions` directly so live status changes show through.
     items: Vec<PickerItem>,
@@ -1445,6 +1456,7 @@ impl Picker {
             query: String::new(),
             selected: 0,
             provider: None,
+            scope: None,
             items: Vec::new(),
             items_rev: 0,
             filter: PickerFilterCache::default(),
@@ -3026,10 +3038,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/new",
-                description: "start a session; reuse the focused session's worktree if present",
-            },
-            HelpEntry {
-                key: "/new-pane",
                 description: "choose an existing session for a new pane",
             },
             HelpEntry {
@@ -3059,6 +3067,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "/sessions",
                 description: "switch the focused pane's session",
+            },
+            HelpEntry {
+                key: "/projects",
+                description: "browse sessions grouped by working directory, newest first",
             },
             HelpEntry {
                 key: "/files",

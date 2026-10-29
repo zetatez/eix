@@ -5724,6 +5724,9 @@ extensions = ["zig"]
     fn math_config_validates_limits() {
         let mut config = Config::default();
         config.validate().expect("defaults are valid");
+        // Math rendering is on by default; `/math off` is the opt-out.
+        assert!(config.math.images);
+        assert_eq!(config.math.dpi, 200);
 
         config.math.dpi = 10;
         assert!(config.validate().is_err());

@@ -122,15 +122,32 @@ impl App {
             return Vec::new();
         };
         let query = picker.query.trim().to_lowercase();
+        let scope = picker.scope.as_deref();
+        let in_scope = |session: &Session| scope.is_none_or(|cwd| session.cwd.as_path() == cwd);
         if query.is_empty() {
-            return self.visible_session_indices();
+            let mut visible: Vec<usize> = self
+                .visible_session_indices()
+                .into_iter()
+                .filter(|&index| in_scope(&self.sessions[index]))
+                .collect();
+            // A project drill-down is ordered like `/projects`: newest first.
+            if scope.is_some() {
+                visible.sort_by(|a, b| {
+                    self.sessions[*b]
+                        .updated_at
+                        .cmp(&self.sessions[*a].updated_at)
+                        .then_with(|| self.sessions[*a].name.cmp(&self.sessions[*b].name))
+                        .then_with(|| self.sessions[*a].id.cmp(&self.sessions[*b].id))
+                });
+            }
+            return visible;
         }
         let mut hits: Vec<(i32, usize)> = self
             .sessions
             .iter()
             .enumerate()
             .filter_map(|(index, session)| {
-                if session.is_agent() {
+                if session.is_agent() || !in_scope(session) {
                     return None;
                 }
                 let haystack = format!("{} {} {}", session.name, session.id, session.cwd.display())
@@ -142,17 +159,91 @@ impl App {
         hits.into_iter().map(|(_, index)| index).collect()
     }
 
+    /// Visible sessions grouped by working directory. Groups follow the newest
+    /// session in each directory (desc); rows inside a group also follow
+    /// `updated_at` desc, so `/projects` opens on the most recently used work.
+    pub(super) fn project_groups(&self) -> Vec<ProjectGroup> {
+        let mut grouped: std::collections::BTreeMap<std::path::PathBuf, Vec<usize>> =
+            std::collections::BTreeMap::new();
+        for index in self.visible_session_indices() {
+            grouped
+                .entry(self.sessions[index].cwd.clone())
+                .or_default()
+                .push(index);
+        }
+        let mut groups: Vec<ProjectGroup> = grouped
+            .into_iter()
+            .map(|(cwd, mut sessions)| {
+                sessions.sort_by(|a, b| {
+                    self.sessions[*b]
+                        .updated_at
+                        .cmp(&self.sessions[*a].updated_at)
+                        .then_with(|| self.sessions[*a].name.cmp(&self.sessions[*b].name))
+                        .then_with(|| self.sessions[*a].id.cmp(&self.sessions[*b].id))
+                });
+                let latest = sessions
+                    .first()
+                    .map(|&index| self.sessions[index].updated_at)
+                    .unwrap_or_default();
+                ProjectGroup {
+                    cwd,
+                    sessions,
+                    latest,
+                }
+            })
+            .collect();
+        groups.sort_by(|a, b| b.latest.cmp(&a.latest).then_with(|| a.cwd.cmp(&b.cwd)));
+        groups
+    }
+
+    /// One row per project, newest project first. The row value is the cwd;
+    /// the preview lists that project's sessions so the right pane explains
+    /// what Enter will drill into.
+    pub(super) fn project_picker_items(&self) -> Vec<PickerItem> {
+        self.project_groups()
+            .iter()
+            .map(|group| {
+                let count = group.sessions.len();
+                let detail = format!(
+                    "{count} session{} · {}",
+                    if count == 1 { "" } else { "s" },
+                    relative_age(group.latest)
+                );
+                let mut preview = vec![
+                    group.cwd.display().to_string(),
+                    String::new(),
+                    format!("{count} session{}", if count == 1 { "" } else { "s" }),
+                    String::new(),
+                ];
+                for &index in &group.sessions {
+                    let session = &self.sessions[index];
+                    preview.push(format!(
+                        "{}  {}  {}  {}",
+                        session.status.symbol(),
+                        session.name,
+                        short_id(&session.id),
+                        relative_age(session.updated_at),
+                    ));
+                }
+                PickerItem::new(group.cwd.to_string_lossy())
+                    .with_label(group.cwd.display().to_string())
+                    .with_detail(detail)
+                    .with_preview(preview.join("\n"))
+            })
+            .collect()
+    }
+
     pub(super) fn create_session(&mut self, tx: &UnboundedSender<Command>, worktree: Option<bool>) {
         self.create_session_in(tx, worktree, None, None);
     }
 
     /// Create a session on the focused session's workspace. If it already runs
     /// in a worktree the new session shares that worktree; otherwise it shares
-    /// the plain workspace. `/new` never creates a new worktree — that is what
-    /// `/new-worktree` is for.
-    pub(super) fn new_session(&mut self, tx: &UnboundedSender<Command>, name: Option<String>) {
+    /// the plain workspace. `<Space>n` never creates a new worktree — that is
+    /// what `/new-worktree` is for.
+    pub(super) fn new_session(&mut self, tx: &UnboundedSender<Command>) {
         let cwd = self.focused_view().map(|view| view.session.cwd.clone());
-        self.create_session_in(tx, Some(false), cwd, name);
+        self.create_session_in(tx, Some(false), cwd, None);
     }
 
     /// Move the focused session into a new worktree. A session can only own
@@ -938,5 +1029,34 @@ impl App {
             model: Some(model),
         });
         true
+    }
+}
+
+/// One working directory and its visible sessions, newest session first.
+pub(super) struct ProjectGroup {
+    pub(super) cwd: std::path::PathBuf,
+    pub(super) sessions: Vec<usize>,
+    pub(super) latest: i64,
+}
+
+/// Short "2m ago" style age for picker details. Old entries fall back to a
+/// date instead of an unwieldy day count.
+fn relative_age(ts: i64) -> String {
+    if ts <= 0 {
+        return "unknown".into();
+    }
+    let seconds = (chrono::Utc::now().timestamp_millis() - ts).max(0) / 1000;
+    match seconds {
+        0..=59 => "just now".into(),
+        60..=3599 => format!("{}m ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        86_400..=2_592_000 => format!("{}d ago", seconds / 86_400),
+        _ => chrono::DateTime::from_timestamp_millis(ts)
+            .map(|dt| {
+                dt.with_timezone(&chrono::Local)
+                    .format("%Y-%m-%d")
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unknown".into()),
     }
 }

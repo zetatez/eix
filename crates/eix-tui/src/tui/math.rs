@@ -1766,6 +1766,13 @@ fn negate_text(text: &str) -> Option<String> {
     })
 }
 
+/// A single-line, script-free rendering used when a real image is not
+/// available, such as a terminal without Kitty/Sixel/iTerm2 support. Math
+/// stays readable instead of reverting to the literal `$...$` source.
+pub(super) fn compact(source: &str) -> String {
+    flatten(&Parser::new(source).parse())
+}
+
 pub fn display(source: &str, width: usize, style: Style) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();

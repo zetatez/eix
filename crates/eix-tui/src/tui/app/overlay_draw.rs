@@ -1,6 +1,7 @@
 //! Rendering of cmdline, menus and overlay panels.
 
 use super::*;
+use crate::tui::syntax::CodeHighlighter;
 
 impl App {
     /// Vim-style command line below the status bar. It is always visible when
@@ -1071,9 +1072,9 @@ impl App {
         }
     }
 
-    /// Rich preview for the session and child-agent panes. Returns `None` for
-    /// other kinds (and while a session preview is still loading), so the
-    /// caller keeps using the plain-text path.
+    /// Rich preview for the session, file and child-agent panes. Returns
+    /// `None` for other kinds (and while a session/file preview is still
+    /// loading or failed), so the caller keeps using the plain-text path.
     pub(super) fn picker_preview_rich(
         &mut self,
         filtered: &[usize],
@@ -1092,6 +1093,33 @@ impl App {
                 .rendered
                 .clone()
                 .map(|preview| preview.tail(height)),
+            PickerKind::Files => {
+                let (path, text) = {
+                    let picker = self.picker.as_ref()?;
+                    let path = picker
+                        .preview
+                        .key
+                        .clone()
+                        .or_else(|| picker.items.get(index).map(|item| item.value.clone()))?;
+                    (path, picker.preview.text.clone()?)
+                };
+                // The highlight pass is stateful and not free; keep the
+                // wrapped result until the pane width or the selected row
+                // changes (both reset `rendered`).
+                if let Some(picker) = self.picker.as_ref() {
+                    if picker.preview.rendered_width == width {
+                        if let Some(preview) = &picker.preview.rendered {
+                            return Some(preview.clone());
+                        }
+                    }
+                }
+                let preview = file_preview_rendered(&path, &text, self.theme);
+                if let Some(picker) = &mut self.picker {
+                    picker.preview.rendered = Some(preview.clone());
+                    picker.preview.rendered_width = width;
+                }
+                Some(preview)
+            }
             PickerKind::Sessions | PickerKind::NewPane => {
                 let text = {
                     let picker = self.picker.as_ref()?;
@@ -1481,6 +1509,54 @@ fn preview_head(text: &str, height: usize) -> Vec<String> {
         .take(height.max(1))
         .map(str::to_string)
         .collect()
+}
+
+/// Render a daemon file preview as syntax-highlighted rows.
+///
+/// The daemon sends `{line:>4} │ {text}`. The gutter is split off so only the
+/// source text reaches the highlighter. Each source line stays on one row: the
+/// pane clips long lines on the right instead of wrapping them, so `/files`
+/// previews keep the file's real line numbers aligned.
+pub(super) fn file_preview_rendered(path: &str, text: &str, theme: Theme) -> PreviewRendered {
+    let mut highlighter = CodeHighlighter::new(path, theme);
+    let gutter_style = Style::default().fg(composer_muted(theme));
+    let mut rows: Vec<Line<'static>> = Vec::new();
+    for raw in text.lines() {
+        let (prefix, content) = split_file_preview_line(raw);
+        let content = content.replace('\t', "    ");
+        // The trailing newline lets syntect carry multi-line state (block
+        // comments, template strings) into the next line; strip it again so
+        // the span does not render an extra row.
+        let mut spans = highlighter.spans(&format!("{content}\n"));
+        if let Some(last) = spans.last_mut() {
+            last.content = last.content.trim_end_matches('\n').to_string().into();
+        }
+        spans.retain(|span| !span.content.is_empty());
+        let mut line = Vec::with_capacity(spans.len() + 1);
+        line.push(Span::styled(prefix.to_string(), gutter_style));
+        line.extend(spans);
+        rows.push(Line::from(line));
+    }
+    if rows.is_empty() {
+        rows.push(Line::from(Span::styled(String::new(), gutter_style)));
+    }
+    PreviewRendered {
+        lines: rows,
+        math: Vec::new(),
+        bytes: text.len(),
+    }
+}
+
+/// Separate the `   12 │ ` gutter from a preview line. A line without a
+/// numeric gutter (binary notice, empty file) comes back whole.
+fn split_file_preview_line(line: &str) -> (&str, &str) {
+    if let Some(index) = line.find(" │ ") {
+        let prefix = &line[..index];
+        if !prefix.trim().is_empty() && prefix.chars().all(|ch| ch.is_ascii_digit() || ch == ' ') {
+            return line.split_at(index + " │ ".len());
+        }
+    }
+    ("", line)
 }
 
 /// Last `height` source lines, used for conversations where the newest output

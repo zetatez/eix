@@ -8,7 +8,7 @@
 //! image when a graphics protocol is available: display math on its own
 //! block, inline math scaled to a single text row. When no image can be
 //! drawn, display math falls back to the character-grid layout and inline
-//! math to its literal `$...$` source; with math turned off both stay as the
+//! math to a compact one-line form; with math turned off both stay as the
 //! literal TeX the message contained.
 //!
 //! It intentionally only covers the constructs that make a chat transcript
@@ -831,13 +831,14 @@ impl Renderer {
     /// Inline math becomes a single-row image when the terminal can paint one;
     /// otherwise it stays as the literal `$...$` Markdown source.
     fn inline_math(&mut self, source: &str) {
-        if self.cell.is_some() {
+        let real_math = looks_like_math(source);
+        if self.cell.is_some() || !real_math || self.raw {
             self.append_styled(&format!("${source}$"), self.style);
             return;
         }
         let color = math_text_color(self.theme);
         let width = self.inline_avail();
-        if self.images && !self.raw {
+        if self.images {
             if let Some(image) = math_image::render_inline(source, width, color) {
                 let cols = usize::from(image.cols.max(1));
                 if image.rows == 1 && cols <= width {
@@ -859,8 +860,18 @@ impl Renderer {
                     inline: true,
                 });
             }
+            // Images are available but this formula needs more than one row:
+            // keep the source instead of shrinking it into an unreadable
+            // single-row picture.
+            self.append_styled(&format!("${source}$"), self.style);
+            return;
         }
-        self.append_styled(&format!("${source}$"), self.style);
+        // No graphics protocol: math is still on, so render a compact
+        // single-line form rather than showing raw TeX.
+        let style = Style::default()
+            .fg(accent(self.theme))
+            .add_modifier(Modifier::ITALIC);
+        self.append_styled(&math::compact(source), style);
     }
 
     /// Width available to a paragraph after its list/quote/heading prefix.
@@ -1310,6 +1321,40 @@ fn dim(theme: Theme) -> Style {
 
 // ----- TeX to Unicode -----------------------------------------------------
 
+/// Decide whether an inline `$...$` span is real math rather than shell
+/// syntax. `$PATH and $HOME` in a shell snippet parses as math, so a span
+/// without any math syntax (and longer than one letter) stays literal.
+pub(super) fn looks_like_math(source: &str) -> bool {
+    let trimmed = source.trim();
+    if trimmed.chars().count() == 1 && trimmed.chars().all(char::is_alphabetic) {
+        return true;
+    }
+    trimmed.chars().any(|ch| {
+        matches!(
+            ch,
+            '\\' | '^'
+                | '_'
+                | '{'
+                | '}'
+                | '['
+                | ']'
+                | '('
+                | ')'
+                | '='
+                | '<'
+                | '>'
+                | '+'
+                | '-'
+                | '*'
+                | '/'
+                | '|'
+                | '!'
+                | ','
+                | '\''
+        ) || ch.is_ascii_digit()
+    })
+}
+
 /// Map ASCII set letters (`R`, `N`, ...) to their blackboard-bold forms.
 pub(super) fn blackboard(text: &str) -> String {
     text.chars()
@@ -1689,8 +1734,9 @@ mod tests {
             Theme::default(),
         ));
         assert!(output.contains("Inline"), "{output}");
-        // Inline math keeps its Markdown source unchanged.
-        assert!(output.contains("$x^2 + y_1$"), "{output}");
+        // Without a graphics protocol inline math is flattened to one row.
+        assert!(output.contains("x^2 + y_1"), "{output}");
+        assert!(!output.contains("$x^2"), "{output}");
         assert!(output.contains("a + b"));
         assert!(output.contains("───────"));
         assert!(output.contains("≤"));
@@ -1703,7 +1749,7 @@ mod tests {
         let rendered = render("before $x^2$ after", 80, Theme::default());
         let output = text(&rendered);
         assert_eq!(output.lines().count(), 1, "{output}");
-        assert!(output.contains("before $x^2$ after"), "{output}");
+        assert!(output.contains("before x^2 after"), "{output}");
     }
 
     #[test]
@@ -1711,7 +1757,21 @@ mod tests {
         let rendered = render("value $\\frac{a+b}{c}$ end", 80, Theme::default());
         let output = text(&rendered);
         assert_eq!(output.lines().count(), 1, "{output}");
-        assert!(output.contains("value $\\frac{a+b}{c}$ end"), "{output}");
+        assert!(output.contains("value (a+b)/c end"), "{output}");
+    }
+
+    #[test]
+    fn inline_math_off_keeps_the_tex_source() {
+        assert_eq!(
+            text(&render_raw("before $x^2$ after", 80, Theme::default())),
+            "  before $x^2$ after"
+        );
+    }
+
+    #[test]
+    fn shell_variables_are_not_treated_as_math() {
+        let output = text(&render("echo $PATH and $HOME", 80, Theme::default()));
+        assert!(output.contains("$PATH and $HOME"), "{output}");
     }
 
     #[test]
@@ -1794,10 +1854,11 @@ mod tests {
             80,
             Theme::default(),
         ));
-        assert!(output.contains("$PATH and $HOME"));
-        assert!(output.contains("$x$"), "{output}");
-        assert!(output.contains("$E = mc^2$"), "{output}");
-        assert!(!output.contains('²'), "{output}");
+        assert!(output.contains("$PATH and $HOME"), "{output}");
+        // Real math is rendered even when the terminal has no image support.
+        assert!(output.contains("see x and"), "{output}");
+        assert!(output.contains("E = mc^2"), "{output}");
+        assert!(!output.contains("$x$"), "{output}");
     }
 
     #[test]
