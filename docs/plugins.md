@@ -1,6 +1,7 @@
 # eix 插件体系设计（v2）
 
 - 状态：v2 内核、hooks、文本 UI、插件间 RPC、细粒度 allowlist、打包/验签/安装均已实现；自定义 UI 视图树与 lockfile 仍是后续里程碑
+- 原生 dylib 扩展：见 [`plugin-dylib.md`](plugin-dylib.md)（P1 已落地：`DylibBackend` 加载器 + `describe` / `tool.call` / `command.run`）
 - 适用范围：`eixd`（host）、`eix-core`（协议与 manifest/打包）、`eix-tui`（UI 贡献的渲染端与 CLI）
 - 关联实现：`crates/eix-core/src/plugin.rs`、`crates/eix-core/src/plugin_package.rs`、`crates/eixd/src/plugin/`、`crates/eixd/src/server.rs`、`crates/eix-tui/src/tui/app/`、`crates/eix-tui/src/main.rs`
 
@@ -12,7 +13,8 @@
 
 | 能力       | 实现                                                                                                   |
 | ---        | ---                                                                                                    |
-| Manifest   | `schema = 2`、`api_version = 2`、`[components.server]` / `[components.ui]`、`[[contributes.commands]]`、`[package]` |
+| Manifest   | `schema = 2`、`api_version = 2`、`[components.server]` / `[components.ui]` / `[components.dylib]`、`abi`、`[[contributes.commands]]`、`[package]` |
+| 原生 dylib | `ExtensionBackend` + `DylibBackend`；`describe` / `tool.call` / `command.run` 已接入，与进程插件共用注册表 |
 | 协议       | JSON-RPC 2.0 over NDJSON；`initialize`、`tools/call`、`commands/run`、`hooks/run`、`rpc.call`、host 反向请求、通知 |
 | 多路复用   | writer task + reader task + 每请求 oneshot；超时发送 `$/cancel`                                        |
 | 注册表     | tools / commands / events / hooks / ui / rpc；启动时做命名空间与能力校验                               |
@@ -28,6 +30,7 @@
 
 尚未实现：
 
+- dylib 插件的 hooks / events / UI 文本表面虽复用同一路由，但内建 host API 只覆盖同步安全的 `log/info/ping/notify/storage.*/secrets.get`；fs / net / rpc / jobs / sessions / ui 仍返回 `EIX_ERR_DENIED`，详见 [`plugin-dylib.md`](plugin-dylib.md)。
 - 插件提交自定义视图树（`pane` / `picker` 等）；当前 UI 贡献是文本 `panel` / `status` 表面。
 - TUI 内直接编辑 settings；目前展示 schema 与当前值，修改仍走全局配置。
 - lockfile、registry、lazy start、ring buffer 审计表和 OS sandbox。
@@ -117,6 +120,7 @@ v1 使用 `schema = 1`、`PLUGIN_API_VERSION = 1`、顶层 `[server]`，工具�
 │    fs · network · secrets · storage · rpc · ui               │
 │                        │                                     │
 │  PluginHost (process per plugin, JSON-RPC, multiplexed)      │
+│  DylibHost  (in-process cdylib, ABI v1 dispatch)             │
 └────────────────────────┬─────────────────────────────────────┘
                          │ stdio / JSON-RPC 2.0
           ┌──────────────┼──────────────┐
@@ -125,15 +129,18 @@ v1 使用 `schema = 1`、`PLUGIN_API_VERSION = 1`、顶层 `[server]`，工具�
       component      (view model)     (no process)
 ```
 
-### 3.1 三种插件形态
+### 3.1 四种插件形态
 
 | 形态 | 是否需要进程 | 适合场景 | 能力 |
 | --- | --- | --- | --- |
+| 服务（Service） | 是 | 工具、hooks、事件、RPC、网络、文件、secret、后台任务 | host API |
+| 原生（Dylib） | 否（加载进 `eixd`） | 性能敏感的工具/命令、first-party 深度扩展 | ABI v1 + 同步 host API |
 | UI（UI） | 是 | 文本 panel / status、通知；自定义视图树待实现 | 声明式文本表面 |
 | 声明式（Declarative） | 否 | 命令、skill、agent、主题、键位、MCP server、权限规则 | 静态贡献 |
-| 服务（Service） | 是 | 工具、hooks、事件、RPC、网络、文件、secret、后台任务 | host API |
 
-一个包可以同时包含声明式、server 和 ui 三类贡献，共用同一个 manifest 和授权。本版不会为 `[components.ui]` 单独启动进程；UI 文本表面来自 server 组件的 `initialize.ui` 与 `host.ui.*`。
+一个包可以同时包含声明式、server / dylib 和 ui 三类贡献，共用同一个 manifest 和授权。`components.server` 与 `components.dylib` 互斥；本版不会为 `[components.ui]` 单独启动进程，UI 文本表面来自 server 组件的 `initialize.ui` 与 `host.ui.*`。
+
+dylib 是**完全可信代码**：它在 daemon 地址空间内运行，崩溃会带崩 daemon，能力系统只约束 `host.*` 调用，不能阻止插件直接使用 `libc`。设计细节见 [`plugin-dylib.md`](plugin-dylib.md)。
 
 ### 3.2 统一注册表
 
@@ -143,7 +150,7 @@ v1 使用 `schema = 1`、`PLUGIN_API_VERSION = 1`、顶层 `[server]`，工具�
 - 贡献冲突在启动时发现：命名空间冲突、schema 非法、能力未授权。
 - 插件退出时按 `plugin` 字段整体移除其贡献，不影响其他插件。
 
-当前 `PluginManager` 已维护 `tools` / `commands` / `subscriptions` / `statuses` 表；后续可进一步统一为按 kind 索引的 `ContributionRegistry`。
+当前 `PluginManager` 已维护 `tools` / `commands` / `subscriptions` / `statuses` 表；进程插件与 dylib 插件都注册进同一张表。实际调用经 `ExtensionBackend` trait 分发：`ProcessBackend`（JSON-RPC 子进程）与 `DylibBackend`（ABI v1 进程内）只是同一 trait 的两种实现，TUI 和 turn 管线不需要感知 backend 类型。
 
 ---
 
@@ -183,6 +190,11 @@ settings = "settings.schema.json"
 command = "python3"
 entry = "server.py"
 
+# 原生 dylib 与 components.server 互斥；二选一。
+# abi = 1
+# [components.dylib]
+# path = "libacme.so"
+
 # UI 组件当前只作为打包声明；文本表面由 server 组件的 initialize.ui 提供。
 [components.ui]
 command = "python3"
@@ -213,10 +225,11 @@ action = "sync"
 ### 4.3 兼容策略
 
 - 只接受 `schema = 2`；缺少 `schema` 或 `api_version` 的 v1 manifest 拒绝加载。
-- 只识别 `[components.server]` / `[components.ui]`；顶层 `[server]` 不再识别。
+- 只识别 `[components.server]` / `[components.ui]` / `[components.dylib]`；顶层 `[server]` 不再识别。
+- `components.dylib` 与 `components.server` 互斥；dylib 包使用 `abi` 声明 ABI 版本，缺省按 1 处理。
 - `[components.ui]` 目前只作为打包声明；没有 server 组件时不会启动 UI 进程。
 - 未知字段由 serde 忽略，未知贡献点暂不解析。
-- 仅声明式（只有 `contributes.commands`）的包允许没有 server / ui 组件；action 命令除外，它必须有 server。
+- 仅声明式（只有 `contributes.commands`）的包允许没有 server / ui / dylib 组件；action 命令除外，它必须有 server 或 dylib。
 
 ### 4.4 从 v1 迁移
 
@@ -284,7 +297,7 @@ action = "sync"
 }
 ```
 
-- `prompt` 和 `action` 必须恰好设置一个；action 需要 server 组件。
+- `prompt` 和 `action` 必须恰好设置一个；action 需要 server 或 dylib 组件。
 - TUI 的 `/` 菜单和命令面板可以触发；host 调用插件的 `commands/run`。
 - `commands/run` 参数：`{command, arguments, session_id, workspace, cwd}`。
 - 返回值：`{ok, prompt?, output?}`。`prompt` 会作为用户消息提交，`output` 展示在文本面板。
@@ -315,6 +328,19 @@ rpc_allow = ["issue-cache"]
 [plugins.acme.settings]
 project_key = "ACME"
 ```
+
+原生 dylib 插件改用库入口，其余授权字段相同：
+
+```toml
+[plugins.acme]
+enabled = true
+library = "plugins/acme/libacme.so"
+timeout_secs = 30
+capabilities = ["tools", "commands"]
+allowed_tools = ["search_*"]
+```
+
+`library` 不能与 `command` 同时出现；manifest 里的 `[components.dylib]` 等价于配置了 `library`。
 
 ### 6.2 规则
 
@@ -567,6 +593,7 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 | 层 | 默认 | 说明 |
 | --- | --- | --- |
 | 内置工具 | 可信 | 现有风险分类 |
+| dylib 插件 | 完全可信 | 在 `eixd` 地址空间内运行；仅加载签名/受信任的库 |
 | 声明式插件 | 可信但受路径约束 | 只能贡献静态内容 |
 | 服务插件 | 不可信 | 工具默认审批；hook 不能批准 |
 | UI 插件 | 不可信 | host 渲染，节点受限 |
@@ -584,6 +611,8 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 - `jobs`：最多 32 个，间隔 1..=86400s。
 
 能力限制的是 host API，不是操作系统。插件进程仍以 daemon 用户身份运行，可以直接读写该用户可访问的文件和网络。需要强隔离时必须启用 sandbox，或使用单独用户 / 容器运行 daemon。
+
+dylib 插件尤其如此：它与 daemon 同进程，可以直接 `libc::open` / 发网络 / 读环境变量，绕过所有 `host.*` 检查。因此 dylib 必须视为完全可信代码，安全边界只能放在加载前（签名、安装路径、ABI/平台校验）。
 
 ### 10.3 审计
 
@@ -698,6 +727,7 @@ pub struct ManifestCommand {
 pub struct PluginConfig {
     pub command: String,
     pub args: Vec<String>,
+    pub library: Option<PathBuf>,    // 原生 dylib；与 command 互斥
     pub env: BTreeMap<String, String>,
     pub enabled: bool,
     pub timeout_secs: u64,
@@ -720,8 +750,9 @@ pub struct PluginConfig {
 当前 `[plugins.<name>]` 支持：
 
 - `command` / `args` / `env` / `cwd`：进程入口；与 `manifest` 二选一或组合。
+- `library`：原生 dylib 路径；相对路径按 config cwd 解析，与 `command` / `components.server` 互斥。使用 dylib 时必须同时授予它实际调用的能力（如 `tools` / `commands`）。
 - `enabled` / `timeout_secs`：启停与请求超时（秒）。
-- `manifest`：`eix-plugin.toml`，相对路径按 config cwd 解析；manifest 的 `name` 必须与配置 key 一致。
+- `manifest`：`eix-plugin.toml`，相对路径按 config cwd 解析；manifest 的 `name` 必须与配置 key 一致。manifest 含 `components.dylib` 时等价于配置了 `library`。
 - `capabilities`：只能收窄 manifest 的申请；留空表示采用 manifest 的申请或 `[tools, commands]`。
 - `allowed_tools` / `denied_tools`：`*` / `?` 通配符，deny 优先。
 - `settings`：任意 JSON 值，随 `initialize` 传给插件。
@@ -815,7 +846,7 @@ pub struct PluginConfig {
 
 | 决策                | 结论     | 理由                                     |
 | ---                 | ---      | ---                                      |
-| 进程内 dylib        | 不做     | ABI 不稳定、崩溃拖垮 daemon、需要 unsafe |
+| 进程内 dylib        | 可信 opt-in | 用 C 边界 + 5 个符号 + JSON dispatch 保持演进；只加载受信任库，默认仍用进程后端 |
 | 进程外 JSON         | 默认     | 语言无关、调试简单、崩溃隔离             |
 | WASM                | 后续可选 | 真正沙箱，但 UI/网络/文件能力要重做一遍  |
 | 原始 ANSI UI        | 不做     | 破坏主题、键位、布局和可访问性           |
@@ -844,7 +875,10 @@ pub struct PluginConfig {
 | ---                                  | ---                                                                      |
 | `crates/eix-core/src/plugin.rs`      | manifest v2、配置、JSON-RPC、content blocks、hooks/ui/rpc、action/settings 类型 |
 | `crates/eix-core/src/plugin_package.rs` | `pack` / `verify` / `install`、checksums、Ed25519、trust store             |
-| `crates/eixd/src/plugin/mod.rs`      | `PluginManager`、注册表、生命周期、hooks 管线、RPC 路由、声明式/action 命令 |
+| `crates/eixd/src/plugin/mod.rs`      | `PluginManager`、注册表、生命周期、hooks 管线、RPC 路由、声明式/action 命令、backend 选择 |
+| `crates/eixd/src/plugin/backend.rs`  | `ExtensionBackend` trait 与 `BackendFuture`                                |
+| `crates/eixd/src/plugin/process.rs`  | `ProcessBackend`：JSON-RPC 子进程适配器                                    |
+| `crates/eixd/src/plugin/dylib.rs`    | `DylibBackend`、ABI 校验、方法翻译、超时、dylib host API                    |
 | `crates/eixd/src/plugin/client.rs`   | 进程 spawn、writer/reader、请求多路复用、超时取消、事件投递、features       |
 | `crates/eixd/src/plugin/host_api.rs` | `HostContext`、fs/net/secrets/session/ui/rpc/blob/job 与能力校验            |
 | `crates/eixd/src/server.rs`          | `plugin.command.run` / `plugin.settings`、turn/tool/prompt hook 接入       |
@@ -853,6 +887,7 @@ pub struct PluginConfig {
 | `crates/eix-tui/src/tui/app/`        | `/plugins [name]`、action 命令分发、`plugin.ui.*` 文本面板与 toast          |
 | `crates/eix-core/src/config.rs`      | `plugins` 解析与 allowlist 校验；项目级 `plugins` 仍被删除                  |
 | `examples/plugins/echo/`             | v2 示例：JSON-RPC 2.0、content blocks、storage、events、action              |
+| `examples/plugins/hello-dylib/`      | dylib 示例：ABI v1、`echo` 工具、`sync` action 命令                          |
 
 hooks / UI / RPC 的接入点见第 7、8、9 节；未实现的只有自定义视图树、settings 编辑与 lockfile。
 

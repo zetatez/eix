@@ -2356,9 +2356,22 @@ impl Config {
                     "plugins.{name}.timeout_secs must be > 0"
                 )));
             }
-            if plugin.enabled && plugin.command.trim().is_empty() && plugin.manifest.is_none() {
+            if plugin.enabled
+                && plugin.command.trim().is_empty()
+                && plugin.library.is_none()
+                && plugin.manifest.is_none()
+            {
                 return Err(ConfigError::Invalid(format!(
-                    "plugins.{name} needs `command` or `manifest`"
+                    "plugins.{name} needs `command`, `library` or `manifest`"
+                )));
+            }
+            if plugin
+                .library
+                .as_ref()
+                .is_some_and(|library| library.as_os_str().is_empty())
+            {
+                return Err(ConfigError::Invalid(format!(
+                    "plugins.{name}.library must not be empty"
                 )));
             }
             for (key, pattern) in plugin
@@ -4103,6 +4116,10 @@ manifest = "eix-plugin.toml"
 
 [plugins.prompts.settings]
 repo = "acme"
+
+[plugins.native]
+library = "libnative.so"
+capabilities = ["tools"]
 "#,
         )
         .unwrap();
@@ -4123,6 +4140,11 @@ repo = "acme"
             Some(std::path::Path::new("eix-plugin.toml"))
         );
         assert_eq!(prompts.settings["repo"], serde_json::json!("acme"));
+        let native = config.plugins.get("native").expect("dylib plugin");
+        assert_eq!(
+            native.library.as_deref(),
+            Some(std::path::Path::new("libnative.so"))
+        );
 
         std::fs::write(
             &path,

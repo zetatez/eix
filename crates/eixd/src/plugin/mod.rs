@@ -8,8 +8,11 @@
 //! registry of tools, commands and event subscriptions. Declarative plugins
 //! (manifest commands only) never spawn a process.
 
+mod backend;
 mod client;
+mod dylib;
 mod host_api;
+mod process;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -33,7 +36,7 @@ use tokio::sync::{broadcast, mpsc, Mutex};
 use crate::store::Store;
 use crate::tools::ToolOutcome;
 
-use client::PluginClient;
+use backend::ExtensionBackend;
 use host_api::RpcCallRequest;
 
 const DEFAULT_CAPABILITIES: &[PluginCapability] =
@@ -99,6 +102,9 @@ struct PluginSpec {
     description: String,
     command: String,
     args: Vec<String>,
+    /// Native library when this package uses `components.dylib` or
+    /// `plugins.<name>.library`. Mutually exclusive with `command`.
+    library: Option<PathBuf>,
     env: BTreeMap<String, String>,
     cwd: PathBuf,
     data_dir: PathBuf,
@@ -176,7 +182,9 @@ impl PluginStatus {
 pub struct PluginManager {
     store: Arc<Store>,
     data_dir: PathBuf,
-    clients: Arc<Mutex<BTreeMap<String, Arc<PluginClient>>>>,
+    /// One backend per running plugin instance. Process and dylib plugins
+    /// share this map and the same registry.
+    backends: Arc<Mutex<BTreeMap<String, Arc<dyn ExtensionBackend>>>>,
     /// Event patterns per running plugin, copied from `initialize`.
     subscriptions: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
     tools: Mutex<Vec<ToolRef>>,
@@ -206,34 +214,34 @@ impl PluginManager {
         // `publish` drops events under backpressure; events are best-effort
         // notifications, not durable state.
         let (event_tx, mut event_rx) = mpsc::channel::<PluginEvent>(1024);
-        let clients: Arc<Mutex<BTreeMap<String, Arc<PluginClient>>>> =
+        let backends: Arc<Mutex<BTreeMap<String, Arc<dyn ExtensionBackend>>>> =
             Arc::new(Mutex::new(BTreeMap::new()));
         let subscriptions = Arc::new(Mutex::new(BTreeMap::<String, Vec<String>>::new()));
-        let event_clients = Arc::clone(&clients);
+        let event_backends = Arc::clone(&backends);
         let event_subscriptions = Arc::clone(&subscriptions);
         tokio::spawn(async move {
             while let Some(event) = event_rx.recv().await {
                 let targets: Vec<_> = {
-                    let clients = event_clients.lock().await;
+                    let backends = event_backends.lock().await;
                     let subscriptions = event_subscriptions.lock().await;
-                    clients
+                    backends
                         .iter()
-                        .filter(|(name, client)| {
-                            !client.is_closed()
+                        .filter(|(name, backend)| {
+                            !backend.is_closed()
                                 && subscriptions.get(*name).is_some_and(|patterns| {
                                     patterns
                                         .iter()
                                         .any(|pattern| wildcard(pattern, &event.method))
                                 })
                         })
-                        .map(|(_, client)| Arc::clone(client))
+                        .map(|(_, backend)| Arc::clone(backend))
                         .collect()
                 };
-                for client in targets {
-                    if let Err(err) = client.notify_event(&event.method, &event.params).await {
+                for backend in targets {
+                    if let Err(err) = backend.notify(&event.method, event.params.clone()).await {
                         eprintln!(
                             "eixd: plugin {} event {} failed: {}",
-                            client.name,
+                            backend.name(),
                             event.method,
                             redact(&format!("{err:#}"))
                         );
@@ -243,12 +251,12 @@ impl PluginManager {
         });
 
         let (rpc_tx, mut rpc_rx) = mpsc::channel::<RpcCallRequest>(64);
-        let rpc_clients = Arc::clone(&clients);
+        let rpc_backends = Arc::clone(&backends);
         let rpc_methods = Arc::new(Mutex::new(BTreeMap::<String, BTreeSet<String>>::new()));
         let router_methods = Arc::clone(&rpc_methods);
         tokio::spawn(async move {
             while let Some(request) = rpc_rx.recv().await {
-                let result = route_rpc(&request, &rpc_clients, &router_methods).await;
+                let result = route_rpc(&request, &rpc_backends, &router_methods).await;
                 let _ = request.reply.send(result);
             }
         });
@@ -256,7 +264,7 @@ impl PluginManager {
         Arc::new(Self {
             store,
             data_dir,
-            clients,
+            backends,
             subscriptions,
             tools: Mutex::new(Vec::new()),
             commands: Mutex::new(Vec::new()),
@@ -331,31 +339,45 @@ impl PluginManager {
             return Ok(());
         }
 
-        let client = PluginClient::spawn(
-            &spec,
+        let backend = self.start_backend(&spec).await?;
+        let init = match backend.initialize(&spec).await {
+            Ok(init) => init,
+            Err(err) => {
+                backend.shutdown().await;
+                return Err(err);
+            }
+        };
+        match self
+            .commit_runtime(&spec, &backend, &init, declarative)
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                backend.shutdown().await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Build the backend selected by the spec: a native library or a child
+    /// process. Both expose the same contribution protocol.
+    async fn start_backend(&self, spec: &PluginSpec) -> Result<Arc<dyn ExtensionBackend>> {
+        if let Some(library) = &spec.library {
+            let backend =
+                dylib::DylibBackend::load(library, spec, Arc::clone(&self.store), self.bus.clone())
+                    .await
+                    .with_context(|| format!("plugin {} failed to start", spec.name))?;
+            return Ok(backend);
+        }
+        let backend = process::ProcessBackend::spawn(
+            spec,
             Arc::clone(&self.store),
             self.bus.clone(),
             self.rpc_tx.clone(),
         )
         .await
         .with_context(|| format!("plugin {} failed to start", spec.name))?;
-        let init = match client.initialize(&spec, &spec.cwd).await {
-            Ok(init) => init,
-            Err(err) => {
-                client.shutdown().await;
-                return Err(err);
-            }
-        };
-        match self
-            .commit_runtime(&spec, &client, &init, declarative)
-            .await
-        {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                client.shutdown().await;
-                Err(err)
-            }
-        }
+        Ok(backend)
     }
 
     /// Commands declared in the manifest, validated against the capability
@@ -445,7 +467,7 @@ impl PluginManager {
     async fn commit_runtime(
         &self,
         spec: &PluginSpec,
-        client: &Arc<PluginClient>,
+        backend: &Arc<dyn ExtensionBackend>,
         init: &PluginInitializeResult,
         declarative: Vec<CommandRef>,
     ) -> Result<()> {
@@ -512,10 +534,10 @@ impl PluginManager {
         self.hooks.lock().await.extend(hooks);
         self.ui.lock().await.extend(ui);
         self.rpc_methods.lock().await.insert(spec.name.clone(), rpc);
-        self.clients
+        self.backends
             .lock()
             .await
-            .insert(spec.name.clone(), Arc::clone(client));
+            .insert(spec.name.clone(), Arc::clone(backend));
         {
             let mut subscriptions = self.subscriptions.lock().await;
             if events.is_empty() {
@@ -617,27 +639,27 @@ impl PluginManager {
         }
     }
 
-    /// Detect children that exited without a request in flight.
+    /// Detect backends that stopped without a request in flight.
     async fn refresh(&self) {
-        let clients = { self.clients.lock().await.clone() };
-        for (name, client) in clients {
-            if let Some(reason) = client.exit_reason().await {
-                self.drop_client(&name, &client, Some(reason)).await;
+        let backends = { self.backends.lock().await.clone() };
+        for (name, backend) in backends {
+            if let Some(reason) = backend.exit_reason().await {
+                self.drop_backend(&name, &backend, Some(reason)).await;
             }
         }
     }
 
-    async fn drop_client(
+    async fn drop_backend(
         &self,
         name: &str,
-        client: &Arc<PluginClient>,
+        backend: &Arc<dyn ExtensionBackend>,
         error: Option<String>,
     ) -> bool {
         let removed = {
-            let mut clients = self.clients.lock().await;
-            match clients.get(name) {
-                Some(current) if Arc::ptr_eq(current, client) => {
-                    clients.remove(name);
+            let mut backends = self.backends.lock().await;
+            match backends.get(name) {
+                Some(current) if Arc::ptr_eq(current, backend) => {
+                    backends.remove(name);
                     true
                 }
                 _ => false,
@@ -646,7 +668,7 @@ impl PluginManager {
         if !removed {
             return false;
         }
-        client.shutdown().await;
+        backend.shutdown().await;
         self.tools.lock().await.retain(|tool| tool.plugin != name);
         self.commands
             .lock()
@@ -675,14 +697,14 @@ impl PluginManager {
         true
     }
 
-    /// Stop every running process before the registry is rebuilt.
+    /// Stop every running backend before the registry is rebuilt.
     async fn stop_all(&self) {
-        let clients: Vec<_> = {
-            let mut clients = self.clients.lock().await;
-            std::mem::take(&mut *clients).into_values().collect()
+        let backends: Vec<_> = {
+            let mut backends = self.backends.lock().await;
+            std::mem::take(&mut *backends).into_values().collect()
         };
-        for client in clients {
-            client.shutdown().await;
+        for backend in backends {
+            backend.shutdown().await;
         }
     }
 
@@ -774,14 +796,14 @@ impl PluginManager {
             .action
             .clone()
             .with_context(|| format!("plugin command {name:?} submits a prompt directly"))?;
-        let client = self
-            .clients
+        let backend = self
+            .backends
             .lock()
             .await
             .get(&command.plugin)
             .cloned()
             .with_context(|| format!("plugin {} is not running", command.plugin))?;
-        let value = client
+        let value = backend
             .request(
                 "commands/run",
                 serde_json::json!({
@@ -846,7 +868,7 @@ impl PluginManager {
         }
         let hooks = self.hook_refs("tool.before").await;
         for hook in hooks {
-            let Some(client) = self.hook_client(&hook).await else {
+            let Some(backend) = self.hook_backend(&hook).await else {
                 continue;
             };
             let request = serde_json::json!({
@@ -858,7 +880,7 @@ impl PluginManager {
                 "workspace": cwd,
                 "cwd": cwd,
             });
-            match call_hook(&client, &hook, request).await {
+            match call_hook(&backend, &hook, request).await {
                 Ok(value) => {
                     let deny = value.get("action").and_then(Value::as_str) == Some("deny")
                         || value.get("decision").and_then(Value::as_str) == Some("deny")
@@ -907,7 +929,7 @@ impl PluginManager {
         let mut current = output.to_string();
         let mut replaced = false;
         for hook in hooks {
-            let Some(client) = self.hook_client(&hook).await else {
+            let Some(backend) = self.hook_backend(&hook).await else {
                 continue;
             };
             let request = serde_json::json!({
@@ -921,7 +943,7 @@ impl PluginManager {
                 "workspace": cwd,
                 "cwd": cwd,
             });
-            match call_hook(&client, &hook, request).await {
+            match call_hook(&backend, &hook, request).await {
                 Ok(value) => {
                     if let Some(output) = value.get("output").and_then(Value::as_str) {
                         current = cap(output, MAX_PLUGIN_OUTPUT);
@@ -948,7 +970,7 @@ impl PluginManager {
         }
         let mut current = prompt.to_string();
         for hook in self.hook_refs("prompt.build").await {
-            let Some(client) = self.hook_client(&hook).await else {
+            let Some(backend) = self.hook_backend(&hook).await else {
                 continue;
             };
             let request = serde_json::json!({
@@ -956,7 +978,7 @@ impl PluginManager {
                 "session_id": session_id,
                 "prompt": current,
             });
-            match call_hook(&client, &hook, request).await {
+            match call_hook(&backend, &hook, request).await {
                 Ok(value) => {
                     if let Some(prompt) = value.get("prompt").and_then(Value::as_str) {
                         if prompt.trim().is_empty() {
@@ -1001,7 +1023,7 @@ impl PluginManager {
         let turn_id = turn_id.to_string();
         tokio::spawn(async move {
             for hook in manager.hook_refs("turn.end").await {
-                let Some(client) = manager.hook_client(&hook).await else {
+                let Some(backend) = manager.hook_backend(&hook).await else {
                     continue;
                 };
                 let request = serde_json::json!({
@@ -1011,7 +1033,7 @@ impl PluginManager {
                     "ok": ok,
                     "error": error,
                 });
-                if let Err(err) = call_hook(&client, &hook, request).await {
+                if let Err(err) = call_hook(&backend, &hook, request).await {
                     eprintln!(
                         "eixd: plugin {} hook turn.end failed: {}",
                         hook.plugin,
@@ -1039,9 +1061,9 @@ impl PluginManager {
         hooks
     }
 
-    async fn hook_client(&self, hook: &HookRef) -> Option<Arc<PluginClient>> {
-        let client = self.clients.lock().await.get(&hook.plugin).cloned()?;
-        (!client.is_closed()).then_some(client)
+    async fn hook_backend(&self, hook: &HookRef) -> Option<Arc<dyn ExtensionBackend>> {
+        let backend = self.backends.lock().await.get(&hook.plugin).cloned()?;
+        (!backend.is_closed()).then_some(backend)
     }
 
     pub async fn call(
@@ -1067,7 +1089,7 @@ impl PluginManager {
                 duration_ms: started.elapsed().as_millis() as u64,
             };
         };
-        let Some(client) = self.clients.lock().await.get(&tool.plugin).cloned() else {
+        let Some(backend) = self.backends.lock().await.get(&tool.plugin).cloned() else {
             return ToolOutcome {
                 ok: false,
                 output: format!("plugin {} is not running", tool.plugin),
@@ -1081,7 +1103,7 @@ impl PluginManager {
             workspace: Some(cwd.to_path_buf()),
             cwd: Some(cwd.to_path_buf()),
         };
-        let result = client
+        let result = backend
             .request(
                 "tools/call",
                 serde_json::to_value(params).unwrap_or(Value::Null),
@@ -1107,9 +1129,10 @@ impl PluginManager {
             Err(err) => {
                 let message = redact(&format!("plugin {} failed: {err:#}", tool.plugin));
                 // A per-call timeout cancels the request but leaves the
-                // plugin running; only a closed connection removes it.
-                if let Some(reason) = client.exit_reason().await {
-                    self.drop_client(&tool.plugin, &client, Some(reason)).await;
+                // plugin running; only a closed backend removes it.
+                if let Some(reason) = backend.exit_reason().await {
+                    self.drop_backend(&tool.plugin, &backend, Some(reason))
+                        .await;
                 }
                 ToolOutcome {
                     ok: false,
@@ -1124,9 +1147,9 @@ impl PluginManager {
         let Some(plugin) = config.plugins.get(name) else {
             bail!("unknown plugin {name:?}");
         };
-        let old = self.clients.lock().await.remove(name);
-        if let Some(client) = old {
-            client.shutdown().await;
+        let old = self.backends.lock().await.remove(name);
+        if let Some(backend) = old {
+            backend.shutdown().await;
         }
         self.subscriptions.lock().await.remove(name);
         {
@@ -1252,7 +1275,10 @@ fn resolve_spec(
         // `components.ui` is a packaging declaration. Text surfaces arrive
         // through `initialize.ui` and `host.ui.*`; the child process itself
         // still runs as a server component with the `ui` capability.
-        if manifest.components.ui.is_some() && manifest.components.server.is_none() {
+        if manifest.components.ui.is_some()
+            && manifest.components.server.is_none()
+            && manifest.components.dylib.is_none()
+        {
             eprintln!(
                 "eixd: plugin {name}: components.ui is declared but only server components start in this build"
             );
@@ -1264,15 +1290,40 @@ fn resolve_spec(
         .transpose()?
         .flatten();
 
-    let (command, args) = if !plugin.command.trim().is_empty() {
-        (plugin.command.clone(), plugin.args.clone())
-    } else if let Some((path, manifest)) = &manifest {
-        let base = path.parent().unwrap_or(&cwd);
-        manifest.server_command(base).unwrap_or_default()
-    } else {
-        bail!("plugin {name} needs `command` or `manifest`");
+    // A native library can come from the config key or the manifest. An
+    // explicit `library` wins, but declaring both a dylib and a process is a
+    // configuration error rather than a silent choice.
+    let library = match &plugin.library {
+        Some(path) => Some(if path.is_absolute() {
+            path.clone()
+        } else {
+            cwd.join(path)
+        }),
+        None => manifest
+            .as_ref()
+            .and_then(|(path, manifest)| manifest.dylib_path(path.parent().unwrap_or(&cwd))),
     };
-    let has_server = !command.trim().is_empty();
+    let process_command = if !plugin.command.trim().is_empty() {
+        Some((plugin.command.clone(), plugin.args.clone()))
+    } else {
+        manifest
+            .as_ref()
+            .and_then(|(path, manifest)| manifest.server_command(path.parent().unwrap_or(&cwd)))
+    };
+    if library.is_some() && process_command.is_some() {
+        bail!("plugin {name} declares both a dylib library and a process command");
+    }
+    if library.is_none() && process_command.is_none() && manifest.is_none() {
+        bail!("plugin {name} needs `command`, `library` or `manifest`");
+    }
+    let (command, args, has_server) = if let Some(library) = &library {
+        (library.display().to_string(), Vec::new(), true)
+    } else if let Some((command, args)) = process_command {
+        let has_server = !command.trim().is_empty();
+        (command, args, has_server)
+    } else {
+        (String::new(), Vec::new(), false)
+    };
 
     let requested = manifest
         .as_ref()
@@ -1328,6 +1379,7 @@ fn resolve_spec(
         description,
         command,
         args,
+        library,
         env: plugin.env.clone(),
         cwd: plugin_cwd,
         data_dir: data_dir.join("plugins").join(name),
@@ -1625,9 +1677,13 @@ fn validate_events(spec: &PluginSpec, events: &[String]) -> Result<Vec<String>> 
 
 /// Call one hook with its declared timeout. The plugin's own request timeout
 /// still applies when the hook does not set one.
-async fn call_hook(client: &PluginClient, hook: &HookRef, params: Value) -> Result<Value> {
+async fn call_hook(
+    backend: &Arc<dyn ExtensionBackend>,
+    hook: &HookRef,
+    params: Value,
+) -> Result<Value> {
     match hook.timeout {
-        Some(timeout) => tokio::time::timeout(timeout, client.request("hooks/run", params))
+        Some(timeout) => tokio::time::timeout(timeout, backend.request("hooks/run", params))
             .await
             .with_context(|| {
                 format!(
@@ -1637,7 +1693,7 @@ async fn call_hook(client: &PluginClient, hook: &HookRef, params: Value) -> Resu
                     timeout.as_millis()
                 )
             })?,
-        None => client.request("hooks/run", params).await,
+        None => backend.request("hooks/run", params).await,
     }
 }
 
@@ -1659,7 +1715,7 @@ fn wildcard(pattern: &str, text: &str) -> bool {
 /// advertised the method; the caller's allowlist is checked by `HostContext`.
 async fn route_rpc(
     request: &RpcCallRequest,
-    clients: &Arc<Mutex<BTreeMap<String, Arc<PluginClient>>>>,
+    backends: &Arc<Mutex<BTreeMap<String, Arc<dyn ExtensionBackend>>>>,
     methods: &Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
 ) -> std::result::Result<Value, String> {
     let exported = methods
@@ -1673,16 +1729,16 @@ async fn route_rpc(
             request.target, request.method
         ));
     }
-    let client = clients
+    let backend = backends
         .lock()
         .await
         .get(&request.target)
         .cloned()
         .ok_or_else(|| format!("plugin {} is not running", request.target))?;
-    if client.is_closed() {
+    if backend.is_closed() {
         return Err(format!("plugin {} is not running", request.target));
     }
-    client
+    backend
         .request(
             "rpc.call",
             serde_json::json!({
@@ -1719,6 +1775,7 @@ mod tests {
             description: String::new(),
             command: String::new(),
             args: Vec::new(),
+            library: None,
             env: BTreeMap::new(),
             cwd: PathBuf::from("/tmp"),
             data_dir: PathBuf::from("/tmp/plugins").join(name),

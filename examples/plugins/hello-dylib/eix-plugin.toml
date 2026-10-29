@@ -1,0 +1,9 @@
+schema = 2
+name = "hello-dylib"
+version = "0.1.0"
+description = "Minimal native dylib plugin"
+abi = 1
+capabilities = ["tools", "commands"]
+
+[components.dylib]
+path = "libeix_plugin_hello_dylib.so"

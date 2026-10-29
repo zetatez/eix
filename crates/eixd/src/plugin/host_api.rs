@@ -929,7 +929,7 @@ fn known_host_method(method: &str) -> bool {
     )
 }
 
-fn required_capability(method: &str) -> Option<PluginCapability> {
+pub(super) fn required_capability(method: &str) -> Option<PluginCapability> {
     match method {
         "host.storage.get"
         | "host.storage.set"

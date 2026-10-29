@@ -20,6 +20,10 @@ use serde_json::Value;
 /// only starts plugins that advertise the same major version.
 pub const PLUGIN_API_VERSION: u32 = 2;
 
+/// ABI version exported by `eix_plugin_abi_version`. Kept in sync with
+/// `eix-plugin-abi`; the loader also checks the actual exported symbol.
+pub const PLUGIN_DYLIB_ABI_VERSION: u32 = 1;
+
 /// Every model-visible plugin tool starts with this prefix. Exposed names are
 /// `plugin__<plugin>__<tool>`; the host keeps the real mapping.
 pub const PLUGIN_TOOL_PREFIX: &str = "plugin__";
@@ -97,13 +101,23 @@ pub struct PluginComponent {
     pub entry: Option<PathBuf>,
 }
 
+/// A native dylib component loaded into `eixd`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginDylib {
+    /// Shared library path, relative to the manifest directory.
+    pub path: PathBuf,
+}
+
 /// Components shipped by one package. A package can be declarative only, or
-/// add a server process, a UI process, or both.
+/// add a server process, a UI process, a native dylib, or a combination.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct PluginComponents {
     pub server: Option<PluginComponent>,
     pub ui: Option<PluginComponent>,
+    /// Native in-process extension. Mutually exclusive with `server`.
+    pub dylib: Option<PluginDylib>,
 }
 
 /// A prompt command declared directly in the manifest. Declarative commands
@@ -148,6 +162,11 @@ pub struct PluginManifest {
     /// enforce it yet.
     #[serde(default)]
     pub min_host_version: Option<String>,
+    /// ABI version for a `components.dylib` package. The loader also checks
+    /// the exported `eix_plugin_abi_version`; this field gives installers a
+    /// cheap pre-flight check.
+    #[serde(default)]
+    pub abi: Option<u32>,
     /// Capabilities the package would like to use. The host still applies the
     /// narrower grant from config.
     #[serde(default)]
@@ -196,6 +215,7 @@ impl Default for PluginManifest {
             description: String::new(),
             api_version: PLUGIN_API_VERSION,
             min_host_version: None,
+            abi: None,
             capabilities: Vec::new(),
             components: PluginComponents::default(),
             contributes: PluginContributions::default(),
@@ -240,17 +260,34 @@ impl PluginManifest {
                 self.name
             ));
         }
-        if self.api_version != PLUGIN_API_VERSION {
+        let speaks_process = self.components.server.is_some() || self.components.ui.is_some();
+        if speaks_process && self.api_version != PLUGIN_API_VERSION {
             return Err(format!(
                 "plugin API version {} is not supported (host expects {})",
                 self.api_version, PLUGIN_API_VERSION
             ));
         }
+        if let Some(abi) = self.abi {
+            if abi != PLUGIN_DYLIB_ABI_VERSION {
+                return Err(format!(
+                    "plugin dylib ABI version {abi} is not supported (host expects {PLUGIN_DYLIB_ABI_VERSION})"
+                ));
+            }
+        }
+        if self.components.dylib.is_some() && self.components.server.is_some() {
+            return Err(
+                "a manifest cannot declare both components.server and components.dylib".into(),
+            );
+        }
         if self.components.server.is_none()
             && self.components.ui.is_none()
+            && self.components.dylib.is_none()
             && self.contributes.commands.is_empty()
         {
-            return Err("manifest needs a server component, a ui component, or a command".into());
+            return Err(
+                "manifest needs a server component, a ui component, a dylib component, or a command"
+                    .into(),
+            );
         }
         for (label, component) in [
             ("components.server", &self.components.server),
@@ -261,6 +298,12 @@ impl PluginManifest {
                     return Err(format!("[{label}] needs `command` or `entry`"));
                 }
             }
+        }
+        if let Some(dylib) = &self.components.dylib {
+            if dylib.path.as_os_str().is_empty() {
+                return Err("[components.dylib] needs `path`".into());
+            }
+            validate_relative_path(&dylib.path, "components.dylib.path")?;
         }
         for command in &self.contributes.commands {
             if !valid_tool_name(&command.name) {
@@ -280,9 +323,9 @@ impl PluginManifest {
                     command.name
                 ));
             }
-            if has_action && self.components.server.is_none() {
+            if has_action && self.components.server.is_none() && self.components.dylib.is_none() {
                 return Err(format!(
-                    "declarative command {:?} uses `action` but the manifest has no server component",
+                    "declarative command {:?} uses `action` but the manifest has no server or dylib component",
                     command.name
                 ));
             }
@@ -331,6 +374,17 @@ impl PluginManifest {
             .ui
             .as_ref()
             .map(|component| resolve_component(component, base))
+    }
+
+    /// Resolve the native library path. `base` is the manifest's directory.
+    pub fn dylib_path(&self, base: &Path) -> Option<PathBuf> {
+        self.components.dylib.as_ref().map(|dylib| {
+            if dylib.path.is_absolute() {
+                dylib.path.clone()
+            } else {
+                base.join(&dylib.path)
+            }
+        })
     }
 }
 
@@ -381,6 +435,9 @@ pub struct PluginConfig {
     /// server component supplies it.
     pub command: String,
     pub args: Vec<String>,
+    /// Native in-process extension. Relative paths resolve from the config
+    /// cwd. Mutually exclusive with `command` and `manifest.components.server`.
+    pub library: Option<PathBuf>,
     pub env: BTreeMap<String, String>,
     /// Set false to keep the entry but ignore it.
     pub enabled: bool,
@@ -416,6 +473,7 @@ impl Default for PluginConfig {
         Self {
             command: String::new(),
             args: Vec::new(),
+            library: None,
             env: BTreeMap::new(),
             enabled: true,
             timeout_secs: 30,
@@ -1025,6 +1083,42 @@ mod tests {
     }
 
     #[test]
+    fn dylib_manifest_resolves_and_validates() {
+        let manifest: PluginManifest = toml::from_str(
+            r#"
+            schema = 2
+            name = "hello"
+            abi = 1
+            capabilities = ["tools"]
+
+            [components.dylib]
+            path = "libhello.so"
+            "#,
+        )
+        .unwrap();
+        manifest.validate().unwrap();
+        assert_eq!(
+            manifest.dylib_path(Path::new("/tmp/hello")),
+            Some(PathBuf::from("/tmp/hello/libhello.so"))
+        );
+
+        let mut wrong_abi = manifest.clone();
+        wrong_abi.abi = Some(2);
+        assert!(wrong_abi.validate().is_err());
+
+        let mut escape = manifest.clone();
+        escape.components.dylib.as_mut().unwrap().path = PathBuf::from("../escape.so");
+        assert!(escape.validate().is_err());
+
+        let mut both = manifest;
+        both.components.server = Some(PluginComponent {
+            command: "python3".into(),
+            ..Default::default()
+        });
+        assert!(both.validate().is_err());
+    }
+
+    #[test]
     fn v1_manifest_is_rejected() {
         let manifest: PluginManifest = toml::from_str(
             r#"
@@ -1049,6 +1143,7 @@ mod tests {
                     entry: Some(PathBuf::from("plugin.py")),
                 }),
                 ui: None,
+                dylib: None,
             },
             ..Default::default()
         };
@@ -1079,6 +1174,7 @@ mod tests {
                     entry: None,
                 }),
                 ui: None,
+                dylib: None,
             },
             ..Default::default()
         };
@@ -1101,6 +1197,7 @@ mod tests {
                     ..Default::default()
                 }),
                 ui: None,
+                dylib: None,
             },
             ..Default::default()
         };
@@ -1210,6 +1307,7 @@ mod tests {
                     ..Default::default()
                 }),
                 ui: None,
+                dylib: None,
             },
             ..Default::default()
         };

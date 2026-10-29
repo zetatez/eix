@@ -1791,6 +1791,145 @@ prompt = "Triage $ARGUMENTS"
 }
 
 #[tokio::test]
+#[ignore = "needs `cargo build -p eix-plugin-hello-dylib`"]
+async fn dylib_plugin_is_hosted_through_the_manager() -> anyhow::Result<()> {
+    let library = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../target/debug/libeix_plugin_hello_dylib.so");
+    if !library.exists() {
+        eprintln!("skipping: {} does not exist", library.display());
+        return Ok(());
+    }
+
+    let dir = temp_dir("dylib");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(plugin_provider_for(
+        listener,
+        Arc::clone(&bodies),
+        "plugin__hello-dylib__echo",
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.load_cwd = dir.clone();
+    config.provider_runtime.timeout_secs = 30;
+    config.plugins.insert(
+        "hello-dylib".to_string(),
+        eix_core::PluginConfig {
+            library: Some(library.clone()),
+            capabilities: vec![
+                eix_core::PluginCapability::Tools,
+                eix_core::PluginCapability::Commands,
+            ],
+            ..eix_core::PluginConfig::default()
+        },
+    );
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+
+    let list: eix_core::PluginListResult = client.request("plugin.list", Value::Null).await?;
+    assert_eq!(list.plugins.len(), 1);
+    let info = &list.plugins[0];
+    assert_eq!(info.name, "hello-dylib");
+    assert_eq!(info.state, eix_core::PluginState::Ready);
+    assert_eq!(info.tools, 1);
+    assert_eq!(info.commands, 1);
+    assert!(info.command.ends_with("libeix_plugin_hello_dylib.so"));
+    assert!(info.error.is_none());
+
+    let commands: eix_core::PluginCommandList =
+        client.request("plugin.commands", Value::Null).await?;
+    let sync = commands
+        .commands
+        .iter()
+        .find(|command| command.name == "plugin/hello-dylib/sync")
+        .expect("action command from describe");
+    assert!(sync.action);
+
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "dylib", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let action: eix_core::PluginCommandRunResult = client
+        .request(
+            "plugin.command.run",
+            json!({
+                "name": "plugin/hello-dylib/sync",
+                "arguments": "--full",
+                "session_id": session_id,
+            }),
+        )
+        .await?;
+    assert!(action.ok);
+    assert_eq!(action.output.as_deref(), Some("synced --full"));
+
+    let _: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "echo something"}),
+        )
+        .await?;
+
+    let approval = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "tool.approval_required" {
+            break notification.params.clone();
+        }
+    };
+    assert_eq!(approval["tool"], "plugin__hello-dylib__echo");
+    let approval_id = approval["approval_id"].as_str().unwrap().to_string();
+    let answered: ApprovalResult = client
+        .request(
+            "approval.respond",
+            json!({
+                "session_id": session_id,
+                "approval_id": approval_id,
+                "decision": "approve",
+            }),
+        )
+        .await?;
+    assert!(answered.accepted);
+
+    let completed = loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed" {
+            break notification.params.clone();
+        }
+    };
+    assert!(completed["error"].is_null());
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let result = attached
+        .events
+        .iter()
+        .find(|event| {
+            event.kind == EventKind::ToolResult
+                && event.payload["tool"] == "plugin__hello-dylib__echo"
+        })
+        .expect("dylib tool result");
+    assert!(
+        result.payload["output"].as_str().unwrap().contains("hi"),
+        "{}",
+        result.payload["output"]
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn exec_command_timeout_kills_the_process() -> anyhow::Result<()> {
     let dir = temp_dir("exec-timeout");
     std::fs::create_dir_all(&dir)?;
@@ -8040,6 +8179,14 @@ async fn mcp_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
 
 /// A provider that asks for the mock plugin's `echo` tool, then answers.
 async fn plugin_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    plugin_provider_for(listener, bodies, "plugin__mock__echo").await;
+}
+
+async fn plugin_provider_for(
+    listener: TcpListener,
+    bodies: Arc<Mutex<Vec<String>>>,
+    plugin_tool: &'static str,
+) {
     loop {
         let Ok((mut socket, _)) = listener.accept().await else {
             return;
@@ -8073,7 +8220,7 @@ async fn plugin_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>)
             let (id, name, arguments) = if tool_results == 0 {
                 ("call_search", "tool_search", json!({"query": "echo text"}))
             } else {
-                ("call_plugin_0", "plugin__mock__echo", json!({"text": "hi"}))
+                ("call_plugin_0", plugin_tool, json!({"text": "hi"}))
             };
             let chunk = json!({
                 "model": "mock-plugin",
