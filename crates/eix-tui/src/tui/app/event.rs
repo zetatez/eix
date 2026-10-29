@@ -484,6 +484,8 @@ impl App {
                         && picker.kind.preview_kind() == Some(kind.as_str())
                     {
                         picker.preview.text = text;
+                        picker.preview.rendered = None;
+                        picker.preview.rendered_width = 0;
                         picker.preview.error = error;
                         picker.preview.loading = false;
                     }

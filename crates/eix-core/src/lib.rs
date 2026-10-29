@@ -27,11 +27,11 @@ pub use commands::{expand as expand_command, load_commands, CustomCommand};
 pub use config::{
     load_cli_config, models_endpoint, subagent_concurrency_supported, theme_preset, CliConfig,
     CompatConfig, Config, ConfigError, ContextConfig, FormatterConfig, FormattersConfig,
-    ImagesConfig, IntegrationConfig, LspConfig, LspServerConfig, McpConfig, McpServerConfig,
-    ModelConfig, ModelInfo, ModelRole, ModelRolesConfig, ModelRoute, NotificationsConfig,
-    PermissionAction, PermissionRule, PromptProfile, ProviderConfig, ProviderKind,
-    ProviderOAuthConfig, ProviderSource, RepoIntegrationConfig, RuleSource, SandboxMode,
-    ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, WorktreeConfig,
+    ImagesConfig, IntegrationConfig, LspConfig, LspServerConfig, MathConfig, McpConfig,
+    McpServerConfig, ModelConfig, ModelInfo, ModelRole, ModelRolesConfig, ModelRoute,
+    NotificationsConfig, PermissionAction, PermissionRule, PromptProfile, ProviderConfig,
+    ProviderKind, ProviderOAuthConfig, ProviderSource, RepoIntegrationConfig, RuleSource,
+    SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, WorktreeConfig,
     DEFAULT_MAX_PARALLEL_SUBAGENTS, SUBAGENT_CONCURRENCY_OPTIONS, THEME_PRESETS,
 };
 pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};

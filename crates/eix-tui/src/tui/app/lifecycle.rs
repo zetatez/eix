@@ -83,6 +83,8 @@ impl App {
             inbox: None,
             theme: Theme::default(),
             theme_config: eix_core::ThemeConfig::default(),
+            math_config: eix_core::MathConfig::default(),
+            config_path: None,
             theme_picker_backup: None,
             keybinds: Keybinds::default(),
             esc_at: None,

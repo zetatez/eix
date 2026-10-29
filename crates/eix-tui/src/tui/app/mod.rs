@@ -244,6 +244,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("reload", "", "re-read the daemon config files"),
         builtin(
+            "math",
+            "[on|off|reload|status]",
+            "show or change display-math image rendering",
+        ),
+        builtin(
             "timeline",
             "",
             "search this session's user input history and jump",
@@ -629,6 +634,7 @@ impl SessionView {
                 self.events_rev,
                 self.subagents_rev,
                 &self.folds,
+                Some(self.session.cwd.as_path()),
             )
         });
         if !stale {
@@ -645,6 +651,7 @@ impl SessionView {
             &self.subagents,
             self.subagents_rev,
             self.events_rev,
+            Some(self.session.cwd.as_path()),
         );
         self.slots = cache.slots.clone();
         self.user_lines = cache.user_lines.clone();
@@ -698,7 +705,15 @@ impl SessionView {
             }
         }
         let live = self.live();
-        let mut tail = transcript::render_tail(live, queued, &self.folds, width, theme, tick);
+        let mut tail = transcript::render_tail(
+            live,
+            queued,
+            &self.folds,
+            width,
+            theme,
+            tick,
+            Some(self.session.cwd.as_path()),
+        );
         if self.session.is_agent() && self.session.parent_id.is_some() {
             tail.lines.push(parent_link_line(theme));
             tail.slots.push(None);
@@ -1188,8 +1203,38 @@ struct PickerPreview {
     /// Row value the current text/loading state belongs to.
     key: Option<String>,
     text: Option<String>,
+    /// Markdown/math render of `text` or of the selected child agent. Session
+    /// and child previews use this so display math and images survive instead
+    /// of being flattened into a `Vec<String>`.
+    rendered: Option<PreviewRendered>,
+    /// Width `rendered` was built for; a pane resize rebuilds it lazily.
+    rendered_width: usize,
     error: Option<String>,
     loading: bool,
+}
+
+#[derive(Default, Clone)]
+struct PreviewRendered {
+    lines: Vec<Line<'static>>,
+    math: Vec<super::math_image::Placement>,
+    /// Approximate plain-text size, used to trim an old activity head.
+    bytes: usize,
+}
+
+impl PreviewRendered {
+    /// Keep only the newest `height` display lines, shifting image anchors.
+    fn tail(mut self, height: usize) -> Self {
+        let keep = height.max(1);
+        if self.lines.len() > keep {
+            let cut = self.lines.len() - keep;
+            self.lines.drain(..cut);
+            self.math.retain(|placement| placement.line >= cut);
+            for placement in &mut self.math {
+                placement.line -= cut;
+            }
+        }
+        self
+    }
 }
 
 /// Filtered row indices, recomputed only when the query or the source rows
@@ -1919,6 +1964,11 @@ pub struct App {
     /// `[theme]` as loaded from config, kept so `/colorscheme` can re-derive a
     /// palette from a different preset without losing explicit slot overrides.
     pub(crate) theme_config: eix_core::ThemeConfig,
+    /// `[math]` as loaded from config, used by `/math reload`.
+    pub(crate) math_config: eix_core::MathConfig,
+    /// Explicit `--config` path, re-read by `/math reload` so edits apply
+    /// without restarting the TUI.
+    pub(crate) config_path: Option<std::path::PathBuf>,
     /// Palette/config captured when the theme picker opened. Esc restores it;
     /// Enter keeps the previewed selection.
     theme_picker_backup: Option<(eix_core::ThemeConfig, Theme)>,

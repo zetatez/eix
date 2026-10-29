@@ -1001,6 +1001,7 @@ fn render_transcript_at(view: &SessionView, width: usize, tick: u64) -> String {
         Theme::default(),
         tick,
         &view.subagents,
+        None,
     )
     .lines
     .iter()
@@ -3752,6 +3753,8 @@ fn file_picker_draws_the_lazy_preview_on_the_right() {
         preview: PickerPreview {
             key: Some("src/a.rs".into()),
             text: Some("   1 │ fn a() {}".into()),
+            rendered: None,
+            rendered_width: 0,
             error: None,
             loading: false,
         },
@@ -3803,6 +3806,46 @@ fn session_picker_preview_requests_the_selected_session_history() {
         app.picker_preview_lines(&filtered, usize::MAX),
         vec!["you:".to_string(), "  hello".to_string()]
     );
+}
+
+#[test]
+fn session_picker_preview_renders_markdown_and_display_math() {
+    let mut app = App::new(None);
+    app.sessions = vec![Session::new("s1", "one", "/tmp")];
+    app.picker = Some(Picker {
+        kind: PickerKind::NewPane,
+        query: String::new(),
+        selected: 0,
+        items: Vec::new(),
+        items_rev: 0,
+        filter: PickerFilterCache::default(),
+        scroll: 0,
+        loading: false,
+        preview: PickerPreview {
+            key: Some("s1".into()),
+            text: Some("**bold**\n\n$$\\frac{a}{b}$$\n".into()),
+            rendered: None,
+            rendered_width: 0,
+            error: None,
+            loading: false,
+        },
+        preview_request: None,
+    });
+
+    let filtered = app.picker_filtered();
+    let rich = app
+        .picker_preview_rich(&filtered, 20, 60)
+        .expect("rich session preview");
+    let text = rich
+        .lines
+        .iter()
+        .map(line_text)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(!text.contains("**"), "{text}");
+    assert!(!text.contains("$$"), "{text}");
+    assert!(text.contains("bold"), "{text}");
+    assert!(text.contains('─') || text.contains("a/b"), "{text}");
 }
 
 #[test]

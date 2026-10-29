@@ -72,6 +72,9 @@ pub struct Config {
     pub plugins: BTreeMap<String, crate::plugin::PluginConfig>,
     /// Prompt image limits and blob retention.
     pub images: ImagesConfig,
+    /// Display-math image rendering. Values are TUI-side; the daemon ignores
+    /// them.
+    pub math: MathConfig,
     /// Language servers used for diagnostics after edits.
     pub lsp: LspConfig,
     /// Optional post-write formatters. Entries are tried in order and the
@@ -120,6 +123,7 @@ impl Default for Config {
             mcp: McpConfig::default(),
             plugins: BTreeMap::new(),
             images: ImagesConfig::default(),
+            math: MathConfig::default(),
             lsp: LspConfig::default(),
             formatter: FormattersConfig::default(),
             formatter_defaults: true,
@@ -1784,6 +1788,43 @@ impl Default for ImagesConfig {
     }
 }
 
+/// Display-math rendering settings for the TUI.
+///
+/// `preamble` is only honored from the trusted (global) config: a project
+/// layer must not be able to inject TeX macros into formulas rendered from
+/// model output.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MathConfig {
+    /// Render display math through the terminal's graphics protocol.
+    pub images: bool,
+    /// Rasterization DPI passed to `dvipng`/poppler.
+    pub dpi: u32,
+    /// Reject formulas longer than this before invoking TeX.
+    pub max_source_bytes: usize,
+    /// Do not shrink an image below this scale; fall back to ASCII instead.
+    /// 0 disables the check.
+    pub min_scale: f32,
+    /// Fall back to ASCII when the rendered image would be taller than this.
+    /// 0 disables the check.
+    pub max_rows: u32,
+    /// Extra LaTeX preamble for project macros. Trusted config only.
+    pub preamble: String,
+}
+
+impl Default for MathConfig {
+    fn default() -> Self {
+        Self {
+            images: true,
+            dpi: 200,
+            max_source_bytes: 64 * 1024,
+            min_scale: 0.5,
+            max_rows: 60,
+            preamble: String::new(),
+        }
+    }
+}
+
 /// Language servers keyed by display name, e.g. `[lsp.servers.rust]`.
 ///
 /// Built-in servers cover the common languages. Explicit entries are merged
@@ -2754,6 +2795,21 @@ impl Config {
                 "images.max_image_bytes must be > 0".into(),
             ));
         }
+        if !(50..=1200).contains(&self.math.dpi) {
+            return Err(ConfigError::Invalid(
+                "math.dpi must be between 50 and 1200".into(),
+            ));
+        }
+        if self.math.max_source_bytes < 1024 {
+            return Err(ConfigError::Invalid(
+                "math.max_source_bytes must be at least 1024".into(),
+            ));
+        }
+        if !(0.0..=1.0).contains(&self.math.min_scale) {
+            return Err(ConfigError::Invalid(
+                "math.min_scale must be between 0 and 1".into(),
+            ));
+        }
         if self.context.budget_tokens == 0 {
             return Err(ConfigError::Invalid(
                 "context.budget_tokens must be > 0".into(),
@@ -3220,6 +3276,14 @@ fn sanitize_project_layer(layer: &mut toml::Value, warnings: &mut Vec<String>) {
                     "project config cannot set tools.{key}; use the global config"
                 ));
             }
+        }
+    }
+
+    // TeX macros can read local files even without shell escape, and they run
+    // while rendering model output. Only the trusted config may define them.
+    if let Some(math) = layer.get_mut("math").and_then(toml::Value::as_table_mut) {
+        if math.remove("preamble").is_some() {
+            warnings.push("project config cannot set math.preamble; use the global config".into());
         }
     }
 
@@ -5472,5 +5536,42 @@ extensions = ["zig"]
         assert!(rule.matches("apply_patch", &json!({"path": "a"})));
         assert!(rule.matches("exec_command", &json!({"cmd": "ls"})));
         assert_eq!(rule.specificity(), 0);
+    }
+
+    #[test]
+    fn math_config_validates_limits() {
+        let mut config = Config::default();
+        config.validate().expect("defaults are valid");
+
+        config.math.dpi = 10;
+        assert!(config.validate().is_err());
+        config.math.dpi = 200;
+
+        config.math.max_source_bytes = 16;
+        assert!(config.validate().is_err());
+        config.math.max_source_bytes = 64 * 1024;
+
+        config.math.min_scale = 1.5;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn project_layer_cannot_define_math_preamble() {
+        let mut layer: toml::Value = toml::from_str(
+            r#"
+[math]
+preamble = "\\newcommand{\\proj}{x}"
+"#,
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        sanitize_project_layer(&mut layer, &mut warnings);
+        assert!(layer["math"].get("preamble").is_none());
+        assert!(
+            warnings
+                .iter()
+                .any(|warning| warning.contains("math.preamble")),
+            "{warnings:?}"
+        );
     }
 }

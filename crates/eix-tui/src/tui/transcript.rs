@@ -8,6 +8,7 @@
 //! the turn is stored.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use eix_core::{
     ApprovalRequiredPayload, AssistantMessagePayload, ContextCompactedPayload,
@@ -236,16 +237,22 @@ pub fn render_with_subagents(
     theme: Theme,
     tick: u64,
     subagents: &HashMap<String, Subagent>,
+    base: Option<&Path>,
 ) -> Transcript {
     let tail_width = width.saturating_sub(2).max(1);
-    let mut out = render_history_with_subagents(events, folds, width, theme, subagents);
-    append_tail(&mut out, live, queued, folds, tail_width, theme, tick);
+    let mut out = render_history_with_subagents(events, folds, width, theme, subagents, base);
+    append_tail(&mut out, live, queued, folds, tail_width, theme, tick, base);
     out
 }
 
 /// Render a standalone event log, used by the sub-agent picker preview. The
 /// child has no nested `spawn_agent` cards, so the subagent map is empty.
-pub fn render_events(events: &[SessionEvent], width: usize, theme: Theme) -> Transcript {
+pub fn render_events(
+    events: &[SessionEvent],
+    width: usize,
+    theme: Theme,
+    base: Option<&Path>,
+) -> Transcript {
     let width = width.saturating_sub(2).max(1);
     let mut blocks = Vec::new();
     let mut tool_index = Vec::new();
@@ -264,7 +271,8 @@ pub fn render_events(events: &[SessionEvent], width: usize, theme: Theme) -> Tra
             width,
             theme,
             &no_subagents,
-            false,
+            true,
+            base,
         );
         append_piece_parts(
             &mut lines,
@@ -293,11 +301,12 @@ pub fn render_history_with_subagents(
     width: usize,
     theme: Theme,
     subagents: &HashMap<String, Subagent>,
+    base: Option<&Path>,
 ) -> Transcript {
     // Keep a two-cell gutter on the right so queued prompts never touch the
     // pane border.
     let width = width.saturating_sub(2).max(1);
-    render_blocks(collect(events), folds, width, theme, subagents)
+    render_blocks(collect(events), folds, width, theme, subagents, base)
 }
 
 /// Render the in-flight turn and queued prompts. This is cheap to call on
@@ -309,6 +318,7 @@ pub fn render_tail(
     width: usize,
     theme: Theme,
     tick: u64,
+    base: Option<&Path>,
 ) -> Transcript {
     let width = width.saturating_sub(2).max(1);
     let mut out = Transcript {
@@ -318,7 +328,7 @@ pub fn render_tail(
         math: Vec::new(),
         copy: Vec::new(),
     };
-    append_tail(&mut out, live, queued, folds, width, theme, tick);
+    append_tail(&mut out, live, queued, folds, width, theme, tick, base);
     out
 }
 
@@ -329,10 +339,11 @@ fn render_blocks(
     width: usize,
     theme: Theme,
     subagents: &HashMap<String, Subagent>,
+    base: Option<&Path>,
 ) -> Transcript {
     let mut out = Transcript::new();
     for collected in blocks {
-        let piece = render_block(&collected.block, folds, width, theme, subagents, true);
+        let piece = render_block(&collected.block, folds, width, theme, subagents, true, base);
         append_piece(&mut out, piece);
     }
     out
@@ -347,12 +358,13 @@ fn render_block(
     theme: Theme,
     subagents: &HashMap<String, Subagent>,
     images: bool,
+    base: Option<&Path>,
 ) -> Transcript {
     let mut out = Transcript::new();
     match block {
         Block::User { seq, text, images } => {
             let line = out.lines.len();
-            user_message(&mut out, text, images, width, theme);
+            user_message(&mut out, text, images, width, theme, base);
             out.user_lines.push((*seq, line));
         }
         Block::Assistant {
@@ -370,10 +382,11 @@ fn render_block(
                     width,
                     theme,
                     folds,
+                    images,
                 );
             }
             if !text.is_empty() {
-                assistant_message(&mut out, text, *cancelled, width, theme, images);
+                assistant_message(&mut out, text, *cancelled, width, theme, images, base);
             }
         }
         Block::Tool(block) => {
@@ -386,12 +399,12 @@ fn render_block(
                 .flatten();
             match subagent {
                 Some(subagent) => subagent_block(&mut out, block, subagent, width, theme, folds),
-                None => tool_block(&mut out, block, width, theme, folds),
+                None => tool_block(&mut out, block, width, theme, folds, base),
             }
         }
         Block::Note { text } => note(&mut out, '◇', text, comment(theme), width),
         Block::Compaction { messages, summary } => {
-            compaction_summary(&mut out, *messages, summary, width, theme, images)
+            compaction_summary(&mut out, *messages, summary, width, theme, images, base)
         }
         Block::Error { text } => note(&mut out, '!', text, theme.error.unwrap_or(DANGER), width),
     }
@@ -501,6 +514,7 @@ fn block_key(
 pub struct HistoryCache {
     width: usize,
     theme: Theme,
+    base: Option<PathBuf>,
     events_rev: u64,
     subagents_rev: u64,
     folds: HashMap<FoldId, bool>,
@@ -528,10 +542,12 @@ impl HistoryCache {
         events_rev: u64,
         subagents_rev: u64,
         folds: &HashMap<FoldId, bool>,
+        base: Option<&Path>,
     ) -> bool {
         self.width == 0
             || self.width != width
             || self.theme != theme
+            || self.base.as_deref() != base
             || self.events_rev != events_rev
             || self.subagents_rev != subagents_rev
             || self.folds != *folds
@@ -547,6 +563,7 @@ impl HistoryCache {
         subagents: &HashMap<String, Subagent>,
         subagents_rev: u64,
         events_rev: u64,
+        base: Option<&Path>,
     ) {
         // Reuse collected blocks when the event log only grew. A history page
         // prepended at the front or a fork/truncation changes the prefix, so
@@ -605,7 +622,7 @@ impl HistoryCache {
         for (index, collected) in self.blocks.iter().enumerate().skip(common) {
             self.starts.push(self.lines.len());
             self.keys.push(keys[index]);
-            let piece = render_block(&collected.block, folds, width, theme, subagents, true);
+            let piece = render_block(&collected.block, folds, width, theme, subagents, true, base);
             append_piece_parts(
                 &mut self.lines,
                 &mut self.slots,
@@ -617,6 +634,7 @@ impl HistoryCache {
         }
         self.width = width;
         self.theme = theme;
+        self.base = base.map(PathBuf::from);
         self.events_rev = events_rev;
         self.subagents_rev = subagents_rev;
         self.folds = folds.clone();
@@ -635,6 +653,7 @@ pub(crate) fn waiting_dots(tick: u64) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn append_tail(
     out: &mut Transcript,
     live: Option<Live<'_>>,
@@ -643,15 +662,25 @@ fn append_tail(
     width: usize,
     theme: Theme,
     tick: u64,
+    base: Option<&Path>,
 ) {
     if let Some(live) = live {
         if !live.reasoning.is_empty() {
-            thinking(out, FoldId::Live, live.reasoning, true, width, theme, folds);
+            thinking(
+                out,
+                FoldId::Live,
+                live.reasoning,
+                true,
+                width,
+                theme,
+                folds,
+                true,
+            );
         }
         if !live.text.is_empty() {
-            assistant_message(out, live.text, false, width, theme, true);
+            assistant_message(out, live.text, false, width, theme, true, base);
         } else if live.reasoning.is_empty() {
-            assistant_message(out, waiting_dots(tick), false, width, theme, true);
+            assistant_message(out, waiting_dots(tick), false, width, theme, true, base);
         }
     }
     if !queued.is_empty() {
@@ -1158,25 +1187,31 @@ fn push_bubble(
 
 /// A user turn: Markdown wrapped in a right-aligned chat bubble, opposite the
 /// left-aligned agent output.
-fn user_message(out: &mut Transcript, text: &str, images: &[String], width: usize, theme: Theme) {
+fn user_message(
+    out: &mut Transcript,
+    text: &str,
+    images: &[String],
+    width: usize,
+    theme: Theme,
+    base: Option<&Path>,
+) {
     let content_width = bubble_content_limit(width);
-    let mut content = Vec::new();
-    for path in images {
-        content.push(Line::from(Span::styled(
-            format!("[image] {path}"),
-            Style::default().fg(theme.comment.unwrap_or(MUTED)),
-        )));
-    }
+    let (mut content, mut placements) = thumbnail_rows(images, content_width, theme, base);
     let image_lines = content.len();
     let mut sources = Vec::new();
-    let mut placements = Vec::new();
     let text = text.trim_end();
     if !text.is_empty() {
         // The bubble supplies its own horizontal padding, so render without
         // the transcript's usual two-cell left gutter. Display math still uses
         // a LaTeX image; `push_bubble` translates its anchors into the box.
-        let rendered =
-            markdown::render_with_indent_detailed(text, content_width.max(1), theme, "", true);
+        let rendered = markdown::render_with_indent_detailed(
+            text,
+            content_width.max(1),
+            theme,
+            "",
+            true,
+            base,
+        );
         content.extend(rendered.lines);
         sources.extend(
             rendered
@@ -1202,6 +1237,7 @@ fn assistant_message(
     width: usize,
     theme: Theme,
     images: bool,
+    base: Option<&Path>,
 ) {
     let mut rendered = markdown::render_with_indent_detailed(
         text.trim_end_matches('\n'),
@@ -1209,6 +1245,7 @@ fn assistant_message(
         theme,
         "  ",
         images,
+        base,
     );
     if rendered.lines.is_empty() {
         rendered.lines.push(Line::from("  "));
@@ -1249,6 +1286,7 @@ fn compaction_summary(
     width: usize,
     theme: Theme,
     images: bool,
+    base: Option<&Path>,
 ) {
     note(
         out,
@@ -1260,13 +1298,15 @@ fn compaction_summary(
     let indent = "    ";
     let content_width = width.saturating_sub(indent.len()).max(1);
     let rendered =
-        markdown::render_with_indent_detailed(summary, content_width, theme, indent, images);
+        markdown::render_with_indent_detailed(summary, content_width, theme, indent, images, base);
     out.push_rendered(rendered);
     out.blank();
 }
 
 /// The "Thinking" module: a collapsible, quietly styled header over the chain
-/// of thought.
+/// of thought. Reasoning models also emit `$$...$$` formulas, so the body uses
+/// the same image/2D renderer as assistant output instead of printing raw TeX.
+#[allow(clippy::too_many_arguments)]
 fn thinking(
     out: &mut Transcript,
     id: FoldId,
@@ -1275,15 +1315,34 @@ fn thinking(
     width: usize,
     theme: Theme,
     folds: &HashMap<FoldId, bool>,
+    images: bool,
 ) {
     let inner = width.saturating_sub(6).max(1);
-    let wrapped = wrap_text(text.trim_end(), inner);
-    let lines = wrapped.len().max(1);
     // Thinking is open by default, both while streaming and after the turn is
     // stored; an explicit click can still collapse it.
     let open = folds.get(&id).copied().unwrap_or(true);
     let fold = Fold { id, open };
     let marker = if open { '▾' } else { '▸' };
+    let rich = open.then(|| {
+        rich_text(
+            text.trim_end(),
+            width,
+            theme,
+            "    │ ",
+            italic_dim(theme),
+            images,
+        )
+    });
+    let lines = rich
+        .as_ref()
+        .map(|rich| rich.lines.len())
+        .unwrap_or_else(|| {
+            text.trim_end()
+                .lines()
+                .map(|line| wrap_text(line, inner).len())
+                .sum()
+        })
+        .max(1);
     let header = if streaming {
         "  ✳ Thinking…".to_string()
     } else if lines == 1 {
@@ -1295,19 +1354,177 @@ fn thinking(
         Line::from(Span::styled(header, italic_dim(theme))),
         Some(fold),
     );
-    if open {
-        for line in wrapped {
-            out.push(
-                Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("│ ", dim(theme)),
-                    Span::styled(line, italic_dim(theme)),
-                ]),
-                Some(fold),
-            );
+    if let Some(rich) = rich {
+        let base_line = out.lines.len();
+        for line in rich.lines {
+            out.push(line, Some(fold));
+        }
+        for mut placement in rich.math {
+            placement.line += base_line;
+            out.math.push(placement);
+        }
+        for (line, source) in rich.sources {
+            out.copy.push((base_line + line, source));
         }
     }
     out.blank();
+}
+
+/// A piece of plain text with the display-math spans pulled out.
+enum MathSegment<'a> {
+    Text(&'a str),
+    Display(&'a str),
+}
+
+/// Split `text` on `$$...$$`. Unclosed delimiters stay literal text.
+fn math_segments(text: &str) -> Vec<MathSegment<'_>> {
+    let bytes = text.as_bytes();
+    let mut segments = Vec::new();
+    let mut start = 0;
+    let mut index = 0;
+    while index + 1 < bytes.len() {
+        if bytes[index] == b'$' && bytes[index + 1] == b'$' && !is_escaped(bytes, index) {
+            if let Some(close) = text[index + 2..].find("$$") {
+                let close = index + 2 + close;
+                if close > index + 2 {
+                    if start < index {
+                        segments.push(MathSegment::Text(&text[start..index]));
+                    }
+                    segments.push(MathSegment::Display(&text[index + 2..close]));
+                    index = close + 2;
+                    start = index;
+                    continue;
+                }
+            }
+        }
+        index += 1;
+    }
+    if start < text.len() {
+        segments.push(MathSegment::Text(&text[start..]));
+    }
+    if segments.is_empty() {
+        segments.push(MathSegment::Text(text));
+    }
+    segments
+}
+
+fn is_escaped(bytes: &[u8], index: usize) -> bool {
+    let mut backslashes = 0;
+    let mut cursor = index;
+    while cursor > 0 && bytes[cursor - 1] == b'\\' {
+        backslashes += 1;
+        cursor -= 1;
+    }
+    backslashes % 2 == 1
+}
+
+/// Replace single-line `$...$` spans with compact ASCII math. Delimiters that
+/// do not look like math (`$PATH`, `$HOME`) stay literal.
+fn expand_inline_math(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut index = 0;
+    let mut plain_start = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'$' || is_escaped(bytes, index) {
+            index += 1;
+            continue;
+        }
+        let opening = index;
+        index += 1;
+        if index >= bytes.len() || bytes[index].is_ascii_whitespace() || bytes[index] == b'$' {
+            continue;
+        }
+        let Some(close) = text[index..].find(['$', '\n']).map(|offset| index + offset) else {
+            break;
+        };
+        if bytes[close] == b'\n' || close == opening + 1 || bytes[close - 1].is_ascii_whitespace() {
+            index = close.max(opening + 1);
+            continue;
+        }
+        let source = &text[index..close];
+        if !markdown::looks_like_math(source) {
+            index = close + 1;
+            continue;
+        }
+        out.push_str(&text[plain_start..opening]);
+        out.push_str(&super::math::compact(source));
+        index = close + 1;
+        plain_start = index;
+    }
+    out.push_str(&text[plain_start..]);
+    out
+}
+
+struct Rich {
+    lines: Vec<Line<'static>>,
+    math: Vec<math_image::Placement>,
+    /// Line -> LaTeX source, so copying a formula in plain tool output or
+    /// reasoning still yields the source rather than the ASCII approximation.
+    sources: Vec<(usize, String)>,
+}
+
+/// Render plain text (tool output, reasoning) while turning `$$...$$` into a
+/// display-math image or the 2D character layout.
+fn rich_text(
+    text: &str,
+    width: usize,
+    theme: Theme,
+    prefix: &str,
+    style: Style,
+    images: bool,
+) -> Rich {
+    let prefix_width = UnicodeWidthStr::width(prefix);
+    let avail = width.saturating_sub(prefix_width).max(1);
+    let mut rich = Rich {
+        lines: Vec::new(),
+        math: Vec::new(),
+        sources: Vec::new(),
+    };
+    for segment in math_segments(text) {
+        match segment {
+            MathSegment::Text(text) => {
+                let expanded = expand_inline_math(text);
+                for line in expanded.lines() {
+                    for wrapped in wrap_text(line, avail) {
+                        rich.lines.push(Line::from(vec![
+                            Span::raw(prefix.to_string()),
+                            Span::styled(wrapped, style),
+                        ]));
+                    }
+                }
+            }
+            MathSegment::Display(source) => {
+                let image = images
+                    .then(|| math_image::render(source, avail, markdown::math_text_color(theme)));
+                let start = rich.lines.len();
+                if let Some(Some(image)) = image {
+                    let rows = usize::from(image.rows.max(1));
+                    let cols = usize::from(image.cols);
+                    let pad = avail.saturating_sub(cols) / 2;
+                    let column = (prefix_width + pad).min(u16::MAX as usize) as u16;
+                    for _ in 0..rows {
+                        rich.lines.push(Line::from(Span::raw(prefix.to_string())));
+                    }
+                    rich.math.push(math_image::Placement {
+                        line: start,
+                        column,
+                        image,
+                    });
+                } else {
+                    for line in super::math::display(source, avail, style) {
+                        let mut spans = vec![Span::raw(prefix.to_string())];
+                        spans.extend(line.spans);
+                        rich.lines.push(Line::from(spans));
+                    }
+                }
+                for line in start..rich.lines.len() {
+                    rich.sources.push((line, source.to_string()));
+                }
+            }
+        }
+    }
+    rich
 }
 
 /// A tool invocation: a compact summary with the status on the following line,
@@ -1320,6 +1537,7 @@ fn tool_block(
     width: usize,
     theme: Theme,
     folds: &HashMap<FoldId, bool>,
+    base: Option<&Path>,
 ) {
     let id = FoldId::Event(block.seq);
     // File-writing tools keep their vimdiff-style preview visible after the
@@ -1392,6 +1610,11 @@ fn tool_block(
         }
         if let Some(diff) = patch_diff {
             push_diff(out, diff_path(block), diff, width, theme, fold);
+        }
+        if block.tool == "view_image" && block.result.as_ref().is_some_and(|result| result.ok) {
+            if let Some(path) = block.arguments.get("path").and_then(Value::as_str) {
+                push_thumbnail(out, Path::new(path), base, width, fold);
+            }
         }
         if let Some(result) = &block.result {
             push_output(out, result.output.trim_end(), width, theme, fold);
@@ -1937,9 +2160,114 @@ fn push_body(out: &mut Transcript, text: &str, width: usize, theme: Theme, fold:
     push_text(out, text, None, width, theme, fold);
 }
 
-/// Tool output, capped at [`OUTPUT_ROWS`] with a trailing ellipsis.
+/// Tool output, capped at [`OUTPUT_ROWS`] with a trailing ellipsis. Output can
+/// contain formulas (for example from `pdftotext` or a notebook), so it uses
+/// the math-aware text renderer.
 fn push_output(out: &mut Transcript, text: &str, width: usize, theme: Theme, fold: Fold) {
-    push_text(out, text, Some(OUTPUT_ROWS), width, theme, fold);
+    if text.is_empty() {
+        return;
+    }
+    let mut rich = rich_text(
+        text,
+        width,
+        theme,
+        BODY_INDENT,
+        Style::default().fg(text_color(theme)),
+        true,
+    );
+    let limit = OUTPUT_ROWS;
+    let truncated = rich.lines.len() > limit;
+    rich.lines.truncate(limit);
+    rich.math
+        .retain(|placement| placement.line + usize::from(placement.image.rows) <= limit);
+    let base = out.lines.len();
+    for line in rich.lines {
+        out.push(line, Some(fold));
+    }
+    for mut placement in rich.math {
+        placement.line += base;
+        out.math.push(placement);
+    }
+    for (line, source) in rich.sources {
+        if line < limit {
+            out.copy.push((base + line, source));
+        }
+    }
+    if truncated {
+        out.push(
+            Line::from(Span::styled(format!("{BODY_INDENT}…"), dim(theme))),
+            Some(fold),
+        );
+    }
+}
+
+/// Reserve cells for a local image and pin the thumbnail to them. Used for
+/// `view_image` results; unreadable or remote paths render nothing here.
+fn push_thumbnail(
+    out: &mut Transcript,
+    path: &Path,
+    base: Option<&Path>,
+    width: usize,
+    fold: Fold,
+) {
+    let prefix_width = BODY_INDENT.len();
+    let avail = width.saturating_sub(prefix_width).max(1);
+    let Some(image) =
+        math_image::render_file(path, base, Some(avail.min(u16::MAX as usize) as u16), None)
+    else {
+        return;
+    };
+    let start = out.lines.len();
+    let rows = usize::from(image.rows.max(1));
+    let cols = usize::from(image.cols);
+    let pad = avail.saturating_sub(cols) / 2;
+    for _ in 0..rows {
+        out.push(Line::from(Span::raw(BODY_INDENT)), Some(fold));
+    }
+    out.math.push(math_image::Placement {
+        line: start,
+        column: (prefix_width + pad).min(u16::MAX as usize) as u16,
+        image,
+    });
+}
+
+/// Thumbnail rows for user attachments inside a chat bubble. Paths that cannot
+/// be decoded keep the old `[image] path` line.
+fn thumbnail_rows(
+    images: &[String],
+    width: usize,
+    theme: Theme,
+    base: Option<&Path>,
+) -> (Vec<Line<'static>>, Vec<math_image::Placement>) {
+    let mut lines = Vec::new();
+    let mut placements = Vec::new();
+    for path in images {
+        let Some(image) = math_image::render_file(
+            Path::new(path),
+            base,
+            Some(width.min(u16::MAX as usize) as u16),
+            None,
+        ) else {
+            lines.push(Line::from(Span::styled(
+                format!("[image] {path}"),
+                Style::default().fg(theme.comment.unwrap_or(MUTED)),
+            )));
+            continue;
+        };
+        let start = lines.len();
+        let rows = usize::from(image.rows.max(1));
+        let cols = usize::from(image.cols);
+        let pad = width.saturating_sub(cols) / 2;
+        for _ in 0..rows {
+            lines.push(Line::from(""));
+        }
+        placements.push(math_image::Placement {
+            line: start,
+            column: pad.min(u16::MAX as usize) as u16,
+            image,
+        });
+    }
+    (lines, placements)
 }
 
 fn push_text(
@@ -2045,6 +2373,72 @@ mod tests {
             cols,
             rows,
         }
+    }
+
+    fn all_text(out: &Transcript) -> String {
+        out.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn thinking_renders_display_math_instead_of_raw_tex() {
+        let mut out = Transcript::new();
+        thinking(
+            &mut out,
+            FoldId::Live,
+            "we need $$\\frac{a}{b}$$ here",
+            false,
+            60,
+            Theme::default(),
+            &HashMap::new(),
+            false,
+        );
+        let text = all_text(&out);
+        assert!(!text.contains("$$"), "{text}");
+        assert!(text.contains('─') || text.contains("a/b"), "{text}");
+    }
+
+    #[test]
+    fn tool_output_expands_display_and_inline_math() {
+        let text = expand_inline_math("cost $x^2$ vs $PATH and $HOME");
+        assert!(!text.contains("$x^2$"), "{text}");
+        assert!(text.contains("x^2") || text.contains('²'), "{text}");
+        assert!(text.contains("$PATH"), "{text}");
+        assert!(text.contains("$HOME"), "{text}");
+    }
+
+    #[test]
+    fn rich_text_keeps_plain_lines_and_math_together() {
+        let rich = rich_text(
+            "before\n$$x = 1$$\nafter",
+            40,
+            Theme::default(),
+            "    ",
+            Style::default(),
+            false,
+        );
+        let text = rich
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("before"), "{text}");
+        assert!(text.contains("after"), "{text}");
+        assert!(!text.contains("$$"), "{text}");
     }
 
     #[test]

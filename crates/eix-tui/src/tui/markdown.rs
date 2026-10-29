@@ -3,13 +3,16 @@
 //! Messages are Markdown, so the transcript renders them into styled
 //! `ratatui` lines instead of showing raw `**`, backticks and `[](...)`. The
 //! renderer deliberately stays terminal-friendly: links show their target,
-//! images become a labelled placeholder, and inline math is shown in a compact
-//! ASCII form. Display math uses a character-grid layout, or a real LaTeX
-//! image when the terminal speaks Kitty, Sixel or iTerm2.
+//! local images become thumbnails when the terminal speaks Kitty, Sixel or
+//! iTerm2 (and a labelled placeholder otherwise), and inline math is shown in
+//! a compact ASCII form. Display math uses a character-grid layout, or a real
+//! LaTeX image when a graphics protocol is available.
 //!
 //! It intentionally only covers the constructs that make a chat transcript
 //! readable: headings, emphasis, inline/fenced code, lists, quotes, rules,
 //! links, images, tables, task lists and inline/display math.
+
+use std::path::{Path, PathBuf};
 
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
@@ -45,7 +48,7 @@ pub(crate) fn render_with_indent(
     theme: Theme,
     indent: &str,
 ) -> Vec<Line<'static>> {
-    render_with_indent_detailed(text, width, theme, indent, false).lines
+    render_with_indent_detailed(text, width, theme, indent, false, None).lines
 }
 
 /// Rendered Markdown plus the metadata the transcript needs beyond the text:
@@ -67,8 +70,9 @@ pub(crate) fn render_with_indent_detailed(
     theme: Theme,
     indent: &str,
     images: bool,
+    base: Option<&Path>,
 ) -> Rendered {
-    let mut renderer = Renderer::new(width, theme, indent, images);
+    let mut renderer = Renderer::new(width, theme, indent, images, base);
     let options = Options::ENABLE_TABLES
         | Options::ENABLE_STRIKETHROUGH
         | Options::ENABLE_TASKLISTS
@@ -85,6 +89,8 @@ struct Renderer {
     theme: Theme,
     indent: String,
     images: bool,
+    /// Session cwd for relative image paths.
+    base: Option<PathBuf>,
     lines: Vec<Line<'static>>,
     placements: Vec<math_image::Placement>,
     sources: Vec<(usize, String)>,
@@ -126,18 +132,22 @@ struct TableState {
 struct Capture {
     dest: String,
     label: String,
+    /// Length of `inline` before the image/link opened, so an image that is
+    /// rendered as a block can remove its placeholder text again.
+    inline_start: usize,
     /// The link/image lives inside a table cell, so its text has already been
     /// appended to the cell buffer instead of the inline span list.
     in_cell: bool,
 }
 
 impl Renderer {
-    fn new(width: usize, theme: Theme, indent: &str, images: bool) -> Self {
+    fn new(width: usize, theme: Theme, indent: &str, images: bool, base: Option<&Path>) -> Self {
         let mut renderer = Self {
             width: width.max(1),
             theme,
             indent: indent.to_string(),
             images,
+            base: base.map(PathBuf::from),
             lines: Vec::new(),
             placements: Vec::new(),
             sources: Vec::new(),
@@ -328,6 +338,7 @@ impl Renderer {
                     dest: dest_url.to_string(),
                     label: String::new(),
                     in_cell: self.cell.is_some(),
+                    inline_start: 0,
                 });
             }
             Tag::Image { dest_url, .. } => {
@@ -346,6 +357,7 @@ impl Renderer {
                     dest: dest_url.to_string(),
                     label: String::new(),
                     in_cell: self.cell.is_some(),
+                    inline_start: self.inline.len(),
                 });
             }
             Tag::MetadataBlock(_) => {}
@@ -422,8 +434,12 @@ impl Renderer {
                     if !cap.in_cell {
                         self.pop_style();
                     }
-                    let label = cap.label.trim();
-                    if !cap.dest.is_empty() {
+                    let label = cap.label.trim().to_string();
+                    if !cap.in_cell && self.images && self.image_block(&cap.dest, cap.inline_start)
+                    {
+                        // The thumbnail (if the local file could be decoded)
+                        // replaced the placeholder text.
+                    } else if !cap.dest.is_empty() {
                         if cap.in_cell || !label.is_empty() {
                             self.append_styled(&format!(" ({})", cap.dest), dim(self.theme));
                         } else {
@@ -611,6 +627,63 @@ impl Renderer {
         spans.push(Span::styled("─".repeat(width), dim(self.theme)));
         self.lines.push(Line::from(spans));
         self.ensure_blank();
+    }
+
+    /// Try to draw a Markdown image as a terminal thumbnail. Only local files
+    /// and `file://` URIs are supported; remote URLs keep the text placeholder
+    /// because the TUI never fetches the network from the render path.
+    fn image_block(&mut self, dest: &str, inline_start: usize) -> bool {
+        if dest.is_empty()
+            || dest.starts_with("http://")
+            || dest.starts_with("https://")
+            || dest.starts_with("data:")
+        {
+            return false;
+        }
+        let first_prefix = self.prefix_spans(true);
+        let cont_prefix = self.prefix_spans(false);
+        let prefix_width = Self::prefix_width(&first_prefix);
+        let avail = self.width.saturating_sub(prefix_width).max(1);
+        let image = math_image::render_file(
+            Path::new(dest),
+            self.base.as_deref(),
+            Some(avail.min(u16::MAX as usize) as u16),
+            None,
+        );
+        let Some(image) = image else {
+            return false;
+        };
+        // The renderer already pushed a `🖼` marker and the alt text; drop them
+        // now that the image will be drawn as its own block.
+        self.inline.truncate(inline_start);
+        self.flush();
+        if let Some(item) = self.items.last_mut() {
+            item.first = false;
+        }
+        self.ensure_blank();
+        let start = self.lines.len();
+        let rows = usize::from(image.rows.max(1));
+        let cols = usize::from(image.cols);
+        let pad = avail.saturating_sub(cols) / 2;
+        let column = (prefix_width + pad).min(u16::MAX as usize) as u16;
+        for row in 0..rows {
+            let mut spans = if row == 0 {
+                first_prefix.clone()
+            } else {
+                cont_prefix.clone()
+            };
+            if spans.is_empty() {
+                spans.push(Span::raw(" "));
+            }
+            self.lines.push(Line::from(spans));
+        }
+        self.placements.push(math_image::Placement {
+            line: start,
+            column,
+            image,
+        });
+        self.ensure_blank();
+        true
     }
 
     fn display_math(&mut self, source: &str) {
@@ -1059,7 +1132,7 @@ fn accent(theme: Theme) -> Color {
 /// Text colour for a LaTeX image. The image is painted over the terminal
 /// background, so a transparent theme needs an explicit foreground rather
 /// than `Reset`.
-fn math_text_color(theme: Theme) -> Option<Color> {
+pub(super) fn math_text_color(theme: Theme) -> Option<Color> {
     if let Some(color) = theme.normal {
         if !matches!(color, Color::Reset) {
             return Some(color);
@@ -1090,7 +1163,7 @@ fn dim(theme: Theme) -> Style {
 /// math people actually put in chat answers (fractions, roots, scripts, Greek
 /// letters and common operators) and leaves anything else readable as text.
 /// Decide whether an inline `$...$` span is real math rather than shell syntax.
-fn looks_like_math(source: &str) -> bool {
+pub(super) fn looks_like_math(source: &str) -> bool {
     let trimmed = source.trim();
     if trimmed.chars().count() == 1 && trimmed.chars().all(char::is_alphabetic) {
         return true;
@@ -1481,7 +1554,7 @@ mod tests {
     #[test]
     fn display_math_without_a_protocol_records_copy_sources() {
         let rendered =
-            render_with_indent_detailed("$$\\frac{a}{b}$$", 40, Theme::default(), "  ", true);
+            render_with_indent_detailed("$$\\frac{a}{b}$$", 40, Theme::default(), "  ", true, None);
         assert!(rendered.images.is_empty());
         assert!(!rendered.lines.is_empty());
         assert_eq!(rendered.sources.len(), rendered.lines.len());

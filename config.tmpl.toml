@@ -277,6 +277,21 @@ MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
 # retention_days = 30
 # max_store_bytes = 2147483648
 
+# --- Display math -----------------------------------------------------------
+# Display math is rendered as a terminal image (Kitty, Sixel or iTerm2) when
+# the terminal supports it, and as 2D ASCII text otherwise. The TUI shells out
+# to `latex`/`dvipng` (or `xelatex` + poppler for CJK). `/math status` reports
+# the detected mode and the reason for a fallback.
+# [math]
+# images = true
+# dpi = 200
+# max_source_bytes = 65536
+# min_scale = 0.5
+# max_rows = 60
+# Extra preamble (macros, packages) for formulas. Trusted config only: project
+# layers cannot set it. EIX_MATH_DPI overrides `dpi`.
+# preamble = "\newcommand{\R}{\mathbb{R}}"
+
 # --- LSP --------------------------------------------------------------------
 # Built in: bash, cpp, css, go, html, json, lua, markdown, python, rust, sql,
 # toml, typescript, yaml. Override or add one here.

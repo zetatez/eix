@@ -348,6 +348,43 @@ impl App {
                 self.status = "reloading config…".into();
                 true
             }
+            "math" => {
+                let option = args.split_whitespace().next().unwrap_or("status");
+                match option {
+                    "on" | "off" => {
+                        self.math_config.images = option == "on";
+                        self.apply_math_mode(false);
+                    }
+                    "reload" => {
+                        self.apply_math_mode(true);
+                    }
+                    "status" => {
+                        let status = super::super::math_image::status();
+                        self.status = if !self.math_config.images {
+                            "math: images off".into()
+                        } else if status.enabled {
+                            format!("math: images {} @ {} dpi", status.protocol, status.dpi)
+                        } else {
+                            format!(
+                                "math: ASCII fallback ({})",
+                                status
+                                    .reason
+                                    .as_deref()
+                                    .unwrap_or("no graphics protocol detected")
+                            )
+                        };
+                        if let Some(error) = &status.last_error {
+                            self.status.push_str(&format!(" · last: {error}"));
+                        }
+                    }
+                    other => {
+                        self.error = Some(format!(
+                            "unknown /math option {other:?} · use on, off, reload or status"
+                        ));
+                    }
+                }
+                true
+            }
             "colorscheme" => {
                 if args.is_empty() {
                     self.open_picker(PickerKind::Themes, tx);
@@ -947,4 +984,37 @@ pub(super) fn parse_schedule_at(text: &str) -> Option<i64> {
     }
     let seconds = parse_duration(text)?;
     Some(eix_core::now_ms() + seconds as i64 * 1_000)
+}
+
+impl App {
+    /// Re-probe the terminal with the current `[math]` settings and drop the
+    /// rendered transcripts so every visible pane picks up the new mode.
+    fn apply_math_mode(&mut self, reload_config: bool) {
+        if reload_config {
+            if let Ok(loaded) = eix_core::Config::load(self.config_path.as_deref()) {
+                self.math_config = loaded.math;
+            }
+        }
+        let enabled = super::super::math_image::reload(&self.math_config);
+        for view in &mut self.views {
+            view.history_cache = None;
+            view.tail_key = None;
+            view.text_lines_valid = false;
+        }
+        self.force_clear = true;
+        let status = super::super::math_image::status();
+        self.status = if !self.math_config.images {
+            "math: images off".into()
+        } else if enabled {
+            format!("math: images {} @ {} dpi", status.protocol, status.dpi)
+        } else {
+            format!(
+                "math: ASCII fallback ({})",
+                status
+                    .reason
+                    .as_deref()
+                    .unwrap_or("no graphics protocol detected")
+            )
+        };
+    }
 }

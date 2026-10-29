@@ -750,29 +750,42 @@ impl App {
             let width = preview_area.width.saturating_sub(2) as usize;
             let height = preview_area.height as usize;
             self.sync_subagent_preview(&filtered, selected, width);
-            let lines = self.picker_preview_lines(&filtered, height);
-            let mut wrapped: Vec<String> = lines
-                .iter()
-                .flat_map(|line| wrap_text(line, width))
-                .collect();
-            // Session previews are conversations: keep the newest lines in
-            // view instead of showing the oldest part of the fetched window.
-            if matches!(
-                kind,
-                PickerKind::Sessions | PickerKind::NewPane | PickerKind::SubagentActivity
-            ) && wrapped.len() > height
-            {
-                wrapped.drain(..wrapped.len() - height);
+            if let Some(rich) = self.picker_preview_rich(&filtered, height, width) {
+                let preview = Paragraph::new(rich.lines)
+                    .style(Style::default().fg(preview_text).bg(dialog_bg))
+                    .block(
+                        Block::default()
+                            .borders(Borders::LEFT)
+                            .border_style(Style::default().fg(muted).bg(dialog_bg)),
+                    );
+                frame.render_widget(preview, preview_area);
+                self.draw_preview_images(frame, preview_area, &rich.math);
+            } else {
+                let lines = self.picker_preview_lines(&filtered, height);
+                let mut wrapped: Vec<String> = lines
+                    .iter()
+                    .flat_map(|line| wrap_text(line, width))
+                    .collect();
+                // Session previews are conversations: keep the newest lines
+                // in view instead of showing the oldest part of the fetched
+                // window.
+                if matches!(
+                    kind,
+                    PickerKind::Sessions | PickerKind::NewPane | PickerKind::SubagentActivity
+                ) && wrapped.len() > height
+                {
+                    wrapped.drain(..wrapped.len() - height);
+                }
+                let body: Vec<Line> = wrapped.into_iter().take(height).map(Line::from).collect();
+                let preview = Paragraph::new(body)
+                    .style(Style::default().fg(preview_text).bg(dialog_bg))
+                    .block(
+                        Block::default()
+                            .borders(Borders::LEFT)
+                            .border_style(Style::default().fg(muted).bg(dialog_bg)),
+                    );
+                frame.render_widget(preview, preview_area);
             }
-            let body: Vec<Line> = wrapped.into_iter().take(height).map(Line::from).collect();
-            let preview = Paragraph::new(body)
-                .style(Style::default().fg(preview_text).bg(dialog_bg))
-                .block(
-                    Block::default()
-                        .borders(Borders::LEFT)
-                        .border_style(Style::default().fg(muted).bg(dialog_bg)),
-                );
-            frame.render_widget(preview, preview_area);
         }
     }
 
@@ -1018,6 +1031,8 @@ impl App {
             picker.preview = PickerPreview {
                 key: Some(value.clone()),
                 text: None,
+                rendered: None,
+                rendered_width: 0,
                 error: None,
                 loading: true,
             };
@@ -1058,22 +1073,117 @@ impl App {
         {
             return;
         }
-        let text = {
+        let rendered = {
             let Some(view) = self.focused_view() else {
                 return;
             };
             let Some((_, agent)) = view.subagents_sorted().get(index).copied() else {
                 return;
             };
-            subagent_preview_text(agent, width, self.theme)
+            subagent_preview(agent, width, self.theme, Some(view.session.cwd.as_path()))
         };
         if let Some(picker) = &mut self.picker {
             picker.preview = PickerPreview {
                 key: Some(key),
-                text: Some(text),
+                text: None,
+                rendered: Some(rendered),
+                rendered_width: width,
                 error: None,
                 loading: false,
             };
+        }
+    }
+
+    /// Rich preview for the session and child-agent panes. Returns `None` for
+    /// other kinds (and while a session preview is still loading), so the
+    /// caller keeps using the plain-text path.
+    pub(super) fn picker_preview_rich(
+        &mut self,
+        filtered: &[usize],
+        height: usize,
+        width: usize,
+    ) -> Option<PreviewRendered> {
+        let (kind, index) = {
+            let picker = self.picker.as_ref()?;
+            (picker.kind, *filtered.get(picker.selected)?)
+        };
+        match kind {
+            PickerKind::SubagentActivity => self
+                .picker
+                .as_ref()?
+                .preview
+                .rendered
+                .clone()
+                .map(|preview| preview.tail(height)),
+            PickerKind::Sessions | PickerKind::NewPane => {
+                let text = {
+                    let picker = self.picker.as_ref()?;
+                    if picker.preview.rendered_width == width {
+                        if let Some(preview) = &picker.preview.rendered {
+                            return Some(preview.clone().tail(height));
+                        }
+                    }
+                    picker.preview.text.clone()?
+                };
+                let base = self.sessions.get(index).map(|session| session.cwd.clone());
+                let rendered = crate::tui::markdown::render_with_indent_detailed(
+                    &text,
+                    width,
+                    self.theme,
+                    "",
+                    true,
+                    base.as_deref(),
+                );
+                let preview = PreviewRendered {
+                    lines: rendered.lines,
+                    math: rendered.images,
+                    bytes: text.len(),
+                };
+                if let Some(picker) = &mut self.picker {
+                    picker.preview.rendered = Some(preview.clone());
+                    picker.preview.rendered_width = width;
+                }
+                Some(preview.tail(height))
+            }
+            _ => None,
+        }
+    }
+
+    /// Paint display-math and Markdown-image thumbnails inside the picker
+    /// preview pane. `math` anchors are relative to the first visible line.
+    fn draw_preview_images(
+        &self,
+        frame: &mut Frame,
+        area: Rect,
+        math: &[crate::tui::math_image::Placement],
+    ) {
+        if !crate::tui::math_image::enabled() {
+            return;
+        }
+        // The preview block draws a one-cell left border.
+        let inner = Rect {
+            x: area.x.saturating_add(1),
+            width: area.width.saturating_sub(1),
+            ..area
+        };
+        for placement in math {
+            if placement.line >= inner.height as usize {
+                continue;
+            }
+            let rect = Rect {
+                x: inner.x.saturating_add(placement.column),
+                y: inner.y.saturating_add(placement.line as u16),
+                width: placement.image.cols,
+                height: placement.image.rows,
+            }
+            .intersection(inner);
+            if rect.width == 0 || rect.height == 0 {
+                continue;
+            }
+            frame.render_widget(
+                ratatui_image::Image::new(&placement.image.protocol).allow_clipping(true),
+                rect,
+            );
         }
     }
 
@@ -1158,11 +1268,17 @@ impl App {
     }
 }
 
-/// Plain text of the selected child agent: identity/status plus its recent
-/// event log and still-streaming thinking. Older events are dropped first so a
-/// long-running child does not make every picker frame re-render its entire
-/// history.
-fn subagent_preview_text(agent: &Subagent, width: usize, theme: Theme) -> String {
+/// Rendered view of the selected child agent: identity/status plus its recent
+/// event log and still-streaming thinking. Unlike the old plain-string
+/// preview, Markdown image anchors and display-math placements survive so the
+/// picker pane can paint them. Older events are dropped first so a long-running
+/// child does not make every picker frame re-render its entire history.
+fn subagent_preview(
+    agent: &Subagent,
+    width: usize,
+    theme: Theme,
+    base: Option<&std::path::Path>,
+) -> PreviewRendered {
     const MAX_EVENTS: usize = 300;
     const MAX_BYTES: usize = 64 * 1024;
 
@@ -1171,7 +1287,8 @@ fn subagent_preview_text(agent: &Subagent, width: usize, theme: Theme) -> String
         transcript::SubagentStatus::Completed => "done",
         transcript::SubagentStatus::Failed => "failed",
     };
-    let mut lines = vec![
+    let mut preview = PreviewRendered::default();
+    for line in [
         agent.name.clone(),
         String::new(),
         format!("status      {status}"),
@@ -1179,30 +1296,34 @@ fn subagent_preview_text(agent: &Subagent, width: usize, theme: Theme) -> String
         format!("events      {}", agent.events.len()),
         String::new(),
         "── live activity ──".to_string(),
-    ];
+    ] {
+        preview.lines.push(Line::from(line));
+    }
     let start = agent.events.len().saturating_sub(MAX_EVENTS);
     if start > 0 {
-        lines.push(format!("… {} older event(s)", start));
+        preview
+            .lines
+            .push(Line::from(format!("… {start} older event(s)")));
     }
-    let rendered = transcript::render_events(&agent.events[start..], width, theme);
-    lines.extend(rendered.lines.iter().map(line_text));
+    let rendered = transcript::render_events(&agent.events[start..], width, theme, base);
+    append_preview(&mut preview, rendered.lines, rendered.math);
     if !agent.reasoning.trim().is_empty() {
-        lines.push(String::new());
-        lines.push("✳ Thinking…".into());
-        lines.extend(agent.reasoning.lines().map(str::to_string));
+        preview.lines.push(Line::from(""));
+        preview.lines.push(Line::from("✳ Thinking…"));
+        append_markdown_preview(&mut preview, &agent.reasoning, width, theme, base);
     }
     if !agent.text.trim().is_empty() {
-        lines.push(String::new());
-        lines.push("✎ Answer…".into());
-        lines.extend(agent.text.lines().map(str::to_string));
+        preview.lines.push(Line::from(""));
+        preview.lines.push(Line::from("✎ Answer…"));
+        append_markdown_preview(&mut preview, &agent.text, width, theme, base);
     }
     if let Some(error) = agent
         .error
         .as_deref()
         .filter(|text| !text.trim().is_empty())
     {
-        lines.push(String::new());
-        lines.push(format!("! {error}"));
+        preview.lines.push(Line::from(""));
+        preview.lines.push(Line::from(format!("! {error}")));
     }
     if agent.events.is_empty() {
         if let Some(result) = agent
@@ -1210,19 +1331,64 @@ fn subagent_preview_text(agent: &Subagent, width: usize, theme: Theme) -> String
             .as_deref()
             .filter(|text| !text.trim().is_empty())
         {
-            lines.push(String::new());
-            lines.push(result.to_string());
+            preview.lines.push(Line::from(""));
+            preview.lines.push(Line::from(result.to_string()));
         }
     }
-    let mut text = lines.join("\n");
-    if text.len() > MAX_BYTES {
-        let mut cut = text.len() - MAX_BYTES;
-        while !text.is_char_boundary(cut) {
-            cut += 1;
-        }
-        text = text[cut..].to_string();
+    preview.bytes = preview
+        .lines
+        .iter()
+        .map(|line| line_text(line).len() + 1)
+        .sum();
+    trim_preview(preview, MAX_BYTES)
+}
+
+fn append_preview(
+    preview: &mut PreviewRendered,
+    lines: Vec<Line<'static>>,
+    math: Vec<crate::tui::math_image::Placement>,
+) {
+    let offset = preview.lines.len();
+    preview.lines.extend(lines);
+    for mut placement in math {
+        placement.line += offset;
+        preview.math.push(placement);
     }
-    text
+}
+
+fn append_markdown_preview(
+    preview: &mut PreviewRendered,
+    text: &str,
+    width: usize,
+    theme: Theme,
+    base: Option<&std::path::Path>,
+) {
+    let rendered =
+        crate::tui::markdown::render_with_indent_detailed(text, width, theme, "  ", true, base);
+    append_preview(preview, rendered.lines, rendered.images);
+}
+
+/// Drop the oldest lines until the preview fits the byte budget, keeping the
+/// image anchors aligned with the lines that remain.
+fn trim_preview(mut preview: PreviewRendered, max_bytes: usize) -> PreviewRendered {
+    if preview.bytes <= max_bytes {
+        return preview;
+    }
+    let mut total = preview.bytes;
+    let mut cut = 0;
+    while total > max_bytes && cut < preview.lines.len() {
+        total = total.saturating_sub(line_text(&preview.lines[cut]).len() + 1);
+        cut += 1;
+    }
+    if cut > 0 {
+        preview.lines.drain(..cut);
+        preview.math.retain(|placement| placement.line >= cut);
+        for placement in &mut preview.math {
+            placement.line -= cut;
+        }
+    }
+    preview.bytes = total;
+    preview
 }
 
 fn line_text(line: &Line<'_>) -> String {

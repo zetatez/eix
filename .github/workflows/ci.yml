@@ -24,6 +24,28 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  math:
+    name: Math rendering
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: math
+      - name: Install TeX and poppler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            texlive-latex-base texlive-latex-recommended \
+            texlive-latex-extra texlive-science texlive-fonts-recommended \
+            texlive-fonts-extra texlive-xetex texlive-lang-chinese \
+            texlive-pictures dvipng poppler-utils fonts-noto-cjk
+      - name: Test LaTeX pipeline
+        env:
+          EIX_REQUIRE_TEX: "1"
+        run: cargo test -p eix-tui math_image
+
   macos:
     name: macOS test
     runs-on: macos-15
