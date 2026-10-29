@@ -55,6 +55,7 @@ impl PluginClient {
         store: Arc<Store>,
         bus: tokio::sync::broadcast::Sender<eix_core::Notification>,
         rpc_tx: mpsc::Sender<super::host_api::RpcCallRequest>,
+        logs: Arc<super::logs::PluginLogs>,
     ) -> Result<Arc<Self>> {
         let workspace = spec.cwd.clone();
         let plugin_data_dir = spec.data_dir.clone();
@@ -73,6 +74,9 @@ impl PluginClient {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
+        if spec.sandbox {
+            apply_sandbox(&mut command, &spec.cwd, &spec.data_dir);
+        }
         let mut child = command
             .spawn()
             .with_context(|| format!("cannot start plugin {} ({})", spec.name, spec.command))?;
@@ -80,10 +84,12 @@ impl PluginClient {
         let stdout = child.stdout.take().context("plugin stdout was not piped")?;
         if let Some(stderr) = child.stderr.take() {
             let name = spec.name.clone();
+            let logs = Arc::clone(&logs);
             tokio::spawn(async move {
                 let mut lines = BufReader::new(stderr).lines();
                 while let Ok(Some(line)) = lines.next_line().await {
                     eprintln!("eix-plugin[{name}]: {}", redact(&line));
+                    logs.push(&name, "stderr", &line);
                 }
             });
         }
@@ -118,6 +124,7 @@ impl PluginClient {
             spec.env.clone(),
             bus,
             rpc_tx,
+            logs,
         );
 
         let writer_connection = Arc::clone(&connection);
@@ -458,5 +465,194 @@ impl Connection {
                 reason.to_string(),
             ));
         }
+    }
+}
+
+/// Best-effort OS hardening applied before exec when `plugins.<name>.sandbox`
+/// is enabled. This is not a replacement for the capability model: it limits
+/// the damage a malicious process plugin can do outside the host API.
+#[cfg(target_os = "linux")]
+fn apply_sandbox(command: &mut Command, workspace: &Path, data_dir: &Path) {
+    let workspace = workspace.to_path_buf();
+    let data_dir = data_dir.to_path_buf();
+    // SAFETY: the closure runs in the forked child before exec. It only uses
+    // async-signal-safe libc calls and owned paths captured by value.
+    unsafe {
+        command.pre_exec(move || {
+            // No setuid/setgid escalation, and ask the kernel to kill the
+            // child if the daemon dies.
+            libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0);
+            set_limit(libc::RLIMIT_CORE, 0);
+            set_limit(libc::RLIMIT_NOFILE, 512);
+            landlock_paths(&workspace, &data_dir);
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_sandbox(_command: &mut Command, _workspace: &Path, _data_dir: &Path) {}
+
+#[cfg(target_os = "linux")]
+fn set_limit(resource: libc::__rlimit_resource_t, value: u64) {
+    let limit = libc::rlimit {
+        rlim_cur: value,
+        rlim_max: value,
+    };
+    // SAFETY: `limit` is a valid rlimit struct for this process.
+    unsafe {
+        libc::setrlimit(resource, &limit);
+    }
+}
+
+#[cfg(target_os = "linux")]
+const LANDLOCK_CREATE_RULESET_VERSION: u32 = 1;
+#[cfg(target_os = "linux")]
+const LANDLOCK_RULE_PATH_BENEATH: u32 = 1;
+#[cfg(target_os = "linux")]
+const ACCESS_EXECUTE: u64 = 1 << 0;
+#[cfg(target_os = "linux")]
+const ACCESS_WRITE_FILE: u64 = 1 << 1;
+#[cfg(target_os = "linux")]
+const ACCESS_READ_FILE: u64 = 1 << 2;
+#[cfg(target_os = "linux")]
+const ACCESS_READ_DIR: u64 = 1 << 3;
+#[cfg(target_os = "linux")]
+const ACCESS_REMOVE_DIR: u64 = 1 << 4;
+#[cfg(target_os = "linux")]
+const ACCESS_REMOVE_FILE: u64 = 1 << 5;
+#[cfg(target_os = "linux")]
+const ACCESS_MAKE_DIR: u64 = 1 << 7;
+#[cfg(target_os = "linux")]
+const ACCESS_MAKE_REG: u64 = 1 << 8;
+#[cfg(target_os = "linux")]
+const ACCESS_MAKE_SOCK: u64 = 1 << 9;
+#[cfg(target_os = "linux")]
+const ACCESS_MAKE_FIFO: u64 = 1 << 10;
+#[cfg(target_os = "linux")]
+const ACCESS_MAKE_SYM: u64 = 1 << 12;
+#[cfg(target_os = "linux")]
+const ACCESS_REFER: u64 = 1 << 13;
+#[cfg(target_os = "linux")]
+const ACCESS_TRUNCATE: u64 = 1 << 14;
+
+#[cfg(target_os = "linux")]
+const READ_ONLY: u64 = ACCESS_EXECUTE | ACCESS_READ_FILE | ACCESS_READ_DIR;
+#[cfg(target_os = "linux")]
+const READ_WRITE: u64 = READ_ONLY
+    | ACCESS_WRITE_FILE
+    | ACCESS_REMOVE_DIR
+    | ACCESS_REMOVE_FILE
+    | ACCESS_MAKE_DIR
+    | ACCESS_MAKE_REG
+    | ACCESS_MAKE_SOCK
+    | ACCESS_MAKE_FIFO
+    | ACCESS_MAKE_SYM
+    | ACCESS_REFER
+    | ACCESS_TRUNCATE;
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LandlockRulesetAttr {
+    handled_access_fs: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[repr(C)]
+struct LandlockPathBeneathAttr {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+/// Restrict the child to system runtime paths plus its workspace and data
+/// directory. Silently does nothing on kernels without Landlock (or when the
+/// syscall is blocked by a container runtime).
+#[cfg(target_os = "linux")]
+fn landlock_paths(workspace: &Path, data_dir: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+    const CREATE_RULESET: libc::c_long = 444;
+    const ADD_RULE: libc::c_long = 445;
+    const RESTRICT_SELF: libc::c_long = 446;
+
+    // Landlock ABI 1 is enough for path-beneath rules.
+    // SAFETY: probing the ABI with a null attribute is explicitly supported.
+    let abi = unsafe {
+        libc::syscall(
+            CREATE_RULESET,
+            std::ptr::null::<LandlockRulesetAttr>(),
+            0usize,
+            LANDLOCK_CREATE_RULESET_VERSION,
+        )
+    };
+    if abi < 0 {
+        return;
+    }
+    let ruleset = LandlockRulesetAttr {
+        handled_access_fs: READ_WRITE,
+    };
+    // SAFETY: the attribute pointer/size match the kernel ABI.
+    let ruleset_fd = unsafe {
+        libc::syscall(
+            CREATE_RULESET,
+            &ruleset,
+            std::mem::size_of::<LandlockRulesetAttr>(),
+            0u32,
+        )
+    };
+    if ruleset_fd < 0 {
+        return;
+    }
+    let add = |path: &Path, access: u64| {
+        let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return;
+        };
+        // SAFETY: `path` is a valid NUL-terminated string; O_PATH opens the
+        // object without requiring read permission.
+        let parent_fd = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        if parent_fd < 0 {
+            return;
+        }
+        let attr = LandlockPathBeneathAttr {
+            allowed_access: access,
+            parent_fd,
+        };
+        // SAFETY: the rule pointer/size and opened fd are valid for the call.
+        unsafe {
+            libc::syscall(
+                ADD_RULE,
+                ruleset_fd,
+                LANDLOCK_RULE_PATH_BENEATH,
+                &attr,
+                0u32,
+            );
+            libc::close(parent_fd);
+        }
+    };
+    for path in [
+        "/usr",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/lib64",
+        "/etc",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/nix/store",
+        "/run/current-system",
+        "/opt",
+        "/snap",
+    ] {
+        add(Path::new(path), READ_ONLY);
+    }
+    add(Path::new("/dev/null"), READ_WRITE);
+    add(Path::new("/tmp"), READ_WRITE);
+    add(workspace, READ_WRITE);
+    add(data_dir, READ_WRITE);
+    // SAFETY: the ruleset fd is valid and fully populated.
+    unsafe {
+        libc::syscall(RESTRICT_SELF, ruleset_fd, 0u32);
+        libc::close(ruleset_fd as i32);
     }
 }

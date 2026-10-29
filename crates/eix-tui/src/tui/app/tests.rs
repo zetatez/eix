@@ -3587,6 +3587,7 @@ fn file_picker_inserts_at_path_into_the_native_prompt() {
         kind: PickerKind::Files,
         query: String::new(),
         selected: 0,
+        provider: None,
         items: vec![PickerItem::new("src/main.rs"), PickerItem::new("README.md")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3691,6 +3692,7 @@ fn file_picker_preview_requests_the_selected_file() {
         kind: PickerKind::Files,
         query: String::new(),
         selected: 0,
+        provider: None,
         items: vec![PickerItem::new("src/a.rs"), PickerItem::new("src/b.rs")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3746,6 +3748,7 @@ fn file_picker_draws_the_lazy_preview_on_the_right() {
         kind: PickerKind::Files,
         query: String::new(),
         selected: 0,
+        provider: None,
         items: vec![PickerItem::new("src/a.rs")],
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3778,6 +3781,7 @@ fn session_picker_preview_requests_the_selected_session_history() {
         kind: PickerKind::NewPane,
         query: String::new(),
         selected: 0,
+        provider: None,
         items: Vec::new(),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -3817,6 +3821,7 @@ fn session_picker_preview_renders_markdown_and_display_math() {
         kind: PickerKind::NewPane,
         query: String::new(),
         selected: 0,
+        provider: None,
         items: Vec::new(),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -4154,6 +4159,7 @@ fn command_palette_aligns_descriptions() {
         kind: PickerKind::Commands,
         query: String::new(),
         selected: 0,
+        provider: None,
         items: command_items(&commands),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -4204,6 +4210,7 @@ fn picker_detail_columns_align_for_every_kind() {
             kind,
             query: String::new(),
             selected: 0,
+            provider: None,
             items: vec![
                 PickerItem::new("a").with_label("a").with_detail("first"),
                 PickerItem::new("b")
@@ -4248,6 +4255,7 @@ fn session_picker_metadata_columns_align() {
         kind: PickerKind::Sessions,
         query: String::new(),
         selected: 0,
+        provider: None,
         items: Vec::new(),
         items_rev: 0,
         filter: PickerFilterCache::default(),
@@ -7997,6 +8005,62 @@ fn old_permission_command_is_gone() {
         .error
         .as_deref()
         .is_some_and(|error| error.contains("unknown command /permission")));
+}
+
+#[test]
+fn plugin_panel_renders_nodes_and_commands_target_the_open_surface() {
+    let mut app = App::new(None);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let node: eix_core::UiNode = serde_json::from_value(serde_json::json!({
+        "kind": "group",
+        "children": [
+            {"kind": "heading", "text": "Issues", "level": 2},
+            {"kind": "actions", "actions": [
+                {"id": "refresh", "label": "Refresh", "kind": "primary"}
+            ]}
+        ]
+    }))
+    .unwrap();
+    let result = eix_core::PluginUiRenderResult {
+        title: "Issues".into(),
+        node: Some(node),
+        body: String::new(),
+    };
+    app.handle_event(
+        Event::PluginUiPanel {
+            plugin: "acme".into(),
+            id: "issues".into(),
+            surface: "panel".into(),
+            title: "Issues".into(),
+            result,
+        },
+        &tx,
+    );
+    assert_eq!(app.plugin_panel.as_ref().unwrap().plugin, "acme");
+    let text = app.text_view.as_ref().unwrap().lines.join("\n");
+    assert!(text.contains("## Issues"));
+    assert!(text.contains("/plugins act refresh"));
+
+    app.handle_event(
+        Event::PluginUiActionDone {
+            plugin: "acme".into(),
+            id: "issues".into(),
+            action: "refresh".into(),
+            result: eix_core::PluginUiActionResult {
+                close: true,
+                ..Default::default()
+            },
+        },
+        &tx,
+    );
+    assert!(app.text_view.is_none());
+    assert!(app.plugin_panel.is_none());
+
+    app.handle_command_text("/plugins act refresh", &tx, false);
+    assert!(app
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains("no plugin panel open")));
 }
 
 fn render_text(app: &mut App, width: u16, height: u16) -> String {

@@ -594,6 +594,18 @@ impl App {
                 settings,
                 surfaces,
             } => {
+                self.plugin_failed = list
+                    .plugins
+                    .iter()
+                    .filter(|plugin| plugin.state == eix_core::PluginState::Failed)
+                    .map(|plugin| plugin.name.clone())
+                    .collect();
+                self.plugin_degraded = list
+                    .plugins
+                    .iter()
+                    .filter(|plugin| plugin.state == eix_core::PluginState::Degraded)
+                    .map(|plugin| plugin.name.clone())
+                    .collect();
                 let (title, text, status) = match &settings {
                     Some(settings) => (
                         format!("plugin · {}", settings.plugin),
@@ -608,6 +620,156 @@ impl App {
                 };
                 self.open_text_view(title, &text);
                 self.status = status;
+            }
+            Event::PluginHealth {
+                total,
+                failed,
+                degraded,
+            } => {
+                self.plugin_failed = failed;
+                self.plugin_degraded = degraded;
+                let unhealthy = self.plugin_failed.len() + self.plugin_degraded.len();
+                if unhealthy > 0 {
+                    self.status = format!(
+                        "plugin health: {unhealthy}/{total} need attention (/plugins doctor)"
+                    );
+                }
+            }
+            Event::PluginDoctor(doctor) => {
+                let text = render_plugin_doctor(&doctor);
+                self.open_text_view("plugin doctor".to_string(), &text);
+                self.status = format!("plugin doctor · {} plugin(s)", doctor.plugins.len());
+            }
+            Event::PluginLogs(logs) => {
+                let text = render_plugin_logs(&logs);
+                self.open_text_view("plugin logs".to_string(), &text);
+                self.status = format!("plugin logs · {} line(s)", logs.entries.len());
+            }
+            Event::PluginActionDone {
+                action,
+                name,
+                ok,
+                message,
+            } => {
+                if ok {
+                    self.status = format!("plugin {name}: {action} ok");
+                    self.push_toast(
+                        format!("plugin {name}: {action}"),
+                        ToastTone::Success,
+                        WARNING_TOAST_DISPLAY,
+                    );
+                } else {
+                    self.status = format!("plugin {name}: {action} failed");
+                    self.error = Some(message.clone());
+                    self.push_toast(
+                        format!("plugin {name}: {action} failed"),
+                        ToastTone::Warning,
+                        WARNING_TOAST_DISPLAY,
+                    );
+                }
+                let _ = tx.send(Command::PluginHealth);
+            }
+            Event::PluginUiPanel {
+                plugin,
+                id,
+                surface,
+                title,
+                result,
+            } => {
+                self.show_plugin_panel(&plugin, &id, &surface, &title, &result);
+            }
+            Event::PluginUiActionDone {
+                plugin,
+                id,
+                action,
+                result,
+            } => {
+                if !result.ok {
+                    let message = result
+                        .error
+                        .clone()
+                        .unwrap_or_else(|| "plugin rejected the action".into());
+                    self.status = format!("plugin {plugin}: {action} failed");
+                    self.error = Some(message);
+                }
+                if let Some(prompt) = result.prompt.filter(|prompt| !prompt.trim().is_empty()) {
+                    if let Some(session_id) = self.focused_session_id() {
+                        if self.session_busy(&session_id) {
+                            self.enqueue(session_id, &prompt, tx);
+                        } else {
+                            self.send_prompt(&session_id, &prompt, tx, false, Vec::new());
+                        }
+                    } else {
+                        self.error = Some("attach a session to run a plugin prompt".into());
+                    }
+                }
+                if result.close {
+                    if self
+                        .plugin_panel
+                        .as_ref()
+                        .is_some_and(|panel| panel.plugin == plugin && panel.id == id)
+                    {
+                        self.plugin_panel = None;
+                        self.text_view = None;
+                    }
+                    self.status = format!("plugin {plugin}: {action} closed the panel");
+                } else if result.ok && (result.node.is_some() || result.body.is_some()) {
+                    let (surface, title) = self
+                        .plugin_panel
+                        .as_ref()
+                        .filter(|panel| panel.plugin == plugin && panel.id == id)
+                        .map(|panel| (panel.surface.clone(), panel.title.clone()))
+                        .unwrap_or_else(|| ("panel".to_string(), id.clone()));
+                    let rendered = eix_core::PluginUiRenderResult {
+                        title: title.clone(),
+                        node: result.node,
+                        body: result.body.unwrap_or_default(),
+                    };
+                    self.show_plugin_panel(&plugin, &id, &surface, &title, &rendered);
+                } else if result.ok {
+                    self.status = format!("plugin {plugin}: {action} ok");
+                }
+                let _ = tx.send(Command::PluginHealth);
+            }
+            Event::PluginPicked {
+                plugin,
+                id,
+                query,
+                items,
+            } => {
+                let matches = self.picker.as_ref().is_some_and(|picker| {
+                    picker.kind == PickerKind::Plugin
+                        && picker.provider.as_ref().is_some_and(|provider| {
+                            provider.plugin == plugin
+                                && provider.id == id
+                                && picker.query.trim() == query.trim()
+                        })
+                });
+                if !matches {
+                    return;
+                }
+                let rows: Vec<PickerItem> = items
+                    .into_iter()
+                    .map(|item| {
+                        let mut row = PickerItem::new(item.id);
+                        row.label = if item.title.is_empty() {
+                            row.value.clone()
+                        } else {
+                            item.title
+                        };
+                        if !item.subtitle.is_empty() {
+                            row.detail = Some(item.subtitle);
+                        }
+                        row
+                    })
+                    .collect();
+                let count = rows.len();
+                if let Some(picker) = &mut self.picker {
+                    picker.set_items(rows);
+                    picker.selected = 0;
+                    picker.loading = false;
+                }
+                self.status = format!("{count} item(s)");
             }
             Event::PluginCommandResult { session_id, result } => {
                 if !result.ok {
@@ -1780,7 +1942,81 @@ fn render_plugin_settings(
         }
     }
     lines.push(String::new());
-    lines.push("Edit values under [plugins.<name>.settings] in the global config.".into());
+    lines.push(
+        "Edit with /plugins set <name> <key>=<json>, or under [plugins.<name>.settings].".into(),
+    );
+    lines.push("Inspect this plugin with /plugins doctor <name> or /plugins logs <name>.".into());
+    lines.join("\n")
+}
+
+fn render_plugin_doctor(doctor: &eix_core::PluginDoctorResult) -> String {
+    if doctor.plugins.is_empty() {
+        return "no plugins configured".into();
+    }
+    let mut lines = Vec::new();
+    for entry in &doctor.plugins {
+        let state = match entry.state {
+            eix_core::PluginState::Disabled => "disabled",
+            eix_core::PluginState::Starting => "starting",
+            eix_core::PluginState::Ready => "ready",
+            eix_core::PluginState::Degraded => "degraded",
+            eix_core::PluginState::Failed => "failed",
+            eix_core::PluginState::Stopped => "stopped",
+        };
+        lines.push(format!(
+            "{} {} · {} · [{}]",
+            entry.name, entry.version, entry.backend, state
+        ));
+        lines.push(format!(
+            "  tools {} · commands {} · hooks {} · ui {} · rpc {} · failures {} · logs {}",
+            entry.tools,
+            entry.commands,
+            entry.hooks,
+            entry.ui,
+            entry.rpc,
+            entry.failures,
+            entry.log_lines
+        ));
+        if !entry.events.is_empty() {
+            lines.push(format!("  events: {}", entry.events.join(", ")));
+        }
+        for check in &entry.checks {
+            lines.push(format!(
+                "  {} {} — {}",
+                if check.ok { "ok  " } else { "FAIL" },
+                check.name,
+                check.detail
+            ));
+        }
+        if let Some(error) = &entry.error {
+            lines.push(format!("  error: {error}"));
+        }
+        if let Some(last) = &entry.last_log {
+            lines.push(format!("  last log: {last}"));
+        }
+        lines.push(String::new());
+    }
+    lines.push("Fix: /plugins restart <name>, /plugins enable|disable <name>.".into());
+    lines.join("\n")
+}
+
+fn render_plugin_logs(logs: &eix_core::PluginLogsResult) -> String {
+    if logs.entries.is_empty() {
+        return "no log lines buffered".into();
+    }
+    let mut lines = Vec::with_capacity(logs.entries.len() + 2);
+    for entry in &logs.entries {
+        lines.push(format!(
+            "{} {:<5} {:<16} {}",
+            entry.timestamp_ms, entry.level, entry.plugin, entry.message
+        ));
+    }
+    lines.push(String::new());
+    lines.push(format!(
+        "{} line(s) · next {}",
+        logs.entries.len(),
+        logs.next
+    ));
     lines.join("\n")
 }
 

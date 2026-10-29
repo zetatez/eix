@@ -671,14 +671,29 @@ impl App {
 
         let rect = search_dialog_rect(area);
         frame.render_widget(Clear, rect);
-        let title = format!(" {} ({}) ", kind.title(), filtered.len());
+        let provider_title = self
+            .picker
+            .as_ref()
+            .filter(|picker| picker.kind == PickerKind::Plugin)
+            .and_then(|picker| picker.provider.as_ref())
+            .map(|provider| provider.title.clone());
+        let title = format!(
+            " {} ({}) ",
+            provider_title.as_deref().unwrap_or_else(|| kind.title()),
+            filtered.len()
+        );
+        let hint = if provider_title.is_some() {
+            "type to search · Enter choose · Esc close"
+        } else {
+            kind.hint()
+        };
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(accent).bg(dialog_bg))
             .title_style(Style::default().bg(dialog_bg))
             .style(Style::default().bg(dialog_bg))
             .title(title)
-            .title_bottom(format!(" {} ", kind.hint()));
+            .title_bottom(format!(" {hint} "));
         let inner = block.inner(rect);
         frame.render_widget(block, rect);
         let body = draw_search_field(frame, inner, &query, accent, preview_text, muted, dialog_bg);

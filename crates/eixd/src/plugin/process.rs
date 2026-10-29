@@ -29,8 +29,9 @@ impl ProcessBackend {
         store: Arc<Store>,
         bus: broadcast::Sender<Notification>,
         rpc_tx: mpsc::Sender<RpcCallRequest>,
+        logs: Arc<super::logs::PluginLogs>,
     ) -> Result<Arc<Self>> {
-        let client = PluginClient::spawn(spec, store, bus, rpc_tx).await?;
+        let client = PluginClient::spawn(spec, store, bus, rpc_tx, logs).await?;
         Ok(Arc::new(Self { client }))
     }
 }

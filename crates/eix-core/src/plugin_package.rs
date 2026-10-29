@@ -28,7 +28,70 @@ use crate::plugin::{PluginError, PluginManifest};
 
 pub const DEFAULT_CHECKSUMS: &str = "eix-plugin.sums";
 pub const DEFAULT_SIGNATURE: &str = "eix-plugin.sig";
+/// Installed-package lockfile, stored next to the installed plugin
+/// directories. It records the version and checksums that were verified at
+/// install time so drift is visible later.
+pub const DEFAULT_LOCKFILE: &str = "plugins.lock";
 const MAX_CHECKSUMS: u64 = 1024 * 1024;
+
+/// One installed plugin entry in `plugins.lock`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LockedPlugin {
+    pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publisher: Option<String>,
+    /// Relative path -> sha256, copied from the package checksum file.
+    pub checksums: BTreeMap<String, String>,
+}
+
+/// `plugins.lock` contents.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginLock {
+    pub plugins: BTreeMap<String, LockedPlugin>,
+}
+
+impl PluginLock {
+    pub fn load(path: &Path) -> Result<Self, PluginError> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let text = std::fs::read_to_string(path).map_err(|source| PluginError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        toml::from_str(&text).map_err(|source| PluginError::Parse {
+            path: path.to_path_buf(),
+            source,
+        })
+    }
+
+    pub fn save(&self, path: &Path) -> Result<(), PluginError> {
+        let text = toml::to_string_pretty(self)
+            .map_err(|err| PluginError::Invalid(format!("cannot encode lockfile: {err}")))?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|source| PluginError::Read {
+                path: parent.to_path_buf(),
+                source,
+            })?;
+        }
+        let temp = path.with_extension("lock.tmp");
+        std::fs::write(&temp, text).map_err(|source| PluginError::Read {
+            path: temp.clone(),
+            source,
+        })?;
+        std::fs::rename(&temp, path).map_err(|source| PluginError::Read {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    }
+}
+
+pub fn lockfile_path(plugins_root: &Path) -> PathBuf {
+    plugins_root.join(DEFAULT_LOCKFILE)
+}
 
 /// Trusted publisher keys. Stored in `plugin-trust.toml`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -322,11 +385,92 @@ pub fn install(
     if backup.exists() {
         let _ = std::fs::remove_dir_all(&backup);
     }
+    // Record what was verified. A failure to write the lockfile must not undo
+    // a successful install, but it is reported so `eix plugin verify` can tell
+    // the package was installed without one.
+    let lock_path = lockfile_path(plugins_root);
+    let mut lock = PluginLock::load(&lock_path).unwrap_or_default();
+    lock.plugins
+        .insert(manifest.name.clone(), locked_entry(&manifest, &target));
+    lock.save(&lock_path)?;
     Ok(InstalledPlugin {
         name: manifest.name.clone(),
         path: target,
         manifest,
     })
+}
+
+/// Compare installed packages against `plugins.lock`. Returns the checked
+/// plugin names.
+pub fn verify_lock(plugins_root: &Path) -> Result<Vec<String>, PluginError> {
+    let lock_path = lockfile_path(plugins_root);
+    let lock = PluginLock::load(&lock_path)?;
+    if lock.plugins.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for (name, entry) in &lock.plugins {
+        let directory = plugins_root.join(name);
+        let manifest_path = directory.join("eix-plugin.toml");
+        if !manifest_path.exists() {
+            return Err(PluginError::Invalid(format!(
+                "{name} is in {} but {} is missing",
+                lock_path.display(),
+                directory.display()
+            )));
+        }
+        let manifest = PluginManifest::load(&manifest_path)?;
+        if manifest.version != entry.version {
+            return Err(PluginError::Invalid(format!(
+                "{name}: lockfile pins {} but installed version is {}",
+                entry.version, manifest.version
+            )));
+        }
+        for (relative, expected) in &entry.checksums {
+            let path = directory.join(relative);
+            let bytes = std::fs::read(&path).map_err(|source| PluginError::Read {
+                path: path.clone(),
+                source,
+            })?;
+            if &hex_digest(&bytes) != expected {
+                return Err(PluginError::Invalid(format!(
+                    "{name}: {relative} does not match {}",
+                    lock_path.display()
+                )));
+            }
+        }
+        names.push(name.clone());
+    }
+    Ok(names)
+}
+
+/// Drop `name` from `plugins.lock` after an uninstall. A missing lockfile or
+/// entry is not an error; returns whether an entry was removed.
+pub fn forget_locked_plugin(plugins_root: &Path, name: &str) -> Result<bool, PluginError> {
+    let path = lockfile_path(plugins_root);
+    let mut lock = PluginLock::load(&path)?;
+    if lock.plugins.remove(name).is_none() {
+        return Ok(false);
+    }
+    lock.save(&path)?;
+    Ok(true)
+}
+
+/// Snapshot the package metadata that a lockfile should pin.
+fn locked_entry(manifest: &PluginManifest, directory: &Path) -> LockedPlugin {
+    let package = manifest.package.as_ref();
+    let checksums_path = package
+        .and_then(|package| package.checksums.clone())
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CHECKSUMS));
+    let checksums = std::fs::read(directory.join(&checksums_path))
+        .ok()
+        .and_then(|bytes| parse_checksums(&bytes, &checksums_path).ok())
+        .unwrap_or_default();
+    LockedPlugin {
+        version: manifest.version.clone(),
+        publisher: package.and_then(|package| package.publisher.clone()),
+        checksums,
+    }
 }
 
 fn copy_tree(source: &Path, target: &Path) -> Result<(), PluginError> {
@@ -587,6 +731,25 @@ mod tests {
         assert!(installed.path.join(DEFAULT_CHECKSUMS).exists());
         assert!(install(&root, &target, &PluginTrustStore::default(), true, false).is_err());
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn lockfile_records_installs_detects_drift_and_forgets_uninstalls() {
+        let root = package("locked");
+        pack(&root).unwrap();
+        let target = root.with_extension("locked-target");
+        let _ = std::fs::remove_dir_all(&target);
+        install(&root, &target, &PluginTrustStore::default(), true, false).unwrap();
+        assert_eq!(verify_lock(&target).unwrap(), vec!["locked".to_string()]);
+
+        std::fs::write(target.join("locked/plugin.py"), "print('drift')\n").unwrap();
+        assert!(verify_lock(&target).is_err());
+
+        assert!(forget_locked_plugin(&target, "locked").unwrap());
+        assert!(!forget_locked_plugin(&target, "locked").unwrap());
+        assert!(verify_lock(&target).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&target);
     }
 
     #[test]

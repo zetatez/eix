@@ -2325,6 +2325,123 @@ impl Config {
         Ok(path)
     }
 
+    /// Register an installed package as `[plugins.<name>]` with `manifest` and
+    /// `enabled = true`, preserving any existing settings/allowlists.
+    pub fn register_plugin(&self, name: &str, manifest: &Path) -> Result<PathBuf, ConfigError> {
+        let (path, mut doc) = self.edit_document()?;
+        let plugins = doc
+            .as_table_mut()
+            .entry("plugins")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let plugins = plugins.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!("`plugins` in {} must be a table", path.display()))
+        })?;
+        let plugin = plugins
+            .entry(name)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let plugin = plugin.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "`plugins.{name}` in {} must be a table",
+                path.display()
+            ))
+        })?;
+        plugin["manifest"] = toml_edit::value(manifest.display().to_string());
+        plugin["enabled"] = toml_edit::value(true);
+        self.save_document(&path, &doc)?;
+        Ok(path)
+    }
+
+    /// Persist `plugins.<name>.enabled`. Runtime `plugin.enable` /
+    /// `plugin.disable` use this so the change survives a daemon restart.
+    pub fn write_plugin_enabled(&self, name: &str, enabled: bool) -> Result<PathBuf, ConfigError> {
+        let (path, mut doc) = self.edit_document()?;
+        let plugins = doc
+            .as_table_mut()
+            .entry("plugins")
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let plugins = plugins.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!("`plugins` in {} must be a table", path.display()))
+        })?;
+        let plugin = plugins
+            .entry(name)
+            .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()));
+        let plugin = plugin.as_table_mut().ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "`plugins.{name}` in {} must be a table",
+                path.display()
+            ))
+        })?;
+        plugin["enabled"] = toml_edit::value(enabled);
+        self.save_document(&path, &doc)?;
+        Ok(path)
+    }
+
+    /// Remove `[plugins.<name>]` entirely. `plugin.uninstall` calls this after
+    /// deleting the installed files.
+    pub fn remove_plugin_config(&self, name: &str) -> Result<PathBuf, ConfigError> {
+        let (path, mut doc) = self.edit_document()?;
+        if let Some(plugins) = doc
+            .as_table_mut()
+            .get_mut("plugins")
+            .and_then(toml_edit::Item::as_table_mut)
+        {
+            plugins.remove(name);
+        }
+        self.save_document(&path, &doc)?;
+        Ok(path)
+    }
+
+    fn edit_document(&self) -> Result<(PathBuf, toml_edit::DocumentMut), ConfigError> {
+        let path = self
+            .explicit_path
+            .clone()
+            .unwrap_or_else(default_config_path);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(source) => {
+                return Err(ConfigError::Read {
+                    path: path.clone(),
+                    source,
+                })
+            }
+        };
+        let doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
+            ConfigError::Invalid(format!("cannot parse {}: {err}", path.display()))
+        })?;
+        Ok((path, doc))
+    }
+
+    fn save_document(&self, path: &Path, doc: &toml_edit::DocumentMut) -> Result<(), ConfigError> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).map_err(|source| ConfigError::Write {
+                path: path.to_path_buf(),
+                source,
+            })?;
+        }
+        let file_name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "config.toml".into());
+        let temp = path.with_file_name(format!("{file_name}.tmp"));
+        let permissions = fs::metadata(path).ok().map(|meta| meta.permissions());
+        fs::write(&temp, doc.to_string()).map_err(|source| ConfigError::Write {
+            path: temp.clone(),
+            source,
+        })?;
+        if let Some(permissions) = permissions {
+            let _ = fs::set_permissions(&temp, permissions);
+        }
+        fs::rename(&temp, path).map_err(|source| ConfigError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        Ok(())
+    }
+
     fn apply_env(&mut self) {
         // Keep only provider entry-point overrides. Every other setting is
         // configured in the config file so a stale shell export cannot silently

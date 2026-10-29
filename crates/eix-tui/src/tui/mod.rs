@@ -83,6 +83,7 @@ pub async fn run(
     let _ = cmd_tx.send(Command::Hello);
     let _ = cmd_tx.send(Command::List);
     let _ = cmd_tx.send(Command::ListPluginCommands);
+    let _ = cmd_tx.send(Command::PluginHealth);
 
     let mut events = EventStream::new();
     let tick = Duration::from_millis(200);

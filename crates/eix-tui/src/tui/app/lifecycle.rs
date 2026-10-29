@@ -99,6 +99,9 @@ impl App {
             // Custom commands are loaded once by `set_compat` at startup.
             commands: builtin_commands(),
             plugin_commands: Vec::new(),
+            plugin_failed: Vec::new(),
+            plugin_degraded: Vec::new(),
+            plugin_panel: None,
             compat,
             command_dismissed: false,
             cmdline: None,

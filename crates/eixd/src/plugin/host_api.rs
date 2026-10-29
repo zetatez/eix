@@ -24,6 +24,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 
 use crate::store::Store;
 
+use super::logs::PluginLogs;
+
 const MAX_STORAGE_KEY: usize = 512;
 const MAX_STORAGE_VALUE: usize = 1_000_000;
 const MAX_FS_FILE: usize = 1024 * 1024;
@@ -61,6 +63,7 @@ pub struct HostContext {
     env: BTreeMap<String, String>,
     bus: broadcast::Sender<Notification>,
     rpc_tx: mpsc::Sender<RpcCallRequest>,
+    logs: Arc<PluginLogs>,
     jobs: Arc<Mutex<HashMap<String, tokio::task::JoinHandle<()>>>>,
 }
 
@@ -79,6 +82,7 @@ impl HostContext {
         env: BTreeMap<String, String>,
         bus: broadcast::Sender<Notification>,
         rpc_tx: mpsc::Sender<RpcCallRequest>,
+        logs: Arc<PluginLogs>,
     ) -> Self {
         Self {
             name,
@@ -93,6 +97,7 @@ impl HostContext {
             env,
             bus,
             rpc_tx,
+            logs,
             jobs: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -235,6 +240,7 @@ impl HostContext {
             self.name,
             redact(&cap(message, 4096))
         );
+        self.logs.push(&self.name, level, &cap(message, 4096));
     }
 
     fn storage_scope(&self, params: &Value) -> Result<String> {
@@ -491,19 +497,35 @@ impl HostContext {
             None => String::new(),
             Some(_) => bail!("UI body must be a string or an array of strings"),
         };
+        // A plugin may send a structured tree instead of plain text. The flat
+        // `body` keeps working for frontends that only render text.
+        let node = match params.get("node") {
+            Some(Value::Null) | None => None,
+            Some(value) => {
+                let node: eix_core::plugin::UiNode =
+                    serde_json::from_value(value.clone()).context("invalid UI node")?;
+                node.validate().map_err(|err| anyhow::anyhow!(err))?;
+                Some(node)
+            }
+        };
+        let body = match (&node, body.is_empty()) {
+            (Some(node), true) => node.to_text(),
+            _ => body,
+        };
         if body.len() > 256 * 1024 {
             bail!("UI body is too large");
         }
-        self.emit(
-            method,
-            json!({
-                "plugin": self.name,
-                "id": id,
-                "surface": surface,
-                "title": title,
-                "body": body,
-            }),
-        );
+        let mut event = json!({
+            "plugin": self.name,
+            "id": id,
+            "surface": surface,
+            "title": title,
+            "body": body,
+        });
+        if let Some(node) = node {
+            event["node"] = serde_json::to_value(node).unwrap_or(Value::Null);
+        }
+        self.emit(method, event);
         Ok(json!({"ok": true}))
     }
 
@@ -1142,6 +1164,7 @@ mod tests {
             env,
             bus,
             rpc_tx,
+            Arc::new(PluginLogs::new()),
         );
         (host, rx)
     }
@@ -1236,6 +1259,7 @@ mod tests {
             BTreeMap::new(),
             bus,
             rpc_tx,
+            Arc::new(PluginLogs::new()),
         );
         let response = call(
             &host,

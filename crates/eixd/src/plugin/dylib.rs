@@ -58,6 +58,7 @@ impl DylibBackend {
         spec: &PluginSpec,
         store: Arc<Store>,
         bus: broadcast::Sender<Notification>,
+        logs: Arc<super::logs::PluginLogs>,
     ) -> Result<Arc<Self>> {
         let library = canonical_library(library)?;
         let host = Arc::new(DylibHost {
@@ -70,6 +71,7 @@ impl DylibBackend {
             network_allow: spec.network_allow.clone(),
             secrets: spec.secrets.clone(),
             env: spec.env.clone(),
+            logs,
         });
         let config = json!({
             "data_dir": spec.data_dir,
@@ -454,6 +456,7 @@ struct DylibHost {
     network_allow: Vec<String>,
     secrets: Vec<String>,
     env: BTreeMap<String, String>,
+    logs: Arc<super::logs::PluginLogs>,
 }
 
 struct HostError {
@@ -600,6 +603,8 @@ impl DylibHost {
             self.name,
             redact(&cap_text(message, MAX_LOG))
         );
+        self.logs
+            .push(&self.name, level, &cap_text(message, MAX_LOG));
     }
 
     fn notify(&self, params: &Value) -> std::result::Result<Value, HostError> {
@@ -906,6 +911,7 @@ mod tests {
             denied_tools: Vec::new(),
             settings: BTreeMap::new(),
             settings_schema: None,
+            sandbox: false,
             network_allow: Vec::new(),
             secrets: Vec::new(),
             rpc_allow: Vec::new(),
@@ -933,7 +939,8 @@ mod tests {
             let spec = test_spec(&library);
             let store = Arc::new(crate::store::Store::in_memory().unwrap());
             let (bus, _) = broadcast::channel(8);
-            let backend = DylibBackend::load(&library, &spec, store, bus)
+            let logs = Arc::new(crate::plugin::logs::PluginLogs::new());
+            let backend = DylibBackend::load(&library, &spec, store, bus, logs)
                 .await
                 .unwrap();
 

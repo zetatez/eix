@@ -629,22 +629,26 @@ checksums = "eix-plugin.sums"
 
 `components.dylib.path` 相对 manifest 目录解析，必须是非空相对路径（绝对路径只在 config 的 `library` 中允许）。`components.server` 与 `components.dylib` 互斥。
 
-`target` / `artifact` 字段尚未解析；跨平台分发时仍建议在包内使用平台目录，并在安装脚本中校验。
+`target` / `artifact` 已解析：`artifact` 优先于 `path`；`target` 支持 `linux-x86_64`、`x86_64-unknown-linux-gnu`、`amd64` 等别名，加载时与当前平台比较，不匹配直接拒绝。
 
 ### 11.3 安装
 
 ```bash
 eix plugin pack dist/
-eix plugin sign dist/ --key ...
+# 用外部 Ed25519 工具签 eix-plugin.sums，把 base64 签名写到 eix-plugin.sig
+eix plugin verify dist/
 eix plugin install dist/
 ```
 
-安装时校验：
+本地开发可以 `eix plugin install dist/ --allow-unsigned`；它会为没有 `[package]` 的目录补表并重新 `pack`。安装时校验：
 
 - `abi` 与 host 支持范围匹配；
+- `min_host_version` 不高于当前 host；
 - `target` 与当前平台匹配；
-- checksums 与 Ed25519 签名；
+- checksums 与 Ed25519 签名（`require_signature = true` 时强制）；
 - `artifact` 在包内，无路径逃逸、无 symlink。
+
+安装后版本与 checksums 写入 `plugins/plugins.lock`；`eix plugin verify-lock`（或库函数 `verify_lock`）会报告漂移。
 
 ---
 
@@ -713,8 +717,8 @@ pub trait ExtensionBackend: Send + Sync {
 | P0 ✅ | `eix-plugin-abi` + `eix-plugin-sdk` 骨架、示例 dylib 可编译 | `cargo check --workspace --all-targets` |
 | P1 ✅ | `DylibBackend` 加载器、`describe`、`tool.call`、`command.run` | 插件工具可在真实 turn 中调用 |
 | P2 🚧 | hooks、events、`rpc.call`、`config.changed`、同步 host API（fs/session/blob）已落地；UI 面板与 async host 方法待做 | 与现有 JSON-RPC 后端功能对齐 |
-| P3 | UI 节点树、provider 流式、agent/skill/theme/keymap/MCP 贡献 | 高自定义场景可用 |
-| P4 | hosted 模式、签名校验、安装分发 | 第三方插件可安全分发 |
+| P3 🚧 | 进程插件已支持 UI 节点树、picker、`ui.render/action/pick`；dylib 的 UI 桥接待做 | 高自定义场景可用 |
+| P4 ✅ | `pack/verify/install/update`、签名、`plugins.lock`、`require_signature`、`target`/`artifact`、Linux opt-in sandbox；registry 待做 | 第三方插件可安全分发 |
 | P5 | 可选 WASM backend | 不可信插件沙箱 |
 
 ---

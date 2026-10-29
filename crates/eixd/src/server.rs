@@ -35,7 +35,8 @@ use eix_core::{
     PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
     PatchResultPayload, PatchReviseParams, PermissionAction, PermissionRule, PickerParams,
     PickerPreviewParams, PickerPreviewResult, PluginCommandList, PluginCommandRunParams,
-    PluginListResult, PluginSettingsResult, ProcessKillParams, ProcessKillResult, ProcessList,
+    PluginListResult, PluginLogsParams, PluginSettingsResult, PluginUiActionParams,
+    PluginUiPickParams, PluginUiRenderParams, ProcessKillParams, ProcessKillResult, ProcessList,
     ProcessListParams, ProcessOutputParams, ProviderAuthInfo, RenameParams, Request, Response,
     RewindParams, RewindResult, RewindScope, RewindToParams, RewindToResult, RuleSource,
     ScheduleAddParams, ScheduleListParams, ScheduleListResult, ScheduleRemoveParams,
@@ -3369,6 +3370,22 @@ impl Daemon {
                 Ok(serde_json::to_value(list)?)
             }
             "plugin.ui.list" => Ok(serde_json::to_value(self.plugins.ui_surfaces().await)?),
+            "plugin.ui.render" => {
+                let params: PluginUiRenderParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(
+                    self.plugins.render_ui(&params).await?,
+                )?)
+            }
+            "plugin.ui.action" => {
+                let params: PluginUiActionParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(
+                    self.plugins.ui_action(&params).await?,
+                )?)
+            }
+            "plugin.ui.pick" => {
+                let params: PluginUiPickParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.plugins.ui_pick(&params).await?)?)
+            }
             "plugin.command.run" => {
                 let params: PluginCommandRunParams = parse_params(request.params.clone())?;
                 let session = self.require_session(&params.session_id)?;
@@ -3446,6 +3463,113 @@ impl Daemon {
                 self.plugins.restart(name, &config).await?;
                 Ok(json!({"restarted": name}))
             }
+            "plugin.start" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.start needs `name`"))?;
+                let config = self.config.load_full();
+                self.plugins.start(name, &config).await?;
+                Ok(json!({"started": name}))
+            }
+            "plugin.stop" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.stop needs `name`"))?;
+                self.plugins.stop(name).await?;
+                Ok(json!({"stopped": name}))
+            }
+            "plugin.enable" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.enable needs `name`"))?;
+                let config = self.config.load_full();
+                if !config.plugins.contains_key(name) {
+                    return Err(rpc("invalid_params", format!("unknown plugin {name:?}")));
+                }
+                config.write_plugin_enabled(name, true)?;
+                self.self_config_write.store(true, Ordering::SeqCst);
+                let mut next = (*config).clone();
+                if let Some(entry) = next.plugins.get_mut(name) {
+                    entry.enabled = true;
+                }
+                self.config.store(Arc::new(next));
+                let next = self.config.load_full();
+                self.plugins.start(name, &next).await?;
+                Ok(json!({"enabled": name}))
+            }
+            "plugin.disable" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.disable needs `name`"))?;
+                let config = self.config.load_full();
+                let plugin = config
+                    .plugins
+                    .get(name)
+                    .cloned()
+                    .ok_or_else(|| rpc("invalid_params", format!("unknown plugin {name:?}")))?;
+                config.write_plugin_enabled(name, false)?;
+                self.self_config_write.store(true, Ordering::SeqCst);
+                let mut next = (*config).clone();
+                if let Some(entry) = next.plugins.get_mut(name) {
+                    entry.enabled = false;
+                }
+                self.config.store(Arc::new(next));
+                self.plugins.disable(name, &plugin).await;
+                Ok(json!({"disabled": name}))
+            }
+            "plugin.uninstall" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "plugin.uninstall needs `name`"))?;
+                if name.contains(['/', '\\']) || name == "." || name == ".." {
+                    return Err(rpc(
+                        "invalid_params",
+                        "plugin name is not a safe path component",
+                    ));
+                }
+                let config = self.config.load_full();
+                config.remove_plugin_config(name)?;
+                self.self_config_write.store(true, Ordering::SeqCst);
+                let mut next = (*config).clone();
+                next.plugins.remove(name);
+                self.config.store(Arc::new(next));
+                self.plugins.forget(name).await;
+                // Only the managed install directory is deleted. A plugin
+                // loaded from an arbitrary path in config is left alone.
+                let root = eix_core::config::config_dir().join("plugins");
+                let directory = root.join(name);
+                let mut removed_files = false;
+                if let Ok(root) = root.canonicalize() {
+                    if let Ok(dir) = directory.canonicalize() {
+                        if dir.starts_with(&root) && dir.is_dir() {
+                            std::fs::remove_dir_all(&dir)
+                                .with_context(|| format!("cannot remove {}", dir.display()))?;
+                            removed_files = true;
+                        }
+                    }
+                }
+                Ok(json!({"uninstalled": name, "removed_files": removed_files}))
+            }
+            "plugin.logs" => {
+                let params: PluginLogsParams = parse_params(request.params.clone())?;
+                Ok(serde_json::to_value(self.plugins.logs(&params))?)
+            }
+            "plugin.logs.clear" => {
+                let name = request.params.get("name").and_then(Value::as_str);
+                self.plugins.clear_logs(name);
+                Ok(json!({"ok": true}))
+            }
+            "plugin.doctor" => Ok(serde_json::to_value(self.plugins.doctor().await)?),
             "stats" => Ok(serde_json::to_value(self.stats().await?)?),
             "lsp.workspace" => {
                 let params: LspWorkspaceParams = parse_params(request.params.clone())?;

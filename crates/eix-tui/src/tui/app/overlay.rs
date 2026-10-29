@@ -12,8 +12,25 @@ impl App {
         let Some(picker) = self.picker.as_ref() else {
             return;
         };
-        if picker.kind != PickerKind::Grep {
-            return;
+        match picker.kind {
+            PickerKind::Grep => {}
+            PickerKind::Plugin => {
+                let Some(provider) = picker.provider.clone() else {
+                    return;
+                };
+                let query = picker.query.trim().to_string();
+                if let Some(picker) = &mut self.picker {
+                    picker.loading = true;
+                }
+                self.status = format!("{}: loading…", provider.title);
+                let _ = tx.send(Command::PluginPick {
+                    plugin: provider.plugin,
+                    id: provider.id,
+                    query,
+                });
+                return;
+            }
+            _ => return,
         }
         let query = picker.query.trim().to_string();
         if query.is_empty() {
@@ -81,11 +98,15 @@ impl App {
         }
         if close {
             self.text_view = None;
+            self.plugin_panel = None;
             self.status = "closed".into();
         }
     }
 
     pub(super) fn open_text_view(&mut self, title: impl Into<String>, text: &str) {
+        // Any other overlay replaces whatever plugin surface was open, so
+        // `/plugins act` must not keep targeting a hidden panel.
+        self.plugin_panel = None;
         self.text_view = Some(TextView::new(title, text));
     }
 
@@ -340,14 +361,14 @@ impl App {
     /// Content search is provider-backed: clear the old rows now and let the
     /// next tick coalesce rapid keystrokes into one daemon request.
     pub(super) fn note_picker_query_change(&mut self, kind: PickerKind) {
-        if kind != PickerKind::Grep {
+        if kind != PickerKind::Grep && kind != PickerKind::Plugin {
             return;
         }
         self.picker_query_due = true;
         if let Some(picker) = &mut self.picker {
             picker.clear_items();
             picker.selected = 0;
-            picker.loading = !picker.query.trim().is_empty();
+            picker.loading = kind == PickerKind::Plugin || !picker.query.trim().is_empty();
         }
     }
 
@@ -578,6 +599,22 @@ impl App {
             .and_then(|picker| picker.items.get(index))
             .map(|item| item.value.clone());
         match kind {
+            PickerKind::Plugin => {
+                let provider = self
+                    .picker
+                    .as_ref()
+                    .and_then(|picker| picker.provider.clone());
+                self.picker = None;
+                if let (Some(provider), Some(value)) = (provider, value) {
+                    let _ = tx.send(Command::PluginUiAction {
+                        plugin: provider.plugin,
+                        id: provider.id,
+                        action: "picked".into(),
+                        values: serde_json::json!({ "item": value }),
+                    });
+                    self.status = "plugin picker: selection sent".into();
+                }
+            }
             PickerKind::Sessions => {
                 self.picker = None;
                 self.select_session(index, tx);
@@ -757,6 +794,7 @@ impl App {
             kind,
             query: String::new(),
             selected: 0,
+            provider: None,
             items: Vec::new(),
             items_rev: 0,
             filter: PickerFilterCache::default(),
@@ -912,6 +950,50 @@ impl App {
                 .unwrap_or(0);
         }
         self.picker = Some(picker);
+    }
+
+    /// Open a picker backed by a plugin's `ui/pick` provider.
+    pub(super) fn open_plugin_picker(
+        &mut self,
+        plugin: &str,
+        id: &str,
+        title: &str,
+        tx: &UnboundedSender<Command>,
+    ) {
+        self.esc_at = None;
+        self.picker_query_due = false;
+        if let Some((config, theme)) = self.theme_picker_backup.take() {
+            self.theme_config = config;
+            self.theme = theme;
+        }
+        let title = if title.trim().is_empty() {
+            id.to_string()
+        } else {
+            title.to_string()
+        };
+        self.picker = Some(Picker {
+            kind: PickerKind::Plugin,
+            query: String::new(),
+            selected: 0,
+            provider: Some(PluginPickerProvider {
+                plugin: plugin.to_string(),
+                id: id.to_string(),
+                title: title.clone(),
+            }),
+            items: Vec::new(),
+            items_rev: 0,
+            filter: PickerFilterCache::default(),
+            scroll: 0,
+            loading: true,
+            preview: PickerPreview::default(),
+            preview_request: None,
+        });
+        self.status = format!("{title}: loading…");
+        let _ = tx.send(Command::PluginPick {
+            plugin: plugin.to_string(),
+            id: id.to_string(),
+            query: String::new(),
+        });
     }
 
     /// Open the content picker, optionally with a prefilled query from

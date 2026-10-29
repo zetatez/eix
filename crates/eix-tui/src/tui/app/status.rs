@@ -235,6 +235,28 @@ impl App {
                 Style::default().fg(status_color).bg(panel),
             ));
 
+            if !self.plugin_failed.is_empty() || !self.plugin_degraded.is_empty() {
+                let (text, color) = if !self.plugin_failed.is_empty() {
+                    (
+                        format!("{} plugin failed", self.plugin_failed.len()),
+                        composer_danger(theme),
+                    )
+                } else {
+                    (
+                        format!("{} plugin degraded", self.plugin_degraded.len()),
+                        warn,
+                    )
+                };
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+                spans.push(Span::styled(
+                    format!("⚠ {text}"),
+                    Style::default()
+                        .fg(color)
+                        .bg(panel)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+
             let (model, provider, variant) = self.model_header_parts();
             let model = short_model(&model);
             if model != "-" && !model.is_empty() {

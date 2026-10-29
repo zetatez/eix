@@ -20,6 +20,9 @@ use serde_json::Value;
 /// only starts plugins that advertise the same major version.
 pub const PLUGIN_API_VERSION: u32 = 2;
 
+/// Host version reported to manifests through `min_host_version`.
+pub const PLUGIN_HOST_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// ABI version exported by `eix_plugin_abi_version`. Kept in sync with
 /// `eix-plugin-abi`; the loader also checks the actual exported symbol.
 pub const PLUGIN_DYLIB_ABI_VERSION: u32 = 1;
@@ -106,7 +109,17 @@ pub struct PluginComponent {
 #[serde(default)]
 pub struct PluginDylib {
     /// Shared library path, relative to the manifest directory.
+    #[serde(default)]
     pub path: PathBuf,
+    /// Optional platform selector, e.g. `linux-x86_64` or
+    /// `x86_64-unknown-linux-gnu`. A package whose selector does not match
+    /// the current host is rejected at load time.
+    #[serde(default)]
+    pub target: Option<String>,
+    /// Optional artifact path. When set it takes precedence over `path`, so
+    /// one manifest can point at `libfoo.so` / `libfoo.dylib` / `foo.dll`.
+    #[serde(default)]
+    pub artifact: Option<PathBuf>,
 }
 
 /// Components shipped by one package. A package can be declarative only, or
@@ -250,6 +263,13 @@ impl PluginManifest {
                 self.schema
             ));
         }
+        if let Some(minimum) = &self.min_host_version {
+            if !version_at_least(PLUGIN_HOST_VERSION, minimum) {
+                return Err(format!(
+                    "plugin needs eix >= {minimum} but this host is {PLUGIN_HOST_VERSION}"
+                ));
+            }
+        }
         if self.name.trim().is_empty() {
             return Err("plugin name is empty".into());
         }
@@ -300,10 +320,28 @@ impl PluginManifest {
             }
         }
         if let Some(dylib) = &self.components.dylib {
-            if dylib.path.as_os_str().is_empty() {
-                return Err("[components.dylib] needs `path`".into());
+            let artifact = dylib
+                .artifact
+                .as_ref()
+                .filter(|path| !path.as_os_str().is_empty());
+            if dylib.path.as_os_str().is_empty() && artifact.is_none() {
+                return Err("[components.dylib] needs `path` or `artifact`".into());
             }
-            validate_relative_path(&dylib.path, "components.dylib.path")?;
+            if !dylib.path.as_os_str().is_empty() {
+                validate_relative_path(&dylib.path, "components.dylib.path")?;
+            }
+            if let Some(artifact) = artifact {
+                validate_relative_path(artifact, "components.dylib.artifact")?;
+            }
+            if let Some(target) = dylib.target.as_deref() {
+                if !target.trim().is_empty() && !target_matches_current(target) {
+                    return Err(format!(
+                        "[components.dylib] target {target:?} does not match this host ({}-{})",
+                        std::env::consts::OS,
+                        std::env::consts::ARCH
+                    ));
+                }
+            }
         }
         for command in &self.contributes.commands {
             if !valid_tool_name(&command.name) {
@@ -379,10 +417,15 @@ impl PluginManifest {
     /// Resolve the native library path. `base` is the manifest's directory.
     pub fn dylib_path(&self, base: &Path) -> Option<PathBuf> {
         self.components.dylib.as_ref().map(|dylib| {
-            if dylib.path.is_absolute() {
-                dylib.path.clone()
+            let path = dylib
+                .artifact
+                .as_ref()
+                .filter(|path| !path.as_os_str().is_empty())
+                .unwrap_or(&dylib.path);
+            if path.is_absolute() {
+                path.clone()
             } else {
-                base.join(&dylib.path)
+                base.join(path)
             }
         })
     }
@@ -438,9 +481,19 @@ pub struct PluginConfig {
     /// Native in-process extension. Relative paths resolve from the config
     /// cwd. Mutually exclusive with `command` and `manifest.components.server`.
     pub library: Option<PathBuf>,
+    /// Refuse to load a package whose manifest has no valid signature (or, for
+    /// process plugins with a manifest, no `[package]` table at all).
+    pub require_signature: bool,
+    /// Apply OS-level hardening before exec: no_new_privs, resource limits and
+    /// (on Linux) a Landlock filesystem jail limited to the workspace, the
+    /// plugin data directory and system runtime paths.
+    pub sandbox: bool,
     pub env: BTreeMap<String, String>,
     /// Set false to keep the entry but ignore it.
     pub enabled: bool,
+    /// Defer startup until the daemon is asked for the plugin list or the
+    /// plugin is started explicitly. Keeps slow plugins off the boot path.
+    pub lazy: bool,
     /// Startup and per-call timeout.
     pub timeout_secs: u64,
     /// Working directory for the child. Defaults to the config load cwd.
@@ -474,8 +527,11 @@ impl Default for PluginConfig {
             command: String::new(),
             args: Vec::new(),
             library: None,
+            require_signature: false,
+            sandbox: false,
             env: BTreeMap::new(),
             enabled: true,
+            lazy: false,
             timeout_secs: 30,
             cwd: None,
             manifest: None,
@@ -711,9 +767,415 @@ pub const PLUGIN_HOOK_POINTS: &[&str] = &[
     "turn.end",
 ];
 
-/// UI surfaces the host knows how to render. `panel` and `status` are text
-/// surfaces; `picker` is reserved for a later milestone.
+/// UI surfaces the host knows how to render.
 pub const PLUGIN_UI_SURFACES: &[&str] = &["panel", "status", "picker"];
+
+/// Limits for one rendered UI tree. They keep a buggy or hostile plugin from
+/// making the TUI allocate unbounded text.
+pub const UI_MAX_NODES: usize = 2000;
+pub const UI_MAX_DEPTH: usize = 16;
+pub const UI_MAX_TEXT: usize = 64 * 1024;
+
+/// One node in a plugin-rendered view tree. Serialized with a `kind` tag:
+/// `{"kind": "text", "text": "..."}`. Unknown kinds are rejected by
+/// [`UiNode::validate`] so a typo renders an error instead of silently
+/// dropping content.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UiNode {
+    Text {
+        text: String,
+    },
+    Markdown {
+        text: String,
+    },
+    Heading {
+        text: String,
+        #[serde(default = "default_heading_level")]
+        level: u8,
+    },
+    Divider,
+    List {
+        #[serde(default)]
+        items: Vec<String>,
+    },
+    Table {
+        #[serde(default)]
+        columns: Vec<String>,
+        #[serde(default)]
+        rows: Vec<Vec<String>>,
+    },
+    Form {
+        id: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        fields: Vec<UiField>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        submit: Option<UiAction>,
+    },
+    Actions {
+        #[serde(default)]
+        actions: Vec<UiAction>,
+    },
+    Picker {
+        id: String,
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        items: Vec<UiPickerItem>,
+    },
+    Group {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        children: Vec<UiNode>,
+    },
+}
+
+fn default_heading_level() -> u8 {
+    2
+}
+
+/// A button in an [`UiNode::Actions`] or form submit. The id is echoed back
+/// through `plugin.ui.action`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiAction {
+    pub id: String,
+    pub label: String,
+    /// `default`, `primary` or `danger`.
+    pub kind: String,
+    /// Optional key hint, e.g. `Enter`.
+    pub key: String,
+}
+
+impl Default for UiAction {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            label: String::new(),
+            kind: "default".into(),
+            key: String::new(),
+        }
+    }
+}
+
+/// One editable field in an [`UiNode::Form`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiField {
+    pub key: String,
+    pub label: String,
+    /// `text`, `number`, `bool`, `select` or `multiline`.
+    pub kind: String,
+    pub value: Value,
+    pub options: Vec<UiOption>,
+    pub placeholder: String,
+    pub help: String,
+    pub required: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiOption {
+    pub value: String,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiPickerItem {
+    pub id: String,
+    pub title: String,
+    pub subtitle: String,
+}
+
+impl UiNode {
+    /// Reject malformed ids and oversized trees. Text length is capped per
+    /// node; the caller caps the serialized body as a whole.
+    pub fn validate(&self) -> Result<(), String> {
+        let mut count = 0usize;
+        self.validate_inner(0, &mut count)
+    }
+
+    fn validate_inner(&self, depth: usize, count: &mut usize) -> Result<(), String> {
+        if depth > UI_MAX_DEPTH {
+            return Err(format!("UI tree is deeper than {UI_MAX_DEPTH}"));
+        }
+        *count += 1;
+        if *count > UI_MAX_NODES {
+            return Err(format!("UI tree has more than {UI_MAX_NODES} nodes"));
+        }
+        let text_ok = |text: &str, label: &str| -> Result<(), String> {
+            if text.len() > UI_MAX_TEXT {
+                Err(format!("{label} is larger than {UI_MAX_TEXT} bytes"))
+            } else {
+                Ok(())
+            }
+        };
+        let id_ok = |id: &str, label: &str| -> Result<(), String> {
+            if id.is_empty() || id.len() > 128 {
+                Err(format!("{label} id must be 1..=128 bytes"))
+            } else {
+                Ok(())
+            }
+        };
+        match self {
+            UiNode::Text { text } | UiNode::Markdown { text } => text_ok(text, "text")?,
+            UiNode::Heading { text, level } => {
+                text_ok(text, "heading")?;
+                if !(1..=6).contains(level) {
+                    return Err("heading level must be 1..=6".into());
+                }
+            }
+            UiNode::Divider => {}
+            UiNode::List { items } => {
+                if items.len() > UI_MAX_NODES {
+                    return Err("list has too many items".into());
+                }
+                for item in items {
+                    text_ok(item, "list item")?;
+                }
+            }
+            UiNode::Table { columns, rows } => {
+                if columns.len() > 64 || rows.len() > 1000 {
+                    return Err("table is too large (64 columns / 1000 rows)".into());
+                }
+                for cell in columns.iter().chain(rows.iter().flatten()) {
+                    text_ok(cell, "table cell")?;
+                }
+                if rows.iter().any(|row| row.len() != columns.len()) {
+                    return Err("table rows must match the column count".into());
+                }
+            }
+            UiNode::Form {
+                id,
+                title,
+                fields,
+                submit,
+            } => {
+                id_ok(id, "form")?;
+                text_ok(title, "form title")?;
+                if fields.len() > 64 {
+                    return Err("form has too many fields".into());
+                }
+                for field in fields {
+                    id_ok(&field.key, "field")?;
+                    if !matches!(
+                        field.kind.as_str(),
+                        "" | "text" | "number" | "bool" | "select" | "multiline"
+                    ) {
+                        return Err(format!("unknown field kind {:?}", field.kind));
+                    }
+                    text_ok(&field.label, "field label")?;
+                }
+                if let Some(action) = submit {
+                    id_ok(&action.id, "action")?;
+                }
+            }
+            UiNode::Actions { actions } => {
+                if actions.len() > 64 {
+                    return Err("too many actions".into());
+                }
+                for action in actions {
+                    id_ok(&action.id, "action")?;
+                    text_ok(&action.label, "action label")?;
+                }
+            }
+            UiNode::Picker { id, title, items } => {
+                id_ok(id, "picker")?;
+                text_ok(title, "picker title")?;
+                if items.len() > 1000 {
+                    return Err("picker has too many items".into());
+                }
+                for item in items {
+                    id_ok(&item.id, "picker item")?;
+                    text_ok(&item.title, "picker item title")?;
+                }
+            }
+            UiNode::Group { title, children } => {
+                text_ok(title, "group title")?;
+                for child in children {
+                    child.validate_inner(depth + 1, count)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Plain-text fallback used by transcripts, logs and frontends without a
+    /// node renderer.
+    pub fn to_text(&self) -> String {
+        let mut out = String::new();
+        self.append_text(&mut out, 0);
+        out
+    }
+
+    fn append_text(&self, out: &mut String, indent: usize) {
+        let pad = " ".repeat(indent);
+        match self {
+            UiNode::Text { text } | UiNode::Markdown { text } => {
+                out.push_str(&pad);
+                out.push_str(text);
+                out.push('\n');
+            }
+            UiNode::Heading { text, level } => {
+                out.push_str(&pad);
+                out.push_str(&"#".repeat(*level as usize));
+                out.push(' ');
+                out.push_str(text);
+                out.push('\n');
+            }
+            UiNode::Divider => out.push_str("---\n"),
+            UiNode::List { items } => {
+                for item in items {
+                    out.push_str(&pad);
+                    out.push_str("- ");
+                    out.push_str(item);
+                    out.push('\n');
+                }
+            }
+            UiNode::Table { columns, rows } => {
+                out.push_str(&pad);
+                out.push_str(&columns.join(" | "));
+                out.push('\n');
+                for row in rows {
+                    out.push_str(&pad);
+                    out.push_str(&row.join(" | "));
+                    out.push('\n');
+                }
+            }
+            UiNode::Form {
+                title,
+                fields,
+                submit,
+                ..
+            } => {
+                if !title.is_empty() {
+                    out.push_str(&pad);
+                    out.push_str(title);
+                    out.push('\n');
+                }
+                for field in fields {
+                    out.push_str(&pad);
+                    out.push_str("- ");
+                    out.push_str(if field.label.is_empty() {
+                        &field.key
+                    } else {
+                        &field.label
+                    });
+                    out.push_str(": ");
+                    out.push_str(&field.value.to_string());
+                    out.push('\n');
+                }
+                if let Some(action) = submit {
+                    out.push_str(&pad);
+                    out.push_str("[");
+                    out.push_str(&action.label);
+                    out.push_str("]\n");
+                }
+            }
+            UiNode::Actions { actions } => {
+                out.push_str(&pad);
+                let labels: Vec<&str> =
+                    actions.iter().map(|action| action.label.as_str()).collect();
+                out.push_str(&labels.join(" · "));
+                out.push('\n');
+            }
+            UiNode::Picker { title, items, .. } => {
+                if !title.is_empty() {
+                    out.push_str(&pad);
+                    out.push_str(title);
+                    out.push('\n');
+                }
+                for item in items {
+                    out.push_str(&pad);
+                    out.push_str("- ");
+                    out.push_str(&item.title);
+                    out.push('\n');
+                }
+            }
+            UiNode::Group { title, children } => {
+                if !title.is_empty() {
+                    out.push_str(&pad);
+                    out.push_str(title);
+                    out.push('\n');
+                }
+                for child in children {
+                    child.append_text(out, indent + 2);
+                }
+            }
+        }
+    }
+}
+
+/// `plugin.ui.render` parameters. The daemon asks a plugin for the current
+/// body of a declared surface.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUiRenderParams {
+    pub plugin: String,
+    pub surface: String,
+    pub id: String,
+}
+
+/// `plugin.ui.render` result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUiRenderResult {
+    pub title: String,
+    pub node: Option<UiNode>,
+    /// Plain-text fallback for frontends without a node renderer.
+    pub body: String,
+}
+
+/// `plugin.ui.action` parameters. `values` carries submitted form values or
+/// the picked item, depending on the action.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUiActionParams {
+    pub plugin: String,
+    /// Surface id the action belongs to.
+    pub id: String,
+    pub action: String,
+    pub values: Value,
+}
+
+/// `plugin.ui.action` result: a plugin may replace its panel, submit a prompt,
+/// close the panel, or just acknowledge the action.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUiActionResult {
+    #[serde(default = "default_true")]
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<UiNode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    #[serde(default)]
+    pub close: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `plugin.ui.pick` parameters for a provider-backed picker.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUiPickParams {
+    pub plugin: String,
+    pub id: String,
+    pub query: String,
+}
+
+/// `plugin.ui.pick` result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginUiPickResult {
+    pub items: Vec<UiPickerItem>,
+}
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -753,6 +1215,76 @@ pub struct PluginUiSurface {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct PluginUiListResult {
     pub surfaces: Vec<PluginUiSurface>,
+}
+
+/// One line in a plugin's host-side log ring buffer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginLogEntry {
+    /// Monotonic sequence number. `plugin.logs` callers pass the last seen
+    /// value as `since` to fetch only newer lines.
+    pub seq: u64,
+    pub plugin: String,
+    pub timestamp_ms: u64,
+    /// `error`, `warn`, `info`, `debug` or `stderr`.
+    pub level: String,
+    pub message: String,
+}
+
+/// `plugin.logs` parameters. Omit `name` for every plugin.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PluginLogsParams {
+    pub name: Option<String>,
+    pub since: Option<u64>,
+    /// Maximum entries returned; the host caps this at 500.
+    pub limit: Option<usize>,
+}
+
+/// `plugin.logs` result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginLogsResult {
+    pub entries: Vec<PluginLogEntry>,
+    /// Pass back as `since` to continue from here.
+    pub next: u64,
+}
+
+/// One diagnostic line from `plugin.doctor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDoctorCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Per-plugin diagnostics from `plugin.doctor`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PluginDoctorEntry {
+    pub name: String,
+    pub state: PluginState,
+    pub enabled: bool,
+    pub version: String,
+    /// `process`, `dylib` or `declarative`.
+    pub backend: String,
+    pub failures: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub tools: usize,
+    pub commands: usize,
+    pub hooks: usize,
+    pub ui: usize,
+    pub rpc: usize,
+    pub events: Vec<String>,
+    pub capabilities: Vec<PluginCapability>,
+    pub log_lines: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_log: Option<String>,
+    pub checks: Vec<PluginDoctorCheck>,
+}
+
+/// `plugin.doctor` result.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PluginDoctorResult {
+    pub plugins: Vec<PluginDoctorEntry>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1043,6 +1575,54 @@ pub fn valid_tool_name(name: &str) -> bool {
 /// Hook points are a closed set; a typo would otherwise become a silent no-op.
 pub fn valid_hook_point(point: &str) -> bool {
     PLUGIN_HOOK_POINTS.contains(&point)
+}
+
+/// Compare dotted numeric versions. Pre-release and build suffixes are
+/// ignored: plugins use this for a "needs at least" check, not ordering.
+pub fn version_at_least(current: &str, minimum: &str) -> bool {
+    fn parse(version: &str) -> Vec<u64> {
+        version
+            .split(['-', '+'])
+            .next()
+            .unwrap_or_default()
+            .split('.')
+            .map(|part| part.trim().parse::<u64>().unwrap_or(0))
+            .collect()
+    }
+    let mut current = parse(current);
+    let mut minimum = parse(minimum);
+    let len = current.len().max(minimum.len());
+    current.resize(len, 0);
+    minimum.resize(len, 0);
+    current >= minimum
+}
+
+/// Whether a dylib manifest's `target` selector names the current host.
+/// Accepts `current`, `linux-x86_64`, `x86_64-unknown-linux-gnu` and the
+/// common `amd64` / `arm64` aliases.
+pub fn target_matches_current(target: &str) -> bool {
+    let target = target.trim().to_ascii_lowercase();
+    if target.is_empty() || target == "current" || target == "any" {
+        return true;
+    }
+    if target == std::env::consts::OS || target == std::env::consts::ARCH {
+        return true;
+    }
+    let parts: Vec<&str> = target
+        .split(|ch: char| ch == '-' || ch == '/' || ch == '_')
+        .filter(|part| !part.is_empty())
+        .collect();
+    let os_ok = |part: &str| match std::env::consts::OS {
+        "macos" => ["macos", "darwin", "apple"].contains(&part),
+        "windows" => ["windows", "win", "pc"].contains(&part),
+        other => part == other,
+    };
+    let arch_ok = |part: &str| match std::env::consts::ARCH {
+        "x86_64" => ["x86_64", "x86", "amd64"].contains(&part),
+        "aarch64" => ["aarch64", "arm64"].contains(&part),
+        other => part == other,
+    };
+    parts.iter().any(|part| os_ok(part)) && parts.iter().any(|part| arch_ok(part))
 }
 
 pub fn valid_ui_surface(surface: &str) -> bool {
@@ -1495,5 +2075,57 @@ mod tests {
         )
         .is_err());
         assert!(validate_plugin_settings(&schema, &serde_json::json!({"repo": "a"})).is_err());
+    }
+
+    #[test]
+    fn ui_nodes_round_trip_render_and_reject_invalid_shapes() {
+        let node: UiNode = serde_json::from_value(serde_json::json!({
+            "kind": "group",
+            "title": "Issues",
+            "children": [
+                {"kind": "heading", "text": "Open", "level": 2},
+                {"kind": "list", "items": ["#42", "#43"]},
+                {"kind": "actions", "actions": [
+                    {"id": "refresh", "label": "Refresh"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        node.validate().unwrap();
+        let text = node.to_text();
+        assert!(text.contains("## Open"));
+        assert!(text.contains("- #42"));
+        assert!(text.contains("Refresh"));
+
+        assert!(serde_json::from_value::<UiNode>(serde_json::json!({"kind": "nope"})).is_err());
+        assert!(UiNode::Heading {
+            text: "bad".into(),
+            level: 9,
+        }
+        .validate()
+        .is_err());
+        assert!(UiNode::Table {
+            columns: vec!["a".into()],
+            rows: vec![vec!["b".into(), "c".into()]],
+        }
+        .validate()
+        .is_err());
+    }
+
+    #[test]
+    fn ui_action_results_default_to_ok() {
+        let result: PluginUiActionResult =
+            serde_json::from_value(serde_json::json!({"prompt": "continue"})).unwrap();
+        assert!(result.ok);
+        assert_eq!(result.prompt.as_deref(), Some("continue"));
+    }
+
+    #[test]
+    fn target_selectors_match_the_current_host() {
+        let current = format!("{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+        assert!(target_matches_current("current"));
+        assert!(target_matches_current("any"));
+        assert!(target_matches_current(&current));
+        assert!(!target_matches_current("plan9-mips"));
     }
 }

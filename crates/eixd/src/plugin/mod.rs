@@ -12,6 +12,7 @@ mod backend;
 mod client;
 mod dylib;
 mod host_api;
+mod logs;
 mod process;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -24,10 +25,12 @@ use anyhow::{bail, Context, Result};
 use eix_core::plugin::{
     valid_hook_point, valid_plugin_name, valid_tool_name, valid_ui_surface, ManifestCommand,
     PluginCapability, PluginCommand, PluginCommandInfo, PluginCommandList, PluginCommandRunResult,
-    PluginConfig, PluginHook, PluginInfo, PluginInitializeResult, PluginListResult, PluginManifest,
+    PluginConfig, PluginDoctorCheck, PluginDoctorEntry, PluginDoctorResult, PluginHook, PluginInfo,
+    PluginInitializeResult, PluginListResult, PluginLogsParams, PluginLogsResult, PluginManifest,
     PluginRpc, PluginSettingsResult, PluginState, PluginTool, PluginToolCallParams,
-    PluginToolCallResult, PluginUi, PluginUiListResult, PluginUiSurface, PLUGIN_COMMAND_PREFIX,
-    PLUGIN_TOOL_PREFIX,
+    PluginToolCallResult, PluginUi, PluginUiActionParams, PluginUiActionResult, PluginUiListResult,
+    PluginUiPickParams, PluginUiPickResult, PluginUiRenderParams, PluginUiRenderResult,
+    PluginUiSurface, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
 };
 use eix_core::redact::redact;
 use eix_core::{Config, Notification, ToolDefinition};
@@ -101,6 +104,7 @@ struct UiRef {
 }
 
 /// Everything needed to start one plugin.
+#[derive(Clone)]
 struct PluginSpec {
     name: String,
     version: String,
@@ -119,6 +123,7 @@ struct PluginSpec {
     denied_tools: Vec<String>,
     settings: BTreeMap<String, Value>,
     settings_schema: Option<Value>,
+    sandbox: bool,
     network_allow: Vec<String>,
     secrets: Vec<String>,
     rpc_allow: Vec<String>,
@@ -143,6 +148,22 @@ impl PluginSpec {
     }
 }
 
+/// Crash-restart bookkeeping for one plugin that has been started.
+#[derive(Debug, Clone, Default)]
+struct Lifecycle {
+    /// Consecutive automatic restarts since the last successful start.
+    attempts: u32,
+    /// When the supervisor may try again.
+    next_start: Option<Instant>,
+    /// Set when backoff is exhausted; only an explicit start clears it.
+    gave_up: bool,
+}
+
+/// Automatic restarts are capped so a plugin that never initializes cannot
+/// spin forever.
+const MAX_RESTART_ATTEMPTS: u32 = 6;
+const MAX_RESTART_BACKOFF: Duration = Duration::from_secs(30);
+
 #[derive(Clone)]
 struct PluginStatus {
     name: String,
@@ -158,6 +179,8 @@ struct PluginStatus {
     rpc: usize,
     events: Vec<String>,
     capabilities: Vec<PluginCapability>,
+    /// `process`, `dylib` or `declarative`.
+    backend: String,
     /// Consecutive backend failures; reset by a successful call.
     failures: u32,
     error: Option<String>,
@@ -202,6 +225,18 @@ pub struct PluginManager {
     /// RPC methods per plugin, copied from `initialize`.
     rpc_methods: Arc<Mutex<BTreeMap<String, BTreeSet<String>>>>,
     statuses: Mutex<BTreeMap<String, PluginStatus>>,
+    /// Log ring buffer shared with process, dylib and host API paths.
+    logs: Arc<logs::PluginLogs>,
+    /// Resolved specs of configured plugins, kept so the supervisor can
+    /// restart a crashed backend without re-reading the config.
+    specs: Mutex<BTreeMap<String, PluginSpec>>,
+    /// Crash-restart state for plugins that have been started at least once.
+    lifecycle: Mutex<BTreeMap<String, Lifecycle>>,
+    /// Serialized `PluginConfig` from the last `load`, used to restart only
+    /// the entries whose configuration changed.
+    fingerprints: Mutex<BTreeMap<String, String>>,
+    /// Set during shutdown so the supervisor does not restart anything.
+    shutting_down: AtomicBool,
     event_tx: mpsc::Sender<PluginEvent>,
     rpc_tx: mpsc::Sender<RpcCallRequest>,
     bus: broadcast::Sender<Notification>,
@@ -269,7 +304,8 @@ impl PluginManager {
             }
         });
 
-        Arc::new(Self {
+        let log_buffer = Arc::new(logs::PluginLogs::new());
+        let manager = Arc::new(Self {
             store,
             data_dir,
             backends,
@@ -280,76 +316,212 @@ impl PluginManager {
             ui: Mutex::new(Vec::new()),
             rpc_methods,
             statuses: Mutex::new(BTreeMap::new()),
+            logs: Arc::clone(&log_buffer),
+            specs: Mutex::new(BTreeMap::new()),
+            lifecycle: Mutex::new(BTreeMap::new()),
+            fingerprints: Mutex::new(BTreeMap::new()),
+            shutting_down: AtomicBool::new(false),
             event_tx,
             rpc_tx,
             bus,
             has_event_subscribers: AtomicBool::new(false),
             has_hooks: AtomicBool::new(false),
-        })
+        });
+
+        // A crashed process or dylib backend is detected here rather than on
+        // the next RPC. Backoff keeps a plugin that dies during initialize
+        // from respawning in a tight loop.
+        let weak = Arc::downgrade(&manager);
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                ticker.tick().await;
+                let Some(manager) = weak.upgrade() else {
+                    break;
+                };
+                manager.supervise().await;
+            }
+        });
+
+        manager
     }
 
-    /// Stop every plugin and start the enabled set from `config`.
+    /// Start enabled plugins, restarting only entries whose configuration
+    /// changed since the previous load.
     pub async fn load(&self, config: &Config) {
-        self.has_event_subscribers.store(false, Ordering::Relaxed);
-        self.has_hooks.store(false, Ordering::Relaxed);
-        self.stop_all().await;
-        self.subscriptions.lock().await.clear();
-        self.tools.lock().await.clear();
-        self.commands.lock().await.clear();
-        self.hooks.lock().await.clear();
-        self.ui.lock().await.clear();
-        self.rpc_methods.lock().await.clear();
-        self.statuses.lock().await.clear();
+        self.shutting_down.store(false, Ordering::Relaxed);
+        let desired: BTreeMap<String, PluginConfig> = config.plugins.clone();
 
-        for (name, plugin) in &config.plugins {
-            self.statuses.lock().await.insert(
-                name.clone(),
-                PluginStatus {
-                    name: name.clone(),
-                    version: String::new(),
-                    description: String::new(),
-                    enabled: plugin.enabled,
-                    command: plugin.command.clone(),
-                    state: if plugin.enabled {
-                        PluginState::Starting
-                    } else {
-                        PluginState::Disabled
-                    },
-                    tools: 0,
-                    commands: 0,
-                    hooks: 0,
-                    ui: 0,
-                    rpc: 0,
-                    events: Vec::new(),
-                    capabilities: plugin.capabilities.clone(),
-                    failures: 0,
-                    error: None,
-                    settings_schema: None,
-                },
-            );
+        // Drop plugins that disappeared from the config or were disabled.
+        let running: Vec<String> = {
+            let specs = self.specs.lock().await;
+            specs.keys().cloned().collect()
+        };
+        for name in running {
+            let keep = desired.get(&name).is_some_and(|plugin| plugin.enabled);
+            if !keep {
+                self.stop_one(&name, PluginState::Stopped).await;
+                self.specs.lock().await.remove(&name);
+                self.lifecycle.lock().await.remove(&name);
+                self.fingerprints.lock().await.remove(&name);
+            }
+        }
+        self.statuses
+            .lock()
+            .await
+            .retain(|name, _| desired.contains_key(name));
+
+        for (name, plugin) in &desired {
+            let fingerprint = plugin_fingerprint(plugin);
+            let unchanged = self
+                .fingerprints
+                .lock()
+                .await
+                .get(name)
+                .is_some_and(|known| known == &fingerprint);
+            let known = self.specs.lock().await.contains_key(name);
             if !plugin.enabled {
+                self.set_disabled(name, plugin).await;
                 continue;
             }
-            match resolve_spec(name, plugin, &config.load_cwd, &self.data_dir) {
-                Ok(spec) => {
-                    if let Err(err) = self.start_one(spec).await {
-                        self.mark_failed(name, plugin, &err).await;
+            // Keep an unchanged plugin exactly as it is: running, failed (no
+            // retry loop on reload) or waiting for a lazy start.
+            if unchanged && known {
+                if let Some(status) = self.statuses.lock().await.get_mut(name) {
+                    if status.state == PluginState::Disabled {
+                        status.state = PluginState::Stopped;
+                        status.enabled = true;
                     }
                 }
-                Err(err) => self.mark_failed(name, plugin, &err).await,
+                continue;
+            }
+
+            self.stop_one(name, PluginState::Stopped).await;
+            match resolve_spec(name, plugin, &config.load_cwd, &self.data_dir) {
+                Ok(spec) => {
+                    self.specs.lock().await.insert(name.clone(), spec.clone());
+                    self.fingerprints
+                        .lock()
+                        .await
+                        .insert(name.clone(), fingerprint);
+                    if plugin.lazy {
+                        self.insert_lazy_status(&spec).await;
+                    } else {
+                        self.lifecycle
+                            .lock()
+                            .await
+                            .insert(name.clone(), Lifecycle::default());
+                        if let Err(err) = self.start_one(&spec).await {
+                            self.mark_failed(name, plugin, &err).await;
+                        }
+                    }
+                }
+                Err(err) => {
+                    self.insert_unresolved_status(name, plugin).await;
+                    self.mark_failed(name, plugin, &err).await;
+                }
             }
         }
     }
 
-    async fn start_one(&self, spec: PluginSpec) -> Result<()> {
-        let declarative = self.declarative_commands(&spec)?;
+    async fn insert_lazy_status(&self, spec: &PluginSpec) {
+        if let Some(status) = self.statuses.lock().await.get_mut(&spec.name) {
+            status.state = PluginState::Stopped;
+            status.enabled = true;
+            status.error = Some("lazy: not started yet".into());
+            return;
+        }
+        self.statuses.lock().await.insert(
+            spec.name.clone(),
+            PluginStatus {
+                name: spec.name.clone(),
+                version: spec.version.clone(),
+                description: spec.description.clone(),
+                enabled: true,
+                command: spec.command.clone(),
+                state: PluginState::Stopped,
+                tools: 0,
+                commands: 0,
+                hooks: 0,
+                ui: 0,
+                rpc: 0,
+                events: Vec::new(),
+                capabilities: spec.capabilities.clone(),
+                backend: backend_kind(spec),
+                failures: 0,
+                error: Some("lazy: not started yet".into()),
+                settings_schema: spec.settings_schema.clone(),
+            },
+        );
+    }
+
+    async fn insert_unresolved_status(&self, name: &str, plugin: &PluginConfig) {
+        self.statuses.lock().await.insert(
+            name.to_string(),
+            PluginStatus {
+                name: name.to_string(),
+                version: String::new(),
+                description: String::new(),
+                enabled: plugin.enabled,
+                command: plugin.command.clone(),
+                state: PluginState::Starting,
+                tools: 0,
+                commands: 0,
+                hooks: 0,
+                ui: 0,
+                rpc: 0,
+                events: Vec::new(),
+                capabilities: plugin.capabilities.clone(),
+                backend: if plugin.library.is_some() {
+                    "dylib".into()
+                } else {
+                    "process".into()
+                },
+                failures: 0,
+                error: None,
+                settings_schema: None,
+            },
+        );
+    }
+
+    async fn set_disabled(&self, name: &str, plugin: &PluginConfig) {
+        self.stop_one(name, PluginState::Disabled).await;
+        self.specs.lock().await.remove(name);
+        self.lifecycle.lock().await.remove(name);
+        self.statuses.lock().await.insert(
+            name.to_string(),
+            PluginStatus {
+                name: name.to_string(),
+                version: String::new(),
+                description: String::new(),
+                enabled: false,
+                command: plugin.command.clone(),
+                state: PluginState::Disabled,
+                tools: 0,
+                commands: 0,
+                hooks: 0,
+                ui: 0,
+                rpc: 0,
+                events: Vec::new(),
+                capabilities: plugin.capabilities.clone(),
+                backend: "disabled".into(),
+                failures: 0,
+                error: None,
+                settings_schema: None,
+            },
+        );
+    }
+
+    async fn start_one(&self, spec: &PluginSpec) -> Result<()> {
+        let declarative = self.declarative_commands(spec)?;
         if !spec.has_server {
-            self.commit_declarative(&spec, declarative).await?;
+            self.commit_declarative(spec, declarative).await?;
             return Ok(());
         }
 
-        let backend = self.start_backend(&spec).await?;
-        let init = match backend.initialize(&spec).await {
+        let backend = self.start_backend(spec).await?;
+        let init = match backend.initialize(spec).await {
             Ok(init) => init,
             Err(err) => {
                 backend.shutdown().await;
@@ -357,7 +529,7 @@ impl PluginManager {
             }
         };
         match self
-            .commit_runtime(&spec, &backend, &init, declarative)
+            .commit_runtime(spec, &backend, &init, declarative)
             .await
         {
             Ok(()) => Ok(()),
@@ -372,10 +544,15 @@ impl PluginManager {
     /// process. Both expose the same contribution protocol.
     async fn start_backend(&self, spec: &PluginSpec) -> Result<Arc<dyn ExtensionBackend>> {
         if let Some(library) = &spec.library {
-            let backend =
-                dylib::DylibBackend::load(library, spec, Arc::clone(&self.store), self.bus.clone())
-                    .await
-                    .with_context(|| format!("plugin {} failed to start", spec.name))?;
+            let backend = dylib::DylibBackend::load(
+                library,
+                spec,
+                Arc::clone(&self.store),
+                self.bus.clone(),
+                Arc::clone(&self.logs),
+            )
+            .await
+            .with_context(|| format!("plugin {} failed to start", spec.name))?;
             return Ok(backend);
         }
         let backend = process::ProcessBackend::spawn(
@@ -383,6 +560,7 @@ impl PluginManager {
             Arc::clone(&self.store),
             self.bus.clone(),
             self.rpc_tx.clone(),
+            Arc::clone(&self.logs),
         )
         .await
         .with_context(|| format!("plugin {} failed to start", spec.name))?;
@@ -466,6 +644,7 @@ impl PluginManager {
                 rpc: 0,
                 events: Vec::new(),
                 capabilities: spec.capabilities.clone(),
+                backend: "declarative".into(),
                 failures: 0,
                 error: None,
                 settings_schema: spec.settings_schema.clone(),
@@ -575,6 +754,7 @@ impl PluginManager {
                 rpc: rpc_count,
                 events,
                 capabilities: spec.capabilities.clone(),
+                backend: backend_kind(spec),
                 failures: 0,
                 error: None,
                 settings_schema: spec.settings_schema.clone(),
@@ -621,6 +801,7 @@ impl PluginManager {
     async fn mark_failed(&self, name: &str, plugin: &PluginConfig, err: &anyhow::Error) {
         let message = redact(&format!("{err:#}"));
         eprintln!("eixd: plugin {name}: {message}");
+        self.logs.push(name, "error", &message);
         if let Some(status) = self.statuses.lock().await.get_mut(name) {
             status.state = PluginState::Failed;
             status.error = Some(message);
@@ -644,6 +825,11 @@ impl PluginManager {
                     rpc: 0,
                     events: Vec::new(),
                     capabilities: plugin.capabilities.clone(),
+                    backend: if plugin.library.is_some() {
+                        "dylib".into()
+                    } else {
+                        "process".into()
+                    },
                     failures: 0,
                     error: Some(message),
                     settings_schema: None,
@@ -661,9 +847,15 @@ impl PluginManager {
         };
         if ok {
             status.failures = 0;
-            if status.state == PluginState::Degraded {
+            let recovered = status.state == PluginState::Degraded;
+            if recovered {
                 status.state = PluginState::Ready;
                 status.error = None;
+            }
+            drop(statuses);
+            if recovered {
+                self.logs
+                    .push(name, "info", "recovered from degraded state");
             }
             return;
         }
@@ -672,7 +864,10 @@ impl PluginManager {
             && status.failures >= DEGRADED_AFTER_FAILURES
         {
             status.state = PluginState::Degraded;
-            status.error = Some(cap(error.unwrap_or("repeated backend failures"), 4096));
+            let message = cap(error.unwrap_or("repeated backend failures"), 4096);
+            status.error = Some(message.clone());
+            drop(statuses);
+            self.logs.push(name, "warn", &message);
         }
     }
 
@@ -706,6 +901,30 @@ impl PluginManager {
             return false;
         }
         backend.shutdown().await;
+        self.clear_contributions(name).await;
+        let message = error
+            .as_deref()
+            .map(redact)
+            .unwrap_or_else(|| "plugin stopped unexpectedly".to_string());
+        self.logs.push(name, "error", &message);
+        if let Some(status) = self.statuses.lock().await.get_mut(name) {
+            status.state = PluginState::Failed;
+            status.error = Some(message);
+            status.tools = 0;
+            status.commands = 0;
+            status.hooks = 0;
+            status.ui = 0;
+            status.rpc = 0;
+            status.failures = 0;
+            status.events.clear();
+        }
+        self.schedule_restart(name).await;
+        true
+    }
+
+    /// Remove every registry entry owned by `name`. Shared by a crash, a
+    /// graceful stop and a reload that only restarts one plugin.
+    async fn clear_contributions(&self, name: &str) {
         self.tools.lock().await.retain(|tool| tool.plugin != name);
         self.commands
             .lock()
@@ -715,15 +934,22 @@ impl PluginManager {
         self.ui.lock().await.retain(|ui| ui.plugin != name);
         self.rpc_methods.lock().await.remove(name);
         self.refresh_has_hooks().await;
-        {
-            let mut subscriptions = self.subscriptions.lock().await;
-            subscriptions.remove(name);
-            self.has_event_subscribers
-                .store(!subscriptions.is_empty(), Ordering::Relaxed);
-        }
+        let mut subscriptions = self.subscriptions.lock().await;
+        subscriptions.remove(name);
+        self.has_event_subscribers
+            .store(!subscriptions.is_empty(), Ordering::Relaxed);
+    }
+
+    /// Stop one plugin without treating it as a crash.
+    async fn stop_one(&self, name: &str, state: PluginState) -> bool {
+        let backend = self.backends.lock().await.remove(name);
+        let Some(backend) = backend else {
+            return false;
+        };
+        backend.shutdown().await;
+        self.clear_contributions(name).await;
         if let Some(status) = self.statuses.lock().await.get_mut(name) {
-            status.state = PluginState::Failed;
-            status.error = error.map(|error| redact(&error));
+            status.state = state;
             status.tools = 0;
             status.commands = 0;
             status.hooks = 0;
@@ -731,8 +957,97 @@ impl PluginManager {
             status.rpc = 0;
             status.failures = 0;
             status.events.clear();
+            if state == PluginState::Stopped {
+                status.error = None;
+            }
         }
         true
+    }
+
+    /// Schedule a restart with 1s/2s/4s/8s/16s/30s backoff.
+    async fn schedule_restart(&self, name: &str) {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(spec) = self.specs.lock().await.get(name).cloned() else {
+            return;
+        };
+        if !spec.has_server {
+            return;
+        }
+        let mut lifecycle = self.lifecycle.lock().await;
+        let entry = lifecycle.entry(name.to_string()).or_default();
+        if entry.gave_up {
+            return;
+        }
+        entry.attempts = entry.attempts.saturating_add(1);
+        if entry.attempts > MAX_RESTART_ATTEMPTS {
+            entry.gave_up = true;
+            entry.next_start = None;
+            drop(lifecycle);
+            self.logs.push(
+                name,
+                "error",
+                "crash-restart budget exhausted; use /plugins restart to retry",
+            );
+            return;
+        }
+        let delay =
+            Duration::from_secs(1u64 << (entry.attempts - 1).min(4)).min(MAX_RESTART_BACKOFF);
+        entry.next_start = Some(Instant::now() + delay);
+        drop(lifecycle);
+        self.logs
+            .push(name, "warn", &format!("restarting in {}s", delay.as_secs()));
+    }
+
+    /// Background supervisor: detect dead backends and retry due restarts.
+    async fn supervise(&self) {
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
+        self.refresh().await;
+        let due: Vec<PluginSpec> = {
+            let mut lifecycle = self.lifecycle.lock().await;
+            let now = Instant::now();
+            let mut due = Vec::new();
+            for (name, entry) in lifecycle.iter_mut() {
+                if entry.gave_up || entry.next_start.is_none_or(|at| at > now) {
+                    continue;
+                }
+                if !self.specs.lock().await.contains_key(name) {
+                    continue;
+                }
+                entry.next_start = None;
+                if let Some(spec) = self.specs.lock().await.get(name) {
+                    due.push(spec.clone());
+                }
+            }
+            due
+        };
+        for spec in due {
+            // A plugin may have been started explicitly while the supervisor
+            // was waiting.
+            if self.backends.lock().await.contains_key(&spec.name) {
+                continue;
+            }
+            self.logs.push(&spec.name, "info", "restarting after crash");
+            match self.start_one(&spec).await {
+                Ok(()) => {
+                    let mut lifecycle = self.lifecycle.lock().await;
+                    lifecycle.insert(spec.name.clone(), Lifecycle::default());
+                    drop(lifecycle);
+                    self.logs.push(&spec.name, "info", "restarted");
+                }
+                Err(err) => {
+                    let message = redact(&format!("{err:#}"));
+                    self.logs
+                        .push(&spec.name, "error", &format!("restart failed: {message}"));
+                    self.mark_failed(&spec.name, &PluginConfig::default(), &err)
+                        .await;
+                    self.schedule_restart(&spec.name).await;
+                }
+            }
+        }
     }
 
     /// Stop every running backend before the registry is rebuilt.
@@ -752,6 +1067,167 @@ impl PluginManager {
         PluginListResult {
             plugins: statuses.values().map(PluginStatus::info).collect(),
         }
+    }
+
+    /// Fetch ring-buffer logs. `since` is the `next` value from a previous
+    /// call.
+    pub fn logs(&self, params: &PluginLogsParams) -> PluginLogsResult {
+        self.logs
+            .snapshot(params.name.as_deref(), params.since, params.limit)
+    }
+
+    pub fn clear_logs(&self, name: Option<&str>) {
+        self.logs.clear(name);
+    }
+
+    /// Per-plugin diagnostics for `plugin.doctor`.
+    pub async fn doctor(&self) -> PluginDoctorResult {
+        self.refresh().await;
+        let statuses = self.statuses.lock().await.clone();
+        let mut plugins = Vec::with_capacity(statuses.len());
+        for status in statuses.into_values() {
+            let mut checks = Vec::new();
+            checks.push(PluginDoctorCheck {
+                name: "enabled".into(),
+                ok: status.enabled,
+                detail: if status.enabled {
+                    "plugin is enabled".into()
+                } else {
+                    "plugin is disabled in config".into()
+                },
+            });
+            checks.push(PluginDoctorCheck {
+                name: "state".into(),
+                ok: matches!(status.state, PluginState::Ready | PluginState::Stopped),
+                detail: format!("state is {:?}", status.state).to_lowercase(),
+            });
+            checks.push(PluginDoctorCheck {
+                name: "backend".into(),
+                ok: status.backend != "disabled",
+                detail: format!("{} backend", status.backend),
+            });
+            checks.push(PluginDoctorCheck {
+                name: "failures".into(),
+                ok: status.failures < DEGRADED_AFTER_FAILURES,
+                detail: format!("{} consecutive failure(s)", status.failures),
+            });
+            let errors = self.logs.error_count(&status.name);
+            checks.push(PluginDoctorCheck {
+                name: "logs".into(),
+                ok: errors == 0,
+                detail: format!("{errors} error line(s) buffered"),
+            });
+            if let Some(schema) = &status.settings_schema {
+                let valid = schema.get("type").and_then(Value::as_str) == Some("object");
+                checks.push(PluginDoctorCheck {
+                    name: "settings_schema".into(),
+                    ok: valid,
+                    detail: if valid {
+                        "settings schema is an object".into()
+                    } else {
+                        "settings schema is not a JSON object schema".into()
+                    },
+                });
+            }
+            let last_log = self.logs.last(&status.name).map(|entry| entry.message);
+            plugins.push(PluginDoctorEntry {
+                name: status.name.clone(),
+                state: status.state,
+                enabled: status.enabled,
+                version: status.version.clone(),
+                backend: status.backend.clone(),
+                failures: status.failures,
+                error: status.error.clone(),
+                tools: status.tools,
+                commands: status.commands,
+                hooks: status.hooks,
+                ui: status.ui,
+                rpc: status.rpc,
+                events: status.events.clone(),
+                capabilities: status.capabilities.clone(),
+                log_lines: self.logs.len(&status.name),
+                last_log,
+                checks,
+            });
+        }
+        PluginDoctorResult { plugins }
+    }
+
+    /// Start one configured plugin by name. Used by `plugin.start` and the
+    /// TUI after `plugin.enable`.
+    pub async fn start(&self, name: &str, config: &Config) -> Result<()> {
+        let plugin = config
+            .plugins
+            .get(name)
+            .with_context(|| format!("unknown plugin {name:?}"))?;
+        if !plugin.enabled {
+            bail!("plugin {name:?} is disabled");
+        }
+        if self.backends.lock().await.contains_key(name) {
+            return Ok(());
+        }
+        let spec = resolve_spec(name, plugin, &config.load_cwd, &self.data_dir)?;
+        self.specs
+            .lock()
+            .await
+            .insert(name.to_string(), spec.clone());
+        self.fingerprints
+            .lock()
+            .await
+            .insert(name.to_string(), plugin_fingerprint(plugin));
+        self.lifecycle
+            .lock()
+            .await
+            .insert(name.to_string(), Lifecycle::default());
+        self.statuses.lock().await.remove(name);
+        match self.start_one(&spec).await {
+            Ok(()) => {
+                self.logs.push(name, "info", "started");
+                Ok(())
+            }
+            Err(err) => {
+                self.insert_unresolved_status(name, plugin).await;
+                self.mark_failed(name, plugin, &err).await;
+                Err(err)
+            }
+        }
+    }
+
+    /// Stop one plugin without disabling it in the config.
+    pub async fn stop(&self, name: &str) -> Result<()> {
+        self.lifecycle.lock().await.remove(name);
+        if !self.stop_one(name, PluginState::Stopped).await {
+            if let Some(status) = self.statuses.lock().await.get_mut(name) {
+                status.state = PluginState::Stopped;
+                status.tools = 0;
+                status.commands = 0;
+                status.hooks = 0;
+                status.ui = 0;
+                status.rpc = 0;
+                status.events.clear();
+            }
+        }
+        self.logs.push(name, "info", "stopped");
+        Ok(())
+    }
+
+    /// Stop one plugin and mark it disabled.
+    pub async fn disable(&self, name: &str, plugin: &PluginConfig) {
+        self.lifecycle.lock().await.remove(name);
+        self.specs.lock().await.remove(name);
+        self.set_disabled(name, plugin).await;
+        self.logs.push(name, "info", "disabled");
+    }
+
+    /// Drop all state for a plugin that is being removed. The caller removes
+    /// it from the config and deletes the installed files.
+    pub async fn forget(&self, name: &str) {
+        self.stop(&name).await.ok();
+        self.specs.lock().await.remove(name);
+        self.lifecycle.lock().await.remove(name);
+        self.fingerprints.lock().await.remove(name);
+        self.statuses.lock().await.remove(name);
+        self.logs.clear(Some(name));
     }
 
     pub async fn tool_definitions(&self) -> Vec<ToolDefinition> {
@@ -814,6 +1290,108 @@ impl PluginManager {
                 })
                 .collect(),
         }
+    }
+
+    /// Ask a plugin for the current body of one of its declared surfaces.
+    pub async fn render_ui(&self, params: &PluginUiRenderParams) -> Result<PluginUiRenderResult> {
+        if !valid_ui_surface(&params.surface) {
+            bail!("unknown UI surface {:?}", params.surface);
+        }
+        let backend = self
+            .backends
+            .lock()
+            .await
+            .get(&params.plugin)
+            .cloned()
+            .with_context(|| format!("plugin {} is not running", params.plugin))?;
+        let value = backend
+            .request(
+                "ui/render",
+                serde_json::json!({"surface": params.surface, "id": params.id}),
+            )
+            .await?;
+        let result: PluginUiRenderResult =
+            serde_json::from_value(value).context("invalid ui/render result")?;
+        if let Some(node) = &result.node {
+            node.validate().map_err(|err| anyhow::anyhow!(err))?;
+        }
+        if result.body.len() > MAX_PLUGIN_OUTPUT {
+            bail!("ui/render body is too large");
+        }
+        self.record_result(&params.plugin, true, None).await;
+        Ok(result)
+    }
+
+    /// Forward a button/form action to the owning plugin.
+    pub async fn ui_action(&self, params: &PluginUiActionParams) -> Result<PluginUiActionResult> {
+        let backend = self
+            .backends
+            .lock()
+            .await
+            .get(&params.plugin)
+            .cloned()
+            .with_context(|| format!("plugin {} is not running", params.plugin))?;
+        let value = backend
+            .request(
+                "ui/action",
+                serde_json::json!({
+                    "id": params.id,
+                    "action": params.action,
+                    "values": params.values,
+                }),
+            )
+            .await;
+        let value = match value {
+            Ok(value) => value,
+            Err(err) => {
+                self.record_result(&params.plugin, false, Some(&format!("{err:#}")))
+                    .await;
+                return Err(err);
+            }
+        };
+        let result: PluginUiActionResult =
+            serde_json::from_value(value).context("invalid ui/action result")?;
+        if let Some(node) = &result.node {
+            node.validate().map_err(|err| anyhow::anyhow!(err))?;
+        }
+        if result
+            .body
+            .as_ref()
+            .is_some_and(|body| body.len() > MAX_PLUGIN_OUTPUT)
+        {
+            bail!("ui/action body is too large");
+        }
+        self.record_result(&params.plugin, true, None).await;
+        Ok(result)
+    }
+
+    /// Ask a plugin picker provider for its rows.
+    pub async fn ui_pick(&self, params: &PluginUiPickParams) -> Result<PluginUiPickResult> {
+        let backend = self
+            .backends
+            .lock()
+            .await
+            .get(&params.plugin)
+            .cloned()
+            .with_context(|| format!("plugin {} is not running", params.plugin))?;
+        let value = backend
+            .request(
+                "ui/pick",
+                serde_json::json!({"id": params.id, "query": params.query}),
+            )
+            .await?;
+        let result: PluginUiPickResult =
+            serde_json::from_value(value).context("invalid ui/pick result")?;
+        if result.items.len() > 1000 {
+            bail!("ui/pick returned more than 1000 items");
+        }
+        for item in &result.items {
+            if item.id.is_empty() || item.id.len() > 128 {
+                bail!("ui/pick item id must be 1..=128 bytes");
+            }
+        }
+        self.record_result(&params.plugin, true, None).await;
+        Ok(result)
     }
 
     pub async fn run_command(
@@ -1339,47 +1917,11 @@ impl PluginManager {
         let Some(plugin) = config.plugins.get(name) else {
             bail!("unknown plugin {name:?}");
         };
-        let old = self.backends.lock().await.remove(name);
-        if let Some(backend) = old {
-            backend.shutdown().await;
-        }
-        self.subscriptions.lock().await.remove(name);
-        {
-            let subscriptions = self.subscriptions.lock().await;
-            self.has_event_subscribers
-                .store(!subscriptions.is_empty(), Ordering::Relaxed);
-        }
-        self.tools.lock().await.retain(|tool| tool.plugin != name);
-        self.commands
-            .lock()
-            .await
-            .retain(|command| command.plugin != name);
-        self.hooks.lock().await.retain(|hook| hook.plugin != name);
-        self.ui.lock().await.retain(|ui| ui.plugin != name);
-        self.rpc_methods.lock().await.remove(name);
-        self.refresh_has_hooks().await;
+        self.stop_one(name, PluginState::Stopped).await;
+        self.lifecycle.lock().await.remove(name);
+        self.statuses.lock().await.remove(name);
         if !plugin.enabled {
-            self.statuses.lock().await.insert(
-                name.to_string(),
-                PluginStatus {
-                    name: name.to_string(),
-                    version: String::new(),
-                    description: String::new(),
-                    enabled: false,
-                    command: plugin.command.clone(),
-                    state: PluginState::Disabled,
-                    tools: 0,
-                    commands: 0,
-                    hooks: 0,
-                    ui: 0,
-                    rpc: 0,
-                    events: Vec::new(),
-                    capabilities: plugin.capabilities.clone(),
-                    failures: 0,
-                    error: None,
-                    settings_schema: None,
-                },
-            );
+            self.set_disabled(name, plugin).await;
             return Ok(());
         }
         let spec = match resolve_spec(name, plugin, &config.load_cwd, &self.data_dir) {
@@ -1389,10 +1931,24 @@ impl PluginManager {
                 return Err(anyhow::anyhow!(redact(&format!("{err:#}"))));
             }
         };
-        if let Err(err) = self.start_one(spec).await {
+        self.specs
+            .lock()
+            .await
+            .insert(name.to_string(), spec.clone());
+        self.fingerprints
+            .lock()
+            .await
+            .insert(name.to_string(), plugin_fingerprint(plugin));
+        self.lifecycle
+            .lock()
+            .await
+            .insert(name.to_string(), Lifecycle::default());
+        if let Err(err) = self.start_one(&spec).await {
+            self.insert_unresolved_status(name, plugin).await;
             self.mark_failed(name, plugin, &err).await;
             return Err(anyhow::anyhow!(redact(&format!("{err:#}"))));
         }
+        self.logs.push(name, "info", "restarted on request");
         Ok(())
     }
 
@@ -1409,8 +1965,10 @@ impl PluginManager {
     }
 
     pub async fn shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Relaxed);
         self.has_event_subscribers.store(false, Ordering::Relaxed);
         self.has_hooks.store(false, Ordering::Relaxed);
+        self.lifecycle.lock().await.clear();
         self.stop_all().await;
         self.subscriptions.lock().await.clear();
         self.tools.lock().await.clear();
@@ -1464,6 +2022,17 @@ fn resolve_spec(
                 path.display(),
                 manifest.name
             );
+        }
+        // Packages that declare `[package]` are verified even without
+        // `require_signature`; the option only changes whether an unsigned
+        // package is accepted.
+        if plugin.require_signature || manifest.package.is_some() {
+            let trust_path = eix_core::config::config_dir().join("plugin-trust.toml");
+            let trust = eix_core::PluginTrustStore::load(&trust_path)
+                .with_context(|| format!("cannot read {}", trust_path.display()))?;
+            let directory = path.parent().unwrap_or(&cwd);
+            eix_core::verify_plugin(directory, manifest, &trust, !plugin.require_signature)
+                .with_context(|| format!("plugin {name} failed signature verification"))?;
         }
         // `components.ui` is a packaging declaration. Text surfaces arrive
         // through `initialize.ui` and `host.ui.*`; the child process itself
@@ -1582,6 +2151,7 @@ fn resolve_spec(
         denied_tools: plugin.denied_tools.clone(),
         settings: plugin.settings.clone(),
         settings_schema,
+        sandbox: plugin.sandbox,
         network_allow: plugin.network_allow.clone(),
         secrets: plugin.secrets.clone(),
         rpc_allow: plugin.rpc_allow.clone(),
@@ -1890,6 +2460,21 @@ async fn call_hook(
     }
 }
 
+fn backend_kind(spec: &PluginSpec) -> String {
+    if spec.library.is_some() {
+        "dylib".into()
+    } else {
+        "process".into()
+    }
+}
+
+/// Stable comparison key for "did this plugin's config change". Serializing
+/// is cheap next to spawning a process and avoids deriving `PartialEq` on
+/// every nested config type.
+fn plugin_fingerprint(plugin: &PluginConfig) -> String {
+    serde_json::to_string(plugin).unwrap_or_default()
+}
+
 fn wildcard(pattern: &str, text: &str) -> bool {
     fn walk(pattern: &[u8], text: &[u8]) -> bool {
         match pattern.split_first() {
@@ -1998,6 +2583,7 @@ mod tests {
             denied_tools: Vec::new(),
             settings: BTreeMap::new(),
             settings_schema: None,
+            sandbox: false,
             network_allow: Vec::new(),
             secrets: Vec::new(),
             rpc_allow: Vec::new(),
@@ -2192,6 +2778,7 @@ mod tests {
                     rpc: 0,
                     events: Vec::new(),
                     capabilities: Vec::new(),
+                    backend: "process".into(),
                     failures: 0,
                     error: None,
                     settings_schema: None,
@@ -2216,6 +2803,63 @@ mod tests {
             assert_eq!(status.state, PluginState::Ready);
             assert_eq!(status.failures, 0);
             assert!(status.error.is_none());
+        });
+    }
+
+    #[test]
+    fn doctor_surfaces_recent_errors_and_log_tail() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let manager = PluginManager::new(
+                Arc::new(crate::store::Store::in_memory().unwrap()),
+                PathBuf::from("/tmp"),
+                tokio::sync::broadcast::channel(8).0,
+            );
+            manager.statuses.lock().await.insert(
+                "acme".to_string(),
+                PluginStatus {
+                    name: "acme".into(),
+                    version: "1.0.0".into(),
+                    description: String::new(),
+                    enabled: true,
+                    command: "python3".into(),
+                    state: PluginState::Ready,
+                    tools: 1,
+                    commands: 0,
+                    hooks: 0,
+                    ui: 0,
+                    rpc: 0,
+                    events: Vec::new(),
+                    capabilities: Vec::new(),
+                    backend: "process".into(),
+                    failures: 0,
+                    error: None,
+                    settings_schema: None,
+                },
+            );
+            manager.logs.push("acme", "error", "boom");
+            manager.logs.push("acme", "info", "still here");
+
+            let doctor = manager.doctor().await;
+            assert_eq!(doctor.plugins.len(), 1);
+            let entry = &doctor.plugins[0];
+            assert_eq!(entry.backend, "process");
+            assert_eq!(entry.log_lines, 2);
+            assert_eq!(entry.last_log.as_deref(), Some("still here"));
+            let logs = entry
+                .checks
+                .iter()
+                .find(|check| check.name == "logs")
+                .unwrap();
+            assert!(!logs.ok);
+            assert!(logs.detail.contains("1 error"));
+
+            let page = manager.logs(&eix_core::plugin::PluginLogsParams {
+                name: Some("acme".into()),
+                ..Default::default()
+            });
+            assert_eq!(page.entries.len(), 2);
+            assert_eq!(page.entries[0].message, "boom");
         });
     }
 
@@ -2261,6 +2905,7 @@ mod tests {
                     rpc: 0,
                     events: Vec::new(),
                     capabilities: Vec::new(),
+                    backend: "process".into(),
                     failures: 0,
                     error: None,
                     settings_schema: Some(serde_json::json!({

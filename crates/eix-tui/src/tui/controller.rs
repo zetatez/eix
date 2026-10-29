@@ -115,6 +115,45 @@ pub enum Command {
     ListPlugins {
         name: Option<String>,
     },
+    /// Refresh only the failed/degraded counts used by the statusline.
+    PluginHealth,
+    /// Collect `plugin.doctor` diagnostics.
+    PluginDoctor {
+        name: Option<String>,
+    },
+    /// Fetch buffered plugin logs.
+    PluginLogs {
+        name: Option<String>,
+    },
+    /// Start, stop, restart, enable, disable or uninstall one plugin.
+    PluginAction {
+        action: String,
+        name: String,
+    },
+    /// Merge values into `[plugins.<name>.settings]`.
+    PluginSettingsSet {
+        name: String,
+        values: Value,
+    },
+    /// Ask a plugin to render one of its declared surfaces.
+    PluginUiRender {
+        plugin: String,
+        surface: String,
+        id: String,
+    },
+    /// Forward a rendered UI action back to the plugin.
+    PluginUiAction {
+        plugin: String,
+        id: String,
+        action: String,
+        values: Value,
+    },
+    /// Query a plugin-backed picker provider.
+    PluginPick {
+        plugin: String,
+        id: String,
+        query: String,
+    },
     /// Run an action command exported by a plugin.
     RunPluginCommand {
         session_id: String,
@@ -306,6 +345,14 @@ impl Command {
             Self::ListMcp => "mcp",
             Self::ListPluginCommands => "plugin commands",
             Self::ListPlugins { .. } => "plugins",
+            Self::PluginHealth => "plugin health",
+            Self::PluginDoctor { .. } => "plugin doctor",
+            Self::PluginLogs { .. } => "plugin logs",
+            Self::PluginAction { .. } => "plugin action",
+            Self::PluginSettingsSet { .. } => "plugin settings",
+            Self::PluginUiRender { .. } => "plugin ui",
+            Self::PluginUiAction { .. } => "plugin ui action",
+            Self::PluginPick { .. } => "plugin pick",
             Self::RunPluginCommand { .. } => "plugin command",
             Self::ReloadConfig => "reload",
             Self::ArchiveSession { .. } => "archive",
@@ -426,6 +473,38 @@ pub enum Event {
         list: eix_core::PluginListResult,
         settings: Option<eix_core::PluginSettingsResult>,
         surfaces: Vec<eix_core::PluginUiSurface>,
+    },
+    PluginHealth {
+        total: usize,
+        failed: Vec<String>,
+        degraded: Vec<String>,
+    },
+    PluginDoctor(eix_core::PluginDoctorResult),
+    PluginLogs(eix_core::PluginLogsResult),
+    PluginActionDone {
+        action: String,
+        name: String,
+        ok: bool,
+        message: String,
+    },
+    PluginUiPanel {
+        plugin: String,
+        id: String,
+        surface: String,
+        title: String,
+        result: eix_core::PluginUiRenderResult,
+    },
+    PluginUiActionDone {
+        plugin: String,
+        id: String,
+        action: String,
+        result: eix_core::PluginUiActionResult,
+    },
+    PluginPicked {
+        plugin: String,
+        id: String,
+        query: String,
+        items: Vec<eix_core::UiPickerItem>,
     },
     PluginCommandResult {
         session_id: String,
@@ -806,6 +885,154 @@ async fn dispatch(
                     list,
                     settings,
                     surfaces,
+                },
+            )
+        }
+        Command::PluginHealth => {
+            let value = requester.request("plugin.list", Value::Null).await?;
+            let list: eix_core::PluginListResult = decode(value)?;
+            let mut failed = Vec::new();
+            let mut degraded = Vec::new();
+            for plugin in &list.plugins {
+                match plugin.state {
+                    eix_core::PluginState::Failed => failed.push(plugin.name.clone()),
+                    eix_core::PluginState::Degraded => degraded.push(plugin.name.clone()),
+                    _ => {}
+                }
+            }
+            send(
+                events,
+                Event::PluginHealth {
+                    total: list.plugins.len(),
+                    failed,
+                    degraded,
+                },
+            )
+        }
+        Command::PluginDoctor { name } => {
+            let value = requester.request("plugin.doctor", Value::Null).await?;
+            let mut result: eix_core::PluginDoctorResult = decode(value)?;
+            if let Some(name) = name {
+                result.plugins.retain(|entry| entry.name == name);
+            }
+            send(events, Event::PluginDoctor(result))
+        }
+        Command::PluginLogs { name } => {
+            let value = requester
+                .request("plugin.logs", json!({ "name": name, "limit": 200 }))
+                .await?;
+            let result: eix_core::PluginLogsResult = decode(value)?;
+            send(events, Event::PluginLogs(result))
+        }
+        Command::PluginAction { action, name } => {
+            let method = format!("plugin.{action}");
+            let result = requester.request(&method, json!({ "name": name })).await;
+            let (ok, message) = match result {
+                Ok(value) => (true, value.to_string()),
+                Err(err) => (false, format!("{err:#}")),
+            };
+            send(
+                events,
+                Event::PluginActionDone {
+                    action,
+                    name,
+                    ok,
+                    message,
+                },
+            )
+        }
+        Command::PluginSettingsSet { name, values } => {
+            let result = requester
+                .request(
+                    "plugin.settings.set",
+                    json!({ "name": name, "values": values }),
+                )
+                .await;
+            let (ok, message) = match result {
+                Ok(_) => (true, "settings updated".to_string()),
+                Err(err) => (false, format!("{err:#}")),
+            };
+            send(
+                events,
+                Event::PluginActionDone {
+                    action: "settings".into(),
+                    name,
+                    ok,
+                    message,
+                },
+            )
+        }
+        Command::PluginUiRender {
+            plugin,
+            surface,
+            id,
+        } => {
+            let value = requester
+                .request(
+                    "plugin.ui.render",
+                    json!({ "plugin": plugin, "surface": surface, "id": id }),
+                )
+                .await?;
+            let result: eix_core::PluginUiRenderResult = decode(value)?;
+            let title = if result.title.is_empty() {
+                id.clone()
+            } else {
+                result.title.clone()
+            };
+            send(
+                events,
+                Event::PluginUiPanel {
+                    plugin,
+                    id,
+                    surface,
+                    title,
+                    result,
+                },
+            )
+        }
+        Command::PluginUiAction {
+            plugin,
+            id,
+            action,
+            values,
+        } => {
+            let value = requester
+                .request(
+                    "plugin.ui.action",
+                    json!({
+                        "plugin": plugin,
+                        "id": id,
+                        "action": action,
+                        "values": values,
+                    }),
+                )
+                .await?;
+            let result: eix_core::PluginUiActionResult = decode(value)?;
+            send(
+                events,
+                Event::PluginUiActionDone {
+                    plugin,
+                    id,
+                    action,
+                    result,
+                },
+            )
+        }
+        Command::PluginPick { plugin, id, query } => {
+            let value = requester
+                .request(
+                    "plugin.ui.pick",
+                    json!({ "plugin": plugin, "id": id, "query": query }),
+                )
+                .await?;
+            let result: eix_core::PluginUiPickResult = decode(value)?;
+            send(
+                events,
+                Event::PluginPicked {
+                    plugin,
+                    id,
+                    query,
+                    items: result.items,
                 },
             )
         }

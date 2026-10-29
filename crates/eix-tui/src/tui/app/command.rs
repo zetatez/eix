@@ -338,9 +338,150 @@ impl App {
                 true
             }
             "plugins" => {
-                let name = (!args.is_empty()).then(|| args.to_string());
-                let _ = tx.send(Command::ListPlugins { name });
-                self.status = "plugins: loading…".into();
+                let mut parts = args.split_whitespace();
+                let first = parts.next().unwrap_or_default();
+                match first {
+                    "" => {
+                        let _ = tx.send(Command::ListPlugins { name: None });
+                        self.status = "plugins: loading…".into();
+                    }
+                    "logs" => {
+                        let name = parts.next().map(str::to_string);
+                        let _ = tx.send(Command::PluginLogs { name });
+                        self.status = "plugin logs: loading…".into();
+                    }
+                    "doctor" | "check" => {
+                        let name = parts.next().map(str::to_string);
+                        let _ = tx.send(Command::PluginDoctor { name });
+                        self.status = "plugin doctor: running…".into();
+                    }
+                    "restart" | "start" | "stop" | "enable" | "disable" | "uninstall" => {
+                        match parts.next() {
+                            Some(name) => {
+                                let _ = tx.send(Command::PluginAction {
+                                    action: first.to_string(),
+                                    name: name.to_string(),
+                                });
+                                self.status = format!("plugin {name}: {first}…");
+                            }
+                            None => {
+                                self.error = Some(format!("usage: /plugins {first} <name>"));
+                            }
+                        }
+                    }
+                    "open" => match (parts.next(), parts.next()) {
+                        (Some(plugin), Some(id)) => {
+                            let surface = parts.next().unwrap_or("panel").to_string();
+                            let _ = tx.send(Command::PluginUiRender {
+                                plugin: plugin.to_string(),
+                                surface,
+                                id: id.to_string(),
+                            });
+                            self.status = "plugin panel: loading…".into();
+                        }
+                        _ => {
+                            self.error =
+                                Some("usage: /plugins open <plugin> <id> [surface]".into());
+                        }
+                    },
+                    "action" | "act" => {
+                        let (plugin, id) = if first == "act" {
+                            match self.plugin_panel.as_ref() {
+                                Some(panel) => (panel.plugin.clone(), panel.id.clone()),
+                                None => {
+                                    self.error =
+                                        Some("no plugin panel open; use /plugins open".into());
+                                    return true;
+                                }
+                            }
+                        } else {
+                            match (parts.next(), parts.next()) {
+                                (Some(plugin), Some(id)) => (plugin.to_string(), id.to_string()),
+                                _ => {
+                                    self.error = Some(
+                                        "usage: /plugins action <plugin> <id> <action> [k=v]…"
+                                            .into(),
+                                    );
+                                    return true;
+                                }
+                            }
+                        };
+                        let Some(action) = parts.next() else {
+                            self.error =
+                                Some("usage: /plugins action <plugin> <id> <action> [k=v]…".into());
+                            return true;
+                        };
+                        let mut values = serde_json::Map::new();
+                        for assignment in parts {
+                            let Some((key, value)) = assignment.split_once('=') else {
+                                self.error = Some(format!(
+                                    "plugin action values must be key=value (bad {assignment:?})"
+                                ));
+                                return true;
+                            };
+                            let value = serde_json::from_str(value)
+                                .unwrap_or_else(|_| Value::String(value.to_string()));
+                            values.insert(key.to_string(), value);
+                        }
+                        let _ = tx.send(Command::PluginUiAction {
+                            plugin,
+                            id,
+                            action: action.to_string(),
+                            values: Value::Object(values),
+                        });
+                        self.status = format!("plugin action {action}: sending…");
+                    }
+                    "pick" => match (parts.next(), parts.next()) {
+                        (Some(plugin), Some(id)) => {
+                            let query = parts.collect::<Vec<_>>().join(" ");
+                            self.open_plugin_picker(plugin, id, id, tx);
+                            if !query.is_empty() {
+                                if let Some(picker) = &mut self.picker {
+                                    picker.query = query;
+                                }
+                                self.picker_query_due = true;
+                            }
+                        }
+                        _ => {
+                            self.error = Some("usage: /plugins pick <plugin> <id> [query]".into());
+                        }
+                    },
+                    "set" => match parts.next() {
+                        Some(name) => {
+                            let mut values = serde_json::Map::new();
+                            for assignment in parts {
+                                let Some((key, value)) = assignment.split_once('=') else {
+                                    self.error = Some(format!(
+                                        "usage: /plugins set <name> <key>=<json>… (bad {assignment:?})"
+                                    ));
+                                    return true;
+                                };
+                                let value = serde_json::from_str(value)
+                                    .unwrap_or_else(|_| Value::String(value.to_string()));
+                                values.insert(key.to_string(), value);
+                            }
+                            if values.is_empty() {
+                                self.error =
+                                    Some("usage: /plugins set <name> <key>=<json>…".into());
+                            } else {
+                                let _ = tx.send(Command::PluginSettingsSet {
+                                    name: name.to_string(),
+                                    values: Value::Object(values),
+                                });
+                                self.status = format!("plugin {name}: updating settings…");
+                            }
+                        }
+                        None => {
+                            self.error = Some("usage: /plugins set <name> <key>=<json>…".into());
+                        }
+                    },
+                    _ => {
+                        let _ = tx.send(Command::ListPlugins {
+                            name: Some(first.to_string()),
+                        });
+                        self.status = "plugins: loading…".into();
+                    }
+                }
                 true
             }
             "reload" => {

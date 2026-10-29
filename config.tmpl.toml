@@ -246,9 +246,12 @@ MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
 
 # [plugins.echo]
 # enabled = true
+# lazy = false                 # defer startup until plugin.start / /plugins start
 # manifest = "examples/plugins/echo/eix-plugin.toml"
 # capabilities = ["tools", "commands"]
 # timeout_secs = 30
+# require_signature = false    # refuse unsigned packages / manifests without [package]
+# sandbox = false              # Linux: no_new_privs + rlimits + Landlock (opt-in)
 # allowed_tools = ["word_*"]
 # denied_tools = ["remember"]
 #

@@ -53,13 +53,18 @@ pub use picker::{
 };
 pub use plugin::{
     ContentBlock, PluginCapability, PluginCommandInfo, PluginCommandList, PluginCommandRunParams,
-    PluginCommandRunResult, PluginConfig, PluginInfo, PluginListResult, PluginManifest,
-    PluginPackage, PluginSettingsResult, PluginState, PluginToolCallParams, PluginToolCallResult,
-    PluginUiListResult, PluginUiSurface, RpcError, RpcNotification, RpcRequest, RpcResponse,
-    PLUGIN_API_VERSION, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
+    PluginCommandRunResult, PluginConfig, PluginDoctorCheck, PluginDoctorEntry, PluginDoctorResult,
+    PluginInfo, PluginListResult, PluginLogEntry, PluginLogsParams, PluginLogsResult,
+    PluginManifest, PluginPackage, PluginSettingsResult, PluginState, PluginToolCallParams,
+    PluginToolCallResult, PluginUiActionParams, PluginUiActionResult, PluginUiListResult,
+    PluginUiPickParams, PluginUiPickResult, PluginUiRenderParams, PluginUiRenderResult,
+    PluginUiSurface, RpcError, RpcNotification, RpcRequest, RpcResponse, UiAction, UiField, UiNode,
+    UiOption, UiPickerItem, PLUGIN_API_VERSION, PLUGIN_COMMAND_PREFIX, PLUGIN_TOOL_PREFIX,
+    UI_MAX_DEPTH, UI_MAX_NODES, UI_MAX_TEXT,
 };
 pub use plugin_package::{
-    install as install_plugin, pack as pack_plugin, verify as verify_plugin, InstalledPlugin,
+    forget_locked_plugin, install as install_plugin, lockfile_path, pack as pack_plugin,
+    verify as verify_plugin, verify_lock, InstalledPlugin, LockedPlugin, PluginLock,
     PluginTrustStore,
 };
 pub use process::{ProcessInfo, ProcessKillResult, ProcessList, ProcessOutput, ProcessStatus};

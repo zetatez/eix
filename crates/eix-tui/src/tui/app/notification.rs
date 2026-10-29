@@ -15,30 +15,50 @@ impl App {
                     .get("plugin")
                     .and_then(Value::as_str)
                     .unwrap_or("plugin");
+                let id = params.get("id").and_then(Value::as_str).unwrap_or("panel");
+                let surface = params
+                    .get("surface")
+                    .and_then(Value::as_str)
+                    .unwrap_or("panel");
                 let title = params
                     .get("title")
                     .and_then(Value::as_str)
-                    .filter(|title| !title.trim().is_empty())
-                    .unwrap_or(plugin);
+                    .unwrap_or_default();
                 let body = params
                     .get("body")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.open_text_view(format!("{plugin} · {title}"), body);
-                self.status = format!("{plugin} · {title}");
+                let node = params.get("node").and_then(|value| {
+                    serde_json::from_value::<eix_core::UiNode>(value.clone()).ok()
+                });
+                let result = eix_core::PluginUiRenderResult {
+                    title: title.to_string(),
+                    node,
+                    body: body.to_string(),
+                };
+                self.show_plugin_panel(plugin, id, surface, title, &result);
             }
             "plugin.ui.close" => {
-                let plugin = notification
-                    .params
+                let params = &notification.params;
+                let plugin = params
                     .get("plugin")
                     .and_then(Value::as_str)
                     .unwrap_or("plugin");
-                if self
-                    .text_view
+                let id = params.get("id").and_then(Value::as_str).unwrap_or_default();
+                let matches_panel = self
+                    .plugin_panel
                     .as_ref()
-                    .is_some_and(|view| view.title.starts_with(&format!("{plugin} · ")))
+                    .is_some_and(|panel| panel.plugin == plugin && panel.id == id);
+                if matches_panel
+                    || self
+                        .text_view
+                        .as_ref()
+                        .is_some_and(|view| view.title.starts_with(&format!("{plugin} · ")))
                 {
                     self.text_view = None;
+                    if matches_panel {
+                        self.plugin_panel = None;
+                    }
                     self.status = format!("{plugin} closed its panel");
                 }
             }

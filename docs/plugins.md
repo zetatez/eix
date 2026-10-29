@@ -1,6 +1,6 @@
 # eix 插件体系设计（v2）
 
-- 状态：v2 内核、hooks、文本 UI、插件间 RPC、细粒度 allowlist、打包/验签/安装均已实现；自定义 UI 视图树与 lockfile 仍是后续里程碑
+- 状态：v2 内核、hooks、UI 视图树、插件间 RPC、细粒度 allowlist、生命周期管理、打包/验签/lockfile、Python/TS SDK 均已实现；WASM 与 hosted 运行时仍是后续里程碑
 - 原生 dylib 扩展：见 [`plugin-dylib.md`](plugin-dylib.md)（P1 已落地：`DylibBackend` 加载器 + `describe` / `tool.call` / `command.run`）
 - 适用范围：`eixd`（host）、`eix-core`（协议与 manifest/打包）、`eix-tui`（UI 贡献的渲染端与 CLI）
 - 关联实现：`crates/eix-core/src/plugin.rs`、`crates/eix-core/src/plugin_package.rs`、`crates/eixd/src/plugin/`、`crates/eixd/src/server.rs`、`crates/eix-tui/src/tui/app/`、`crates/eix-tui/src/main.rs`
@@ -18,23 +18,24 @@
 | 协议       | JSON-RPC 2.0 over NDJSON；`initialize`、`tools/call`、`commands/run`、`hooks/run`、`rpc.call`、host 反向请求、通知 |
 | 多路复用   | writer task + reader task + 每请求 oneshot；超时发送 `$/cancel`                                        |
 | 注册表     | tools / commands / events / hooks / ui / rpc；启动时做命名空间与能力校验                               |
-| 生命周期   | `disabled` / `starting` / `ready` / `degraded` / `failed` / `stopped`；连续 3 次后端失败进入 `degraded`，成功一次恢复 |
+| 生命周期   | `disabled` / `starting` / `ready` / `degraded` / `failed` / `stopped`；连续 3 次后端失败进入 `degraded`，成功一次恢复；`lazy` 惰性启动、崩溃退避重启、按配置 diff 的 reload |
 | Host API   | `host.log/info/ping`、`storage.*`、`fs.*`、`net.request`、`secrets.get`、`session.*`、`ui.*`、`notify`、`rpc.call`、`blob.*`、`job.*` |
 | Hooks      | `tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end`，按 priority + 插件名排序                  |
 | Action 命令 | manifest 或运行时 `commands` 的 `action`；host 调用 `commands/run`，可返回 prompt 或文本输出          |
 | 声明式插件 | 仅含 `[[contributes.commands]]` 的包不启动进程                                                         |
 | 工具结果   | content blocks（text/image/resource/diff/json）+ `structured` + `is_error`                             |
 | Settings   | manifest `settings = "schema.json"` 必须是包内、`type: object`、≤256 KiB；`plugin.settings.set` 校验后写回配置并通知插件 |
-| UI 表面    | `plugin.ui.list` 返回已声明的 `panel` / `status` / `picker`；TUI `/plugins [name]` 展示                       |
-| 分发       | `eix plugin pack/verify/install/trust/untrust`；detached Ed25519 签名 + SHA-256 checksums              |
+| UI 视图树  | `ui/render` / `ui/action` / `ui/pick`；`UiNode` 支持 text/markdown/heading/divider/list/table/form/actions/picker/group；TUI 渲染进文本 overlay 并给出 `/plugins act` 提示 |
+| 可观测性   | 每插件 500 行日志 ring buffer、`plugin.logs {name, since, limit}`、`plugin.logs.clear`、`plugin.doctor`；TUI `/plugins logs|doctor` 与 statusline 健康标记 |
+| 分发       | `eix plugin pack/verify/install/update/uninstall/trust/untrust`；detached Ed25519 + SHA-256 checksums、`plugins.lock`、`require_signature`、`min_host_version`、`target`/`artifact` |
+| SDK        | `eix-plugin-sdk`（Rust）、`sdks/python`、`sdks/typescript`；`sdks/conformance/run.py` 做协议一致性测试 |
 | 示例       | `examples/plugins/echo/` 已迁移到 v2，并演示 action 命令                                               |
 
 尚未实现：
 
 - dylib 插件的 host API 覆盖同步安全的 `log/info/ping/notify/storage.*/secrets.get/fs.*/session.*/blob.*`；`net` / `ui` / `rpc` / `jobs` 仍返回 `EIX_ERR_DENIED`，详见 [`plugin-dylib.md`](plugin-dylib.md)。
-- 插件提交自定义视图树（`pane` / `picker` 等）；`picker` 表面可以被声明和列出，实际渲染仍复用文本面板。
-- TUI 内直接编辑 settings；`plugin.settings.set` 已可用，但 TUI 仍只读展示。
-- lockfile、registry、lazy start、ring buffer 审计表和 OS sandbox。
+- TUI 内直接编辑 settings；`plugin.settings.set` 已可用，TUI 仍只读展示。
+- registry、自动升级、WASM / hosted 运行时。
 
 ---
 
@@ -55,18 +56,19 @@ v1 使用 `schema = 1`、`PLUGIN_API_VERSION = 1`、顶层 `[server]`，工具�
 已在后续里程碑解决：
 
 4. hooks：`tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end` 已接入 turn 与工具管线。
-5. UI 贡献：文本 `panel` / `status` 表面与 `host.notify` 已接入 TUI；自定义视图树仍待实现。
-6. 包管理：提供 `pack` / `verify` / `install`、SHA-256 checksums、Ed25519 签名和本地 trust store。
+5. UI 贡献：`panel` / `status` / `picker`、`host.notify`、`UiNode` 视图树与 `ui.render` / `ui.action` / `ui.pick` 已接入 TUI。
+6. 包管理：提供 `pack` / `verify` / `install` / `update` / `uninstall`、SHA-256 checksums、Ed25519 签名、本地 trust store 与 `plugins.lock`。
 7. settings schema：manifest 可声明 JSON Schema，`/plugins <name>` 展示 schema 与当前值。
 8. 能力粒度：fs 限定 workspace，网络与 RPC 使用 allowlist，secrets 按环境变量名授权。
+9. 生命周期：`lazy`、退避重启、按配置 diff 的 reload、ring buffer 日志与 `plugin.doctor`。
+10. 安全：`require_signature`、`min_host_version`、平台 `target`/`artifact`、Linux opt-in sandbox。
+11. SDK：Rust `eix-plugin-sdk`、Python 与 TypeScript SDK，以及共享 conformance harness。
 
 仍需后续里程碑：
 
-9. UI 视图树、picker provider 与 settings 的可持久化编辑。
-10. lockfile、registry、lazy start、退避重启、ring buffer 审计表和指标。
-11. 可选 OS sandbox。
-12. 插件 SDK（`eix-sdk` 目前是 HTTP client，不是 plugin SDK）。
-13. 项目级插件仍被完全禁止；多 workspace 语义不完整。
+12. registry、自动升级与持久化 `plugin_audit`。
+13. WASM / hosted 运行时；TUI 内 settings 编辑。
+14. 项目级插件仍被完全禁止；多 workspace 语义不完整。
 
 ---
 
@@ -136,7 +138,7 @@ v1 使用 `schema = 1`、`PLUGIN_API_VERSION = 1`、顶层 `[server]`，工具�
 | --- | --- | --- | --- |
 | 服务（Service） | 是 | 工具、hooks、事件、RPC、网络、文件、secret、后台任务 | host API |
 | 原生（Dylib） | 否（加载进 `eixd`） | 性能敏感的工具/命令、first-party 深度扩展 | ABI v1 + 同步 host API |
-| UI（UI） | 是 | 文本 panel / status、通知；自定义视图树待实现 | 声明式文本表面 |
+| UI（UI） | 是 | 文本 panel / status / picker、通知、视图树 | 声明式表面 + `UiNode` |
 | 声明式（Declarative） | 否 | 命令、skill、agent、主题、键位、MCP server、权限规则 | 静态贡献 |
 
 一个包可以同时包含声明式、server / dylib 和 ui 三类贡献，共用同一个 manifest 和授权。`components.server` 与 `components.dylib` 互斥；本版不会为 `[components.ui]` 单独启动进程，UI 文本表面来自 server 组件的 `initialize.ui` 与 `host.ui.*`。
@@ -456,7 +458,7 @@ dispatcher   --> 每个 in-flight 请求一个 task，max_inflight 默认 8
 | `host.secrets.get` | `secrets` | 只读取 `plugins.<name>.secrets` 列出的环境变量 |
 | `host.session.get` / `list` | `sessions_read` | 只读 session 元数据 |
 | `host.notify` | `ui` | 发送 `plugin.notify`，TUI 显示 toast |
-| `host.ui.open` / `update` / `close` | `ui` | 文本 `panel` / `status` 表面，正文 ≤256 KiB |
+| `host.ui.open` / `update` / `close` | `ui` | 面板/状态事件；可带 `body` 文本或 `node` 视图树，正文 ≤256 KiB |
 | `host.rpc.call` | `rpc` | 调用 allowlist 内其他插件导出的方法 |
 | `host.blob.put` / `get` | `storage` | 内容寻址（SHA-256），存在插件数据目录，单个 ≤8 MiB |
 | `host.job.register/trigger/unregister` | `jobs` | 最多 32 个 job，间隔 1..=86400s，通过 `job.run` 通知插件 |
@@ -538,39 +540,59 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 
 ## 9. UI 贡献
 
-### 9.1 已实现的文本表面
+### 9.1 已实现的表面
 
 - 插件不输出 ANSI、不直接操作终端。
 - `initialize.ui` 可声明 `panel` / `status` / `picker`；`plugin.ui.list` 把它们暴露给前端。
-- `host.ui.open` / `update` 发送 `{plugin, id, surface, title, body}`，TUI 打开或更新文本面板。
-- `host.ui.close` 关闭匹配插件的前缀面板。
+- `host.ui.open` / `update` 发送 `{plugin, id, surface, title, body, node?}`，TUI 打开或更新面板。
+- `host.ui.close {id}` 关闭匹配的插件面板；TUI 也会在面板被其他 overlay 替换时清掉本地引用。
 - `host.notify` 发送 `{plugin, level, message}`，TUI 显示 toast。
-- 正文是纯文本或字符串数组，单条 ≤256 KiB。
+- `body` 是纯文本或字符串数组；`node` 是可选的结构化视图树。两者都给时 TUI 优先渲染 `node`，`body` 作为无节点渲染器的回退。整帧 ≤256 KiB。
 
 ### 9.2 Surface
 
 | Surface | 现状 | 说明 |
 | --- | --- | --- |
-| `panel` | 已实现 | 全屏文本面板，Esc 关闭 |
-| `status` | 已实现 | 目前作为文本面板打开，不常驻 statusline |
-| `picker` | 声明/列出 | `plugin.ui.list` 可见，`/plugins <name>` 会标注；实际交互仍待 `ui.render` / `ui.action` |
+| `panel` | 已实现 | 全屏文本 overlay，Esc 关闭 |
+| `status` | 已实现 | 作为面板打开，不常驻 statusline |
+| `picker` | 已实现 | `ui/render` 返回 `picker` 节点或声明 picker 表面；`ui/pick` 提供搜索行，TUI 打开插件选择器 |
 | `notification` | 已实现 | `host.notify` toast |
 
-`plugin.ui.list` 返回 `{surfaces: [{plugin, surface, id, title}]}`。TUI 在 `/plugins` 和 `/plugins <name>` 中展示声明，并据此解释 `plugin.ui.open` 事件；真正由插件驱动选择器还需要下一步的自定义视图树。
+`plugin.ui.list` 返回 `{surfaces: [{plugin, surface, id, title}]}`。TUI `/plugins [name]` 展示声明，并可用：
 
-### 9.3 自定义视图树（后续）
+```text
+/plugins open <plugin> <id> [surface]      # 调用 plugin.ui.render
+/plugins action <plugin> <id> <action> [k=v]…
+/plugins act <action> [k=v]…               # 对当前面板执行
+/plugins pick <plugin> <id> [query]        # 打开 ui/pick 选择器
+```
+
+TUI 把视图树渲染到文本 overlay；按钮与表单提交会显示对应的 `/plugins act <action>` 提示，因此同一棵树在键盘、脚本和测试里都可驱动。
+
+### 9.3 视图树
 
 ```json
 {
-  "kind": "list",
-  "id": "issues",
+  "kind": "group",
   "title": "Issues",
-  "items": [{"id": "42", "label": "#42 Fix parser"}],
-  "actions": [{"id": "open", "label": "Open", "key": "Enter"}]
+  "children": [
+    {"kind": "heading", "text": "Open", "level": 2},
+    {"kind": "list", "items": ["#42 Fix parser", "#43 Add tests"]},
+    {"kind": "actions", "actions": [
+      {"id": "refresh", "label": "Refresh", "kind": "primary"}
+    ]},
+    {"kind": "picker", "id": "issues", "title": "Issues", "items": [
+      {"id": "42", "title": "#42 Fix parser", "subtitle": "bug"}
+    ]}
+  ]
 }
 ```
 
-规划中的节点：`text`、`markdown`、`list`、`table`、`tree`、`tabs`、`form`、`diff`、`log`、`progress`、`sparkline`、`actions`、`spacer`。限制：最大 2000 节点、深度 16、单文本 64 KiB；未知 `kind` 渲染为错误占位。
+节点：`text`、`markdown`、`heading`、`divider`、`list`、`table`、`form`、`actions`、`picker`、`group`。限制：最多 2000 节点、深度 16、单文本 64 KiB、表格 64 列/1000 行、picker 1000 项；未知 `kind` 反序列化失败。`UiNode::validate()` 在 daemon 侧执行，host 不会把非法树送到 TUI。
+
+`ui/render` 返回 `{title, node?, body}`；`ui/action` 返回 `{ok, node?, body?, prompt?, close?, error?}`，其中 `prompt` 会提交为用户消息，`close` 关闭面板。`ui/pick {id, query}` 返回 `{items:[{id,title,subtitle}]}`；TUI 的插件 picker 在输入后 200ms 防抖查询，回车把选中项作为 `ui/action {action:"picked", values:{item}}` 回传。
+
+dylib 后端目前不实现 `ui/render` / `ui/action` / `ui/pick`，调用会返回 unknown method。
 
 ### 9.4 设置表单
 
@@ -639,12 +661,14 @@ ok, duration_ms, detail_hash, error
 
 ```toml
 [plugins.acme]
-sandbox = "strict"   # inherit | strict
+sandbox = true        # 默认 false；Linux 上 opt-in
+require_signature = true
 ```
 
-- Linux：Landlock（只读系统目录 + 授权 workspace + 插件数据目录 + 授权网络）+ seccomp + `no_new_privs` + rlimit。
-- macOS：seatbelt profile。
-- 其他平台：明确说明只有进程隔离，不假装有沙箱。
+- Linux：`PR_SET_NO_NEW_PRIVS`、`PR_SET_PDEATHSIG`、rlimits 与 Landlock 路径白名单；白名单包含 workspace、插件数据目录与系统运行库路径。
+- macOS / 其他平台：当前为 no-op，只保留进程隔离，不假装有沙箱。
+- sandbox 只限制进程能触达的文件与系统调用；host API 的能力校验仍然是主要边界。
+- `require_signature = true` 时拒绝未签名或没有 `[package]` 的包；默认 false 便于本地开发。
 
 ### 10.5 供应链
 
@@ -652,9 +676,13 @@ sandbox = "strict"   # inherit | strict
 - `eix plugin verify <dir> [--allow-unsigned]` 校验 checksums，并在存在 `eix-plugin.sig` 时用 trust store 验证 detached Ed25519 签名。
 - 签名覆盖 `eix-plugin.sums` 的原始字节；默认签名文件为 `eix-plugin.sig`，可用 `[package] signature` 覆盖。
 - `eix plugin trust <publisher> <base64-public-key>` / `untrust` 管理全局 `plugin-trust.toml`。
-- `eix plugin install <dir> [--force] [--allow-unsigned]` 先验签再复制到 `~/.config/eix/plugins/<name>`；不自动修改配置，只打印 `[plugins.<name>]` 片段。
-- 安装拒绝 symlink、路径逃逸和未列入 checksums 的额外文件；未签名安装必须显式 `--allow-unsigned`。
-- 尚无 registry、lockfile 与自动升级；升级需要重新 pack / 签名 / install。
+- `eix plugin install <dir> [--force] [--allow-unsigned]` 先验签再复制到 `~/.config/eix/plugins/<name>`，并把 `[plugins.<name>]` 直接写入配置。
+- `--allow-unsigned` 会为没有 `[package]` 的本地目录补表并重新 `pack`，便于开发；生产分发仍应签名。
+- `target`（`linux-x86_64`、`x86_64-unknown-linux-gnu`、`amd64` 等别名）与 `artifact`/`path` 让一个 manifest 指向正确的平台库；`artifact` 优先。
+- manifest 的 `min_host_version` 在 daemon 加载时强制校验，host 版本通过 `PLUGIN_HOST_VERSION` 暴露。
+- 安装拒绝 symlink、路径逃逸和未列入 checksums 的额外文件。
+- `~/.config/eix/plugins/plugins.lock` 记录已安装插件的 version/publisher/checksums；`eix plugin verify-lock`（库函数 `verify_lock`）检测漂移，失败时返回非零。
+- 尚无 registry 与自动升级；`eix plugin update <dir>` 重新验证并覆盖安装，然后写回配置。
 
 ---
 
@@ -677,8 +705,11 @@ disabled -> installed -> starting -> ready
 
 ### 11.2 启动与重启
 
-- 已实现：启动失败标记 `failed`、`plugin.restart`、崩溃检测（`exit_reason`）。
-- 规划中：`lazy = true` 惰性启动、事件订阅者 eager 除外、1s/2s/4s 退避与 circuit breaker、`/reload` 配置 diff 只重启变化的插件。
+- `lazy = true`：启动/重载时只登记 spec 与状态，不 spawn；首次 `plugin.start` 或 TUI `/plugins start <name>` 才启动。
+- 启动失败标记 `failed` 并保留 `error`；`plugin.restart` / `/plugins restart` 显式重试。
+- 崩溃检测基于 `exit_reason`；1s supervisor 发现进程退出后按 1s/2s/4s/8s/16s 退避重启，最多 6 次，超限进入 `gave_up`，需显式 restart。
+- `/reload` 按 `PluginConfig` 的序列化指纹做 diff：只重启新增或配置变化的插件；未变化的 failed 插件不会因为 reload 被自动重试。
+- `plugin.stop/start/enable/disable/uninstall/forget` 覆盖手动生命周期；uninstall 只删除受管理的安装目录并要求 canonical path 在插件根内。
 
 ### 11.3 并发与背压
 
@@ -736,8 +767,11 @@ pub struct PluginConfig {
     pub command: String,
     pub args: Vec<String>,
     pub library: Option<PathBuf>,    // 原生 dylib；与 command 互斥
+    pub require_signature: bool,     // 拒绝未签名/无 [package] 的包
+    pub sandbox: bool,               // Linux opt-in 进程硬化
     pub env: BTreeMap<String, String>,
     pub enabled: bool,
+    pub lazy: bool,                  // 延迟到 plugin.start
     pub timeout_secs: u64,
     pub cwd: Option<PathBuf>,
     pub manifest: Option<PathBuf>,
@@ -760,6 +794,9 @@ pub struct PluginConfig {
 - `command` / `args` / `env` / `cwd`：进程入口；与 `manifest` 二选一或组合。
 - `library`：原生 dylib 路径；相对路径按 config cwd 解析，与 `command` / `components.server` 互斥。使用 dylib 时必须同时授予它实际调用的能力（如 `tools` / `commands`）。
 - `enabled` / `timeout_secs`：启停与请求超时（秒）。
+- `lazy`：延迟启动，首次 `plugin.start` / `/plugins start` 才 spawn。
+- `require_signature`：拒绝未签名或没有 `[package]` 的包；默认 false。
+- `sandbox`：Linux 上启用 no_new_privs / PDEATHSIG / rlimits / Landlock；其他平台 no-op。默认 false。
 - `manifest`：`eix-plugin.toml`，相对路径按 config cwd 解析；manifest 的 `name` 必须与配置 key 一致。manifest 含 `components.dylib` 时等价于配置了 `library`。
 - `capabilities`：只能收窄 manifest 的申请；留空表示采用 manifest 的申请或 `[tools, commands]`。
 - `allowed_tools` / `denied_tools`：`*` / `?` 通配符，deny 优先。
@@ -773,7 +810,8 @@ pub struct PluginConfig {
 ### 12.3 数据库
 
 - `plugin_kv`：已用于 storage，按插件名与 global/workspace scope 隔离。
-- `plugin_audit`、`plugin_installs`：规划中，尚未实现。
+- `plugin_audit`、`plugin_installs`：规划中，尚未实现；当前审计用每插件日志 ring buffer 与 `plugin.doctor`。
+- 安装状态存在 `plugins/plugins.lock`（TOML），不写入 SQLite。
 - secrets 只从配置选择的环境变量读取，不落 SQLite。
 
 ---
@@ -782,22 +820,23 @@ pub struct PluginConfig {
 
 ### 13.1 运维
 
-- 每插件 ring buffer（最近 500 行）、`plugin.logs {name, since}`：规划中。
-- `plugin.list` 已返回 state / tools / commands / hooks / ui / rpc / events / capabilities / failures / error。
+- 每插件内存 ring buffer 保留最近 500 行；`plugin.logs {name?, since?, limit?}` 用单调 `seq` 分页，不落库。`plugin.logs.clear` 清空，`plugin.doctor` 汇总状态、最近错误、日志尾部和 lockfile 漂移。
+- 日志写入前统一 `redact`，并统计 `error_count` 与 `last`；daemon 生命周期、stderr 与 `host.log` 都进入同一缓冲区。
+- `plugin.list` 返回 state / tools / commands / hooks / ui / rpc / events / capabilities / failures / error / lazy。
 - `plugin.settings {name}` 返回 schema 与当前值；`plugin.settings.set {name, values}` 校验并写回配置。
 - `plugin.ui.list` 返回已声明的 `{plugin, surface, id, title}` 表面，供 TUI 预知面板与 picker。
-- `plugin.doctor`：规划中。
-- TUI `/plugins [name]`：列表、贡献计数、错误；带 name 时展示 settings schema。
-- `/reload` 仍会重启全部插件；按 diff 重启尚未实现。
-- statusline 在插件 failed/degraded 时显示标记：规划中。
+- TUI `/plugins [name]`：列表、贡献计数、错误、settings schema；`/plugins logs [name]`、`/plugins doctor [name]`、`/plugins restart|start|stop|enable|disable|uninstall <name>`、`/plugins set <name> <key>=<json>…`。
+- TUI 还支持 `/plugins open|action|act|pick` 驱动视图树与插件 picker。
+- `/reload` 只重启配置指纹变化的插件；statusline 在 failed/degraded 时显示标记，启动与每次插件操作后静默刷新健康状态。
 
 ### 13.2 开发
 
-- `eix plugin new` / `run` / `test`：规划中。
-- `eix plugin pack/verify/install/trust/untrust`：已实现。
-- SDK：`eix-plugin` Rust crate、Python package、TypeScript package：规划中；`eix-sdk` 是 daemon HTTP client。
+- `eix plugin new <name> [--python|--dylib]` 生成 Python 插件或 dylib manifest 脚手架；`eix plugin run` 前台运行，`eix plugin test` 做 10s initialize 握手检查。
+- `eix plugin pack/verify/install/update/uninstall/verify-lock/trust/untrust` 已实现；install/update 直接写回 `[plugins.<name>]` 与 `plugins.lock`。
+- SDK：`crates/eix-plugin-sdk`（Rust）、`sdks/python/eix_plugin.py`、`sdks/typescript/`（ESM + `.d.ts`）。`eix-sdk` 仍是 daemon HTTP client，不是插件 SDK。
+- 一致性测试：`sdks/conformance/run.py` 启动插件并覆盖 initialize、tools/call、commands/run、hooks/run、ui/render 与 shutdown；Python 与 TS fixture 都有测试入口（见各 SDK README）。
 - 文档：本文件与 `crates/eix-core/src/plugin.rs` 的类型定义。
-- 示例：`examples/plugins/echo/` 覆盖 tools、commands、action、events、storage。
+- 示例：`examples/plugins/echo/` 覆盖 tools、commands、action、events、storage；`sdks/*/examples/` 覆盖 SDK。
 
 ---
 
@@ -820,10 +859,10 @@ pub struct PluginConfig {
 - 加入状态枚举、声明式命令、工具名过滤、事件订阅。
 - 验收：`cargo test -p eixd plugin` 与插件 e2e 覆盖新协议。
 
-### Phase 1：协议 v2 + SDK（协议已完成，SDK 未开始）
+### Phase 1：协议 v2 + SDK（已完成）
 
 - JSON-RPC 2.0 帧、多路复用、取消、content blocks 已落地。
-- Python/TS SDK + conformance test 未开始。
+- Python / TypeScript SDK 与共享 conformance harness 已落地；Rust 侧为 `eix-plugin-sdk`。
 - 验收：一个慢工具不阻塞同插件的第二个调用；取消能生效。
 
 ### Phase 2：Hooks + 声明式插件 + Action 命令（核心已完成）
@@ -834,17 +873,18 @@ pub struct PluginConfig {
 - settings schema 已解析，`plugin.settings.set` 校验后写回配置并通过 `config.changed` 热更新；TUI 仍只读展示。
 - 连续失败 3 次进入 `degraded`，成功一次恢复。
 
-### Phase 3：UI 贡献（文本表面已完成）
+### Phase 3：UI 贡献（已完成）
 
-- `panel` / `status` / `notification` 已落地；`picker` 可声明并通过 `plugin.ui.list` 列出，自定义 `UiNode`、`ui.render` / `ui.action` 待实现。
+- `panel` / `status` / `notification` / `picker` 已落地；`UiNode` 视图树、`ui.render` / `ui.action` / `ui.pick` 已实现。
+- TUI 把节点渲染进文本 overlay，并提供 `/plugins open|action|act|pick`；插件 picker 支持 200ms 防抖查询。
 - `/plugins [name]` 管理器已落地，并展示插件声明的 UI 表面。
-- 验收：插件能打开/更新/关闭文本面板，JSON 不被当作 ANSI 执行。
+- 验收：插件能打开/更新/关闭面板与选择器，JSON 不被当作 ANSI 执行。
 
-### Phase 4：安全与分发（核心已完成）
+### Phase 4：安全与分发（已完成，registry 除外）
 
 - fs / network / secrets / RPC 的 allowlist 已落地。
-- 可选 strict sandbox 未实现。
-- `pack` / `verify` / `install` / Ed25519 签名 / trust store 已落地；lockfile 与 registry 未实现。
+- `require_signature`、`min_host_version`、平台 `target`/`artifact`、Linux opt-in sandbox 与 `plugins.lock` 已落地。
+- `pack` / `verify` / `install` / `update` / `uninstall` / Ed25519 签名 / trust store 已落地；registry 与自动升级未实现。
 
 ### Phase 5：高级扩展（部分完成）
 
@@ -883,28 +923,32 @@ pub struct PluginConfig {
 
 | 位置                                 | 现状                                                                     |
 | ---                                  | ---                                                                      |
-| `crates/eix-core/src/plugin.rs`      | manifest v2、配置、JSON-RPC、content blocks、hooks/ui/rpc、action/settings 类型 |
-| `crates/eix-core/src/plugin_package.rs` | `pack` / `verify` / `install`、checksums、Ed25519、trust store             |
-| `crates/eixd/src/plugin/mod.rs`      | `PluginManager`、注册表、生命周期、hooks 管线、RPC 路由、声明式/action 命令、backend 选择、`degraded` 计数、settings 写入 |
+| `crates/eix-core/src/plugin.rs`      | manifest v2、配置、JSON-RPC、content blocks、hooks/ui/rpc、UiNode、action/settings 类型 |
+| `crates/eix-core/src/plugin_package.rs` | `pack` / `verify` / `install` / `update`、checksums、Ed25519、trust store、`plugins.lock` / `verify_lock` |
+| `crates/eixd/src/plugin/mod.rs`      | `PluginManager`、注册表、生命周期与 supervisor、日志/doctor、hooks 管线、RPC 路由、声明式/action 命令、UI 渲染、backend 选择、`degraded` 计数、settings 写入 |
+| `crates/eixd/src/plugin/logs.rs`     | 每插件 500 行 ring buffer、seq 分页、脱敏、error_count/last |
 | `crates/eixd/src/plugin/backend.rs`  | `ExtensionBackend` trait 与 `BackendFuture`                                |
 | `crates/eixd/src/plugin/process.rs`  | `ProcessBackend`：JSON-RPC 子进程适配器                                    |
 | `crates/eixd/src/plugin/dylib.rs`    | `DylibBackend`、ABI 校验、方法翻译、超时、dylib host API                    |
-| `crates/eixd/src/plugin/client.rs`   | 进程 spawn、writer/reader、请求多路复用、超时取消、事件投递、features       |
+| `crates/eixd/src/plugin/client.rs`   | 进程 spawn、sandbox、writer/reader、请求多路复用、超时取消、事件投递、features |
 | `crates/eixd/src/plugin/host_api.rs` | `HostContext`、共享 `WorkspaceFs`/blob、fs/net/secrets/session/ui/rpc/job 与能力校验 |
-| `crates/eixd/src/server.rs`          | `plugin.command.run` / `plugin.settings[.set]` / `plugin.ui.list`、watcher 自写抑制、turn/tool/prompt hook 接入 |
+| `crates/eixd/src/server.rs`          | `plugin.command.run` / `plugin.settings[.set]` / `plugin.ui.list|render|action|pick` / `plugin.logs[.clear]` / `plugin.doctor`、watcher 自写抑制、turn/tool/prompt hook 接入 |
 | `crates/eixd/src/classifier.rs`      | `RiskCategory::Plugin` 保留；插件工具默认审批                              |
-| `crates/eix-tui/src/main.rs`         | `eix plugin pack/verify/install/trust/untrust` CLI                         |
-| `crates/eix-tui/src/tui/app/`        | `/plugins [name]`、action 命令分发、`plugin.ui.*` 文本面板与 toast          |
-| `crates/eix-core/src/config.rs`      | `plugins` 解析与 allowlist 校验；项目级 `plugins` 仍被删除                  |
+| `crates/eix-tui/src/main.rs`         | `eix plugin new/run/test/pack/verify/install/update/uninstall/trust/untrust` CLI |
+| `crates/eix-tui/src/tui/app/`        | `/plugins [name|logs|doctor|start|stop|restart|enable|disable|uninstall|set|open|action|act|pick]`、`plugin.ui.*`、`plugin_ui.rs` 视图树渲染 |
+| `crates/eix-core/src/config.rs`      | `plugins` 解析与 allowlist 校验、`register_plugin` / `remove_plugin_config`；项目级 `plugins` 仍被删除 |
+| `crates/eix-plugin-sdk/`             | Rust 插件 SDK                                                             |
+| `sdks/python/`、`sdks/typescript/`   | Python 与 TS/JS 插件 SDK、示例与测试                                      |
+| `sdks/conformance/`                  | 共享协议一致性 harness                                                    |
 | `examples/plugins/echo/`             | v2 示例：JSON-RPC 2.0、content blocks、storage、events、action              |
 | `examples/plugins/hello-dylib/`      | dylib 示例：ABI v1、`echo` 工具、`sync` action 命令                          |
 
-hooks / UI / RPC 的接入点见第 7、8、9 节；未实现的只有自定义视图树、settings 编辑与 lockfile。
+hooks / UI / RPC 的接入点见第 7、8、9 节；未实现的只有 registry、自动升级、WASM/hosted 与 TUI 内 settings 编辑。
 
 ## 19. 后续最小步骤
 
-1. 审计与可观测性：`plugin_audit`、ring buffer、`plugin.logs`。
+1. registry 与签名分发的自动升级流程。
 2. 更多声明式贡献：skills / agents / themes / keymaps / MCP。
-3. Python / TypeScript SDK 与协议一致性测试。
-4. 自定义 UI 视图树、picker provider、TUI 内 settings 编辑（`plugin.settings.set` 已可用）。
-5. lockfile、registry、按 diff 重启与可选 OS sandbox。
+3. TUI 内 settings 编辑与更丰富的视图节点（tree/tabs/progress/diff）。
+4. WASM 或 hosted 插件运行时（真正强隔离）。
+5. 持久化 `plugin_audit`（当前使用内存 ring buffer 与 `plugin.doctor`）。

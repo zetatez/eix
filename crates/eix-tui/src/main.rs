@@ -27,7 +27,7 @@ use eix_core::{
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
 use client::{ensure_daemon, Client};
 
@@ -287,6 +287,12 @@ enum McpCmd {
 
 #[derive(Clone)]
 enum PluginCmd {
+    /// Scaffold a new plugin package.
+    New { name: String, dylib: bool },
+    /// Run a process plugin in the foreground (prints its stderr).
+    Run { directory: PathBuf },
+    /// Smoke-test the handshake of a process plugin.
+    Test { directory: PathBuf },
     /// Write `eix-plugin.sums` for a package directory.
     Pack { directory: PathBuf },
     /// Verify checksums and the detached signature.
@@ -300,6 +306,15 @@ enum PluginCmd {
         allow_unsigned: bool,
         force: bool,
     },
+    /// Reinstall and re-register an existing package.
+    Update {
+        directory: PathBuf,
+        allow_unsigned: bool,
+    },
+    /// Remove an installed package and its config entry.
+    Uninstall { name: String },
+    /// Compare installed files against `plugins.lock`.
+    VerifyLock,
     /// Add or replace a trusted publisher key.
     Trust {
         publisher: String,
@@ -829,10 +844,34 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
         }
         "plugin" => {
             let sub = args.first().cloned().ok_or_else(|| {
-                anyhow::anyhow!("usage: eix plugin <pack|verify|install|trust|untrust>")
+                anyhow::anyhow!(
+                    "usage: eix plugin <new|run|test|pack|verify|install|update|uninstall|verify-lock|trust|untrust>"
+                )
             })?;
             args.remove(0);
             match sub.as_str() {
+                "new" => {
+                    let dylib = take_switch(&mut args, "--dylib");
+                    let python = take_switch(&mut args, "--python");
+                    if dylib && python {
+                        bail!("--dylib and --python are mutually exclusive");
+                    }
+                    let name = args.first().cloned().ok_or_else(|| {
+                        anyhow::anyhow!("usage: eix plugin new <name> [--dylib|--python]")
+                    })?;
+                    Ok(Command::Plugin(PluginCmd::New { name, dylib }))
+                }
+                "run" | "test" => {
+                    let directory = args
+                        .first()
+                        .map(PathBuf::from)
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    Ok(Command::Plugin(if sub == "run" {
+                        PluginCmd::Run { directory }
+                    } else {
+                        PluginCmd::Test { directory }
+                    }))
+                }
                 "pack" => {
                     let directory = args
                         .first()
@@ -865,6 +904,26 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
                         force,
                     }))
                 }
+                "update" => {
+                    let allow_unsigned = take_switch(&mut args, "--allow-unsigned");
+                    let directory = args.first().map(PathBuf::from).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "usage: eix plugin update <directory> [--allow-unsigned]"
+                        )
+                    })?;
+                    Ok(Command::Plugin(PluginCmd::Update {
+                        directory,
+                        allow_unsigned,
+                    }))
+                }
+                "uninstall" | "remove" => {
+                    let name = args
+                        .first()
+                        .cloned()
+                        .ok_or_else(|| anyhow::anyhow!("usage: eix plugin uninstall <name>"))?;
+                    Ok(Command::Plugin(PluginCmd::Uninstall { name }))
+                }
+                "verify-lock" | "check-lock" => Ok(Command::Plugin(PluginCmd::VerifyLock)),
                 "trust" => {
                     let publisher = args.first().cloned().ok_or_else(|| {
                         anyhow::anyhow!("usage: eix plugin trust <publisher> <base64-public-key>")
@@ -885,7 +944,7 @@ fn parse_command(name: String, mut args: Vec<String>) -> Result<Command> {
                     Ok(Command::Plugin(PluginCmd::Untrust { publisher }))
                 }
                 other => bail!(
-                    "unknown plugin command {other:?}; use pack, verify, install, trust or untrust"
+                    "unknown plugin command {other:?}; use new, run, test, pack, verify, install, update, uninstall, verify-lock, trust or untrust"
                 ),
             }
         }
@@ -1873,13 +1932,178 @@ async fn kill(cli: &Cli, process: &str) -> Result<()> {
     Ok(())
 }
 
-/// Package, verify, install and trust plugins. Installation never edits the
-/// config; it prints the exact `[plugins.<name>]` snippet to add.
+/// Package, verify, install and trust plugins. `install` and `update` register
+/// the package under `[plugins.<name>]`; the daemon still needs a reload.
 async fn plugin_command(_cli: &Cli, cmd: PluginCmd) -> Result<()> {
     let config_dir = core_config::config_dir();
     let plugins_root = config_dir.join("plugins");
     let trust_path = config_dir.join("plugin-trust.toml");
     match cmd {
+        PluginCmd::New { name, dylib } => {
+            if !eix_core::plugin::valid_plugin_name(&name) {
+                bail!(
+                    "invalid plugin name {name:?}: use letters, digits, '.', '_' or '-', without '__'"
+                );
+            }
+            let directory = std::env::current_dir()?.join(&name);
+            if directory.exists() {
+                bail!("{} already exists", directory.display());
+            }
+            std::fs::create_dir_all(&directory)
+                .with_context(|| format!("cannot create {}", directory.display()))?;
+            let manifest = if dylib {
+                format!(
+                    "schema = 2\nname = {name:?}\nversion = \"0.1.0\"\ndescription = \"\"\n\
+                     api_version = {}\nabi = {}\ncapabilities = [\"tools\"]\n\n\
+                     [components.dylib]\npath = \"lib{name}.so\"\n",
+                    eix_core::plugin::PLUGIN_API_VERSION,
+                    eix_core::plugin::PLUGIN_DYLIB_ABI_VERSION,
+                )
+            } else {
+                format!(
+                    "schema = 2\nname = {name:?}\nversion = \"0.1.0\"\ndescription = \"\"\n\
+                     api_version = {}\ncapabilities = [\"tools\"]\n\n\
+                     [components.server]\ncommand = \"python3\"\nentry = \"plugin.py\"\n",
+                    eix_core::plugin::PLUGIN_API_VERSION,
+                )
+            };
+            std::fs::write(directory.join("eix-plugin.toml"), manifest)
+                .with_context(|| format!("cannot write {}/eix-plugin.toml", name))?;
+            if dylib {
+                std::fs::write(
+                    directory.join("README.md"),
+                    format!(
+                        "# {name}\n\nBuild a cdylib that exports the eix plugin ABI and copy it to \
+                         `lib{name}.so`.\n"
+                    ),
+                )?;
+            } else {
+                std::fs::write(directory.join("plugin.py"), python_plugin_template(&name))
+                    .with_context(|| format!("cannot write {name}/plugin.py"))?;
+            }
+            println!("created {}", directory.display());
+            println!();
+            println!("Next:");
+            if dylib {
+                println!("  build lib{name}.so, then `eix plugin install {name} --allow-unsigned`");
+            } else {
+                println!("  eix plugin test {name}");
+                println!("  eix plugin install {name} --allow-unsigned");
+            }
+            Ok(())
+        }
+        PluginCmd::Run { directory } => {
+            let directory = directory
+                .canonicalize()
+                .with_context(|| format!("cannot read {}", directory.display()))?;
+            let manifest = eix_core::PluginManifest::load(&directory.join("eix-plugin.toml"))?;
+            let Some((program, args)) = manifest.server_command(&directory) else {
+                bail!(
+                    "{} is not a process plugin; it has no [components.server]",
+                    directory.display()
+                );
+            };
+            println!("running {} ({}) in the foreground", manifest.name, program);
+            let status = tokio::process::Command::new(&program)
+                .args(&args)
+                .current_dir(&directory)
+                .stdin(std::process::Stdio::inherit())
+                .stdout(std::process::Stdio::inherit())
+                .stderr(std::process::Stdio::inherit())
+                .status()
+                .await
+                .with_context(|| format!("cannot run {program}"))?;
+            if !status.success() {
+                bail!("{program} exited with {status}");
+            }
+            Ok(())
+        }
+        PluginCmd::Test { directory } => {
+            let directory = directory
+                .canonicalize()
+                .with_context(|| format!("cannot read {}", directory.display()))?;
+            let manifest = eix_core::PluginManifest::load(&directory.join("eix-plugin.toml"))?;
+            let Some((program, args)) = manifest.server_command(&directory) else {
+                bail!(
+                    "{} is not a process plugin; test a dylib by loading it in the daemon",
+                    directory.display()
+                );
+            };
+            let mut child = tokio::process::Command::new(&program)
+                .args(&args)
+                .current_dir(&directory)
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::inherit())
+                .kill_on_drop(true)
+                .spawn()
+                .with_context(|| format!("cannot run {program}"))?;
+            let mut stdin = child.stdin.take().context("plugin stdin was not piped")?;
+            let stdout = child.stdout.take().context("plugin stdout was not piped")?;
+            let mut stdout = tokio::io::BufReader::new(stdout);
+            let params = json!({
+                "protocol_version": eix_core::plugin::PLUGIN_API_VERSION,
+                "api_version": eix_core::plugin::PLUGIN_API_VERSION,
+                "plugin": {"name": manifest.name, "version": manifest.version},
+                "host": {"name": "eix", "version": eix_core::plugin::PLUGIN_HOST_VERSION},
+                "features": [],
+                "capabilities": manifest.capabilities,
+                "workspace": directory,
+                "config": {"settings": {}},
+            });
+            let request =
+                json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": params});
+            let mut line = serde_json::to_string(&request)?;
+            line.push('\n');
+            stdin.write_all(line.as_bytes()).await?;
+            stdin.flush().await?;
+            let mut reply = String::new();
+            let read = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                stdout.read_line(&mut reply),
+            )
+            .await
+            .context("plugin did not answer initialize within 10s")??;
+            if read == 0 {
+                bail!("plugin closed stdout before answering initialize");
+            }
+            let response: eix_core::plugin::RpcResponse = serde_json::from_str(reply.trim())
+                .context("plugin sent a non-JSON-RPC line on stdout")?;
+            if let Some(error) = response.error {
+                bail!("initialize failed ({}): {}", error.code, error.message);
+            }
+            let init: eix_core::plugin::PluginInitializeResult =
+                serde_json::from_value(response.result.unwrap_or(Value::Null))
+                    .context("invalid initialize result")?;
+            if init.api_version != eix_core::plugin::PLUGIN_API_VERSION {
+                bail!(
+                    "plugin speaks API version {}, host expects {}",
+                    init.api_version,
+                    eix_core::plugin::PLUGIN_API_VERSION
+                );
+            }
+            println!(
+                "ok: {} {} (API {})",
+                init.name, init.version, init.api_version
+            );
+            println!(
+                "  tools {} · commands {} · hooks {} · ui {} · rpc {} · events {}",
+                init.tools.len(),
+                init.commands.len(),
+                init.hooks.len(),
+                init.ui.len(),
+                init.rpc.len(),
+                init.events.len()
+            );
+            for tool in &init.tools {
+                println!("  tool {}", tool.name);
+            }
+            let shutdown = json!({"jsonrpc": "2.0", "method": "shutdown"});
+            let _ = stdin.write_all(format!("{shutdown}\n").as_bytes()).await;
+            let _ = stdin.flush().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            Ok(())
+        }
         PluginCmd::Pack { directory } => {
             let entries = eix_core::pack_plugin(&directory)
                 .with_context(|| format!("cannot pack {}", directory.display()))?;
@@ -1908,6 +2132,9 @@ async fn plugin_command(_cli: &Cli, cmd: PluginCmd) -> Result<()> {
             allow_unsigned,
             force,
         } => {
+            if allow_unsigned {
+                prepare_local_package(&directory)?;
+            }
             let trust = eix_core::PluginTrustStore::load(&trust_path)?;
             let installed =
                 eix_core::install_plugin(&directory, &plugins_root, &trust, allow_unsigned, force)?;
@@ -1917,14 +2144,92 @@ async fn plugin_command(_cli: &Cli, cmd: PluginCmd) -> Result<()> {
                 installed.manifest.version,
                 installed.path.display()
             );
-            println!();
-            println!("Add this to your global config and reload the daemon:");
-            println!();
-            println!("[plugins.{}]", installed.name);
+            let manifest_path = installed.path.join("eix-plugin.toml");
+            let config_path = Config::default().register_plugin(&installed.name, &manifest_path)?;
             println!(
-                "manifest = {:?}",
-                installed.path.join("eix-plugin.toml").display().to_string()
+                "registered [plugins.{}] in {}",
+                installed.name,
+                config_path.display()
             );
+            println!(
+                "lockfile: {}",
+                eix_core::lockfile_path(&plugins_root).display()
+            );
+            println!("Run `eix daemon reload` (or /reload in the TUI) to start it.");
+            Ok(())
+        }
+        PluginCmd::Update {
+            directory,
+            allow_unsigned,
+        } => {
+            if allow_unsigned {
+                prepare_local_package(&directory)?;
+            }
+            let trust = eix_core::PluginTrustStore::load(&trust_path)?;
+            let installed =
+                eix_core::install_plugin(&directory, &plugins_root, &trust, allow_unsigned, true)?;
+            println!(
+                "updated {} to {} in {}",
+                installed.name,
+                installed.manifest.version,
+                installed.path.display()
+            );
+            let manifest_path = installed.path.join("eix-plugin.toml");
+            let config_path = Config::default().register_plugin(&installed.name, &manifest_path)?;
+            println!("config: {}", config_path.display());
+            println!(
+                "lockfile: {}",
+                eix_core::lockfile_path(&plugins_root).display()
+            );
+            println!("Reload the daemon to pick up the new version.");
+            Ok(())
+        }
+        PluginCmd::Uninstall { name } => {
+            if !eix_core::plugin::valid_plugin_name(&name)
+                || name.contains(['/', '\\'])
+                || name == "."
+                || name == ".."
+            {
+                bail!("invalid plugin name {name:?}");
+            }
+            let config_path = Config::default().remove_plugin_config(&name)?;
+            println!("removed [plugins.{name}] from {}", config_path.display());
+            let directory = plugins_root.join(&name);
+            let mut removed_files = false;
+            if let (Ok(root), Ok(dir)) = (plugins_root.canonicalize(), directory.canonicalize()) {
+                if dir.starts_with(&root) && dir.is_dir() {
+                    std::fs::remove_dir_all(&dir)
+                        .with_context(|| format!("cannot remove {}", dir.display()))?;
+                    removed_files = true;
+                }
+            }
+            if removed_files {
+                println!("removed {}", directory.display());
+            } else {
+                println!("no managed install directory for {name}; files were left alone");
+            }
+            if eix_core::forget_locked_plugin(&plugins_root, &name)? {
+                println!(
+                    "removed {name} from {}",
+                    eix_core::lockfile_path(&plugins_root).display()
+                );
+            }
+            println!("Reload the daemon to unload it.");
+            Ok(())
+        }
+        PluginCmd::VerifyLock => {
+            let lock_path = eix_core::lockfile_path(&plugins_root);
+            if !lock_path.exists() {
+                bail!(
+                    "no lockfile at {}; install a plugin first",
+                    lock_path.display()
+                );
+            }
+            let names = eix_core::verify_lock(&plugins_root)?;
+            println!("{} plugin(s) match {}", names.len(), lock_path.display());
+            for name in names {
+                println!("  {name}");
+            }
             Ok(())
         }
         PluginCmd::Trust {
@@ -1955,6 +2260,119 @@ async fn plugin_command(_cli: &Cli, cmd: PluginCmd) -> Result<()> {
         }
     }
 }
+
+/// Prepare a local package for `install --allow-unsigned`: a manifest with no
+/// `[package]` table gets one, then checksums are regenerated. Signed or
+/// already-packaged directories are left untouched.
+fn prepare_local_package(directory: &Path) -> Result<()> {
+    let manifest_path = directory.join("eix-plugin.toml");
+    let manifest = eix_core::PluginManifest::load(&manifest_path)?;
+    if manifest.package.is_some() {
+        return Ok(());
+    }
+    let mut text = std::fs::read_to_string(&manifest_path)
+        .with_context(|| format!("cannot read {}", manifest_path.display()))?;
+    if !text.trim_end().ends_with("[package]") {
+        text.push_str("\n[package]\n");
+    }
+    std::fs::write(&manifest_path, text)
+        .with_context(|| format!("cannot write {}", manifest_path.display()))?;
+    let entries = eix_core::pack_plugin(directory)
+        .with_context(|| format!("cannot pack {}", directory.display()))?;
+    println!(
+        "packed {} file(s) for the unsigned install (add a signature for distribution)",
+        entries.len()
+    );
+    Ok(())
+}
+
+/// Starter server plugin written by `eix plugin new`. It implements the
+/// minimum handshake plus one tool so `eix plugin test` succeeds immediately.
+fn python_plugin_template(name: &str) -> String {
+    PYTHON_PLUGIN_TEMPLATE.replace("__PLUGIN_NAME__", name)
+}
+
+const PYTHON_PLUGIN_TEMPLATE: &str = r#"#!/usr/bin/env python3
+"""Minimal eix server plugin (plugin API v2).
+
+Wire format: JSON-RPC 2.0, one object per line on stdin/stdout. Responses must
+carry the request ``id``; notifications such as ``shutdown`` have no id.
+"""
+
+import json
+import sys
+
+NAME = "__PLUGIN_NAME__"
+API_VERSION = 2
+
+TOOLS = [
+    {
+        "name": "hello",
+        "description": "Return a greeting.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+        },
+    }
+]
+
+
+def send(value):
+    sys.stdout.write(json.dumps(value, separators=(",", ":")) + "\n")
+    sys.stdout.flush()
+
+
+def reply(request_id, result=None, error=None):
+    message = {"jsonrpc": "2.0", "id": request_id}
+    if error is not None:
+        message["error"] = error
+    else:
+        message["result"] = result if result is not None else {}
+    send(message)
+
+
+def handle(request):
+    method = request.get("method")
+    request_id = request.get("id")
+    if method == "initialize":
+        reply(
+            request_id,
+            {
+                "name": NAME,
+                "version": "0.1.0",
+                "api_version": API_VERSION,
+                "features": [],
+                "tools": TOOLS,
+            },
+        )
+    elif method == "tools/call":
+        arguments = (request.get("params") or {}).get("arguments") or {}
+        who = arguments.get("name") or "world"
+        reply(
+            request_id,
+            {"ok": True, "content": [{"type": "text", "text": f"hello, {who}"}]},
+        )
+    elif method in ("shutdown", "exit"):
+        sys.exit(0)
+    elif request_id is not None:
+        reply(request_id, error={"code": -32601, "message": f"unknown method {method}"})
+
+
+def main():
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            request = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        handle(request)
+
+
+if __name__ == "__main__":
+    main()
+"#;
 
 async fn mcp_command(cli: &Cli, cmd: McpCmd) -> Result<()> {
     let store = eixd::oauth::Store::new(cli.data_dir.join("oauth").join("mcp"));
@@ -3212,11 +3630,19 @@ COMMANDS:
     mcp auth <server> [--no-browser]
                                authorize a remote MCP server with OAuth (PKCE)
     mcp logout <server>        forget a remote MCP server's OAuth token
+    plugin new NAME [--dylib|--python]
+                               scaffold a plugin package in ./NAME
+    plugin run [DIR]           run a process plugin in the foreground
+    plugin test [DIR]          check a process plugin's initialize handshake
     plugin pack [DIR]          write eix-plugin.sums for a plugin directory
     plugin verify [DIR] [--allow-unsigned]
                                verify checksums and the detached signature
     plugin install DIR [--force] [--allow-unsigned]
-                               verify and install under ~/.config/eix/plugins
+                               verify, install and register a plugin
+    plugin update DIR [--allow-unsigned]
+                               reinstall and re-register a plugin
+    plugin uninstall NAME      remove a plugin and its config entry
+    plugin verify-lock         compare installed files with plugins.lock
     plugin trust PUBLISHER KEY trust a base64 Ed25519 publisher key
     plugin untrust PUBLISHER   remove a trusted publisher key
     auth login PROVIDER [--api-key KEY | --stdin] [--no-browser]

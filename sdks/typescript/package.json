@@ -1,0 +1,26 @@
+{
+  "name": "eix-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Dependency-free SDK for eix server plugins (API v2)",
+  "type": "module",
+  "main": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node test/conformance.mjs"
+  }
+}

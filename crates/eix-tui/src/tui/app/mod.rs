@@ -46,6 +46,7 @@ mod lifecycle;
 mod notification;
 mod overlay;
 mod overlay_draw;
+mod plugin_ui;
 mod prompt;
 mod prompts;
 mod search;
@@ -239,8 +240,8 @@ fn builtin_commands() -> Vec<CommandSpec> {
         builtin("mcp", "", "browse MCP servers and their tools"),
         builtin(
             "plugins",
-            "[name]",
-            "list plugins or inspect one plugin's settings form",
+            "[name|logs|doctor|start|stop|restart|enable|disable|uninstall|set|open|action|act|pick]",
+            "inspect plugins, logs/doctor, lifecycle, settings and UI panels",
         ),
         builtin("reload", "", "re-read the daemon config files"),
         builtin(
@@ -1110,6 +1111,25 @@ enum PickerKind {
     Mcp,
     /// The focused session's current task list.
     Todos,
+    /// Rows provided by a plugin through `ui/pick`.
+    Plugin,
+}
+
+/// Provider behind an open `PickerKind::Plugin` overlay.
+#[derive(Clone, Debug)]
+struct PluginPickerProvider {
+    plugin: String,
+    id: String,
+    title: String,
+}
+
+/// A plugin-rendered surface currently shown in the text overlay.
+#[derive(Clone, Debug)]
+struct PluginPanelRef {
+    plugin: String,
+    id: String,
+    surface: String,
+    title: String,
 }
 
 impl PickerKind {
@@ -1134,7 +1154,8 @@ impl PickerKind {
             | Self::Skills
             | Self::Themes
             | Self::Mcp
-            | Self::Todos => None,
+            | Self::Todos
+            | Self::Plugin => None,
         }
     }
 
@@ -1168,6 +1189,7 @@ impl PickerKind {
             Self::Themes => "colorschemes — live preview",
             Self::Mcp => "mcp — servers and tools",
             Self::Todos => "todos — model task list",
+            Self::Plugin => "plugin picker",
         }
     }
 
@@ -1194,6 +1216,7 @@ impl PickerKind {
             Self::Themes => "Enter apply · ↑/↓ live preview · Esc cancel",
             Self::Mcp => "Enter close · ↑/↓ or C-j/C-k/C-n/C-p select · Esc close",
             Self::Todos => "Enter close · ↑/↓ or C-j/C-k/C-n/C-p select · Esc close",
+            Self::Plugin => "type to search · Enter choose · Esc close",
         }
     }
 }
@@ -1254,6 +1277,8 @@ struct Picker {
     kind: PickerKind,
     query: String,
     selected: usize,
+    /// Provider for `PickerKind::Plugin`; `None` for built-in kinds.
+    provider: Option<PluginPickerProvider>,
     /// Rows for data providers and the command palette. Session kinds read
     /// `App::sessions` directly so live status changes show through.
     items: Vec<PickerItem>,
@@ -2004,6 +2029,11 @@ pub struct App {
     commands: Vec<CommandSpec>,
     /// Prompt commands advertised by server plugins.
     plugin_commands: Vec<eix_core::PluginCommandInfo>,
+    /// Plugins currently failed or degraded, shown in the statusline.
+    plugin_failed: Vec<String>,
+    plugin_degraded: Vec<String>,
+    /// Plugin-rendered surface currently open, used by `/plugins act`.
+    plugin_panel: Option<PluginPanelRef>,
     /// Opt-in resources from other agent harnesses.
     compat: eix_core::CompatConfig,
     /// `/` command menu was dismissed with Esc for the current draft.
