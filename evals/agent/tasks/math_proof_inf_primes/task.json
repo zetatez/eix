@@ -20,7 +20,7 @@
       "kind": "text_all",
       "axis": "correctness",
       "needles": [
-        "contradiction",
+        "contradict",
         "qed"
       ]
     },

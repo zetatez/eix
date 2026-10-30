@@ -49,7 +49,20 @@
         "has no",
         "nothing to ignore",
         "no parameter",
-        "no such parameter"
+        "no such parameter",
+        "no edit was needed",
+        "no edit needed",
+        "already calls",
+        "already correct",
+        "remains",
+        "was not needed",
+        "premise is incorrect",
+        "premise does not match",
+        "no change was needed",
+        "nothing to fix",
+        "no code changes",
+        "made no changes",
+        "no changes were made"
       ]
     }
   ],

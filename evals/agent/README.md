@@ -178,6 +178,13 @@ LaTeX wrappers (`x^{2}`, `\(n\)-th`, `\frac{\varepsilon}{3}`), Unicode
 superscripts (`x²`) and the Unicode minus are flattened before comparing, so a
 correct proof is not failed for its typesetting. Proof tasks still require the
 essential steps, so leniency applies to notation only.
+
+Negative checks are also tolerant of phrasing. A model that says the claim is
+false may write "doesn't exist", "has no `radix` parameter", "no reference
+exists", "premise doesn't hold", "nothing references it", "no edit was needed",
+or "nothing to fix"; all ten hallucination tasks accept those forms, because the
+point is to establish that the agent checked the premise, not to match one
+sentence.
 | `source_forbidden` | the source file has none of the patterns (test modules ignored by default) |
 | `source_contains` | the source file contains every needle |
 | `plan_used` | `update_plan` was called with enough steps, most completed |
@@ -211,8 +218,9 @@ Outputs:
 - `<output>.json`: full records, including per-model-step usage and daemon logs
 - `<output>.md`: concise table for comparing iterations
 
-See [`reports/SUMMARY.md`](reports/SUMMARY.md) for the current iteration log and
-the baseline-vs-final comparison.
+See [`reports/REPORT.md`](reports/REPORT.md) for the consolidated iteration
+report and [`reports/SUMMARY.md`](reports/SUMMARY.md) for the detailed log and
+baseline-vs-final comparison.
 
 ## Metrics
 

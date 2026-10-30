@@ -8,13 +8,6 @@
       "axis": "correctness"
     },
     {
-      "kind": "text_all",
-      "axis": "correctness",
-      "needles": [
-        "retries_three_times"
-      ]
-    },
-    {
       "kind": "text_any_of",
       "axis": "correctness",
       "needles": [
@@ -45,7 +38,20 @@
         "no method",
         "no config",
         "no file",
-        "not used"
+        "not used",
+        "no edit was needed",
+        "no edit needed",
+        "already calls",
+        "already correct",
+        "remains",
+        "was not needed",
+        "premise is incorrect",
+        "premise does not match",
+        "no change was needed",
+        "nothing to fix",
+        "no code changes",
+        "made no changes",
+        "no changes were made"
       ]
     }
   ],

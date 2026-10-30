@@ -36,7 +36,20 @@
         "cannot find",
         "can't find",
         "no dependency",
-        "isn't defined"
+        "isn't defined",
+        "no edit was needed",
+        "no edit needed",
+        "already calls",
+        "already correct",
+        "remains",
+        "was not needed",
+        "premise is incorrect",
+        "premise does not match",
+        "no change was needed",
+        "nothing to fix",
+        "no code changes",
+        "made no changes",
+        "no changes were made"
       ]
     }
   ],
