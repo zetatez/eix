@@ -1,0 +1,405 @@
+{
+  "generated_at": "20261030T124106Z",
+  "args": {
+    "tasks": "",
+    "repeats": 1,
+    "bin_dir": "/tmp/eix-agent-target/debug",
+    "config": "/home/shiyi/.config/eix/config.toml",
+    "workdir": "/tmp/eix-agent-eval",
+    "output": "evals/agent/reports/baseline.json",
+    "timeout": 420.0,
+    "verify_timeout": 180.0,
+    "daemon_timeout": 20.0
+  },
+  "summary": {
+    "runs": 3,
+    "passed": 3,
+    "pass_rate": 1.0,
+    "total_prompt_tokens": 117054,
+    "total_completion_tokens": 4502,
+    "total_tokens": 121556,
+    "total_cache_read_tokens": 72832,
+    "usage_coverage": 1.0,
+    "cache_hit_rate": 0.6222,
+    "mean_duration_s": 25.802,
+    "mean_model_steps": 5.67,
+    "mean_tool_calls": 4.67
+  },
+  "results": [
+    {
+      "task": "add_slugify",
+      "repeat": 1,
+      "run_id": "20261030T123949Z-add_slugify-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T123949Z-add_slugify-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Implement `slugify` in src/lib.rs. The contract: lowercase ASCII letters and digits are kept; every run of other characters becomes a single `-`; the result has no leading or trailing `-`; an empty or punctuation-only input becomes an empty string. Keep the public signature and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Implemented `slugify` in `src/lib.rs:6`. It lowercases ASCII alphanumerics, collapses every run of other characters into a single `-`, and defers the separator so leading/trailing dashes never appear; punctuation-only input yields `\"\"`.\n\n`cargo test` passes: 1 unit test passed, 0 failed (plus doc-tests clean).\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 18.689
+      },
+      "session": {
+        "id": "c244e011-21e2-4dc7-a23b-1969d524b6b9",
+        "name": "add_slugify",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model_steps": 4,
+        "steps_with_usage": 4,
+        "usage_coverage": 1.0,
+        "tool_calls": 3,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 4,
+          "tool_call": 3,
+          "permission_evaluated": 3,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 3,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 24997,
+        "completion_tokens": 883,
+        "cache_read_tokens": 10752,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 476,
+        "uncached_prompt_tokens": 14245,
+        "cache_hit_rate": 0.4301,
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5905,
+            "completion_tokens": 51,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 6116,
+            "completion_tokens": 431,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 215,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 6357,
+            "completion_tokens": 60,
+            "cache_read_tokens": 5504,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6619,
+            "completion_tokens": 341,
+            "cache_read_tokens": 5248,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 261,
+            "tool_calls": 0,
+            "chars": 311
+          }
+        ],
+        "model": "deepseek/deepseek-v4.1-flash"
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 17 ++++++++++++++++-\n 1 file changed, 16 insertions(+), 1 deletion(-)"
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T123949Z-add_slugify-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T123949Z-add_slugify-r1/data/eix.sqlite3\n",
+      "verify_duration_s": 0.1,
+      "duration_s": 18.689,
+      "model": "deepseek/deepseek-v4.1-flash"
+    },
+    {
+      "task": "fix_pagination",
+      "repeat": 1,
+      "run_id": "20261030T124007Z-fix_pagination-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T124007Z-fix_pagination-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Fix the `paginate` function in src/lib.rs: pages are 1-based, page 0 or a page past the end returns an empty slice, per_page 0 returns an empty slice, and the last page may be partial. Keep the public signature and the existing tests unchanged. Inspect the code, make the smallest correct fix, run `cargo test`, and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Fixed `paginate` in `src/lib.rs:5` with a minimal change:\n\n- `page == 0` or `per_page == 0` returns `&[]`.\n- Start offset now uses `(page - 1) * per_page` with checked arithmetic, so huge page numbers don't overflow or panic.\n- A start offset at or past `items.len()` returns `&[]`.\n- The end offset is clamped to `items.len()`, so the last page can be partial.\n\nVerification: `cargo test` passes (2 passed, 0 failed), with the public signature and existing tests unchanged.\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 14.587
+      },
+      "session": {
+        "id": "3b648017-1ebe-4476-b23d-333c39056c67",
+        "name": "fix_pagination",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model_steps": 4,
+        "steps_with_usage": 4,
+        "usage_coverage": 1.0,
+        "tool_calls": 3,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 4,
+          "tool_call": 3,
+          "permission_evaluated": 3,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 3,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 25341,
+        "completion_tokens": 972,
+        "cache_read_tokens": 16512,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 467,
+        "uncached_prompt_tokens": 8829,
+        "cache_hit_rate": 0.6516,
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5910,
+            "completion_tokens": 46,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 6203,
+            "completion_tokens": 419,
+            "cache_read_tokens": 5248,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 189,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 6459,
+            "completion_tokens": 164,
+            "cache_read_tokens": 5504,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 66,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6769,
+            "completion_tokens": 343,
+            "cache_read_tokens": 5760,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 212,
+            "tool_calls": 0,
+            "chars": 474
+          }
+        ],
+        "model": "deepseek/deepseek-v4.1-flash"
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 12 ++++++++++--\n 1 file changed, 10 insertions(+), 2 deletions(-)"
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T124007Z-fix_pagination-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T124007Z-fix_pagination-r1/data/eix.sqlite3\n",
+      "verify_duration_s": 0.109,
+      "duration_s": 14.587,
+      "model": "deepseek/deepseek-v4.1-flash"
+    },
+    {
+      "task": "merge_inventory",
+      "repeat": 1,
+      "run_id": "20261030T124022Z-merge_inventory-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T124022Z-merge_inventory-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. This small crate parses `name=qty` lines and builds a sorted report. Fix the crate so duplicate names are merged by summing quantities, whitespace around names is trimmed, blank lines are skipped, and malformed lines return an error. The report must stay sorted by name. Keep the public API and the existing tests unchanged. Inspect all modules, run `cargo test`, and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 3 tests\n...\ntest result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Fixed and verified.\n\nChanges:\n- `src/items.rs`: names are trimmed, a missing/blank name is rejected, and quantities are trimmed before parsing so `apple = 3` works; blank lines are still skipped and malformed lines return `Err`.\n- `src/report.rs`: duplicate names now accumulate (`+=`) into the existing `BTreeMap` entry instead of overwriting, so quantities are summed while output remains sorted by name.\n\nVerification: `cargo test` passes (existing `duplicate_names_are_summed` test). I also ran a temporary integration test covering whitespace trimming, blank lines, sorted merged output, and both error paths; it passed and was removed afterward.\n\nNote: an untracked `Cargo.lock` was generated by the build; public API and existing tests are unchanged.\n",
+        "stderr": "patch applied: src/items.rs\npatch applied: src/items.rs\n",
+        "timed_out": false,
+        "duration_s": 44.129
+      },
+      "session": {
+        "id": "f65e89d8-d8ed-44a2-8364-ab2adbb088df",
+        "name": "merge_inventory",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model_steps": 9,
+        "steps_with_usage": 9,
+        "usage_coverage": 1.0,
+        "tool_calls": 8,
+        "tools": {
+          "exec_command": 6,
+          "apply_patch": 2
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 9,
+          "tool_call": 8,
+          "permission_evaluated": 8,
+          "snapshot": 8,
+          "process_started": 6,
+          "process_exited": 6,
+          "tool_result": 8,
+          "patch_applied": 2
+        },
+        "prompt_tokens": 66716,
+        "completion_tokens": 2647,
+        "cache_read_tokens": 45568,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 1364,
+        "uncached_prompt_tokens": 21148,
+        "cache_hit_rate": 0.683,
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5912,
+            "completion_tokens": 79,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 10,
+            "prompt_tokens": 6611,
+            "completion_tokens": 507,
+            "cache_read_tokens": 5248,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 210,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 16,
+            "prompt_tokens": 6934,
+            "completion_tokens": 153,
+            "cache_read_tokens": 5888,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 94,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 23,
+            "prompt_tokens": 7194,
+            "completion_tokens": 578,
+            "cache_read_tokens": 6272,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 376,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 30,
+            "prompt_tokens": 7654,
+            "completion_tokens": 375,
+            "cache_read_tokens": 0,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 312,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 37,
+            "prompt_tokens": 7737,
+            "completion_tokens": 276,
+            "cache_read_tokens": 6528,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 147,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 43,
+            "prompt_tokens": 7890,
+            "completion_tokens": 203,
+            "cache_read_tokens": 7040,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 50,
+            "prompt_tokens": 8241,
+            "completion_tokens": 101,
+            "cache_read_tokens": 7040,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 22,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 57,
+            "prompt_tokens": 8543,
+            "completion_tokens": 375,
+            "cache_read_tokens": 7552,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 203,
+            "tool_calls": 0,
+            "chars": 757
+          }
+        ],
+        "model": "deepseek/deepseek-v4.1-flash"
+      },
+      "changes": {
+        "files": [
+          "src/items.rs",
+          "src/report.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/items.rs  | 7 ++++++-\n src/report.rs | 2 +-\n 2 files changed, 7 insertions(+), 2 deletions(-)"
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T124022Z-merge_inventory-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T124022Z-merge_inventory-r1/data/eix.sqlite3\n",
+      "verify_duration_s": 0.101,
+      "duration_s": 44.129,
+      "model": "deepseek/deepseek-v4.1-flash"
+    }
+  ]
+}

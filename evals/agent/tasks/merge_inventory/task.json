@@ -1,0 +1,5 @@
+{
+  "id": "merge_inventory",
+  "prompt": "Work autonomously and do not ask questions. This small crate parses `name=qty` lines and builds a sorted report. Fix the crate so duplicate names are merged by summing quantities, whitespace around names is trimmed, blank lines are skipped, and malformed lines return an error. The report must stay sorted by name. Keep the public API and the existing tests unchanged. Inspect all modules, run `cargo test`, and finish only when the tests pass.",
+  "verify": ["cargo", "test", "--quiet"]
+}

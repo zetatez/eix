@@ -1,0 +1,5 @@
+{
+  "id": "fix_pagination",
+  "prompt": "Work autonomously and do not ask questions. Fix the `paginate` function in src/lib.rs: pages are 1-based, page 0 or a page past the end returns an empty slice, per_page 0 returns an empty slice, and the last page may be partial. Keep the public signature and the existing tests unchanged. Inspect the code, make the smallest correct fix, run `cargo test`, and finish only when the tests pass.",
+  "verify": ["cargo", "test", "--quiet"]
+}
