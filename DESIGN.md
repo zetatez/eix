@@ -406,8 +406,10 @@ diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syn
 折叠摘要给出，不再重复 `input` / `output` 标签；摘要因宽度截断时，展开后会在正文补回完整命令。
 `thinking` 与工具块都可用鼠标点击折叠；排队中的 prompt 以 `⏳ queued` 行显示在转录末尾。
 消息正文（用户消息与 agent 输出）经 `tui/markdown.rs` 渲染：pulldown-cmark 解析 CommonMark
-与 GFM 表格/任务列表/删除线，转成保留样式的 `Line`；链接显示目标地址，图片显示
-`🖼 alt (path)` 占位，`$...$` / `$$...$$` 数学公式：行内公式转成紧凑 Unicode，块级公式用
+与 GFM 表格/任务列表/删除线，转成保留样式的 `Line`；链接显示目标地址，点击链接文字
+或地址会用系统 opener 打开（仅 `http://` / `https://` / `mailto:` / `file://`），相对
+路径和锚点保持惰性；图片在支持 Kitty / Sixel / iTerm2 的终端显示缩略图，否则显示
+`🖼 alt (path)` 占位；`$...$` / `$$...$$` 数学公式：行内公式转成紧凑 Unicode，块级公式用
 2D Unicode 网格排版（分数横线、根号、上下极限、矩阵、可伸缩括号），不引入 TeX 排版引擎。
 鼠标按住左键拖拽可选择转录文本（反色高亮），松开后自动复制，并在右上角短暂显示
 `Copied N chars`；优先调用
@@ -416,7 +418,7 @@ diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syn
 恢复打开前的配色；不再通过 `/colorscheme <name>` 直接切换。内置 preset 统一命名为
 `<light|dark>-<scheme>`（如 `dark-github`、`light-github`），覆盖 GitHub、One、Tokyo、Monokai、
 Mariana、Gruvbox、Catppuccin、Rosé Pine 以及 Vim 的 Delek、Peach Puff、Ron、Zellner、Desert 的
-亮色/暗色版本。亮色主题下
+亮色/暗色版本；`light-eink` 提供低饱和的墨水屏纸感配色。亮色主题下
 模式徽标会保留色相并自动压暗，保证至少 3:1 的对比度。预设里的 `background` 会同时应用到转录区、
 colorscheme picker 和其他浮层；默认配色和没有 `background` 的自定义配色继续使用终端背景。
 输入框不再使用独立的 `panel` 填充，始终跟随主题 `background`（默认即终端背景）。
@@ -2031,7 +2033,7 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 - [x] session 事件日志 + SQLite 持久化 + attach 协议（事件流广播）
 - [x] `eix` CLI（chat / send / log / ls / new / rename / cancel / approve[--hunks] / deny / answer / doctor）
 - [x] TUI v1（多 pane 自动平铺、焦点切换、转录、session 栏、fuzzy picker、多行输入、流式跟随）
-- [x] 转录 Markdown 渲染（强调、代码、列表、引用、表格、链接、图片占位、Unicode 行内公式与 2D 块级公式）
+- [x] 转录 Markdown 渲染（强调、代码、列表、引用、表格、链接点击、终端图片缩略图/占位、Unicode 行内公式与 2D 块级公式）
 - [x] 转录鼠标选择 + 松开自动复制（native clipboard helper，失败时 OSC 52；右上角短暂确认）
 - [x] 工具调用 + 审批门禁（`apply_patch` / `exec_command`、workspace 沙箱、审批卡片）
 - [x] 写入前 Vim 风格 side-by-side diff 预览（左旧右新、语法高亮、窄宽回退 unified；TUI 卡片、`d` 全屏审阅、`eix chat` / `eix log`）

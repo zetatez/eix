@@ -849,7 +849,7 @@ impl ThemePreset {
 /// through [`theme_preset`]. This array keeps each scheme's light and dark
 /// variants adjacent; the `/colorscheme` picker groups all light palettes
 /// before dark ones and sorts each group by scheme name.
-pub const THEME_PRESETS: [ThemePreset; 21] = [
+pub const THEME_PRESETS: [ThemePreset; 22] = [
     ThemePreset {
         name: "light-catppuccin",
         description: "Catppuccin Latte",
@@ -914,6 +914,21 @@ pub const THEME_PRESETS: [ThemePreset; 21] = [
         diff_add: Some("#50fa7b"),
         diff_delete: Some("#ff5555"),
         panel: Some("#44475a"),
+    },
+    ThemePreset {
+        name: "light-eink",
+        description: "E-ink Paper",
+        // High-contrast ink on warm paper with only a trace of color, so the
+        // UI stays readable on grayscale panels and in bright ambient light.
+        background: Some("#f4f2ec"),
+        normal: Some("#23231f"),
+        comment: Some("#7d7a70"),
+        string: Some("#46574a"),
+        function: Some("#2c4657"),
+        error: Some("#8a3a30"),
+        diff_add: Some("#46574a"),
+        diff_delete: Some("#8a3a30"),
+        panel: Some("#e9e6dc"),
     },
     ThemePreset {
         name: "light-github",
