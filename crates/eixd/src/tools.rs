@@ -157,7 +157,15 @@ pub fn definitions() -> Vec<ToolDefinition> {
 /// `tool_search`. They cover capabilities that may not exist in a session
 /// (network, images, a language server), so paying for them on every request
 /// buys nothing. Sub-agents never see them: a child has no `tool_search`.
-const OPTIONAL_TOOLS: &[&str] = &["view_image", "web_fetch", "web_search", "lsp_diagnostics"];
+const OPTIONAL_TOOLS: &[&str] = &[
+    "view_image",
+    "web_fetch",
+    "web_search",
+    "lsp_diagnostics",
+    "spawn_agent",
+    "memory",
+    "get_context_remaining",
+];
 
 /// True for the optional built-ins hidden behind `tool_search`.
 pub fn is_optional(tool: &str) -> bool {
@@ -231,18 +239,18 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "exec_command",
-            "Run a shell command; returns output or a session ID for ongoing work. Quote paths with spaces and put `--` before names starting with `-`.",
+            "Run a shell command; returns output or a session id. Quote paths with spaces; put `--` before names that start with `-`.",
             json!({
                 "type": "object",
                 "properties": {
                     "cmd": {"type": "string", "description": "Shell command to execute."},
-                    "workdir": {"type": "string", "description": "Working directory; defaults to the turn cwd."},
-                    "tty": {"type": "boolean", "description": "Allocate a PTY (default false)."},
-                    "shell": {"type": "string", "description": "Shell binary; defaults to the user's shell."},
-                    "login": {"type": "boolean", "description": "Run the shell as a login shell. Defaults to true."},
-                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding. Defaults to 10000 ms (250-30000)."},
-                    "timeout_ms": {"type": "integer", "description": "Maximum runtime; defaults to the configured timeout."},
-                    "max_output_tokens": {"type": "integer", "description": "Output token budget; defaults to 4000."},
+                    "workdir": {"type": "string", "description": "Working dir (default: turn cwd)."},
+                    "tty": {"type": "boolean", "description": "Allocate a PTY."},
+                    "shell": {"type": "string", "description": "Shell binary (default: user shell)."},
+                    "login": {"type": "boolean", "description": "Login shell (default true)."},
+                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding, 250-30000 (default 10000)."},
+                    "timeout_ms": {"type": "integer", "description": "Max runtime (default: configured)."},
+                    "max_output_tokens": {"type": "integer", "description": "Output token budget (default 4000)."},
                     "sandbox_permissions": {"type": "string", "enum": ["use_default", "with_additional_permissions", "require_escalated"], "description": "Sandbox override; require_escalated needs approval, with_additional_permissions needs additional_permissions."},
                     "additional_permissions": {"type": "object", "description": "Extra access for this command; needs with_additional_permissions.", "properties": {"network": {"type": "object", "properties": {"enabled": {"type": "boolean"}}}, "file_system": {"type": "object", "properties": {"read": {"type": "array", "items": {"type": "string"}}, "write": {"type": "array", "items": {"type": "string"}}}}}},
                     "justification": {"type": "string", "description": "Question shown with the approval request; required for require_escalated."},
@@ -376,7 +384,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "spawn_agent",
-            "Run a read-only sub-agent on one focused question; returns its answer.",
+            "Run a read-only sub-agent on one focused question; returns its answer. Use only when the user asks or broad independent work needs it; children are read-only.",
             json!({
                 "type": "object",
                 "properties": {
@@ -428,7 +436,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "tool_search",
-            "Search tools that are not loaded yet (MCP, plugin and optional built-ins: web, images, LSP) and expose the best matches for the next model call. For MCP discovery always use this instead of listing resources.",
+            "Search tools that are not loaded yet (MCP, plugin and optional built-ins: web, images, LSP, sub-agents, memory) and expose the best matches for the next model call. For MCP discovery always use this instead of listing resources.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2698,8 +2706,8 @@ mod tests {
             "Full mode should be cheaper: ask {ask}, full {full}"
         );
         // Absolute guard: without MCP or plugin tools the Full-mode request
-        // carries ~1.6k tokens of schema. Growth past this is a regression.
-        assert!(full < 1_700, "Full-mode schemas are {full} tokens");
+        // carries ~1.4k tokens of schema. Growth past this is a regression.
+        assert!(full < 1_500, "Full-mode schemas are {full} tokens");
         let full_tools = turn_definitions(false);
         assert!(
             !full_tools
@@ -2731,7 +2739,9 @@ mod tests {
     fn optional_tools_are_deferred_not_base() {
         let base = turn_definitions(true);
         let optional = optional_definitions();
-        assert_eq!(optional.len(), 4);
+        // Optional capabilities stay one `tool_search` away instead of riding
+        // in every request: web, images, LSP, sub-agents, memory, context use.
+        assert_eq!(optional.len(), 7);
         for tool in &optional {
             assert!(is_optional(&tool.function.name));
             assert!(
@@ -2750,6 +2760,16 @@ mod tests {
             .expect("web_fetch is optional");
         let lower = web.function.description.to_lowercase();
         assert!(lower.contains("http") && lower.contains("url"), "{lower}");
+        // Deferring is only safe if the tool still runs when it is asked for,
+        // and the sub-agent guardrail moved into its schema with it.
+        for name in ["spawn_agent", "memory", "get_context_remaining"] {
+            assert!(optional.iter().any(|tool| tool.function.name == name), "{name}");
+        }
+        let spawn = optional
+            .iter()
+            .find(|tool| tool.function.name == "spawn_agent")
+            .expect("spawn_agent is optional");
+        assert!(spawn.function.description.to_lowercase().contains("read-only"));
     }
 
     #[test]
