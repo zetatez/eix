@@ -5,6 +5,7 @@ members = [
     "crates/eix-plugin-abi",
     "crates/eix-plugin-sdk",
     "crates/eixd",
+    "crates/eix-asr",
     "crates/eix-tui",
     "crates/eix-sdk",
     "examples/plugins/hello-dylib",

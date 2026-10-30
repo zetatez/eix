@@ -324,6 +324,15 @@ pub enum Command {
         patch_id: String,
         text: String,
     },
+    /// Start microphone dictation for a session. Starting again replaces a
+    /// running capture.
+    VoiceStart {
+        session_id: Option<String>,
+        /// Transcribe this audio file instead of reading the microphone.
+        file: Option<PathBuf>,
+    },
+    /// Stop dictation and close any open utterance.
+    VoiceStop,
 }
 
 impl Command {
@@ -393,6 +402,8 @@ impl Command {
             Self::DraftSet { .. } => "draft",
             Self::PatchGet { .. } => "patch",
             Self::PatchRevise { .. } => "patch",
+            Self::VoiceStart { .. } => "voice",
+            Self::VoiceStop => "voice",
         }
     }
 }
@@ -561,6 +572,7 @@ pub enum Event {
         patch_id: String,
         text: String,
     },
+    Voice(super::voice::VoiceEvent),
     Notification(Notification),
     Error {
         context: String,
@@ -601,17 +613,57 @@ async fn run(
     let cwd = std::env::current_dir().context("cannot determine current directory")?;
     ensure_endpoint(&endpoint, &data_dir, config.as_deref()).await?;
     let (requester, mut net_events) = Requester::connect(&endpoint).await?;
+    // Capture lives in the client, so dictation is driven here rather than by
+    // the request dispatcher: it owns a long-lived task and a stop handle.
+    let capture = eix_core::Config::load(config.as_deref())
+        .unwrap_or_default()
+        .voice
+        .capture;
+    let mut stop: Option<tokio::sync::oneshot::Sender<()>> = None;
 
     loop {
         tokio::select! {
             command = cmd_rx.recv() => {
                 let Some(command) = command else { break };
+                match command {
+                    Command::VoiceStart { session_id, file } => {
+                        // Replacing a running capture is the natural meaning of
+                        // pressing the dictation key twice.
+                        if let Some(previous) = stop.take() {
+                            let _ = previous.send(());
+                        }
+                        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel();
+                        stop = Some(stop_tx);
+                        let (voice_tx, mut voice_rx) =
+                            mpsc::unbounded_channel::<super::voice::VoiceEvent>();
+                        let requester = requester.clone();
+                        let config = capture.clone();
+                        tokio::spawn(super::voice::dictate(
+                            requester, config, session_id, file, stop_rx, voice_tx,
+                        ));
+                        let events = ev_tx.clone();
+                        tokio::spawn(async move {
+                            while let Some(event) = voice_rx.recv().await {
+                                let _ = events.send(Event::Voice(event));
+                            }
+                        });
+                        continue;
+                    }
+                    Command::VoiceStop => {
+                        if let Some(previous) = stop.take() {
+                            let _ = previous.send(());
+                        }
+                        continue;
+                    }
+                    command => {
                 let label = command.label();
                 if let Err(err) = dispatch(command, &requester, &ev_tx, &cwd).await {
                     let _ = ev_tx.send(Event::Error {
                         context: label.to_string(),
                         message: format!("{err:#}"),
                     });
+                }
+                    }
                 }
             }
             event = net_events.recv() => {
@@ -1603,6 +1655,9 @@ async fn dispatch(
                 .await?;
             Ok(())
         }
+        // Dictation is driven by `run` directly: it owns the capture task and
+        // its stop handle, so there is nothing to dispatch here.
+        Command::VoiceStart { .. } | Command::VoiceStop => Ok(()),
     }
 }
 

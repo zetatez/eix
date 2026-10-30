@@ -441,6 +441,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     let plugins =
         crate::plugin::PluginManager::new(Arc::clone(&store), data_dir.clone(), bus.clone());
     plugins.load(&config).await;
+    let asr = Arc::new(crate::asr::Manager::new(bus.clone()));
     let daemon = Arc::new(Daemon {
         store,
         data_dir: data_dir.clone(),
@@ -462,6 +463,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         processes,
         mcp: Mutex::new(crate::mcp::McpSet::new(data_dir.join("oauth").join("mcp"))),
         plugins,
+        asr,
         lsp: Mutex::new(crate::lsp::LspSet::new()),
         todos: Mutex::new(HashMap::new()),
         turns: Mutex::new(HashMap::new()),
@@ -777,6 +779,9 @@ pub(crate) struct Daemon {
     mcp: Mutex<crate::mcp::McpSet>,
     /// Out-of-process server plugins and their contributions.
     plugins: Arc<crate::plugin::PluginManager>,
+    /// Speech-to-text utterances. Independent of sessions except for routing
+    /// events, so the UI can dictate without an active turn.
+    pub(crate) asr: Arc<crate::asr::Manager>,
     lsp: Mutex<crate::lsp::LspSet>,
     /// Model-managed task lists, keyed by session. In-memory: a daemon
     /// restart clears them.
@@ -3643,6 +3648,84 @@ impl Daemon {
             }
             "plugin.doctor" => Ok(serde_json::to_value(self.plugins.doctor().await)?),
             "stats" => Ok(serde_json::to_value(self.stats().await?)?),
+            "asr.start" => {
+                let config = self.config.load();
+                let voice = &config.voice;
+                let session_id = request
+                    .params
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
+                let slot = voice
+                    .cloud
+                    .credential
+                    .clone()
+                    .unwrap_or_else(|| voice.cloud.provider.credential_key().to_string());
+                let api_key = self
+                    .auth
+                    .load(&slot)
+                    .ok()
+                    .flatten()
+                    .and_then(|credential| credential.api_key);
+                let started = self
+                    .asr
+                    .start(voice, session_id, api_key)
+                    .await
+                    .map_err(asr_error)?;
+                Ok(json!({
+                    "utterance_id": started.utterance_id,
+                    "format": started.format,
+                    "caps": started.caps,
+                    "backend": started.backend,
+                    // Chunked upload endpoint, for clients that would rather
+                    // stream audio than base64 it through JSON.
+                    "upload": format!("/asr/{}/pcm", started.utterance_id),
+                }))
+            }
+            "asr.pcm" => {
+                let utterance_id = request
+                    .params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "asr.pcm needs `utterance_id`"))?;
+                let encoded = request
+                    .params
+                    .get("pcm")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "asr.pcm needs base64 `pcm`"))?;
+                let pcm = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| rpc("invalid_params", "`pcm` is not valid base64"))?;
+                let bytes = self.asr.push(utterance_id, pcm).await.map_err(asr_error)?;
+                Ok(json!({ "bytes": bytes }))
+            }
+            "asr.finish" => {
+                let utterance_id = request
+                    .params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "asr.finish needs `utterance_id`"))?;
+                self.asr.finish(utterance_id).await.map_err(asr_error)?;
+                Ok(json!({ "ok": true }))
+            }
+            "asr.cancel" => {
+                let utterance_id = request
+                    .params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "asr.cancel needs `utterance_id`"))?;
+                self.asr.cancel(utterance_id).await.map_err(asr_error)?;
+                Ok(json!({ "ok": true }))
+            }
+            "asr.status" => {
+                let utterance_id = request
+                    .params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| rpc("invalid_params", "asr.status needs `utterance_id`"))?;
+                Ok(self.asr.status(utterance_id).await.unwrap_or(Value::Null))
+            }
             "lsp.workspace" => {
                 let params: LspWorkspaceParams = parse_params(request.params.clone())?;
                 let session = self.require_session(&params.session_id)?;
@@ -11122,6 +11205,21 @@ fn rpc(code: impl Into<String>, message: impl Into<String>) -> anyhow::Error {
         code: code.into(),
         message: message.into(),
     })
+}
+
+/// Map an ASR failure onto an RPC error a client can branch on: `unavailable`
+/// means "configure a backend", `invalid_params` means the audio is wrong.
+fn asr_error(err: eix_core::asr::AsrError) -> anyhow::Error {
+    use eix_core::asr::AsrErrorKind;
+    let code = match err.kind {
+        AsrErrorKind::Format => "invalid_params",
+        AsrErrorKind::Unavailable => "asr_unavailable",
+        AsrErrorKind::Provider => "asr_provider",
+        AsrErrorKind::Transport => "asr_transport",
+        AsrErrorKind::Cancelled => "asr_cancelled",
+        AsrErrorKind::Internal => "internal",
+    };
+    rpc(code, err.message)
 }
 
 /// Whether an error is the `busy` refusal from [`Daemon::submit_inner`].

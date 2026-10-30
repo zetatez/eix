@@ -143,8 +143,9 @@ impl App {
         frame.render_widget(paragraph, area);
 
         // The error dialog covers the prompt; don't leave a blinking input
-        // cursor on top of it.
-        if focused && self.error.is_none() && self.cmdline.is_none() {
+        // cursor on top of it. The reason dialog owns the cursor while open.
+        if focused && self.error.is_none() && self.cmdline.is_none() && self.reason_prompt.is_none()
+        {
             let x = area.x + 2 + layout.cursor_col.min(inner_width.saturating_sub(1)) as u16;
             let row = layout
                 .cursor_line
@@ -322,6 +323,18 @@ impl App {
             }
             spans.push(Span::styled(
                 format!("{} img", self.pending_images.len()),
+                Style::default().fg(warn).bg(panel),
+            ));
+        }
+        // Dictation is live input, so it shows as a level meter rather than a
+        // one-shot message: silence while the key is on is worth noticing.
+        if let Some(level) = self.voice {
+            if !spans.is_empty() {
+                spans.push(Span::styled(" · ", Style::default().fg(muted).bg(panel)));
+            }
+            let bars = ((level * 8.0).round() as usize).clamp(1, 8);
+            spans.push(Span::styled(
+                format!("mic {}", "▮".repeat(bars)),
                 Style::default().fg(warn).bg(panel),
             ));
         }

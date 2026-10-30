@@ -93,6 +93,8 @@ pub struct Config {
     pub theme: ThemeConfig,
     /// Transcript-mode key overrides (`action = "C-x"`). Empty keeps defaults.
     pub keys: std::collections::BTreeMap<String, String>,
+    /// Speech-to-text: local helper process or a cloud websocket.
+    pub voice: crate::asr::VoiceConfig,
     /// Explicit `--config` path; when set, project files are not merged.
     #[serde(skip)]
     pub explicit_path: Option<PathBuf>,
@@ -131,6 +133,7 @@ impl Default for Config {
             integration: IntegrationConfig::default(),
             theme: ThemeConfig::default(),
             keys: std::collections::BTreeMap::new(),
+            voice: crate::asr::VoiceConfig::default(),
             explicit_path: None,
             load_cwd: PathBuf::new(),
             watch_paths: Vec::new(),

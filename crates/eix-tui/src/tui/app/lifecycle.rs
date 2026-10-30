@@ -63,6 +63,8 @@ impl App {
             process_view: None,
             transcript_search: None,
             status: "connecting…".into(),
+            voice: None,
+            voice_active: false,
             error: None,
             connected: false,
             tick: 0,

@@ -863,6 +863,45 @@ impl App {
                     self.status = format!("dropped {skipped} notifications");
                 }
             }
+            // Dictation arrives as events rather than as a request result, so a
+            // finished utterance is pasted at the cursor like any other text.
+            "asr.final" => {
+                let text = notification
+                    .params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim();
+                let interim = notification
+                    .params
+                    .get("interim")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                if text.is_empty() {
+                    return;
+                }
+                if self.voice_active {
+                    self.focus = Focus::Input;
+                    let spacer = (!self.input.is_empty()).then_some(" ");
+                    self.input
+                        .insert_text(&format!("{}{text}", spacer.unwrap_or_default()));
+                    self.status = if interim {
+                        "voice: partial transcript inserted".into()
+                    } else {
+                        "voice: transcript inserted".into()
+                    };
+                }
+            }
+            "asr.error" => {
+                let message = notification
+                    .params
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("speech recognition failed")
+                    .to_string();
+                self.error = Some(message);
+                self.status = "voice failed".into();
+            }
             _ => {}
         }
     }

@@ -384,3 +384,45 @@ MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
 # Keep an entry but disable it.
 # [mcp.servers.playwright]
 # enabled = false
+
+# Speech to text. Off by default: enabling it can send audio off the machine.
+# See docs/voice.md for the helper protocol and the event shapes.
+[voice]
+enabled = false
+# "local" runs an external helper, "cloud" posts one request per utterance,
+# "fake" needs neither and is meant for tests.
+backend = "local"
+# Empty lets the engine detect the language.
+language = ""
+# Silence, in ms, after which an utterance is considered over.
+silence_ms = 800
+# Keep the PCM next to the transcript for debugging. Off by default.
+retain_audio = false
+
+# Microphone capture, used by clients (`/voice` in the TUI). The daemon never
+# opens a device; a recorder's stdout is read as raw PCM16 mono 16 kHz.
+[voice.capture]
+# Empty picks the first of parec, pw-record, arecord found on PATH.
+command = ""
+# RMS below this counts as silence, on a 0.0-1.0 scale.
+threshold = 0.02
+# Silence that ends an utterance, and a hard cap per utterance.
+silence_ms = 800
+max_utterance_ms = 60000
+
+[voice.local]
+# sherpa | whisper | custom. Only chooses the default helper arguments.
+engine = "sherpa"
+# Required when backend = "local"; spawned once per utterance.
+# command = "/usr/local/bin/eix-asr"
+args = []
+threads = 4
+# model_dir = "~/.local/share/eix/models/parakeet"
+
+[voice.cloud]
+# deepgram | openai | custom.
+provider = "deepgram"
+# model = "nova-3"
+# endpoint = "wss://api.deepgram.com/v1/listen"
+# Credential slot; the key itself lives in `eix auth`, not here.
+# credential = "asr.deepgram"

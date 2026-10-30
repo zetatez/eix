@@ -98,6 +98,7 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
     let query = parse_query(query);
     let mut content_length = 0usize;
     let mut expect_continue = false;
+    let mut chunked = false;
     let mut auth: Option<String> = None;
     for line in lines {
         let Some((key, value)) = line.split_once(':') else {
@@ -107,6 +108,7 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
         let value = value.trim();
         match key.as_str() {
             "content-length" => content_length = value.parse().unwrap_or(0),
+            "transfer-encoding" => chunked = value.eq_ignore_ascii_case("chunked"),
             "expect" if value.eq_ignore_ascii_case("100-continue") => expect_continue = true,
             "authorization" => {
                 auth = Some(
@@ -231,6 +233,27 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
         return events(daemon, writer, filter).await;
     }
 
+    // One POST per audio chunk. Streaming the body lets a capture loop send
+    // 100 ms as soon as it has them instead of buffering the utterance.
+    if method == "POST" {
+        if let Some(utterance_id) = path
+            .strip_prefix("/asr/")
+            .and_then(|rest| rest.strip_suffix("/pcm"))
+            .filter(|id| !id.is_empty() && !id.contains('/'))
+        {
+            return upload_pcm(
+                daemon,
+                reader,
+                writer,
+                body_prefix,
+                content_length,
+                chunked,
+                utterance_id,
+            )
+            .await;
+        }
+    }
+
     if path != "/rpc" || method != "POST" {
         return write_status(&mut writer, 404, "not found").await;
     }
@@ -258,6 +281,153 @@ async fn handle(daemon: Arc<Daemon>, stream: TcpStream, token: &str) -> Result<(
     };
     let response = daemon.handle_remote(&request).await;
     write_json(&mut writer, 200, &response).await
+}
+
+/// Append PCM16 to one utterance. Accepts both `Content-Length` bodies and
+/// `Transfer-Encoding: chunked`, because a capture loop does not know the
+/// utterance length up front.
+async fn upload_pcm(
+    daemon: Arc<Daemon>,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    mut writer: tokio::net::tcp::OwnedWriteHalf,
+    body_prefix: Vec<u8>,
+    content_length: usize,
+    chunked: bool,
+    utterance_id: &str,
+) -> Result<()> {
+    if !chunked && (content_length == 0 || content_length > MAX_BODY) {
+        return write_status(&mut writer, 413, "invalid body size").await;
+    }
+    let mut total = 0u64;
+
+    let result: Result<()> = if chunked {
+        let mut buf = body_prefix;
+        let mut pos = 0usize;
+        loop {
+            let line = match take_line(&mut reader, &mut buf, &mut pos).await? {
+                Some(line) => line,
+                None => break,
+            };
+            let size = line
+                .split(';')
+                .next()
+                .map(str::trim)
+                .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+                .ok_or_else(|| anyhow::anyhow!("invalid chunk size"))?;
+            if size == 0 {
+                break;
+            }
+            if total as usize + size > MAX_BODY {
+                return write_status(&mut writer, 413, "audio exceeds the body limit").await;
+            }
+            let pcm = take_bytes(&mut reader, &mut buf, &mut pos, size).await?;
+            if let Err(err) = push_pcm(&daemon, utterance_id, pcm, &mut total).await {
+                return write_json(&mut writer, 400, &serde_json::json!({ "error": err })).await;
+            }
+        }
+        Ok(())
+    } else {
+        let mut remaining = content_length;
+        let mut buf = body_prefix;
+        if buf.len() > remaining {
+            buf.truncate(remaining);
+        }
+        loop {
+            if !buf.is_empty() {
+                let pcm = std::mem::take(&mut buf);
+                if let Err(err) = push_pcm(&daemon, utterance_id, pcm, &mut total).await {
+                    return write_json(&mut writer, 400, &serde_json::json!({ "error": err }))
+                        .await;
+                }
+            }
+            if remaining == 0 {
+                break;
+            }
+            let mut chunk = vec![0u8; remaining.min(64 * 1024)];
+            timeout(READ_TIMEOUT, reader.read_exact(&mut chunk))
+                .await
+                .context("body read timed out")??;
+            remaining -= chunk.len();
+            buf = chunk;
+        }
+        Ok(())
+    };
+    result?;
+    write_json(
+        &mut writer,
+        200,
+        &serde_json::json!({ "utterance_id": utterance_id, "bytes": total }),
+    )
+    .await
+}
+
+async fn push_pcm(
+    daemon: &Daemon,
+    utterance_id: &str,
+    pcm: Vec<u8>,
+    total: &mut u64,
+) -> std::result::Result<(), String> {
+    let bytes = daemon
+        .asr
+        .push(utterance_id, pcm)
+        .await
+        .map_err(|err| err.message)?;
+    *total = bytes;
+    Ok(())
+}
+
+/// Read up to the next CRLF, refilling from the socket as needed.
+async fn take_line(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    buf: &mut Vec<u8>,
+    pos: &mut usize,
+) -> Result<Option<String>> {
+    loop {
+        if let Some(index) = buf[*pos..].windows(2).position(|w| w == b"\r\n") {
+            let line = String::from_utf8_lossy(&buf[*pos..*pos + index]).into_owned();
+            *pos += index + 2;
+            return Ok(Some(line));
+        }
+        if buf.len() > MAX_BODY + MAX_HEAD {
+            return Err(anyhow::anyhow!("chunked framing exceeds the limit"));
+        }
+        let mut chunk = [0u8; 16 * 1024];
+        let read = timeout(READ_TIMEOUT, reader.read(&mut chunk)).await;
+        let n = match read {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) | Err(_) => return Ok(None),
+        };
+        if n == 0 {
+            return Ok(None);
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+}
+
+async fn take_bytes(
+    reader: &mut tokio::net::tcp::OwnedReadHalf,
+    buf: &mut Vec<u8>,
+    pos: &mut usize,
+    size: usize,
+) -> Result<Vec<u8>> {
+    while buf.len() - *pos < size + 2 {
+        let mut chunk = [0u8; 64 * 1024];
+        let n = timeout(READ_TIMEOUT, reader.read(&mut chunk))
+            .await
+            .context("chunk read timed out")??;
+        if n == 0 {
+            return Err(anyhow::anyhow!("upload ended mid-chunk"));
+        }
+        buf.extend_from_slice(&chunk[..n]);
+    }
+    let pcm = buf[*pos..*pos + size].to_vec();
+    *pos += size + 2;
+    // Drop consumed framing so a long utterance cannot grow without bound.
+    if *pos > 64 * 1024 {
+        buf.drain(..*pos);
+        *pos = 0;
+    }
+    Ok(pcm)
 }
 
 /// Read the request body, or write a 413 and return `None` when the declared

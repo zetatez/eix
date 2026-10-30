@@ -1230,6 +1230,7 @@ impl App {
                 };
             }
             Event::Notification(notification) => self.notification(notification, tx),
+            Event::Voice(event) => self.voice_event(event),
             Event::Error { context, message } => {
                 self.error = Some(message.clone());
                 self.status = format!("{context} failed");

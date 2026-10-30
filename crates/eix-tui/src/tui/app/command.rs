@@ -15,6 +15,73 @@ impl App {
         self.handle_command_text(text, tx, true)
     }
 
+    /// `/voice` starts dictation into the prompt, `/voice off` stops it, and
+    /// `/voice file PATH` transcribes an existing recording.
+    pub(super) fn command_voice(&mut self, args: &str, tx: &UnboundedSender<Command>) {
+        let args = args.trim();
+        if matches!(args, "off" | "stop") || (args.is_empty() && self.voice.is_some()) {
+            let _ = tx.send(Command::VoiceStop);
+            self.voice = None;
+            self.voice_active = false;
+            self.status = "voice: stopped".into();
+            return;
+        }
+        let file = if args == "file" || args.starts_with("file ") {
+            let path = args["file".len()..].trim();
+            if path.is_empty() {
+                self.status = "usage: /voice file PATH".into();
+                return;
+            }
+            Some(std::path::PathBuf::from(path))
+        } else if args.is_empty() || args == "on" {
+            None
+        } else {
+            self.status = "usage: /voice [on|off|file PATH]".into();
+            return;
+        };
+        let _ = tx.send(Command::VoiceStart {
+            session_id: self.focused_session_id(),
+            file: file.clone(),
+        });
+        // A file has no live level; the microphone starts at zero until the
+        // first frame arrives.
+        self.voice = file.is_none().then_some(0.0);
+        self.voice_active = true;
+        self.status = match file {
+            Some(path) => format!("voice: transcribing {}", path.display()),
+            None => "voice: listening".into(),
+        };
+    }
+
+    pub(super) fn voice_event(&mut self, event: super::super::voice::VoiceEvent) {
+        use super::super::voice::VoiceEvent;
+        match event {
+            VoiceEvent::Speech => self.status = "voice: listening…".into(),
+            VoiceEvent::Level(level) => {
+                if self.voice.is_some() {
+                    self.voice = Some(level);
+                }
+            }
+            VoiceEvent::End { spoken_ms, capped } => {
+                self.status = if capped {
+                    format!("voice: {spoken_ms} ms captured (limit reached)")
+                } else {
+                    format!("voice: {spoken_ms} ms transcribed")
+                };
+            }
+            VoiceEvent::Done => {
+                self.voice = None;
+                self.voice_active = false;
+            }
+            VoiceEvent::Error(message) => {
+                self.voice = None;
+                self.voice_active = false;
+                self.error = Some(message);
+                self.status = "voice failed".into();
+            }
+        }
+    }
+
     /// Run a `/command` line. `clear_prompt` is false for the `:` command
     /// line, where the prompt buffer is an unrelated draft that must survive.
     pub(super) fn handle_command_text(
@@ -241,6 +308,10 @@ impl App {
             }
             "btw" => {
                 self.command_btw(args, tx);
+                true
+            }
+            "voice" => {
+                self.command_voice(args, tx);
                 true
             }
             "init" => {

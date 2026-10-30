@@ -17,6 +17,7 @@ mod prefs;
 mod syntax;
 mod theme;
 mod transcript;
+pub(crate) mod voice;
 mod workspace;
 
 use std::io::{self, IsTerminal, Write};

@@ -5,6 +5,7 @@
 //! commands over the protocol in [`protocol`].
 
 pub mod agents;
+pub mod asr;
 pub mod commands;
 pub mod compat;
 pub mod config;

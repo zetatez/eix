@@ -197,6 +197,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "browse worktrees and branches, insert a path or name",
         ),
         builtin("processes", "", "list and inspect background processes"),
+        builtin(
+            "voice",
+            "[on|off|file PATH]",
+            "dictate with the microphone, or transcribe an audio file",
+        ),
         builtin("approvals", "", "open the approval inbox"),
         builtin("cancel", "", "cancel the focused session's running turn"),
         builtin("clear", "", "delete this session's history, context and memory"),
@@ -2152,6 +2157,11 @@ pub struct App {
     /// Vim-style `/` / `?` search within the focused transcript.
     transcript_search: Option<TranscriptSearch>,
     status: String,
+    /// `/voice` state: `Some(level)` while the microphone is being read.
+    voice: Option<f32>,
+    /// A dictation session is running, microphone or file. Transients gate on
+    /// this rather than on `voice`, which is `None` for file transcription.
+    voice_active: bool,
     error: Option<String>,
     connected: bool,
     tick: u64,
@@ -2769,7 +2779,7 @@ fn command_category(name: &str) -> CommandCategory {
         "new-worktree" | "ready" | "integrate" | "cd" | "projects" | "rename" | "archive"
         | "delete" | "fork" | "branch" | "close" | "exit" | "quit" => CommandCategory::Sessions,
         "processes" | "approvals" | "agents" | "mcp" | "plugins" | "skills" | "subagents"
-        | "todos" => CommandCategory::Tools,
+        | "todos" | "voice" => CommandCategory::Tools,
         "code-review" | "security-review" | "simplify" | "verify" => CommandCategory::Review,
         "effort" | "colorscheme" | "doctor" | "math" | "model" | "model-plan" | "reload" => {
             CommandCategory::Settings
@@ -3313,6 +3323,10 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "/todos",
                 description: "browse the model's current task list",
+            },
+            HelpEntry {
+                key: "/voice [on|off|file PATH]",
+                description: "dictate into the prompt, or transcribe an audio file",
             },
             HelpEntry {
                 key: "/agents",
