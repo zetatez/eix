@@ -153,6 +153,69 @@ pub fn definitions() -> Vec<ToolDefinition> {
     DEFINITIONS.get_or_init(build_definitions).clone()
 }
 
+/// Optional tools that stay out of the base turn and are discovered through
+/// `tool_search`. They cover capabilities that may not exist in a session
+/// (network, images, a language server), so paying for them on every request
+/// buys nothing. Sub-agents never see them: a child has no `tool_search`.
+const OPTIONAL_TOOLS: &[&str] = &["view_image", "web_fetch", "web_search", "lsp_diagnostics"];
+
+/// True for the optional built-ins hidden behind `tool_search`.
+pub fn is_optional(tool: &str) -> bool {
+    OPTIONAL_TOOLS.contains(&tool)
+}
+
+/// Optional built-in schemas, for the deferred catalog.
+pub fn optional_definitions() -> Vec<ToolDefinition> {
+    definitions()
+        .into_iter()
+        .filter(|tool| is_optional(&tool.function.name))
+        .collect()
+}
+
+/// Schemas for one turn. `approvals` is false in Full mode, where no call is
+/// ever prompted: the approval-only `exec_command` fields and the
+/// `request_user_input` schema cannot fire, so they are not advertised.
+///
+/// This depends on the session mode, which is fixed for the turn. A mode switch
+/// between turns rewrites the tool prefix once; keeping the fields is not worth
+/// the tokens on every Full-mode request.
+pub fn turn_definitions(approvals: bool) -> Vec<ToolDefinition> {
+    static ASK: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+    static AUTONOMOUS: OnceLock<Vec<ToolDefinition>> = OnceLock::new();
+    let cache = if approvals { &ASK } else { &AUTONOMOUS };
+    cache
+        .get_or_init(|| {
+            let mut tools = definitions();
+            // Optional capabilities are always deferred, in every mode: a
+            // session that never needs the web should never pay for it.
+            tools.retain(|tool| !is_optional(&tool.function.name));
+            if !approvals {
+                tools.retain(|tool| tool.function.name != "request_user_input");
+                for tool in &mut tools {
+                    if tool.function.name == "exec_command" {
+                        strip_approval_fields(&mut tool.function.parameters);
+                    }
+                }
+            }
+            tools
+        })
+        .clone()
+}
+
+/// Drop the fields that only matter when a call may be shown to the user.
+fn strip_approval_fields(parameters: &mut Value) {
+    if let Some(properties) = parameters.get_mut("properties").and_then(Value::as_object_mut) {
+        for field in [
+            "sandbox_permissions",
+            "additional_permissions",
+            "justification",
+            "prefix_rule",
+        ] {
+            properties.remove(field);
+        }
+    }
+}
+
 fn build_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition::function(
@@ -326,31 +389,31 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "request_user_input",
-            "Request user input for one to three short questions and wait for the response.",
+            "Request user input for one to three short questions and wait for the answer.",
             json!({
                 "type": "object",
                 "properties": {
                     "questions": {
                         "type": "array",
-                        "description": "Questions to show the user. Prefer 1 and do not exceed 3.",
+                        "description": "Questions for the user. Prefer 1; never more than 3.",
                         "minItems": 1,
                         "maxItems": 3,
                         "items": {
                             "type": "object",
                             "properties": {
-                                "id": {"type": "string", "description": "Stable identifier for mapping answers (snake_case)."},
-                                "header": {"type": "string", "description": "Short header label shown in the UI (12 or fewer chars)."},
-                                "question": {"type": "string", "description": "Single-sentence prompt shown to the user."},
+                                "id": {"type": "string", "description": "Stable id (snake_case)."},
+                                "header": {"type": "string", "description": "Short label (<=12 chars)."},
+                                "question": {"type": "string", "description": "One sentence for the user."},
                                 "options": {
                                     "type": "array",
                                     "minItems": 2,
                                     "maxItems": 3,
-                                    "description": "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option; the client adds a free-form \"Other\" automatically.",
+                                    "description": "2-3 exclusive choices; put the recommended one first with \"(Recommended)\" in its label. The client adds a free-form \"Other\".",
                                     "items": {
                                         "type": "object",
                                         "properties": {
-                                            "label": {"type": "string", "description": "User-facing label (1-5 words)."},
-                                            "description": {"type": "string", "description": "One short sentence explaining impact/tradeoff if selected."}
+                                            "label": {"type": "string", "description": "Label (1-5 words)."},
+                                            "description": {"type": "string", "description": "One sentence on the impact."}
                                         },
                                         "required": ["label", "description"]
                                     }
@@ -365,7 +428,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "tool_search",
-            "Search deferred tools (MCP and plugin tools) by metadata with BM25 and expose the best matches for the next model call. For MCP tool discovery, always use this instead of listing resources.",
+            "Search tools that are not loaded yet (MCP, plugin and optional built-ins: web, images, LSP) and expose the best matches for the next model call. For MCP discovery always use this instead of listing resources.",
             json!({
                 "type": "object",
                 "properties": {
@@ -2621,6 +2684,72 @@ mod tests {
         // Every request pays for these schemas. Keep room for a few additions,
         // but fail before descriptions drift back into paragraphs.
         assert!(tokens < 2_500, "built-in tool schemas are {tokens} tokens");
+    }
+
+    #[test]
+    fn full_mode_schemas_drop_what_cannot_fire() {
+        let ask = crate::context::estimate_tool_schema_tokens(&turn_definitions(true));
+        let full = crate::context::estimate_tool_schema_tokens(&turn_definitions(false));
+        // No call is ever prompted in Full mode, so the approval fields and the
+        // question tool cannot be used. The saving is what makes Full-mode
+        // requests cheaper than Build-mode ones, not an arbitrary trim.
+        assert!(
+            full + 400 < ask,
+            "Full mode should be cheaper: ask {ask}, full {full}"
+        );
+        // Absolute guard: without MCP or plugin tools the Full-mode request
+        // carries ~1.6k tokens of schema. Growth past this is a regression.
+        assert!(full < 1_700, "Full-mode schemas are {full} tokens");
+        let full_tools = turn_definitions(false);
+        assert!(
+            !full_tools
+                .iter()
+                .any(|tool| tool.function.name == "request_user_input")
+        );
+        let exec = full_tools
+            .iter()
+            .find(|tool| tool.function.name == "exec_command")
+            .expect("exec_command is always advertised");
+        let properties = exec.function.parameters["properties"]
+            .as_object()
+            .expect("exec_command has properties");
+        for field in [
+            "sandbox_permissions",
+            "additional_permissions",
+            "justification",
+            "prefix_rule",
+        ] {
+            assert!(!properties.contains_key(field), "{field} should be gone");
+        }
+        // The fields that every call can use must survive.
+        for field in ["cmd", "workdir", "yield_time_ms", "max_output_tokens"] {
+            assert!(properties.contains_key(field), "{field} should stay");
+        }
+    }
+
+    #[test]
+    fn optional_tools_are_deferred_not_base() {
+        let base = turn_definitions(true);
+        let optional = optional_definitions();
+        assert_eq!(optional.len(), 4);
+        for tool in &optional {
+            assert!(is_optional(&tool.function.name));
+            assert!(
+                !base
+                    .iter()
+                    .any(|base_tool| base_tool.function.name == tool.function.name),
+                "{} must not be advertised in the base turn",
+                tool.function.name
+            );
+        }
+        // Descriptions must carry the words a search query would use, since
+        // that is the only signal `tool_search` ranks with.
+        let web = optional
+            .iter()
+            .find(|tool| tool.function.name == "web_fetch")
+            .expect("web_fetch is optional");
+        let lower = web.function.description.to_lowercase();
+        assert!(lower.contains("http") && lower.contains("url"), "{lower}");
     }
 
     #[test]
