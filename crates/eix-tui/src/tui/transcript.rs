@@ -36,6 +36,24 @@ const OUTPUT_ROWS: usize = 40;
 /// rest of the transcript down on every delta.
 const THINKING_WINDOW_ROWS: usize = 12;
 
+/// Left rule for the thinking timeline. The live window and the expanded
+/// transcript share it, so removing the box does not change the text layout.
+const THINKING_INDENT: &str = "    │ ";
+
+/// Timeline nodes for the first thought, a heading, a new paragraph and the
+/// truncated top of the live window. Keep them small and muted: the rule should
+/// guide the eye without competing with the reasoning text.
+const THINKING_START: &str = "    ◦ ";
+const THINKING_HEADING: &str = "    ▸ ";
+const THINKING_POINT: &str = "    · ";
+const THINKING_HIDDEN: &str = "    ⋮ ";
+
+/// Opacity of the outermost, second and third rows of the live window. A
+/// terminal cannot blur glyphs, so the fade is a color blend toward the pane
+/// background; this gives the newest line a soft entrance and lets the oldest
+/// line disappear as it scrolls out.
+const THINKING_FADE: [f32; 3] = [0.18, 0.48, 0.76];
+
 /// Identity of a foldable block. Stored blocks use the `seq` of their event so
 /// the fold survives reloads; the in-flight turn uses [`FoldId::Live`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1558,14 +1576,15 @@ fn thinking(
         if thinking {
             thinking_window(out, text.trim_end(), width, theme, fold);
         } else {
-            let rich = rich_text(
+            let mut rich = rich_text(
                 text.trim_end(),
                 width,
                 theme,
-                "    │ ",
+                THINKING_INDENT,
                 italic_dim(theme),
                 images,
             );
+            decorate_thinking_timeline(&mut rich.lines, theme, false);
             let base_line = out.lines.len();
             for line in rich.lines {
                 out.push(line, Some(fold));
@@ -1586,42 +1605,109 @@ fn thinking(
     out.blank();
 }
 
-/// Draw the fixed-height live viewport. Only the tail is drawn, so a long
-/// reasoning stream never grows the transcript.
+/// Draw the fixed-height live viewport as a timeline: a left rule instead of a
+/// box, with only the tail of the stream visible. A long reasoning stream never
+/// grows the transcript.
 fn thinking_window(out: &mut Transcript, text: &str, width: usize, theme: Theme, fold: Fold) {
-    let box_width = width.saturating_sub(BODY_INDENT.len()).max(6);
-    let inner_width = box_width.saturating_sub(4).max(1);
-    let rich = rich_text(text, inner_width, theme, "", italic_dim(theme), false);
+    let rich = rich_text(
+        text,
+        width,
+        theme,
+        THINKING_INDENT,
+        italic_dim(theme),
+        false,
+    );
     let start = rich.lines.len().saturating_sub(THINKING_WINDOW_ROWS);
-
-    out.push(
-        Line::from(Span::styled(
-            format!("{BODY_INDENT}╭{}╮", "─".repeat(box_width.saturating_sub(2))),
-            dim(theme),
-        )),
-        Some(fold),
-    );
+    let mut rows = Vec::with_capacity(THINKING_WINDOW_ROWS);
     for index in 0..THINKING_WINDOW_ROWS {
-        let mut spans = vec![Span::raw(BODY_INDENT), Span::styled("│ ", dim(theme))];
-        let used = rich
-            .lines
-            .get(start + index)
-            .map(|line| {
-                spans.extend(line.spans.iter().cloned());
-                line.width()
-            })
-            .unwrap_or(0);
-        spans.push(Span::raw(" ".repeat(inner_width.saturating_sub(used))));
-        spans.push(Span::styled(" │", dim(theme)));
-        out.push(Line::from(spans), Some(fold));
+        rows.push(
+            rich.lines
+                .get(start + index)
+                .cloned()
+                .unwrap_or_else(|| Line::from(Span::raw(THINKING_INDENT))),
+        );
     }
-    out.push(
-        Line::from(Span::styled(
-            format!("{BODY_INDENT}╰{}╯", "─".repeat(box_width.saturating_sub(2))),
-            dim(theme),
-        )),
-        Some(fold),
-    );
+    decorate_thinking_timeline(&mut rows, theme, start > 0);
+    for (index, line) in rows.into_iter().enumerate() {
+        let distance = index.min(THINKING_WINDOW_ROWS - 1 - index);
+        let opacity = THINKING_FADE.get(distance).copied().unwrap_or(1.0);
+        out.push(fade_line(line, theme, opacity), Some(fold));
+    }
+}
+
+/// Replace the left rule with a node when a rendered line starts a new idea.
+/// The classifier only uses visible structure (heading, paragraph break), so it
+/// stays cheap and never second-guesses the model's prose.
+fn decorate_thinking_timeline(lines: &mut [Line<'static>], theme: Theme, truncated_above: bool) {
+    let mut previous_blank = true;
+    let mut seen_content = false;
+    for (index, line) in lines.iter_mut().enumerate() {
+        let Some(prefix) = line.spans.first() else {
+            continue;
+        };
+        if prefix.content.as_ref() != THINKING_INDENT {
+            continue;
+        }
+        let body: String = line
+            .spans
+            .iter()
+            .skip(1)
+            .map(|span| span.content.as_ref())
+            .collect();
+        let blank = body.trim().is_empty();
+        let node = if truncated_above && index == 0 {
+            Some(THINKING_HIDDEN)
+        } else if blank {
+            None
+        } else if body.trim_start().starts_with('#') {
+            Some(THINKING_HEADING)
+        } else if !seen_content {
+            Some(THINKING_START)
+        } else if previous_blank {
+            Some(THINKING_POINT)
+        } else {
+            None
+        };
+        line.spans[0] = match node {
+            Some(glyph) => Span::styled(glyph, dim(theme)),
+            None => Span::styled(THINKING_INDENT, dim(theme)),
+        };
+        if !blank {
+            seen_content = true;
+        }
+        previous_blank = blank;
+    }
+}
+
+/// Blend a line toward the pane background. Terminals have no alpha channel,
+/// so opacity is approximated per span; non-RGB colors fall back to `DIM`.
+fn fade_line(mut line: Line<'static>, theme: Theme, opacity: f32) -> Line<'static> {
+    if opacity >= 1.0 {
+        return line;
+    }
+    let background = super::diff::base_background(theme);
+    for span in &mut line.spans {
+        let style = span.style;
+        let foreground = style.fg.unwrap_or_else(|| comment(theme));
+        span.style = match (
+            super::syntax::rgb(foreground),
+            super::syntax::rgb(background),
+        ) {
+            (Some((red, green, blue)), Some((bg_red, bg_green, bg_blue))) => style.fg(Color::Rgb(
+                blend_channel(red, bg_red, opacity),
+                blend_channel(green, bg_green, opacity),
+                blend_channel(blue, bg_blue, opacity),
+            )),
+            _ => style.add_modifier(Modifier::DIM),
+        };
+    }
+    line
+}
+
+fn blend_channel(foreground: u8, background: u8, opacity: f32) -> u8 {
+    (background as f32 + (foreground as f32 - background as f32) * opacity)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 /// A piece of plain text with the display-math spans pulled out.
@@ -2662,6 +2748,32 @@ mod tests {
         let text = all_text(&out);
         assert!(!text.contains("$$"), "{text}");
         assert!(text.contains('─') || text.contains("a/b"), "{text}");
+    }
+
+    #[test]
+    fn live_thinking_fades_at_the_window_edges() {
+        let mut out = Transcript::new();
+        let text = (1..=THINKING_WINDOW_ROWS)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        thinking(
+            &mut out,
+            FoldId::Live,
+            &text,
+            true,
+            40,
+            Theme::default(),
+            &HashMap::new(),
+            false,
+        );
+        let color = |row: usize| out.lines[row].spans.last().unwrap().style.fg;
+        let top = color(1).unwrap();
+        let middle = color(1 + THINKING_WINDOW_ROWS / 2).unwrap();
+        let bottom = color(THINKING_WINDOW_ROWS).unwrap();
+        assert_ne!(top, middle);
+        assert_ne!(bottom, middle);
+        assert_eq!(top, bottom);
     }
 
     #[test]

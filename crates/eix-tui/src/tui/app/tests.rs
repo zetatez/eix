@@ -2327,9 +2327,18 @@ fn transcript_streams_live_thinking_in_a_fixed_window() {
     assert!(short.contains("Thinking…"), "{short}");
     assert!(short.contains("first thought"), "{short}");
     assert!(short.contains("second thought"), "{short}");
-    assert!(short.contains('╭') && short.contains('╰'), "{short}");
-    // Twelve fixed content rows between the window borders.
-    assert_eq!(short.matches("│ ").count(), 12, "{short}");
+    assert!(!short.contains('╭') && !short.contains('╰'), "{short}");
+    // Twelve fixed timeline rows, each with a rule or node prefix.
+    let timeline_rows = short
+        .lines()
+        .filter(|line| {
+            line.chars()
+                .nth(4)
+                .is_some_and(|cell| matches!(cell, '│' | '◦' | '·' | '▸' | '⋮'))
+        })
+        .count();
+    assert_eq!(timeline_rows, 12, "{short}");
+    assert!(short.contains("    ◦ "), "{short}");
 
     // A long chain of thought keeps the same height and only shows its tail.
     view.stream.as_mut().unwrap().reasoning = (1..=40)
@@ -2338,8 +2347,24 @@ fn transcript_streams_live_thinking_in_a_fixed_window() {
         .join("\n");
     let long = render_transcript(&view, 40);
     assert_eq!(short.lines().count(), long.lines().count(), "{long}");
+    assert!(long.contains("    ⋮ "), "{long}");
     assert!(long.contains("thought 40"), "{long}");
     assert!(!long.contains("thought 1\n"), "{long}");
+}
+
+#[test]
+fn thinking_timeline_nodes_follow_content() {
+    let session = Session::new("s1", "chat", "/tmp");
+    let mut view = SessionView::new(session, Vec::new());
+    view.stream = Some(StreamState {
+        turn_id: "t1".into(),
+        text: String::new(),
+        reasoning: "first thought\n\n## Plan\nmore detail\n\nnext paragraph".into(),
+    });
+    let rendered = render_transcript(&view, 40);
+    assert!(rendered.contains("    ◦ "), "{rendered}");
+    assert!(rendered.contains("    ▸ "), "{rendered}");
+    assert!(rendered.contains("    · "), "{rendered}");
 }
 
 #[test]
