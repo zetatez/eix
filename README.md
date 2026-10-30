@@ -229,6 +229,9 @@ eix tui [--session ID]
 | `Enter` | 发送 prompt；turn 运行中自动排队 |
 | `Esc Esc` | 中断当前 turn，或回到转录区 |
 
+以上按键都可在 `~/.config/eix/config.toml` 的 `[keys]` 中改写；一个动作可写逗号分隔的多个键
+（如 `quit = "Ctrl-c, Ctrl-d, Z"`），leader 组合写成 `new_session = "leader n"`。
+
 `/model` 为当前 session 固定普通 turn 与探索子代理共用的模型；`/model-plan` 为当前
 session 固定 Plan 模式模型，`/model-plan default` 清除并回退到 `model_roles.plan` 或
 `/model`。`/model global <id>`（或 `eix model use <id>`）切换 daemon 的运行时默认模型，

@@ -159,14 +159,14 @@ snapshots = true
 # path = "https://docs.rs/**"
 # action = "allow"
 
-# --- Worktrees --------------------------------------------------------------
-[worktree]
-auto = false                         # true: create one per new session
-base = "auto"                        # or "main"
-
+# --- Integration / Worktrees ------------------------------------------------
 [integration]
 auto_ready = false
 auto_commit = true
+
+[worktree]
+auto = false                         # true: create one per new session
+base = "auto"                        # or "main"
 
 # [integration.repos."/home/me/project"]
 # base = "main"
@@ -206,40 +206,6 @@ pi = false                           # $PI_CODING_AGENT_DIR + .pi
 # tcp = "127.0.0.1:7420"
 # http = "127.0.0.1:7421"
 # token = "{env:EIX_REMOTE_TOKEN}"
-
-# --- MCP --------------------------------------------------------------------
-# stdio servers start lazily and need Node.js / npx.
-[mcp.servers.context7]
-command = "npx"
-args = ["-y", "@upstash/context7-mcp"]
-
-[mcp.servers.sequential-thinking]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
-
-[mcp.servers.memory]
-command = "npx"
-args = ["-y", "@modelcontextprotocol/server-memory"]
-
-[mcp.servers.memory.env]
-MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
-
-# Remote server (Streamable HTTP; `url` and `command` are exclusive).
-# [mcp.servers.docs]
-# url = "https://mcp.example.com/mcp"
-# timeout_secs = 30
-# allowed_tools = ["search_*", "read_*"]
-# denied_tools = ["write_*"]
-#
-# [mcp.servers.docs.headers]
-# Authorization = "Bearer {env:MCP_TOKEN}"
-#
-# [mcp.servers.docs.oauth]
-# scopes = ["read"]                  # or run `eix mcp auth docs`
-
-# Keep an entry but disable it.
-# [mcp.servers.playwright]
-# enabled = false
 
 # --- Plugins ----------------------------------------------------------------
 # Trusted child processes (not OS-sandboxed); global config only.
@@ -341,10 +307,80 @@ preset = "dark-github"
 # panel = "#1f2335"
 
 # --- Keys -------------------------------------------------------------------
-# Overrides replace defaults; they do not add aliases.
+# Overrides replace that action's defaults; a comma-separated value binds
+# several keys. Leader chords use `leader X`; `leader` only changes the prefix.
 [keys]
 leader = "Space"
-# sessions = "C-t"
-# new_session = "leader N"
-# close_pane = "C-q"
-# help = "F2"
+quit = "Ctrl-c, Ctrl-d, Z"
+help = "F1"
+models = "Ctrl-/, Ctrl-_, Ctrl-7"
+cycle_reasoning = "Ctrl-t"
+palette = "Ctrl-p"
+page_up = "PageUp, Ctrl-b, Ctrl-u"
+page_down = "PageDown, Ctrl-f"
+pane_prev = "<"
+pane_next = ">"
+cycle_mode = "Tab"
+cycle_mode_back = "BackTab, S-Tab"
+close_pane = "q"
+
+# Ctrl-1..9 focus the matching session. Ctrl-7 stays on the model picker.
+tab_1 = "Ctrl-1"
+tab_2 = "Ctrl-2"
+tab_3 = "Ctrl-3"
+tab_4 = "Ctrl-4"
+tab_5 = "Ctrl-5"
+tab_6 = "Ctrl-6"
+tab_8 = "Ctrl-8"
+tab_9 = "Ctrl-9"
+
+# Leader chords: Space then the key below.
+new_session = "leader n"
+new_worktree = "leader W"
+sessions = "leader o"
+files = "leader f"
+grep = "leader s"
+git = "leader g"
+timeline = "leader h"
+processes = "leader b"
+inbox = "leader a"
+cancel = "leader x"
+colorscheme = "leader c"
+layout_horizontal = "leader v"
+layout_tabby = "leader t"
+layout_fibonacci = "leader r"
+layout_cycle = "leader l"
+
+# --- MCP --------------------------------------------------------------------
+# stdio servers start lazily and need Node.js / npx.
+[mcp.servers.context7]
+command = "npx"
+args = ["-y", "@upstash/context7-mcp"]
+
+[mcp.servers.sequential-thinking]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-sequential-thinking"]
+
+[mcp.servers.memory]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-memory"]
+
+[mcp.servers.memory.env]
+MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
+
+# Remote server (Streamable HTTP; `url` and `command` are exclusive).
+# [mcp.servers.docs]
+# url = "https://mcp.example.com/mcp"
+# timeout_secs = 30
+# allowed_tools = ["search_*", "read_*"]
+# denied_tools = ["write_*"]
+#
+# [mcp.servers.docs.headers]
+# Authorization = "Bearer {env:MCP_TOKEN}"
+#
+# [mcp.servers.docs.oauth]
+# scopes = ["read"]                  # or run `eix mcp auth docs`
+
+# Keep an entry but disable it.
+# [mcp.servers.playwright]
+# enabled = false

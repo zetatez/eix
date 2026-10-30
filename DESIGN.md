@@ -208,7 +208,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `q` 关闭当前 pane（最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、
   `j/k`/`g/G` 等导航、`/`/`?`/`#` 当前对话搜索和 `Ctrl-P`。
 - 全局 / TUI 动作和 leader 组合都可通过 `[keys]` 覆盖；配置某个动作会替换它的默认绑定，
-  不会保留旧键作为别名。裸字母对 normal / 转录区动作安全；可配置为全局的动作
+  不会保留旧键作为别名。值可以用逗号分隔多个键，例如 `quit = "Ctrl-c, Ctrl-d, Z"`；leader 组合写成
+  `new_session = "leader n"`。裸字母对 normal / 转录区动作安全；可配置为全局的动作
   （`quit`、`help`、`sessions`、`models`、`timeline`、`cycle_reasoning`、`tab_N`）配成裸字母时
   自动降级为 normal / 转录区专用。overlay 内部导航键固定。
 - 输入框 normal 模式复用转录区的 TUI 动作：leader、`/`/`?`/`#` 当前对话搜索、翻页/滚动和
@@ -2085,7 +2086,7 @@ pin 的 session；`config.reload` 保留覆盖，daemon 重启或 `model.use` �
 - [x] HTTP API（`[server] http`；`/health`、`/openapi.json`、`/pair`、`/stats`、POST `/rpc`、SSE `/events` + `session_id` 过滤，Bearer token、CORS/OPTIONS；`eix-sdk` 类型化 Rust client、`clients/ts` 无依赖 TypeScript client）
 - [x] 客户端配对（`eix pair [--name]` / `pair list` / `pair revoke`；一次性 code、SHA-256 token、60 秒 20 次失败限流、撤销即时生效）
 - [x] 图片附件（`eix send --image` / TUI `/image` / 粘贴拖入路径或 `file://`，OpenAI 多模态 content，SHA-256 blob 存储、保留/GC、export/import 往返）
-- [x] 可配置全局 / TUI / leader 快捷键（`[keys] action = "C-x"` 或 `action = "leader N"`，含命名键/F1-F12；overlay 导航键固定）
+- [x] 可配置全局 / TUI / leader 快捷键（`[keys] action = "Ctrl-x"`、`action = "leader N"` 或逗号分隔的 `"Ctrl-x, F2"`，含命名键/F1-F12；overlay 导航键固定）
 - [x] LSP diagnostics（内置常见语言 server、懒启动 stdio client、写入后附诊断、`lsp_diagnostics`、`lsp.workspace` 全工作区扫描 RPC；可按语言覆盖）
 - [x] prompt `!<cmd>` 直接执行 shell（sandbox + snapshot + 只读拒绝，保留 tool 事件）
 - [x] Neovim 插件集成文档（`docs/nvim.md`：传输、消息格式、常用请求/通知、最小 Lua 传输层）
