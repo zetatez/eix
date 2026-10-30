@@ -797,7 +797,7 @@ impl Default for ToolsConfig {
 #[serde(default)]
 pub struct ThemeConfig {
     /// Built-in palette name (`dark-github`, `light-one`, `dark-tokyo`,
-    /// `dark-monokai`, `dark-mariana`, `light-catppuccin`, …). Names are
+    /// `dark-monokai`, `dark-nord`, `light-catppuccin`, …). Names are
     /// `<light|dark>-<scheme>`. Explicit fields
     /// below override individual slots of the preset; without a preset the
     /// terminal palette is used (transparent background).
@@ -849,7 +849,7 @@ impl ThemePreset {
 /// through [`theme_preset`]. This array keeps each scheme's light and dark
 /// variants adjacent; the `/colorscheme` picker groups all light palettes
 /// before dark ones and sorts each group by scheme name.
-pub const THEME_PRESETS: [ThemePreset; 23] = [
+pub const THEME_PRESETS: [ThemePreset; 21] = [
     ThemePreset {
         name: "light-catppuccin",
         description: "Catppuccin Latte",
@@ -999,19 +999,6 @@ pub const THEME_PRESETS: [ThemePreset; 23] = [
         panel: Some("#3c3836"),
     },
     ThemePreset {
-        name: "dark-mariana",
-        description: "Sublime Text Mariana",
-        background: Some("#303841"),
-        normal: Some("#d8dee9"),
-        comment: Some("#a6acb9"),
-        string: Some("#fac761"),
-        function: Some("#6699cc"),
-        error: Some("#ec5f66"),
-        diff_add: Some("#99c794"),
-        diff_delete: Some("#ec5f66"),
-        panel: Some("#343d46"),
-    },
-    ThemePreset {
         name: "dark-monokai",
         description: "Sublime Text Monokai",
         background: Some("#272822"),
@@ -1140,19 +1127,6 @@ pub const THEME_PRESETS: [ThemePreset; 23] = [
         diff_add: Some("#9ece6a"),
         diff_delete: Some("#f7768e"),
         panel: Some("#24283b"),
-    },
-    ThemePreset {
-        name: "light-zellner",
-        description: "Vim Zellner",
-        background: Some("#ffffff"),
-        normal: Some("#000000"),
-        comment: Some("#ff0000"),
-        string: Some("#ff00ff"),
-        function: Some("#0000ff"),
-        error: Some("#ff0000"),
-        diff_add: Some("#5f875f"),
-        diff_delete: Some("#af5faf"),
-        panel: Some("#dadada"),
     },
 ];
 

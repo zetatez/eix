@@ -325,10 +325,10 @@ MEMORY_FILE_PATH = "{env:HOME}/.config/eix/memory.json"
 
 # --- Theme ------------------------------------------------------------------
 # Presets: light-catppuccin, dark-catppuccin, light-delek, dark-desert,
-# dark-dracula, light-github, dark-github, light-gruvbox, dark-gruvbox,
-# dark-mariana, dark-monokai, dark-nord, light-one, dark-one,
+# dark-dracula, light-eink, light-eink-mono, light-github, dark-github,
+# light-gruvbox, dark-gruvbox, dark-monokai, dark-nord, light-one, dark-one,
 # light-peachpuff, dark-ron, light-rose-pine, light-solarized,
-# dark-solarized, dark-tokyo, light-zellner.
+# dark-solarized, dark-tokyo.
 [theme]
 preset = "dark-github"
 # normal = "#c0caf5"

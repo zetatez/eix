@@ -418,7 +418,7 @@ diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syn
 `/colorscheme` 打开带实时预览的 colorscheme picker：上下移动立即重绘界面，`Enter` 应用，`Esc`
 恢复打开前的配色；不再通过 `/colorscheme <name>` 直接切换。内置 preset 统一命名为
 `<light|dark>-<scheme>`（如 `dark-github`、`light-github`），覆盖 GitHub、One、Tokyo、Monokai、
-Mariana、Gruvbox、Catppuccin、Rosé Pine 以及 Vim 的 Delek、Peach Puff、Ron、Zellner、Desert 的
+Nord、Gruvbox、Catppuccin、Rosé Pine 以及 Vim 的 Delek、Peach Puff、Ron、Desert 的
 亮色/暗色版本；`light-eink` 与纯灰阶的 `light-eink-mono` 提供墨水屏纸感配色。亮色主题下
 模式徽标会保留色相并自动压暗，保证至少 3:1 的对比度。预设里的 `background` 会同时应用到转录区、
 colorscheme picker 和其他浮层；默认配色和没有 `background` 的自定义配色继续使用终端背景。
