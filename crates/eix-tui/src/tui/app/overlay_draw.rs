@@ -256,6 +256,62 @@ impl App {
         );
     }
 
+    /// Deny-reason editor. It takes the composer's place so it can never
+    /// overlap the prompt, and the approval card above stays fully visible.
+    pub(super) fn draw_reason_prompt(&self, frame: &mut Frame, input_area: Rect) {
+        let Some(prompt) = self.reason_prompt.as_ref() else {
+            return;
+        };
+        let height = 3u16;
+        if input_area.width < 16 || input_area.height < height {
+            return;
+        }
+        let theme = self.theme;
+        let panel = dialog_background(theme);
+        let warn = composer_warn(theme);
+        // Clear the composer chrome and content first; the dialog occupies the
+        // bottom rows of the same slot.
+        frame.render_widget(Clear, input_area);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(panel)),
+            input_area,
+        );
+        let width = input_area.width.min(88);
+        let rect = Rect::new(
+            input_area.x,
+            input_area.y + input_area.height - height,
+            width,
+            height,
+        );
+        let inner = width.saturating_sub(2) as usize;
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(warn).bg(panel))
+            .style(Style::default().bg(panel))
+            .title(Span::styled(
+                " deny reason ",
+                Style::default()
+                    .fg(warn)
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " Enter denies · Esc cancels ",
+                Style::default().fg(composer_muted(theme)).bg(panel),
+            ));
+        let (visible, caret) = reason_window(&prompt.input.text, prompt.input.cursor, inner);
+        let line = Line::from(Span::styled(
+            visible,
+            Style::default().fg(composer_text(theme)).bg(panel),
+        ));
+        frame.render_widget(Paragraph::new(line).block(block), rect);
+
+        let x = rect.x + 1 + caret.min(inner.saturating_sub(1) as u16);
+        frame.set_cursor_position((x, rect.y + 1));
+    }
+
     pub(super) fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         let dialog_bg = dialog_background(theme);
@@ -1621,4 +1677,47 @@ fn unified_review_body(
         }
     }
     body
+}
+
+/// Visible slice of the deny-reason buffer and the caret column inside it.
+/// Keeps the caret on screen: long reasons scroll horizontally instead of
+/// being clipped at the right edge. A leading `…` marks hidden text.
+fn reason_window(text: &str, cursor: usize, width: usize) -> (String, u16) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let width = width.max(1);
+    let char_width = |ch: char| UnicodeWidthChar::width(ch).unwrap_or(0);
+    let tail_width =
+        |start: usize| -> usize { chars[start..].iter().map(|ch| char_width(*ch)).sum() };
+
+    // Prefer showing the tail; stop scrolling once the caret would fall behind
+    // the window's left edge.
+    let mut start = 0usize;
+    while start < cursor && tail_width(start) + usize::from(start > 0) > width {
+        start += 1;
+    }
+
+    let prefix = start > 0;
+    let mut used = usize::from(prefix);
+    let mut end = start;
+    while end < chars.len() {
+        let next = used + char_width(chars[end]);
+        if next > width {
+            break;
+        }
+        used = next;
+        end += 1;
+    }
+
+    let mut visible = String::new();
+    if prefix {
+        visible.push('…');
+    }
+    visible.extend(chars[start..end].iter());
+    let hidden_caret = chars[start..cursor.min(end)]
+        .iter()
+        .map(|ch| char_width(*ch))
+        .sum::<usize>();
+    let caret = usize::from(prefix) + hidden_caret;
+    (visible, caret as u16)
 }

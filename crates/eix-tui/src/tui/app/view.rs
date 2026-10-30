@@ -23,7 +23,14 @@ impl App {
         let cmdline_height = u16::from(show_cmdline);
         let inner_width = area.width.saturating_sub(4).max(1) as usize;
         let input_layout = self.input.wrap(inner_width);
-        let input_height = prompt_input_height_for_rows(area.height, input_layout.segments.len());
+        // The deny-reason dialog reuses the prompt slot; it needs exactly one
+        // input row plus its borders, so the draft's row count must not shrink
+        // it off screen.
+        let input_height = if self.reason_prompt.is_some() {
+            3
+        } else {
+            prompt_input_height_for_rows(area.height, input_layout.segments.len())
+        };
         let chunks = Layout::vertical([
             Constraint::Min(3),
             Constraint::Length(input_height),
@@ -33,7 +40,11 @@ impl App {
         .split(area);
 
         self.draw_body(frame, chunks[0]);
-        self.draw_input(frame, chunks[1], input_layout);
+        if self.reason_prompt.is_some() {
+            self.draw_reason_prompt(frame, chunks[1]);
+        } else {
+            self.draw_input(frame, chunks[1], input_layout);
+        }
         self.draw_status_bar(frame, chunks[2]);
         self.draw_cmdline(frame, chunks[3]);
         if self.cmdline_menu_open() {

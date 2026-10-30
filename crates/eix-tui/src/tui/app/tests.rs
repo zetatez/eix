@@ -3097,6 +3097,153 @@ fn approval_keys_answer_the_focused_pane() {
     assert!(app.approvals.contains_key("s1"));
 }
 
+#[test]
+fn reason_prompt_uses_its_own_dialog_above_the_composer() {
+    let (mut app, tx, _rx) = app_with_diff(None);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &tx);
+    for ch in "这个改动超出范围".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+
+    let rendered = render_text(&mut app, 60, 20);
+    let lines: Vec<&str> = rendered.lines().collect();
+    // Exactly one dialog: the old implementation reused the composer title and
+    // the prompt body, which is what produced the overlap/garbling.
+    assert_eq!(rendered.matches("deny reason").count(), 1, "{rendered}");
+    // The approval card is still fully readable above the editor.
+    assert!(rendered.contains("Deny with reason…"), "{rendered}");
+
+    let title = lines
+        .iter()
+        .position(|line| line.contains("deny reason"))
+        .expect("reason dialog");
+    let text = lines
+        .iter()
+        .position(|line| line.contains('这') && line.contains('围'))
+        .expect("typed reason");
+    assert!(title < text, "{rendered}");
+    // The dialog replaces the composer slot: its bottom border is immediately
+    // followed by the status bar, with no composer row bleeding through.
+    let bottom = lines
+        .iter()
+        .position(|line| line.contains("Enter denies"))
+        .expect("reason dialog footer");
+    assert!(bottom > text, "{rendered}");
+    let next = lines
+        .iter()
+        .skip(bottom + 1)
+        .find(|line| !line.trim().is_empty())
+        .expect("status bar below the reason dialog");
+    assert!(
+        next.contains("Build"),
+        "unexpected row: {next:?}\n{rendered}"
+    );
+}
+
+#[test]
+fn reason_prompt_edits_multibyte_text_and_enter_denies() {
+    let (mut app, tx, mut rx) = app_with_diff(None);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &tx);
+    for ch in "下载太慢".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+    // Backspace must remove one whole character, not one byte.
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &tx);
+    // Cursor motion is by character too, so the insert lands before 太.
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('很'), KeyModifiers::NONE), &tx);
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+    match rx.try_recv().expect("approval command") {
+        Command::Approval {
+            session_id,
+            approval_id,
+            decision,
+            reason,
+            ..
+        } => {
+            assert_eq!(session_id, "s1");
+            assert_eq!(approval_id, "a1");
+            assert_eq!(decision, ApprovalDecision::Deny);
+            assert_eq!(reason.as_deref(), Some("下载很太"));
+        }
+        _ => panic!("expected a denial command"),
+    }
+    assert!(app.reason_prompt.is_none());
+}
+
+#[test]
+fn a_stale_leader_prefix_does_not_swallow_the_approval_key() {
+    let (mut app, tx, mut rx) = app_with_diff(None);
+    // The user tapped the leader just before the card arrived.
+    app.pending_leader = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+    assert!(!app.pending_leader);
+    match rx.try_recv().expect("approval command") {
+        Command::Approval { decision, .. } => assert_eq!(decision, ApprovalDecision::Approve),
+        _ => panic!("expected an approval command"),
+    }
+}
+
+#[test]
+fn stale_approval_response_reloads_the_live_card() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = Session::new("s1", "tools", "/tmp");
+    session.status = SessionStatus::AwaitingApproval;
+    let live = SessionEvent::new(
+        "s1",
+        1,
+        EventKind::ApprovalRequired,
+        serde_json::json!({
+            "approval_id": "a2",
+            "call_id": "c2",
+            "tool": "exec_command",
+            "summary": "exec_command: ls",
+            "arguments": {"cmd": "ls"},
+        }),
+    );
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(session, vec![live]));
+    app.focused = 0;
+    app.focus = Focus::Transcript;
+    // The card still points at the request that was just superseded.
+    app.approvals.insert(
+        "s1".to_string(),
+        PendingApproval {
+            kind: PendingKind::Tool,
+            approval_id: "a1".to_string(),
+            call_id: "c1".to_string(),
+            tool: "exec_command".to_string(),
+            summary: "$ ls".to_string(),
+            diff: None,
+            path: None,
+            hunks: Vec::new(),
+            selected: Vec::new(),
+            cursor: 0,
+        },
+    );
+
+    app.handle_event(
+        Event::Approval {
+            approval_id: "a1".to_string(),
+            accepted: false,
+        },
+        &tx,
+    );
+
+    let pending = app.approvals.get("s1").expect("card reloaded");
+    assert_eq!(pending.approval_id, "a2");
+    // Enter now answers the live request instead of resending the dead id.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    match rx.try_recv().expect("approval command") {
+        Command::Approval { approval_id, .. } => assert_eq!(approval_id, "a2"),
+        _ => panic!("expected an approval command"),
+    }
+}
+
 fn app_with_diff(
     diff: Option<&str>,
 ) -> (

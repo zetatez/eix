@@ -1685,10 +1685,12 @@ impl PendingInput {
     }
 }
 
-/// Inline reason for denying an approval (`r` on the card).
+/// Inline reason for denying an approval (`r` on the card). The buffer is the
+/// same one the `:` command line uses, so editing (including CJK) stays
+/// cursor-correct.
 struct ReasonPrompt {
     session_id: String,
-    text: String,
+    input: CmdLine,
 }
 
 /// Vim-style `:` command line. The cursor is a character index so editing

@@ -3107,6 +3107,7 @@ impl Daemon {
                     &call_id,
                     "exec_command",
                     &decision,
+                    mode,
                     None,
                 )?;
                 if decision.action == PermissionAction::Deny {
@@ -4386,12 +4387,17 @@ impl Daemon {
         } = params;
         {
             let mut approvals = self.approvals.lock().await;
+            // Check the id while the entry is still in place. Removing first
+            // would briefly hide the live request from concurrent responders
+            // and from `approval.list`, so a second Enter could look stale.
+            let stale = approvals.get(&session_id).is_some_and(|pending| {
+                !approval_id.is_empty() && pending.approval_id != approval_id
+            });
+            if stale {
+                // Stale card: keep waiting for the current approval.
+                return Ok(ApprovalResult { accepted: false });
+            }
             if let Some(pending) = approvals.remove(&session_id) {
-                if !approval_id.is_empty() && pending.approval_id != approval_id {
-                    // Stale card: keep waiting for the current approval.
-                    approvals.insert(session_id, pending);
-                    return Ok(ApprovalResult { accepted: false });
-                }
                 let decision = if decision == ApprovalDecision::Always && !pending.allow_always {
                     ApprovalDecision::Approve
                 } else {
@@ -7137,7 +7143,14 @@ impl Daemon {
         }
 
         let session = self.require_session(session_id)?;
-        self.record_permission(session_id, &call.id, tool, decision, None)?;
+        self.record_permission(
+            session_id,
+            &call.id,
+            tool,
+            decision,
+            self.session_mode(&session),
+            None,
+        )?;
         if decision.action != PermissionAction::Allow {
             let output = decision.reason.clone();
             self.record_tool_result(session_id, call, false, true, &output, 0)?;
@@ -7597,9 +7610,11 @@ impl Daemon {
             )
         };
         // Codex's `sandbox_permissions=require_escalated` and
-        // `additional_permissions` always need a human decision, even when the
-        // command would otherwise match an allow rule.
-        if tool == "exec_command" {
+        // `additional_permissions` need a human decision, even when the
+        // command would otherwise match an allow rule. Full already runs shell
+        // commands unsandboxed, so escalating there asks for nothing extra and
+        // must not turn every command into an approval.
+        if tool == "exec_command" && mode != SessionMode::Full {
             if let Some(reason) = tools::escalation_reason(&args) {
                 decision.action = PermissionAction::Ask;
                 decision.force_ask = true;
@@ -7614,6 +7629,7 @@ impl Daemon {
             &call.id,
             tool,
             &decision,
+            mode,
             classifier_audit.as_ref(),
         )?;
         // A deny is global and absolute: it must run before the special-case
@@ -9326,6 +9342,14 @@ impl Daemon {
         let Ok(session) = self.require_session(session_id) else {
             return false;
         };
+        self.command_plan(&session, args)
+            .is_ok_and(|plan| plan.sandboxed)
+    }
+
+    /// Resolve an `exec_command` line for the session. Full runs shell
+    /// commands unsandboxed, matching the mode's declared behavior; other modes
+    /// keep the configured sandbox unless the call asks to escalate.
+    fn command_plan(&self, session: &Session, args: &Value) -> Result<tools::CommandPlan> {
         let command = args
             .get("cmd")
             .or_else(|| args.get("command"))
@@ -9335,15 +9359,18 @@ impl Daemon {
             .get("workdir")
             .or_else(|| args.get("cwd"))
             .and_then(Value::as_str);
+        let mut options = tools::command_options(args);
+        if self.session_mode(session).allows_unsandboxed_exec() {
+            options.escalated = true;
+        }
         tools::command_plan_with(
             command,
             cwd,
             &session.cwd,
             session.worktree.as_deref(),
             &self.config.load(),
-            tools::command_options(args),
+            options,
         )
-        .is_ok_and(|plan| plan.sandboxed)
     }
 
     async fn exec_command_outcome(&self, session_id: &str, args: &Value) -> tools::ToolOutcome {
@@ -9370,18 +9397,7 @@ impl Daemon {
                 }
             }
         };
-        let cwd = args
-            .get("workdir")
-            .or_else(|| args.get("cwd"))
-            .and_then(Value::as_str);
-        let plan = match tools::command_plan_with(
-            command,
-            cwd,
-            &session.cwd,
-            session.worktree.as_deref(),
-            &self.config.load(),
-            tools::command_options(args),
-        ) {
+        let plan = match self.command_plan(&session, args) {
             Ok(plan) => plan,
             Err(err) => {
                 return tools::ToolOutcome {
@@ -9519,7 +9535,13 @@ impl Daemon {
         }
     }
 
-    fn sandbox_status(&self, decision: &PermissionDecision) -> &'static str {
+    fn sandbox_status(&self, decision: &PermissionDecision, mode: SessionMode) -> &'static str {
+        // Full runs shell commands unsandboxed regardless of the configured
+        // sandbox, so reporting the configured mode here would mislead the
+        // audit log and the approval card.
+        if mode.allows_unsandboxed_exec() {
+            return "off";
+        }
         if decision.action == PermissionAction::Sandbox {
             return "sandbox";
         }
@@ -9656,9 +9678,10 @@ impl Daemon {
         call_id: &str,
         tool: &str,
         decision: &PermissionDecision,
+        mode: SessionMode,
         classifier: Option<&ClassifierAuditPayload>,
     ) -> Result<()> {
-        let sandbox = self.sandbox_status(decision);
+        let sandbox = self.sandbox_status(decision, mode);
         let event = self.store.append_event(
             session_id,
             EventKind::PermissionEvaluated,
@@ -10244,7 +10267,9 @@ impl Daemon {
 
         let approval_id = Uuid::new_v4().to_string();
         let summary = self.tool_summary(tool, args);
-        let cwd = self.require_session(session_id)?.cwd;
+        let session = self.require_session(session_id)?;
+        let cwd = session.cwd.clone();
+        let mode = self.session_mode(&session);
         let config = self.config.load();
         let mut patch_ops = None;
         let diff = match tool {
@@ -10269,8 +10294,12 @@ impl Daemon {
         };
         let hunks: Vec<eix_core::HunkInfo> = Vec::new();
         let (responder, receiver) = oneshot::channel();
-        let allow_always =
-            decision.risk.level <= eix_core::RiskLevel::Medium && !decision.force_ask;
+        // Full is the user's blanket opt-in: escalating a command (or matching
+        // an explicit ask rule) there may still be remembered for the session
+        // so the same request does not come back every turn. Other modes keep
+        // the one-shot gate for anything that had to force an ask.
+        let allow_always = decision.risk.level <= eix_core::RiskLevel::Medium
+            && (!decision.force_ask || mode.allows_unruled_asks());
         self.approvals.lock().await.insert(
             session_id.to_string(),
             PendingApproval {
@@ -10298,7 +10327,7 @@ impl Daemon {
         } else {
             vec!["once".to_string()]
         };
-        let sandbox = self.sandbox_status(decision);
+        let sandbox = self.sandbox_status(decision, mode);
         let event = self.store.append_event(
             session_id,
             EventKind::ApprovalRequired,
@@ -12267,7 +12296,7 @@ fn permissions_note(
             "\n\n## Approvals\nMode: Auto (sandbox: {sandbox}, network: {network}). Unruled low-risk calls may be auto-approved after an intent check; stay inside the workspace.\n{scope}{rules}{escalation}\n{segmentation}"
         ),
         SessionMode::Full => format!(
-            "\n\n## Approvals\nMode: Full (sandbox: {sandbox}, network: {network}). Unruled asks are allowed and external writes are permitted. Keep scope minimal and never bypass secret-path or catastrophic denials.\n{scope}{rules}"
+            "\n\n## Approvals\nMode: Full (shell commands run unsandboxed with full network). Unruled asks are allowed and external writes are permitted. Keep scope minimal and never bypass secret-path or catastrophic denials.\n{scope}{rules}"
         ),
     }
 }

@@ -1177,7 +1177,12 @@ impl App {
                     }
                     self.status = "approval sent".into();
                 } else {
-                    self.status = "approval was stale; the daemon is still waiting".into();
+                    // The daemon rejected this id (another client answered
+                    // first, or the card was already superseded). Rebuild it
+                    // from the log so the next Enter/y targets the live
+                    // request instead of a dead id that never resolves.
+                    self.reload_stale_approval(&approval_id);
+                    self.status = "approval was stale; showing the current request".into();
                 }
             }
             Event::InputResponded { accepted } => {
@@ -1302,6 +1307,12 @@ impl App {
         }
         if self.pending_leader {
             self.restore_leader_status();
+            // A blocking card may appear while a leader prefix is still
+            // pending. The card owns Enter/y/n, and another leader cannot start
+            // under it, so the stale prefix must not swallow the answer.
+            if self.focused_approval().is_some() || self.focused_input().is_some() {
+                self.pending_leader = false;
+            }
         }
         // Quit works from every mode, including insert and any open overlay.
         // Save the draft first so quitting never loses it.
@@ -1406,35 +1417,7 @@ impl App {
         }
 
         if self.reason_prompt.is_some() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.reason_prompt = None;
-                    self.status = "denial cancelled".into();
-                }
-                KeyCode::Enter => {
-                    if let Some(prompt) = self.reason_prompt.take() {
-                        let reason = prompt.text.trim().to_string();
-                        self.respond_approval_for(
-                            &prompt.session_id,
-                            ApprovalDecision::Deny,
-                            None,
-                            (!reason.is_empty()).then_some(reason),
-                            tx,
-                        );
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(prompt) = self.reason_prompt.as_mut() {
-                        prompt.text.pop();
-                    }
-                }
-                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(prompt) = self.reason_prompt.as_mut() {
-                        prompt.text.push(ch);
-                    }
-                }
-                _ => {}
-            }
+            self.handle_reason_key(key, tx);
             return;
         }
 
