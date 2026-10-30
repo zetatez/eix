@@ -1862,12 +1862,12 @@ fn transcript_renders_chat_turns_and_thinking() {
         user.starts_with(' ') && user.contains("│ hi there │"),
         "user turn should be a right-aligned bubble: {user:?}"
     );
-    assert!(lines.iter().any(|line| line.contains("▾ Thinking")));
-    // Stored thinking is expanded by default.
-    assert!(rendered.contains("pondering"));
+    assert!(lines.iter().any(|line| line.contains("▸ Thinking")));
+    // Stored thinking is collapsed by default.
+    assert!(!rendered.contains("pondering"));
     let mut view = view;
-    view.folds.insert(FoldId::Event(2), false);
-    assert!(!render_transcript(&view, 40).contains("pondering"));
+    view.folds.insert(FoldId::Event(2), true);
+    assert!(render_transcript(&view, 40).contains("pondering"));
 }
 
 #[test]
@@ -2147,13 +2147,13 @@ fn cached_history_honors_fold_changes() {
     let mut app = App::new(None);
     app.views.push(SessionView::new(session, events));
     app.focused = 0;
-    let unfolded = render_text(&mut app, 60, 24);
-    assert!(unfolded.contains("hidden chain"), "{unfolded:?}");
-
-    app.views[0].folds.insert(FoldId::Event(2), false);
     let folded = render_text(&mut app, 60, 24);
     assert!(folded.contains("Thinking"));
-    assert!(!folded.contains("hidden chain"));
+    assert!(!folded.contains("hidden chain"), "{folded:?}");
+
+    app.views[0].folds.insert(FoldId::Event(2), true);
+    let unfolded = render_text(&mut app, 60, 24);
+    assert!(unfolded.contains("hidden chain"), "{unfolded:?}");
 }
 
 #[test]
@@ -2315,17 +2315,46 @@ fn expanded_tool_card_shows_the_full_long_command() {
 }
 
 #[test]
-fn transcript_streams_live_thinking() {
+fn transcript_streams_live_thinking_in_a_fixed_window() {
     let session = Session::new("s1", "chat", "/tmp");
     let mut view = SessionView::new(session, Vec::new());
     view.stream = Some(StreamState {
         turn_id: "t1".into(),
         text: String::new(),
+        reasoning: "first thought\nsecond thought".into(),
+    });
+    let short = render_transcript(&view, 40);
+    assert!(short.contains("Thinking…"), "{short}");
+    assert!(short.contains("first thought"), "{short}");
+    assert!(short.contains("second thought"), "{short}");
+    assert!(short.contains('╭') && short.contains('╰'), "{short}");
+    // Twelve fixed content rows between the window borders.
+    assert_eq!(short.matches("│ ").count(), 12, "{short}");
+
+    // A long chain of thought keeps the same height and only shows its tail.
+    view.stream.as_mut().unwrap().reasoning = (1..=40)
+        .map(|line| format!("thought {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let long = render_transcript(&view, 40);
+    assert_eq!(short.lines().count(), long.lines().count(), "{long}");
+    assert!(long.contains("thought 40"), "{long}");
+    assert!(!long.contains("thought 1\n"), "{long}");
+}
+
+#[test]
+fn live_thinking_collapses_once_the_answer_starts() {
+    let session = Session::new("s1", "chat", "/tmp");
+    let mut view = SessionView::new(session, Vec::new());
+    view.stream = Some(StreamState {
+        turn_id: "t1".into(),
+        text: "the answer".into(),
         reasoning: "thinking out loud".into(),
     });
     let rendered = render_transcript(&view, 40);
-    assert!(rendered.contains("Thinking…"));
-    assert!(rendered.contains("thinking out loud"));
+    assert!(rendered.contains("▸ Thinking"), "{rendered}");
+    assert!(!rendered.contains("thinking out loud"), "{rendered}");
+    assert!(rendered.contains("the answer"), "{rendered}");
 }
 
 #[test]

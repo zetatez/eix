@@ -177,6 +177,7 @@ impl App {
                             .is_none_or(|stream| stream.turn_id != started.turn_id)
                         {
                             view.stream = Some(StreamState::new(started.turn_id));
+                            view.folds.remove(&FoldId::Live);
                         }
                         view.unread = false;
                     }
@@ -325,6 +326,10 @@ impl App {
                     match event.kind {
                         EventKind::AssistantMessage => {
                             view.stream = None;
+                            // The streamed reasoning is now a stored block;
+                            // drop its live fold so the next step starts with
+                            // an open live window again.
+                            view.folds.remove(&FoldId::Live);
                             if let Ok(payload) = serde_json::from_value::<AssistantMessagePayload>(
                                 event.payload.clone(),
                             ) {
@@ -423,8 +428,12 @@ impl App {
                     if self.status.starts_with("retrying ") {
                         self.status = "running".into();
                     }
+                    let mut answer_started = false;
                     match &mut view.stream {
                         Some(stream) if stream.turn_id == delta.turn_id => {
+                            if !reasoning && stream.text.is_empty() {
+                                answer_started = true;
+                            }
                             let target = if reasoning {
                                 &mut stream.reasoning
                             } else {
@@ -441,9 +450,15 @@ impl App {
                                 stream.reasoning.push_str(&delta.delta);
                             } else {
                                 stream.text.push_str(&delta.delta);
+                                answer_started = true;
                             }
                             view.stream = Some(stream);
                         }
+                    }
+                    if answer_started {
+                        // Thinking is over once the answer starts; clear the
+                        // live fold so the block collapses automatically.
+                        view.folds.remove(&FoldId::Live);
                     }
                 }
             }
@@ -468,6 +483,7 @@ impl App {
                             .is_some_and(|stream| stream.turn_id == reset.turn_id)
                         {
                             view.stream = None;
+                            view.folds.remove(&FoldId::Live);
                         }
                     }
                 }
@@ -493,6 +509,7 @@ impl App {
                             .is_some_and(|stream| stream.turn_id == retry.turn_id)
                         {
                             view.stream = None;
+                            view.folds.remove(&FoldId::Live);
                         }
                     }
                     let delay = retry.delay_ms as f64 / 1000.0;
@@ -726,6 +743,7 @@ impl App {
                     let finished = done.error.is_none() && !done.cancelled;
                     let background = index != self.focused;
                     self.views[index].stream = None;
+                    self.views[index].folds.remove(&FoldId::Live);
                     if let Some(error) = done.error {
                         self.error = Some(error);
                         self.status = "error".into();

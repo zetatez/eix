@@ -31,6 +31,11 @@ use super::theme::Theme;
 /// never silently folded away, and the daemon already bounds their size.
 const OUTPUT_ROWS: usize = 40;
 
+/// Height of the live Thinking viewport. The box stays this size while the
+/// model streams, so a long chain of thought scrolls instead of pushing the
+/// rest of the transcript down on every delta.
+const THINKING_WINDOW_ROWS: usize = 12;
+
 /// Identity of a foldable block. Stored blocks use the `seq` of their event so
 /// the fold survives reloads; the in-flight turn uses [`FoldId::Live`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -728,11 +733,14 @@ fn append_tail(
 ) {
     if let Some(live) = live {
         if !live.reasoning.is_empty() {
+            // The box is live only until the answer starts streaming; after
+            // that the reasoning block collapses like a stored one, while a
+            // click can still expand the full text.
             thinking(
                 out,
                 FoldId::Live,
                 live.reasoning,
-                true,
+                live.text.is_empty(),
                 width,
                 theme,
                 folds,
@@ -1504,74 +1512,116 @@ fn compaction_summary(
 }
 
 /// The "Thinking" module: a collapsible, quietly styled header over the chain
-/// of thought. Reasoning models also emit `$$...$$` formulas, so the body uses
-/// the same image/2D renderer as assistant output instead of printing raw TeX.
+/// of thought. While the model is still thinking, the body is a fixed-height
+/// window that tails the latest output. Once thinking ends the block collapses;
+/// expanding it later shows the complete reasoning, not just the window.
+/// Reasoning models also emit `$$...$$` formulas, so both views use the same
+/// image/2D renderer as assistant output instead of printing raw TeX.
 #[allow(clippy::too_many_arguments)]
 fn thinking(
     out: &mut Transcript,
     id: FoldId,
     text: &str,
-    streaming: bool,
+    thinking: bool,
     width: usize,
     theme: Theme,
     folds: &HashMap<FoldId, bool>,
     images: bool,
 ) {
     let inner = width.saturating_sub(6).max(1);
-    // Thinking is open by default, both while streaming and after the turn is
-    // stored; an explicit click can still collapse it.
-    let open = folds.get(&id).copied().unwrap_or(true);
+    // Active thinking opens its fixed window; a finished block starts folded.
+    let open = folds.get(&id).copied().unwrap_or(thinking);
     let fold = Fold { id, open };
     let marker = if open { '▾' } else { '▸' };
-    let rich = open.then(|| {
-        rich_text(
-            text.trim_end(),
-            width,
-            theme,
-            "    │ ",
-            italic_dim(theme),
-            images,
-        )
-    });
-    let lines = rich
-        .as_ref()
-        .map(|rich| rich.lines.len())
-        .unwrap_or_else(|| {
-            text.trim_end()
-                .lines()
-                .map(|line| wrap_text(line, inner).len())
-                .sum()
-        })
-        .max(1);
-    let header = if streaming {
-        "  ✳ Thinking…".to_string()
-    } else if lines == 1 {
-        format!("  {marker} Thinking · 1 line")
+    let closed_lines = || {
+        text.trim_end()
+            .lines()
+            .map(|line| wrap_text(line, inner).len())
+            .sum::<usize>()
+            .max(1)
+    };
+    let header = if thinking {
+        format!("  {marker} ✳ Thinking…")
     } else {
-        format!("  {marker} Thinking · {lines} lines")
+        let lines = closed_lines();
+        if lines == 1 {
+            format!("  {marker} Thinking · 1 line")
+        } else {
+            format!("  {marker} Thinking · {lines} lines")
+        }
     };
     out.push(
         Line::from(Span::styled(header, italic_dim(theme))),
         Some(fold),
     );
-    if let Some(rich) = rich {
-        let base_line = out.lines.len();
-        for line in rich.lines {
-            out.push(line, Some(fold));
-        }
-        for mut placement in rich.math {
-            placement.line += base_line;
-            out.math.push(placement);
-        }
-        for mut pending in rich.pending {
-            pending.line += base_line;
-            out.math_pending.push(pending);
-        }
-        for (line, source) in rich.sources {
-            out.copy.push((base_line + line, source));
+    if open {
+        if thinking {
+            thinking_window(out, text.trim_end(), width, theme, fold);
+        } else {
+            let rich = rich_text(
+                text.trim_end(),
+                width,
+                theme,
+                "    │ ",
+                italic_dim(theme),
+                images,
+            );
+            let base_line = out.lines.len();
+            for line in rich.lines {
+                out.push(line, Some(fold));
+            }
+            for mut placement in rich.math {
+                placement.line += base_line;
+                out.math.push(placement);
+            }
+            for mut pending in rich.pending {
+                pending.line += base_line;
+                out.math_pending.push(pending);
+            }
+            for (line, source) in rich.sources {
+                out.copy.push((base_line + line, source));
+            }
         }
     }
     out.blank();
+}
+
+/// Draw the fixed-height live viewport. Only the tail is drawn, so a long
+/// reasoning stream never grows the transcript.
+fn thinking_window(out: &mut Transcript, text: &str, width: usize, theme: Theme, fold: Fold) {
+    let box_width = width.saturating_sub(BODY_INDENT.len()).max(6);
+    let inner_width = box_width.saturating_sub(4).max(1);
+    let rich = rich_text(text, inner_width, theme, "", italic_dim(theme), false);
+    let start = rich.lines.len().saturating_sub(THINKING_WINDOW_ROWS);
+
+    out.push(
+        Line::from(Span::styled(
+            format!("{BODY_INDENT}╭{}╮", "─".repeat(box_width.saturating_sub(2))),
+            dim(theme),
+        )),
+        Some(fold),
+    );
+    for index in 0..THINKING_WINDOW_ROWS {
+        let mut spans = vec![Span::raw(BODY_INDENT), Span::styled("│ ", dim(theme))];
+        let used = rich
+            .lines
+            .get(start + index)
+            .map(|line| {
+                spans.extend(line.spans.iter().cloned());
+                line.width()
+            })
+            .unwrap_or(0);
+        spans.push(Span::raw(" ".repeat(inner_width.saturating_sub(used))));
+        spans.push(Span::styled(" │", dim(theme)));
+        out.push(Line::from(spans), Some(fold));
+    }
+    out.push(
+        Line::from(Span::styled(
+            format!("{BODY_INDENT}╰{}╯", "─".repeat(box_width.saturating_sub(2))),
+            dim(theme),
+        )),
+        Some(fold),
+    );
 }
 
 /// A piece of plain text with the display-math spans pulled out.
@@ -2597,6 +2647,8 @@ mod tests {
     #[test]
     fn thinking_renders_display_math_instead_of_raw_tex() {
         let mut out = Transcript::new();
+        let mut folds = HashMap::new();
+        folds.insert(FoldId::Live, true);
         thinking(
             &mut out,
             FoldId::Live,
@@ -2604,7 +2656,7 @@ mod tests {
             false,
             60,
             Theme::default(),
-            &HashMap::new(),
+            &folds,
             false,
         );
         let text = all_text(&out);
