@@ -797,7 +797,7 @@ impl Default for ToolsConfig {
 #[serde(default)]
 pub struct ThemeConfig {
     /// Built-in palette name (`dark-github`, `light-one`, `dark-tokyo`,
-    /// `dark-monokai`, `dark-mariana`, `light-catppuccin`, …). Names are
+    /// `dark-monokai`, `dark-nord`, `light-catppuccin`, …). Names are
     /// `<light|dark>-<scheme>`. Explicit fields
     /// below override individual slots of the preset; without a preset the
     /// terminal palette is used (transparent background).
@@ -849,7 +849,7 @@ impl ThemePreset {
 /// through [`theme_preset`]. This array keeps each scheme's light and dark
 /// variants adjacent; the `/colorscheme` picker groups all light palettes
 /// before dark ones and sorts each group by scheme name.
-pub const THEME_PRESETS: [ThemePreset; 22] = [
+pub const THEME_PRESETS: [ThemePreset; 21] = [
     ThemePreset {
         name: "light-catppuccin",
         description: "Catppuccin Latte",
@@ -931,6 +931,22 @@ pub const THEME_PRESETS: [ThemePreset; 22] = [
         panel: Some("#e9e6dc"),
     },
     ThemePreset {
+        name: "light-eink-mono",
+        description: "E-ink Paper (monochrome)",
+        // Strict grayscale: roles differ only in lightness, like a Kindle
+        // page. Best for color-blind use, grayscale panels, or anyone who
+        // wants syntax highlighting to stay out of the way.
+        background: Some("#f4f2ec"),
+        normal: Some("#1c1c1a"),
+        comment: Some("#7a7873"),
+        string: Some("#45443f"),
+        function: Some("#0f0f0e"),
+        error: Some("#2b2a27"),
+        diff_add: Some("#55534d"),
+        diff_delete: Some("#2b2a27"),
+        panel: Some("#e7e5de"),
+    },
+    ThemePreset {
         name: "light-github",
         description: "GitHub Light / Primer",
         background: Some("#ffffff"),
@@ -981,19 +997,6 @@ pub const THEME_PRESETS: [ThemePreset; 22] = [
         diff_add: Some("#98971a"),
         diff_delete: Some("#cc241d"),
         panel: Some("#3c3836"),
-    },
-    ThemePreset {
-        name: "dark-mariana",
-        description: "Sublime Text Mariana",
-        background: Some("#303841"),
-        normal: Some("#d8dee9"),
-        comment: Some("#a6acb9"),
-        string: Some("#fac761"),
-        function: Some("#6699cc"),
-        error: Some("#ec5f66"),
-        diff_add: Some("#99c794"),
-        diff_delete: Some("#ec5f66"),
-        panel: Some("#343d46"),
     },
     ThemePreset {
         name: "dark-monokai",
@@ -1124,19 +1127,6 @@ pub const THEME_PRESETS: [ThemePreset; 22] = [
         diff_add: Some("#9ece6a"),
         diff_delete: Some("#f7768e"),
         panel: Some("#24283b"),
-    },
-    ThemePreset {
-        name: "light-zellner",
-        description: "Vim Zellner",
-        background: Some("#ffffff"),
-        normal: Some("#000000"),
-        comment: Some("#ff0000"),
-        string: Some("#ff00ff"),
-        function: Some("#0000ff"),
-        error: Some("#ff0000"),
-        diff_add: Some("#5f875f"),
-        diff_delete: Some("#af5faf"),
-        panel: Some("#dadada"),
     },
 ];
 

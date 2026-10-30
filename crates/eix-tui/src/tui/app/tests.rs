@@ -152,7 +152,7 @@ fn explicit_session_ignores_saved_restore_state() {
         focused: Some("saved".into()),
         layout: WorkspaceLayout::Horizontal,
     });
-    assert_eq!(app.layout, PaneLayout::Grid);
+    assert_eq!(app.layout, PaneLayout::Fibonacci);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sessions = vec![
         Session::new("explicit", "explicit", cwd.clone()),
@@ -191,7 +191,7 @@ fn startup_creates_a_session_when_the_launch_directory_has_none() {
 #[test]
 fn adjacent_panes_share_one_border() {
     let area = Rect::new(0, 0, 100, 40);
-    let two = pane_rects(area, 2);
+    let two = layout_pane_rects(PaneLayout::Fibonacci, area, 2);
     assert!(pane_borders(&two, 0).contains(Borders::RIGHT));
     assert!(!pane_borders(&two, 1).contains(Borders::LEFT));
 
@@ -331,7 +331,7 @@ fn leader_h_opens_the_timeline_picker() {
 }
 
 #[test]
-fn leader_g_opens_the_session_picker() {
+fn leader_g_opens_git_while_leader_o_opens_sessions() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(SessionView::new(
@@ -342,6 +342,12 @@ fn leader_g_opens_the_session_picker() {
 
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
     app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+    let picker = app.picker.as_ref().expect("git picker");
+    assert_eq!(picker.kind, PickerKind::Git);
+    app.picker = None;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     let picker = app.picker.as_ref().expect("session picker");
     assert_eq!(picker.kind, PickerKind::Sessions);
 }
@@ -393,30 +399,6 @@ fn focused_pane_border_uses_the_accent_color() {
         "inactive pane border should stay muted"
     );
     assert_eq!(inactive.symbol(), "│");
-}
-
-#[test]
-fn pane_layouts_stay_inside_the_area() {
-    let area = Rect::new(0, 0, 100, 40);
-    for count in 1..=6 {
-        let rects = pane_rects(area, count);
-        assert_eq!(rects.len(), count);
-        for rect in rects {
-            assert!(rect.x >= area.x);
-            assert!(rect.y >= area.y);
-            assert!(rect.x + rect.width <= area.x + area.width);
-            assert!(rect.y + rect.height <= area.y + area.height);
-        }
-    }
-
-    let two = pane_rects(area, 2);
-    assert!(two[0].x < two[1].x);
-    assert_eq!(two[0].height, area.height);
-
-    let three = pane_rects(area, 3);
-    assert_eq!(three[0].height, area.height);
-    assert_eq!(three[1].x, three[2].x);
-    assert_eq!(three[1].width, three[2].width);
 }
 
 #[test]
@@ -676,6 +658,29 @@ fn ctrl_digits_switch_tabby_tabs_in_insert_mode() {
 }
 
 #[test]
+fn layout_cycle_walks_fibonacci_tabby_horizontal() {
+    let mut layout = PaneLayout::Fibonacci;
+    let mut seen = Vec::new();
+    for _ in 0..3 {
+        layout = layout.next();
+        seen.push(layout);
+    }
+    assert_eq!(
+        seen,
+        vec![
+            PaneLayout::Tabby,
+            PaneLayout::Horizontal,
+            PaneLayout::Fibonacci,
+        ]
+    );
+}
+
+#[test]
+fn new_apps_start_in_the_fibonacci_layout() {
+    assert_eq!(App::new(None).layout, PaneLayout::Fibonacci);
+}
+
+#[test]
 fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["a", "b", "c"]);
@@ -692,7 +697,7 @@ fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
         ('v', PaneLayout::Horizontal),
         ('t', PaneLayout::Tabby),
         ('r', PaneLayout::Fibonacci),
-        ('l', PaneLayout::Grid),
+        ('l', PaneLayout::Tabby),
     ] {
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(
@@ -704,13 +709,13 @@ fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
         assert_eq!(toast.text, format!("layout: {}", expected.label()));
         assert_eq!(toast.tone, ToastTone::Success);
     }
-    assert_eq!(app.status, "layout: grid");
+    assert_eq!(app.status, "layout: tabby");
     let rendered = render_text(&mut app, 80, 20);
     assert!(
         rendered
             .lines()
             .nth(1)
-            .is_some_and(|line| line.contains("layout: grid")),
+            .is_some_and(|line| line.contains("layout: tabby")),
         "{rendered}"
     );
 }
@@ -718,7 +723,6 @@ fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
 #[test]
 fn every_layout_renders_a_three_pane_session_set() {
     for layout in [
-        PaneLayout::Grid,
         PaneLayout::Horizontal,
         PaneLayout::Tabby,
         PaneLayout::Fibonacci,
@@ -847,7 +851,7 @@ fn leaving_tabby_layout_clears_tab_hit_boxes() {
     let _ = render_text(&mut app, 80, 20);
     assert!(!app.tab_areas.is_empty());
 
-    app.layout = PaneLayout::Grid;
+    app.layout = PaneLayout::Fibonacci;
     let _ = render_text(&mut app, 80, 20);
     assert!(app.tab_areas.is_empty());
 }
@@ -977,7 +981,7 @@ fn an_unread_tab_uses_the_success_colour_and_a_dot() {
 #[test]
 fn an_unread_pane_title_uses_the_success_colour_and_a_dot() {
     let mut app = app_with_panes(&["a", "b"]);
-    app.layout = PaneLayout::Grid;
+    app.layout = PaneLayout::Fibonacci;
     app.focused = 0;
     app.views[1].unread = true;
 
@@ -1551,28 +1555,19 @@ fn subagents_command_opens_the_live_child_picker() {
 }
 
 #[test]
-fn leader_i_opens_the_subagent_picker() {
+fn subagents_only_open_through_the_command() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["parent"]);
     app.focus = Focus::Transcript;
-
-    // Without children the shortcut falls back to the concurrency picker.
-    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
-    assert_eq!(
-        app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::Subagents)
-    );
-    assert!(!app.pending_leader);
-    app.picker = None;
-
     app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
-    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
-    assert_eq!(
-        app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::SubagentActivity)
-    );
+
+    // Subagents is low-frequency: no leader chord, only /subagents.
+    for ch in ['p', 'i'] {
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none(), "leader+{ch} should stay free");
+        assert!(!app.pending_leader, "leader+{ch} should clear the prefix");
+    }
 }
 
 #[test]
@@ -1867,12 +1862,12 @@ fn transcript_renders_chat_turns_and_thinking() {
         user.starts_with(' ') && user.contains("│ hi there │"),
         "user turn should be a right-aligned bubble: {user:?}"
     );
-    assert!(lines.iter().any(|line| line.contains("▾ Thinking")));
-    // Stored thinking is expanded by default.
-    assert!(rendered.contains("pondering"));
+    assert!(lines.iter().any(|line| line.contains("▸ Thinking")));
+    // Stored thinking is collapsed by default.
+    assert!(!rendered.contains("pondering"));
     let mut view = view;
-    view.folds.insert(FoldId::Event(2), false);
-    assert!(!render_transcript(&view, 40).contains("pondering"));
+    view.folds.insert(FoldId::Event(2), true);
+    assert!(render_transcript(&view, 40).contains("pondering"));
 }
 
 #[test]
@@ -2152,13 +2147,13 @@ fn cached_history_honors_fold_changes() {
     let mut app = App::new(None);
     app.views.push(SessionView::new(session, events));
     app.focused = 0;
-    let unfolded = render_text(&mut app, 60, 24);
-    assert!(unfolded.contains("hidden chain"), "{unfolded:?}");
-
-    app.views[0].folds.insert(FoldId::Event(2), false);
     let folded = render_text(&mut app, 60, 24);
     assert!(folded.contains("Thinking"));
-    assert!(!folded.contains("hidden chain"));
+    assert!(!folded.contains("hidden chain"), "{folded:?}");
+
+    app.views[0].folds.insert(FoldId::Event(2), true);
+    let unfolded = render_text(&mut app, 60, 24);
+    assert!(unfolded.contains("hidden chain"), "{unfolded:?}");
 }
 
 #[test]
@@ -2320,17 +2315,71 @@ fn expanded_tool_card_shows_the_full_long_command() {
 }
 
 #[test]
-fn transcript_streams_live_thinking() {
+fn transcript_streams_live_thinking_in_a_fixed_window() {
     let session = Session::new("s1", "chat", "/tmp");
     let mut view = SessionView::new(session, Vec::new());
     view.stream = Some(StreamState {
         turn_id: "t1".into(),
         text: String::new(),
+        reasoning: "first thought\nsecond thought".into(),
+    });
+    let short = render_transcript(&view, 40);
+    assert!(short.contains("Thinking…"), "{short}");
+    assert!(short.contains("first thought"), "{short}");
+    assert!(short.contains("second thought"), "{short}");
+    assert!(!short.contains('╭') && !short.contains('╰'), "{short}");
+    // Twelve fixed timeline rows, each with a rule or node prefix.
+    let timeline_rows = short
+        .lines()
+        .filter(|line| {
+            line.chars()
+                .nth(4)
+                .is_some_and(|cell| matches!(cell, '│' | '◦' | '·' | '▸' | '⋮'))
+        })
+        .count();
+    assert_eq!(timeline_rows, 12, "{short}");
+    assert!(short.contains("    ◦ "), "{short}");
+
+    // A long chain of thought keeps the same height and only shows its tail.
+    view.stream.as_mut().unwrap().reasoning = (1..=40)
+        .map(|line| format!("thought {line}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let long = render_transcript(&view, 40);
+    assert_eq!(short.lines().count(), long.lines().count(), "{long}");
+    assert!(long.contains("    ⋮ "), "{long}");
+    assert!(long.contains("thought 40"), "{long}");
+    assert!(!long.contains("thought 1\n"), "{long}");
+}
+
+#[test]
+fn thinking_timeline_nodes_follow_content() {
+    let session = Session::new("s1", "chat", "/tmp");
+    let mut view = SessionView::new(session, Vec::new());
+    view.stream = Some(StreamState {
+        turn_id: "t1".into(),
+        text: String::new(),
+        reasoning: "first thought\n\n## Plan\nmore detail\n\nnext paragraph".into(),
+    });
+    let rendered = render_transcript(&view, 40);
+    assert!(rendered.contains("    ◦ "), "{rendered}");
+    assert!(rendered.contains("    ▸ "), "{rendered}");
+    assert!(rendered.contains("    · "), "{rendered}");
+}
+
+#[test]
+fn live_thinking_collapses_once_the_answer_starts() {
+    let session = Session::new("s1", "chat", "/tmp");
+    let mut view = SessionView::new(session, Vec::new());
+    view.stream = Some(StreamState {
+        turn_id: "t1".into(),
+        text: "the answer".into(),
         reasoning: "thinking out loud".into(),
     });
     let rendered = render_transcript(&view, 40);
-    assert!(rendered.contains("Thinking…"));
-    assert!(rendered.contains("thinking out loud"));
+    assert!(rendered.contains("▸ Thinking"), "{rendered}");
+    assert!(!rendered.contains("thinking out loud"), "{rendered}");
+    assert!(rendered.contains("the answer"), "{rendered}");
 }
 
 #[test]
@@ -3048,6 +3097,153 @@ fn approval_keys_answer_the_focused_pane() {
     assert!(app.approvals.contains_key("s1"));
 }
 
+#[test]
+fn reason_prompt_uses_its_own_dialog_above_the_composer() {
+    let (mut app, tx, _rx) = app_with_diff(None);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &tx);
+    for ch in "这个改动超出范围".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+
+    let rendered = render_text(&mut app, 60, 20);
+    let lines: Vec<&str> = rendered.lines().collect();
+    // Exactly one dialog: the old implementation reused the composer title and
+    // the prompt body, which is what produced the overlap/garbling.
+    assert_eq!(rendered.matches("deny reason").count(), 1, "{rendered}");
+    // The approval card is still fully readable above the editor.
+    assert!(rendered.contains("Deny with reason…"), "{rendered}");
+
+    let title = lines
+        .iter()
+        .position(|line| line.contains("deny reason"))
+        .expect("reason dialog");
+    let text = lines
+        .iter()
+        .position(|line| line.contains('这') && line.contains('围'))
+        .expect("typed reason");
+    assert!(title < text, "{rendered}");
+    // The dialog replaces the composer slot: its bottom border is immediately
+    // followed by the status bar, with no composer row bleeding through.
+    let bottom = lines
+        .iter()
+        .position(|line| line.contains("Enter denies"))
+        .expect("reason dialog footer");
+    assert!(bottom > text, "{rendered}");
+    let next = lines
+        .iter()
+        .skip(bottom + 1)
+        .find(|line| !line.trim().is_empty())
+        .expect("status bar below the reason dialog");
+    assert!(
+        next.contains("Build"),
+        "unexpected row: {next:?}\n{rendered}"
+    );
+}
+
+#[test]
+fn reason_prompt_edits_multibyte_text_and_enter_denies() {
+    let (mut app, tx, mut rx) = app_with_diff(None);
+    app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE), &tx);
+    for ch in "下载太慢".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+    // Backspace must remove one whole character, not one byte.
+    app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE), &tx);
+    // Cursor motion is by character too, so the insert lands before 太.
+    app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('很'), KeyModifiers::NONE), &tx);
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+    match rx.try_recv().expect("approval command") {
+        Command::Approval {
+            session_id,
+            approval_id,
+            decision,
+            reason,
+            ..
+        } => {
+            assert_eq!(session_id, "s1");
+            assert_eq!(approval_id, "a1");
+            assert_eq!(decision, ApprovalDecision::Deny);
+            assert_eq!(reason.as_deref(), Some("下载很太"));
+        }
+        _ => panic!("expected a denial command"),
+    }
+    assert!(app.reason_prompt.is_none());
+}
+
+#[test]
+fn a_stale_leader_prefix_does_not_swallow_the_approval_key() {
+    let (mut app, tx, mut rx) = app_with_diff(None);
+    // The user tapped the leader just before the card arrived.
+    app.pending_leader = true;
+
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+
+    assert!(!app.pending_leader);
+    match rx.try_recv().expect("approval command") {
+        Command::Approval { decision, .. } => assert_eq!(decision, ApprovalDecision::Approve),
+        _ => panic!("expected an approval command"),
+    }
+}
+
+#[test]
+fn stale_approval_response_reloads_the_live_card() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut session = Session::new("s1", "tools", "/tmp");
+    session.status = SessionStatus::AwaitingApproval;
+    let live = SessionEvent::new(
+        "s1",
+        1,
+        EventKind::ApprovalRequired,
+        serde_json::json!({
+            "approval_id": "a2",
+            "call_id": "c2",
+            "tool": "exec_command",
+            "summary": "exec_command: ls",
+            "arguments": {"cmd": "ls"},
+        }),
+    );
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(session, vec![live]));
+    app.focused = 0;
+    app.focus = Focus::Transcript;
+    // The card still points at the request that was just superseded.
+    app.approvals.insert(
+        "s1".to_string(),
+        PendingApproval {
+            kind: PendingKind::Tool,
+            approval_id: "a1".to_string(),
+            call_id: "c1".to_string(),
+            tool: "exec_command".to_string(),
+            summary: "$ ls".to_string(),
+            diff: None,
+            path: None,
+            hunks: Vec::new(),
+            selected: Vec::new(),
+            cursor: 0,
+        },
+    );
+
+    app.handle_event(
+        Event::Approval {
+            approval_id: "a1".to_string(),
+            accepted: false,
+        },
+        &tx,
+    );
+
+    let pending = app.approvals.get("s1").expect("card reloaded");
+    assert_eq!(pending.approval_id, "a2");
+    // Enter now answers the live request instead of resending the dead id.
+    app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
+    match rx.try_recv().expect("approval command") {
+        Command::Approval { approval_id, .. } => assert_eq!(approval_id, "a2"),
+        _ => panic!("expected an approval command"),
+    }
+}
+
 fn app_with_diff(
     diff: Option<&str>,
 ) -> (
@@ -3413,7 +3609,7 @@ fn opening_processes_sends_a_list_request_and_closes_with_q() {
         Vec::new(),
     ));
     app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_transcript_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &tx);
     assert!(app.process_view.is_some());
     assert!(rx.try_recv().is_ok());
 
@@ -4102,7 +4298,7 @@ fn session_picker_preview_requests_the_selected_session_history() {
         Session::new("s2", "two", "/tmp"),
     ];
     app.picker = Some(Picker {
-        kind: PickerKind::NewPane,
+        kind: PickerKind::Sessions,
         query: String::new(),
         selected: 0,
         provider: None,
@@ -4143,7 +4339,7 @@ fn session_picker_preview_renders_markdown_and_display_math() {
     let mut app = App::new(None);
     app.sessions = vec![Session::new("s1", "one", "/tmp")];
     app.picker = Some(Picker {
-        kind: PickerKind::NewPane,
+        kind: PickerKind::Sessions,
         query: String::new(),
         selected: 0,
         provider: None,
@@ -4191,7 +4387,7 @@ fn session_picker_hides_subagents_and_marks_worktrees_before_ids() {
     child.parent_id = Some("s1".into());
     app.sessions = vec![Session::new("s1", "normal", "/tmp"), worktree, child];
 
-    app.open_picker(PickerKind::NewPane, &tx);
+    app.open_picker(PickerKind::Sessions, &tx);
     let filtered = app.picker_filtered();
     assert_eq!(filtered, vec![0, 1]);
     assert_eq!(app.picker.as_ref().unwrap().selected, 0);
@@ -4527,7 +4723,7 @@ fn help_overlay_renders_section_rules() {
     app.open_help();
 
     let text = render_text(&mut app, 120, 40);
-    assert!(text.contains("▍ prompt commands"), "{text}");
+    assert!(text.contains("▍ common"), "{text}");
     assert!(text.contains("type to search"), "{text}");
     assert!(text.contains("help ·"), "{text}");
 }
@@ -4571,7 +4767,7 @@ fn help_key_descriptions_align() {
     };
     assert_eq!(
         column(long, "horizontal"),
-        column(short, "cycle grid"),
+        column(short, "cycle fibonacci"),
         "{text}"
     );
 }
@@ -5418,7 +5614,7 @@ fn transcript_leader_matches_the_prompt_leader() {
     assert_eq!(app.status, "no pending approvals");
 
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
         Some(PickerKind::Git)
@@ -5525,12 +5721,12 @@ fn transcript_pane_requires_leader_for_pane_actions_except_q() {
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::NewPane)
+        Some(PickerKind::Sessions)
     ));
 
     app.picker = None;
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &tx);
     assert!(app.process_view.is_some());
 
     // Ctrl-P opens the command palette from the transcript.
@@ -5736,7 +5932,7 @@ fn q_closes_the_focused_pane_and_never_quits_on_the_last() {
 }
 
 #[test]
-fn leader_c_closes_the_focused_pane() {
+fn leader_c_opens_the_colorscheme_picker() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(SessionView::new(
@@ -5753,7 +5949,11 @@ fn leader_c_closes_the_focused_pane() {
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
     app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &tx);
 
-    assert_eq!(app.views.len(), 1);
+    assert_eq!(app.views.len(), 2, "leader+c no longer closes the pane");
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Themes)
+    );
 }
 
 #[test]
@@ -5820,7 +6020,7 @@ fn prompt_normal_mode_matches_transcript_for_tui_actions() {
         ],
         vec![
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
         ],
         vec![
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
@@ -5872,17 +6072,24 @@ fn config_remaps_global_and_leader_actions() {
         ("quit".to_string(), "C-x".to_string()),
     ]));
 
-    // Ctrl-G is no longer a default, and the sessions override removes the
-    // leader-g default too. Ctrl-T wins over reasoning because overrides
-    // are matched first.
+    // Ctrl-G is no longer a default, and the sessions override replaces the
+    // leader-o default. Leader-g still opens the git picker. Ctrl-T wins over
+    // reasoning because overrides are matched first.
     app.handle_key(
         KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
         &tx,
     );
     assert!(app.picker.is_none());
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     assert!(app.picker.is_none());
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+    assert!(matches!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Git)
+    ));
+    app.picker = None;
     app.handle_key(
         KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
         &tx,
@@ -5892,6 +6099,9 @@ fn config_remaps_global_and_leader_actions() {
         Some(PickerKind::Sessions)
     ));
     app.picker = None;
+    // Picker queries queued while the overlays opened must not mask the
+    // Create command below.
+    while rx.try_recv().is_ok() {}
 
     // Leader actions can be remapped independently of the prefix.
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
@@ -6305,7 +6515,7 @@ fn ctrl_w_still_deletes_a_word_in_insert_mode() {
 }
 
 #[test]
-fn leader_o_opens_the_new_pane_picker() {
+fn leader_o_opens_the_session_picker() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.focus_input();
@@ -6315,12 +6525,40 @@ fn leader_o_opens_the_new_pane_picker() {
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::NewPane)
+        Some(PickerKind::Sessions)
     ));
 }
 
 #[test]
-fn new_command_opens_the_new_pane_picker_instead_of_creating_a_session() {
+fn session_picker_focuses_open_sessions_and_opens_the_rest_in_new_panes() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(session_pane("s1", "one"));
+    app.views.push(session_pane("s2", "two"));
+    app.focused = 1;
+    app.sessions = vec![
+        Session::new("s1", "one", "/tmp"),
+        Session::new("s3", "three", "/tmp"),
+    ];
+
+    // Already open: focus its pane instead of attaching a duplicate pane.
+    app.open_picker(PickerKind::Sessions, &tx);
+    app.picker_enter(PickerKind::Sessions, &tx);
+    assert!(app.picker.is_none());
+    assert_eq!(app.focused, 0);
+    assert_eq!(app.status, "session is already open");
+    assert!(rx.try_recv().is_err(), "focusing must not attach again");
+
+    // Not open yet: one picker entry opens it in a new pane.
+    app.open_picker(PickerKind::Sessions, &tx);
+    let picker = app.picker.as_mut().expect("session picker");
+    picker.selected = 1;
+    app.picker_enter(PickerKind::Sessions, &tx);
+    assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "s3"));
+}
+
+#[test]
+fn new_alias_opens_the_session_picker_instead_of_creating_a_session() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(session_pane("s1", "one"));
@@ -6331,7 +6569,7 @@ fn new_command_opens_the_new_pane_picker_instead_of_creating_a_session() {
     app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::NewPane)
+        Some(PickerKind::Sessions)
     ));
     while let Ok(command) = rx.try_recv() {
         assert!(
@@ -7806,14 +8044,121 @@ fn attention_queue_and_keys_are_no_longer_prompt_commands() {
 }
 
 #[test]
+fn fzf_command_opens_the_file_picker_and_files_stays_an_alias() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+
+    assert!(app.handle_prompt_command("/fzf", &tx));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Files)
+    );
+    app.picker = None;
+
+    assert!(app.handle_prompt_command("/files", &tx));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Files)
+    );
+}
+
+#[test]
 fn command_palette_mirrors_the_slash_command_menu() {
     let commands = builtin_commands();
-    let items = command_items(&commands);
+    let items: Vec<PickerItem> = command_items(&commands)
+        .into_iter()
+        .filter(|item| !is_command_header(item))
+        .collect();
     assert_eq!(items.len(), commands.len());
-    for (item, spec) in items.iter().zip(commands.iter()) {
-        assert_eq!(item.value, spec.name);
+    for spec in &commands {
+        let item = items
+            .iter()
+            .find(|item| item.value == spec.name)
+            .unwrap_or_else(|| panic!("/{} is missing from the palette", spec.name));
         assert_eq!(item.label, command_label(spec, "/"));
         assert_eq!(item.detail.as_deref(), Some(spec.description.as_str()));
+    }
+}
+
+#[test]
+fn command_palette_navigation_skips_category_headers() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+    app.focus = Focus::Transcript;
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        &tx,
+    );
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Commands)
+    );
+    assert_eq!(app.selected_picker_value().as_deref(), Some("help"));
+
+    // Walking the whole list never lands on a category header.
+    for _ in 0..builtin_commands().len() {
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        assert!(
+            app.selected_picker_value().is_some(),
+            "selection landed on a category header"
+        );
+    }
+
+    // Filtering hides headers instead of fuzzy-matching their titles.
+    for ch in "fzf".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+    let filtered = app.picker_filtered();
+    assert!(!filtered.is_empty());
+    assert!(filtered
+        .iter()
+        .all(|&index| !is_command_header(&app.picker.as_ref().unwrap().items[index])));
+}
+
+#[test]
+fn command_palette_groups_common_first() {
+    let items = command_items(&builtin_commands());
+    let headers: Vec<&str> = items
+        .iter()
+        .filter(|item| is_command_header(item))
+        .map(|item| item.label.as_str())
+        .collect();
+    assert_eq!(
+        headers,
+        vec![
+            "common",
+            "files & search",
+            "conversation",
+            "sessions",
+            "tools",
+            "review",
+            "settings",
+        ]
+    );
+    // The first row is a header, and every header has commands after it.
+    assert!(is_command_header(&items[0]));
+    assert!(!is_command_header(&items[1]));
+    // Common commands lead the list.
+    assert_eq!(items[1].value, "help");
+}
+
+#[test]
+fn help_documents_every_builtin_command() {
+    let documented: Vec<&str> = HELP_SECTIONS
+        .iter()
+        .filter(|section| section.scope == "commands")
+        .flat_map(|section| section.entries.iter())
+        .map(|entry| entry.key)
+        .collect();
+    for spec in builtin_commands() {
+        let bare = format!("/{}", spec.name);
+        assert!(
+            documented
+                .iter()
+                .any(|key| *key == bare || key.starts_with(&format!("{bare} "))),
+            "{bare} is missing from /help"
+        );
     }
 }
 
@@ -7835,9 +8180,14 @@ fn help_opens_filtered_references_and_scoped_keys_help() {
     assert_eq!(app.help_query, "space");
     let rows = help_rows_in(&app.help_query, app.help_scope);
     assert!(!rows.is_empty());
+    let key_titles: Vec<&str> = HELP_SECTIONS
+        .iter()
+        .filter(|section| section.scope == "keys")
+        .map(|section| section.title)
+        .collect();
     assert!(rows.iter().all(|row| !matches!(
         row,
-        HelpRow::Section(title) if *title != "keys"
+        HelpRow::Section(title) if !key_titles.contains(title)
     )));
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
@@ -8708,26 +9058,21 @@ fn tab_and_shift_tab_cycle_every_session_mode() {
 }
 
 #[test]
-fn leader_m_still_opens_the_full_mode_picker() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+fn leader_m_no_longer_opens_the_mode_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["s1"]);
     app.focus = Focus::Transcript;
+    let mode = app.focused_view().map(|view| view.session.mode);
 
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
     app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), &tx);
-    let picker = app.picker.as_ref().expect("mode picker");
-    assert_eq!(picker.kind, PickerKind::Modes);
-    let values: Vec<&str> = picker
-        .items
-        .iter()
-        .map(|item| item.value.as_str())
-        .collect();
-    assert_eq!(values, ["plan", "build", "auto", "full"]);
-    assert!(
-        rx.try_recv().is_err(),
-        "opening the picker must not change the mode"
+
+    assert!(app.picker.is_none(), "leader+m should stay free");
+    assert_eq!(
+        app.focused_view().map(|view| view.session.mode),
+        mode,
+        "leader+m must not change the mode"
     );
-    assert!(app.status.starts_with("mode: "), "{}", app.status);
 }
 
 #[test]
@@ -9030,7 +9375,6 @@ fn status_feedback_uses_top_right_toasts() {
         "retrying 2/5",
         "model: loading provider catalogs…",
         "approvals · Enter opens · y/n answer · Esc closes",
-        "layout: grid",
         "mode: full",
         "pane closed",
         "no tasks",
@@ -9140,7 +9484,6 @@ fn warning_status_filter_is_narrow() {
         "rate limited · retrying 1/5 in 4.0s",
         "model: loading provider catalogs…",
         "approvals · Enter opens · y/n answer · Esc closes",
-        "layout: grid",
         "mode → Build",
         "pane closed",
         "session created",

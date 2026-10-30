@@ -198,6 +198,28 @@ impl App {
         self.approval_rev = self.approval_rev.wrapping_add(1);
     }
 
+    /// Rebuild the card(s) that received a stale response. The daemon keeps
+    /// one live request per session, so re-reading the log replaces the dead
+    /// card with the request it is actually waiting for (or removes it).
+    pub(super) fn reload_stale_approval(&mut self, approval_id: &str) {
+        let mut sessions: Vec<String> = self
+            .approvals
+            .iter()
+            .filter(|(_, pending)| pending.approval_id == approval_id)
+            .map(|(session_id, _)| session_id.clone())
+            .collect();
+        if sessions.is_empty() {
+            // The card may have already been replaced locally; refresh the
+            // focused session so the next Enter targets a live approval.
+            if let Some(session_id) = self.focused_view().map(|view| view.session.id.clone()) {
+                sessions.push(session_id);
+            }
+        }
+        for session_id in sessions {
+            self.reload_pending(&session_id);
+        }
+    }
+
     /// Recompute the cached question for a session from its replayable log.
     pub(super) fn reload_input(&mut self, session_id: &str) {
         let next = self
@@ -499,9 +521,85 @@ impl App {
         };
         self.reason_prompt = Some(ReasonPrompt {
             session_id,
-            text: String::new(),
+            input: CmdLine::new(' '),
         });
         self.status = "reason for denial · Enter to deny · Esc to cancel".into();
+    }
+
+    /// Route keys while the deny-reason editor is open. It behaves like the
+    /// `:` line: Vim-style cursor motion, multibyte-safe deletion, and Enter
+    /// sends the denial.
+    pub(super) fn handle_reason_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Esc => {
+                self.reason_prompt = None;
+                self.status = "denial cancelled".into();
+            }
+            KeyCode::Enter => {
+                if let Some(prompt) = self.reason_prompt.take() {
+                    let reason = prompt.input.text.trim().to_string();
+                    self.respond_approval_for(
+                        &prompt.session_id,
+                        ApprovalDecision::Deny,
+                        None,
+                        (!reason.is_empty()).then_some(reason),
+                        tx,
+                    );
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.backspace();
+                }
+            }
+            KeyCode::Delete => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.delete();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.right();
+                }
+            }
+            KeyCode::Home => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.home();
+                }
+            }
+            KeyCode::End => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.end();
+                }
+            }
+            KeyCode::Char('u') if ctrl => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.kill_to_start();
+                }
+            }
+            KeyCode::Char('k') if ctrl => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.kill_to_end();
+                }
+            }
+            KeyCode::Char('w') if ctrl => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.kill_word();
+                }
+            }
+            KeyCode::Char(ch) if !ctrl => {
+                if let Some(prompt) = self.reason_prompt.as_mut() {
+                    prompt.input.insert_char(ch);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Write the staged content to a temp file, let the user edit it, and send

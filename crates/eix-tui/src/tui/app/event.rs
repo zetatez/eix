@@ -211,7 +211,7 @@ impl App {
                 }
                 if let Some(session_id) = jump {
                     self.views[index].selection = None;
-                    self.open_session_id_in_new_pane(session_id, tx);
+                    self.open_or_focus_session_id(session_id, tx);
                 } else if let Some(fold) = fold {
                     self.views[index].folds.insert(fold.id, !fold.open);
                     self.views[index].selection = None;
@@ -1177,7 +1177,12 @@ impl App {
                     }
                     self.status = "approval sent".into();
                 } else {
-                    self.status = "approval was stale; the daemon is still waiting".into();
+                    // The daemon rejected this id (another client answered
+                    // first, or the card was already superseded). Rebuild it
+                    // from the log so the next Enter/y targets the live
+                    // request instead of a dead id that never resolves.
+                    self.reload_stale_approval(&approval_id);
+                    self.status = "approval was stale; showing the current request".into();
                 }
             }
             Event::InputResponded { accepted } => {
@@ -1302,6 +1307,12 @@ impl App {
         }
         if self.pending_leader {
             self.restore_leader_status();
+            // A blocking card may appear while a leader prefix is still
+            // pending. The card owns Enter/y/n, and another leader cannot start
+            // under it, so the stale prefix must not swallow the answer.
+            if self.focused_approval().is_some() || self.focused_input().is_some() {
+                self.pending_leader = false;
+            }
         }
         // Quit works from every mode, including insert and any open overlay.
         // Save the draft first so quitting never loses it.
@@ -1406,35 +1417,7 @@ impl App {
         }
 
         if self.reason_prompt.is_some() {
-            match key.code {
-                KeyCode::Esc => {
-                    self.reason_prompt = None;
-                    self.status = "denial cancelled".into();
-                }
-                KeyCode::Enter => {
-                    if let Some(prompt) = self.reason_prompt.take() {
-                        let reason = prompt.text.trim().to_string();
-                        self.respond_approval_for(
-                            &prompt.session_id,
-                            ApprovalDecision::Deny,
-                            None,
-                            (!reason.is_empty()).then_some(reason),
-                            tx,
-                        );
-                    }
-                }
-                KeyCode::Backspace => {
-                    if let Some(prompt) = self.reason_prompt.as_mut() {
-                        prompt.text.pop();
-                    }
-                }
-                KeyCode::Char(ch) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if let Some(prompt) = self.reason_prompt.as_mut() {
-                        prompt.text.push(ch);
-                    }
-                }
-                _ => {}
-            }
+            self.handle_reason_key(key, tx);
             return;
         }
 
@@ -1518,7 +1501,7 @@ impl App {
             if available {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/g/s · i subagents · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
+                self.status = "leader: f/g/s · n new · o sessions · v/t/r/l layout · a approvals · c colorscheme · Esc cancel"
                     .into();
             }
             return true;
@@ -1891,11 +1874,9 @@ impl App {
             KeyAction::NewSession => self.run_action("new-session", tx),
             KeyAction::NewWorktree => self.run_action("new-worktree", tx),
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
-            KeyAction::NewPane => self.run_action("new", tx),
             KeyAction::Palette => self.run_action("commands", tx),
-            KeyAction::Files => self.run_action("files", tx),
+            KeyAction::Files => self.run_action("fzf", tx),
             KeyAction::Grep => self.run_action("grep", tx),
-            KeyAction::Subagents => self.open_subagents(tx),
             KeyAction::Models => self.run_action("model", tx),
             KeyAction::Git => self.run_action("git", tx),
             KeyAction::Processes => self.run_action("processes", tx),
@@ -1927,6 +1908,7 @@ impl App {
             }
             KeyAction::ClosePane => self.run_action("close-pane", tx),
             KeyAction::ModePicker => self.run_action("mode", tx),
+            KeyAction::Colorscheme => self.run_action("colorscheme", tx),
             KeyAction::LayoutHorizontal => self.run_action("layout-horizontal", tx),
             KeyAction::LayoutTabby => self.run_action("layout-tabby", tx),
             KeyAction::LayoutFibonacci => self.run_action("layout-fibonacci", tx),

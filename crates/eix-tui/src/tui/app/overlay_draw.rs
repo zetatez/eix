@@ -256,6 +256,62 @@ impl App {
         );
     }
 
+    /// Deny-reason editor. It takes the composer's place so it can never
+    /// overlap the prompt, and the approval card above stays fully visible.
+    pub(super) fn draw_reason_prompt(&self, frame: &mut Frame, input_area: Rect) {
+        let Some(prompt) = self.reason_prompt.as_ref() else {
+            return;
+        };
+        let height = 3u16;
+        if input_area.width < 16 || input_area.height < height {
+            return;
+        }
+        let theme = self.theme;
+        let panel = dialog_background(theme);
+        let warn = composer_warn(theme);
+        // Clear the composer chrome and content first; the dialog occupies the
+        // bottom rows of the same slot.
+        frame.render_widget(Clear, input_area);
+        frame.render_widget(
+            Block::default().style(Style::default().bg(panel)),
+            input_area,
+        );
+        let width = input_area.width.min(88);
+        let rect = Rect::new(
+            input_area.x,
+            input_area.y + input_area.height - height,
+            width,
+            height,
+        );
+        let inner = width.saturating_sub(2) as usize;
+
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(warn).bg(panel))
+            .style(Style::default().bg(panel))
+            .title(Span::styled(
+                " deny reason ",
+                Style::default()
+                    .fg(warn)
+                    .bg(panel)
+                    .add_modifier(Modifier::BOLD),
+            ))
+            .title_bottom(Span::styled(
+                " Enter denies · Esc cancels ",
+                Style::default().fg(composer_muted(theme)).bg(panel),
+            ));
+        let (visible, caret) = reason_window(&prompt.input.text, prompt.input.cursor, inner);
+        let line = Line::from(Span::styled(
+            visible,
+            Style::default().fg(composer_text(theme)).bg(panel),
+        ));
+        frame.render_widget(Paragraph::new(line).block(block), rect);
+
+        let x = rect.x + 1 + caret.min(inner.saturating_sub(1) as u16);
+        frame.set_cursor_position((x, rect.y + 1));
+    }
+
     pub(super) fn draw_diff_view(&mut self, frame: &mut Frame, area: Rect) {
         let theme = self.theme;
         let dialog_bg = dialog_background(theme);
@@ -747,10 +803,8 @@ impl App {
                 // Session previews are conversations: keep the newest lines
                 // in view instead of showing the oldest part of the fetched
                 // window.
-                if matches!(
-                    kind,
-                    PickerKind::Sessions | PickerKind::NewPane | PickerKind::SubagentActivity
-                ) && wrapped.len() > height
+                if matches!(kind, PickerKind::Sessions | PickerKind::SubagentActivity)
+                    && wrapped.len() > height
                 {
                     wrapped.drain(..wrapped.len() - height);
                 }
@@ -831,7 +885,7 @@ impl App {
                     })
                     .collect()
             }
-            PickerKind::Sessions | PickerKind::NewPane => {
+            PickerKind::Sessions => {
                 let open_panes: Vec<Option<usize>> = self
                     .sessions
                     .iter()
@@ -940,6 +994,14 @@ impl App {
                     .iter()
                     .filter_map(|&index| picker.items.get(index))
                     .map(|item| {
+                        if kind == PickerKind::Commands && is_command_header(item) {
+                            return ListItem::new(Line::from(Span::styled(
+                                format!("▍ {}", item.label),
+                                Style::default()
+                                    .fg(composer_accent(self.theme))
+                                    .add_modifier(Modifier::BOLD),
+                            )));
+                        }
                         let label = match kind {
                             PickerKind::Models | PickerKind::PlanModels => {
                                 pad_to(&truncate(&item.label, model_width), model_width)
@@ -985,9 +1047,7 @@ impl App {
             return;
         };
         let value = match picker.kind {
-            PickerKind::Sessions | PickerKind::NewPane => {
-                self.sessions.get(index).map(|session| session.id.clone())
-            }
+            PickerKind::Sessions => self.sessions.get(index).map(|session| session.id.clone()),
             PickerKind::Files => picker.items.get(index).map(|item| item.value.clone()),
             _ => None,
         };
@@ -1120,7 +1180,7 @@ impl App {
                 }
                 Some(preview)
             }
-            PickerKind::Sessions | PickerKind::NewPane => {
+            PickerKind::Sessions => {
                 let text = {
                     let picker = self.picker.as_ref()?;
                     if picker.preview.rendered_width == width {
@@ -1208,7 +1268,7 @@ impl App {
                 }
                 vec!["select a sub-agent".into()]
             }
-            PickerKind::Sessions | PickerKind::NewPane => {
+            PickerKind::Sessions => {
                 if let Some(text) = &picker.preview.text {
                     return preview_tail(text, height);
                 }
@@ -1515,7 +1575,7 @@ fn preview_head(text: &str, height: usize) -> Vec<String> {
 ///
 /// The daemon sends `{line:>4} │ {text}`. The gutter is split off so only the
 /// source text reaches the highlighter. Each source line stays on one row: the
-/// pane clips long lines on the right instead of wrapping them, so `/files`
+/// pane clips long lines on the right instead of wrapping them, so `/fzf`
 /// previews keep the file's real line numbers aligned.
 pub(super) fn file_preview_rendered(path: &str, text: &str, theme: Theme) -> PreviewRendered {
     let mut highlighter = CodeHighlighter::new(path, theme);
@@ -1617,4 +1677,47 @@ fn unified_review_body(
         }
     }
     body
+}
+
+/// Visible slice of the deny-reason buffer and the caret column inside it.
+/// Keeps the caret on screen: long reasons scroll horizontally instead of
+/// being clipped at the right edge. A leading `…` marks hidden text.
+fn reason_window(text: &str, cursor: usize, width: usize) -> (String, u16) {
+    let chars: Vec<char> = text.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let width = width.max(1);
+    let char_width = |ch: char| UnicodeWidthChar::width(ch).unwrap_or(0);
+    let tail_width =
+        |start: usize| -> usize { chars[start..].iter().map(|ch| char_width(*ch)).sum() };
+
+    // Prefer showing the tail; stop scrolling once the caret would fall behind
+    // the window's left edge.
+    let mut start = 0usize;
+    while start < cursor && tail_width(start) + usize::from(start > 0) > width {
+        start += 1;
+    }
+
+    let prefix = start > 0;
+    let mut used = usize::from(prefix);
+    let mut end = start;
+    while end < chars.len() {
+        let next = used + char_width(chars[end]);
+        if next > width {
+            break;
+        }
+        used = next;
+        end += 1;
+    }
+
+    let mut visible = String::new();
+    if prefix {
+        visible.push('…');
+    }
+    visible.extend(chars[start..end].iter());
+    let hidden_caret = chars[start..cursor.min(end)]
+        .iter()
+        .map(|ch| char_width(*ch))
+        .sum::<usize>();
+    let caret = usize::from(prefix) + hidden_caret;
+    (visible, caret as u16)
 }

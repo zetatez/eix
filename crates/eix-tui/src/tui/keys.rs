@@ -15,11 +15,9 @@ pub enum KeyAction {
     NewSession,
     NewWorktree,
     Sessions,
-    NewPane,
     Palette,
     Files,
     Grep,
-    Subagents,
     Models,
     Git,
     Processes,
@@ -41,6 +39,7 @@ pub enum KeyAction {
     Redo,
     ClosePane,
     ModePicker,
+    Colorscheme,
     LayoutHorizontal,
     LayoutTabby,
     LayoutFibonacci,
@@ -66,12 +65,10 @@ impl KeyAction {
             "help" => Self::Help,
             "new_session" | "new" => Self::NewSession,
             "new_worktree" => Self::NewWorktree,
-            "sessions" => Self::Sessions,
-            "new_pane" => Self::NewPane,
+            "sessions" | "new_pane" => Self::Sessions,
             "palette" | "commands" => Self::Palette,
-            "files" => Self::Files,
+            "files" | "fzf" => Self::Files,
             "grep" => Self::Grep,
-            "subagents" | "subagent" => Self::Subagents,
             "model" | "models" => Self::Models,
             "git" | "worktrees" | "branches" => Self::Git,
             "processes" | "ps" => Self::Processes,
@@ -93,6 +90,7 @@ impl KeyAction {
             "redo" => Self::Redo,
             "close_pane" => Self::ClosePane,
             "mode" | "perm" => Self::ModePicker,
+            "colorscheme" | "theme" => Self::Colorscheme,
             "layout_horizontal" => Self::LayoutHorizontal,
             "layout_tabby" => Self::LayoutTabby,
             "layout_fibonacci" => Self::LayoutFibonacci,
@@ -153,7 +151,8 @@ impl Default for Keybinds {
 impl Keybinds {
     /// Built-in defaults, then the `[keys]` overrides. Configuring an action
     /// replaces all of that action's default bindings; it does not add an alias.
-    /// `leader` changes the leader prefix itself.
+    /// A value may list several comma-separated keys (`"Ctrl-c, Ctrl-d, Z"`), each
+    /// getting its own scope. `leader` changes the leader prefix itself.
     pub fn from_config(config: &BTreeMap<String, String>) -> Self {
         let mut leader = parse_key("Space").expect("Space is a valid key");
         if let Some(spec) = config
@@ -175,11 +174,12 @@ impl Keybinds {
             let Some(action) = KeyAction::parse(name) else {
                 continue;
             };
-            let Some(binding) = parse_binding(spec, action) else {
+            let bindings = parse_bindings(spec, action);
+            if bindings.is_empty() {
                 continue;
-            };
+            }
             overridden.insert(action);
-            overrides.push(binding);
+            overrides.extend(bindings);
         }
 
         let defaults = default_bindings()
@@ -280,18 +280,15 @@ fn default_bindings() -> Vec<Binding> {
     for (action, spec) in [
         (KeyAction::NewSession, "n"),
         (KeyAction::NewWorktree, "W"),
-        (KeyAction::NewPane, "o"),
+        (KeyAction::Sessions, "o"),
         (KeyAction::Files, "f"),
         (KeyAction::Grep, "s"),
-        (KeyAction::Subagents, "i"),
-        (KeyAction::Sessions, "g"),
+        (KeyAction::Git, "g"),
         (KeyAction::Timeline, "h"),
-        (KeyAction::Git, "G"),
-        (KeyAction::Processes, "p"),
+        (KeyAction::Processes, "b"),
         (KeyAction::Inbox, "a"),
         (KeyAction::Cancel, "x"),
-        (KeyAction::ClosePane, "c"),
-        (KeyAction::ModePicker, "m"),
+        (KeyAction::Colorscheme, "c"),
         (KeyAction::LayoutHorizontal, "v"),
         (KeyAction::LayoutTabby, "t"),
         (KeyAction::LayoutFibonacci, "r"),
@@ -323,6 +320,12 @@ fn push_leader(bindings: &mut Vec<Binding>, action: KeyAction, spec: &str) {
             leader: true,
         });
     }
+}
+
+fn parse_bindings(spec: &str, action: KeyAction) -> Vec<Binding> {
+    spec.split(',')
+        .filter_map(|part| parse_binding(part, action))
+        .collect()
 }
 
 fn parse_binding(spec: &str, action: KeyAction) -> Option<Binding> {
@@ -406,7 +409,7 @@ fn is_bare_letter(key: KeyEvent) -> bool {
             .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
 }
 
-/// Parse `C-x`, `S-Tab`, `A-Enter`, `Space`, `F2`, or a single character.
+/// Parse `Ctrl-x` (or the `C-x` shorthand), `S-Tab`, `A-Enter`, `Space`, `F2`, or a single character.
 pub fn parse_key(spec: &str) -> Option<KeyEvent> {
     let spec = spec.trim();
     if spec.is_empty() {
@@ -490,6 +493,10 @@ mod tests {
             Some(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
         );
         assert_eq!(
+            parse_key("Ctrl-x"),
+            Some(key(KeyCode::Char('x'), KeyModifiers::CONTROL))
+        );
+        assert_eq!(
             parse_key("S-Tab"),
             Some(key(KeyCode::Tab, KeyModifiers::SHIFT))
         );
@@ -546,23 +553,37 @@ mod tests {
         );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(KeyAction::Git)
+        );
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('o'), KeyModifiers::NONE)),
             Some(KeyAction::Sessions)
         );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('s'), KeyModifiers::NONE)),
             Some(KeyAction::Grep)
         );
+        // Subagents has no leader binding; use /subagents instead.
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('p'), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Some(KeyAction::Colorscheme)
+        );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('i'), KeyModifiers::NONE)),
-            Some(KeyAction::Subagents)
+            None
         );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('h'), KeyModifiers::NONE)),
             Some(KeyAction::Timeline)
         );
+        // The git picker moved from Space G to Space g with the sessions merge.
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('G'), KeyModifiers::SHIFT)),
-            Some(KeyAction::Git)
+            None
         );
     }
 
@@ -609,6 +630,39 @@ mod tests {
     }
 
     #[test]
+    fn config_accepts_multiple_comma_separated_bindings() {
+        let binds = Keybinds::from_config(&config(&[
+            ("help", "F2, F3, not-a-key"),
+            ("quit", "C-q, Z"),
+        ]));
+        assert_eq!(
+            binds.global_action(key(KeyCode::F(2), KeyModifiers::NONE)),
+            Some(KeyAction::Help)
+        );
+        assert_eq!(
+            binds.global_action(key(KeyCode::F(3), KeyModifiers::NONE)),
+            Some(KeyAction::Help)
+        );
+        // Invalid entries are skipped, and the action's defaults are replaced.
+        assert_eq!(
+            binds.global_action(key(KeyCode::F(1), KeyModifiers::NONE)),
+            None
+        );
+        assert_eq!(
+            binds.global_action(key(KeyCode::Char('q'), KeyModifiers::CONTROL)),
+            Some(KeyAction::Quit)
+        );
+        assert_eq!(
+            binds.normal_action(key(KeyCode::Char('Z'), KeyModifiers::SHIFT)),
+            Some(KeyAction::Quit)
+        );
+        assert_eq!(
+            binds.global_action(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            None
+        );
+    }
+
+    #[test]
     fn leader_prefix_and_chords_are_configurable() {
         let binds =
             Keybinds::from_config(&config(&[("leader", "C-b"), ("new_session", "leader N")]));
@@ -619,6 +673,23 @@ mod tests {
             Some(KeyAction::NewSession)
         );
         // The default Space+n is replaced.
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('n'), KeyModifiers::NONE)),
+            None
+        );
+    }
+
+    #[test]
+    fn leader_chords_accept_multiple_bindings() {
+        let binds = Keybinds::from_config(&config(&[("new_session", "leader N, leader C-n")]));
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('N'), KeyModifiers::NONE)),
+            Some(KeyAction::NewSession)
+        );
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('n'), KeyModifiers::CONTROL)),
+            Some(KeyAction::NewSession)
+        );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('n'), KeyModifiers::NONE)),
             None

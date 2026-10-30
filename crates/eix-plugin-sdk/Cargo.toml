@@ -2,7 +2,7 @@
 name = "eix-plugin-sdk"
 version.workspace = true
 edition.workspace = true
-license.workspace = true
+license-file.workspace = true
 
 [dependencies]
 eix-plugin-abi = { path = "../eix-plugin-abi" }

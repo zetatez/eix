@@ -4,7 +4,7 @@ class @CLASS@ < Formula
   url "file://#{File.expand_path("@TARBALL@", __dir__)}"
   sha256 "@SHA256@"
   version "@VERSION@"
-  license "MIT"
+  license :cannot_represent
 
   def install
     bin.install "eix"

@@ -412,18 +412,32 @@ impl App {
     }
 
     pub(super) fn move_picker(&mut self, delta: i32) {
-        let len = self.picker_filtered().len();
+        let filtered = self.picker_filtered();
+        let len = filtered.len();
+        // Command-palette category headers are visual separators: skip them
+        // when stepping or paging.
+        let selectable: Vec<bool> = match &self.picker {
+            Some(picker) => filtered
+                .iter()
+                .map(|&index| !picker.items.get(index).is_some_and(is_command_header))
+                .collect(),
+            None => Vec::new(),
+        };
         if let Some(picker) = &mut self.picker {
             if len == 0 {
                 picker.selected = 0;
             } else {
                 let current = picker.selected.min(len - 1);
-                picker.selected = if delta.unsigned_abs() == 1 {
+                let step = if delta.unsigned_abs() == 1 {
                     // Step navigation cycles; page jumps still stop at the ends.
-                    wrap_step(current, len, delta as isize)
+                    let target =
+                        (current as isize + delta.signum() as isize).rem_euclid(len as isize);
+                    selectable_after(&selectable, target, delta.signum() as isize)
                 } else {
-                    (current as i32 + delta).clamp(0, len as i32 - 1) as usize
+                    let target = (current as i32 + delta).clamp(0, len as i32 - 1) as isize;
+                    selectable_after(&selectable, target, delta.signum() as isize)
                 };
+                picker.selected = step;
             }
         }
         self.preview_theme_selection();
@@ -502,7 +516,7 @@ impl App {
         let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
             return Vec::new();
         };
-        let sessions_rev = if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) {
+        let sessions_rev = if kind == PickerKind::Sessions {
             self.sessions_fingerprint()
         } else {
             0
@@ -528,7 +542,7 @@ impl App {
             }
         }
         let rows = match kind {
-            PickerKind::Sessions | PickerKind::NewPane => self.filtered_sessions(),
+            PickerKind::Sessions => self.filtered_sessions(),
             PickerKind::SubagentActivity => self.filtered_subagents(),
             _ => self.filtered_items(),
         };
@@ -627,6 +641,9 @@ impl App {
             .iter()
             .enumerate()
             .filter_map(|(index, item)| {
+                if picker.kind == PickerKind::Commands && is_command_header(item) {
+                    return None;
+                }
                 let mut haystack = format!(
                     "{} {} {}",
                     item.label,
@@ -663,6 +680,7 @@ impl App {
             .as_ref()?
             .items
             .get(index)
+            .filter(|item| !is_command_header(item))
             .map(|item| item.value.clone())
     }
 
@@ -689,11 +707,14 @@ impl App {
         let Some(index) = filtered.get(selected).copied() else {
             return;
         };
-        let value = self
+        let item = self
             .picker
             .as_ref()
-            .and_then(|picker| picker.items.get(index))
-            .map(|item| item.value.clone());
+            .and_then(|picker| picker.items.get(index));
+        if item.is_some_and(is_command_header) {
+            return;
+        }
+        let value = item.map(|item| item.value.clone());
         match kind {
             PickerKind::Plugin => {
                 let provider = self
@@ -713,11 +734,7 @@ impl App {
             }
             PickerKind::Sessions => {
                 self.picker = None;
-                self.select_session(index, tx);
-            }
-            PickerKind::NewPane => {
-                self.picker = None;
-                self.open_in_new_pane(index, tx);
+                self.open_or_focus_session(index, tx);
             }
             PickerKind::Projects => {
                 let Some(value) = value else {
@@ -850,7 +867,7 @@ impl App {
                 });
                 self.picker = None;
                 if let Some(child) = child {
-                    self.open_session_id_in_new_pane(child, tx);
+                    self.open_or_focus_session_id(child, tx);
                 }
             }
             PickerKind::Modes => {
@@ -983,6 +1000,11 @@ impl App {
             });
         } else if kind == PickerKind::Commands {
             picker.set_items(command_items(&self.commands));
+            picker.selected = picker
+                .items
+                .iter()
+                .position(|item| !is_command_header(item))
+                .unwrap_or(0);
         } else if kind == PickerKind::Models {
             picker.loading = true;
             self.status = "model: loading provider catalogs…".into();
@@ -1233,9 +1255,8 @@ impl App {
         match id {
             "commands" | "palette" => self.open_picker(PickerKind::Commands, tx),
             "keys" => self.open_keys_help(""),
-            "sessions" => self.open_picker(PickerKind::Sessions, tx),
-            "new" => self.open_picker(PickerKind::NewPane, tx),
-            "files" => self.open_picker(PickerKind::Files, tx),
+            "sessions" | "new" => self.open_picker(PickerKind::Sessions, tx),
+            "fzf" => self.open_picker(PickerKind::Files, tx),
             "image" | "images" => self.open_picker(PickerKind::Images, tx),
             "grep" => self.open_grep_picker("", tx),
             "git" | "worktrees" | "branches" => self.open_picker(PickerKind::Git, tx),

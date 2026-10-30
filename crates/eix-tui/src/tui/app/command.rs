@@ -85,10 +85,6 @@ impl App {
                 self.open_help_scoped(None, args);
                 true
             }
-            "new" => {
-                self.open_picker(PickerKind::NewPane, tx);
-                true
-            }
             "new-worktree" => {
                 let name = (!args.is_empty()).then(|| args.to_string());
                 self.new_worktree(tx, name);
@@ -123,7 +119,7 @@ impl App {
                 }
                 true
             }
-            "files" => {
+            "fzf" => {
                 self.open_picker(PickerKind::Files, tx);
                 true
             }

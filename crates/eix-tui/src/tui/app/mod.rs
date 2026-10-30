@@ -159,6 +159,8 @@ const COMMAND_ALIASES: &[(&str, &str)] = &[
     ("worktrees", "git"),
     ("branches", "git"),
     ("undo", "rewind"),
+    ("new", "sessions"),
+    ("files", "fzf"),
 ];
 
 fn command_alias(name: &str) -> Option<&'static str> {
@@ -172,7 +174,6 @@ fn command_alias(name: &str) -> Option<&'static str> {
 fn builtin_commands() -> Vec<CommandSpec> {
     vec![
         builtin("help", "[query]", "search the key and command reference"),
-        builtin("new", "", "open a session in a new pane"),
         builtin(
             "new-worktree",
             "[name]",
@@ -184,7 +185,7 @@ fn builtin_commands() -> Vec<CommandSpec> {
             "queue this worktree for rebase, tests and merge",
         ),
         builtin("integrate", "", "show this session's integration state"),
-        builtin("files", "", "browse and insert workspace files"),
+        builtin("fzf", "", "browse and insert workspace files"),
         builtin(
             "grep",
             "[query]",
@@ -211,7 +212,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("cd", "[path]", "change the session cwd, with directory completion"),
         builtin("init", "", "draft an AGENTS.md for this workspace"),
-        builtin("sessions", "", "open the session picker"),
+        builtin(
+            "sessions",
+            "",
+            "focus an open session or open it in a new pane",
+        ),
         builtin(
             "projects",
             "",
@@ -1222,10 +1227,8 @@ impl StreamState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerKind {
-    /// Replace the focused pane's session.
+    /// Focus an open session or open it in a new pane.
     Sessions,
-    /// Open the chosen session in a new pane (or focus it if already open).
-    NewPane,
     /// Browse sessions grouped by working directory, newest project first.
     Projects,
     /// Insert a workspace file after `@` in the prompt.
@@ -1300,7 +1303,6 @@ impl PickerKind {
             Self::Grep => Some(eix_core::KIND_GREP),
             Self::Git => Some(eix_core::KIND_GIT),
             Self::Sessions
-            | Self::NewPane
             | Self::Projects
             | Self::Commands
             | Self::Models
@@ -1327,15 +1329,14 @@ impl PickerKind {
     fn preview_kind(self) -> Option<&'static str> {
         match self {
             Self::Files => Some(eix_core::KIND_FILES),
-            Self::Sessions | Self::NewPane => Some(eix_core::KIND_SESSION_PREVIEW),
+            Self::Sessions => Some(eix_core::KIND_SESSION_PREVIEW),
             _ => None,
         }
     }
 
     fn title(self) -> &'static str {
         match self {
-            Self::Sessions => "sessions — switch focused pane",
-            Self::NewPane => "sessions — open in a new pane",
+            Self::Sessions => "sessions — focus or open in a new pane",
             Self::Projects => "projects — newest sessions",
             Self::Files => "files — insert after @",
             Self::Images => "images — attach and insert after @",
@@ -1364,8 +1365,7 @@ impl PickerKind {
 
     fn hint(self) -> &'static str {
         match self {
-            Self::Sessions => "Enter open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
-            Self::NewPane => "Enter split · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
+            Self::Sessions => "Enter focus or open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Projects => {
                 "type to search · Enter pick a session · ↑/↓ or C-j/C-k/C-n/C-p · Esc close"
             }
@@ -1685,10 +1685,12 @@ impl PendingInput {
     }
 }
 
-/// Inline reason for denying an approval (`r` on the card).
+/// Inline reason for denying an approval (`r` on the card). The buffer is the
+/// same one the `:` command line uses, so editing (including CJK) stays
+/// cursor-correct.
 struct ReasonPrompt {
     session_id: String,
-    text: String,
+    input: CmdLine,
 }
 
 /// Vim-style `:` command line. The cursor is a character index so editing
@@ -2011,8 +2013,6 @@ const HORIZONTAL_TAIL_PANES: usize = 4;
 /// How open sessions are arranged in the body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaneLayout {
-    /// The original automatic tiling.
-    Grid,
     /// One column of panes; the first pane gets most of the height and the
     /// following panes compact when the terminal is short.
     Horizontal,
@@ -2025,7 +2025,6 @@ enum PaneLayout {
 impl PaneLayout {
     fn label(self) -> &'static str {
         match self {
-            Self::Grid => "grid",
             Self::Horizontal => "horizontal",
             Self::Tabby => "tabby",
             Self::Fibonacci => "fibonacci",
@@ -2034,16 +2033,14 @@ impl PaneLayout {
 
     fn next(self) -> Self {
         match self {
-            Self::Grid => Self::Horizontal,
-            Self::Horizontal => Self::Tabby,
-            Self::Tabby => Self::Fibonacci,
-            Self::Fibonacci => Self::Grid,
+            Self::Fibonacci => Self::Tabby,
+            Self::Tabby => Self::Horizontal,
+            Self::Horizontal => Self::Fibonacci,
         }
     }
 
     fn workspace_layout(self) -> WorkspaceLayout {
         match self {
-            Self::Grid => WorkspaceLayout::Grid,
             Self::Horizontal => WorkspaceLayout::Horizontal,
             Self::Tabby => WorkspaceLayout::Tabby,
             Self::Fibonacci => WorkspaceLayout::Fibonacci,
@@ -2052,7 +2049,6 @@ impl PaneLayout {
 
     fn from_workspace_layout(layout: WorkspaceLayout) -> Self {
         match layout {
-            WorkspaceLayout::Grid => Self::Grid,
             WorkspaceLayout::Horizontal => Self::Horizontal,
             WorkspaceLayout::Tabby => Self::Tabby,
             WorkspaceLayout::Fibonacci => Self::Fibonacci,
@@ -2733,20 +2729,91 @@ fn skill_picker_items(skills: &[eix_core::Skill]) -> Vec<PickerItem> {
         .collect()
 }
 
+/// Command-palette group. Declaration order is display order: common commands
+/// first, then the remaining categories, with user/plugin commands last.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum CommandCategory {
+    Common,
+    Files,
+    Conversation,
+    Sessions,
+    Tools,
+    Review,
+    Settings,
+    Custom,
+}
+
+impl CommandCategory {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Common => "common",
+            Self::Files => "files & search",
+            Self::Conversation => "conversation",
+            Self::Sessions => "sessions",
+            Self::Tools => "tools",
+            Self::Review => "review",
+            Self::Settings => "settings",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+/// Names that predate user-defined commands. Unknown names (Markdown commands
+/// and plugin actions) fall into `custom`.
+fn command_category(name: &str) -> CommandCategory {
+    match name {
+        "help" | "fzf" | "grep" | "git" | "sessions" | "cancel" | "perm" => CommandCategory::Common,
+        "diff" | "image" => CommandCategory::Files,
+        "btw" | "clear" | "compact" | "context" | "goal" | "init" | "loop" | "redo" | "rewind"
+        | "schedule" | "timeline" => CommandCategory::Conversation,
+        "new-worktree" | "ready" | "integrate" | "cd" | "projects" | "rename" | "archive"
+        | "delete" | "fork" | "branch" | "close" | "exit" | "quit" => CommandCategory::Sessions,
+        "processes" | "approvals" | "agents" | "mcp" | "plugins" | "skills" | "subagents"
+        | "todos" => CommandCategory::Tools,
+        "code-review" | "security-review" | "simplify" | "verify" => CommandCategory::Review,
+        "effort" | "colorscheme" | "doctor" | "math" | "model" | "model-plan" | "reload" => {
+            CommandCategory::Settings
+        }
+        _ => CommandCategory::Custom,
+    }
+}
+
+/// Sentinel carried by a palette header row. Command names never contain it.
+const COMMAND_HEADER_MARK: char = '\u{1}';
+
+fn command_header(title: &str) -> PickerItem {
+    PickerItem::new(format!("{COMMAND_HEADER_MARK}{title}")).with_label(title)
+}
+
+fn is_command_header(item: &PickerItem) -> bool {
+    item.value.starts_with(COMMAND_HEADER_MARK)
+}
+
 /// Rows for the `Ctrl-P` command palette. It is generated from the same
 /// built-in/user command list as the prompt's `/` menu, so both stay in sync.
-/// `value` is the command name dispatched as `/name`.
+/// `value` is the command name dispatched as `/name`; category headers are
+/// rendered as dim rows and skipped by selection.
 fn command_items(commands: &[CommandSpec]) -> Vec<PickerItem> {
-    commands
-        .iter()
-        .map(|spec| {
-            let label = command_label(spec, "/");
+    let mut ordered: Vec<&CommandSpec> = commands.iter().collect();
+    // Stable sort: builtin order survives inside each category.
+    ordered.sort_by_key(|spec| command_category(&spec.name));
+    let mut items = Vec::with_capacity(commands.len() + 8);
+    let mut current = None;
+    for spec in ordered {
+        let category = command_category(&spec.name);
+        if current != Some(category) {
+            items.push(command_header(category.title()));
+            current = Some(category);
+        }
+        let label = command_label(spec, "/");
+        items.push(
             PickerItem::new(&spec.name)
                 .with_label(label.clone())
                 .with_detail(&spec.description)
-                .with_preview(format!("{label}\n\n{}", spec.description))
-        })
-        .collect()
+                .with_preview(format!("{label}\n\n{}", spec.description)),
+        );
+    }
+    items
 }
 
 /// The display form used by the `/` and `:` menus and the command palette.
@@ -3039,6 +3106,8 @@ struct HelpEntry {
 
 struct HelpSection {
     title: &'static str,
+    /// Which overlay shows this section: "commands", "keys" or "notes".
+    scope: &'static str,
     entries: &'static [HelpEntry],
 }
 
@@ -3058,7 +3127,8 @@ impl HelpEntry {
 
 const HELP_SECTIONS: &[HelpSection] = &[
     HelpSection {
-        title: "prompt commands",
+        title: "common",
+        scope: "commands",
         entries: &[
             HelpEntry {
                 key: "/help",
@@ -3069,39 +3139,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "choose an existing session for a new pane",
             },
             HelpEntry {
-                key: "/new-worktree",
-                description: "move the current session into an isolated git worktree",
-            },
-            HelpEntry {
-                key: "/clear",
-                description: "delete this session's history, context and memory",
-            },
-            HelpEntry {
-                key: "/compact",
-                description: "summarize the history (/compact optional notes)",
-            },
-            HelpEntry {
-                key: "/btw",
-                description: "one-off answer (/btw <question>); kept out of the conversation",
-            },
-            HelpEntry {
-                key: "/cd",
-                description: "change the working directory (/cd <path>); lists matching subdirectories while typing",
-            },
-            HelpEntry {
-                key: "/init",
-                description: "draft AGENTS.md; you review before sending",
-            },
-            HelpEntry {
                 key: "/sessions",
                 description: "switch the focused pane's session",
             },
             HelpEntry {
-                key: "/projects",
-                description: "browse sessions grouped by working directory, newest first",
-            },
-            HelpEntry {
-                key: "/files",
+                key: "/fzf",
                 description: "search workspace files and insert a path",
             },
             HelpEntry {
@@ -3111,6 +3153,150 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "/git",
                 description: "search git worktrees and branches, insert a path or name",
+            },
+            HelpEntry {
+                key: "/cancel",
+                description: "cancel the focused session's running turn",
+            },
+            HelpEntry {
+                key: "/perm",
+                description: "choose Plan · Build · Auto · Full in a search picker (alias: /mode)",
+            },
+            HelpEntry {
+                key: "!<cmd>",
+                description: "run a shell command in the session cwd (sandboxed, snapshotted)",
+            },
+        ],
+    },
+    HelpSection {
+        title: "files & search",
+        scope: "commands",
+        entries: &[
+            HelpEntry {
+                key: "/diff [staged]",
+                description: "search changed files, with a per-file diff preview on the right",
+            },
+            HelpEntry {
+                key: "/image [path|clear]",
+                description: "search images to attach and insert @path; paste/drop also attaches",
+            },
+        ],
+    },
+    HelpSection {
+        title: "conversation",
+        scope: "commands",
+        entries: &[
+            HelpEntry {
+                key: "/compact",
+                description: "summarize the history (/compact optional notes)",
+            },
+            HelpEntry {
+                key: "/btw",
+                description: "one-off answer (/btw <question>); kept out of the conversation",
+            },
+            HelpEntry {
+                key: "/clear",
+                description: "delete this session's history, context and memory",
+            },
+            HelpEntry {
+                key: "/context [all]",
+                description: "show the context token ledger, budget and sector usage",
+            },
+            HelpEntry {
+                key: "/timeline",
+                description: "search this session's user inputs; Enter jumps to the message",
+            },
+            HelpEntry {
+                key: "/rewind [n|both|chat|files]",
+                description: "roll back to an earlier checkpoint; /undo still works as an alias",
+            },
+            HelpEntry {
+                key: "/redo",
+                description: "restore the most recently rewound turn and its files",
+            },
+            HelpEntry {
+                key: "/goal [text|done|reopen|clear]",
+                description: "set a goal that persists across turns and is injected into context",
+            },
+            HelpEntry {
+                key: "/loop <interval> <prompt>",
+                description: "repeat a prompt while idle; /loop stop clears them",
+            },
+            HelpEntry {
+                key: "/schedule <+duration|HH:MM> <prompt>",
+                description: "run a prompt once; /schedule stop [id] clears them",
+            },
+            HelpEntry {
+                key: "/cd",
+                description: "change the working directory (/cd <path>); lists matching subdirectories while typing",
+            },
+        ],
+    },
+    HelpSection {
+        title: "sessions",
+        scope: "commands",
+        entries: &[
+            HelpEntry {
+                key: "/projects",
+                description: "browse sessions grouped by working directory, newest first",
+            },
+            HelpEntry {
+                key: "/rename <name>",
+                description: "rename this session",
+            },
+            HelpEntry {
+                key: "/fork",
+                description: "pick a user message to fork before (/fork name forks everything)",
+            },
+            HelpEntry {
+                key: "/branch",
+                description: "fork this session and switch this pane to the new branch",
+            },
+            HelpEntry {
+                key: "/init",
+                description: "draft AGENTS.md; you review before sending",
+            },
+            HelpEntry {
+                key: "/new-worktree",
+                description: "move the current session into an isolated git worktree",
+            },
+            HelpEntry {
+                key: "/ready",
+                description: "queue this worktree for rebase, tests and merge",
+            },
+            HelpEntry {
+                key: "/integrate",
+                description: "show this session's integration state",
+            },
+            HelpEntry {
+                key: "/archive",
+                description: "hide the session from the picker",
+            },
+            HelpEntry {
+                key: "/delete",
+                description: "delete the focused session immediately",
+            },
+            HelpEntry {
+                key: "/close",
+                description: "save the draft and close the focused session (the last one quits eix)",
+            },
+            HelpEntry {
+                key: "/exit",
+                description: "save the draft and quit eix",
+            },
+            HelpEntry {
+                key: "/quit",
+                description: "save the draft and quit eix",
+            },
+        ],
+    },
+    HelpSection {
+        title: "tools",
+        scope: "commands",
+        entries: &[
+            HelpEntry {
+                key: "/skills [name] [args]",
+                description: "browse skills with a preview, or insert one with arguments",
             },
             HelpEntry {
                 key: "/processes",
@@ -3129,61 +3315,23 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "browse the model's current task list",
             },
             HelpEntry {
-                key: "/cancel",
-                description: "cancel the focused session's running turn",
+                key: "/agents",
+                description: "choose the session's primary agent",
             },
             HelpEntry {
-                key: "/timeline",
-                description: "search this session's user inputs; Enter jumps to the message",
+                key: "/subagents",
+                description: "monitor live sub-agents or set the max parallel spawn_agent calls",
             },
             HelpEntry {
-                key: "/archive",
-                description: "hide the session from the picker",
+                key: "/plugins",
+                description: "inspect plugins, logs/doctor, lifecycle, settings and UI panels",
             },
-            HelpEntry {
-                key: "/delete",
-                description: "delete the focused session immediately",
-            },
-            HelpEntry {
-                key: "/rewind [n|both|chat|files]",
-                description: "roll back to an earlier checkpoint; /undo still works as an alias",
-            },
-            HelpEntry {
-                key: "/redo",
-                description: "restore the most recently rewound turn and its files",
-            },
-            HelpEntry {
-                key: "/context [all]",
-                description: "show the context token ledger, budget and sector usage",
-            },
-            HelpEntry {
-                key: "/effort [low|medium|high]",
-                description: "set this session's reasoning effort",
-            },
-            HelpEntry {
-                key: "/rename <name>",
-                description: "rename this session",
-            },
-            HelpEntry {
-                key: "/diff [staged]",
-                description: "search changed files, with a per-file diff preview on the right",
-            },
-            HelpEntry {
-                key: "/doctor",
-                description: "show daemon, config, sandbox and snapshot diagnostics",
-            },
-            HelpEntry {
-                key: "/goal [text|done|reopen|clear]",
-                description: "set a goal that persists across turns and is injected into context",
-            },
-            HelpEntry {
-                key: "/loop <interval> <prompt>",
-                description: "repeat a prompt while idle; /loop stop clears them",
-            },
-            HelpEntry {
-                key: "/schedule <+duration|HH:MM> <prompt>",
-                description: "run a prompt once; /schedule stop [id] clears them",
-            },
+        ],
+    },
+    HelpSection {
+        title: "review",
+        scope: "commands",
+        entries: &[
             HelpEntry {
                 key: "/code-review",
                 description: "review the current diff for correctness, regressions and tests",
@@ -3200,66 +3348,53 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 key: "/verify",
                 description: "build, test and exercise the change; report evidence",
             },
+        ],
+    },
+    HelpSection {
+        title: "settings",
+        scope: "commands",
+        entries: &[
             HelpEntry {
-                key: "/skills [name] [args]",
-                description: "browse skills with a preview, or insert one with arguments",
+                key: "/model",
+                description: "search providers/models and switch this session",
             },
             HelpEntry {
-                key: "/image [path|clear]",
-                description: "search images to attach and insert @path; paste/drop also attaches",
+                key: "/model-plan",
+                description: "choose the model used by this session's Plan-mode turns",
+            },
+            HelpEntry {
+                key: "/effort [low|medium|high]",
+                description: "set this session's reasoning effort",
             },
             HelpEntry {
                 key: "/colorscheme",
                 description: "browse colorschemes with live preview; Enter applies, Esc restores",
             },
             HelpEntry {
-                key: "!<cmd>",
-                description: "run a shell command in the session cwd (sandboxed, snapshotted)",
+                key: "/math",
+                description: "show or change display-math image rendering",
             },
             HelpEntry {
-                key: "/fork",
-                description: "pick a user message to fork before (/fork name forks everything)",
+                key: "/doctor",
+                description: "show daemon, config, sandbox and snapshot diagnostics",
             },
             HelpEntry {
-                key: "/branch",
-                description: "fork this session and switch this pane to the new branch",
-            },
-            HelpEntry {
-                key: "/perm",
-                description: "choose Plan · Build · Auto · Full in a search picker (alias: /mode)",
-            },
-            HelpEntry {
-                key: "/exit",
-                description: "save the draft and quit eix",
-            },
-            HelpEntry {
-                key: "/quit",
-                description: "save the draft and quit eix",
-            },
-            HelpEntry {
-                key: "/close",
-                description: "save the draft and close the focused session (the last one quits eix)",
+                key: "/reload",
+                description: "re-read the daemon config files",
             },
         ],
     },
     HelpSection {
-        title: "keys",
+        title: "essentials",
+        scope: "keys",
         entries: &[
             HelpEntry {
                 key: "i",
                 description: "focus the prompt in insert mode",
             },
             HelpEntry {
-                key: "mouse",
-                description: "click folds Thinking / tool blocks; click a subagent card to open it; click ← parent agent in a child to return; wheel scrolls",
-            },
-            HelpEntry {
                 key: "Esc",
                 description: "prompt: normal mode (keeps focus)",
-            },
-            HelpEntry {
-                key: ":",
-                description: "normal mode: open the command line (:q closes the pane, :qa quits)",
             },
             HelpEntry {
                 key: "Esc Esc",
@@ -3270,116 +3405,38 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "insert: send (queued while busy); normal / transcript: promote the focused session to first",
             },
             HelpEntry {
-                key: "Ctrl-J",
-                description: "newline (insert mode)",
-            },
-            HelpEntry {
-                key: "Space o/f/g",
-                description: "prompt & transcript: new pane / files / git",
-            },
-            HelpEntry {
-                key: "Space s",
-                description: "prompt & transcript: search file contents and insert @path:line",
-            },
-            HelpEntry {
-                key: "Space i",
-                description: "prompt & transcript: monitor live sub-agents (children first, else the concurrency limit)",
-            },
-            HelpEntry {
-                key: "Space p",
-                description: "prompt & transcript: processes",
-            },
-            HelpEntry {
-                key: "Space a/x",
-                description: "prompt & transcript: approvals / cancel",
-            },
-            HelpEntry {
-                key: "Space n/c",
-                description: "prompt & transcript: new session / close pane",
-            },
-            HelpEntry {
                 key: "q",
                 description: "prompt normal & transcript: close the focused pane (the last one stays)",
-            },
-            HelpEntry {
-                key: "< / >",
-                description: "prompt normal & transcript: previous / next pane",
-            },
-            HelpEntry {
-                key: "Ctrl-W Ctrl-W",
-                description: "prompt normal & transcript: focus the next pane (wraps around)",
-            },
-            HelpEntry {
-                key: "Space v / Space t / Space r",
-                description: "horizontal / tabby / fibonacci layout",
-            },
-            HelpEntry {
-                key: "Space l",
-                description: "cycle grid / horizontal / tabby / fibonacci layout",
-            },
-            HelpEntry {
-                key: "Ctrl-1 … Ctrl-9",
-                description: "focus the Nth open session / tabby tab (Ctrl-7 opens the model picker on some terminals)",
-            },
-            HelpEntry {
-                key: "session order",
-                description: "normal Enter promotes the focused session to first; Ctrl-1…9 jumps directly, < / > or Ctrl-W Ctrl-W moves prev/next",
-            },
-            HelpEntry {
-                key: "Space W",
-                description: "prompt & transcript: move this session into a worktree",
-            },
-            HelpEntry {
-                key: "Ctrl-J / Ctrl-K",
-                description: "normal mode: browse submitted prompts (newer / older)",
-            },
-            HelpEntry {
-                key: "j / k",
-                description: "normal mode: move between lines in the draft",
             },
             HelpEntry {
                 key: "Ctrl-P",
                 description: "command palette (prompt normal mode and transcript)",
             },
             HelpEntry {
-                key: "Space g",
-                description: "session picker (switch the focused pane's session)",
+                key: "F1",
+                description: "open this searchable help anywhere",
             },
             HelpEntry {
-                key: "Space h",
-                description: "search this session's user-input history and jump",
+                key: "help search",
+                description: "type to filter entries · ↑/↓ select · Ctrl-U clears · Esc closes",
             },
             HelpEntry {
-                key: "Ctrl-T",
-                description: "cycle reasoning (default medium): low / medium / high",
+                key: "Z / Ctrl-C / Ctrl-D",
+                description: "quit (Z in normal/transcript; Ctrl-C/D in any mode; draft is saved first)",
             },
             HelpEntry {
-                key: "Ctrl-/",
-                description: "open the searchable model picker (Ctrl-_ / Ctrl-7 also work)",
+                key: "mouse",
+                description: "click folds Thinking / tool blocks; click a subagent card to open it; click ← parent agent in a child to return; wheel scrolls",
             },
+        ],
+    },
+    HelpSection {
+        title: "sessions & panes",
+        scope: "keys",
+        entries: &[
             HelpEntry {
                 key: "Space o",
-                description: "open session in a new pane",
-            },
-            HelpEntry {
-                key: "Space G",
-                description: "insert a git worktree path or branch name",
-            },
-            HelpEntry {
-                key: "@ (in prompt)",
-                description: "workspace file picker",
-            },
-            HelpEntry {
-                key: "Tab",
-                description: "cycle Plan → Build → Auto → Full → Plan",
-            },
-            HelpEntry {
-                key: "Shift-Tab",
-                description: "cycle the other way: Build → Plan → Full → Auto → Build",
-            },
-            HelpEntry {
-                key: "Space m",
-                description: "open the full Plan / Build / Auto / Full mode picker",
+                description: "focus an open session or open it in a new pane",
             },
             HelpEntry {
                 key: "Space n",
@@ -3390,9 +3447,113 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "move this session into a fresh git worktree",
             },
             HelpEntry {
-                key: "Space x",
-                description: "cancel focused turn",
+                key: "< / >",
+                description: "prompt normal & transcript: previous / next pane",
             },
+            HelpEntry {
+                key: "Ctrl-W Ctrl-W",
+                description: "prompt normal & transcript: focus the next pane (wraps around)",
+            },
+            HelpEntry {
+                key: "Ctrl-1 … Ctrl-9",
+                description: "focus the Nth open session / tabby tab (Ctrl-7 opens the model picker on some terminals)",
+            },
+            HelpEntry {
+                key: "session order",
+                description: "normal Enter promotes the focused session to first; Ctrl-1…9 jumps directly, < / > or Ctrl-W Ctrl-W moves prev/next",
+            },
+        ],
+    },
+    HelpSection {
+        title: "files & history",
+        scope: "keys",
+        entries: &[
+            HelpEntry {
+                key: "Space f",
+                description: "prompt & transcript: workspace file picker (inserts @path)",
+            },
+            HelpEntry {
+                key: "Space s",
+                description: "prompt & transcript: search file contents and insert @path:line",
+            },
+            HelpEntry {
+                key: "Space g",
+                description: "insert a git worktree path or branch name",
+            },
+            HelpEntry {
+                key: "Space h",
+                description: "search this session's user-input history and jump",
+            },
+            HelpEntry {
+                key: "@ (in prompt)",
+                description: "workspace file picker",
+            },
+        ],
+    },
+    HelpSection {
+        title: "prompt editing",
+        scope: "keys",
+        entries: &[
+            HelpEntry {
+                key: ":",
+                description: "normal mode: open the command line (:q closes the pane, :qa quits)",
+            },
+            HelpEntry {
+                key: "Ctrl-J",
+                description: "newline (insert mode)",
+            },
+            HelpEntry {
+                key: "j / k",
+                description: "normal mode: move between lines in the draft",
+            },
+            HelpEntry {
+                key: "Ctrl-J / Ctrl-K",
+                description: "normal mode: browse submitted prompts (newer / older)",
+            },
+            HelpEntry {
+                key: "Tab",
+                description: "cycle Plan → Build → Auto → Full → Plan",
+            },
+            HelpEntry {
+                key: "Shift-Tab",
+                description: "cycle the other way: Build → Plan → Full → Auto → Build",
+            },
+            HelpEntry {
+                key: "Ctrl-T",
+                description: "cycle reasoning (default medium): low / medium / high",
+            },
+            HelpEntry {
+                key: "Ctrl-/",
+                description: "open the searchable model picker (Ctrl-_ / Ctrl-7 also work)",
+            },
+        ],
+    },
+    HelpSection {
+        title: "transcript",
+        scope: "keys",
+        entries: &[
+            HelpEntry {
+                key: "j / k",
+                description: "scroll focused transcript",
+            },
+            HelpEntry {
+                key: "g / G",
+                description: "top / follow tail",
+            },
+            HelpEntry {
+                key: "PageUp / PageDown",
+                description: "page the transcript (Ctrl-B / Ctrl-U and Ctrl-F also work)",
+            },
+            HelpEntry {
+                key: "/ · ? · #",
+                description: "search this transcript (/ forward; ?/# backward; n/N next/prev; Esc clears)",
+            },
+        ],
+    },
+    HelpSection {
+        title: "approvals & questions",
+        scope: "keys",
+        entries: &[
             HelpEntry {
                 key: "y / n",
                 description: "approve / deny a pending tool call (card shortcut)",
@@ -3421,46 +3582,41 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 key: "Space a",
                 description: "approvals inbox across sessions",
             },
+        ],
+    },
+    HelpSection {
+        title: "layout & tools",
+        scope: "keys",
+        entries: &[
             HelpEntry {
-                key: "j / k",
-                description: "scroll focused transcript",
+                key: "Space v / Space t / Space r",
+                description: "horizontal / tabby / fibonacci layout",
             },
             HelpEntry {
-                key: "g / G",
-                description: "top / follow tail",
+                key: "Space l",
+                description: "cycle fibonacci / tabby / horizontal layout",
             },
             HelpEntry {
-                key: "PageUp / PageDown",
-                description: "page the transcript (Ctrl-B / Ctrl-U and Ctrl-F also work)",
-            },
-            HelpEntry {
-                key: "Space p",
+                key: "Space b",
                 description: "background processes (x kills, r refreshes)",
             },
             HelpEntry {
-                key: "/ · ? · #",
-                description: "search this transcript (/ forward; ?/# backward; n/N next/prev; Esc clears)",
+                key: "Space c",
+                description: "prompt & transcript: colorscheme picker",
             },
             HelpEntry {
-                key: "F1",
-                description: "open this searchable help anywhere",
-            },
-            HelpEntry {
-                key: "Z / Ctrl-C / Ctrl-D",
-                description: "quit (Z in normal/transcript; Ctrl-C/D in any mode; draft is saved first)",
+                key: "Space x",
+                description: "cancel focused turn",
             },
             HelpEntry {
                 key: "[keys]",
                 description: "override global/TUI actions and leader chords in config.toml; `leader` changes the prefix",
             },
-            HelpEntry {
-                key: "help search",
-                description: "type to filter entries · ↑/↓ select · Ctrl-U clears · Esc closes",
-            },
         ],
     },
     HelpSection {
         title: "notes",
+        scope: "notes",
         entries: &[
             HelpEntry {
                 key: "prompt",
@@ -3496,7 +3652,7 @@ fn help_rows_in(query: &str, scope: Option<&str>) -> Vec<HelpRow> {
     let query = query.trim().to_lowercase();
     let mut rows = Vec::new();
     for section in HELP_SECTIONS {
-        if scope.is_some_and(|scope| scope != section.title) {
+        if scope.is_some_and(|scope| scope != section.scope) {
             continue;
         }
         let matched: Vec<&HelpEntry> = section
@@ -3525,7 +3681,7 @@ fn help_entry_count_in(query: &str, scope: Option<&str>) -> usize {
     let query = query.trim().to_lowercase();
     HELP_SECTIONS
         .iter()
-        .filter(|section| scope.is_none_or(|scope| scope == section.title))
+        .filter(|section| scope.is_none_or(|scope| scope == section.scope))
         .flat_map(|section| section.entries.iter())
         .filter(|entry| entry.matches(&query))
         .count()
@@ -3548,14 +3704,14 @@ fn draw_help(
     let matches = help_entry_count_in(query, scope);
     let total: usize = HELP_SECTIONS
         .iter()
-        .filter(|section| scope.is_none_or(|scope| scope == section.title))
+        .filter(|section| scope.is_none_or(|scope| scope == section.scope))
         .map(|section| section.entries.len())
         .sum();
     // Size the key column from the whole scope, not the filtered rows, so
     // descriptions do not jump horizontally while the user types.
     let key_width = HELP_SECTIONS
         .iter()
-        .filter(|section| scope.is_none_or(|scope| scope == section.title))
+        .filter(|section| scope.is_none_or(|scope| scope == section.scope))
         .flat_map(|section| section.entries.iter())
         .map(|entry| UnicodeWidthStr::width(entry.key))
         .max()
@@ -3739,7 +3895,6 @@ fn pane_borders(areas: &[Rect], index: usize) -> Borders {
 
 fn layout_pane_rects(layout: PaneLayout, area: Rect, count: usize) -> Vec<Rect> {
     match layout {
-        PaneLayout::Grid => pane_rects(area, count),
         PaneLayout::Horizontal => horizontal_pane_rects(area, count),
         PaneLayout::Fibonacci => fibonacci_pane_rects(area, count),
         PaneLayout::Tabby => vec![area],
@@ -3818,51 +3973,6 @@ fn fibonacci_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
         }
     }
     rects
-}
-
-fn pane_rects(area: Rect, count: usize) -> Vec<Rect> {
-    match count {
-        0 => Vec::new(),
-        1 => vec![area],
-        2 => Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area)
-            .to_vec(),
-        3 => {
-            let columns =
-                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(area);
-            let right = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(columns[1]);
-            vec![columns[0], right[0], right[1]]
-        }
-        4 => {
-            let rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(area);
-            let mut rects = Vec::with_capacity(4);
-            for row in rows.iter() {
-                let columns =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(*row);
-                rects.extend(columns.iter().copied());
-            }
-            rects
-        }
-        n => {
-            let columns = (n as f64).sqrt().ceil() as usize;
-            let rows = n.div_ceil(columns);
-            let row_rects =
-                Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
-            let mut rects = Vec::with_capacity(n);
-            for row in row_rects.iter() {
-                let col_rects =
-                    Layout::horizontal(vec![Constraint::Ratio(1, columns as u32); columns])
-                        .split(*row);
-                rects.extend(col_rects.iter().copied());
-            }
-            rects.truncate(n);
-            rects
-        }
-    }
 }
 
 /// Line index where each hunk starts in the review body.
@@ -3981,6 +4091,24 @@ fn wrap_step(current: usize, len: usize, delta: isize) -> usize {
         return 0;
     }
     (current.min(len - 1) as isize + delta).rem_euclid(len as isize) as usize
+}
+
+/// Nearest selectable row at or after `target`, walking in `direction` (and
+/// wrapping) past command-palette category headers.
+fn selectable_after(selectable: &[bool], target: isize, direction: isize) -> usize {
+    let len = selectable.len();
+    if len == 0 {
+        return 0;
+    }
+    let step = if direction < 0 { -1 } else { 1 };
+    let mut pos = target.rem_euclid(len as isize);
+    for _ in 0..len {
+        if selectable[pos as usize] {
+            return pos as usize;
+        }
+        pos = (pos + step).rem_euclid(len as isize);
+    }
+    pos as usize
 }
 
 impl App {

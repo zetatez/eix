@@ -115,40 +115,15 @@ impl App {
             composer_inactive_border(self.theme)
         };
 
-        // Deny reasons temporarily replace the top border. Mode, session and
-        // workspace context live in the statusline below the prompt.
-        let title_width = area.width.saturating_sub(2) as usize;
-        let top_left = if let Some(prompt) = &self.reason_prompt {
-            let line = Line::from(vec![
-                Span::styled(
-                    " deny reason: ",
-                    Style::default()
-                        .fg(composer_warn(self.theme))
-                        .bg(panel)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{}▏", prompt.text),
-                    Style::default().fg(text).bg(panel),
-                ),
-                Span::styled(
-                    "  Enter denies · Esc cancels",
-                    Style::default().fg(composer_muted(self.theme)).bg(panel),
-                ),
-            ]);
-            truncate_line(line, title_width)
-        } else {
-            Line::default()
-        };
-
+        // Deny reasons render in their own dialog that takes over this slot;
+        // the caller skips this prompt entirely while that editor is open, so
+        // the two can never overlap.
         let block = Block::default()
             .borders(Borders::ALL)
             .border_type(BorderType::Rounded)
             .border_style(Style::default().fg(border_color).bg(panel))
             .style(Style::default().bg(panel))
-            .title_style(Style::default().bg(panel))
-            .padding(Padding::new(1, 1, 0, 0))
-            .title_top(top_left);
+            .padding(Padding::new(1, 1, 0, 0));
 
         // One cell of left padding keeps the text close to the border; one
         // cell on the right mirrors it.
