@@ -159,6 +159,7 @@ const COMMAND_ALIASES: &[(&str, &str)] = &[
     ("worktrees", "git"),
     ("branches", "git"),
     ("undo", "rewind"),
+    ("new", "sessions"),
 ];
 
 fn command_alias(name: &str) -> Option<&'static str> {
@@ -172,7 +173,6 @@ fn command_alias(name: &str) -> Option<&'static str> {
 fn builtin_commands() -> Vec<CommandSpec> {
     vec![
         builtin("help", "[query]", "search the key and command reference"),
-        builtin("new", "", "open a session in a new pane"),
         builtin(
             "new-worktree",
             "[name]",
@@ -211,7 +211,11 @@ fn builtin_commands() -> Vec<CommandSpec> {
         ),
         builtin("cd", "[path]", "change the session cwd, with directory completion"),
         builtin("init", "", "draft an AGENTS.md for this workspace"),
-        builtin("sessions", "", "open the session picker"),
+        builtin(
+            "sessions",
+            "",
+            "focus an open session or open it in a new pane",
+        ),
         builtin(
             "projects",
             "",
@@ -1222,10 +1226,8 @@ impl StreamState {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PickerKind {
-    /// Replace the focused pane's session.
+    /// Focus an open session or open it in a new pane.
     Sessions,
-    /// Open the chosen session in a new pane (or focus it if already open).
-    NewPane,
     /// Browse sessions grouped by working directory, newest project first.
     Projects,
     /// Insert a workspace file after `@` in the prompt.
@@ -1300,7 +1302,6 @@ impl PickerKind {
             Self::Grep => Some(eix_core::KIND_GREP),
             Self::Git => Some(eix_core::KIND_GIT),
             Self::Sessions
-            | Self::NewPane
             | Self::Projects
             | Self::Commands
             | Self::Models
@@ -1327,15 +1328,14 @@ impl PickerKind {
     fn preview_kind(self) -> Option<&'static str> {
         match self {
             Self::Files => Some(eix_core::KIND_FILES),
-            Self::Sessions | Self::NewPane => Some(eix_core::KIND_SESSION_PREVIEW),
+            Self::Sessions => Some(eix_core::KIND_SESSION_PREVIEW),
             _ => None,
         }
     }
 
     fn title(self) -> &'static str {
         match self {
-            Self::Sessions => "sessions — switch focused pane",
-            Self::NewPane => "sessions — open in a new pane",
+            Self::Sessions => "sessions — focus or open in a new pane",
             Self::Projects => "projects — newest sessions",
             Self::Files => "files — insert after @",
             Self::Images => "images — attach and insert after @",
@@ -1364,8 +1364,7 @@ impl PickerKind {
 
     fn hint(self) -> &'static str {
         match self {
-            Self::Sessions => "Enter open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
-            Self::NewPane => "Enter split · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
+            Self::Sessions => "Enter focus or open · ↑/↓ or C-j/C-k/C-n/C-p · Esc close",
             Self::Projects => {
                 "type to search · Enter pick a session · ↑/↓ or C-j/C-k/C-n/C-p · Esc close"
             }
@@ -3275,7 +3274,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Space o/f/g",
-                description: "prompt & transcript: new pane / files / git",
+                description: "prompt & transcript: sessions (focus or open) / files / git",
             },
             HelpEntry {
                 key: "Space s",
@@ -3342,8 +3341,12 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "command palette (prompt normal mode and transcript)",
             },
             HelpEntry {
+                key: "Space o",
+                description: "focus an open session or open it in a new pane",
+            },
+            HelpEntry {
                 key: "Space g",
-                description: "session picker (switch the focused pane's session)",
+                description: "insert a git worktree path or branch name",
             },
             HelpEntry {
                 key: "Space h",
@@ -3356,14 +3359,6 @@ const HELP_SECTIONS: &[HelpSection] = &[
             HelpEntry {
                 key: "Ctrl-/",
                 description: "open the searchable model picker (Ctrl-_ / Ctrl-7 also work)",
-            },
-            HelpEntry {
-                key: "Space o",
-                description: "open session in a new pane",
-            },
-            HelpEntry {
-                key: "Space G",
-                description: "insert a git worktree path or branch name",
             },
             HelpEntry {
                 key: "@ (in prompt)",

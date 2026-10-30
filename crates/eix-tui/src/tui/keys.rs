@@ -15,7 +15,6 @@ pub enum KeyAction {
     NewSession,
     NewWorktree,
     Sessions,
-    NewPane,
     Palette,
     Files,
     Grep,
@@ -66,8 +65,7 @@ impl KeyAction {
             "help" => Self::Help,
             "new_session" | "new" => Self::NewSession,
             "new_worktree" => Self::NewWorktree,
-            "sessions" => Self::Sessions,
-            "new_pane" => Self::NewPane,
+            "sessions" | "new_pane" => Self::Sessions,
             "palette" | "commands" => Self::Palette,
             "files" => Self::Files,
             "grep" => Self::Grep,
@@ -280,13 +278,12 @@ fn default_bindings() -> Vec<Binding> {
     for (action, spec) in [
         (KeyAction::NewSession, "n"),
         (KeyAction::NewWorktree, "W"),
-        (KeyAction::NewPane, "o"),
+        (KeyAction::Sessions, "o"),
         (KeyAction::Files, "f"),
         (KeyAction::Grep, "s"),
         (KeyAction::Subagents, "i"),
-        (KeyAction::Sessions, "g"),
+        (KeyAction::Git, "g"),
         (KeyAction::Timeline, "h"),
-        (KeyAction::Git, "G"),
         (KeyAction::Processes, "p"),
         (KeyAction::Inbox, "a"),
         (KeyAction::Cancel, "x"),
@@ -546,6 +543,10 @@ mod tests {
         );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('g'), KeyModifiers::NONE)),
+            Some(KeyAction::Git)
+        );
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('o'), KeyModifiers::NONE)),
             Some(KeyAction::Sessions)
         );
         assert_eq!(
@@ -560,9 +561,10 @@ mod tests {
             binds.leader_action(key(KeyCode::Char('h'), KeyModifiers::NONE)),
             Some(KeyAction::Timeline)
         );
+        // The git picker moved from Space G to Space g with the sessions merge.
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('G'), KeyModifiers::SHIFT)),
-            Some(KeyAction::Git)
+            None
         );
     }
 

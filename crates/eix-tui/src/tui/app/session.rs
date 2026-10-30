@@ -771,22 +771,20 @@ impl App {
         let _ = tx.send(Command::Attach(id));
     }
 
-    pub(super) fn open_in_new_pane(&mut self, index: usize, tx: &UnboundedSender<Command>) {
+    /// Focus the session's pane when it is already open, otherwise open it in
+    /// a new pane. This is the single `Space o` / `/sessions` entry.
+    pub(super) fn open_or_focus_session(&mut self, index: usize, tx: &UnboundedSender<Command>) {
         if self.sessions.is_empty() {
             return;
         }
         self.selected = index.min(self.sessions.len() - 1);
         let id = self.sessions[self.selected].id.clone();
-        self.open_session_id_in_new_pane(id, tx);
+        self.open_or_focus_session_id(id, tx);
     }
 
     /// Open or focus one session in a new pane. The subagent card uses the
     /// child session id directly because it is not listed in the picker.
-    pub(super) fn open_session_id_in_new_pane(
-        &mut self,
-        id: String,
-        tx: &UnboundedSender<Command>,
-    ) {
+    pub(super) fn open_or_focus_session_id(&mut self, id: String, tx: &UnboundedSender<Command>) {
         if let Some(open) = self.open_session(&id) {
             self.focused = open;
             self.status = "session is already open".into();

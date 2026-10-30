@@ -502,7 +502,7 @@ impl App {
         let Some(kind) = self.picker.as_ref().map(|picker| picker.kind) else {
             return Vec::new();
         };
-        let sessions_rev = if matches!(kind, PickerKind::Sessions | PickerKind::NewPane) {
+        let sessions_rev = if kind == PickerKind::Sessions {
             self.sessions_fingerprint()
         } else {
             0
@@ -528,7 +528,7 @@ impl App {
             }
         }
         let rows = match kind {
-            PickerKind::Sessions | PickerKind::NewPane => self.filtered_sessions(),
+            PickerKind::Sessions => self.filtered_sessions(),
             PickerKind::SubagentActivity => self.filtered_subagents(),
             _ => self.filtered_items(),
         };
@@ -713,11 +713,7 @@ impl App {
             }
             PickerKind::Sessions => {
                 self.picker = None;
-                self.select_session(index, tx);
-            }
-            PickerKind::NewPane => {
-                self.picker = None;
-                self.open_in_new_pane(index, tx);
+                self.open_or_focus_session(index, tx);
             }
             PickerKind::Projects => {
                 let Some(value) = value else {
@@ -850,7 +846,7 @@ impl App {
                 });
                 self.picker = None;
                 if let Some(child) = child {
-                    self.open_session_id_in_new_pane(child, tx);
+                    self.open_or_focus_session_id(child, tx);
                 }
             }
             PickerKind::Modes => {
@@ -1233,8 +1229,7 @@ impl App {
         match id {
             "commands" | "palette" => self.open_picker(PickerKind::Commands, tx),
             "keys" => self.open_keys_help(""),
-            "sessions" => self.open_picker(PickerKind::Sessions, tx),
-            "new" => self.open_picker(PickerKind::NewPane, tx),
+            "sessions" | "new" => self.open_picker(PickerKind::Sessions, tx),
             "files" => self.open_picker(PickerKind::Files, tx),
             "image" | "images" => self.open_picker(PickerKind::Images, tx),
             "grep" => self.open_grep_picker("", tx),

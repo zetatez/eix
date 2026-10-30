@@ -105,7 +105,7 @@ impl App {
     }
 
     pub(super) fn draw_body(&mut self, frame: &mut Frame, area: Rect) {
-        // Sessions live in the floating picker (`Space g` / `/sessions`), not in
+        // Sessions live in the floating picker (`Space o` / `/sessions`), not in
         // a permanent sidebar: panes get the whole body.
         self.tab_areas.clear();
         if self.views.is_empty()

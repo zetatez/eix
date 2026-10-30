@@ -747,10 +747,8 @@ impl App {
                 // Session previews are conversations: keep the newest lines
                 // in view instead of showing the oldest part of the fetched
                 // window.
-                if matches!(
-                    kind,
-                    PickerKind::Sessions | PickerKind::NewPane | PickerKind::SubagentActivity
-                ) && wrapped.len() > height
+                if matches!(kind, PickerKind::Sessions | PickerKind::SubagentActivity)
+                    && wrapped.len() > height
                 {
                     wrapped.drain(..wrapped.len() - height);
                 }
@@ -831,7 +829,7 @@ impl App {
                     })
                     .collect()
             }
-            PickerKind::Sessions | PickerKind::NewPane => {
+            PickerKind::Sessions => {
                 let open_panes: Vec<Option<usize>> = self
                     .sessions
                     .iter()
@@ -985,9 +983,7 @@ impl App {
             return;
         };
         let value = match picker.kind {
-            PickerKind::Sessions | PickerKind::NewPane => {
-                self.sessions.get(index).map(|session| session.id.clone())
-            }
+            PickerKind::Sessions => self.sessions.get(index).map(|session| session.id.clone()),
             PickerKind::Files => picker.items.get(index).map(|item| item.value.clone()),
             _ => None,
         };
@@ -1120,7 +1116,7 @@ impl App {
                 }
                 Some(preview)
             }
-            PickerKind::Sessions | PickerKind::NewPane => {
+            PickerKind::Sessions => {
                 let text = {
                     let picker = self.picker.as_ref()?;
                     if picker.preview.rendered_width == width {
@@ -1208,7 +1204,7 @@ impl App {
                 }
                 vec!["select a sub-agent".into()]
             }
-            PickerKind::Sessions | PickerKind::NewPane => {
+            PickerKind::Sessions => {
                 if let Some(text) = &picker.preview.text {
                     return preview_tail(text, height);
                 }

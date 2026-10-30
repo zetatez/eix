@@ -331,7 +331,7 @@ fn leader_h_opens_the_timeline_picker() {
 }
 
 #[test]
-fn leader_g_opens_the_session_picker() {
+fn leader_g_opens_git_while_leader_o_opens_sessions() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(SessionView::new(
@@ -342,6 +342,12 @@ fn leader_g_opens_the_session_picker() {
 
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
     app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+    let picker = app.picker.as_ref().expect("git picker");
+    assert_eq!(picker.kind, PickerKind::Git);
+    app.picker = None;
+
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     let picker = app.picker.as_ref().expect("session picker");
     assert_eq!(picker.kind, PickerKind::Sessions);
 }
@@ -4102,7 +4108,7 @@ fn session_picker_preview_requests_the_selected_session_history() {
         Session::new("s2", "two", "/tmp"),
     ];
     app.picker = Some(Picker {
-        kind: PickerKind::NewPane,
+        kind: PickerKind::Sessions,
         query: String::new(),
         selected: 0,
         provider: None,
@@ -4143,7 +4149,7 @@ fn session_picker_preview_renders_markdown_and_display_math() {
     let mut app = App::new(None);
     app.sessions = vec![Session::new("s1", "one", "/tmp")];
     app.picker = Some(Picker {
-        kind: PickerKind::NewPane,
+        kind: PickerKind::Sessions,
         query: String::new(),
         selected: 0,
         provider: None,
@@ -4191,7 +4197,7 @@ fn session_picker_hides_subagents_and_marks_worktrees_before_ids() {
     child.parent_id = Some("s1".into());
     app.sessions = vec![Session::new("s1", "normal", "/tmp"), worktree, child];
 
-    app.open_picker(PickerKind::NewPane, &tx);
+    app.open_picker(PickerKind::Sessions, &tx);
     let filtered = app.picker_filtered();
     assert_eq!(filtered, vec![0, 1]);
     assert_eq!(app.picker.as_ref().unwrap().selected, 0);
@@ -5418,7 +5424,7 @@ fn transcript_leader_matches_the_prompt_leader() {
     assert_eq!(app.status, "no pending approvals");
 
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('G'), KeyModifiers::SHIFT), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
         Some(PickerKind::Git)
@@ -5525,7 +5531,7 @@ fn transcript_pane_requires_leader_for_pane_actions_except_q() {
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::NewPane)
+        Some(PickerKind::Sessions)
     ));
 
     app.picker = None;
@@ -5872,17 +5878,24 @@ fn config_remaps_global_and_leader_actions() {
         ("quit".to_string(), "C-x".to_string()),
     ]));
 
-    // Ctrl-G is no longer a default, and the sessions override removes the
-    // leader-g default too. Ctrl-T wins over reasoning because overrides
-    // are matched first.
+    // Ctrl-G is no longer a default, and the sessions override replaces the
+    // leader-o default. Leader-g still opens the git picker. Ctrl-T wins over
+    // reasoning because overrides are matched first.
     app.handle_key(
         KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL),
         &tx,
     );
     assert!(app.picker.is_none());
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     assert!(app.picker.is_none());
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE), &tx);
+    assert!(matches!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Git)
+    ));
+    app.picker = None;
     app.handle_key(
         KeyEvent::new(KeyCode::Char('t'), KeyModifiers::CONTROL),
         &tx,
@@ -5892,6 +5905,9 @@ fn config_remaps_global_and_leader_actions() {
         Some(PickerKind::Sessions)
     ));
     app.picker = None;
+    // Picker queries queued while the overlays opened must not mask the
+    // Create command below.
+    while rx.try_recv().is_ok() {}
 
     // Leader actions can be remapped independently of the prefix.
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
@@ -6305,7 +6321,7 @@ fn ctrl_w_still_deletes_a_word_in_insert_mode() {
 }
 
 #[test]
-fn leader_o_opens_the_new_pane_picker() {
+fn leader_o_opens_the_session_picker() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.focus_input();
@@ -6315,12 +6331,40 @@ fn leader_o_opens_the_new_pane_picker() {
     app.handle_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::NewPane)
+        Some(PickerKind::Sessions)
     ));
 }
 
 #[test]
-fn new_command_opens_the_new_pane_picker_instead_of_creating_a_session() {
+fn session_picker_focuses_open_sessions_and_opens_the_rest_in_new_panes() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(session_pane("s1", "one"));
+    app.views.push(session_pane("s2", "two"));
+    app.focused = 1;
+    app.sessions = vec![
+        Session::new("s1", "one", "/tmp"),
+        Session::new("s3", "three", "/tmp"),
+    ];
+
+    // Already open: focus its pane instead of attaching a duplicate pane.
+    app.open_picker(PickerKind::Sessions, &tx);
+    app.picker_enter(PickerKind::Sessions, &tx);
+    assert!(app.picker.is_none());
+    assert_eq!(app.focused, 0);
+    assert_eq!(app.status, "session is already open");
+    assert!(rx.try_recv().is_err(), "focusing must not attach again");
+
+    // Not open yet: one picker entry opens it in a new pane.
+    app.open_picker(PickerKind::Sessions, &tx);
+    let picker = app.picker.as_mut().expect("session picker");
+    picker.selected = 1;
+    app.picker_enter(PickerKind::Sessions, &tx);
+    assert!(matches!(rx.try_recv(), Ok(Command::Attach(id)) if id == "s3"));
+}
+
+#[test]
+fn new_alias_opens_the_session_picker_instead_of_creating_a_session() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(session_pane("s1", "one"));
@@ -6331,7 +6375,7 @@ fn new_command_opens_the_new_pane_picker_instead_of_creating_a_session() {
     app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
     assert!(matches!(
         app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::NewPane)
+        Some(PickerKind::Sessions)
     ));
     while let Ok(command) = rx.try_recv() {
         assert!(

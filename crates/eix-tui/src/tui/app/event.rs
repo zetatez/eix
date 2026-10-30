@@ -211,7 +211,7 @@ impl App {
                 }
                 if let Some(session_id) = jump {
                     self.views[index].selection = None;
-                    self.open_session_id_in_new_pane(session_id, tx);
+                    self.open_or_focus_session_id(session_id, tx);
                 } else if let Some(fold) = fold {
                     self.views[index].folds.insert(fold.id, !fold.open);
                     self.views[index].selection = None;
@@ -1518,7 +1518,7 @@ impl App {
             if available {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/g/s · i subagents · n new · o pane · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
+                self.status = "leader: f/g/s · i subagents · n new · o sessions · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
                     .into();
             }
             return true;
@@ -1891,7 +1891,6 @@ impl App {
             KeyAction::NewSession => self.run_action("new-session", tx),
             KeyAction::NewWorktree => self.run_action("new-worktree", tx),
             KeyAction::Sessions => self.open_picker(PickerKind::Sessions, tx),
-            KeyAction::NewPane => self.run_action("new", tx),
             KeyAction::Palette => self.run_action("commands", tx),
             KeyAction::Files => self.run_action("files", tx),
             KeyAction::Grep => self.run_action("grep", tx),

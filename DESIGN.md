@@ -199,9 +199,10 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `y`/`yy`/`Y`/visual `y` 同时自动写入系统剪贴板（native helper，失败时 OSC 52）。
 - leader 前缀默认 `<Space>`，可通过 `[keys].leader` 修改；输入框 normal 与转录区共用同一映射：
   `n` 新建 session 并开新 pane（当前 session 有 worktree 时复用）、`W` 当前 session 移入 worktree、
-  `o` 打开 session picker（已有 session 放进新 pane；只列普通/worktree session，
-  不列子 agent）、`c` 关闭 pane、`f` 文件、
-  `s` 文件内容（类似 rg）、`i` subagents（有子 agent 时实时监控，否则并发上限）、`g` session picker、`h` 用户输入 timeline、`G` git（worktrees + branches）、
+  `o` 打开 session picker（已打开的 session 直接聚焦其 pane，否则放进新 pane；只列普通/worktree
+  session，不列子 agent）、`c` 关闭 pane、`f` 文件、
+  `s` 文件内容（类似 rg）、`i` subagents（有子 agent 时实时监控，否则并发上限）、
+  `g` git（worktrees + branches）、`h` 用户输入 timeline、
   `p` 进程、`a` 审批 inbox、`x` 取消、`m` 完整执行模式 picker、
   `v`/`t`/`r`/`l` 布局。单字母默认留给 vim；转录区裸
   `q` 关闭当前 pane（最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、
@@ -222,8 +223,8 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   连续切换，daemon 的 session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
 - `Enter` 在 insert 提交；normal 模式把当前 pane 的 session 提到第一位。
-- `@`（insert，行首/空白后）打开文件 picker；`<Space>g` / `<Space>h` 在 normal / 转录区打开
-  session picker / 用户输入 timeline。
+- `@`（insert，行首/空白后）打开文件 picker；`<Space>o` / `<Space>g` / `<Space>h` 在 normal / 转录区打开
+  session picker / git picker / 用户输入 timeline。
 - picker：`Ctrl-J`/`Ctrl-K`（或 `↑`/`↓`）上下选择。
 - 不再有 `[input] backend` / `minimal` 配置，也没有外部编辑器回退路径。
 
@@ -328,9 +329,9 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | 键 | 行为 |
 |---|---|
 | `F1` | 任意模式：可搜索帮助 |
-| `<Space>g` | 转录区 / 输入框 normal：session picker |
+| `<Space>o` | 转录区 / 输入框 normal：session picker（已打开则聚焦，否则开新 pane） |
 | `<Space>h` | 转录区 / 输入框 normal：当前 session 的 user-input timeline |
-| `<Space>G` | 转录区 / 输入框 normal：git picker（worktrees + branches） |
+| `<Space>g` | 转录区 / 输入框 normal：git picker（worktrees + branches） |
 | `<C-t>` | 任意模式：reasoning low / medium / high |
 | `<C-/>` / `<C-_>` / `<C-7>` | 任意模式：模型 picker |
 | `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab；需 kitty 键盘协议；`Ctrl-7` 通常留给模型 picker） |
@@ -373,14 +374,14 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | 命令 | 行为 |
 |---|---|
 | `/help [query]` | 可搜索帮助（命令 / 快捷键 / notes），可带初始查询 |
-| `/new` | session picker，把已有 session 放进新 pane（同 `<Space>o`） |
+| `/new` | `/sessions` 的别名：session picker（已打开则聚焦，否则开新 pane，同 `<Space>o`） |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示 |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
 | `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要，生成结果在 transcript 中展示 |
 | `/btw <question>` | 一次性旁支问答，不写事件日志；`btw.delta` / `btw.completed` 通知，`btw.cancel` 中断 |
 | `/cd [path]` | 切换 session cwd（`session.cd`，canonicalize 后校验在 worktree 内）；输入路径前缀时在输入框上方列出匹配的子目录，`Tab` 补全、`Enter` 切换 |
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
-| `/sessions` / `/fork` | 打开 session picker / fork 当前 session |
+| `/sessions` / `/fork` | session picker（已打开则聚焦，否则开新 pane）/ fork 当前 session |
 | `/projects` | 按工作目录聚合 session，项目与目录内 session 都按最新时间倒序；可搜索，`Enter` 进入该项目后选择 session |
 | `/files` / `/grep` / `/git` | picker；`/files` 插入 `@路径`，`/grep [query]` 搜索内容并插入 `@路径:行号`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
 | `/processes` / `/approvals` | 进程 / 审批收件箱 |
@@ -478,9 +479,9 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     紧跟 session id 前；
     files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
     grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
-  - 入口：`<Space>g`（sessions，切换 pane）、`<Space>h`（timeline）、`<Space>o`（sessions，新 pane）、
+  - 入口：`<Space>o`（sessions，已打开则聚焦，否则开新 pane）、`<Space>h`（timeline）、
     `<Space>f`（files）、`<Space>s`（grep，文件内容）、`<Space>i`（subagents，实时活动）、`Ctrl-P`（commands，命令面板；转录区与输入框
-    normal 模式都可用）、`<Space>G`（git，统一列出 worktrees 和 branches；没有 linked worktree 时
+    normal 模式都可用）、`<Space>g`（git，统一列出 worktrees 和 branches；没有 linked worktree 时
     省略仓库主路径）、prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
   - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`images`
     （按 png/jpg/jpeg/gif/webp 过滤的 workspace 图片，默认最多 5000 行）、`grep`
@@ -927,6 +928,9 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > 防抖，Enter 插入 `@path:line`。搜索跳过派生目录、二进制文件和大于 4 MiB 的文件。
 > 快捷键调整（2026-10-26）：TUI 的 sessions 从 `Ctrl-G` 移到 `<Space>g`，timeline 从
 > `Ctrl-H` / `Ctrl-Backspace` 移到 `<Space>h`；git picker 从 `<Space>g` 移到 `<Space>G`。
+> 合并 session 入口（2026-10-30）：`<Space>g` 与 `<Space>o` 合为一个入口 `<Space>o`——已打开的
+> session 直接聚焦其 pane，未打开则开新 pane；git picker 回到 `<Space>g`，`<Space>G` 取消。
+> `/new` 成为 `/sessions` 的别名。
 > 输入焦点（2026-10-18）：`Esc` 只在 insert/visual 下回到 normal 并保留焦点，500ms 内
 > 再按一次才回到转录；`<CR>` 只在 insert 提交；`<C-g>` 在任意模式打开 picker；
 > `Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 只在 insert 换行；`F1` 全局帮助；
@@ -1265,7 +1269,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 
 | 快捷键 | 功能 |
 | --- | --- |
-| `Space o` | 把已有 session 开到新 pane |
+| `Space o` | session picker：已打开则聚焦，否则开新 pane |
 | `Space n` | 新建 session（有 worktree 则复用） |
 | `Space W` | 把当前 session 移入新 worktree |
 | `Space c` | 保存并关闭当前 pane |
@@ -1275,9 +1279,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 | `Space f` | 文件 picker |
 | `Space s` | 搜索文件内容并插入 `@path:line` |
 | `Space i` | subagents 实时 picker：有子 agent 时监控并搜索 child，否则打开并发上限 picker |
-| `Space g` | session picker（切换聚焦 pane） |
+| `Space g` | git picker（worktrees + branches） |
 | `Space h` | 用户输入 timeline picker |
-| `Space G` | git picker（worktrees + branches） |
 | `Space p` | 后台进程列表 |
 | `Space v` | horizontal 布局 |
 | `Space t` | tabby 布局 |
@@ -1343,7 +1346,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | 命令 | 行为 |
 | --- | --- |
 | `/help [query]` | 打开可搜索帮助（命令、快捷键、notes）；可带初始查询 |
-| `/new` | 打开 session picker，把已有 session 放进新 pane（同 `<Space>o`） |
+| `/new` | `/sessions` 的别名：打开 session picker，已打开则聚焦，否则开新 pane（同 `<Space>o`） |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示，不重复创建 |
 | `/ready` | 把当前 worktree 交给 daemon 做 rebase / 测试 / ff merge |
 | `/integrate` | 显示当前 session 的集成队列状态与最近错误 |
@@ -1352,7 +1355,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/btw <question>` | 用一次性上下文回答旁支问题；不写入事件日志，也不进入主对话；`Esc` 关闭 |
 | `/cd [path]` | 切换当前 session 的 cwd（支持 `~` 和相对路径）；输入路径前缀时列出匹配的子目录，`Tab` 补全、`Enter` 切换；省略时显示当前路径 |
 | `/init` | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送 |
-| `/sessions` | 打开 session picker |
+| `/sessions` | 打开 session picker：已打开的 session 直接聚焦，否则开新 pane |
 | `/projects` | 按工作目录浏览 session：项目按最新 session 时间倒序，进入项目后可在目录内搜索并选择 session |
 | `/files` | 文件 picker，选中后插入 `@path` |
 | `/grep [query]` | 内容 picker：搜索 workspace 文件内容，选中后插入 `@path:line`；可直接带初始查询 |

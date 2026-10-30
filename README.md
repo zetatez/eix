@@ -219,8 +219,8 @@ eix tui [--session ID]
 | `F1` | 可搜索帮助 |
 | `Ctrl-T` | 切换 reasoning 强度 |
 | `Ctrl-/` | 模型 picker |
-| `Space g` / `Space h` | session picker / 输入 timeline |
-| `Space f` / `Space s` / `Space G` | 文件 / 内容搜索 / git picker |
+| `Space o` / `Space h` | session picker（已打开则聚焦，否则新 pane）/ 输入 timeline |
+| `Space f` / `Space s` / `Space g` | 文件 / 内容搜索 / git picker |
 | `Space i` | subagents 实时 picker（无子 agent 时打开并发上限） |
 | `Space n` / `Space W` | 新建 session / 移入新 worktree |
 | `Space a` / `Space p` | 审批收件箱 / 后台进程 |
