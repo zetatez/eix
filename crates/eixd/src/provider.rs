@@ -321,6 +321,10 @@ impl Provider {
             "model": model,
             "messages": wire_messages,
             "stream": true,
+            // Ask OpenAI-compatible servers to include the final usage chunk.
+            // Without it many gateways only report tokens for some steps, which
+            // makes cache-hit and token accounting impossible.
+            "stream_options": {"include_usage": true},
         });
         if let Some(effort) = &route.reasoning_effort {
             body["reasoning_effort"] = json!(effort);
