@@ -297,4 +297,6 @@ TCP, and the Neovim protocol surface. See the
 
 ## License
 
-MIT
+The project is proprietary. All rights reserved. See [LICENSE](./LICENSE).
+
+Copyright (c) 2026 shiyi <zetatez@icloud.com>
