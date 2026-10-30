@@ -1,0 +1,34 @@
+{
+  "id": "instruction_api_shape",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Add `pub fn clamp_percent(value: i32) -> u8` to src/lib.rs: clamp the value into `0..=100` and return it as `u8`. Constraints: edit only src/lib.rs; do not change the existing `clamp01` function, Cargo.toml or the existing tests; add no other public functions and no dependencies. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "checks": [
+    {
+      "kind": "path_unchanged",
+      "axis": "adherence",
+      "path": "Cargo.toml"
+    }
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

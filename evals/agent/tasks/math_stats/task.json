@@ -1,0 +1,27 @@
+{
+  "id": "math_stats",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate computes basic statistics over `f64` slices. `mean`, `variance` (population, divide by n) and `median` must return `None` for an empty slice and for any input containing a non-finite value. `median` must average the two middle values for an even count. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

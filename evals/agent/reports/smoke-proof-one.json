@@ -1,0 +1,226 @@
+{
+  "generated_at": "20261030T151828Z",
+  "args": {
+    "tasks": "math_proof_inf_primes",
+    "repeats": 1,
+    "bin_dir": "/tmp/eix-agent-new-bin",
+    "config": "/home/shiyi/.config/eix/config.toml",
+    "workdir": "/tmp/eix-agent-eval",
+    "output": "evals/agent/reports/smoke-proof-one.json",
+    "timeout": 300.0,
+    "keep_workdir": false,
+    "verify_timeout": 180.0,
+    "daemon_timeout": 20.0
+  },
+  "summary": {
+    "runs": 1,
+    "passed": 1,
+    "pass_rate": 1.0,
+    "total_prompt_tokens": 5496,
+    "total_completion_tokens": 709,
+    "total_tokens": 6205,
+    "total_cache_read_tokens": 4736,
+    "usage_coverage": 1.0,
+    "cache_hit_rate": 0.8617,
+    "mean_duration_s": 6.902,
+    "mean_model_steps": 1.0,
+    "mean_tool_calls": 0.0,
+    "score": {
+      "runs": 1,
+      "passed": 1,
+      "pass_rate": 1.0,
+      "pass_all_tasks": "1/1",
+      "mean_score": 98.8,
+      "axes": {
+        "correctness": 1.0,
+        "adherence": 1.0,
+        "loops": 1.0,
+        "tokens": 1.0,
+        "time": 1.0,
+        "cache": 0.862
+      },
+      "tasks": {
+        "math_proof_inf_primes": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 98.8
+        }
+      },
+      "categories": {
+        "mathematical-reasoning": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 98.8
+        }
+      }
+    }
+  },
+  "results": [
+    {
+      "task": "math_proof_inf_primes",
+      "category": "mathematical-reasoning",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T151821Z-math_proof_inf_primes-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T151821Z-math_proof_inf_primes-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not change any file. Prove by contradiction that there are infinitely many primes, using the product of all primes plus one. Explain why the new number must have a prime divisor not in the list. End with the line `QED`.",
+      "passed": true,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "Assume, for contradiction, that there are only finitely many primes, and list all of them:\n\\[\np_1,p_2,\\dots,p_n.\n\\]\nForm their product and add one:\n\\[\nN=p_1p_2\\cdots p_n+1.\n\\]\nClearly \\(N>1\\).\n\nFor each listed prime \\(p_i\\),\n\\[\nN=p_i\\left(\\prod_{j\\ne i}p_j\\right)+1,\n\\]\nso \\(N\\equiv 1\\pmod{p_i}\\). Hence \\(p_i\\nmid N\\) for every \\(i=1,\\dots,n\\).\n\nSince \\(N>1\\), it has a prime divisor: take its smallest divisor greater than \\(1\\); that divisor cannot be composite, so it is prime. Let \\(q\\) be such a prime divisor of \\(N\\).\n\nBecause every prime was assumed to be in the list, \\(q=p_i\\) for some \\(i\\). But then \\(p_i\\mid N\\), contradicting the fact that none of the listed primes divides \\(N\\). Therefore \\(q\\) is a prime not in the list, so the original list could not have contained all primes.\n\nThus no finite list can contain every prime, and there are infinitely many primes.\n\nQED\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 6.902
+      },
+      "session": {
+        "id": "57e83b22-f007-4dfc-89a9-efe9b7fef3dd",
+        "name": "math_proof_inf_primes",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 1,
+        "steps_with_usage": 1,
+        "usage_coverage": 1.0,
+        "tool_calls": 0,
+        "tools": {},
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 1
+        },
+        "prompt_tokens": 5496,
+        "completion_tokens": 709,
+        "cache_read_tokens": 4736,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 452,
+        "uncached_prompt_tokens": 760,
+        "cache_hit_rate": 0.8617,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 0,
+          "first_step_cache_hit": 0.8617,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5496,
+            "completion_tokens": 709,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 452,
+            "tool_calls": 0,
+            "chars": 887
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          2,
+          8
+        ],
+        "tokens": [
+          20000,
+          70000
+        ],
+        "seconds": [
+          12,
+          70
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T151821Z-math_proof_inf_primes-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T151821Z-math_proof_inf_primes-r1/data/eix.sqlite3\n",
+      "duration_s": 6.902,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_all",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "score": {
+        "total": 98.8,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.862
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 6205,
+          "steps": 1,
+          "seconds": 6.902,
+          "cache_hit_rate": 0.862,
+          "first_step_cache_hit": 0.862,
+          "budgets": {
+            "steps": [
+              2.0,
+              8.0
+            ],
+            "tokens": [
+              20000.0,
+              70000.0
+            ],
+            "seconds": [
+              12.0,
+              70.0
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "id": "agentic_rle",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement run-length encoding in src/lib.rs. `encode` turns each run of the same character into that character followed by the run length, omitting the length when it is 1, so `aaabcc` becomes `a3bc2`. `decode` reverses that, treats a missing count as 1, accepts multi-digit counts, and returns `None` when the input starts with a digit, has a zero count, or has trailing digits. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

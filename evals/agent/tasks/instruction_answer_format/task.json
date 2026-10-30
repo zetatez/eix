@@ -1,0 +1,35 @@
+{
+  "id": "instruction_answer_format",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Do not change any file. Reply with exactly these three lines and nothing else:\nstatus: ok\nfiles: 0\nrisk: none",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_all",
+      "axis": "correctness",
+      "needles": [
+        "status: ok",
+        "files: 0",
+        "risk: none"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      3,
+      10
+    ],
+    "tokens": [
+      25000,
+      80000
+    ],
+    "seconds": [
+      15,
+      80
+    ]
+  }
+}

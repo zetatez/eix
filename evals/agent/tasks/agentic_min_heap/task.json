@@ -1,0 +1,27 @@
+{
+  "id": "agentic_min_heap",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement a binary min-heap in src/lib.rs with `new()`, `push(value)`, `pop()` returning the smallest value, and `len()`. Duplicate values are allowed. `pop` on an empty heap returns `None`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

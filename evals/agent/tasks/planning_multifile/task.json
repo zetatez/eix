@@ -1,0 +1,36 @@
+{
+  "id": "planning_multifile",
+  "category": "task-planning",
+  "planning": true,
+  "prompt": "Work autonomously and do not ask questions. First call `update_plan` with at least three steps covering the lexer, the parser and the final test run, then implement them and mark steps completed as you finish. `eval_expr` accepts a string of the form `A op B` with single spaces, where A and B are non-negative integers and op is `+`, `-` or `*`; it returns the `i64` result in `Some`, or `None` for malformed input or overflow. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "checks": [
+    {
+      "kind": "plan_used",
+      "axis": "planning",
+      "min_steps": 3,
+      "min_completed": 2
+    }
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

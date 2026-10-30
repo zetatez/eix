@@ -1,0 +1,27 @@
+{
+  "id": "math_binomial_mod",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `binom_mod(n, k, p)` in src/lib.rs, returning `C(n, k) mod p` via Lucas' theorem. `p` is a prime. Return `Some(0)` when `k > n`, and `None` when `p < 2`. `n` and `k` may be as large as `10^18`, so do not compute the full factorial. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      7,
+      16
+    ],
+    "tokens": [
+      40000,
+      135000
+    ],
+    "seconds": [
+      28,
+      120
+    ]
+  }
+}

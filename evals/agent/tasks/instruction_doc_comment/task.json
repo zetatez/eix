@@ -1,0 +1,37 @@
+{
+  "id": "instruction_doc_comment",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Add a doc comment to `square` in src/lib.rs that says exactly `Returns x squared.` Do not change its body, Cargo.toml or the existing tests, and add nothing else. Run `cargo test` and finish only when the tests pass.",
+  "checks": [
+    {
+      "kind": "source_contains",
+      "axis": "correctness",
+      "path": "src/lib.rs",
+      "needles": [
+        "/// Returns x squared."
+      ]
+    }
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      3,
+      10
+    ],
+    "tokens": [
+      25000,
+      80000
+    ],
+    "seconds": [
+      15,
+      80
+    ]
+  },
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ]
+}

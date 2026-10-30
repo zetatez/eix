@@ -1,0 +1,42 @@
+{
+  "id": "instruction_no_unsafe",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Add `pub fn checked_abs(x: i64) -> Option<i64>` to src/lib.rs: it returns `None` for `i64::MIN` and `Some(x.abs())` otherwise. Constraints: edit only src/lib.rs; do not use `unsafe`, `unwrap`, `expect`, `panic!` or `todo!` in your implementation; add no dependencies and no test modules; keep the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "checks": [
+    {
+      "kind": "source_forbidden",
+      "axis": "adherence",
+      "path": "src/lib.rs",
+      "ignore_tests": true,
+      "patterns": [
+        "unsafe",
+        "\\.unwrap\\(",
+        "\\.expect\\(",
+        "panic!",
+        "todo!"
+      ]
+    }
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

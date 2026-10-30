@@ -1,0 +1,23 @@
+{
+  "id": "instruction_exact",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Add `pub fn sum_checked(values: &[i64]) -> Result<i64, &'static str>` to src/lib.rs. Empty input returns `Err(\"empty\")`. Sum with checked_add; if any addition overflows return `Err(\"overflow\")`. Otherwise return the sum. Constraints: edit only src/lib.rs; do not change `checked_div`; add no dependencies and no test modules; the implementation must not use `unwrap`, `expect`, `panic!`, `wrapping_add` or `saturating_add`; use `checked_add`. Keep the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": ["cargo", "test", "--quiet"],
+  "editable": ["src/lib.rs"],
+  "checks": [
+    {
+      "kind": "source_forbidden",
+      "axis": "adherence",
+      "path": "src/lib.rs",
+      "ignore_tests": true,
+      "patterns": [
+        "\\.unwrap\\(",
+        "\\.expect\\(",
+        "panic!",
+        "wrapping_add",
+        "saturating_add"
+      ]
+    }
+  ],
+  "budgets": {"steps": [5, 12], "tokens": [30000, 100000], "seconds": [20, 100]}
+}

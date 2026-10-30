@@ -1,0 +1,504 @@
+{
+  "generated_at": "20261030T155819Z",
+  "args": {
+    "tasks": "instruction_no_files",
+    "repeats": 3,
+    "bin_dir": "/tmp/eix-agent-new-bin",
+    "config": "/home/shiyi/.config/eix/config.toml",
+    "workdir": "/tmp/eix-agent-eval",
+    "output": "evals/agent/reports/smoke-instr2.json",
+    "timeout": 300.0,
+    "keep_workdir": false,
+    "verify_timeout": 180.0,
+    "daemon_timeout": 20.0
+  },
+  "summary": {
+    "runs": 3,
+    "passed": 3,
+    "pass_rate": 1.0,
+    "total_prompt_tokens": 16383,
+    "total_completion_tokens": 277,
+    "total_tokens": 16660,
+    "total_cache_read_tokens": 14208,
+    "usage_coverage": 1.0,
+    "cache_hit_rate": 0.8672,
+    "mean_duration_s": 2.834,
+    "mean_model_steps": 1.0,
+    "mean_tool_calls": 0.0,
+    "score": {
+      "runs": 3,
+      "passed": 3,
+      "pass_rate": 1.0,
+      "pass_all_tasks": "1/1",
+      "mean_score": 98.8,
+      "axes": {
+        "correctness": 1.0,
+        "adherence": 1.0,
+        "loops": 1.0,
+        "tokens": 1.0,
+        "time": 1.0,
+        "cache": 0.867
+      },
+      "tasks": {
+        "instruction_no_files": {
+          "runs": 3,
+          "passed": 3,
+          "mean_score": 98.8
+        }
+      },
+      "categories": {
+        "instruction-following": {
+          "runs": 3,
+          "passed": 3,
+          "mean_score": 98.8
+        }
+      }
+    }
+  },
+  "results": [
+    {
+      "task": "instruction_no_files",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155811Z-instruction_no_files-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155811Z-instruction_no_files-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not modify any file. In one sentence, explain why running a downloaded script without review is unsafe.",
+      "passed": true,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "Because a downloaded script executes with your user's privileges, it can silently run whatever commands its author chose \u2014 exfiltrate credentials, alter or delete files, install persistence, or fetch further payloads \u2014 and you can't know which until you've read it.\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 3.881
+      },
+      "session": {
+        "id": "5c07b391-aa84-4cda-b7d7-3fa8d2ca171f",
+        "name": "instruction_no_files",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 1,
+        "steps_with_usage": 1,
+        "usage_coverage": 1.0,
+        "tool_calls": 0,
+        "tools": {},
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 1
+        },
+        "prompt_tokens": 5461,
+        "completion_tokens": 128,
+        "cache_read_tokens": 4736,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 74,
+        "uncached_prompt_tokens": 725,
+        "cache_hit_rate": 0.8672,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 0,
+          "first_step_cache_hit": 0.8672,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5461,
+            "completion_tokens": 128,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 74,
+            "tool_calls": 0,
+            "chars": 265
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155811Z-instruction_no_files-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155811Z-instruction_no_files-r1/data/eix.sqlite3\n",
+      "duration_s": 3.881,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "score": {
+        "total": 98.8,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.867
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 5589,
+          "steps": 1,
+          "seconds": 3.881,
+          "cache_hit_rate": 0.867,
+          "first_step_cache_hit": 0.867,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_no_files",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 2,
+      "run_id": "20261030T155815Z-instruction_no_files-r2",
+      "repo": "/tmp/eix-agent-eval/20261030T155815Z-instruction_no_files-r2/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not modify any file. In one sentence, explain why running a downloaded script without review is unsafe.",
+      "passed": true,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "Because a downloaded script executes with your user's privileges and can silently read, modify, or exfiltrate your files, install malware, or reach internal services, and without reviewing it you have no idea whether its contents match what it claims to do.\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 2.575
+      },
+      "session": {
+        "id": "61cca71d-5546-4827-aa01-03b020d5e831",
+        "name": "instruction_no_files",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 1,
+        "steps_with_usage": 1,
+        "usage_coverage": 1.0,
+        "tool_calls": 0,
+        "tools": {},
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 1
+        },
+        "prompt_tokens": 5461,
+        "completion_tokens": 91,
+        "cache_read_tokens": 4736,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 39,
+        "uncached_prompt_tokens": 725,
+        "cache_hit_rate": 0.8672,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 0,
+          "first_step_cache_hit": 0.8672,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5461,
+            "completion_tokens": 91,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 39,
+            "tool_calls": 0,
+            "chars": 257
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155815Z-instruction_no_files-r2/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155815Z-instruction_no_files-r2/data/eix.sqlite3\n",
+      "duration_s": 2.575,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "score": {
+        "total": 98.8,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.867
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 5552,
+          "steps": 1,
+          "seconds": 2.575,
+          "cache_hit_rate": 0.867,
+          "first_step_cache_hit": 0.867,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_no_files",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 3,
+      "run_id": "20261030T155817Z-instruction_no_files-r3",
+      "repo": "/tmp/eix-agent-eval/20261030T155817Z-instruction_no_files-r3/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not modify any file. In one sentence, explain why running a downloaded script without review is unsafe.",
+      "passed": true,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "Because you cannot know what the script actually does until you inspect it, it could execute hidden malicious commands (data exfiltration, credential theft, arbitrary code) with your user's full permissions and privileges.\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 2.047
+      },
+      "session": {
+        "id": "1c00b766-594b-485a-8ae4-748ece45de88",
+        "name": "instruction_no_files",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 1,
+        "steps_with_usage": 1,
+        "usage_coverage": 1.0,
+        "tool_calls": 0,
+        "tools": {},
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 1
+        },
+        "prompt_tokens": 5461,
+        "completion_tokens": 58,
+        "cache_read_tokens": 4736,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 16,
+        "uncached_prompt_tokens": 725,
+        "cache_hit_rate": 0.8672,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 0,
+          "first_step_cache_hit": 0.8672,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5461,
+            "completion_tokens": 58,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 16,
+            "tool_calls": 0,
+            "chars": 222
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155817Z-instruction_no_files-r3/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155817Z-instruction_no_files-r3/data/eix.sqlite3\n",
+      "duration_s": 2.047,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "score": {
+        "total": 98.8,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.867
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 5519,
+          "steps": 1,
+          "seconds": 2.047,
+          "cache_hit_rate": 0.867,
+          "first_step_cache_hit": 0.867,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

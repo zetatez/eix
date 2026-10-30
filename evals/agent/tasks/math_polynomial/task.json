@@ -1,0 +1,27 @@
+{
+  "id": "math_polynomial",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `eval` and `derivative` in src/lib.rs. Coefficients are in ascending order, so `[1, 2, 3]` means `1 + 2x + 3x^2`. `eval` uses checked `i64` arithmetic and returns `None` on overflow; an empty slice evaluates to `Some(0)`. `derivative` returns the coefficient slice of the derivative, which is empty for a constant or empty input. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "math_determinant",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `det3` and `invertible` in src/lib.rs. `det3` returns the determinant of a 3x3 `i64` matrix using checked arithmetic, or `None` if any intermediate result overflows `i64`. `invertible` is true exactly when `det3` is `Some(value)` and `value != 0`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

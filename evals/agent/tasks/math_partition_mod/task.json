@@ -1,0 +1,27 @@
+{
+  "id": "math_partition_mod",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `partitions(n, modulus)` in src/lib.rs, returning the number of integer partitions of `n` reduced modulo `modulus`. Use Euler's pentagonal-number recurrence instead of enumerating partitions. `partitions(0, m)` is 1, and `modulus == 0` returns `None`. `n` may be as large as 10000. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      7,
+      16
+    ],
+    "tokens": [
+      40000,
+      135000
+    ],
+    "seconds": [
+      28,
+      120
+    ]
+  }
+}

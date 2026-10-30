@@ -1,0 +1,27 @@
+{
+  "id": "math_crt",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `crt(residues, moduli)` in src/lib.rs, the Chinese remainder theorem. The slices must have equal length, every modulus must be positive, and the moduli must be pairwise coprime. Return the unique solution in `[0, lcm)` as `Some(i64)`, or `None` when the input is inconsistent or the result cannot be represented in `i64`. Two empty slices return `Some(0)`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      7,
+      16
+    ],
+    "tokens": [
+      40000,
+      130000
+    ],
+    "seconds": [
+      28,
+      120
+    ]
+  }
+}

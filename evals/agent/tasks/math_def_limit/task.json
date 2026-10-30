@@ -1,0 +1,84 @@
+{
+  "id": "math_def_limit",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Do not change any file. State the epsilon-delta definition of lim_{x -> a} f(x) = L, then use it to prove that lim_{x -> 2} (3x + 1) = 7. Give an explicit choice of delta in terms of epsilon. End with the line `QED`.",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "epsilon",
+        "\u03b5"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "delta",
+        "\u03b4"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "for all",
+        "for every"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "there exists",
+        "choose"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "3x + 1",
+        "3x+1"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "epsilon/3",
+        "\u03b5/3",
+        "epsilon / 3",
+        "\u03b5 / 3",
+        "\\frac{\\varepsilon}{3}"
+      ]
+    },
+    {
+      "kind": "text_all",
+      "axis": "correctness",
+      "needles": [
+        "qed"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      2,
+      9
+    ],
+    "tokens": [
+      22000,
+      80000
+    ],
+    "seconds": [
+      14,
+      80
+    ]
+  }
+}

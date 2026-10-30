@@ -1,0 +1,27 @@
+{
+  "id": "math_isqrt",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `isqrt` and `is_perfect_square` in src/lib.rs for the full `u64` range. `isqrt(n)` is the largest integer whose square is at most `n`. `is_perfect_square(n)` is true exactly when `n` is a perfect square, including 0 and 1. Do not use floating point. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

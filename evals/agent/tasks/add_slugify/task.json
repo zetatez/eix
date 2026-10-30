@@ -1,5 +1,27 @@
 {
   "id": "add_slugify",
   "prompt": "Work autonomously and do not ask questions. Implement `slugify` in src/lib.rs. The contract: lowercase ASCII letters and digits are kept; every run of other characters becomes a single `-`; the result has no leading or trailing `-`; an empty or punctuation-only input becomes an empty string. Keep the public signature and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
-  "verify": ["cargo", "test", "--quiet"]
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      4,
+      9
+    ],
+    "tokens": [
+      28000,
+      90000
+    ],
+    "seconds": [
+      18,
+      90
+    ]
+  },
+  "category": "agentic-coding"
 }

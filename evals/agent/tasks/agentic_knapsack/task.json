@@ -1,0 +1,27 @@
+{
+  "id": "agentic_knapsack",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `max_value(weights, values, capacity)` in src/lib.rs for 0/1 knapsack: each item may be used at most once, and the total weight must not exceed `capacity`. Return the largest achievable value as `Some(u64)`, or `None` if the slice lengths differ. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

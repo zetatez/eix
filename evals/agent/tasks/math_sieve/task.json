@@ -1,0 +1,27 @@
+{
+  "id": "math_sieve",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `primes_up_to(limit)` in src/lib.rs using the sieve of Eratosthenes. Return every prime less than or equal to `limit` in ascending order. `limit` below 2 returns an empty vector. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

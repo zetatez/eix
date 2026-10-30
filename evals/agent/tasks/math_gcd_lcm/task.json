@@ -1,0 +1,27 @@
+{
+  "id": "math_gcd_lcm",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate computes greatest common divisors and least common multiples. `gcd(a, b)` must be non-negative, `gcd(0, 0)` is 0, and signs must not matter. `lcm(a, b)` must be non-negative, `lcm(0, n)` is 0, and it must return `None` when the result does not fit in `u64` instead of overflowing. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

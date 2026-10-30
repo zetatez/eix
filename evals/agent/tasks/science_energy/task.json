@@ -1,0 +1,27 @@
+{
+  "id": "science_energy",
+  "category": "scientific-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate computes mechanical energy. `kinetic(mass, velocity)` returns `0.5 * mass * velocity^2`, and `potential(mass, height, gravity)` returns `mass * gravity * height`. Every argument must be finite; mass and velocity must be non-negative, height may be negative, and gravity must be strictly positive. Otherwise return `Err(\"invalid\")`. Keep the public signatures and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

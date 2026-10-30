@@ -1,0 +1,27 @@
+{
+  "id": "refactor_dupes",
+  "prompt": "Work autonomously and do not ask questions. This crate computes order totals. `total_with_tax` must saturate instead of overflowing, and `total_with_discount` must clamp at zero instead of underflowing when the discount is larger than the subtotal. The subtotal logic is duplicated in both functions; factor it into one private helper. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  },
+  "category": "agentic-coding"
+}

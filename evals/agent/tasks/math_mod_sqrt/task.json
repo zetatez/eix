@@ -1,0 +1,27 @@
+{
+  "id": "math_mod_sqrt",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `sqrt_mod(a, p)` in src/lib.rs using the Tonelli-Shanks algorithm. `p` is an odd prime. Return the smallest `x` in `[0, p)` with `x^2 = a (mod p)`, or `None` when `a` is a non-residue. `sqrt_mod(0, p)` is 0. Return `None` for `p < 3` or even `p`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      7,
+      17
+    ],
+    "tokens": [
+      40000,
+      140000
+    ],
+    "seconds": [
+      30,
+      130
+    ]
+  }
+}

@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -31,9 +32,27 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 
+import score as scoring
+
 ROOT = Path(__file__).resolve().parents[2]
 TASKS_DIR = Path(__file__).resolve().parent / "tasks"
 DEFAULT_CONFIG = Path.home() / ".config" / "eix" / "config.toml"
+
+# Commands that create throwaway files or delete things the task didn't ask
+# about. They are not fatal, but they burn steps, so the score counts them.
+SCRATCH_MARKERS = (
+    "tmp_verify",
+    "edge_cases",
+    "scratch",
+    "mkdir -p tests",
+)
+# Ad-hoc verification outside the workspace: mktemp dirs, /tmp probe programs,
+# and include!-based harnesses. The agent should trust the task's own tests.
+SCRATCH_PROGRAM = re.compile(
+    r"(mktemp\s+-d|include!\(|cat\s*>\s*(?:\"?\$work|/tmp/|/var/tmp/)|mkdir\s+-p\s+/tmp/)"
+)
+DELETE_MARKER = re.compile(r"\brm\s+(?:-\w+\s+)*(?:Cargo\.lock|tests/|src/[^\s]+\.rs)\b")
+HEREDOC_WRITE = re.compile(r"cat\s*>+\s*(?:tests/|src/)[^\s]*\.rs\b")
 
 
 def now_stamp() -> str:
@@ -108,7 +127,9 @@ def git_init(repo: Path) -> None:
     subprocess.run(["git", "config", "user.email", "eval@eix.local"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "eix eval"], cwd=repo, check=True)
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-qm", "seed"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "commit", "-qm", "seed", "--allow-empty"], cwd=repo, check=True
+    )
 
 
 def latest_session(db: Path, cwd: Path) -> dict | None:
@@ -153,6 +174,19 @@ def read_events(db: Path, session_id: str) -> list[dict]:
     return events
 
 
+def _tool_text(name: str, raw_args: str) -> str:
+    """Return the free text a tool call carries, for cheap heuristics."""
+    try:
+        args = json.loads(raw_args)
+    except json.JSONDecodeError:
+        return ""
+    if name == "apply_patch":
+        return str(args.get("input") or "")
+    if name in ("exec_command", "shell"):
+        return str(args.get("cmd") or args.get("command") or "")
+    return ""
+
+
 def summarize_events(events: list[dict]) -> dict:
     kinds = Counter(event["kind"] for event in events)
     steps = []
@@ -161,6 +195,7 @@ def summarize_events(events: list[dict]) -> dict:
     tools = Counter()
     errors = []
     model = None
+    tool_log: list[tuple[str, str]] = []
     for event in events:
         payload = event["payload"]
         if event["kind"] == "assistant_message":
@@ -184,11 +219,67 @@ def summarize_events(events: list[dict]) -> dict:
             reasoning += step["reasoning_tokens"]
         elif event["kind"] == "tool_call":
             tool_calls += 1
-            tools[payload.get("tool") or "?"] += 1
+            name = payload.get("tool") or "?"
+            tools[name] += 1
+            args = payload.get("arguments") or {}
+            tool_log.append((name, json.dumps(args, sort_keys=True)))
         elif event["kind"] == "error":
             errors.append(str(payload.get("message") or "")[:300])
     total_prompt = prompt
     uncached = max(0, prompt - cache_read)
+
+    seen = Counter()
+    redundant = 0
+    scratch = 0
+    verification = 0
+    git_status = 0
+    reads_before_edit = 0
+    edited = False
+    for name, raw in tool_log:
+        if seen[(name, raw)]:
+            redundant += 1
+        seen[(name, raw)] += 1
+        text = _tool_text(name, raw)
+        lowered = text.lower()
+        if (
+            any(marker in lowered for marker in SCRATCH_MARKERS)
+            or SCRATCH_PROGRAM.search(text)
+            or DELETE_MARKER.search(text)
+            or HEREDOC_WRITE.search(text)
+        ):
+            scratch += 1
+        if name == "apply_patch":
+            edited = True
+            if re.search(r"\*\*\* Add File:\s*\S*(?:tests?/|tmp)", text):
+                scratch += 1
+        if "cargo test" in lowered or "cargo nextest" in lowered or "cargo check" in lowered:
+            verification += 1
+        if "git status" in lowered or "git diff" in lowered:
+            git_status += 1
+        if not edited and name in ("exec_command", "shell", "read_file", "list_files", "grep"):
+            reads_before_edit += 1
+
+    first_prompt = steps[0]["prompt_tokens"] if steps else 0
+    first_hit = steps[0]["cache_read_tokens"] / first_prompt if first_prompt else 0.0
+
+    plan_updates = 0
+    plan_steps = 0
+    plan_completed = 0
+    for name, raw in tool_log:
+        if name != "update_plan":
+            continue
+        plan_updates += 1
+        try:
+            plan = json.loads(raw).get("plan") or []
+        except (json.JSONDecodeError, AttributeError):
+            plan = []
+        plan_steps = len(plan)
+        plan_completed = sum(
+            1
+            for step in plan
+            if isinstance(step, dict) and step.get("status") == "completed"
+        )
+
     return {
         "model": model,
         "model_steps": len(steps),
@@ -220,9 +311,153 @@ def summarize_events(events: list[dict]) -> dict:
         "reasoning_tokens": reasoning,
         "uncached_prompt_tokens": uncached,
         "cache_hit_rate": round(cache_read / prompt, 4) if prompt else 0.0,
+        "process": {
+            "redundant_tool_calls": redundant,
+            "scratch_writes": scratch,
+            "verification_runs": verification,
+            "git_status_calls": git_status,
+            "reads_before_first_edit": reads_before_edit,
+            "first_step_cache_hit": round(first_hit, 4),
+            "plan_updates": plan_updates,
+            "plan_steps": plan_steps,
+            "plan_completed": plan_completed,
+        },
         "errors": errors,
         "steps": steps,
     }
+
+
+def remove_injected(paths: list[Path], repo: Path) -> None:
+    """Delete injected hidden tests so a later run cannot read the answer key."""
+    for path in paths:
+        path.unlink(missing_ok=True)
+        parent = path.parent
+        while parent != repo and parent.is_dir() and not any(parent.iterdir()):
+            parent.rmdir()
+            parent = parent.parent
+
+
+def final_assistant_text(events: list[dict]) -> str:
+    """Last assistant message that actually wrote prose (not just a tool call)."""
+    for event in reversed(events):
+        if event["kind"] != "assistant_message":
+            continue
+        text = (event["payload"].get("text") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def strip_tests(source: str) -> str:
+    """Drop a trailing `#[cfg(test)]` module so test helpers can use `unwrap`."""
+    index = source.find("#[cfg(test)]")
+    return source[:index] if index >= 0 else source
+
+
+def _flatten_latex(text: str) -> str:
+    """Remove LaTeX punctuation so notation variants compare equal.
+
+    `x^{2}`, `x^2` and `x²` collapse together, as do `\\(n\\)-th` and `n-th`,
+    `\\frac{\\varepsilon}{3}` and `fracvarepsilon3`, and the Unicode minus with
+    an ASCII hyphen.
+    """
+    return (
+        text.replace("\\(", "")
+        .replace("\\)", "")
+        .replace("\\[", "")
+        .replace("\\]", "")
+        .replace("\\", "")
+        .replace("{", "")
+        .replace("}", "")
+        .replace("$", "")
+        .replace("²", "^2")
+        .replace("³", "^3")
+        .replace("−", "-")
+    )
+
+
+def text_has(text: str, needle: str) -> bool:
+    """Match a prose needle, tolerating LaTeX/markdown decoration."""
+    text = text.lower()
+    needle = needle.lower()
+    if needle in text:
+        return True
+    flat_needle = _flatten_latex(needle)
+    return len(flat_needle) >= 2 and flat_needle in _flatten_latex(text)
+
+
+def evaluate_checks(
+    meta: dict, repo: Path, changes: dict, events: list[dict], metrics: dict
+) -> list[dict]:
+    """Run the task's structural checks.
+
+    Checks with `axis: correctness` gate the pass; the others only feed the
+    score, so a stylistic instruction cannot hide a broken implementation.
+    """
+    process = metrics.get("process") or {}
+    results = []
+    for check in meta.get("checks") or []:
+        kind = check.get("kind", "")
+        ok = False
+        detail = ""
+        if kind == "files_unchanged":
+            files = [
+                path
+                for path in changes.get("files") or []
+                if path not in ("Cargo.lock",) and not path.startswith("target/")
+            ]
+            ok = not files
+            detail = ", ".join(files)
+        elif kind == "path_unchanged":
+            path = check.get("path", "")
+            changed = path in (changes.get("files") or [])
+            ok = not changed
+            detail = f"changed: {path}" if changed else ""
+        elif kind == "text_all":
+            text = final_assistant_text(events)
+            missing = [needle for needle in check.get("needles", []) if not text_has(text, needle)]
+            ok = not missing
+            detail = "missing: " + ", ".join(missing) if missing else ""
+        elif kind == "text_any_of":
+            text = final_assistant_text(events)
+            ok = any(text_has(text, needle) for needle in check.get("needles", []))
+            detail = "" if ok else "none of: " + ", ".join(check.get("needles", []))
+        elif kind == "source_contains":
+            path = repo / check.get("path", "")
+            source = path.read_text(errors="replace") if path.exists() else ""
+            if check.get("ignore_tests", False):
+                source = strip_tests(source)
+            missing = [needle for needle in check.get("needles", []) if needle not in source]
+            ok = not missing
+            detail = "missing: " + ", ".join(missing) if missing else ""
+        elif kind == "source_forbidden":
+            path = repo / check.get("path", "")
+            source = path.read_text(errors="replace") if path.exists() else ""
+            if check.get("ignore_tests", True):
+                source = strip_tests(source)
+            hits = [pattern for pattern in check.get("patterns", []) if re.search(pattern, source)]
+            ok = not hits
+            detail = "found: " + ", ".join(hits) if hits else ""
+        elif kind == "plan_used":
+            steps = process.get("plan_steps", 0)
+            completed = process.get("plan_completed", 0)
+            ok = (
+                process.get("plan_updates", 0) >= 1
+                and steps >= check.get("min_steps", 1)
+                and completed >= check.get("min_completed", steps)
+            )
+            detail = f"updates={process.get('plan_updates', 0)} steps={steps} completed={completed}"
+        else:
+            detail = f"unknown check: {kind}"
+        results.append(
+            {
+                "kind": kind,
+                "axis": check.get("axis", "correctness"),
+                "ok": ok,
+                "detail": detail,
+            }
+        )
+    return results
 
 
 def git_changes(repo: Path) -> dict:
@@ -238,7 +473,9 @@ def git_changes(repo: Path) -> dict:
 
 def run_task(task_dir: Path, args: argparse.Namespace, repeat: int) -> dict:
     meta = json.loads((task_dir / "task.json").read_text())
-    run_id = f"{now_stamp()}-{meta['id']}-r{repeat}"
+    # Parallel shards start in the same second, so the pid keeps their run
+    # directories distinct; the stamp keeps runs sortable.
+    run_id = f"{now_stamp()}-{meta['id']}-r{repeat}-p{os.getpid()}"
     root = Path(args.workdir) / run_id
     repo = root / "repo"
     data_dir = root / "data"
@@ -284,6 +521,8 @@ def run_task(task_dir: Path, args: argparse.Namespace, repeat: int) -> dict:
 
     result = {
         "task": meta["id"],
+        "category": meta.get("category") or "agentic",
+        "planning": bool(meta.get("planning")),
         "repeat": repeat,
         "run_id": run_id,
         "repo": str(repo),
@@ -295,8 +534,11 @@ def run_task(task_dir: Path, args: argparse.Namespace, repeat: int) -> dict:
         "session": None,
         "metrics": {},
         "changes": {},
+        "editable": meta.get("editable") or [],
+        "budgets": meta.get("budgets") or {},
         "daemon_log": "",
     }
+    injected: list[Path] = []
 
     try:
         wait_for_socket(socket_path, timeout=args.daemon_timeout)
@@ -334,26 +576,49 @@ def run_task(task_dir: Path, args: argparse.Namespace, repeat: int) -> dict:
         )
         result["send"] = send
         result["changes"] = git_changes(repo)
-
-        if (task_dir / "hidden").is_dir():
-            copy_tree(task_dir / "hidden", repo)
-
-        verify_cmd = meta.get("verify", ["cargo", "test", "--quiet"])
-        verify = run(verify_cmd, cwd=repo, env=env, timeout=args.verify_timeout)
-        result["verify_exit"] = verify["exit"]
-        result["verify_output"] = (verify["stdout"] + verify["stderr"])[-8000:]
-        result["verify_duration_s"] = verify["duration_s"]
-        result["passed"] = verify["exit"] == 0
+        result["duration_s"] = send["duration_s"]
 
         events = read_events(data_dir / "eix.sqlite3", session["id"])
         result["metrics"] = summarize_events(events)
-        result["duration_s"] = send["duration_s"]
         result["model"] = result["metrics"].get("model") or session.get("model")
+        # Structural checks look at the agent's own output, so they must run
+        # before hidden tests are copied in.
+        result["checks"] = evaluate_checks(
+            meta, repo, result["changes"], events, result["metrics"]
+        )
+
+        if (task_dir / "hidden").is_dir():
+            hidden_root = task_dir / "hidden"
+            injected = [
+                repo / item.relative_to(hidden_root)
+                for item in hidden_root.rglob("*")
+                if item.is_file()
+            ]
+            copy_tree(hidden_root, repo)
+
+        verify_cmd = meta.get("verify")
+        if verify_cmd:
+            verify = run(verify_cmd, cwd=repo, env=env, timeout=args.verify_timeout)
+            result["verify_exit"] = verify["exit"]
+            result["verify_output"] = (verify["stdout"] + verify["stderr"])[-8000:]
+            result["verify_duration_s"] = verify["duration_s"]
+            verify_ok = verify["exit"] == 0
+        else:
+            verify_ok = True
+
+        gating = [
+            check
+            for check in result["checks"]
+            if check["axis"] == "correctness"
+        ]
+        result["passed"] = verify_ok and all(check["ok"] for check in gating)
+        result["score"] = scoring.score_run(result)
         return result
     except Exception as exc:  # keep the run report even when the harness fails
         result["harness_error"] = f"{type(exc).__name__}: {exc}"
         return result
     finally:
+        remove_injected(injected, repo)
         daemon.terminate()
         try:
             daemon.wait(timeout=8)
@@ -364,6 +629,10 @@ def run_task(task_dir: Path, args: argparse.Namespace, repeat: int) -> dict:
         log_path = root / "eixd.log"
         if log_path.exists():
             result["daemon_log"] = log_path.read_text(errors="replace")[-6000:]
+        # Each run leaves a repo plus its cargo target behind. At 50+ tasks
+        # that fills /tmp, so drop the work tree unless explicitly kept.
+        if not getattr(args, "keep_workdir", False):
+            shutil.rmtree(root, ignore_errors=True)
 
 
 def aggregate(results: list[dict]) -> dict:
@@ -399,6 +668,9 @@ def aggregate(results: list[dict]) -> dict:
         )
         if runs
         else 0.0,
+        "score": (
+            scoring.score_report({"results": results})
+        ),
     }
 
 
@@ -413,7 +685,13 @@ def markdown_report(results: list[dict], summary: dict, args: argparse.Namespace
         "",
         "## Summary",
         "",
+        f"- score: **{summary['score']['mean_score']:.1f}** / 100",
         f"- pass: **{summary['passed']}/{summary['runs']}** ({summary['pass_rate']:.0%})",
+        f"- axes: "
+        + ", ".join(
+            f"{axis} {value * 100:.0f}"
+            for axis, value in summary["score"]["axes"].items()
+        ),
         f"- mean duration: **{summary['mean_duration_s']:.1f}s**",
         f"- mean model steps: **{summary['mean_model_steps']:.2f}**",
         f"- mean tool calls: **{summary['mean_tool_calls']:.2f}**",
@@ -424,8 +702,8 @@ def markdown_report(results: list[dict], summary: dict, args: argparse.Namespace
         "",
         "## Runs",
         "",
-        "| task | pass | time | steps | tools | prompt | completion | cache hit |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| task | category | pass | score | time | steps | tools | prompt | completion | cache hit |",
+        "| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in results:
         metrics = result.get("metrics") or {}
@@ -434,10 +712,13 @@ def markdown_report(results: list[dict], summary: dict, args: argparse.Namespace
             if metrics.get("prompt_tokens")
             else "n/a"
         )
+        score = result.get("score") or {}
         lines.append(
-            "| {task} | {passed} | {time:.1f}s | {steps} | {tools} | {prompt} | {completion} | {cache} |".format(
+            "| {task} | {category} | {passed} | {score} | {time:.1f}s | {steps} | {tools} | {prompt} | {completion} | {cache} |".format(
                 task=result["task"],
+                category=result.get("category") or "agentic",
                 passed="yes" if result["passed"] else "no",
+                score=f"{score.get('total', 0):.0f} {score.get('grade', '-')}",
                 time=result.get("duration_s", 0),
                 steps=metrics.get("model_steps", 0),
                 tools=metrics.get("tool_calls", 0),
@@ -488,6 +769,11 @@ def parse_args() -> argparse.Namespace:
         default=str(ROOT / "evals" / "agent" / "reports" / "latest.json"),
     )
     parser.add_argument("--timeout", type=float, default=600.0)
+    parser.add_argument(
+        "--keep-workdir",
+        action="store_true",
+        help="keep each run's repo and daemon data under --workdir",
+    )
     parser.add_argument("--verify-timeout", type=float, default=180.0)
     parser.add_argument("--daemon-timeout", type=float, default=20.0)
     return parser.parse_args()
@@ -514,9 +800,11 @@ def main() -> int:
         for repeat in range(1, args.repeats + 1):
             eprint(f"==> {task_dir.name} repeat {repeat}/{args.repeats}")
             result = run_task(task_dir, args, repeat)
+            score = result.get("score") or {}
             eprint(
-                "    {status} in {time:.1f}s ({steps} steps, {tools} tools, {tokens} tokens)".format(
+                "    {status} score {score} in {time:.1f}s ({steps} steps, {tools} tools, {tokens} tokens)".format(
                     status="PASS" if result["passed"] else "FAIL",
+                    score=f"{score.get('total', 0):.0f}{score.get('grade', '')}",
                     time=result.get("duration_s", 0),
                     steps=result.get("metrics", {}).get("model_steps", 0),
                     tools=result.get("metrics", {}).get("tool_calls", 0),

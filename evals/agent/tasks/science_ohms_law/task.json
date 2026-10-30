@@ -1,0 +1,27 @@
+{
+  "id": "science_ohms_law",
+  "category": "scientific-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate applies Ohm's law. `voltage(i, r)` returns `i * r`, `current(v, r)` returns `v / r`, and `power(v, i)` returns `v * i`. Every argument must be finite; resistance must be strictly positive, and voltage/current must be non-negative. Otherwise return `Err(\"invalid\")`. Keep the public signatures and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

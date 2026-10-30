@@ -1,0 +1,27 @@
+{
+  "id": "science_molarity",
+  "category": "scientific-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate converts between mass, moles and molarity. `moles(mass, molar_mass)` returns `mass / molar_mass`, and `molarity(moles, volume_liters)` returns `moles / volume_liters`. Every argument must be finite and strictly positive; otherwise return `Err(\"invalid\")`. Keep the public signatures and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

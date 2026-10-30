@@ -1,0 +1,27 @@
+{
+  "id": "math_fibonacci_fast",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `fib_mod(n, modulus)` in src/lib.rs, returning the `n`-th Fibonacci number with `F(0) = 0` and `F(1) = 1`, reduced modulo `modulus`. Return `None` when `modulus == 0`. `n` may be as large as one billion, so use fast doubling rather than a linear loop. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

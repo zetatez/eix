@@ -1,0 +1,27 @@
+{
+  "id": "agentic_csv",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `split_line` and `parse` in src/lib.rs for a small CSV dialect: fields are separated by commas, double quotes may wrap a field containing commas, and a doubled quote inside a quoted field is one literal quote. `parse` maps every input line through `split_line`. Keep the public signatures and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

@@ -1,0 +1,1943 @@
+{
+  "generated_at": "20261030T155753Z",
+  "args": {
+    "tasks": "instruction_exact,instruction_no_unsafe,instruction_format_output,instruction_api_shape,instruction_answer_format,instruction_no_files,instruction_exact_constant,instruction_range_check,instruction_doc_comment,instruction_no_mut",
+    "repeats": 1,
+    "bin_dir": "/tmp/eix-agent-new-bin",
+    "config": "/home/shiyi/.config/eix/config.toml",
+    "workdir": "/tmp/eix-agent-eval",
+    "output": "evals/agent/reports/smoke-instr.json",
+    "timeout": 300.0,
+    "keep_workdir": false,
+    "verify_timeout": 180.0,
+    "daemon_timeout": 20.0
+  },
+  "summary": {
+    "runs": 10,
+    "passed": 9,
+    "pass_rate": 0.9,
+    "total_prompt_tokens": 215793,
+    "total_completion_tokens": 4765,
+    "total_tokens": 220558,
+    "total_cache_read_tokens": 183680,
+    "usage_coverage": 1.0,
+    "cache_hit_rate": 0.8512,
+    "mean_duration_s": 13.149,
+    "mean_model_steps": 3.7,
+    "mean_tool_calls": 2.7,
+    "score": {
+      "runs": 10,
+      "passed": 9,
+      "pass_rate": 0.9,
+      "pass_all_tasks": "9/10",
+      "mean_score": 91.8,
+      "axes": {
+        "correctness": 0.9,
+        "adherence": 1.0,
+        "loops": 0.94,
+        "tokens": 0.988,
+        "time": 0.988,
+        "cache": 0.855
+      },
+      "tasks": {
+        "instruction_exact": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 98.5
+        },
+        "instruction_no_unsafe": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 98.7
+        },
+        "instruction_format_output": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 98.6
+        },
+        "instruction_api_shape": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 98.7
+        },
+        "instruction_answer_format": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 98.8
+        },
+        "instruction_no_files": {
+          "runs": 1,
+          "passed": 0,
+          "mean_score": 40.0
+        },
+        "instruction_exact_constant": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 96.1
+        },
+        "instruction_range_check": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 94.8
+        },
+        "instruction_doc_comment": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 96.9
+        },
+        "instruction_no_mut": {
+          "runs": 1,
+          "passed": 1,
+          "mean_score": 96.8
+        }
+      },
+      "categories": {
+        "instruction-following": {
+          "runs": 10,
+          "passed": 9,
+          "mean_score": 91.8
+        }
+      }
+    }
+  },
+  "results": [
+    {
+      "task": "instruction_exact",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155540Z-instruction_exact-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155540Z-instruction_exact-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Add `pub fn sum_checked(values: &[i64]) -> Result<i64, &'static str>` to src/lib.rs. Empty input returns `Err(\"empty\")`. Sum with checked_add; if any addition overflows return `Err(\"overflow\")`. Otherwise return the sum. Constraints: edit only src/lib.rs; do not change `checked_div`; add no dependencies and no test modules; the implementation must not use `unwrap`, `expect`, `panic!`, `wrapping_add` or `saturating_add`; use `checked_add`. Keep the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 4 tests\n....\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Added `sum_checked` to `src/lib.rs:1`:\n\n- Empty slice returns `Err(\"empty\")`.\n- Accumulates from the first element using `checked_add`; any overflow returns `Err(\"overflow\")`.\n- No `unwrap`/`expect`/`panic!`, no new dependencies or test modules, `checked_div` and existing tests untouched.\n\n`cargo test` passes (1 test, `tests::divides`). Note: running the tests generated an untracked `Cargo.lock`; I left it in place.\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 17.834
+      },
+      "session": {
+        "id": "82858c3e-dd0d-4d78-a0b8-cbf383edcf70",
+        "name": "instruction_exact",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 5,
+        "steps_with_usage": 5,
+        "usage_coverage": 1.0,
+        "tool_calls": 4,
+        "tools": {
+          "exec_command": 3,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 5,
+          "tool_call": 4,
+          "permission_evaluated": 4,
+          "process_started": 3,
+          "process_exited": 3,
+          "tool_result": 4,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 29933,
+        "completion_tokens": 765,
+        "cache_read_tokens": 25344,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 286,
+        "uncached_prompt_tokens": 4589,
+        "cache_hit_rate": 0.8467,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 1,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8475,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5588,
+            "completion_tokens": 41,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5757,
+            "completion_tokens": 356,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 136,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 6003,
+            "completion_tokens": 64,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 5,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6258,
+            "completion_tokens": 127,
+            "cache_read_tokens": 5248,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 86,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 28,
+            "prompt_tokens": 6327,
+            "completion_tokens": 177,
+            "cache_read_tokens": 5504,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 59,
+            "tool_calls": 0,
+            "chars": 419
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 15 +++++++++++++++\n 1 file changed, 15 insertions(+)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          5,
+          12
+        ],
+        "tokens": [
+          30000,
+          100000
+        ],
+        "seconds": [
+          20,
+          100
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155540Z-instruction_exact-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155540Z-instruction_exact-r1/data/eix.sqlite3\n",
+      "duration_s": 17.834,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "source_forbidden",
+          "axis": "adherence",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.113,
+      "score": {
+        "total": 98.5,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 0.99,
+          "time": 1.0,
+          "cache": 0.847
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 1,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 30698,
+          "steps": 5,
+          "seconds": 17.834,
+          "cache_hit_rate": 0.847,
+          "first_step_cache_hit": 0.848,
+          "budgets": {
+            "steps": [
+              5.0,
+              12.0
+            ],
+            "tokens": [
+              30000.0,
+              100000.0
+            ],
+            "seconds": [
+              20.0,
+              100.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_no_unsafe",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155558Z-instruction_no_unsafe-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155558Z-instruction_no_unsafe-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Add `pub fn checked_abs(x: i64) -> Option<i64>` to src/lib.rs: it returns `None` for `i64::MIN` and `Some(x.abs())` otherwise. Constraints: edit only src/lib.rs; do not use `unsafe`, `unwrap`, `expect`, `panic!` or `todo!` in your implementation; add no dependencies and no test modules; keep the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Implemented `checked_abs` in `src/lib.rs:1`:\n\n```rust\npub fn checked_abs(x: i64) -> Option<i64> {\n    if x == i64::MIN {\n        None\n    } else {\n        Some(x.abs())\n    }\n}\n```\n\nNo `unsafe`, `unwrap`, `expect`, `panic!`, or `todo!`; no new dependencies or test modules, and existing tests untouched. `cargo test` passes (1 passed, 0 failed).\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 14.097
+      },
+      "session": {
+        "id": "cfe8c1aa-42ba-4eff-81b0-5e9d319ba972",
+        "name": "instruction_no_unsafe",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 4,
+        "steps_with_usage": 4,
+        "usage_coverage": 1.0,
+        "tool_calls": 3,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 4,
+          "tool_call": 3,
+          "permission_evaluated": 3,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 3,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 23169,
+        "completion_tokens": 519,
+        "cache_read_tokens": 19712,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 181,
+        "uncached_prompt_tokens": 3457,
+        "cache_hit_rate": 0.8508,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8518,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5560,
+            "completion_tokens": 41,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5678,
+            "completion_tokens": 249,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 118,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5835,
+            "completion_tokens": 63,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 4,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6096,
+            "completion_tokens": 166,
+            "cache_read_tokens": 5120,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 59,
+            "tool_calls": 0,
+            "chars": 345
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 6 +++++-\n 1 file changed, 5 insertions(+), 1 deletion(-)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          5,
+          12
+        ],
+        "tokens": [
+          30000,
+          100000
+        ],
+        "seconds": [
+          20,
+          100
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155558Z-instruction_no_unsafe-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155558Z-instruction_no_unsafe-r1/data/eix.sqlite3\n",
+      "duration_s": 14.097,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "source_forbidden",
+          "axis": "adherence",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.098,
+      "score": {
+        "total": 98.7,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.851
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 23688,
+          "steps": 4,
+          "seconds": 14.097,
+          "cache_hit_rate": 0.851,
+          "first_step_cache_hit": 0.852,
+          "budgets": {
+            "steps": [
+              5.0,
+              12.0
+            ],
+            "tokens": [
+              30000.0,
+              100000.0
+            ],
+            "seconds": [
+              20.0,
+              100.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_format_output",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155612Z-instruction_format_output-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155612Z-instruction_format_output-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Implement `format_duration(total_seconds: u64) -> String` in src/lib.rs. It returns hours, minutes and seconds as `H:MM:SS`: hours are not zero-padded, minutes and seconds are always two digits, and `0` formats as `0:00:00`. Constraints: edit only src/lib.rs; do not use `println!` or `dbg!`; add no dependencies; keep the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Implemented in src/lib.rs:5.\n\n```rust\nformat!(\n    \"{}:{:02}:{:02}\",\n    total_seconds / 3600,\n    (total_seconds / 60) % 60,\n    total_seconds % 60\n)\n```\n\nThe original used raw `total_seconds / 60` for minutes, which produced `1:61:1` for 3661; minutes are now wrapped with `% 60` and both minutes and seconds are zero-padded via `{:02}`. Hours stay unpadded, so `0` gives `0:00:00`.\n\n`cargo test` passes: 1 passed, 0 failed. Only src/lib.rs was edited; running the tests generated an untracked `Cargo.lock`, which I left in place.\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 17.338
+      },
+      "session": {
+        "id": "032f2be9-c45c-4350-bd80-2dd994ea8414",
+        "name": "instruction_format_output",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 5,
+        "steps_with_usage": 5,
+        "usage_coverage": 1.0,
+        "tool_calls": 4,
+        "tools": {
+          "exec_command": 3,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 5,
+          "tool_call": 4,
+          "permission_evaluated": 4,
+          "process_started": 3,
+          "process_exited": 3,
+          "tool_result": 4,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 29749,
+        "completion_tokens": 991,
+        "cache_read_tokens": 25344,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 510,
+        "uncached_prompt_tokens": 4405,
+        "cache_hit_rate": 0.8519,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 1,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8518,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5560,
+            "completion_tokens": 48,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5760,
+            "completion_tokens": 201,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 39,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5948,
+            "completion_tokens": 59,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6206,
+            "completion_tokens": 116,
+            "cache_read_tokens": 5248,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 75,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 28,
+            "prompt_tokens": 6275,
+            "completion_tokens": 567,
+            "cache_read_tokens": 5504,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 396,
+            "tool_calls": 0,
+            "chars": 532
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 4 ++--\n 1 file changed, 2 insertions(+), 2 deletions(-)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          5,
+          12
+        ],
+        "tokens": [
+          30000,
+          100000
+        ],
+        "seconds": [
+          20,
+          100
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155612Z-instruction_format_output-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155612Z-instruction_format_output-r1/data/eix.sqlite3\n",
+      "duration_s": 17.338,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "source_forbidden",
+          "axis": "adherence",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.096,
+      "score": {
+        "total": 98.6,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 0.989,
+          "time": 1.0,
+          "cache": 0.852
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 1,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 30740,
+          "steps": 5,
+          "seconds": 17.338,
+          "cache_hit_rate": 0.852,
+          "first_step_cache_hit": 0.852,
+          "budgets": {
+            "steps": [
+              5.0,
+              12.0
+            ],
+            "tokens": [
+              30000.0,
+              100000.0
+            ],
+            "seconds": [
+              20.0,
+              100.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_api_shape",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155630Z-instruction_api_shape-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155630Z-instruction_api_shape-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Add `pub fn clamp_percent(value: i32) -> u8` to src/lib.rs: clamp the value into `0..=100` and return it as `u8`. Constraints: edit only src/lib.rs; do not change the existing `clamp01` function, Cargo.toml or the existing tests; add no other public functions and no dependencies. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Implemented `clamp_percent` in `src/lib.rs:5-7` as `value.clamp(0, 100) as u8`. `clamp01`, tests, and `Cargo.toml` untouched.\n\n`cargo test`: 1 passed, 0 failed (plus doc-tests clean).\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 14.827
+      },
+      "session": {
+        "id": "a6f464ca-1aab-4876-b964-d4220fac4164",
+        "name": "instruction_api_shape",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 4,
+        "steps_with_usage": 4,
+        "usage_coverage": 1.0,
+        "tool_calls": 3,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 4,
+          "tool_call": 3,
+          "permission_evaluated": 3,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 3,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 23256,
+        "completion_tokens": 325,
+        "cache_read_tokens": 19712,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 63,
+        "uncached_prompt_tokens": 3544,
+        "cache_hit_rate": 0.8476,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8544,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5543,
+            "completion_tokens": 43,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5739,
+            "completion_tokens": 144,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 53,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5856,
+            "completion_tokens": 59,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6118,
+            "completion_tokens": 79,
+            "cache_read_tokens": 5120,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 10,
+            "tool_calls": 0,
+            "chars": 183
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 2 +-\n 1 file changed, 1 insertion(+), 1 deletion(-)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          5,
+          12
+        ],
+        "tokens": [
+          30000,
+          100000
+        ],
+        "seconds": [
+          20,
+          100
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155630Z-instruction_api_shape-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155630Z-instruction_api_shape-r1/data/eix.sqlite3\n",
+      "duration_s": 14.827,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "path_unchanged",
+          "axis": "adherence",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.103,
+      "score": {
+        "total": 98.7,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.85
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 23581,
+          "steps": 4,
+          "seconds": 14.827,
+          "cache_hit_rate": 0.848,
+          "first_step_cache_hit": 0.854,
+          "budgets": {
+            "steps": [
+              5.0,
+              12.0
+            ],
+            "tokens": [
+              30000.0,
+              100000.0
+            ],
+            "seconds": [
+              20.0,
+              100.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_answer_format",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155645Z-instruction_answer_format-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155645Z-instruction_answer_format-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not change any file. Reply with exactly these three lines and nothing else:\nstatus: ok\nfiles: 0\nrisk: none",
+      "passed": true,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "status: ok\nfiles: 0\nrisk: none\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 2.182
+      },
+      "session": {
+        "id": "d0e56975-7194-42c8-84ef-a0250b2c5fbe",
+        "name": "instruction_answer_format",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 1,
+        "steps_with_usage": 1,
+        "usage_coverage": 1.0,
+        "tool_calls": 0,
+        "tools": {},
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 1
+        },
+        "prompt_tokens": 5469,
+        "completion_tokens": 88,
+        "cache_read_tokens": 4736,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 75,
+        "uncached_prompt_tokens": 733,
+        "cache_hit_rate": 0.866,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 0,
+          "first_step_cache_hit": 0.866,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5469,
+            "completion_tokens": 88,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 75,
+            "tool_calls": 0,
+            "chars": 30
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155645Z-instruction_answer_format-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155645Z-instruction_answer_format-r1/data/eix.sqlite3\n",
+      "duration_s": 2.182,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_all",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "score": {
+        "total": 98.8,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.866
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 5557,
+          "steps": 1,
+          "seconds": 2.182,
+          "cache_hit_rate": 0.866,
+          "first_step_cache_hit": 0.866,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_no_files",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155647Z-instruction_no_files-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155647Z-instruction_no_files-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not modify any file. In one sentence, explain why running a downloaded script without review is unsafe.",
+      "passed": false,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "Because the script runs with your user's privileges, so it can silently read or exfiltrate credentials, delete files, install malware, or change system state without you knowing what it actually does.\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 2.919
+      },
+      "session": {
+        "id": "06d79a8e-d788-4ea5-9a77-9af133edcf84",
+        "name": "instruction_no_files",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 1,
+        "steps_with_usage": 1,
+        "usage_coverage": 1.0,
+        "tool_calls": 0,
+        "tools": {},
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 1
+        },
+        "prompt_tokens": 5461,
+        "completion_tokens": 98,
+        "cache_read_tokens": 4736,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 57,
+        "uncached_prompt_tokens": 725,
+        "cache_hit_rate": 0.8672,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 0,
+          "first_step_cache_hit": 0.8672,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5461,
+            "completion_tokens": 98,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 57,
+            "tool_calls": 0,
+            "chars": 200
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155647Z-instruction_no_files-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155647Z-instruction_no_files-r1/data/eix.sqlite3\n",
+      "duration_s": 2.919,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": false,
+          "detail": "none of: unsafe, untrusted, trust, malicious, review"
+        }
+      ],
+      "score": {
+        "total": 40.0,
+        "grade": "F",
+        "passed": false,
+        "components": {
+          "correctness": 0.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.867
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [
+            "text_any_of"
+          ],
+          "tokens": 5559,
+          "steps": 1,
+          "seconds": 2.919,
+          "cache_hit_rate": 0.867,
+          "first_step_cache_hit": 0.867,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_exact_constant",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155650Z-instruction_exact_constant-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155650Z-instruction_exact_constant-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Add `pub const LIMIT: u32 = 4096;` to src/lib.rs. Do not change `DEFAULT_LIMIT`, Cargo.toml or the existing tests, and add nothing else. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Added `pub const LIMIT: u32 = 4096;` at `src/lib.rs:2`, directly after `DEFAULT_LIMIT`. No other source, manifest, or test changes.\n\n`cargo test` passes: 1 unit test (`default_limit`) and 0 doc-tests, all green. `Cargo.lock` was generated as a side effect of the test run; it is build output, not a source edit.\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 19.87
+      },
+      "session": {
+        "id": "fe912cc4-ad72-443c-af15-dfcda07a9e70",
+        "name": "instruction_exact_constant",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 4,
+        "steps_with_usage": 4,
+        "usage_coverage": 1.0,
+        "tool_calls": 3,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 4,
+          "tool_call": 3,
+          "permission_evaluated": 3,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 3,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 22955,
+        "completion_tokens": 408,
+        "cache_read_tokens": 19584,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 128,
+        "uncached_prompt_tokens": 3371,
+        "cache_hit_rate": 0.8531,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8589,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5514,
+            "completion_tokens": 43,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5656,
+            "completion_tokens": 108,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 25,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5765,
+            "completion_tokens": 59,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6020,
+            "completion_tokens": 198,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 103,
+            "tool_calls": 0,
+            "chars": 311
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 1 +\n 1 file changed, 1 insertion(+)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155650Z-instruction_exact_constant-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155650Z-instruction_exact_constant-r1/data/eix.sqlite3\n",
+      "duration_s": 19.87,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "path_unchanged",
+          "axis": "adherence",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "source_contains",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.091,
+      "score": {
+        "total": 96.1,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 0.857,
+          "tokens": 1.0,
+          "time": 0.925,
+          "cache": 0.855
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 23363,
+          "steps": 4,
+          "seconds": 19.87,
+          "cache_hit_rate": 0.853,
+          "first_step_cache_hit": 0.859,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_range_check",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155710Z-instruction_range_check-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155710Z-instruction_range_check-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. In src/lib.rs, make `validate` also reject values above 100 with `ParseError::TooLarge`. Keep everything else, including the existing tests, unchanged and add nothing else. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "`validate` now rejects values above 100 with `ParseError::TooLarge`.\n\n- `src/lib.rs:13`: added the `n > 100` branch after the negative check, leaving existing branches and tests untouched.\n- `cargo test`: 1 passed, 0 failed (doc-tests: 0).\n\nNote: running the tests generated an untracked `Cargo.lock`; I left it in place.\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 18.081
+      },
+      "session": {
+        "id": "bd2bf2dd-90c6-4188-913c-f431431d1710",
+        "name": "instruction_range_check",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 5,
+        "steps_with_usage": 5,
+        "usage_coverage": 1.0,
+        "tool_calls": 4,
+        "tools": {
+          "exec_command": 3,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 5,
+          "tool_call": 4,
+          "permission_evaluated": 4,
+          "process_started": 3,
+          "process_exited": 3,
+          "tool_result": 4,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 29585,
+        "completion_tokens": 580,
+        "cache_read_tokens": 25216,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 214,
+        "uncached_prompt_tokens": 4369,
+        "cache_hit_rate": 0.8523,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 1,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8606,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5503,
+            "completion_tokens": 43,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5754,
+            "completion_tokens": 165,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 38,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5907,
+            "completion_tokens": 63,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 4,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6164,
+            "completion_tokens": 131,
+            "cache_read_tokens": 5248,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 85,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 28,
+            "prompt_tokens": 6257,
+            "completion_tokens": 178,
+            "cache_read_tokens": 5504,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 87,
+            "tool_calls": 0,
+            "chars": 321
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 2 ++\n 1 file changed, 2 insertions(+)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          4,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155710Z-instruction_range_check-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155710Z-instruction_range_check-r1/data/eix.sqlite3\n",
+      "duration_s": 18.081,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "path_unchanged",
+          "axis": "adherence",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.109,
+      "score": {
+        "total": 94.8,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 0.833,
+          "tokens": 0.906,
+          "time": 0.953,
+          "cache": 0.855
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 1,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 30165,
+          "steps": 5,
+          "seconds": 18.081,
+          "cache_hit_rate": 0.852,
+          "first_step_cache_hit": 0.861,
+          "budgets": {
+            "steps": [
+              4.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_doc_comment",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155728Z-instruction_doc_comment-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155728Z-instruction_doc_comment-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Add a doc comment to `square` in src/lib.rs that says exactly `Returns x squared.` Do not change its body, Cargo.toml or the existing tests, and add nothing else. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "Added `/// Returns x squared.` directly above `square` in `src/lib.rs:4`. Body, tests, and `Cargo.toml` are untouched.\n\n`cargo test` passes: 1 test passed, 0 failed; doc-tests: 0 run.\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 11.624
+      },
+      "session": {
+        "id": "8ec9a202-8508-41d0-a3b5-c59bb5893d7d",
+        "name": "instruction_doc_comment",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 4,
+        "steps_with_usage": 4,
+        "usage_coverage": 1.0,
+        "tool_calls": 3,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 4,
+          "tool_call": 3,
+          "permission_evaluated": 3,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 3,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 23067,
+        "completion_tokens": 386,
+        "cache_read_tokens": 19712,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 124,
+        "uncached_prompt_tokens": 3355,
+        "cache_hit_rate": 0.8546,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8594,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5511,
+            "completion_tokens": 43,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5682,
+            "completion_tokens": 129,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 30,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5807,
+            "completion_tokens": 59,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6067,
+            "completion_tokens": 155,
+            "cache_read_tokens": 5120,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 94,
+            "tool_calls": 0,
+            "chars": 183
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 1 +\n 1 file changed, 1 insertion(+)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155728Z-instruction_doc_comment-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155728Z-instruction_doc_comment-r1/data/eix.sqlite3\n",
+      "duration_s": 11.624,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "source_contains",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.107,
+      "score": {
+        "total": 96.9,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 0.857,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.856
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 23453,
+          "steps": 4,
+          "seconds": 11.624,
+          "cache_hit_rate": 0.855,
+          "first_step_cache_hit": 0.859,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "instruction_no_mut",
+      "category": "instruction-following",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T155740Z-instruction_no_mut-r1",
+      "repo": "/tmp/eix-agent-eval/20261030T155740Z-instruction_no_mut-r1/repo",
+      "prompt": "Work autonomously and do not ask questions. Reimplement `sum` in src/lib.rs without any `let mut` binding. Keep the signature and the existing tests unchanged, and add nothing else. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 1 test\n.\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "`sum` is now implemented without any `let mut` in `src/lib.rs:1`:\n\n```rust\npub fn sum(values: &[i64]) -> i64 {\n    values.iter().fold(0, |total, value| total + value)\n}\n```\n\nSignature, tests, and everything else are untouched. `cargo test` passes: 1 passed, 0 failed. Note that `cargo test` generated a `Cargo.lock` (the only other working-tree change); I left it in place.\n",
+        "stderr": "patch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 12.722
+      },
+      "session": {
+        "id": "a63f8d81-3535-4d8f-8bee-afe228254cb1",
+        "name": "instruction_no_mut",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 4,
+        "steps_with_usage": 4,
+        "usage_coverage": 1.0,
+        "tool_calls": 3,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 4,
+          "tool_call": 3,
+          "permission_evaluated": 3,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 3,
+          "snapshot": 2,
+          "patch_applied": 1
+        },
+        "prompt_tokens": 23149,
+        "completion_tokens": 605,
+        "cache_read_tokens": 19584,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 248,
+        "uncached_prompt_tokens": 3565,
+        "cache_hit_rate": 0.846,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8614,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5498,
+            "completion_tokens": 43,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5682,
+            "completion_tokens": 219,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 76,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5851,
+            "completion_tokens": 170,
+            "cache_read_tokens": 4992,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 111,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 6118,
+            "completion_tokens": 173,
+            "cache_read_tokens": 5120,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 61,
+            "tool_calls": 0,
+            "chars": 373
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 6 +-----\n 1 file changed, 1 insertion(+), 5 deletions(-)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          3,
+          10
+        ],
+        "tokens": [
+          25000,
+          80000
+        ],
+        "seconds": [
+          15,
+          80
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T155740Z-instruction_no_mut-r1/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T155740Z-instruction_no_mut-r1/data/eix.sqlite3\n",
+      "duration_s": 12.722,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "source_forbidden",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        }
+      ],
+      "verify_duration_s": 0.105,
+      "score": {
+        "total": 96.8,
+        "grade": "A",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 0.857,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.851
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 23754,
+          "steps": 4,
+          "seconds": 12.722,
+          "cache_hit_rate": 0.846,
+          "first_step_cache_hit": 0.861,
+          "budgets": {
+            "steps": [
+              3.0,
+              10.0
+            ],
+            "tokens": [
+              25000.0,
+              80000.0
+            ],
+            "seconds": [
+              15.0,
+              80.0
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

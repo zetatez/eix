@@ -1,0 +1,36 @@
+{
+  "id": "planning_testfirst",
+  "category": "task-planning",
+  "planning": true,
+  "prompt": "Work autonomously and do not ask questions. The visible tests fail because `slugify` is wrong. First call `update_plan` with at least three steps covering reproducing the failures, fixing `slugify`, and the final test run, then fix it and mark steps completed. `slugify` lowercases, replaces each run of non-alphanumeric characters with a single `-`, and trims leading/trailing `-`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "checks": [
+    {
+      "kind": "plan_used",
+      "axis": "planning",
+      "min_steps": 3,
+      "min_completed": 2
+    }
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

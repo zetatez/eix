@@ -1,0 +1,27 @@
+{
+  "id": "math_newton",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `sqrt_newton(x)` in src/lib.rs using Newton's method on `t^2 - x`, iterating `t = (t + x/t)/2`. Return `None` when `x` is negative or not finite. For `x == 0` return 0. Converge to an absolute error near `1e-12` and do not divide by zero. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

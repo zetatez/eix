@@ -1,0 +1,27 @@
+{
+  "id": "agentic_wordwrap",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `wrap(text, width)` in src/lib.rs. Split on whitespace, join words with single spaces, and start a new line when adding the next word would exceed `width` characters. A word longer than `width` sits on its own line and is not split. Empty or whitespace-only input returns an empty vector. Keep the public signature and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

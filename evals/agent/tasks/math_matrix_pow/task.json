@@ -1,0 +1,27 @@
+{
+  "id": "math_matrix_pow",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `power(matrix, exponent, modulus)` in src/lib.rs for a 2x2 `u64` matrix. Return `matrix^exponent` with every entry reduced modulo `modulus`, or `None` when `modulus == 0`. The zero-th power is the identity. `exponent` may be as large as `10^18`, so use binary exponentiation and `u128` intermediates. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      15
+    ],
+    "tokens": [
+      35000,
+      125000
+    ],
+    "seconds": [
+      25,
+      115
+    ]
+  }
+}

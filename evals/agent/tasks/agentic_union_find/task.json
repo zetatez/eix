@@ -1,0 +1,27 @@
+{
+  "id": "agentic_union_find",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement a disjoint-set forest in src/lib.rs. `new(n)` creates `n` singleton sets; `find(x)` returns the representative; `union(a, b)` merges the sets and returns `true` only when they were separate; `components()` returns the current number of sets. Use path compression and union by rank or size so repeated operations stay fast. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

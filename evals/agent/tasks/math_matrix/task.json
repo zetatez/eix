@@ -1,0 +1,27 @@
+{
+  "id": "math_matrix",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `transpose` and `multiply` in src/lib.rs. `transpose` returns an empty vector for empty input and works for an empty first row. `multiply` returns `None` if either operand is ragged, the inner dimensions do not match, or any addition/multiplication overflows `i64`; empty operands produce `Some(vec![])`. Keep the public signatures and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "agentic_merge_inversions",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `sort_and_count(values)` in src/lib.rs with merge sort. Return the stably sorted vector and the number of inversions, counted as pairs `i < j` with `values[i] > values[j]`. Equal elements are not inversions. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "math_prime_factors",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `factorize(n)` in src/lib.rs. It returns the prime factorization as `(prime, exponent)` pairs in ascending prime order. Inputs 0 and 1 return an empty vector. Exponents must be grouped rather than repeated. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "id": "agentic_quickselect",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `kth_smallest(values, k)` in src/lib.rs using quickselect (average linear time; a full sort defeats the purpose). `k` is zero-based. Return the k-th smallest value, or `None` when `k >= values.len()`. The slice may be reordered. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "checks": [
+    {
+      "kind": "source_forbidden",
+      "axis": "adherence",
+      "path": "src/lib.rs",
+      "patterns": [
+        "\\.sort"
+      ]
+    }
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

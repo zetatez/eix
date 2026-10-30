@@ -1,0 +1,38 @@
+{
+  "id": "instruction_no_mut",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Reimplement `sum` in src/lib.rs without any `let mut` binding. Keep the signature and the existing tests unchanged, and add nothing else. Run `cargo test` and finish only when the tests pass.",
+  "checks": [
+    {
+      "kind": "source_forbidden",
+      "axis": "correctness",
+      "path": "src/lib.rs",
+      "ignore_tests": true,
+      "patterns": [
+        "let mut"
+      ]
+    }
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      3,
+      10
+    ],
+    "tokens": [
+      25000,
+      80000
+    ],
+    "seconds": [
+      15,
+      80
+    ]
+  },
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ]
+}

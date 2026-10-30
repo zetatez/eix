@@ -11,3 +11,7 @@ node_modules/
 
 # Python
 __pycache__/
+
+# Parallel eval shards are merged into the arm report; keep them out of git.
+evals/agent/reports/*-s[0-9].json
+evals/agent/reports/*-s[0-9].md

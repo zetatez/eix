@@ -1,0 +1,27 @@
+{
+  "id": "math_binomial_prob",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `binomial_probability(n, k, p)` in src/lib.rs, returning `P(X = k) = C(n, k) p^k (1-p)^(n-k)` for `X ~ Binomial(n, p)`. Return `None` when `k > n`, `p` is not finite or outside `[0, 1]`. Treat `0^0` as 1. Compute `C(n, k)` with a multiplicative loop to avoid overflow. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "math_primes",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate tests primality and lists primes. `is_prime(n)` must be false for 0 and 1, true for 2 and 3, and must not treat the square of a prime as prime. `primes_up_to(n)` returns every prime in `2..=n` in ascending order, and an empty vector when `n < 2`. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

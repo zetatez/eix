@@ -1,0 +1,83 @@
+{
+  "id": "math_def_continuity",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Do not change any file. Give the epsilon-delta definition of continuity of f at a point a, then prove that f(x) = x^2 is continuous at a = 3. End with the line `QED`.",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "epsilon",
+        "\u03b5"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "delta",
+        "\u03b4"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "continuous",
+        "continuity"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "x^2",
+        "x\u00b2"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "9",
+        "f(3)"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "|x - 3|",
+        "|x-3|",
+        "abs(x-3)",
+        "abs(x - 3)"
+      ]
+    },
+    {
+      "kind": "text_all",
+      "axis": "correctness",
+      "needles": [
+        "qed"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      2,
+      9
+    ],
+    "tokens": [
+      22000,
+      80000
+    ],
+    "seconds": [
+      14,
+      80
+    ]
+  }
+}

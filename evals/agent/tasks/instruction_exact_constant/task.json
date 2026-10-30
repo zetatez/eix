@@ -1,0 +1,42 @@
+{
+  "id": "instruction_exact_constant",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Add `pub const LIMIT: u32 = 4096;` to src/lib.rs. Do not change `DEFAULT_LIMIT`, Cargo.toml or the existing tests, and add nothing else. Run `cargo test` and finish only when the tests pass.",
+  "checks": [
+    {
+      "kind": "path_unchanged",
+      "axis": "adherence",
+      "path": "Cargo.toml"
+    },
+    {
+      "kind": "source_contains",
+      "axis": "correctness",
+      "path": "src/lib.rs",
+      "needles": [
+        "pub const LIMIT: u32 = 4096;"
+      ]
+    }
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      3,
+      10
+    ],
+    "tokens": [
+      25000,
+      80000
+    ],
+    "seconds": [
+      15,
+      80
+    ]
+  },
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ]
+}

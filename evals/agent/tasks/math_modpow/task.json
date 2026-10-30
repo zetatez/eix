@@ -1,0 +1,27 @@
+{
+  "id": "math_modpow",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `mod_pow(base, exp, modulus)` in src/lib.rs using modular exponentiation, so large exponents do not overflow. It returns `base^exp mod modulus`; `mod_pow(x, 0, m)` is `1 mod m`, and `modulus == 1` returns 0. A modulus of 0 must panic with `modulus`. Keep the public signature and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

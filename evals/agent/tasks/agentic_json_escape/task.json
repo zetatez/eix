@@ -1,0 +1,27 @@
+{
+  "id": "agentic_json_escape",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `escape` and `unescape` in src/lib.rs for JSON strings. `escape` must turn `\"` into `\\\"`, `\\` into `\\\\`, newline/tab/carriage return into `\\n`/`\\t`/`\\r`, and every other control character below U+0020 into `\\u00XX` with four lowercase hex digits. `unescape` must reverse those escapes and return `None` for an unknown escape, a trailing backslash, or an invalid `\\u` escape. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

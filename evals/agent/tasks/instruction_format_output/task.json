@@ -1,0 +1,39 @@
+{
+  "id": "instruction_format_output",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Implement `format_duration(total_seconds: u64) -> String` in src/lib.rs. It returns hours, minutes and seconds as `H:MM:SS`: hours are not zero-padded, minutes and seconds are always two digits, and `0` formats as `0:00:00`. Constraints: edit only src/lib.rs; do not use `println!` or `dbg!`; add no dependencies; keep the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "checks": [
+    {
+      "kind": "source_forbidden",
+      "axis": "adherence",
+      "path": "src/lib.rs",
+      "ignore_tests": true,
+      "patterns": [
+        "println!",
+        "dbg!"
+      ]
+    }
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

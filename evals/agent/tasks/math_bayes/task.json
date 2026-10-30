@@ -1,0 +1,27 @@
+{
+  "id": "math_bayes",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `posterior(prior, sensitivity, false_positive)` in src/lib.rs for Bayes' theorem. Given `P(A) = prior`, `P(B|A) = sensitivity` and `P(B|not A) = false_positive`, return `P(A|B) = P(B|A)P(A) / (P(B|A)P(A) + P(B|not A)P(not A))`. Return `None` when an input is not finite or outside `[0, 1]`, or when the denominator is zero. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

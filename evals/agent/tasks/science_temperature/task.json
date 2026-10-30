@@ -1,0 +1,27 @@
+{
+  "id": "science_temperature",
+  "category": "scientific-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate converts between Celsius, Fahrenheit and Kelvin. Every function must return `Err(\"finite\")` for a non-finite input, and `Err(\"below absolute zero\")` for a Celsius value below -273.15, a Fahrenheit value below -459.67, or a Kelvin value below 0. Otherwise return the converted value: `C = (F - 32) * 5/9`, `K = C + 273.15`. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

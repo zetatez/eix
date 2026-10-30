@@ -1,0 +1,27 @@
+{
+  "id": "agentic_semver",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `Version::parse` in src/lib.rs for strings of exactly three dot-separated non-negative integers, for example `1.2.3`. Reject missing or extra components, empty components, non-digits, and leading zeros such as `01.2.3` (a single `0` is fine). Ordering is the derived tuple order. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

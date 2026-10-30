@@ -1,0 +1,27 @@
+{
+  "id": "agentic_kadane",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `max_subarray(values)` in src/lib.rs with Kadane's algorithm. Return `Some((sum, start, end))` for the non-empty contiguous subarray with the largest sum, with inclusive indices, or `None` for an empty slice. When several subarrays tie, return the first one encountered by a left-to-right scan. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

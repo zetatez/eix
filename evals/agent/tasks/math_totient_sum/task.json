@@ -1,0 +1,27 @@
+{
+  "id": "math_totient_sum",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `sum_phi(n)` in src/lib.rs, returning `phi(1) + phi(2) + ... + phi(n)` where `phi` is Euler's totient. `sum_phi(0)` is 0. `n` may be as large as one million, so build a totient sieve instead of factoring every number. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

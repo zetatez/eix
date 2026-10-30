@@ -1,0 +1,27 @@
+{
+  "id": "math_geometric_series",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `sum_geometric(first, ratio, terms)` in src/lib.rs, the finite geometric series `first * (1 - ratio^terms) / (1 - ratio)`. When `ratio == 1` return `first * terms`. `terms == 0` returns 0. Return `None` when `first` or `ratio` is not finite. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      4,
+      11
+    ],
+    "tokens": [
+      25000,
+      90000
+    ],
+    "seconds": [
+      18,
+      95
+    ]
+  }
+}

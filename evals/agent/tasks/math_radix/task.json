@@ -1,0 +1,27 @@
+{
+  "id": "math_radix",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `to_base(value, base)` and `from_base(text, base)` in src/lib.rs for bases 2 through 36, using lowercase digits for output and accepting either case on input. Return `None` for an unsupported base, an empty input, an invalid digit, or a value that does not fit in `u64`. `to_base(0, b)` is `Some(\"0\")`. Keep the public signatures and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

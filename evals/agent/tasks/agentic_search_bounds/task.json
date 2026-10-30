@@ -1,0 +1,27 @@
+{
+  "id": "agentic_search_bounds",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `lower_bound` and `upper_bound` in src/lib.rs on a sorted slice. `lower_bound` returns the first index whose value is greater than or equal to the target; `upper_bound` returns the first index whose value is strictly greater. Both return `values.len()` when no such index exists. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      4,
+      10
+    ],
+    "tokens": [
+      25000,
+      85000
+    ],
+    "seconds": [
+      18,
+      90
+    ]
+  }
+}

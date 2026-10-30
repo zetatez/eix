@@ -1,0 +1,64 @@
+{
+  "id": "math_proof_inf_primes",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Do not change any file. Prove by contradiction that there are infinitely many primes, using the product of all primes plus one. Explain why the new number must have a prime divisor not in the list. End with the line `QED`.",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "infinitely many primes",
+        "infinite primes",
+        "infinitely many prime numbers"
+      ]
+    },
+    {
+      "kind": "text_all",
+      "axis": "correctness",
+      "needles": [
+        "contradiction",
+        "qed"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "plus 1",
+        "plus one",
+        "add 1",
+        "add one",
+        "+ 1",
+        "+1"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "prime divisor",
+        "prime factor",
+        "divides"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      2,
+      8
+    ],
+    "tokens": [
+      20000,
+      70000
+    ],
+    "seconds": [
+      12,
+      70
+    ]
+  }
+}

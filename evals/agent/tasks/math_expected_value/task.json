@@ -1,0 +1,27 @@
+{
+  "id": "math_expected_value",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `mean_variance(probabilities, values)` in src/lib.rs for a finite discrete distribution. Both slices must be non-empty and the same length; every probability must be finite, non-negative, and sum to 1 within `1e-9`; every value must be finite. Return `Some((mean, variance))` with `variance = sum p_i (v_i - mean)^2`, or `None` for invalid input. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "id": "math_combinatorics",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate computes factorials and binomial coefficients. `factorial` must return the exact `u128` value and panic with `overflow` when the result does not fit `u128`. `binomial(n, k)` must return the exact `u128` coefficient, return 0 when `k > n`, and avoid intermediate overflow (the factorial formula overflows long before the coefficient does). `binomial(0, 0)` is 1. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": ["cargo", "test", "--quiet"],
+  "editable": ["src/lib.rs"],
+  "budgets": {"steps": [6, 14], "tokens": [35000, 120000], "seconds": [25, 110]}
+}

@@ -1,0 +1,27 @@
+{
+  "id": "math_induction_cubes",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `sum_cubes(n)` in src/lib.rs for the identity `1^3 + 2^3 + ... + n^3 = (n(n+1)/2)^2`. Return the exact sum as `Some(u64)`, or `None` if the closed form does not fit in `u64`. `sum_cubes(0)` is 0. Do not loop over every term; use the closed form. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      4,
+      11
+    ],
+    "tokens": [
+      25000,
+      90000
+    ],
+    "seconds": [
+      18,
+      95
+    ]
+  }
+}

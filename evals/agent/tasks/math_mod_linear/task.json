@@ -1,0 +1,27 @@
+{
+  "id": "math_mod_linear",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `solve_linear(a, b, m)` in src/lib.rs, returning the smallest non-negative `x` with `a * x = b (mod m)`. Return `None` when `m == 0` or when no solution exists. Use the extended Euclidean algorithm: a solution exists exactly when `gcd(a, m)` divides `b`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

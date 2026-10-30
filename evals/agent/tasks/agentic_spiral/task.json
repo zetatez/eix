@@ -1,0 +1,27 @@
+{
+  "id": "agentic_spiral",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `spiral(matrix)` in src/lib.rs, returning the elements of a rectangular matrix in clockwise spiral order starting at the top-left. An empty matrix returns an empty vector; a ragged matrix also returns an empty vector. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

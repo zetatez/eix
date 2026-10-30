@@ -1,0 +1,27 @@
+{
+  "id": "math_angle",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `normalize_deg`, `to_radians` and `to_degrees` in src/lib.rs. `normalize_deg` maps any finite angle into `[0, 360)` and returns `None` for non-finite input. The conversions return `None` for non-finite input. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      4,
+      11
+    ],
+    "tokens": [
+      25000,
+      90000
+    ],
+    "seconds": [
+      18,
+      95
+    ]
+  }
+}

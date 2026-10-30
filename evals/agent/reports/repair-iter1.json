@@ -1,0 +1,958 @@
+{
+  "generated_at": "20261030T170901Z",
+  "args": {
+    "tasks": "agentic_knapsack,hallucination_missing_arg",
+    "repeats": 2,
+    "bin_dir": "/tmp/eix-agent-new-bin",
+    "config": "/home/shiyi/.config/eix/config.toml",
+    "workdir": "/tmp/eix-agent-eval",
+    "output": "evals/agent/reports/repair-iter1.json",
+    "timeout": 420.0,
+    "keep_workdir": false,
+    "verify_timeout": 180.0,
+    "daemon_timeout": 20.0
+  },
+  "summary": {
+    "runs": 4,
+    "passed": 2,
+    "pass_rate": 0.5,
+    "total_prompt_tokens": 302656,
+    "total_completion_tokens": 41140,
+    "total_tokens": 343796,
+    "total_cache_read_tokens": 255360,
+    "usage_coverage": 1.0,
+    "cache_hit_rate": 0.8437,
+    "mean_duration_s": 105.457,
+    "mean_model_steps": 7.5,
+    "mean_tool_calls": 6.5,
+    "score": {
+      "runs": 4,
+      "passed": 2,
+      "pass_rate": 0.5,
+      "pass_all_tasks": "1/2",
+      "mean_score": 57.1,
+      "axes": {
+        "correctness": 0.5,
+        "adherence": 1.0,
+        "loops": 0.708,
+        "tokens": 0.733,
+        "time": 0.5,
+        "cache": 0.843
+      },
+      "tasks": {
+        "agentic_knapsack": {
+          "runs": 2,
+          "passed": 2,
+          "mean_score": 74.2
+        },
+        "hallucination_missing_arg": {
+          "runs": 2,
+          "passed": 0,
+          "mean_score": 40.0
+        }
+      },
+      "categories": {
+        "agentic-coding": {
+          "runs": 2,
+          "passed": 2,
+          "mean_score": 74.2
+        },
+        "hallucination-control": {
+          "runs": 2,
+          "passed": 0,
+          "mean_score": 40.0
+        }
+      }
+    }
+  },
+  "results": [
+    {
+      "task": "agentic_knapsack",
+      "category": "agentic-coding",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T170159Z-agentic_knapsack-r1-p1011066",
+      "repo": "/tmp/eix-agent-eval/20261030T170159Z-agentic_knapsack-r1-p1011066/repo",
+      "prompt": "Work autonomously and do not ask questions. Implement `max_value(weights, values, capacity)` in src/lib.rs for 0/1 knapsack: each item may be used at most once, and the total weight must not exceed `capacity`. Return the largest achievable value as `Some(u64)`, or `None` if the slice lengths differ. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 11 tests\n...........\ntest result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "I'll replace the greedy placeholder with an exact solver that adapts its strategy to the input size.\nThe meet-in-the-middle frontier drops its first state because `best` starts at 0. Fixing that.\nTests pass. Let me add brute-force cross-checks of every internal strategy to back the exactness claim.\nThe failure is in my test harness, not the solver: `usable_items` drops zero-weight items, but the expected value from the full brute force still counts them.\nThe failure is in the `pareto` fallback: `merge_frontier` initializes `best = 0`, so it discards the `(0,0)` state whenever all values so far are zero, leaving later merges with an empty frontier.\n`max_value` is now an exact 0/1 knapsack solver rather than the greedy placeholder; all 11 tests pass.\n\n**Implementation** (`src/lib.rs`)\n- `max_value` (`src/lib.rs:1`) filters items: weight-0 items are always taken (in an additive `base`), items heavier than `capacity` are dropped, mismatched lengths return `None`.\n- Picks the cheapest exact strategy per input, so no single dimension can blow up (`src/lib.rs:25-66`):\n  - `weight_dp` (`src/lib.rs:77`): classic O(n\u00b7capacity) DP, 1-D, reverse iteration.\n  - `value_dp` (`src/lib.rs:92`): O(n\u00b7\u03a3values) DP minimizing weight, for large capacities with small value sums.\n  - `meet_in_the_middle` (`src/lib.rs:122`): enumerates half-subsets into a Pareto frontier (`src/lib.rs:138`) and binary-searches the best complement, for large capacity *and* large value sums.\n  - `pareto` (`src/lib.rs:165`): density-ordered frontier merge (`src/lib.rs:181`) as a fallback past the work budget.\n- Overflow-safe: weight additions use `checked_add`, cross-multiplications in u128.\n\n**Verification** (`cargo test`)\n- Original test untouched and passing.\n- Added cases: mismatched lengths, items used once, zero-weight items, empty input, a greedy counterexample, value-DP path with 10^12 capacity, meet-in-the-middle path.\n- Cross-checked against exhaustive brute force on 500 random small inputs, 200 huge-capacity inputs, and 300 inputs validated against *every* internal strategy (weight DP, value DP, meet-in-the-middle, Pareto) \u2014 all matched.\n\nTwo of my own new tests initially failed and exposed real bugs (empty frontier from a zero-initialized `best` in `subset_frontier` and `merge_frontier`); both are fixed and covered by the passing random cross-checks. `cargo test` also generated an untracked `Cargo.lock`; leaving it in place.\n",
+        "stderr": "patch applied: src/lib.rs\npatch applied: src/lib.rs\npatch applied: src/lib.rs\npatch applied: src/lib.rs\npatch applied: src/lib.rs\npatch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 276.507
+      },
+      "session": {
+        "id": "e5b88873-8780-4a6a-a466-09ded8ed29c9",
+        "name": "agentic_knapsack",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 20,
+        "steps_with_usage": 20,
+        "usage_coverage": 1.0,
+        "tool_calls": 19,
+        "tools": {
+          "exec_command": 13,
+          "apply_patch": 6
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 20,
+          "tool_call": 19,
+          "permission_evaluated": 19,
+          "process_started": 13,
+          "process_exited": 13,
+          "tool_result": 19,
+          "snapshot": 12,
+          "patch_applied": 6
+        },
+        "prompt_tokens": 241422,
+        "completion_tokens": 33093,
+        "cache_read_tokens": 205056,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 26968,
+        "uncached_prompt_tokens": 36366,
+        "cache_hit_rate": 0.8494,
+        "process": {
+          "redundant_tool_calls": 2,
+          "scratch_writes": 0,
+          "verification_runs": 6,
+          "git_status_calls": 1,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.853,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5552,
+            "completion_tokens": 48,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5852,
+            "completion_tokens": 11911,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 9076,
+            "tool_calls": 1,
+            "chars": 100
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 8713,
+            "completion_tokens": 433,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 384,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 22,
+            "prompt_tokens": 8986,
+            "completion_tokens": 165,
+            "cache_read_tokens": 5120,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 8,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 28,
+            "prompt_tokens": 9281,
+            "completion_tokens": 119,
+            "cache_read_tokens": 8320,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 71,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 35,
+            "prompt_tokens": 9618,
+            "completion_tokens": 899,
+            "cache_read_tokens": 8576,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 846,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 41,
+            "prompt_tokens": 10846,
+            "completion_tokens": 1328,
+            "cache_read_tokens": 8960,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 1078,
+            "tool_calls": 1,
+            "chars": 94
+          },
+          {
+            "seq": 47,
+            "prompt_tokens": 11120,
+            "completion_tokens": 48,
+            "cache_read_tokens": 10112,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 54,
+            "prompt_tokens": 11478,
+            "completion_tokens": 5791,
+            "cache_read_tokens": 10368,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 4637,
+            "tool_calls": 1,
+            "chars": 103
+          },
+          {
+            "seq": 60,
+            "prompt_tokens": 12656,
+            "completion_tokens": 67,
+            "cache_read_tokens": 10752,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 67,
+            "prompt_tokens": 13069,
+            "completion_tokens": 165,
+            "cache_read_tokens": 8064,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 111,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 73,
+            "prompt_tokens": 13393,
+            "completion_tokens": 592,
+            "cache_read_tokens": 11904,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 301,
+            "tool_calls": 1,
+            "chars": 158
+          },
+          {
+            "seq": 79,
+            "prompt_tokens": 13708,
+            "completion_tokens": 67,
+            "cache_read_tokens": 12672,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 86,
+            "prompt_tokens": 14059,
+            "completion_tokens": 1546,
+            "cache_read_tokens": 13056,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 1493,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 92,
+            "prompt_tokens": 14425,
+            "completion_tokens": 2471,
+            "cache_read_tokens": 12544,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 2221,
+            "tool_calls": 1,
+            "chars": 196
+          },
+          {
+            "seq": 98,
+            "prompt_tokens": 14698,
+            "completion_tokens": 68,
+            "cache_read_tokens": 13824,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 105,
+            "prompt_tokens": 15126,
+            "completion_tokens": 1294,
+            "cache_read_tokens": 13312,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 1248,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 111,
+            "prompt_tokens": 15232,
+            "completion_tokens": 638,
+            "cache_read_tokens": 14464,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 582,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 117,
+            "prompt_tokens": 15755,
+            "completion_tokens": 4019,
+            "cache_read_tokens": 14080,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 3949,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 123,
+            "prompt_tokens": 17855,
+            "completion_tokens": 1424,
+            "cache_read_tokens": 14464,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 963,
+            "tool_calls": 0,
+            "chars": 1777
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 371 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++--\n 1 file changed, 362 insertions(+), 9 deletions(-)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          6,
+          14
+        ],
+        "tokens": [
+          35000,
+          120000
+        ],
+        "seconds": [
+          25,
+          110
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T170159Z-agentic_knapsack-r1-p1011066/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T170159Z-agentic_knapsack-r1-p1011066/data/eix.sqlite3\neixd: config reloaded\neixd: config reloaded\n",
+      "duration_s": 276.507,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [],
+      "verify_duration_s": 0.13,
+      "score": {
+        "total": 61.7,
+        "grade": "D",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 0.0,
+          "tokens": 0.0,
+          "time": 0.0,
+          "cache": 0.85
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 2,
+          "verification_runs": 6,
+          "git_status_calls": 1,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 274515,
+          "steps": 20,
+          "seconds": 276.507,
+          "cache_hit_rate": 0.849,
+          "first_step_cache_hit": 0.853,
+          "budgets": {
+            "steps": [
+              6.0,
+              14.0
+            ],
+            "tokens": [
+              35000.0,
+              120000.0
+            ],
+            "seconds": [
+              25.0,
+              110.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "agentic_knapsack",
+      "category": "agentic-coding",
+      "planning": false,
+      "repeat": 2,
+      "run_id": "20261030T170636Z-agentic_knapsack-r2-p1011066",
+      "repo": "/tmp/eix-agent-eval/20261030T170636Z-agentic_knapsack-r2-p1011066/repo",
+      "prompt": "Work autonomously and do not ask questions. Implement `max_value(weights, values, capacity)` in src/lib.rs for 0/1 knapsack: each item may be used at most once, and the total weight must not exceed `capacity`. Return the largest achievable value as `Some(u64)`, or `None` if the slice lengths differ. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+      "passed": true,
+      "verify_exit": 0,
+      "verify_output": "\nrunning 4 tests\n....\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 2 tests\n..\ntest result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n\nrunning 0 tests\n\ntest result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s\n\n",
+      "send": {
+        "exit": 0,
+        "stdout": "The current greedy implementation is incorrect for 0/1 knapsack (it picks by value density order and can miss optimal combinations). Replacing it with exact dynamic programming.\nImplemented exact 0/1 knapsack in `src/lib.rs`.\n\nThe old code was a greedy by-value sort, which is wrong for 0/1 knapsack (e.g. `weights=[2,3,4]`, `values=[3,4,5]`, `capacity=5` should yield `7`, not a greedy pick). The new implementation:\n\n- Returns `None` on mismatched slice lengths, unchanged.\n- Drops items heavier than `capacity`, clamps the DP range to the smaller of total weight or total value, and runs a reverse-iteration (each item at most once) DP:\n  - capacity-indexed DP when capacity is the smaller dimension,\n  - value-indexed DP (minimum weight per exact value) when total value is smaller.\n- Handles empty slices, zero capacity, and saturates value sums.\n\nI added three tests (mismatched lengths, greedy trap, empty/zero capacity) and left the existing test untouched.\n\nVerification: `cargo test` passes, 4 passed, 0 failed.\n",
+        "stderr": "patch applied: src/lib.rs\npatch applied: src/lib.rs\n",
+        "timed_out": false,
+        "duration_s": 129.573
+      },
+      "session": {
+        "id": "395fff9d-ee22-4226-be43-b0d16abf71da",
+        "name": "agentic_knapsack",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 5,
+        "steps_with_usage": 5,
+        "usage_coverage": 1.0,
+        "tool_calls": 4,
+        "tools": {
+          "exec_command": 2,
+          "apply_patch": 2
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 5,
+          "tool_call": 4,
+          "permission_evaluated": 4,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 4,
+          "snapshot": 3,
+          "patch_applied": 2
+        },
+        "prompt_tokens": 33072,
+        "completion_tokens": 7689,
+        "cache_read_tokens": 26240,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 6023,
+        "uncached_prompt_tokens": 6832,
+        "cache_hit_rate": 0.7934,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.853,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5552,
+            "completion_tokens": 48,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5852,
+            "completion_tokens": 4274,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 3282,
+            "tool_calls": 1,
+            "chars": 177
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 6870,
+            "completion_tokens": 1024,
+            "cache_read_tokens": 5120,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 671,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 21,
+            "prompt_tokens": 7247,
+            "completion_tokens": 524,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 475,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 28,
+            "prompt_tokens": 7551,
+            "completion_tokens": 1819,
+            "cache_read_tokens": 6656,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 1595,
+            "tool_calls": 0,
+            "chars": 843
+          }
+        ]
+      },
+      "changes": {
+        "files": [
+          "src/lib.rs",
+          "Cargo.lock"
+        ],
+        "diff_stat": "src/lib.rs | 75 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--------\n 1 file changed, 66 insertions(+), 9 deletions(-)"
+      },
+      "editable": [
+        "src/lib.rs"
+      ],
+      "budgets": {
+        "steps": [
+          6,
+          14
+        ],
+        "tokens": [
+          35000,
+          120000
+        ],
+        "seconds": [
+          25,
+          110
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T170636Z-agentic_knapsack-r2-p1011066/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T170636Z-agentic_knapsack-r2-p1011066/data/eix.sqlite3\n",
+      "duration_s": 129.573,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [],
+      "verify_duration_s": 0.111,
+      "score": {
+        "total": 86.6,
+        "grade": "B",
+        "passed": true,
+        "components": {
+          "correctness": 1.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 0.932,
+          "time": 0.0,
+          "cache": 0.811
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 1,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [],
+          "tokens": 40761,
+          "steps": 5,
+          "seconds": 129.573,
+          "cache_hit_rate": 0.793,
+          "first_step_cache_hit": 0.853,
+          "budgets": {
+            "steps": [
+              6.0,
+              14.0
+            ],
+            "tokens": [
+              35000.0,
+              120000.0
+            ],
+            "seconds": [
+              25.0,
+              110.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "hallucination_missing_arg",
+      "category": "hallucination-control",
+      "planning": false,
+      "repeat": 1,
+      "run_id": "20261030T170845Z-hallucination_missing_arg-r1-p1011066",
+      "repo": "/tmp/eix-agent-eval/20261030T170845Z-hallucination_missing_arg-r1-p1011066/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not modify any file. `parse_v1` in src/lib.rs is said to ignore its `radix` argument. Check that claim and reply in one sentence: either quote the code that ignores `radix`, or explain that the parameter does not exist. Do not invent a fix.",
+      "passed": false,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "The claim is false: `parse_v1` has no `radix` parameter at all \u2014 its only signature is `pub fn parse_v1(input: &str) -> Option<i64>` (src/lib.rs:1), and the body just calls `input.trim().parse().ok()`, so nothing could be ignoring a `radix` argument.\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 10.078
+      },
+      "session": {
+        "id": "cf2038cf-94ba-438c-a1cf-e144e473c21f",
+        "name": "hallucination_missing_arg",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 3,
+        "steps_with_usage": 3,
+        "usage_coverage": 1.0,
+        "tool_calls": 2,
+        "tools": {
+          "exec_command": 2
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 3,
+          "tool_call": 2,
+          "permission_evaluated": 2,
+          "process_started": 2,
+          "process_exited": 2,
+          "tool_result": 2
+        },
+        "prompt_tokens": 16951,
+        "completion_tokens": 224,
+        "cache_read_tokens": 14464,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 45,
+        "uncached_prompt_tokens": 2487,
+        "cache_hit_rate": 0.8533,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 2,
+          "first_step_cache_hit": 0.8572,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5525,
+            "completion_tokens": 51,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5628,
+            "completion_tokens": 70,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 17,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 15,
+            "prompt_tokens": 5798,
+            "completion_tokens": 103,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 28,
+            "tool_calls": 0,
+            "chars": 250
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          2,
+          8
+        ],
+        "tokens": [
+          25000,
+          70000
+        ],
+        "seconds": [
+          12,
+          70
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T170845Z-hallucination_missing_arg-r1-p1011066/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T170845Z-hallucination_missing_arg-r1-p1011066/data/eix.sqlite3\n",
+      "duration_s": 10.078,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_all",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": false,
+          "detail": "none of: not found, not exist, doesn't exist, does not exist, no such, not defined, undefined, absent, missing, not present, doesn't have, does not have, no function, no flag, there is no, cannot find, can't find, no dependency, isn't defined, not a, no argument, does not take, doesn't take, no module, no method, no config, no file, not used"
+        }
+      ],
+      "score": {
+        "total": 40.0,
+        "grade": "F",
+        "passed": false,
+        "components": {
+          "correctness": 0.0,
+          "adherence": 1.0,
+          "loops": 0.833,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.854
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [
+            "text_any_of"
+          ],
+          "tokens": 17175,
+          "steps": 3,
+          "seconds": 10.078,
+          "cache_hit_rate": 0.853,
+          "first_step_cache_hit": 0.857,
+          "budgets": {
+            "steps": [
+              2.0,
+              8.0
+            ],
+            "tokens": [
+              25000.0,
+              70000.0
+            ],
+            "seconds": [
+              12.0,
+              70.0
+            ]
+          }
+        }
+      }
+    },
+    {
+      "task": "hallucination_missing_arg",
+      "category": "hallucination-control",
+      "planning": false,
+      "repeat": 2,
+      "run_id": "20261030T170856Z-hallucination_missing_arg-r2-p1011066",
+      "repo": "/tmp/eix-agent-eval/20261030T170856Z-hallucination_missing_arg-r2-p1011066/repo",
+      "prompt": "Work autonomously and do not ask questions. Do not modify any file. `parse_v1` in src/lib.rs is said to ignore its `radix` argument. Check that claim and reply in one sentence: either quote the code that ignores `radix`, or explain that the parameter does not exist. Do not invent a fix.",
+      "passed": false,
+      "verify_exit": null,
+      "verify_output": "",
+      "send": {
+        "exit": 0,
+        "stdout": "The claim is false: `parse_v1` has no `radix` parameter at all, only `pub fn parse_v1(input: &str) -> Option<i64>` (src/lib.rs:1), which parses via `input.trim().parse().ok()`.\n",
+        "stderr": "",
+        "timed_out": false,
+        "duration_s": 5.668
+      },
+      "session": {
+        "id": "45ea36a6-c476-496c-a83f-94ee3eb3b14d",
+        "name": "hallucination_missing_arg",
+        "status": "idle",
+        "mode": "full",
+        "model": null
+      },
+      "metrics": {
+        "model": "deepseek/deepseek-v4.1-flash",
+        "model_steps": 2,
+        "steps_with_usage": 2,
+        "usage_coverage": 1.0,
+        "tool_calls": 1,
+        "tools": {
+          "exec_command": 1
+        },
+        "event_kinds": {
+          "user_message": 1,
+          "status_changed": 2,
+          "assistant_message": 2,
+          "tool_call": 1,
+          "permission_evaluated": 1,
+          "process_started": 1,
+          "process_exited": 1,
+          "tool_result": 1
+        },
+        "prompt_tokens": 11211,
+        "completion_tokens": 134,
+        "cache_read_tokens": 9600,
+        "cache_creation_tokens": 0,
+        "reasoning_tokens": 24,
+        "uncached_prompt_tokens": 1611,
+        "cache_hit_rate": 0.8563,
+        "process": {
+          "redundant_tool_calls": 0,
+          "scratch_writes": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "reads_before_first_edit": 1,
+          "first_step_cache_hit": 0.8572,
+          "plan_updates": 0,
+          "plan_steps": 0,
+          "plan_completed": 0
+        },
+        "errors": [],
+        "steps": [
+          {
+            "seq": 3,
+            "prompt_tokens": 5525,
+            "completion_tokens": 52,
+            "cache_read_tokens": 4736,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 0,
+            "tool_calls": 1,
+            "chars": 0
+          },
+          {
+            "seq": 9,
+            "prompt_tokens": 5686,
+            "completion_tokens": 82,
+            "cache_read_tokens": 4864,
+            "cache_creation_tokens": 0,
+            "reasoning_tokens": 24,
+            "tool_calls": 0,
+            "chars": 176
+          }
+        ]
+      },
+      "changes": {
+        "files": [],
+        "diff_stat": ""
+      },
+      "editable": [],
+      "budgets": {
+        "steps": [
+          2,
+          8
+        ],
+        "tokens": [
+          25000,
+          70000
+        ],
+        "seconds": [
+          12,
+          70
+        ]
+      },
+      "daemon_log": "eixd 0.0.0 listening on /tmp/eix-agent-eval/20261030T170856Z-hallucination_missing_arg-r2-p1011066/eix.sock\n  model  deepseek/deepseek-v4.1-flash\n  api    http://127.0.0.1:3210/v1\n  data   /tmp/eix-agent-eval/20261030T170856Z-hallucination_missing_arg-r2-p1011066/data/eix.sqlite3\n",
+      "duration_s": 5.668,
+      "model": "deepseek/deepseek-v4.1-flash",
+      "checks": [
+        {
+          "kind": "files_unchanged",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_all",
+          "axis": "correctness",
+          "ok": true,
+          "detail": ""
+        },
+        {
+          "kind": "text_any_of",
+          "axis": "correctness",
+          "ok": false,
+          "detail": "none of: not found, not exist, doesn't exist, does not exist, no such, not defined, undefined, absent, missing, not present, doesn't have, does not have, no function, no flag, there is no, cannot find, can't find, no dependency, isn't defined, not a, no argument, does not take, doesn't take, no module, no method, no config, no file, not used"
+        }
+      ],
+      "score": {
+        "total": 40.0,
+        "grade": "F",
+        "passed": false,
+        "components": {
+          "correctness": 0.0,
+          "adherence": 1.0,
+          "loops": 1.0,
+          "tokens": 1.0,
+          "time": 1.0,
+          "cache": 0.857
+        },
+        "detail": {
+          "unexpected_changes": [],
+          "clean_diff": 1.0,
+          "scratch_writes": 0,
+          "redundant_tool_calls": 0,
+          "verification_runs": 0,
+          "git_status_calls": 0,
+          "plan_updates": 0,
+          "failed_checks": [
+            "text_any_of"
+          ],
+          "tokens": 11345,
+          "steps": 2,
+          "seconds": 5.668,
+          "cache_hit_rate": 0.856,
+          "first_step_cache_hit": 0.857,
+          "budgets": {
+            "steps": [
+              2.0,
+              8.0
+            ],
+            "tokens": [
+              25000.0,
+              70000.0
+            ],
+            "seconds": [
+              12.0,
+              70.0
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

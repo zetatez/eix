@@ -1,0 +1,27 @@
+{
+  "id": "math_big_factorial",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `factorial(n)` in src/lib.rs. It returns the exact decimal representation of `n!` as a string, so results far beyond `u64` must be correct. `0!` and `1!` are `\"1\"`. Return `None` when `n` is greater than 10000. Do not use external crates. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      15
+    ],
+    "tokens": [
+      35000,
+      125000
+    ],
+    "seconds": [
+      25,
+      115
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "math_linear",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate solves the 2x2 system `a*x + b*y = e`, `c*x + d*y = f`. `solve(a, b, c, d, e, f)` returns `Some((x, y))`, or `None` when the determinant is zero or any input is non-finite. Keep the public signature and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

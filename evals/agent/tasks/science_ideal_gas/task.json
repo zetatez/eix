@@ -1,0 +1,27 @@
+{
+  "id": "science_ideal_gas",
+  "category": "scientific-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate applies the ideal gas law `P * V = n * R * T` with `R = 8.314`. `pressure(n, t, v)` returns `n * R * t / v`, `volume(n, t, p)` returns `n * R * t / p`, and `temperature(p, v, n)` returns `p * v / (n * R)`. Every argument must be finite and strictly positive; otherwise return `Err(\"invalid\")`. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

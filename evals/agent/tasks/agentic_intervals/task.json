@@ -1,0 +1,27 @@
+{
+  "id": "agentic_intervals",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `merge(intervals)` in src/lib.rs. Sort by start, then merge intervals that overlap or touch (for example `(1, 2)` and `(2, 5)` merge into `(1, 5)`). Return an empty vector for empty input. Keep the public signature and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

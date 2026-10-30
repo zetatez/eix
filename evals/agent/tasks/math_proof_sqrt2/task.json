@@ -1,0 +1,55 @@
+{
+  "id": "math_proof_sqrt2",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Do not change any file. Prove that sqrt(2) is irrational. Use a proof by contradiction and state clearly why the numerator and denominator cannot both be even. End with the line `QED`.",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "sqrt(2)",
+        "\u221a2",
+        "sqrt{2}",
+        "square root of 2"
+      ]
+    },
+    {
+      "kind": "text_all",
+      "axis": "correctness",
+      "needles": [
+        "contradiction",
+        "even",
+        "qed"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "coprime",
+        "relatively prime",
+        "lowest terms",
+        "in lowest terms"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      2,
+      8
+    ],
+    "tokens": [
+      20000,
+      70000
+    ],
+    "seconds": [
+      12,
+      70
+    ]
+  }
+}

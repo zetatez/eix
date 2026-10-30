@@ -1,0 +1,75 @@
+{
+  "id": "math_def_group",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Do not change any file. State the four group axioms, then show that the integers modulo 5 under addition form a group. End with the line `QED`.",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "closure",
+        "closed under"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "associativity",
+        "associative"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "identity",
+        "neutral element"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "inverse"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "modulo 5",
+        "mod 5",
+        "z/5",
+        "z_5",
+        "z5"
+      ]
+    },
+    {
+      "kind": "text_all",
+      "axis": "correctness",
+      "needles": [
+        "qed"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      2,
+      9
+    ],
+    "tokens": [
+      22000,
+      80000
+    ],
+    "seconds": [
+      14,
+      80
+    ]
+  }
+}

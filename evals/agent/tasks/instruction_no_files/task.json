@@ -1,0 +1,45 @@
+{
+  "id": "instruction_no_files",
+  "category": "instruction-following",
+  "prompt": "Work autonomously and do not ask questions. Do not modify any file. In one sentence, explain why running a downloaded script without review is unsafe.",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "unsafe",
+        "untrusted",
+        "trust",
+        "malicious",
+        "review",
+        "malware",
+        "exfiltrat",
+        "credential",
+        "privilege",
+        "danger",
+        "harm",
+        "risk",
+        "without knowing"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      3,
+      10
+    ],
+    "tokens": [
+      25000,
+      80000
+    ],
+    "seconds": [
+      15,
+      80
+    ]
+  }
+}

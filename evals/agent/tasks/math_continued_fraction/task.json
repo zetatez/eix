@@ -1,0 +1,27 @@
+{
+  "id": "math_continued_fraction",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `from_fraction(coefficients)` in src/lib.rs, evaluating the finite continued fraction `[a0; a1, ..., an] = a0 + 1 / (a1 + 1 / (... + 1/an))`. Return `None` for empty input or when an intermediate denominator is zero, since the value is undefined. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

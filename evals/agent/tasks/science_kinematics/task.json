@@ -1,0 +1,8 @@
+{
+  "id": "science_kinematics",
+  "category": "scientific-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate computes projectile motion under constant gravity, with angles in degrees. Implement `range`, `max_height` and `time_of_flight` using the standard ideal-projectile equations, and validate inputs first: a negative or non-finite speed returns `Err(\"speed\")`, a non-positive or non-finite gravity returns `Err(\"gravity\")`, and a non-finite angle returns `Err(\"angle\")`. Results are in the same units as the inputs. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": ["cargo", "test", "--quiet"],
+  "editable": ["src/lib.rs"],
+  "budgets": {"steps": [5, 12], "tokens": [30000, 100000], "seconds": [20, 100]}
+}

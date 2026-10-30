@@ -1,0 +1,27 @@
+{
+  "id": "math_divisors",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `divisors`, `sum_proper_divisors` and `is_perfect` in src/lib.rs. `divisors(n)` returns all positive divisors in ascending order; `divisors(0)` is empty. `sum_proper_divisors(n)` sums divisors strictly less than `n`, and `sum_proper_divisors(0)` is 0. `is_perfect(n)` is true exactly when `n > 1` and its proper divisors sum to `n`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "agentic_dijkstra",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `shortest(nodes, edges, source)` in src/lib.rs for a directed weighted graph. Edges are `(from, to, weight)`. Return a vector of `Option<u64>` distances, using `None` for unreachable nodes. Return `None` for an out-of-range source or edge endpoint. Duplicate edges are allowed; keep the cheapest. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      15
+    ],
+    "tokens": [
+      35000,
+      125000
+    ],
+    "seconds": [
+      25,
+      115
+    ]
+  }
+}

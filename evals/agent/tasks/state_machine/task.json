@@ -1,0 +1,27 @@
+{
+  "id": "state_machine",
+  "prompt": "Work autonomously and do not ask questions. This crate models an order lifecycle. `next` must implement: Draft + Submit -> Active; Active + Pause -> Paused; Paused + Resume -> Active; Draft, Active or Paused + Close -> Closed; every other pair, including anything leaving Closed, returns None. Keep the public API and the existing tests unchanged. Inspect the modules, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/machine.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  },
+  "category": "agentic-coding"
+}

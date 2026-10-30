@@ -1,0 +1,27 @@
+{
+  "id": "math_set_ops",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `union`, `intersection` and `difference` in src/lib.rs. Treat both input slices as mathematical sets: ignore duplicates, accept unsorted input, and return the result as an ascending vector of distinct values. `difference(a, b)` contains the values in `a` that are not in `b`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "agentic_lru",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement a small LRU cache in src/lib.rs with `Lru::new(capacity)`, `get(key)`, `put(key, value)` and `len()`. `get` returns the value and marks the key most-recently-used; `put` inserts or updates and evicts the least-recently-used entry when over capacity. A capacity of 0 stores nothing. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

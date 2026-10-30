@@ -1,0 +1,27 @@
+{
+  "id": "math_convex_hull",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `hull_area2(points)` in src/lib.rs. Build the convex hull with the monotone-chain algorithm, dropping collinear points and duplicates, and return twice the hull area as a `u64` so the result stays integral. Fewer than three distinct points, or only collinear points, return 0. Points may be negative. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      15
+    ],
+    "tokens": [
+      35000,
+      125000
+    ],
+    "seconds": [
+      25,
+      115
+    ]
+  }
+}

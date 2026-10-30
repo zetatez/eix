@@ -1,0 +1,27 @@
+{
+  "id": "agentic_next_permutation",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `next_permutation(values)` in src/lib.rs, rearranging the slice into the next lexicographically greater permutation and returning `true`. If no greater permutation exists, rearrange into ascending order and return `false`. Duplicates are allowed. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

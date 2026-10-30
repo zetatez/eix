@@ -1,0 +1,27 @@
+{
+  "id": "math_pythagorean",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `primitive_triples(limit)` in src/lib.rs. Return every primitive Pythagorean triple `(a, b, c)` with `a < b`, `c <= limit`, using Euclid's formula with coprime `m > n`, opposite parity, `a = m^2 - n^2`, `b = 2mn`, `c = m^2 + n^2`. Sort by `(c, a, b)`. A limit below 5 returns an empty vector. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

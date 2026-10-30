@@ -1,0 +1,27 @@
+{
+  "id": "math_triangle",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `classify` and `area` in src/lib.rs. Both return `None` unless all three sides are finite, strictly positive, and satisfy the strict triangle inequality. `classify` returns `\"equilateral\"`, `\"isosceles\"` or `\"scalene\"`. `area` uses Heron's formula. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

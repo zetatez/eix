@@ -1,0 +1,27 @@
+{
+  "id": "math_collatz",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `steps` and `max_value` in src/lib.rs for the Collatz sequence. `steps(n)` counts the terms until reaching 1. `max_value(n)` returns the largest value reached, including `n` itself. Both return `None` for `n == 0` and when the next term would overflow `u64`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

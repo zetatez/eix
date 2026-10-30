@@ -1,0 +1,27 @@
+{
+  "id": "agentic_ring_buffer",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `RingBuffer` in src/lib.rs: `new(capacity)` starts empty, `push(value)` appends and evicts the oldest value once the buffer is full, `iter()` yields values oldest to newest, and `len()` never exceeds the capacity. A capacity of 0 stores nothing. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

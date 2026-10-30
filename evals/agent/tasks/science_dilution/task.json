@@ -1,0 +1,27 @@
+{
+  "id": "science_dilution",
+  "category": "scientific-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate solves dilution problems with `C1 * V1 = C2 * V2`. `final_concentration(c1, v1, v2)` returns `c1 * v1 / v2`, and `required_volume(c1, v1, c2)` returns the final volume `c1 * v1 / c2`. Every argument must be finite and strictly positive; otherwise return `Err(\"invalid\")`. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "id": "counter_saturate",
+  "prompt": "Work autonomously and do not ask questions. `Counter` stores an `i64` and currently panics on overflow in debug builds and wraps in release builds. Change `add` and `sub` to saturate at `i64::MAX` / `i64::MIN` instead, record the new value, and keep the public API and existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      4,
+      10
+    ],
+    "tokens": [
+      28000,
+      90000
+    ],
+    "seconds": [
+      18,
+      90
+    ]
+  },
+  "category": "agentic-coding"
+}

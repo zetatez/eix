@@ -1,0 +1,27 @@
+{
+  "id": "agentic_cli_args",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `parse` in src/lib.rs. It accepts `--verbose`, `--name=value` and `--count=N` and returns `Args`. Unknown arguments produce `Err(\"unknown: <arg>\")`, `--name` or `--count` without `=value` produce `Err(\"missing value: <flag>\")`, and a count that is not a `u32` produces `Err(\"invalid count: <value>\")`. Later occurrences overwrite earlier ones. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

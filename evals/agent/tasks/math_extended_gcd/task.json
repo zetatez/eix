@@ -1,0 +1,27 @@
+{
+  "id": "math_extended_gcd",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement `extended_gcd(a, b)` in src/lib.rs. It returns `(g, x, y)` such that `a*x + b*y = g`, where `g` is the non-negative greatest common divisor. `extended_gcd(0, 0)` returns `(0, 0, 0)`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

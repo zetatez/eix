@@ -1,0 +1,27 @@
+{
+  "id": "agentic_toposort",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `order(nodes, edges)` in src/lib.rs for a directed graph with nodes `0..nodes`. Each edge `(from, to)` means `from` must come before `to`. Return a topological order that always picks the smallest available node first, or `None` if an edge is out of range or the graph has a cycle. Duplicate edges count once. An empty graph returns an empty vector. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      15
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "id": "planning_refactor",
+  "category": "task-planning",
+  "planning": true,
+  "prompt": "Work autonomously and do not ask questions. This crate has two identical subtotal loops. First call `update_plan` with at least three steps covering (1) extracting one shared helper, (2) switching both public functions to it, and (3) verifying with tests, then do the work and mark steps completed as you finish them. The shared helper must use `saturating_add` so `subtotal_a(&[i64::MAX, 1])` is `i64::MAX` and `subtotal_b(&[i64::MIN, -1])` is `i64::MIN`. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "checks": [
+    {
+      "kind": "plan_used",
+      "axis": "planning",
+      "min_steps": 3,
+      "min_completed": 2
+    }
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  }
+}

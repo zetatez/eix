@@ -1,0 +1,12 @@
+{
+  "id": "planning_pipeline",
+  "category": "task-planning",
+  "planning": true,
+  "prompt": "Work autonomously and do not ask questions. This crate has three modules and the public `run` function is unimplemented. First call `update_plan` with at least three steps covering tokenization, transformation and the public `run` function, then implement `run(input)` as `transform(tokenize(input))` joined by single spaces, marking plan steps completed as you finish them. `tokenize` splits on whitespace, trims surrounding ASCII punctuation and lowercases; `transform` drops the stopwords `the`, `a` and `an`. Keep the public API and the existing tests unchanged. Inspect the modules, run `cargo test`, and finish only when the tests pass.",
+  "verify": ["cargo", "test", "--quiet"],
+  "editable": ["src/lib.rs"],
+  "checks": [
+    {"kind": "plan_used", "axis": "planning", "min_steps": 3, "min_completed": 2}
+  ],
+  "budgets": {"steps": [6, 14], "tokens": [35000, 120000], "seconds": [25, 110]}
+}

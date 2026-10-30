@@ -1,0 +1,29 @@
+{
+  "id": "agentic_ledger",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Fix the ledger crate across src/entry.rs, src/ledger.rs and src/lib.rs. `parse_entry` accepts exactly `deposit:N` or `withdraw:N` where N is a positive decimal integer without a sign, returning the matching enum variant and `None` otherwise. `apply` parses every line and returns the final balance as `Ok(i64)`; a malformed line is `Err(\"bad entry: <line>\")` and a withdrawal larger than the current balance is `Err(\"overdraft: <line>\")`. Empty input is `Ok(0)`. Do not change the public API or the existing tests. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs",
+    "src/entry.rs",
+    "src/ledger.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      15
+    ],
+    "tokens": [
+      35000,
+      130000
+    ],
+    "seconds": [
+      25,
+      115
+    ]
+  }
+}

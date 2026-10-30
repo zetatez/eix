@@ -1,0 +1,75 @@
+{
+  "id": "math_proof_cantor",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Do not change any file. Prove that the real numbers in [0, 1] are uncountable using Cantor's diagonal argument. Explain how the constructed number differs from every listed number. End with the line `QED`.",
+  "checks": [
+    {
+      "kind": "files_unchanged",
+      "axis": "correctness"
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "uncountable",
+        "not countable",
+        "no bijection"
+      ]
+    },
+    {
+      "kind": "text_all",
+      "axis": "correctness",
+      "needles": [
+        "contradiction",
+        "qed"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "diagonal",
+        "d_{nn}",
+        "d_nn",
+        "n-th digit",
+        "nth digit",
+        "diagonal argument"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "decimal",
+        "digit"
+      ]
+    },
+    {
+      "kind": "text_any_of",
+      "axis": "correctness",
+      "needles": [
+        "differ",
+        "different",
+        "change",
+        "omits",
+        "not equal",
+        "\\neq"
+      ]
+    }
+  ],
+  "editable": [],
+  "budgets": {
+    "steps": [
+      2,
+      9
+    ],
+    "tokens": [
+      22000,
+      80000
+    ],
+    "seconds": [
+      14,
+      80
+    ]
+  }
+}

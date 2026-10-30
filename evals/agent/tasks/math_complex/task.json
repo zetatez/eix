@@ -1,0 +1,27 @@
+{
+  "id": "math_complex",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. Implement complex arithmetic in src/lib.rs. `Complex::new(re, im)` builds a value. `add` and `mul` use the standard formulas. `div` returns `None` when the divisor is exactly zero, otherwise `(a * conj(b)) / |b|^2`. `abs` returns the magnitude. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      12
+    ],
+    "tokens": [
+      30000,
+      100000
+    ],
+    "seconds": [
+      20,
+      100
+    ]
+  }
+}

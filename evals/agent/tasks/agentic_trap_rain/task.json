@@ -1,0 +1,27 @@
+{
+  "id": "agentic_trap_rain",
+  "category": "agentic-coding",
+  "prompt": "Work autonomously and do not ask questions. Implement `trap(height)` in src/lib.rs, returning the total units of rainwater trapped between bars of the given heights. Return 0 for slices with fewer than three bars. Keep the public API and the existing tests unchanged. Run `cargo test` and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/lib.rs"
+  ],
+  "budgets": {
+    "steps": [
+      5,
+      13
+    ],
+    "tokens": [
+      30000,
+      110000
+    ],
+    "seconds": [
+      22,
+      105
+    ]
+  }
+}

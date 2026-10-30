@@ -1,0 +1,8 @@
+{
+  "id": "math_rational",
+  "category": "mathematical-reasoning",
+  "prompt": "Work autonomously and do not ask questions. This crate models exact rational numbers with `i64` numerator and denominator. `new` must reduce by the greatest common divisor and keep the denominator positive; a zero denominator must panic with `zero denominator`. `add` and `mul` must return reduced results, must not overflow for intermediate products that fit in `i128` even when the operands' cross-products exceed `i64`, and must panic with `overflow` if the reduced result does not fit `i64`. `to_f64` returns the quotient. Keep the public signatures and the existing tests unchanged. Inspect the code, make the smallest correct change, run `cargo test`, and finish only when the tests pass.",
+  "verify": ["cargo", "test", "--quiet"],
+  "editable": ["src/lib.rs"],
+  "budgets": {"steps": [6, 14], "tokens": [35000, 120000], "seconds": [25, 110]}
+}

@@ -1,0 +1,27 @@
+{
+  "id": "validate_config",
+  "prompt": "Work autonomously and do not ask questions. This crate parses `key=value` config lines. Finish the parser so that: blank lines and lines starting with `#` are skipped; surrounding whitespace is trimmed from keys and values; an empty key is `ConfigError::EmptyKey`; a line without `=` is `ConfigError::MissingEquals`; a repeated key is `ConfigError::DuplicateKey` (first duplicate wins, reporting the key). Keep the public API, the error variants and the existing tests unchanged. Inspect both modules, run `cargo test`, and finish only when the tests pass.",
+  "verify": [
+    "cargo",
+    "test",
+    "--quiet"
+  ],
+  "editable": [
+    "src/parser.rs"
+  ],
+  "budgets": {
+    "steps": [
+      6,
+      14
+    ],
+    "tokens": [
+      35000,
+      120000
+    ],
+    "seconds": [
+      25,
+      110
+    ]
+  },
+  "category": "agentic-coding"
+}
