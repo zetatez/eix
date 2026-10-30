@@ -20,7 +20,7 @@ impl App {
             selected: 0,
             views: Vec::new(),
             focused: 0,
-            layout: PaneLayout::Grid,
+            layout: PaneLayout::Fibonacci,
             pending_attach: None,
             initial_session,
             restore_sessions: Vec::new(),

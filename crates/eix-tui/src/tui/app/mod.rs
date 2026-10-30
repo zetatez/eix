@@ -2033,10 +2033,10 @@ impl PaneLayout {
 
     fn next(self) -> Self {
         match self {
+            Self::Fibonacci => Self::Tabby,
+            Self::Tabby => Self::Grid,
             Self::Grid => Self::Horizontal,
-            Self::Horizontal => Self::Tabby,
-            Self::Tabby => Self::Fibonacci,
-            Self::Fibonacci => Self::Grid,
+            Self::Horizontal => Self::Fibonacci,
         }
     }
 
@@ -3314,7 +3314,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Space l",
-                description: "cycle grid / horizontal / tabby / fibonacci layout",
+                description: "cycle fibonacci / tabby / grid / horizontal layout",
             },
             HelpEntry {
                 key: "Ctrl-1 … Ctrl-9",

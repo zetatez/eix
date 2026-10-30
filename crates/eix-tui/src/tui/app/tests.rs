@@ -152,7 +152,7 @@ fn explicit_session_ignores_saved_restore_state() {
         focused: Some("saved".into()),
         layout: WorkspaceLayout::Horizontal,
     });
-    assert_eq!(app.layout, PaneLayout::Grid);
+    assert_eq!(app.layout, PaneLayout::Fibonacci);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let sessions = vec![
         Session::new("explicit", "explicit", cwd.clone()),
@@ -682,6 +682,30 @@ fn ctrl_digits_switch_tabby_tabs_in_insert_mode() {
 }
 
 #[test]
+fn layout_cycle_walks_fibonacci_tabby_grid_horizontal() {
+    let mut layout = PaneLayout::Fibonacci;
+    let mut seen = Vec::new();
+    for _ in 0..4 {
+        layout = layout.next();
+        seen.push(layout);
+    }
+    assert_eq!(
+        seen,
+        vec![
+            PaneLayout::Tabby,
+            PaneLayout::Grid,
+            PaneLayout::Horizontal,
+            PaneLayout::Fibonacci,
+        ]
+    );
+}
+
+#[test]
+fn new_apps_start_in_the_fibonacci_layout() {
+    assert_eq!(App::new(None).layout, PaneLayout::Fibonacci);
+}
+
+#[test]
 fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["a", "b", "c"]);
@@ -698,7 +722,7 @@ fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
         ('v', PaneLayout::Horizontal),
         ('t', PaneLayout::Tabby),
         ('r', PaneLayout::Fibonacci),
-        ('l', PaneLayout::Grid),
+        ('l', PaneLayout::Tabby),
     ] {
         app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
         app.handle_key(
@@ -710,13 +734,13 @@ fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
         assert_eq!(toast.text, format!("layout: {}", expected.label()));
         assert_eq!(toast.tone, ToastTone::Success);
     }
-    assert_eq!(app.status, "layout: grid");
+    assert_eq!(app.status, "layout: tabby");
     let rendered = render_text(&mut app, 80, 20);
     assert!(
         rendered
             .lines()
             .nth(1)
-            .is_some_and(|line| line.contains("layout: grid")),
+            .is_some_and(|line| line.contains("layout: tabby")),
         "{rendered}"
     );
 }
@@ -4582,7 +4606,7 @@ fn help_key_descriptions_align() {
     };
     assert_eq!(
         column(long, "horizontal"),
-        column(short, "cycle grid"),
+        column(short, "cycle fibonacci"),
         "{text}"
     );
 }
