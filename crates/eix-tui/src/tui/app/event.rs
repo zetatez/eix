@@ -172,6 +172,11 @@ impl App {
                     }
                 }
                 if let Some((line, column)) = clicked {
+                    if let Some(url) = self.views[index].link_at(line, column).map(str::to_string) {
+                        self.views[index].selection = None;
+                        self.open_link(&url);
+                        return;
+                    }
                     let parent_link = self.views[index]
                         .text_lines
                         .get(line)
@@ -228,6 +233,48 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Open a transcript link with the desktop handler. Only the schemes
+    /// accepted by [`is_openable_url`] reach the opener, and the URL is passed
+    /// as a single argument so it can never be interpreted as shell syntax.
+    /// Spawn failures surface as a warning toast; a detached waiter reaps the
+    /// opener without blocking the UI.
+    fn open_link(&mut self, url: &str) {
+        let url = url.trim();
+        if !is_openable_url(url) {
+            return;
+        }
+        let mut command = if cfg!(target_os = "macos") {
+            let mut command = std::process::Command::new("open");
+            command.arg(url);
+            command
+        } else if cfg!(target_os = "windows") {
+            let mut command = std::process::Command::new("cmd");
+            command.args(["/C", "start", "", url]);
+            command
+        } else {
+            let mut command = std::process::Command::new("xdg-open");
+            command.arg(url);
+            command
+        };
+        match command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+        {
+            Ok(mut child) => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
+            Err(err) => self.push_toast(
+                format!("cannot open link: {err}"),
+                ToastTone::Warning,
+                WARNING_TOAST_DISPLAY,
+            ),
         }
     }
 

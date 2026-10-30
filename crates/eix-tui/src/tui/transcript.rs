@@ -163,6 +163,8 @@ pub struct Transcript {
     pub math_pending: Vec<math_image::Pending>,
     /// Line -> LaTeX source, so copying a rendered formula yields the source.
     pub copy: Vec<(usize, String)>,
+    /// Clickable link ranges, in final transcript coordinates.
+    pub links: Vec<markdown::LinkSpan>,
 }
 
 /// Fold target for a line: which block, and whether it is currently open.
@@ -270,6 +272,7 @@ pub fn render_events(
     let mut math = Vec::new();
     let mut math_pending = Vec::new();
     let mut copy = Vec::new();
+    let mut links = Vec::new();
     for collected in blocks {
         let piece = render_block(
             &collected.block,
@@ -287,6 +290,7 @@ pub fn render_events(
             &mut math,
             &mut math_pending,
             &mut copy,
+            &mut links,
             piece,
         );
     }
@@ -297,6 +301,7 @@ pub fn render_events(
         math,
         math_pending,
         copy,
+        links,
     }
 }
 
@@ -336,6 +341,7 @@ pub fn render_tail(
         math: Vec::new(),
         math_pending: Vec::new(),
         copy: Vec::new(),
+        links: Vec::new(),
     };
     append_tail(&mut out, live, queued, folds, width, theme, tick, base);
     out
@@ -439,6 +445,7 @@ fn append_piece_parts(
     math: &mut Vec<math_image::Placement>,
     math_pending: &mut Vec<math_image::Pending>,
     copy: &mut Vec<(usize, String)>,
+    links: &mut Vec<markdown::LinkSpan>,
     piece: Transcript,
 ) {
     let skip = usize::from(
@@ -471,6 +478,13 @@ fn append_piece_parts(
         }
         copy.push((base + line - skip, source));
     }
+    for mut link in piece.links {
+        if link.line < skip {
+            continue;
+        }
+        link.line = base + link.line - skip;
+        links.push(link);
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +495,7 @@ fn append_piece(dst: &mut Transcript, piece: Transcript) {
     let mut math = std::mem::take(&mut dst.math);
     let mut math_pending = std::mem::take(&mut dst.math_pending);
     let mut copy = std::mem::take(&mut dst.copy);
+    let mut links = std::mem::take(&mut dst.links);
     append_piece_parts(
         &mut lines,
         &mut slots,
@@ -488,6 +503,7 @@ fn append_piece(dst: &mut Transcript, piece: Transcript) {
         &mut math,
         &mut math_pending,
         &mut copy,
+        &mut links,
         piece,
     );
     dst.lines = lines;
@@ -496,6 +512,7 @@ fn append_piece(dst: &mut Transcript, piece: Transcript) {
     dst.math = math;
     dst.math_pending = math_pending;
     dst.copy = copy;
+    dst.links = links;
 }
 
 /// Identity of a block's rendered output. `rev` changes whenever the block's
@@ -563,6 +580,7 @@ pub struct HistoryCache {
     pub math: Vec<math_image::Placement>,
     pub math_pending: Vec<math_image::Pending>,
     pub copy: Vec<(usize, String)>,
+    pub links: Vec<markdown::LinkSpan>,
     /// Bumped by the viewport when a pending formula became displayable, so
     /// the next render replaces its ASCII fallback with the image.
     math_rev: u64,
@@ -656,6 +674,7 @@ impl HistoryCache {
             self.math.retain(|placement| placement.line < cut);
             self.math_pending.retain(|pending| pending.line < cut);
             self.copy.retain(|(line, _)| *line < cut);
+            self.links.retain(|link| link.line < cut);
             self.keys.truncate(common);
             self.starts.truncate(common);
         }
@@ -670,6 +689,7 @@ impl HistoryCache {
                 &mut self.math,
                 &mut self.math_pending,
                 &mut self.copy,
+                &mut self.links,
                 piece,
             );
         }
@@ -1042,6 +1062,7 @@ impl Transcript {
             math: Vec::new(),
             math_pending: Vec::new(),
             copy: Vec::new(),
+            links: Vec::new(),
         }
     }
 
@@ -1069,6 +1090,12 @@ impl Transcript {
         for (line, source) in rendered.sources {
             if line < len {
                 self.copy.push((base + line, source));
+            }
+        }
+        for mut link in rendered.links {
+            if link.line < len {
+                link.line += base;
+                self.links.push(link);
             }
         }
     }
@@ -1156,6 +1183,7 @@ fn push_bubble(
     mut sources: Vec<(usize, String)>,
     mut placements: Vec<math_image::Placement>,
     mut pending: Vec<math_image::Pending>,
+    mut links: Vec<markdown::LinkSpan>,
     width: usize,
     theme: Theme,
 ) {
@@ -1233,11 +1261,18 @@ fn push_bubble(
 
     // The top border occupies one line; content starts below it. The bubble
     // adds `body_pad`, the left border and its inner padding before content.
+    let left = body_pad + 1 + BUBBLE_PAD;
     sources.retain(|(line, _)| *line >= removed);
     for (line, source) in sources {
         out.copy.push((base + 1 + line - removed, source));
     }
-    let left = body_pad + 1 + BUBBLE_PAD;
+    links.retain(|link| link.line >= removed);
+    for mut link in links {
+        link.line = base + 1 + link.line - removed;
+        link.start += left;
+        link.end += left;
+        out.links.push(link);
+    }
     placements.retain(|placement| placement.line >= removed);
     for mut placement in placements {
         placement.line = base + 1 + placement.line - removed;
@@ -1276,6 +1311,7 @@ fn user_message(
     let image_lines = content.len();
     let mut sources = Vec::new();
     let mut math_pending = Vec::new();
+    let mut links = Vec::new();
     let text = text.trim_end();
     if !text.is_empty() {
         // The bubble supplies its own horizontal padding, so render without
@@ -1304,6 +1340,10 @@ fn user_message(
             pending.line += image_lines;
             pending
         }));
+        links.extend(rendered.links.into_iter().map(|mut link| {
+            link.line += image_lines;
+            link
+        }));
     }
     push_bubble(
         out,
@@ -1311,6 +1351,7 @@ fn user_message(
         sources,
         placements,
         math_pending,
+        links,
         width,
         theme,
     );
@@ -2715,6 +2756,7 @@ mod tests {
             Vec::new(),
             vec![placement],
             Vec::new(),
+            Vec::new(),
             40,
             Theme::default(),
         );
@@ -2722,6 +2764,32 @@ mod tests {
         // The top border occupies line 0; both placeholder rows survive.
         assert_eq!(placement.line, 1);
         assert_eq!(placement.column, 36);
+    }
+
+    #[test]
+    fn bubble_shifts_links_into_the_box() {
+        let mut out = Transcript::new();
+        let content = vec![Line::from("text")];
+        let link = markdown::LinkSpan {
+            line: 0,
+            start: 0,
+            end: 4,
+            url: "https://e.com".to_string(),
+        };
+        push_bubble(
+            &mut out,
+            content,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![link],
+            40,
+            Theme::default(),
+        );
+        let link = out.links.first().expect("link");
+        // Top border at line 0; the box's left padding precedes the content.
+        assert_eq!(link.line, 1);
+        assert_eq!((link.start, link.end), (34, 38));
     }
 
     #[test]
@@ -2738,6 +2806,7 @@ mod tests {
             content,
             Vec::new(),
             vec![placement],
+            Vec::new(),
             Vec::new(),
             40,
             Theme::default(),

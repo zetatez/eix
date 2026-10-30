@@ -65,6 +65,18 @@ pub(crate) struct Rendered {
     pub pending: Vec<math_image::Pending>,
     /// `(line index, LaTeX source)`.
     pub sources: Vec<(usize, String)>,
+    /// Clickable link ranges, already mapped to final wrapped lines.
+    pub links: Vec<LinkSpan>,
+}
+
+/// A link's visible cells on one rendered line. A link that wraps produces
+/// one span per line so the click handler only needs a line lookup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LinkSpan {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+    pub url: String,
 }
 
 /// `images` is false for callers that discard the metadata (for example the
@@ -119,6 +131,9 @@ struct Renderer {
     table: Option<TableState>,
     cell: Option<String>,
     caps: Vec<Capture>,
+    /// Destinations of clickable links, in the order their start markers were
+    /// emitted into `inline`. `finish` consumes them while stripping markers.
+    link_dests: Vec<String>,
 }
 
 struct ListState {
@@ -134,6 +149,10 @@ struct ItemState {
 
 /// Zero-width prefix that makes an inline-image span atomic while wrapping.
 const INLINE_IMAGE_MARK: char = '\u{200B}';
+/// Zero-width delimiters around clickable link text. They survive wrapping
+/// with their label, so `finish` can map each link to final line columns.
+const LINK_START: char = '\u{200C}';
+const LINK_END: char = '\u{200D}';
 
 struct CodeState {
     buffer: String,
@@ -182,6 +201,7 @@ impl Renderer {
             table: None,
             cell: None,
             caps: Vec::new(),
+            link_dests: Vec::new(),
         };
         renderer.style = renderer.base_style();
         renderer
@@ -348,12 +368,18 @@ impl Renderer {
             Tag::Strikethrough => self.push_style(Modifier::CROSSED_OUT),
             Tag::Superscript | Tag::Subscript => self.push_style(Modifier::BOLD),
             Tag::Link { dest_url, .. } => {
+                let clickable =
+                    self.cell.is_none() && !dest_url.is_empty() && !dest_url.starts_with('#');
                 if self.cell.is_none() {
                     self.style_stack.push(self.style);
                     self.style = self
                         .style
                         .fg(accent(self.theme))
                         .add_modifier(Modifier::UNDERLINED);
+                }
+                if clickable {
+                    self.link_dests.push(dest_url.to_string());
+                    self.inline.push(Span::raw(LINK_START.to_string()));
                 }
                 self.caps.push(Capture {
                     dest: dest_url.to_string(),
@@ -447,6 +473,9 @@ impl Renderer {
                     let label = cap.label.trim();
                     if !cap.dest.is_empty() && label != cap.dest && !cap.dest.starts_with('#') {
                         self.append_styled(&format!(" ({})", cap.dest), dim(self.theme));
+                    }
+                    if !cap.in_cell && !cap.dest.is_empty() && !cap.dest.starts_with('#') {
+                        self.inline.push(Span::raw(LINK_END.to_string()));
                     }
                 }
             }
@@ -1097,13 +1126,71 @@ impl Renderer {
         self.placements.retain(|placement| placement.line < len);
         self.pending.retain(|pending| pending.line < len);
         self.sources.retain(|(line, _)| *line < len);
+        let links = extract_links(&mut self.lines, &self.link_dests);
         Rendered {
             lines: self.lines,
             images: self.placements,
             pending: self.pending,
             sources: self.sources,
+            links,
         }
     }
+}
+
+/// Strip the link markers from every line and return their clickable ranges.
+/// A link that wrapped contributes one range per line; the destination queue
+/// matches the start markers in emission order.
+fn extract_links(lines: &mut [Line<'static>], dests: &[String]) -> Vec<LinkSpan> {
+    let mut links = Vec::new();
+    let mut open: Option<(usize, String)> = None;
+    let mut dests = dests.iter();
+    for (line_no, line) in lines.iter_mut().enumerate() {
+        let mut column = 0usize;
+        for span in &mut line.spans {
+            let text = span.content.as_ref();
+            if !text.contains(LINK_START) && !text.contains(LINK_END) {
+                column += UnicodeWidthStr::width(text);
+                continue;
+            }
+            let mut clean = String::with_capacity(text.len());
+            for ch in text.chars() {
+                if ch == LINK_START {
+                    let url = dests.next().cloned().unwrap_or_default();
+                    if !url.is_empty() {
+                        open = Some((column, url));
+                    }
+                } else if ch == LINK_END {
+                    if let Some((start, url)) = open.take() {
+                        if column > start {
+                            links.push(LinkSpan {
+                                line: line_no,
+                                start,
+                                end: column,
+                                url,
+                            });
+                        }
+                    }
+                } else {
+                    clean.push(ch);
+                    column += UnicodeWidthChar::width(ch).unwrap_or(0);
+                }
+            }
+            span.content = std::borrow::Cow::Owned(clean);
+        }
+        // A wrapped link continues at the next line's first cell.
+        if let Some((start, url)) = open.take() {
+            if column > start {
+                links.push(LinkSpan {
+                    line: line_no,
+                    start,
+                    end: column,
+                    url: url.clone(),
+                });
+            }
+            open = Some((0, url));
+        }
+    }
+    links
 }
 
 // ----- wrapping -----------------------------------------------------------
@@ -1627,6 +1714,82 @@ mod tests {
         ));
         assert!(output.contains("the docs (https://example.com/docs)"));
         assert!(output.contains("🖼 diagram (img/flow.png)"));
+    }
+
+    #[test]
+    fn records_clickable_links_with_display_columns() {
+        let rendered = render_with_indent_detailed(
+            "See [the docs](https://example.com/docs) now",
+            80,
+            Theme::default(),
+            "",
+            false,
+            None,
+        );
+        let output = text(&rendered.lines);
+        assert!(
+            !output.contains(LINK_START) && !output.contains(LINK_END),
+            "{output}"
+        );
+        let link = rendered.links.first().expect("clickable link");
+        assert_eq!(link.line, 0);
+        assert_eq!(link.url, "https://example.com/docs");
+        assert_eq!(link.start, 4, "label starts after 'See '");
+        assert!(link.end > link.start + 8, "target suffix stays clickable");
+        assert_eq!(
+            rendered.lines[0]
+                .spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "See the docs (https://example.com/docs) now"
+        );
+    }
+
+    #[test]
+    fn wrapped_links_span_each_line() {
+        let rendered = render_with_indent_detailed(
+            "Read [the long documentation page](https://example.com/very/long) now",
+            24,
+            Theme::default(),
+            "",
+            false,
+            None,
+        );
+        assert!(
+            rendered.links.len() > 1,
+            "link should wrap: {:?}",
+            rendered.links
+        );
+        assert!(rendered
+            .links
+            .iter()
+            .all(|link| link.url == "https://example.com/very/long"));
+        assert!(
+            rendered
+                .links
+                .windows(2)
+                .all(|pair| pair[1].line > pair[0].line),
+            "one span per wrapped line: {:?}",
+            rendered.links
+        );
+        for link in &rendered.links {
+            assert!(link.start < link.end, "empty span: {link:?}");
+        }
+    }
+
+    #[test]
+    fn anchors_and_table_links_are_not_clickable() {
+        let rendered = render_with_indent_detailed(
+            "[jump](#section)\n\n| link |\n| - |\n| [docs](https://example.com) |",
+            60,
+            Theme::default(),
+            "",
+            false,
+            None,
+        );
+        assert!(rendered.links.is_empty(), "{:?}", rendered.links);
+        assert!(text(&rendered.lines).contains("(https://example.com)"));
     }
 
     #[test]

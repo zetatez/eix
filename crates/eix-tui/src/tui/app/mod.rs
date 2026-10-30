@@ -34,6 +34,7 @@ use super::controller::{Command, Event};
 use super::diff::DiffRow;
 use super::editor::{Editor, Mode, Outcome};
 use super::keys::{KeyAction, Keybinds};
+use super::markdown;
 use super::math_image;
 use super::theme::Theme;
 use super::transcript::{self, FoldId, Subagent, SubagentStatus};
@@ -599,6 +600,8 @@ struct SessionView {
     /// Line -> LaTeX source for rendered display math, merged from the history
     /// cache and the live tail.
     copy_overrides: HashMap<usize, String>,
+    /// Clickable link ranges for the current transcript.
+    links: Vec<markdown::LinkSpan>,
     /// Stored user-message sequence -> first rendered line, for `/timeline`.
     user_lines: Vec<(u64, usize)>,
     /// Active mouse selection, if any.
@@ -636,6 +639,7 @@ impl SessionView {
             slots: Vec::new(),
             text_lines: Vec::new(),
             copy_overrides: HashMap::new(),
+            links: Vec::new(),
             user_lines: Vec::new(),
             selection: None,
             unread: false,
@@ -668,6 +672,7 @@ impl SessionView {
         self.slots.clear();
         self.text_lines.clear();
         self.copy_overrides.clear();
+        self.links.clear();
         self.user_lines.clear();
         self.selection = None;
         self.unread = false;
@@ -864,11 +869,13 @@ impl SessionView {
         }
         let mut lines = Vec::with_capacity(self.line_count);
         let mut copy = HashMap::new();
+        let mut links = Vec::new();
         let mut history_len = 0;
         if let Some(cache) = self.history_cache.as_ref() {
             history_len = cache.lines.len();
             lines.extend(cache.lines.iter().map(text_line));
             copy.extend(cache.copy.iter().cloned());
+            links.extend(cache.links.iter().cloned());
         }
         lines.extend(self.tail.lines.iter().map(text_line));
         copy.extend(
@@ -877,9 +884,27 @@ impl SessionView {
                 .iter()
                 .map(|(line, source)| (history_len + line, source.clone())),
         );
+        links.extend(self.tail.links.iter().cloned().map(|mut link| {
+            link.line += history_len;
+            link
+        }));
         self.text_lines = lines;
         self.copy_overrides = copy;
+        self.links = links;
         self.text_lines_valid = true;
+    }
+
+    /// The first clickable link covering `column` on `line`, if any.
+    fn link_at(&self, line: usize, column: usize) -> Option<&str> {
+        self.links
+            .iter()
+            .find(|link| {
+                link.line == line
+                    && column >= link.start
+                    && column < link.end
+                    && is_openable_url(&link.url)
+            })
+            .map(|link| link.url.as_str())
     }
 
     /// Child agents in a stable order for the picker. Sorting by name keeps
@@ -3445,6 +3470,18 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 key: "ask_user",
                 description: "approval/question cards use - [ ] / - [x] rows; the first option is recommended.",
             },
+            HelpEntry {
+                key: "links",
+                description: "click http(s), mailto and file links in a transcript to open them; relative links and anchors stay inert",
+            },
+            HelpEntry {
+                key: "images",
+                description: "attachments, remote images and provider images render on Kitty/Sixel/iTerm2 terminals; otherwise a text placeholder remains",
+            },
+            HelpEntry {
+                key: "mouse",
+                description: "click a block header to fold; drag to select and copy; the wheel scrolls the pane under the pointer",
+            },
         ],
     },
 ];
@@ -4514,6 +4551,15 @@ fn parent_link_line(theme: Theme) -> Line<'static> {
 /// Whether a transcript line is the clickable parent link.
 fn is_parent_link(text: &str) -> bool {
     text.trim_start().starts_with("← parent agent")
+}
+
+/// Schemes a click may hand to the desktop opener. Relative paths and any
+/// other scheme stay inert so a rendered document cannot launch commands.
+fn is_openable_url(url: &str) -> bool {
+    let url = url.trim().to_ascii_lowercase();
+    ["http://", "https://", "mailto:", "file://"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
 }
 
 /// Picker marker column before the session id: `⑂` for worktrees.

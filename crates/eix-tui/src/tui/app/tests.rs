@@ -10127,3 +10127,44 @@ fn fork_picker_needs_a_user_message() {
         .iter()
         .any(|command| matches!(command, Command::Fork { .. })));
 }
+
+#[test]
+fn transcript_links_are_clickable_only_for_openable_schemes() {
+    let events = vec![SessionEvent::new(
+        "s1",
+        1,
+        EventKind::AssistantMessage,
+        serde_json::json!({
+            "text": "See [docs](https://example.com/x) and [rel](notes.md).",
+            "model": "test"
+        }),
+    )];
+    let mut view = SessionView::new(Session::new("s1", "links", "/tmp"), events);
+    view.ensure_history(60, Theme::default());
+    view.ensure_text_lines();
+
+    let link = view.links.first().cloned().expect("web link");
+    assert_eq!(link.url, "https://example.com/x");
+    assert!(view.link_at(link.line, link.start).is_some());
+    assert!(view
+        .link_at(link.line, link.start.saturating_sub(1))
+        .is_none());
+    // Relative links stay visible but never reach the desktop opener.
+    let relative = view
+        .links
+        .iter()
+        .find(|link| link.url == "notes.md")
+        .expect("relative link span");
+    assert!(view.link_at(relative.line, relative.start).is_none());
+}
+
+#[test]
+fn openable_urls_reject_non_navigation_schemes() {
+    assert!(is_openable_url("https://example.com"));
+    assert!(is_openable_url("HTTP://example.com"));
+    assert!(is_openable_url("mailto:dev@example.com"));
+    assert!(is_openable_url("file:///tmp/a.txt"));
+    assert!(!is_openable_url("javascript:alert(1)"));
+    assert!(!is_openable_url("notes.md"));
+    assert!(!is_openable_url("#section"));
+}
