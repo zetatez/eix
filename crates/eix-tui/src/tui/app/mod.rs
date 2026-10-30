@@ -2010,8 +2010,6 @@ const HORIZONTAL_TAIL_PANES: usize = 4;
 /// How open sessions are arranged in the body.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PaneLayout {
-    /// The original automatic tiling.
-    Grid,
     /// One column of panes; the first pane gets most of the height and the
     /// following panes compact when the terminal is short.
     Horizontal,
@@ -2024,7 +2022,6 @@ enum PaneLayout {
 impl PaneLayout {
     fn label(self) -> &'static str {
         match self {
-            Self::Grid => "grid",
             Self::Horizontal => "horizontal",
             Self::Tabby => "tabby",
             Self::Fibonacci => "fibonacci",
@@ -2034,15 +2031,13 @@ impl PaneLayout {
     fn next(self) -> Self {
         match self {
             Self::Fibonacci => Self::Tabby,
-            Self::Tabby => Self::Grid,
-            Self::Grid => Self::Horizontal,
+            Self::Tabby => Self::Horizontal,
             Self::Horizontal => Self::Fibonacci,
         }
     }
 
     fn workspace_layout(self) -> WorkspaceLayout {
         match self {
-            Self::Grid => WorkspaceLayout::Grid,
             Self::Horizontal => WorkspaceLayout::Horizontal,
             Self::Tabby => WorkspaceLayout::Tabby,
             Self::Fibonacci => WorkspaceLayout::Fibonacci,
@@ -2051,7 +2046,6 @@ impl PaneLayout {
 
     fn from_workspace_layout(layout: WorkspaceLayout) -> Self {
         match layout {
-            WorkspaceLayout::Grid => Self::Grid,
             WorkspaceLayout::Horizontal => Self::Horizontal,
             WorkspaceLayout::Tabby => Self::Tabby,
             WorkspaceLayout::Fibonacci => Self::Fibonacci,
@@ -3314,7 +3308,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "Space l",
-                description: "cycle fibonacci / tabby / grid / horizontal layout",
+                description: "cycle fibonacci / tabby / horizontal layout",
             },
             HelpEntry {
                 key: "Ctrl-1 … Ctrl-9",
@@ -3734,7 +3728,6 @@ fn pane_borders(areas: &[Rect], index: usize) -> Borders {
 
 fn layout_pane_rects(layout: PaneLayout, area: Rect, count: usize) -> Vec<Rect> {
     match layout {
-        PaneLayout::Grid => pane_rects(area, count),
         PaneLayout::Horizontal => horizontal_pane_rects(area, count),
         PaneLayout::Fibonacci => fibonacci_pane_rects(area, count),
         PaneLayout::Tabby => vec![area],
@@ -3813,51 +3806,6 @@ fn fibonacci_pane_rects(area: Rect, count: usize) -> Vec<Rect> {
         }
     }
     rects
-}
-
-fn pane_rects(area: Rect, count: usize) -> Vec<Rect> {
-    match count {
-        0 => Vec::new(),
-        1 => vec![area],
-        2 => Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-            .split(area)
-            .to_vec(),
-        3 => {
-            let columns =
-                Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                    .split(area);
-            let right = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(columns[1]);
-            vec![columns[0], right[0], right[1]]
-        }
-        4 => {
-            let rows = Layout::vertical([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .split(area);
-            let mut rects = Vec::with_capacity(4);
-            for row in rows.iter() {
-                let columns =
-                    Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                        .split(*row);
-                rects.extend(columns.iter().copied());
-            }
-            rects
-        }
-        n => {
-            let columns = (n as f64).sqrt().ceil() as usize;
-            let rows = n.div_ceil(columns);
-            let row_rects =
-                Layout::vertical(vec![Constraint::Ratio(1, rows as u32); rows]).split(area);
-            let mut rects = Vec::with_capacity(n);
-            for row in row_rects.iter() {
-                let col_rects =
-                    Layout::horizontal(vec![Constraint::Ratio(1, columns as u32); columns])
-                        .split(*row);
-                rects.extend(col_rects.iter().copied());
-            }
-            rects.truncate(n);
-            rects
-        }
-    }
 }
 
 /// Line index where each hunk starts in the review body.

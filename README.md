@@ -27,7 +27,7 @@ daemon 中维护；TUI、`eix chat`、`eix send` 和 HTTP SDK 只是可替换的
 | 领域 | 能力 |
 | --- | --- |
 | Session | 事件日志 + SQLite 持久化、自动命名、attach/detach、fork / branch / rewind、rewind/redo（对话 + 工作区文件）、export/import |
-| TUI | 多 pane 自动平铺、四种布局、统一 fuzzy picker、Markdown 转录、side-by-side diff、审批收件箱 |
+| TUI | 多 pane 自动平铺、三种布局、统一 fuzzy picker、Markdown 转录、side-by-side diff、审批收件箱 |
 | 输入 | 内置 Vim 风格编辑器（normal / insert / visual）、leader 键、可配置快捷键、命令面板 |
 | 执行模式 | `plan` 只读、`build` 工作区写入、`auto` 意图分类、`full` 放行 |
 | 安全 | 风险分析、显式规则、bubblewrap 沙箱、补丁审批 + 执行前快照、secret 占位符 |

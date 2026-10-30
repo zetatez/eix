@@ -191,7 +191,7 @@ fn startup_creates_a_session_when_the_launch_directory_has_none() {
 #[test]
 fn adjacent_panes_share_one_border() {
     let area = Rect::new(0, 0, 100, 40);
-    let two = pane_rects(area, 2);
+    let two = layout_pane_rects(PaneLayout::Fibonacci, area, 2);
     assert!(pane_borders(&two, 0).contains(Borders::RIGHT));
     assert!(!pane_borders(&two, 1).contains(Borders::LEFT));
 
@@ -399,30 +399,6 @@ fn focused_pane_border_uses_the_accent_color() {
         "inactive pane border should stay muted"
     );
     assert_eq!(inactive.symbol(), "│");
-}
-
-#[test]
-fn pane_layouts_stay_inside_the_area() {
-    let area = Rect::new(0, 0, 100, 40);
-    for count in 1..=6 {
-        let rects = pane_rects(area, count);
-        assert_eq!(rects.len(), count);
-        for rect in rects {
-            assert!(rect.x >= area.x);
-            assert!(rect.y >= area.y);
-            assert!(rect.x + rect.width <= area.x + area.width);
-            assert!(rect.y + rect.height <= area.y + area.height);
-        }
-    }
-
-    let two = pane_rects(area, 2);
-    assert!(two[0].x < two[1].x);
-    assert_eq!(two[0].height, area.height);
-
-    let three = pane_rects(area, 3);
-    assert_eq!(three[0].height, area.height);
-    assert_eq!(three[1].x, three[2].x);
-    assert_eq!(three[1].width, three[2].width);
 }
 
 #[test]
@@ -682,10 +658,10 @@ fn ctrl_digits_switch_tabby_tabs_in_insert_mode() {
 }
 
 #[test]
-fn layout_cycle_walks_fibonacci_tabby_grid_horizontal() {
+fn layout_cycle_walks_fibonacci_tabby_horizontal() {
     let mut layout = PaneLayout::Fibonacci;
     let mut seen = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..3 {
         layout = layout.next();
         seen.push(layout);
     }
@@ -693,7 +669,6 @@ fn layout_cycle_walks_fibonacci_tabby_grid_horizontal() {
         seen,
         vec![
             PaneLayout::Tabby,
-            PaneLayout::Grid,
             PaneLayout::Horizontal,
             PaneLayout::Fibonacci,
         ]
@@ -748,7 +723,6 @@ fn ctrl_digits_and_leader_letters_switch_panes_and_layouts() {
 #[test]
 fn every_layout_renders_a_three_pane_session_set() {
     for layout in [
-        PaneLayout::Grid,
         PaneLayout::Horizontal,
         PaneLayout::Tabby,
         PaneLayout::Fibonacci,
@@ -877,7 +851,7 @@ fn leaving_tabby_layout_clears_tab_hit_boxes() {
     let _ = render_text(&mut app, 80, 20);
     assert!(!app.tab_areas.is_empty());
 
-    app.layout = PaneLayout::Grid;
+    app.layout = PaneLayout::Fibonacci;
     let _ = render_text(&mut app, 80, 20);
     assert!(app.tab_areas.is_empty());
 }
@@ -1007,7 +981,7 @@ fn an_unread_tab_uses_the_success_colour_and_a_dot() {
 #[test]
 fn an_unread_pane_title_uses_the_success_colour_and_a_dot() {
     let mut app = app_with_panes(&["a", "b"]);
-    app.layout = PaneLayout::Grid;
+    app.layout = PaneLayout::Fibonacci;
     app.focused = 0;
     app.views[1].unread = true;
 
@@ -9103,7 +9077,6 @@ fn status_feedback_uses_top_right_toasts() {
         "retrying 2/5",
         "model: loading provider catalogs…",
         "approvals · Enter opens · y/n answer · Esc closes",
-        "layout: grid",
         "mode: full",
         "pane closed",
         "no tasks",
@@ -9213,7 +9186,6 @@ fn warning_status_filter_is_narrow() {
         "rate limited · retrying 1/5 in 4.0s",
         "model: loading provider catalogs…",
         "approvals · Enter opens · y/n answer · Esc closes",
-        "layout: grid",
         "mode → Build",
         "pane closed",
         "session created",

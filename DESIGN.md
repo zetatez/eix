@@ -91,8 +91,8 @@ statusline 左侧对 idle / running 只显示图标：idle 为静态 `⠶`，run
 - TUI 按启动目录把仍打开的 pane 记录在 `<data_dir>/workspaces.json`：`Ctrl-C` / `Ctrl-D` /
   `Z` / `/quit` / `/exit` 退出时保存 pane 顺序、焦点与 layout，下次启动依次重新 attach；
   `:q` / `:qa` / `:wq` / `:x` 或最后一个 pane 的 `/close` 退出时清除记录。记录为空或 session
-  已失效时，回退到该目录最近更新的 user session；旧记录缺少 layout 时按 fibonacci 处理。显式
-  session 参数忽略保存的 pane、焦点与 layout。
+  已失效时，回退到该目录最近更新的 user session；旧记录缺少 layout（或仍写着已删除的
+  `grid`）时按 fibonacci 处理。显式 session 参数忽略保存的 pane、焦点与 layout。
 - 同一 session 可被多 client 观察，但**只有一个输入所有者（controller）**。
 - 所有者断开 → 自动转移给最早的 watcher；显式抢占用 `<leader>a C`（claim）。
 - draft 由 daemon 持有，client 只是视图；所有权切换时重新加载 draft。
@@ -287,11 +287,11 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 ## 6. 布局与焦点
 
 - pane 树：水平/垂直分割，每个 leaf 显示一个 session 的转录。
-- 布局模式：`grid`（自动平铺）、`horizontal`（单列，第一个 pane 固定占 55% 高度；pane 超过 5 个
+- 布局模式：`horizontal`（单列，第一个 pane 固定占 55% 高度；pane 超过 5 个
   时只渲染第一个 pane + 后续 4 个，其余隐藏，焦点移入隐藏 pane 时窗口滑动；空间不足时压缩为
   标题行/单行内容，不退回 tabby）、`tabby`（输入框
   上方显示 tab，只渲染当前 session）、`fibonacci`（默认；左/上/右/下循环切分的螺旋分屏，不显示 tab）。用 leader
-  `<Space>v/t/r` 切换，`<Space>l` 按 fibonacci → tabby → grid → horizontal 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session，
+  `<Space>v/t/r` 切换，`<Space>l` 按 fibonacci → tabby → horizontal 循环；`Ctrl-1` … `Ctrl-9` 聚焦第 N 个已打开 session，
   在 `tabby` 下即切换到第 N 个 tab。TUI 启动时请求 kitty 键盘协议（CSI-u），否则传统终端
   会把 `Ctrl-2`/`Ctrl-3` 等编码成 NUL/Esc；不支持该协议时用 `<` / `>` 或
   `Ctrl-W Ctrl-W` 移动焦点。
@@ -336,7 +336,7 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `<C-/>` / `<C-_>` / `<C-7>` | 任意模式：模型 picker |
 | `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab；需 kitty 键盘协议；`Ctrl-7` 通常留给模型 picker） |
 | `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
-| `<Space>l` | 循环 fibonacci → tabby → grid → horizontal |
+| `<Space>l` | 循环 fibonacci → tabby → horizontal |
 | `q` / `<Space>c` | 转录区 / 输入框 normal：关闭当前 pane（最后一个 pane 保持打开） |
 | `<Space>a` | 跨 session 审批收件箱 |
 | `<` / `>` | 转录区 / 输入框 normal：上一个 / 下一个 pane |

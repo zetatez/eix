@@ -16,10 +16,10 @@ const FILE_NAME: &str = "workspaces.json";
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WorkspaceLayout {
-    Grid,
     Horizontal,
     Tabby,
     #[default]
+    #[serde(alias = "grid")]
     Fibonacci,
 }
 
@@ -172,12 +172,19 @@ mod tests {
     }
 
     #[test]
+    fn legacy_grid_layout_loads_as_fibonacci() {
+        let active: ActiveWorkspace =
+            serde_json::from_str(r#"{"sessions":["s1"],"layout":"grid"}"#).unwrap();
+        assert_eq!(active.layout, WorkspaceLayout::Fibonacci);
+    }
+
+    #[test]
     fn clearing_removes_only_that_workspace() {
         let data = temp_dir();
         let first = ActiveWorkspace {
             sessions: vec!["s1".into()],
             focused: Some("s1".into()),
-            layout: WorkspaceLayout::Grid,
+            layout: WorkspaceLayout::Fibonacci,
         };
         let second = ActiveWorkspace {
             sessions: vec!["s2".into()],
