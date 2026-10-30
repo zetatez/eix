@@ -281,10 +281,10 @@ fn default_bindings() -> Vec<Binding> {
         (KeyAction::Sessions, "o"),
         (KeyAction::Files, "f"),
         (KeyAction::Grep, "s"),
-        (KeyAction::Subagents, "i"),
+        (KeyAction::Subagents, "p"),
         (KeyAction::Git, "g"),
         (KeyAction::Timeline, "h"),
-        (KeyAction::Processes, "p"),
+        (KeyAction::Processes, "b"),
         (KeyAction::Inbox, "a"),
         (KeyAction::Cancel, "x"),
         (KeyAction::ClosePane, "c"),
@@ -554,8 +554,13 @@ mod tests {
             Some(KeyAction::Grep)
         );
         assert_eq!(
-            binds.leader_action(key(KeyCode::Char('i'), KeyModifiers::NONE)),
+            binds.leader_action(key(KeyCode::Char('p'), KeyModifiers::NONE)),
             Some(KeyAction::Subagents)
+        );
+        // Leader+i is free again.
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('i'), KeyModifiers::NONE)),
+            None
         );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('h'), KeyModifiers::NONE)),

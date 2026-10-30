@@ -1518,7 +1518,7 @@ impl App {
             if available {
                 self.pending_leader = true;
                 self.leader_status_backup = Some(std::mem::take(&mut self.status));
-                self.status = "leader: f/g/s · i subagents · n new · o sessions · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
+                self.status = "leader: f/g/s · p subagents · n new · o sessions · v/t/r/l layout · a approvals · c close · m mode · Esc cancel"
                     .into();
             }
             return true;

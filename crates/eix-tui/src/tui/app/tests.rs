@@ -1557,14 +1557,14 @@ fn subagents_command_opens_the_live_child_picker() {
 }
 
 #[test]
-fn leader_i_opens_the_subagent_picker() {
+fn leader_p_opens_the_subagent_picker() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["parent"]);
     app.focus = Focus::Transcript;
 
     // Without children the shortcut falls back to the concurrency picker.
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
     assert_eq!(
         app.picker.as_ref().map(|picker| picker.kind),
         Some(PickerKind::Subagents)
@@ -1572,9 +1572,14 @@ fn leader_i_opens_the_subagent_picker() {
     assert!(!app.pending_leader);
     app.picker = None;
 
-    app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+    // Leader+i no longer opens the picker (it stays free for a future action).
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
     app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
+    assert!(app.picker.is_none());
+
+    app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
+    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
     assert_eq!(
         app.picker.as_ref().map(|picker| picker.kind),
         Some(PickerKind::SubagentActivity)
@@ -3419,7 +3424,7 @@ fn opening_processes_sends_a_list_request_and_closes_with_q() {
         Vec::new(),
     ));
     app.handle_transcript_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_transcript_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
+    app.handle_transcript_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &tx);
     assert!(app.process_view.is_some());
     assert!(rx.try_recv().is_ok());
 
@@ -5536,7 +5541,7 @@ fn transcript_pane_requires_leader_for_pane_actions_except_q() {
 
     app.picker = None;
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
+    app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE), &tx);
     assert!(app.process_view.is_some());
 
     // Ctrl-P opens the command palette from the transcript.
@@ -5826,7 +5831,7 @@ fn prompt_normal_mode_matches_transcript_for_tui_actions() {
         ],
         vec![
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),
-            KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
         ],
         vec![
             KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE),

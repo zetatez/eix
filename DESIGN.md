@@ -201,9 +201,9 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   `n` 新建 session 并开新 pane（当前 session 有 worktree 时复用）、`W` 当前 session 移入 worktree、
   `o` 打开 session picker（已打开的 session 直接聚焦其 pane，否则放进新 pane；只列普通/worktree
   session，不列子 agent）、`c` 关闭 pane、`f` 文件、
-  `s` 文件内容（类似 rg）、`i` subagents（有子 agent 时实时监控，否则并发上限）、
+  `s` 文件内容（类似 rg）、`p` subagents（有子 agent 时实时监控，否则并发上限）、
   `g` git（worktrees + branches）、`h` 用户输入 timeline、
-  `p` 进程、`a` 审批 inbox、`x` 取消、`m` 完整执行模式 picker、
+  `b` 进程、`a` 审批 inbox、`x` 取消、`m` 完整执行模式 picker、
   `v`/`t`/`r`/`l` 布局。单字母默认留给 vim；转录区裸
   `q` 关闭当前 pane（最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、
   `j/k`/`g/G` 等导航、`/`/`?`/`#` 当前对话搜索和 `Ctrl-P`。
@@ -473,14 +473,14 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     session 的预览会随选中项通过 `picker.preview` 拉取最近对话（you / assistant / tool / error）；
     session picker 只列普通 session 和 worktree session，`origin = agent` 的子 session 不进入列表，
     只能从父 transcript 的 subagent 卡片打开；child transcript 底部提供可点击的
-    `← parent agent`；`/subagents` 或 `<Space>i` 在父 session 有子 agent 时打开实时 subagent picker
+    `← parent agent`；`/subagents` 或 `<Space>p` 在父 session 有子 agent 时打开实时 subagent picker
     （按名字搜索，右侧预览 child 事件、工具调用/结果、流式 thinking 和 answer，`Enter` 在
     pane 中打开 child session），没有子 agent 时回退到并发上限 picker；worktree 标记 `⑂` 单独占一列，
     紧跟 session id 前；
     files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
     grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
   - 入口：`<Space>o`（sessions，已打开则聚焦，否则开新 pane）、`<Space>h`（timeline）、
-    `<Space>f`（files）、`<Space>s`（grep，文件内容）、`<Space>i`（subagents，实时活动）、`Ctrl-P`（commands，命令面板；转录区与输入框
+    `<Space>f`（files）、`<Space>s`（grep，文件内容）、`<Space>p`（subagents，实时活动）、`Ctrl-P`（commands，命令面板；转录区与输入框
     normal 模式都可用）、`<Space>g`（git，统一列出 worktrees 和 branches；没有 linked worktree 时
     省略仓库主路径）、prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
   - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`images`
@@ -930,7 +930,8 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `Ctrl-H` / `Ctrl-Backspace` 移到 `<Space>h`；git picker 从 `<Space>g` 移到 `<Space>G`。
 > 合并 session 入口（2026-10-30）：`<Space>g` 与 `<Space>o` 合为一个入口 `<Space>o`——已打开的
 > session 直接聚焦其 pane，未打开则开新 pane；git picker 回到 `<Space>g`，`<Space>G` 取消。
-> `/new` 成为 `/sessions` 的别名。
+> `/new` 成为 `/sessions` 的别名。同日后台进程从 `<Space>p` 移到 `<Space>b`，subagents 从
+> `<Space>i` 移到 `<Space>p`，`<Space>i` 释放。
 > 输入焦点（2026-10-18）：`Esc` 只在 insert/visual 下回到 normal 并保留焦点，500ms 内
 > 再按一次才回到转录；`<CR>` 只在 insert 提交；`<C-g>` 在任意模式打开 picker；
 > `Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 只在 insert 换行；`F1` 全局帮助；
@@ -1278,10 +1279,10 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 | `Space m` | 完整执行模式 picker |
 | `Space f` | 文件 picker |
 | `Space s` | 搜索文件内容并插入 `@path:line` |
-| `Space i` | subagents 实时 picker：有子 agent 时监控并搜索 child，否则打开并发上限 picker |
+| `Space p` | subagents 实时 picker：有子 agent 时监控并搜索 child，否则打开并发上限 picker |
 | `Space g` | git picker（worktrees + branches） |
 | `Space h` | 用户输入 timeline picker |
-| `Space p` | 后台进程列表 |
+| `Space b` | 后台进程列表 |
 | `Space v` | horizontal 布局 |
 | `Space t` | tabby 布局 |
 | `Space r` | fibonacci 布局 |

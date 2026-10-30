@@ -221,9 +221,9 @@ eix tui [--session ID]
 | `Ctrl-/` | 模型 picker |
 | `Space o` / `Space h` | session picker（已打开则聚焦，否则新 pane）/ 输入 timeline |
 | `Space f` / `Space s` / `Space g` | 文件 / 内容搜索 / git picker |
-| `Space i` | subagents 实时 picker（无子 agent 时打开并发上限） |
+| `Space p` | subagents 实时 picker（无子 agent 时打开并发上限） |
 | `Space n` / `Space W` | 新建 session / 移入新 worktree |
-| `Space a` / `Space p` | 审批收件箱 / 后台进程 |
+| `Space a` / `Space b` | 审批收件箱 / 后台进程 |
 | `Tab` / `Shift-Tab` | 正向 / 反向循环执行模式 |
 | `Enter` | 发送 prompt；turn 运行中自动排队 |
 | `Esc Esc` | 中断当前 turn，或回到转录区 |

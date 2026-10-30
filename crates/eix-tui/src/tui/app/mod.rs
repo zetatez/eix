@@ -3281,11 +3281,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "prompt & transcript: search file contents and insert @path:line",
             },
             HelpEntry {
-                key: "Space i",
+                key: "Space p",
                 description: "prompt & transcript: monitor live sub-agents (children first, else the concurrency limit)",
             },
             HelpEntry {
-                key: "Space p",
+                key: "Space b",
                 description: "prompt & transcript: processes",
             },
             HelpEntry {
@@ -3429,7 +3429,7 @@ const HELP_SECTIONS: &[HelpSection] = &[
                 description: "page the transcript (Ctrl-B / Ctrl-U and Ctrl-F also work)",
             },
             HelpEntry {
-                key: "Space p",
+                key: "Space b",
                 description: "background processes (x kills, r refreshes)",
             },
             HelpEntry {
