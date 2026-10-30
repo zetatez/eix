@@ -938,6 +938,14 @@ impl App {
                     .iter()
                     .filter_map(|&index| picker.items.get(index))
                     .map(|item| {
+                        if kind == PickerKind::Commands && is_command_header(item) {
+                            return ListItem::new(Line::from(Span::styled(
+                                format!("▍ {}", item.label),
+                                Style::default()
+                                    .fg(composer_accent(self.theme))
+                                    .add_modifier(Modifier::BOLD),
+                            )));
+                        }
                         let label = match kind {
                             PickerKind::Models | PickerKind::PlanModels => {
                                 pad_to(&truncate(&item.label, model_width), model_width)
@@ -1511,7 +1519,7 @@ fn preview_head(text: &str, height: usize) -> Vec<String> {
 ///
 /// The daemon sends `{line:>4} │ {text}`. The gutter is split off so only the
 /// source text reaches the highlighter. Each source line stays on one row: the
-/// pane clips long lines on the right instead of wrapping them, so `/files`
+/// pane clips long lines on the right instead of wrapping them, so `/fzf`
 /// previews keep the file's real line numbers aligned.
 pub(super) fn file_preview_rendered(path: &str, text: &str, theme: Theme) -> PreviewRendered {
     let mut highlighter = CodeHighlighter::new(path, theme);

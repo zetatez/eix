@@ -1555,33 +1555,19 @@ fn subagents_command_opens_the_live_child_picker() {
 }
 
 #[test]
-fn leader_p_opens_the_subagent_picker() {
+fn subagents_only_open_through_the_command() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["parent"]);
     app.focus = Focus::Transcript;
-
-    // Without children the shortcut falls back to the concurrency picker.
-    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
-    assert_eq!(
-        app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::Subagents)
-    );
-    assert!(!app.pending_leader);
-    app.picker = None;
-
-    // Leader+i no longer opens the picker (it stays free for a future action).
-    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE), &tx);
-    assert!(app.picker.is_none());
-
     app.views[0].upsert_subagent("child-1".into(), "call-1".into(), "parent/scout-1".into());
-    app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
-    app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE), &tx);
-    assert_eq!(
-        app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::SubagentActivity)
-    );
+
+    // Subagents is low-frequency: no leader chord, only /subagents.
+    for ch in ['p', 'i'] {
+        app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+        assert!(app.picker.is_none(), "leader+{ch} should stay free");
+        assert!(!app.pending_leader, "leader+{ch} should clear the prefix");
+    }
 }
 
 #[test]
@@ -4536,7 +4522,7 @@ fn help_overlay_renders_section_rules() {
     app.open_help();
 
     let text = render_text(&mut app, 120, 40);
-    assert!(text.contains("▍ prompt commands"), "{text}");
+    assert!(text.contains("▍ common"), "{text}");
     assert!(text.contains("type to search"), "{text}");
     assert!(text.contains("help ·"), "{text}");
 }
@@ -5745,7 +5731,7 @@ fn q_closes_the_focused_pane_and_never_quits_on_the_last() {
 }
 
 #[test]
-fn leader_c_closes_the_focused_pane() {
+fn leader_c_opens_the_colorscheme_picker() {
     let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(SessionView::new(
@@ -5762,7 +5748,11 @@ fn leader_c_closes_the_focused_pane() {
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
     app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE), &tx);
 
-    assert_eq!(app.views.len(), 1);
+    assert_eq!(app.views.len(), 2, "leader+c no longer closes the pane");
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Themes)
+    );
 }
 
 #[test]
@@ -7853,14 +7843,121 @@ fn attention_queue_and_keys_are_no_longer_prompt_commands() {
 }
 
 #[test]
+fn fzf_command_opens_the_file_picker_and_files_stays_an_alias() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+
+    assert!(app.handle_prompt_command("/fzf", &tx));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Files)
+    );
+    app.picker = None;
+
+    assert!(app.handle_prompt_command("/files", &tx));
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Files)
+    );
+}
+
+#[test]
 fn command_palette_mirrors_the_slash_command_menu() {
     let commands = builtin_commands();
-    let items = command_items(&commands);
+    let items: Vec<PickerItem> = command_items(&commands)
+        .into_iter()
+        .filter(|item| !is_command_header(item))
+        .collect();
     assert_eq!(items.len(), commands.len());
-    for (item, spec) in items.iter().zip(commands.iter()) {
-        assert_eq!(item.value, spec.name);
+    for spec in &commands {
+        let item = items
+            .iter()
+            .find(|item| item.value == spec.name)
+            .unwrap_or_else(|| panic!("/{} is missing from the palette", spec.name));
         assert_eq!(item.label, command_label(spec, "/"));
         assert_eq!(item.detail.as_deref(), Some(spec.description.as_str()));
+    }
+}
+
+#[test]
+fn command_palette_navigation_skips_category_headers() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = app_with_panes(&["s1"]);
+    app.focus = Focus::Transcript;
+
+    app.handle_key(
+        KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL),
+        &tx,
+    );
+    assert_eq!(
+        app.picker.as_ref().map(|picker| picker.kind),
+        Some(PickerKind::Commands)
+    );
+    assert_eq!(app.selected_picker_value().as_deref(), Some("help"));
+
+    // Walking the whole list never lands on a category header.
+    for _ in 0..builtin_commands().len() {
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+        assert!(
+            app.selected_picker_value().is_some(),
+            "selection landed on a category header"
+        );
+    }
+
+    // Filtering hides headers instead of fuzzy-matching their titles.
+    for ch in "fzf".chars() {
+        app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE), &tx);
+    }
+    let filtered = app.picker_filtered();
+    assert!(!filtered.is_empty());
+    assert!(filtered
+        .iter()
+        .all(|&index| !is_command_header(&app.picker.as_ref().unwrap().items[index])));
+}
+
+#[test]
+fn command_palette_groups_common_first() {
+    let items = command_items(&builtin_commands());
+    let headers: Vec<&str> = items
+        .iter()
+        .filter(|item| is_command_header(item))
+        .map(|item| item.label.as_str())
+        .collect();
+    assert_eq!(
+        headers,
+        vec![
+            "common",
+            "files & search",
+            "conversation",
+            "sessions",
+            "tools",
+            "review",
+            "settings",
+        ]
+    );
+    // The first row is a header, and every header has commands after it.
+    assert!(is_command_header(&items[0]));
+    assert!(!is_command_header(&items[1]));
+    // Common commands lead the list.
+    assert_eq!(items[1].value, "help");
+}
+
+#[test]
+fn help_documents_every_builtin_command() {
+    let documented: Vec<&str> = HELP_SECTIONS
+        .iter()
+        .filter(|section| section.scope == "commands")
+        .flat_map(|section| section.entries.iter())
+        .map(|entry| entry.key)
+        .collect();
+    for spec in builtin_commands() {
+        let bare = format!("/{}", spec.name);
+        assert!(
+            documented
+                .iter()
+                .any(|key| *key == bare || key.starts_with(&format!("{bare} "))),
+            "{bare} is missing from /help"
+        );
     }
 }
 
@@ -7882,9 +7979,14 @@ fn help_opens_filtered_references_and_scoped_keys_help() {
     assert_eq!(app.help_query, "space");
     let rows = help_rows_in(&app.help_query, app.help_scope);
     assert!(!rows.is_empty());
+    let key_titles: Vec<&str> = HELP_SECTIONS
+        .iter()
+        .filter(|section| section.scope == "keys")
+        .map(|section| section.title)
+        .collect();
     assert!(rows.iter().all(|row| !matches!(
         row,
-        HelpRow::Section(title) if *title != "keys"
+        HelpRow::Section(title) if !key_titles.contains(title)
     )));
 
     app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
@@ -8755,26 +8857,21 @@ fn tab_and_shift_tab_cycle_every_session_mode() {
 }
 
 #[test]
-fn leader_m_still_opens_the_full_mode_picker() {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+fn leader_m_no_longer_opens_the_mode_picker() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = app_with_panes(&["s1"]);
     app.focus = Focus::Transcript;
+    let mode = app.focused_view().map(|view| view.session.mode);
 
     app.handle_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE), &tx);
     app.handle_key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE), &tx);
-    let picker = app.picker.as_ref().expect("mode picker");
-    assert_eq!(picker.kind, PickerKind::Modes);
-    let values: Vec<&str> = picker
-        .items
-        .iter()
-        .map(|item| item.value.as_str())
-        .collect();
-    assert_eq!(values, ["plan", "build", "auto", "full"]);
-    assert!(
-        rx.try_recv().is_err(),
-        "opening the picker must not change the mode"
+
+    assert!(app.picker.is_none(), "leader+m should stay free");
+    assert_eq!(
+        app.focused_view().map(|view| view.session.mode),
+        mode,
+        "leader+m must not change the mode"
     );
-    assert!(app.status.starts_with("mode: "), "{}", app.status);
 }
 
 #[test]

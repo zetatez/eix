@@ -18,7 +18,6 @@ pub enum KeyAction {
     Palette,
     Files,
     Grep,
-    Subagents,
     Models,
     Git,
     Processes,
@@ -40,6 +39,7 @@ pub enum KeyAction {
     Redo,
     ClosePane,
     ModePicker,
+    Colorscheme,
     LayoutHorizontal,
     LayoutTabby,
     LayoutFibonacci,
@@ -67,9 +67,8 @@ impl KeyAction {
             "new_worktree" => Self::NewWorktree,
             "sessions" | "new_pane" => Self::Sessions,
             "palette" | "commands" => Self::Palette,
-            "files" => Self::Files,
+            "files" | "fzf" => Self::Files,
             "grep" => Self::Grep,
-            "subagents" | "subagent" => Self::Subagents,
             "model" | "models" => Self::Models,
             "git" | "worktrees" | "branches" => Self::Git,
             "processes" | "ps" => Self::Processes,
@@ -91,6 +90,7 @@ impl KeyAction {
             "redo" => Self::Redo,
             "close_pane" => Self::ClosePane,
             "mode" | "perm" => Self::ModePicker,
+            "colorscheme" | "theme" => Self::Colorscheme,
             "layout_horizontal" => Self::LayoutHorizontal,
             "layout_tabby" => Self::LayoutTabby,
             "layout_fibonacci" => Self::LayoutFibonacci,
@@ -281,14 +281,12 @@ fn default_bindings() -> Vec<Binding> {
         (KeyAction::Sessions, "o"),
         (KeyAction::Files, "f"),
         (KeyAction::Grep, "s"),
-        (KeyAction::Subagents, "p"),
         (KeyAction::Git, "g"),
         (KeyAction::Timeline, "h"),
         (KeyAction::Processes, "b"),
         (KeyAction::Inbox, "a"),
         (KeyAction::Cancel, "x"),
-        (KeyAction::ClosePane, "c"),
-        (KeyAction::ModePicker, "m"),
+        (KeyAction::Colorscheme, "c"),
         (KeyAction::LayoutHorizontal, "v"),
         (KeyAction::LayoutTabby, "t"),
         (KeyAction::LayoutFibonacci, "r"),
@@ -553,11 +551,15 @@ mod tests {
             binds.leader_action(key(KeyCode::Char('s'), KeyModifiers::NONE)),
             Some(KeyAction::Grep)
         );
+        // Subagents has no leader binding; use /subagents instead.
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('p'), KeyModifiers::NONE)),
-            Some(KeyAction::Subagents)
+            None
         );
-        // Leader+i is free again.
+        assert_eq!(
+            binds.leader_action(key(KeyCode::Char('c'), KeyModifiers::NONE)),
+            Some(KeyAction::Colorscheme)
+        );
         assert_eq!(
             binds.leader_action(key(KeyCode::Char('i'), KeyModifiers::NONE)),
             None

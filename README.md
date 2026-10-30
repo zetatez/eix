@@ -182,7 +182,7 @@ TUI 可以把多个 session 同时开在不同 pane；同一 session 只会在�
 | `auto` | workspace-write；未命中规则的默认询问交给意图分类器，低置信度仍询问 |
 | `full` | 解除 workspace 路径限制并放行默认询问；硬拒绝、secret 保护和显式 `deny` / `ask` 仍生效 |
 
-在 TUI 用 `Tab` / `Shift-Tab` 循环，或 `/perm` / `Space m`；CLI 用 `eix mode`。
+在 TUI 用 `Tab` / `Shift-Tab` 循环，或 `/perm`；CLI 用 `eix mode`。
 
 ### 审批与工作区
 
@@ -219,9 +219,10 @@ eix tui [--session ID]
 | `F1` | 可搜索帮助 |
 | `Ctrl-T` | 切换 reasoning 强度 |
 | `Ctrl-/` | 模型 picker |
+| `Ctrl-P` | 命令面板（按常用 / 功能分组） |
 | `Space o` / `Space h` | session picker（已打开则聚焦，否则新 pane）/ 输入 timeline |
 | `Space f` / `Space s` / `Space g` | 文件 / 内容搜索 / git picker |
-| `Space p` | subagents 实时 picker（无子 agent 时打开并发上限） |
+| `Space c` | colorscheme picker |
 | `Space n` / `Space W` | 新建 session / 移入新 worktree |
 | `Space a` / `Space b` | 审批收件箱 / 后台进程 |
 | `Tab` / `Shift-Tab` | 正向 / 反向循环执行模式 |

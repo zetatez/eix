@@ -200,10 +200,10 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
 - leader 前缀默认 `<Space>`，可通过 `[keys].leader` 修改；输入框 normal 与转录区共用同一映射：
   `n` 新建 session 并开新 pane（当前 session 有 worktree 时复用）、`W` 当前 session 移入 worktree、
   `o` 打开 session picker（已打开的 session 直接聚焦其 pane，否则放进新 pane；只列普通/worktree
-  session，不列子 agent）、`c` 关闭 pane、`f` 文件、
-  `s` 文件内容（类似 rg）、`p` subagents（有子 agent 时实时监控，否则并发上限）、
+  session，不列子 agent）、`f` 文件、
+  `s` 文件内容（类似 rg）、`c` colorscheme、
   `g` git（worktrees + branches）、`h` 用户输入 timeline、
-  `b` 进程、`a` 审批 inbox、`x` 取消、`m` 完整执行模式 picker、
+  `b` 进程、`a` 审批 inbox、`x` 取消、
   `v`/`t`/`r`/`l` 布局。单字母默认留给 vim；转录区裸
   `q` 关闭当前 pane（最后一个 pane 保持打开），裸 `Z` 退出，保留 `i`（聚焦输入框）、
   `j/k`/`g/G` 等导航、`/`/`?`/`#` 当前对话搜索和 `Ctrl-P`。
@@ -218,8 +218,7 @@ prompt 需要的常用 vim 子集，换取零启动成本与零按键往返。
   insert 模式的 `Ctrl-W` 仍用于删除前一个词。
 - `Ctrl-J`/`Ctrl-K` 上下翻转录历史（`j`/`k`、`3j`、`dj`、`↑`/`↓` 是草稿内行移动）。
 - 输入框 normal 模式与转录区的 `Tab` 按 Plan → Build → Auto → Full → Plan 正向循环，
-  `Shift-Tab` 反向循环（Build → Plan → Full → Auto）。`Space m`（或 `/perm`）仍打开完整
-  picker 直接选择某个模式。输入框下方 statusline 左侧显示当前模式；本地立即更新以支持
+  `Shift-Tab` 反向循环（Build → Plan → Full → Auto）。`/perm` 仍打开完整 picker 直接选择某个模式。输入框下方 statusline 左侧显示当前模式；本地立即更新以支持
   连续切换，daemon 的 session 事件负责最终校正。
 - `Esc`：insert/visual → normal 并保持焦点；normal 下 500ms 内再按一次回到转录区。
 - `Enter` 在 insert 提交；normal 模式把当前 pane 的 session 提到第一位。
@@ -329,16 +328,23 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | 键 | 行为 |
 |---|---|
 | `F1` | 任意模式：可搜索帮助 |
+| `<Space>n` | 转录区 / 输入框 normal：新建 session（有 worktree 则复用） |
+| `<Space>W` | 把当前 session 移入新的 git worktree |
 | `<Space>o` | 转录区 / 输入框 normal：session picker（已打开则聚焦，否则开新 pane） |
-| `<Space>h` | 转录区 / 输入框 normal：当前 session 的 user-input timeline |
+| `<Space>f` | 工作区文件 picker（插入 `@path`） |
+| `<Space>s` | 搜索文件内容并插入 `@path:line` |
 | `<Space>g` | 转录区 / 输入框 normal：git picker（worktrees + branches） |
+| `<Space>h` | 转录区 / 输入框 normal：当前 session 的 user-input timeline |
+| `<Space>b` | 后台进程 |
+| `<Space>a` | 跨 session 审批收件箱 |
+| `<Space>x` | 取消当前 turn |
+| `<Space>c` | colorscheme picker（实时预览；Enter 应用，Esc 还原） |
 | `<C-t>` | 任意模式：reasoning low / medium / high |
 | `<C-/>` / `<C-_>` / `<C-7>` | 任意模式：模型 picker |
 | `Ctrl-1…9` | 聚焦第 N 个已打开 session（`tabby` 下为第 N 个 tab；需 kitty 键盘协议；`Ctrl-7` 通常留给模型 picker） |
 | `<Space>v/t/r` | horizontal / tabby / fibonacci 布局 |
 | `<Space>l` | 循环 fibonacci → tabby → horizontal |
-| `q` / `<Space>c` | 转录区 / 输入框 normal：关闭当前 pane（最后一个 pane 保持打开） |
-| `<Space>a` | 跨 session 审批收件箱 |
+| `q` | 转录区 / 输入框 normal：关闭当前 pane（最后一个 pane 保持打开） |
 | `<` / `>` | 转录区 / 输入框 normal：上一个 / 下一个 pane |
 | `Ctrl-W Ctrl-W` | 转录区 / 输入框 normal 模式 1 秒内连按两次：聚焦下一个 pane，最后一个回绕到第一个 |
 | `Ctrl-C` / `Ctrl-D` | 任意模式：保存草稿并退出 |
@@ -355,15 +361,15 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `Esc` | insert/visual → normal；normal 下 500ms 内再按一次：有 turn 在跑时中断它，否则回到转录区 |
 | `:` | normal 模式：激活 statusline 下方的命令行；`Tab` 才显示匹配命令并补全；菜单中 `Ctrl-J`/`Ctrl-K`、`Ctrl-N`/`Ctrl-P` 上下选择，`Enter` 执行选中项；菜单打开时 `Esc` 先收起菜单并保留输入，再按一次关闭命令行，`↑`/`↓` 历史；`:!cmd` / `:r!cmd` 直接执行/读取 shell |
 | `/` / `?` / `#` | normal 模式：在当前 session 对话中搜索；`/` 向前，`?`/`#` 向后；`n`/`N` 跳匹配，`Esc` 清除高亮 |
-| `F1` / `/help` | 打开可搜索帮助；`/`、`?`、`#` 在 normal 模式打开命令行 |
+| `F1` / `/help` | 打开可搜索帮助（按常用 / 主题分组）；`/`、`?`、`#` 在 normal 模式打开命令行 |
 | `Ctrl-J` / `Ctrl-K` | normal 模式下浏览已提交的 prompt 历史（newer / older） |
 | `Ctrl-T` | 任意焦点：推理强度 low → medium → high → low（默认 medium） |
 | `Ctrl-/` | 任意焦点：打开可搜索的模型 picker（`Ctrl-_` / `Ctrl-7` 也兼容） |
-| `Ctrl-P` | 转录区 / 输入框 normal 模式：打开命令面板 |
+| `Ctrl-P` | 转录区 / 输入框 normal 模式：打开命令面板（按常用 / 功能分组） |
 | `Tab` | normal 模式下正向循环 Plan → Build → Auto → Full（命令面板的 `cycle execution mode` 同义） |
 | `Shift-Tab` | normal 模式下反向循环 Build → Plan → Full → Auto |
 | `j` / `k` | normal 模式下在草稿内上下行移动（`3j`、`dj`、方向键同样可用） |
-| `<Space>n/W/o/f/s/i/g/p/c/a/x/m/v/t/r/l` | TUI 动作（见 5.1）；可用 `[keys]` 覆盖 |
+| `<Space>n/W/o/f/s/g/h/b/a/x/c/v/t/r/l` | TUI 动作（见 5.1）；可用 `[keys]` 覆盖 |
 | `i a I A o O x X D C s S r ~ J p P u C-r` | 常用 vim 编辑 |
 | `d c y` + motion / `dd cc yy` / `iw aw` | 操作符 |
 | `v V` + `d x y c p ~ o` | visual |
@@ -373,7 +379,7 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 
 | 命令 | 行为 |
 |---|---|
-| `/help [query]` | 可搜索帮助（命令 / 快捷键 / notes），可带初始查询 |
+| `/help [query]` | 可搜索帮助（命令 / 快捷键 / notes，按常用 / 主题分组），可带初始查询 |
 | `/new` | `/sessions` 的别名：session picker（已打开则聚焦，否则开新 pane，同 `<Space>o`） |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示 |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
@@ -383,11 +389,11 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
 | `/sessions` / `/fork` | session picker（已打开则聚焦，否则开新 pane）/ fork 当前 session |
 | `/projects` | 按工作目录聚合 session，项目与目录内 session 都按最新时间倒序；可搜索，`Enter` 进入该项目后选择 session |
-| `/files` / `/grep` / `/git` | picker；`/files` 插入 `@路径`，`/grep [query]` 搜索内容并插入 `@路径:行号`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
+| `/fzf` / `/grep` / `/git` | picker；`/fzf` 插入 `@路径`（旧名 `/files` 仍可用），`/grep [query]` 搜索内容并插入 `@路径:行号`，`/git` 插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
 | `/processes` / `/approvals` | 进程 / 审批收件箱 |
 | `/mcp` / `/todos` | MCP server picker / 任务列表 picker（均可搜索和预览；`/mcp` 中 `Space` 启用/停用 server） |
 | `/cancel` | 取消运行 |
-| `/perm` | picker 搜索并选择 `plan` / `build` / `auto` / `full`；也可直接带 mode；与 `Space m` 相同；旧名 `/mode` 仍可用 |
+| `/perm` | picker 搜索并选择 `plan` / `build` / `auto` / `full`；也可直接带 mode；旧名 `/mode` 仍可用 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 
@@ -473,14 +479,14 @@ attach 时只取最近 1000 条事件；滚动到顶部时按 `before_seq` 加�
     session 的预览会随选中项通过 `picker.preview` 拉取最近对话（you / assistant / tool / error）；
     session picker 只列普通 session 和 worktree session，`origin = agent` 的子 session 不进入列表，
     只能从父 transcript 的 subagent 卡片打开；child transcript 底部提供可点击的
-    `← parent agent`；`/subagents` 或 `<Space>p` 在父 session 有子 agent 时打开实时 subagent picker
+    `← parent agent`；`/subagents` 在父 session 有子 agent 时打开实时 subagent picker
     （按名字搜索，右侧预览 child 事件、工具调用/结果、流式 thinking 和 answer，`Enter` 在
     pane 中打开 child session），没有子 agent 时回退到并发上限 picker；worktree 标记 `⑂` 单独占一列，
     紧跟 session id 前；
     files 的预览按需读取文件内容并加行号，超过 64 KiB 或 400 行时截断，避免初始列表携带大 payload；
     grep 的预览直接使用匹配行（含 `path:line`），查询防抖后由 daemon 做大小写不敏感的字面量搜索。
   - 入口：`<Space>o`（sessions，已打开则聚焦，否则开新 pane）、`<Space>h`（timeline）、
-    `<Space>f`（files）、`<Space>s`（grep，文件内容）、`<Space>p`（subagents，实时活动）、`Ctrl-P`（commands，命令面板；转录区与输入框
+    `<Space>f`（files）、`<Space>s`（grep，文件内容）、`Ctrl-P`（commands，命令面板；转录区与输入框
     normal 模式都可用）、`<Space>g`（git，统一列出 worktrees 和 branches；没有 linked worktree 时
     省略仓库主路径）、prompt 内 `@`（files）、`/grep [query]`、`Eix pick` 经独立前端选择。
   - provider 由 daemon 的 `picker.query {kind}` 提供：`files`（workspace 相对路径）、`images`
@@ -930,8 +936,10 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 > `Ctrl-H` / `Ctrl-Backspace` 移到 `<Space>h`；git picker 从 `<Space>g` 移到 `<Space>G`。
 > 合并 session 入口（2026-10-30）：`<Space>g` 与 `<Space>o` 合为一个入口 `<Space>o`——已打开的
 > session 直接聚焦其 pane，未打开则开新 pane；git picker 回到 `<Space>g`，`<Space>G` 取消。
-> `/new` 成为 `/sessions` 的别名。同日后台进程从 `<Space>p` 移到 `<Space>b`，subagents 从
-> `<Space>i` 移到 `<Space>p`，`<Space>i` 释放。
+> `/new` 成为 `/sessions` 的别名。同日后台进程从 `<Space>p` 移到 `<Space>b`；subagents 使用频率
+> 低，不再绑定 leader 键，统一用 `/subagents` 打开。`/files` 更名为 `/fzf`（旧名保留为别名）；
+> `<Space>c` 从关闭 pane 改为打开 colorscheme picker，关闭 pane 仍可用裸 `q`。`<Space>m` 解绑，
+> 模式切换只保留 `Tab` / `Shift-Tab` 循环与 `/perm` picker。
 > 输入焦点（2026-10-18）：`Esc` 只在 insert/visual 下回到 normal 并保留焦点，500ms 内
 > 再按一次才回到转录；`<CR>` 只在 insert 提交；`<C-g>` 在任意模式打开 picker；
 > `Ctrl-J` / `Ctrl-Enter` / `Shift-Enter` 只在 insert 换行；`F1` 全局帮助；
@@ -1257,7 +1265,7 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 | `/` / `?` / `#` | 搜索当前 transcript；`n` / `N` 跳下一个 / 上一个，`Esc` 清除 |
 | `Enter` | insert 模式发送（turn 运行中自动排队）；normal / 转录区把当前 session 提到第一位 |
 | `Ctrl-J` | insert 模式换行 |
-| `Ctrl-P` | 命令面板（输入框 normal / 转录区） |
+| `Ctrl-P` | 命令面板（输入框 normal / 转录区；按常用 / 功能分组，分组标题不参与选择） |
 | `Tab` | 输入框 normal / 转录区：Plan → Build → Auto → Full 循环 |
 | `Shift-Tab` | 反向循环：Build → Plan → Full → Auto |
 | `j` / `k` | 转录区滚动；输入框 normal 下移动草稿行 |
@@ -1273,13 +1281,11 @@ TCP/HTTP 端点不会自动拉起本地 daemon。
 | `Space o` | session picker：已打开则聚焦，否则开新 pane |
 | `Space n` | 新建 session（有 worktree 则复用） |
 | `Space W` | 把当前 session 移入新 worktree |
-| `Space c` | 保存并关闭当前 pane |
+| `Space c` | colorscheme picker |
 | `Space x` | 取消当前 turn |
 | `Space a` | 跨 session 审批收件箱 |
-| `Space m` | 完整执行模式 picker |
 | `Space f` | 文件 picker |
 | `Space s` | 搜索文件内容并插入 `@path:line` |
-| `Space p` | subagents 实时 picker：有子 agent 时监控并搜索 child，否则打开并发上限 picker |
 | `Space g` | git picker（worktrees + branches） |
 | `Space h` | 用户输入 timeline picker |
 | `Space b` | 后台进程列表 |
@@ -1346,7 +1352,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 
 | 命令 | 行为 |
 | --- | --- |
-| `/help [query]` | 打开可搜索帮助（命令、快捷键、notes）；可带初始查询 |
+| `/help [query]` | 打开可搜索帮助（命令、快捷键、notes，按常用 / 主题分组）；可带初始查询 |
 | `/new` | `/sessions` 的别名：打开 session picker，已打开则聚焦，否则开新 pane（同 `<Space>o`） |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示，不重复创建 |
 | `/ready` | 把当前 worktree 交给 daemon 做 rebase / 测试 / ff merge |
@@ -1358,7 +1364,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/init` | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送 |
 | `/sessions` | 打开 session picker：已打开的 session 直接聚焦，否则开新 pane |
 | `/projects` | 按工作目录浏览 session：项目按最新 session 时间倒序，进入项目后可在目录内搜索并选择 session |
-| `/files` | 文件 picker，选中后插入 `@path` |
+| `/fzf` | 文件 picker，选中后插入 `@path`（旧名 `/files` 仍可用） |
 | `/grep [query]` | 内容 picker：搜索 workspace 文件内容，选中后插入 `@path:line`；可直接带初始查询 |
 | `/git` | git picker：worktrees + branches，选中后插入 worktree 路径或分支名（旧名 `/worktrees`、`/branches` 仍可用） |
 | `/processes` / `/approvals` | 背景进程列表 / 审批收件箱 |
@@ -1392,7 +1398,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/simplify [scope]` | 内置 prompt：在不改变行为的前提下精简改动 |
 | `/verify [scope]` | 内置 prompt：跑格式化、构建、测试并实际验证改动，要求给出证据 |
 | `/fork [name]` | 不带参数打开用户消息 picker，选中后 fork 到该消息之前（末行可选整段对话）；带名字时 fork 当前 session（默认共享工作区；`worktree.auto = true` 时自动建 worktree） |
-| `/perm` | 弹窗搜索并选择执行模式：`plan` / `build` / `auto` / `full`；也可直接 `/perm <mode>`；`Space m` 打开同一 picker；旧名 `/mode` 仍可用 |
+| `/perm` | 弹窗搜索并选择执行模式：`plan` / `build` / `auto` / `full`；也可直接 `/perm <mode>`；旧名 `/mode` 仍可用 |
 | `/exit` / `/quit` | 保存草稿并退出整个 eix 客户端（不关闭 session pane） |
 | `/close` | 保存草稿并关闭当前 session；如果它是最后一个 pane，同时退出 eix |
 

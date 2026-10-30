@@ -119,7 +119,7 @@ impl App {
                 }
                 true
             }
-            "files" => {
+            "fzf" => {
                 self.open_picker(PickerKind::Files, tx);
                 true
             }

@@ -1879,11 +1879,12 @@ fn char_to_byte(text: &str, char_index: usize) -> usize {
 pub(super) fn leader_action(ch: char) -> Option<&'static str> {
     Some(match ch {
         'o' => "new",
-        'f' => "files",
+        'f' => "fzf",
         's' => "grep",
         'g' => "git",
-        'c' => "close-pane",
-        'p' => "processes",
+        'h' => "timeline",
+        'c' => "colorscheme",
+        'b' => "processes",
         'a' => "approvals",
         'n' => "new-session",
         'W' => "new-worktree",
@@ -1892,7 +1893,6 @@ pub(super) fn leader_action(ch: char) -> Option<&'static str> {
         'r' => "layout-fibonacci",
         'l' => "layout-cycle",
         'x' => "cancel",
-        'm' => "mode",
         _ => return None,
     })
 }
@@ -2187,16 +2187,6 @@ mod tests {
                 Outcome::Action(action)
             );
         }
-    }
-
-    #[test]
-    fn leader_m_opens_the_mode_picker() {
-        let mut editor = editor_with("");
-        let _ = key(&mut editor, KeyCode::Char(' '));
-        assert_eq!(
-            key(&mut editor, KeyCode::Char('m')),
-            Outcome::Action("mode")
-        );
     }
 
     #[test]
