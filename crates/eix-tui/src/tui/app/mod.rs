@@ -565,6 +565,8 @@ struct SessionView {
     math_rev: u64,
     /// Same as `math_rev`, but for the live tail.
     tail_math_rev: u64,
+    /// Last global remote-image revision seen by this pane.
+    remote_rev: u64,
     history_cache: Option<transcript::HistoryCache>,
     /// Cached live tail (streaming text, reasoning and queued prompts).
     tail: transcript::Transcript,
@@ -617,6 +619,7 @@ impl SessionView {
             subagents_rev: 0,
             math_rev: 0,
             tail_math_rev: 0,
+            remote_rev: 0,
             history_cache: None,
             tail: transcript::Transcript::new(),
             tail_key: None,

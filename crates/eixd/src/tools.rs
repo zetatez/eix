@@ -2267,6 +2267,9 @@ pub fn command_plan_with(
                 .iter()
                 .map(|path| expand_sandbox_path(path, &workspace)),
         );
+        // Spilled tool output is intentionally outside the workspace; mount it
+        // read-only so shell inspection (`grep`, `sed -n`) can reach it.
+        read_paths.push(eix_core::config::spill_dir());
         let mut writable_roots: Vec<PathBuf> = config
             .tools
             .sandbox_writable_roots
@@ -2447,29 +2450,42 @@ fn resolve_path_inner(cwd: &Path, raw: &str, config: Option<&Config>) -> Result<
     let normalized = normalize(&joined);
     let external =
         |path: &Path| config.is_some_and(|config| config.tools.external_path_allowed(path));
+    // Tool outputs the daemon spilled for truncation are model-readable even
+    // though they live outside the workspace. The complete text is otherwise
+    // unreachable without re-running the command that produced it.
+    let internal = |path: &Path| {
+        let storage = eix_core::config::spill_dir();
+        if path.starts_with(&storage) {
+            return true;
+        }
+        storage
+            .canonicalize()
+            .is_ok_and(|real| path.starts_with(real))
+    };
     let external_allowed = external(&normalized);
-    if !normalized.starts_with(&root) && !external_allowed {
+    let internal_allowed = internal(&normalized);
+    if !normalized.starts_with(&root) && !external_allowed && !internal_allowed {
         if let Ok(real) = normalized.canonicalize() {
-            if real.starts_with(&root) || external(&real) {
+            if real.starts_with(&root) || external(&real) || internal(&real) {
                 return Ok(real);
             }
         }
         bail!("path escapes the session workspace: {raw}");
     }
     if let Ok(real) = normalized.canonicalize() {
-        if !real.starts_with(&root) && !external(&real) {
+        if !real.starts_with(&root) && !external(&real) && !internal(&real) {
             bail!("path escapes the session workspace: {raw}");
         }
         return Ok(real);
     }
-    if external_allowed {
+    if external_allowed || internal_allowed {
         return Ok(normalized);
     }
     // New path: the nearest existing ancestor must still be inside the root.
     let mut ancestor = normalized.parent();
     while let Some(dir) = ancestor {
         if let Ok(real) = dir.canonicalize() {
-            if !real.starts_with(&root) && !external(&real) {
+            if !real.starts_with(&root) && !external(&real) && !internal(&real) {
                 bail!("path escapes the session workspace: {raw}");
             }
             break;

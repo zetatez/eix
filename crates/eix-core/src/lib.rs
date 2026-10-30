@@ -34,7 +34,9 @@ pub use config::{
     SandboxMode, ServerConfig, ThemeConfig, ThemePreset, ToolsConfig, WorktreeConfig,
     DEFAULT_MAX_PARALLEL_SUBAGENTS, SUBAGENT_CONCURRENCY_OPTIONS, THEME_PRESETS,
 };
-pub use context::{ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector};
+pub use context::{
+    ContextCacheInfo, ContextEntryInfo, ContextLedgerResult, ContextSectorInfo, Sector,
+};
 pub use event::{
     payload, ApprovalRequiredPayload, AssistantMessagePayload, ClassifierAuditPayload,
     ContextClearedPayload, ContextCompactedPayload, ContextDropPayload, ContextPinPayload,

@@ -188,6 +188,10 @@ pub struct AssistantMessagePayload {
     pub cancelled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<Usage>,
+    /// Images returned by the provider. Inline bytes use `data`; provider
+    /// URLs use `path`. Empty for text-only responses.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub images: Vec<ImageAttachment>,
     /// Tool calls requested alongside this assistant message. The matching
     /// `tool_call` / `tool_result` events carry the same call ids.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -212,6 +216,12 @@ pub struct ToolResultPayload {
     pub output: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
+    /// Absolute path to the complete output when `output` is large enough to be
+    /// truncated in the provider view. Written by the daemon under its data
+    /// directory so the model can re-read the elided middle instead of paying
+    /// to run the command again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spill: Option<String>,
 }
 
 /// One selectable hunk of a proposed write, including its rendered lines.
@@ -544,10 +554,12 @@ mod tests {
             reasoning_signature: None,
             cancelled: false,
             usage: None,
+            images: Vec::new(),
             tool_calls: Vec::new(),
         });
         assert_eq!(assistant["text"], "yo");
         assert!(assistant.get("usage").is_none());
+        assert!(assistant.get("images").is_none());
         assert!(assistant.get("tool_calls").is_none());
 
         let call = payload(&ToolCallPayload {
@@ -564,8 +576,10 @@ mod tests {
             denied: false,
             output: "hi".into(),
             duration_ms: None,
+            spill: None,
         });
         assert_eq!(result["ok"], true);
         assert!(result.get("duration_ms").is_none());
+        assert!(result.get("spill").is_none());
     }
 }

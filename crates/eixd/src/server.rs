@@ -418,6 +418,9 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
     fs::create_dir_all(&data_dir)
         .with_context(|| format!("cannot create data dir {}", data_dir.display()))?;
     Store::set_permissions(&data_dir)?;
+    // Spill files live outside the workspace; register their root so the path
+    // guard and the sandbox mount can reach them.
+    eix_core::config::set_spill_root(&data_dir);
 
     let db_path = data_dir.join("eix.sqlite3");
     let store = Arc::new(Store::open(&db_path)?);
@@ -473,6 +476,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         temporary_modes: std::sync::Mutex::new(HashMap::new()),
         skill_tools: Mutex::new(HashMap::new()),
         token_scales: std::sync::Mutex::new(HashMap::new()),
+        tool_caps: std::sync::Mutex::new(HashMap::new()),
         model_catalog: Mutex::new(ModelCatalogCache::default()),
         classifier_cache: Mutex::new(HashMap::new()),
         prompt_cache: Mutex::new(PromptCache::default()),
@@ -810,6 +814,10 @@ pub(crate) struct Daemon {
     /// provider-reported prompt usage. Starts at 1.0 and is updated with a
     /// bounded EWMA after each completed request.
     token_scales: std::sync::Mutex<HashMap<String, f64>>,
+    /// Per-session reduction of `context.tool_output_tokens` applied after a
+    /// pressure-triggered prune. In memory only: a restart rebuilds with the
+    /// configured cap, which at worst pays for another prune.
+    tool_caps: std::sync::Mutex<HashMap<SessionId, usize>>,
     /// Cached merged model catalog. `/model` may be opened repeatedly; don't
     /// hit every provider on each open.
     model_catalog: Mutex<ModelCatalogCache>,
@@ -3021,6 +3029,8 @@ impl Daemon {
                 }
                 self.todos.lock().await.remove(&params.session_id);
                 self.queued.lock().await.remove(&params.session_id);
+                self.remove_spill(&params.session_id);
+                self.clear_tool_output_cap(&params.session_id);
                 self.emit_value(
                     "session.deleted",
                     json!({ "session_id": params.session_id }),
@@ -3043,6 +3053,8 @@ impl Daemon {
                 if deleted {
                     self.todos.lock().await.remove(&params.session_id);
                     self.queued.lock().await.remove(&params.session_id);
+                    self.remove_spill(&params.session_id);
+                    self.clear_tool_output_cap(&params.session_id);
                     self.emit_value(
                         "session.deleted",
                         json!({ "session_id": params.session_id }),
@@ -6044,13 +6056,10 @@ impl Daemon {
         if !mcp_configured || sub_agent {
             definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
         }
-        // `ready` is only meaningful inside an enabled integration worktree.
-        // Hiding it elsewhere removes a schema the model can never use.
-        let worktree_ready = self
-            .require_session(&session_id)
-            .map(|session| session.has_worktree() && self.config.load().integration.enabled)
-            .unwrap_or(false);
-        if !worktree_ready {
+        // `ready` follows the integration feature, not this session's worktree
+        // state: adding the schema after a mid-session worktree creation would
+        // rewrite the cached tool prefix.
+        if !self.config.load().integration.enabled {
             definitions.retain(|tool| tool.function.name != "ready");
         }
         // MCP and plugin tools are deferred: `tool_search` pulls the ones the
@@ -6158,6 +6167,10 @@ impl Daemon {
         // Cumulative provider tokens for this turn, used in failure
         // diagnostics.
         let mut turn_tokens = 0u64;
+        // A cold prefix cache is worth one log line per turn, not one per
+        // round. Silent regressions here are expensive: a compaction or prompt
+        // rewrite can drop reuse from ~99% to near zero.
+        let mut cache_cold_reported = false;
         let mut tool_calls_run = 0usize;
         // The budget notice is advisory: one per turn, so it nudges the model
         // to stay compact without becoming repeated prompt noise.
@@ -6367,6 +6380,7 @@ impl Daemon {
                         if completion.tool_calls.is_empty()
                             && completion.text.trim().is_empty()
                             && completion.reasoning.trim().is_empty()
+                            && completion.images.is_empty()
                             && attempt < max_retries =>
                     {
                         (
@@ -6547,10 +6561,29 @@ impl Daemon {
                 turn_tokens += usage
                     .total_tokens
                     .max(usage.prompt_tokens.saturating_add(usage.completion_tokens));
+                // Later rounds reuse a prefix that was just written, so a low
+                // hit rate there means the head or the tool list changed
+                // between requests. Report it once: the number is actionable,
+                // repeated lines are not.
+                let cold = usage.prompt_tokens >= 20_000
+                    && usage.cache_read_tokens * 2 < usage.prompt_tokens;
+                if cold && round > 0 && !cache_cold_reported {
+                    cache_cold_reported = true;
+                    let rate = usage.cache_read_tokens as f64 / usage.prompt_tokens as f64 * 100.0;
+                    eprintln!(
+                        "eixd: prefix cache hit rate is {rate:.1}% on a {} token prompt \
+                         (session {session_id}, round {round}); the cached prefix changed — \
+                         check mode/permission changes, the tool list, or a compaction",
+                        usage.prompt_tokens
+                    );
+                }
             }
 
             if completion.tool_calls.is_empty() {
-                if completion.text.trim().is_empty() && completion.reasoning.trim().is_empty() {
+                if completion.text.trim().is_empty()
+                    && completion.reasoning.trim().is_empty()
+                    && completion.images.is_empty()
+                {
                     return Err(anyhow::anyhow!(
                         "model returned an empty response after {} attempt(s) (finish_reason: {:?})",
                         attempt + 1,
@@ -6558,6 +6591,7 @@ impl Daemon {
                     ));
                 }
                 let final_text = completion.text.clone();
+                let final_images = std::mem::take(&mut completion.images);
                 let event = self.store.append_event(
                     session_id,
                     EventKind::AssistantMessage,
@@ -6569,6 +6603,7 @@ impl Daemon {
                         reasoning_signature: completion.reasoning_signature,
                         cancelled: false,
                         usage: completion.usage.clone(),
+                        images: final_images,
                         tool_calls: Vec::new(),
                     }),
                 )?;
@@ -6599,10 +6634,13 @@ impl Daemon {
                 }
                 self.transition(session_id, SessionStatus::Idle)?;
                 let duration_ms = turn_started.elapsed().as_millis() as u64;
-                let cost = completion
-                    .usage
-                    .as_ref()
-                    .and_then(|usage| route.cost(usage.prompt_tokens, usage.completion_tokens));
+                let cost = completion.usage.as_ref().and_then(|usage| {
+                    route.cost_with_cache(
+                        usage.prompt_tokens,
+                        usage.completion_tokens,
+                        usage.cache_read_tokens,
+                    )
+                });
                 if let Some(baseline) = turn_baseline.as_deref() {
                     self.emit_turn_diff(session_id, turn_id, &session.cwd, baseline)
                         .await;
@@ -6665,6 +6703,7 @@ impl Daemon {
                     notices.push(notice);
                 }
             }
+            let assistant_images = std::mem::take(&mut completion.images);
             let event = self.store.append_event(
                 session_id,
                 EventKind::AssistantMessage,
@@ -6676,6 +6715,7 @@ impl Daemon {
                     reasoning_signature: completion.reasoning_signature.clone(),
                     cancelled: false,
                     usage: completion.usage.clone(),
+                    images: assistant_images,
                     tool_calls: completion.tool_calls.clone(),
                 }),
             )?;
@@ -8181,12 +8221,37 @@ impl Daemon {
         if !mcp_configured || sub_agent {
             definitions.retain(|tool| !is_mcp_meta(&tool.function.name));
         }
-        if !sub_agent {
-            definitions.extend(self.plugins.tool_definitions().await);
-        }
-        let worktree_ready = session.has_worktree() && self.config.load().integration.enabled;
-        if !worktree_ready {
+        let plugin_tools = if sub_agent {
+            Vec::new()
+        } else {
+            self.plugins.tool_definitions().await
+        };
+        let plugin_names: HashSet<String> = plugin_tools
+            .iter()
+            .map(|tool| tool.function.name.clone())
+            .collect();
+        definitions.extend(plugin_tools);
+        // `ready` depends only on the integration feature, not on whether this
+        // session already has a worktree. Creating a worktree mid-session used
+        // to add the schema and rewrite the cached tool prefix; the tool itself
+        // reports "cannot queue" when there is no worktree.
+        if !self.config.load().integration.enabled {
             definitions.retain(|tool| tool.function.name != "ready");
+        }
+        // Tool schemas are fixed request overhead. When they exceed the
+        // configured share, drop plugin tools from the base request: they stay
+        // discoverable through `tool_search`, which is cheaper than paying for
+        // every schema on every round.
+        let limit = self.config.load().context.max_tool_schema_tokens.max(1);
+        if crate::context::estimate_tool_schema_tokens(&definitions) > limit {
+            let before = definitions.len();
+            definitions.retain(|tool| !plugin_names.contains(&tool.function.name));
+            if definitions.len() != before {
+                eprintln!(
+                    "eixd: tool schemas exceeded {limit} tokens; deferred {} plugin tool(s) to `tool_search`",
+                    before - definitions.len()
+                );
+            }
         }
         definitions
     }
@@ -8244,6 +8309,22 @@ impl Daemon {
         events: &[Event],
         static_context: &StaticContext,
     ) -> Result<Ledger> {
+        let cap = self.tool_output_cap(session_id);
+        self.build_ledger_capped(session_id, tools, events, static_context, cap)
+            .await
+    }
+
+    /// Same as [`build_ledger_from_events`](Self::build_ledger_from_events), but
+    /// with an explicit per-result tool-output cap. Pressure handling uses a
+    /// smaller cap to prune free of charge before paying for a summary.
+    async fn build_ledger_capped(
+        &self,
+        session_id: &str,
+        tools: &[ToolDefinition],
+        events: &[Event],
+        static_context: &StaticContext,
+        tool_output_tokens: usize,
+    ) -> Result<Ledger> {
         let session = self.require_session(session_id)?;
         let config = self.config.load_full();
         let mode = self.session_mode(&session);
@@ -8263,7 +8344,10 @@ impl Daemon {
         let memory = self.memory.read(&session.cwd).await;
         let model = self.model_for_session(&session);
         let route = config.route(&model);
-        let budget = config.context.effective_budget_tokens(route.context_tokens);
+        let budget = config.context.effective_budget_tokens(
+            route.context_tokens,
+            config.provider_runtime.max_output_tokens as usize,
+        );
         let resources = self.prompt_resources(&config, &session.cwd).await;
         let session_rules = self
             .always
@@ -8272,11 +8356,13 @@ impl Daemon {
             .get(&session.id)
             .cloned()
             .unwrap_or_default();
+        let directives = session_directives(&config, &session, mode, tools, &session_rules);
         let sections = Sections {
             skills: (!resources.skills.is_empty()).then(|| resources.skills.clone()),
             memory,
             tasks,
             goal,
+            directives: (!directives.is_empty()).then_some(directives),
             environment: Some(
                 environment_summary(
                     &session.cwd,
@@ -8289,22 +8375,14 @@ impl Daemon {
             workspace: None,
         };
         let mut ledger = Ledger::build_with_state_and_static(
-            &config,
-            system_prompt(
-                &config,
-                &model,
-                &session,
-                mode,
-                Some(&resources),
-                tools,
-                &session_rules,
-            ),
+            stable_system_prompt(&config, &model, &session, Some(&resources)),
             static_context,
             sections,
             events,
             Some(&self.blobs),
             tools,
             self.token_scale(&model),
+            tool_output_tokens,
             budget,
         )
         .await;
@@ -8348,7 +8426,10 @@ impl Daemon {
         let memory = self.memory.read(&session.cwd).await;
         let model = self.model_for_session(&session);
         let route = config.route(&model);
-        let budget = config.context.effective_budget_tokens(route.context_tokens);
+        let budget = config.context.effective_budget_tokens(
+            route.context_tokens,
+            config.provider_runtime.max_output_tokens as usize,
+        );
         let resources = self.prompt_resources(&config, &session.cwd).await;
         let session_rules = self
             .always
@@ -8357,11 +8438,13 @@ impl Daemon {
             .get(&session.id)
             .cloned()
             .unwrap_or_default();
+        let directives = session_directives(&config, &session, mode, tools, &session_rules);
         let sections = Sections {
             skills: (!resources.skills.is_empty()).then(|| resources.skills.clone()),
             memory,
             tasks,
             goal,
+            directives: (!directives.is_empty()).then_some(directives),
             environment: Some(
                 environment_summary(
                     &session.cwd,
@@ -8379,16 +8462,8 @@ impl Daemon {
             new_events,
             all_events,
             &images,
-            config.context.tool_output_tokens,
-            system_prompt(
-                &config,
-                &model,
-                &session,
-                mode,
-                Some(&resources),
-                tools,
-                &session_rules,
-            ),
+            self.tool_output_cap(session_id),
+            stable_system_prompt(&config, &model, &session, Some(&resources)),
             static_context,
             sections,
             tools,
@@ -8423,6 +8498,37 @@ impl Daemon {
             Err(poisoned) => poisoned.into_inner(),
         };
         scales.get(model).copied().unwrap_or(1.0)
+    }
+
+    /// Per-result tool-output cap for this session. Starts at the configured
+    /// value and drops after a pressure prune so later rounds keep the smaller
+    /// results instead of re-inflating the request.
+    fn tool_output_cap(&self, session_id: &str) -> usize {
+        let configured = self.config.load().context.tool_output_tokens.max(1);
+        let caps = match self.tool_caps.lock() {
+            Ok(caps) => caps,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        caps.get(session_id)
+            .copied()
+            .map(|cap| cap.min(configured))
+            .unwrap_or(configured)
+    }
+
+    fn set_tool_output_cap(&self, session_id: &str, cap: usize) {
+        let mut caps = match self.tool_caps.lock() {
+            Ok(caps) => caps,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        caps.insert(session_id.to_string(), cap.max(1));
+    }
+
+    fn clear_tool_output_cap(&self, session_id: &str) {
+        let mut caps = match self.tool_caps.lock() {
+            Ok(caps) => caps,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        caps.remove(session_id);
     }
 
     /// Feed provider-reported prompt usage back into the estimate. The observed
@@ -8612,11 +8718,15 @@ impl Daemon {
         Ok(format!("{COMPACTION_PREFIX}\n\n{summary}"))
     }
 
-    /// Summarize the oldest history when the request is about to cross
-    /// `context.auto_compact_threshold` of the budget. `force` bypasses the
-    /// threshold after the provider reports a context-length error. Summary
-    /// failures are logged and ignored: a provider hiccup must not block the
-    /// turn.
+    /// Bring the request back under `context.auto_compact_threshold` of the
+    /// budget. Pruning tool output is tried first because it is free and
+    /// reversible; only when that fails to relieve the pressure is the oldest
+    /// history summarized. `force` bypasses the threshold after the provider
+    /// reports a context-length error. Summary failures are logged and ignored:
+    /// a provider hiccup must not block the turn.
+    ///
+    /// The returned flag means "the context was reduced", whether by pruning or
+    /// by a summary.
     #[allow(clippy::too_many_arguments)]
     async fn auto_compact_if_needed(
         &self,
@@ -8639,6 +8749,31 @@ impl Daemon {
         let over_threshold = (info.total_tokens as f64) > threshold * info.budget_tokens as f64;
         if !force && !over_threshold {
             return (ledger, false);
+        }
+        // Raw tool output is usually the bulk of a long session and it is
+        // recoverable (spill files, or just re-running the command), so shrink
+        // it before paying for a summary. A partial cut is not worth it: the
+        // summary would still run and pay both costs, so only keep the pruned
+        // ledger when it alone clears the threshold.
+        let configured = config.context.tool_output_tokens.max(1);
+        let cap = (configured / 4).max(1);
+        if cap < self.tool_output_cap(session_id) {
+            match self
+                .build_ledger_capped(session_id, tools, events, static_context, cap)
+                .await
+            {
+                Ok(pruned) => {
+                    let pruned_info = pruned.info();
+                    let relieved = (pruned_info.total_tokens as f64)
+                        <= threshold * pruned_info.budget_tokens as f64;
+                    if pruned_info.total_tokens < info.total_tokens && relieved {
+                        self.set_tool_output_cap(session_id, cap);
+                        self.emit_context(session_id, &pruned);
+                        return (pruned, true);
+                    }
+                }
+                Err(err) => eprintln!("eixd: pressure prune failed: {err:#}"),
+            }
         }
         // Forced recovery may have only two user turns, in which case the
         // retention window leaves nothing to summarize. Fall back to keeping
@@ -8694,16 +8829,29 @@ impl Daemon {
             )
             .await
         {
-            Ok(summary) => {
-                self.plugins
-                    .run_compact_after(session_id, turn_id, &summary)
-                    .await
-            }
+            Ok(summary) => summary,
             Err(err) => {
                 eprintln!("eixd: auto-compaction skipped: {err:#}");
                 return (ledger, false);
             }
         };
+        // A summary that barely shrinks the history would cost a provider call
+        // every round while freeing almost nothing, so keep the history and let
+        // trimming handle it. Tiny ranges are exempt: there the summary is
+        // dominated by fixed prose, and tests exercise exact compaction on them.
+        const MIN_SHRINK_TOKENS: usize = 256;
+        let summary_tokens = crate::context::estimate_tokens(&summary);
+        if tokens >= MIN_SHRINK_TOKENS && summary_tokens * 10 >= tokens * 9 {
+            eprintln!(
+                "eixd: auto-compaction skipped: summary ({summary_tokens} tokens) does not \
+                 shrink {tokens} tokens of history"
+            );
+            return (ledger, false);
+        }
+        let summary = self
+            .plugins
+            .run_compact_after(session_id, turn_id, &summary)
+            .await;
         let event = match self.store.append_event(
             session_id,
             EventKind::ContextCompacted,
@@ -8723,6 +8871,9 @@ impl Daemon {
             }
         };
         self.emit_event(&event);
+        // The summary freed room; a reduced tool-output cap from an earlier
+        // prune would keep new results unnecessarily small.
+        self.clear_tool_output_cap(session_id);
         self.emit_value(
             "context.compacted",
             json!({
@@ -8790,6 +8941,8 @@ impl Daemon {
             cancel.store(true, Ordering::Relaxed);
         }
         self.staging.clear_session(&params.session_id);
+        self.remove_spill(&params.session_id);
+        self.clear_tool_output_cap(&params.session_id);
         self.memory.clear(&session.cwd).await?;
         let ledger = self.build_ledger(&params.session_id).await?;
         self.emit_context(&params.session_id, &ledger);
@@ -9895,6 +10048,7 @@ impl Daemon {
         output: &str,
         duration_ms: u64,
     ) -> Result<()> {
+        let spill = self.spill_tool_output(session_id, output);
         let event = self.store.append_event(
             session_id,
             EventKind::ToolResult,
@@ -9905,10 +10059,46 @@ impl Daemon {
                 denied,
                 output: output.to_string(),
                 duration_ms: (duration_ms > 0).then_some(duration_ms),
+                spill,
             }),
         )?;
         self.emit_event(&event);
         Ok(())
+    }
+
+    /// Persist the complete text of a tool result that will be truncated in the
+    /// provider view. The provider message then names this file, so the model
+    /// can re-read the elided middle instead of paying to run the command
+    /// again. Best effort: a storage failure leaves truncation unchanged.
+    fn spill_tool_output(&self, session_id: &str, output: &str) -> Option<String> {
+        let cap = self.tool_output_cap(session_id);
+        if crate::context::estimate_tokens(output) <= cap {
+            return None;
+        }
+        let dir = eix_core::config::spill_dir().join(session_id);
+        if let Err(err) = fs::create_dir_all(&dir) {
+            eprintln!("eixd: cannot create spill dir {}: {err}", dir.display());
+            return None;
+        }
+        let _ = Store::set_permissions(&dir);
+        let path = dir.join(format!("{}.txt", Uuid::new_v4()));
+        if let Err(err) = fs::write(&path, output) {
+            eprintln!("eixd: cannot write spill {}: {err}", path.display());
+            return None;
+        }
+        let _ = Store::set_permissions(&path);
+        Some(path.display().to_string())
+    }
+
+    /// Drop spilled tool output for a session that is being deleted or cleared.
+    /// Nothing in the event log points at these files afterwards.
+    fn remove_spill(&self, session_id: &str) {
+        let dir = eix_core::config::spill_dir().join(session_id);
+        if let Err(err) = fs::remove_dir_all(&dir) {
+            if err.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("eixd: cannot remove spill dir {}: {err}", dir.display());
+            }
+        }
     }
 
     /// Ask the user one to three questions and block until they answer or the
@@ -10226,6 +10416,7 @@ impl Daemon {
                     reasoning_signature: None,
                     cancelled: true,
                     usage: None,
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                 }),
             )?;
@@ -11895,36 +12086,40 @@ fn system_prompt(
     tools: &[ToolDefinition],
     session_rules: &[PermissionRule],
 ) -> String {
+    // One-shot callers (`/btw`, tests) want everything the model sees. The
+    // turn loop splits the parts instead: only the stable half goes in the
+    // head system message.
+    format!(
+        "{}\n\n{}",
+        stable_system_prompt(config, model, session, resources),
+        session_directives(config, session, mode, tools, session_rules)
+    )
+}
+
+/// The part of the system prompt that stays byte-identical for the whole
+/// session: base contract, model extras, agent instructions and the sub-agent
+/// catalog. Approval rules and tool notes are deliberately absent — they change
+/// with the mode and the catalog, and rewriting the head would invalidate the
+/// provider's cached prefix.
+fn stable_system_prompt(
+    config: &Config,
+    model: &str,
+    session: &Session,
+    resources: Option<&PromptResources>,
+) -> String {
     let is_subagent = session.origin == SessionOrigin::Agent;
     let custom = config.provider_runtime.system_prompt.as_deref();
     let workspace = session.cwd.display().to_string();
-    let tool_help = tool_note(tools);
     let mut prompt = if let Some(prompt) = custom {
-        if is_subagent {
-            format!("{prompt}{tool_help}")
-        } else {
-            format!(
-                "{prompt}{tool_help}{}",
-                permissions_note(config, mode, session_rules)
-            )
-        }
+        prompt.to_string()
     } else if is_subagent {
-        format!(
-            "{}{}",
-            SUBAGENT_SYSTEM_PROMPT.replace("{cwd}", &workspace),
-            tool_help
-        )
+        SUBAGENT_SYSTEM_PROMPT.replace("{cwd}", &workspace)
     } else {
         let base = match config.provider_runtime.prompt_profile {
             eix_core::PromptProfile::Concise => CONCISE_SYSTEM_PROMPT,
             eix_core::PromptProfile::Default => BASE_SYSTEM_PROMPT,
         };
-        format!(
-            "{}{}{}",
-            base.replace("{cwd}", &workspace),
-            tool_help,
-            permissions_note(config, mode, session_rules)
-        )
+        base.replace("{cwd}", &workspace)
     };
     // A custom prompt may not describe the sub-agent contract; add it.
     if is_subagent && custom.is_some() {
@@ -11975,18 +12170,39 @@ fn system_prompt(
             prompt.push('.');
         }
     }
-    if session.has_worktree() && config.integration.enabled {
-        prompt.push_str(
-            "\n\n## Worktree integration\n\
-             This session runs in an isolated git worktree. Commit your changes before you finish.\n\
-             Run the project tests after your edits. When they pass, call the `ready` tool (or run\n\
-             `eix ready`) so the daemon can rebase, test and fast-forward the base branch. Do not\n\
-             merge or rebase the base branch yourself. If eix asks you to repair a rebase conflict\n\
-             or a failing integration test, resolve it in this worktree, run the tests, then call\n\
-             `ready` again.",
-        );
-    }
     prompt
+}
+
+/// Worktree guidance depends on session state, so it belongs with the tail
+/// directives, not the cached head.
+const WORKTREE_INTEGRATION_NOTE: &str = "\n\n## Worktree integration\n\
+     This session runs in an isolated git worktree. Commit your changes before you finish.\n\
+     Run the project tests after your edits. When they pass, call the `ready` tool (or run\n\
+     `eix ready`) so the daemon can rebase, test and fast-forward the base branch. Do not\n\
+     merge or rebase the base branch yourself. If eix asks you to repair a rebase conflict\n\
+     or a failing integration test, resolve it in this worktree, run the tests, then call\n\
+     `ready` again.";
+
+/// Directives that depend on the current mode, permission rules and tool
+/// catalog. They are re-rendered every round and appended after history, so a
+/// mode switch or a new MCP tool does not rewrite the head system prompt and
+/// invalidate the provider's cached prefix.
+fn session_directives(
+    config: &Config,
+    session: &Session,
+    mode: SessionMode,
+    tools: &[ToolDefinition],
+    session_rules: &[PermissionRule],
+) -> String {
+    let mut out = String::new();
+    if session.origin != SessionOrigin::Agent {
+        out.push_str(&permissions_note(config, mode, session_rules));
+    }
+    out.push_str(&tool_note(tools));
+    if session.has_worktree() && config.integration.enabled {
+        out.push_str(WORKTREE_INTEGRATION_NOTE);
+    }
+    out.trim().to_string()
 }
 
 /// Best-effort status from the child's structured reply. A child that cannot
@@ -12723,6 +12939,31 @@ mod tests {
         );
         assert!(child.contains("cannot see the parent conversation"));
         assert!(child.contains("read-only sub-agent"));
+    }
+
+    #[test]
+    fn approval_and_tool_notes_ride_in_the_tail_directives() {
+        let config = Config::default();
+        let session = Session::new("id", "eix", "/home/me/eix");
+        let tools = test_tools();
+        let head = stable_system_prompt(&config, "", &session, None);
+        // The cached head must not depend on the mode or the tool catalog.
+        assert!(!head.contains("## Approvals"), "{head}");
+        assert!(!head.contains("## Tools"), "{head}");
+        assert_eq!(stable_system_prompt(&config, "", &session, None), head);
+
+        let build = session_directives(&config, &session, SessionMode::Build, &tools, &[]);
+        let plan = session_directives(&config, &session, SessionMode::Plan, &tools, &[]);
+        assert!(build.contains("## Approvals"));
+        assert!(build.contains("## Tools"));
+        assert!(build.contains("Mode: Build"));
+        assert!(plan.contains("Mode: Plan"));
+        assert_ne!(build, plan, "switching modes must change the tail only");
+
+        // The one-shot wrapper still shows the model everything.
+        let combined = system_prompt(&config, "", &session, SessionMode::Build, None, &tools, &[]);
+        assert!(combined.starts_with(&head));
+        assert!(combined.contains("Mode: Build"));
     }
 
     #[test]

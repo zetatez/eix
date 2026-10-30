@@ -160,6 +160,63 @@ async fn daemon_streams_and_persists_a_turn() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn assistant_images_are_persisted_from_provider_parts() -> anyhow::Result<()> {
+    let dir = temp_dir("assistant-image");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(image_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-image".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "image", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "draw it"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    let assistant = attached
+        .events
+        .iter()
+        .find(|event| event.kind == EventKind::AssistantMessage)
+        .expect("assistant event");
+    assert_eq!(assistant.payload["text"], "done");
+    assert_eq!(assistant.payload["images"][0]["mime"], "image/png");
+    assert_eq!(assistant.payload["images"][0]["data"], "QUJD");
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn disconnecting_a_client_does_not_cancel_the_turn() -> anyhow::Result<()> {
     let dir = temp_dir("client-disconnect");
     std::fs::create_dir_all(&dir)?;
@@ -6258,6 +6315,28 @@ async fn mock_provider_delayed(
     }
 }
 
+/// Reply with an OpenAI-style content array that carries an image part.
+async fn image_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            bodies.lock().await.push(body);
+            let events = concat!(
+                "data: {\"model\":\"mock-image\",\"choices\":[{\"delta\":{\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,QUJD\"}}]}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\n\n",
+                "data: [DONE]\n\n",
+            );
+            write_sse(&mut socket, events).await;
+        });
+    }
+}
+
 /// Like `mock_provider`, but records the raw request headers so tests can
 /// assert on provider authentication.
 async fn header_capturing_provider(listener: TcpListener, headers: Arc<Mutex<Vec<String>>>) {
@@ -6959,6 +7038,247 @@ async fn plan_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
     }
 }
 
+async fn large_output_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+
+            let has_tool_result = value["messages"]
+                .as_array()
+                .map(|messages| messages.iter().any(|message| message["role"] == "tool"))
+                .unwrap_or(false);
+            let chunk = if has_tool_result {
+                json!({
+                    "model": "mock-large",
+                    "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                })
+            } else {
+                let arguments =
+                    json!({"cmd": "cat big.txt", "max_output_tokens": 100_000}).to_string();
+                json!({
+                    "model": "mock-large",
+                    "choices": [{
+                        "delta": {
+                            "tool_calls": [{
+                                "index": 0,
+                                "id": "call_big",
+                                "type": "function",
+                                "function": {"name": "exec_command", "arguments": arguments},
+                            }]
+                        },
+                        "finish_reason": "tool_calls",
+                    }],
+                })
+            };
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn pressure_prunes_tool_output_before_summarizing() -> anyhow::Result<()> {
+    let dir = temp_dir("prune-first");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("big.txt"), "0123456789abcdef\n".repeat(25_000))?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(large_output_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-large".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    // The raw result is huge, so the ordinary build truncates it to 20k tokens.
+    config.tools.max_output_bytes = 400_000;
+    config.context.tool_output_tokens = 20_000;
+    // Pressure is certain before pruning and impossible after it: pruning
+    // leaves ~5k tokens of tool output against a 12.8k threshold.
+    config.context.budget_tokens = 16_000;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "prune", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "read the file"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(
+        !attached
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::ContextCompacted),
+        "pruning should have relieved the pressure without a summary"
+    );
+
+    let bodies = bodies.lock().await;
+    assert_eq!(bodies.len(), 2, "a prune must not add a summary request");
+    let second: Value = serde_json::from_str(&bodies[1])?;
+    let tool = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool message");
+    let content = tool["content"].as_str().unwrap();
+    assert!(content.contains("truncated"), "{content}");
+    // The unpruned view is ~80KB; the pruned one is ~20KB plus a marker.
+    assert!(
+        content.len() < 30_000,
+        "tool output was not pruned: {} chars",
+        content.len()
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+async fn verbose_summary_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) {
+    loop {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let bodies = Arc::clone(&bodies);
+        tokio::spawn(async move {
+            let Some(body) = read_http_body(&mut socket).await else {
+                return;
+            };
+            let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+            bodies.lock().await.push(body);
+            let summarizing = value["messages"]
+                .as_array()
+                .map(|messages| {
+                    messages.iter().any(|message| {
+                        message["content"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("Summarize the conversation"))
+                    })
+                })
+                .unwrap_or(false);
+            // A summary as big as the history it should replace.
+            let content = if summarizing {
+                "the same details again ".repeat(5_000)
+            } else {
+                "ok".to_string()
+            };
+            let chunk = json!({
+                "model": "mock-verbose",
+                "choices": [{"delta": {"content": content}, "finish_reason": "stop"}],
+            });
+            let events = format!("data: {chunk}\n\ndata: [DONE]\n\n");
+            write_sse(&mut socket, &events).await;
+        });
+    }
+}
+
+#[tokio::test]
+async fn a_summary_that_does_not_shrink_history_is_rejected() -> anyhow::Result<()> {
+    let dir = temp_dir("no-shrink");
+    std::fs::create_dir_all(&dir)?;
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(verbose_summary_provider(listener, Arc::clone(&bodies)));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-verbose".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.context.instructions_files = Vec::new();
+    config.context.workspace_summary = false;
+    // Below the budget, so trimming keeps the history intact, but far enough
+    // over the threshold that compaction is attempted on every round.
+    config.context.budget_tokens = 8_000;
+    config.context.auto_compact_threshold = 0.5;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "no-shrink", "cwd": dir}))
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let padding = "build the thing carefully ".repeat(120);
+    for text in [padding.clone(), padding.clone(), padding] {
+        let submitted: SubmitResult = client
+            .request(
+                "prompt.submit",
+                json!({"session_id": session_id, "text": text}),
+            )
+            .await?;
+        loop {
+            let notification = client.next_notification().await?;
+            if notification.method == "turn.completed"
+                && notification.params["turn_id"] == submitted.turn_id.as_str()
+            {
+                assert!(notification.params["error"].is_null());
+                break;
+            }
+        }
+    }
+
+    let attached: AttachResult = client
+        .request("session.attach", json!({"session_id": session_id}))
+        .await?;
+    assert!(
+        !attached
+            .events
+            .iter()
+            .any(|event| event.kind == EventKind::ContextCompacted),
+        "a non-shrinking summary must not be committed"
+    );
+    let bodies = bodies.lock().await;
+    assert!(
+        bodies
+            .iter()
+            .any(|body| body.contains("Summarize the conversation")),
+        "the summary was never requested"
+    );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
 #[tokio::test]
 async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Result<()> {
     let dir = temp_dir("auto-compact");
@@ -7075,7 +7395,7 @@ async fn repeat_tool_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<Strin
                     messages.iter().rev().find(|message| {
                         let content = message["content"].as_str().unwrap_or_default();
                         message["role"] != "user"
-                            || !["<environment>", "<tasks>", "<context>"]
+                            || !["<environment>", "<tasks>", "<context>", "<directives>"]
                                 .iter()
                                 .any(|tag| content.starts_with(tag))
                     })

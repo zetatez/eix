@@ -1306,11 +1306,21 @@ impl ContextConfig {
     /// wins over the static default so a 32k budget cannot be sent to an 8k
     /// model. The reserve leaves room for the completion and provider-side
     /// tokenization differences.
-    pub fn effective_budget_tokens(&self, model_context_tokens: Option<usize>) -> usize {
+    pub fn effective_budget_tokens(
+        &self,
+        model_context_tokens: Option<usize>,
+        max_output_tokens: usize,
+    ) -> usize {
         let Some(window) = model_context_tokens.filter(|tokens| *tokens > 0) else {
             return self.budget_tokens.max(1);
         };
-        let reserve = (window / 4).clamp(1_024, 8_000);
+        // The prompt and the completion share one window. Reserving room for the
+        // largest completion the provider may return (plus margin for estimate
+        // error) stops a request that the ledger says fits from dying with a
+        // context-length error. A small output budget therefore buys more input
+        // room than a large one.
+        let reserve = (max_output_tokens as f64 * 1.25) as usize;
+        let reserve = reserve.clamp(1_024, (window / 2).max(1_024));
         self.budget_tokens
             .min(window.saturating_sub(reserve).max(1))
             .max(1)
@@ -1660,6 +1670,10 @@ pub struct ModelConfig {
     pub input_cost: Option<f64>,
     /// USD per million output tokens.
     pub output_cost: Option<f64>,
+    /// USD per million prompt tokens served from the provider's prefix cache.
+    /// Defaults to 10% of `input_cost` (the common cache-hit rate) so cost
+    /// estimates do not look wrong on routes with prompt caching.
+    pub cache_read_cost: Option<f64>,
     /// Advertised context window, when known.
     pub context_tokens: Option<usize>,
     /// Variants accepted as `id#variant` (for example `high`, `medium`, `low`).
@@ -2027,6 +2041,11 @@ pub struct ProviderSource {
     pub default: bool,
 }
 
+/// Cache-hit prompt tokens are billed at this share of the input rate when the
+/// model config does not set `cache_read_cost`. DeepSeek and Anthropic both
+/// charge about a tenth of the input price for cache reads.
+const DEFAULT_CACHE_READ_RATIO: f64 = 0.1;
+
 /// Everything the provider needs for one request, resolved from the selected
 /// model id.
 #[derive(Debug, Clone)]
@@ -2041,17 +2060,38 @@ pub struct ModelRoute {
     pub reasoning_effort: Option<String>,
     pub input_cost: Option<f64>,
     pub output_cost: Option<f64>,
+    /// Prompt tokens served from the prefix cache, priced separately.
+    pub cache_read_cost: Option<f64>,
     /// Advertised context window for this model, when known.
     pub context_tokens: Option<usize>,
 }
 
 impl ModelRoute {
     /// Estimated USD cost for one completion, when pricing is configured.
+    /// Cached prompt tokens are billed at `cache_read_cost` instead of the full
+    /// input rate, so cost tracking reflects cache hits.
     pub fn cost(&self, prompt_tokens: u64, completion_tokens: u64) -> Option<f64> {
+        self.cost_with_cache(prompt_tokens, completion_tokens, 0)
+    }
+
+    /// Like [`cost`](Self::cost), but `cache_read_tokens` (a subset of
+    /// `prompt_tokens`) is charged at the cache rate.
+    pub fn cost_with_cache(
+        &self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cache_read_tokens: u64,
+    ) -> Option<f64> {
         let input = self.input_cost?;
         let output = self.output_cost?;
+        let cached = cache_read_tokens.min(prompt_tokens);
+        let uncached = prompt_tokens - cached;
+        let cache_price = self
+            .cache_read_cost
+            .unwrap_or(input * DEFAULT_CACHE_READ_RATIO);
         Some(
-            (prompt_tokens as f64 / 1_000_000.0) * input
+            (uncached as f64 / 1_000_000.0) * input
+                + (cached as f64 / 1_000_000.0) * cache_price
                 + (completion_tokens as f64 / 1_000_000.0) * output,
         )
     }
@@ -2887,6 +2927,7 @@ impl Config {
             }
             if model.input_cost.is_some_and(|cost| cost < 0.0)
                 || model.output_cost.is_some_and(|cost| cost < 0.0)
+                || model.cache_read_cost.is_some_and(|cost| cost < 0.0)
             {
                 return Err(ConfigError::Invalid(format!(
                     "models[{index}] cost must not be negative"
@@ -3302,6 +3343,13 @@ impl Config {
             reasoning_effort,
             input_cost: resolved.input_cost,
             output_cost: resolved.output_cost,
+            cache_read_cost: configured
+                .and_then(|model| model.cache_read_cost)
+                .or_else(|| {
+                    resolved
+                        .input_cost
+                        .map(|cost| cost * DEFAULT_CACHE_READ_RATIO)
+                }),
             context_tokens: resolved.context_tokens,
         }
     }
@@ -3890,6 +3938,26 @@ pub fn db_path() -> PathBuf {
     data_dir().join("eix.sqlite3")
 }
 
+/// Complete tool outputs that were truncated in the provider view. Kept under
+/// the data dir so a tool call can re-read them, and mounted read-only in the
+/// sandbox for shell-based inspection.
+pub fn spill_dir() -> PathBuf {
+    SPILL_ROOT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| data_dir().join("spill"))
+}
+
+/// Point [`spill_dir`] at a daemon's actual data directory. `eixd::run` calls
+/// this once so the writer, the sandbox mount and the path guard agree even
+/// when the daemon was started with `--data-dir`. The first call wins, which
+/// matches production; tests that run several daemons share that one root.
+pub fn set_spill_root(data_dir: &Path) {
+    let _ = SPILL_ROOT.set(data_dir.join("spill"));
+}
+
+static SPILL_ROOT: OnceLock<PathBuf> = OnceLock::new();
+
 pub fn daemon_log_path() -> PathBuf {
     data_dir().join("eixd.log")
 }
@@ -4105,15 +4173,56 @@ persistent_mode = true
             ..ContextConfig::default()
         };
         // No known window: keep the configured budget.
-        assert_eq!(context.effective_budget_tokens(None), 32_000);
-        assert_eq!(context.effective_budget_tokens(Some(0)), 32_000);
+        assert_eq!(context.effective_budget_tokens(None, 8_192), 32_000);
+        assert_eq!(context.effective_budget_tokens(Some(0), 8_192), 32_000);
 
-        // A high configured budget is clamped below a small real window.
-        assert_eq!(context.effective_budget_tokens(Some(8_000)), 6_000);
+        // A high configured budget is clamped below a small real window. The
+        // reserve follows the completion budget: 8192 * 1.25 = 10240, capped at
+        // half the window (4000) here.
+        assert_eq!(context.effective_budget_tokens(Some(8_000), 8_192), 4_000);
+        // A small completion budget leaves more room for the prompt.
+        assert_eq!(context.effective_budget_tokens(Some(8_000), 1_024), 6_720);
         // A large window still uses the configured budget.
-        assert_eq!(context.effective_budget_tokens(Some(1_000_000)), 32_000);
+        assert_eq!(
+            context.effective_budget_tokens(Some(1_000_000), 8_192),
+            32_000
+        );
         // Tiny windows never collapse to zero.
-        assert_eq!(context.effective_budget_tokens(Some(1)), 1);
+        assert_eq!(context.effective_budget_tokens(Some(1), 8_192), 1);
+    }
+
+    #[test]
+    fn cache_reads_are_billed_at_the_cache_rate() {
+        let route = ModelRoute {
+            provider: "p".into(),
+            kind: ProviderKind::OpenAi,
+            model: "m".into(),
+            endpoint: String::new(),
+            api_key: None,
+            reasoning_effort: None,
+            input_cost: Some(3.0),
+            output_cost: Some(15.0),
+            cache_read_cost: None,
+            context_tokens: None,
+        };
+        // 1M prompt tokens without a cache hit: the plain input rate.
+        let full = route.cost(1_000_000, 0).unwrap();
+        assert!((full - 3.0).abs() < 1e-9, "{full}");
+        // Half served from cache at the default 10% ratio.
+        let cached = route.cost_with_cache(1_000_000, 0, 500_000).unwrap();
+        assert!((cached - 1.65).abs() < 1e-9, "{cached}");
+
+        // An explicit cache price wins over the default ratio.
+        let mut custom = route.clone();
+        custom.cache_read_cost = Some(0.6);
+        let priced = custom.cost_with_cache(1_000_000, 0, 500_000).unwrap();
+        assert!((priced - 1.8).abs() < 1e-9, "{priced}");
+
+        // Cache reads are a subset of the prompt; extra ones are not billed
+        // twice.
+        let all_cached = route.cost_with_cache(1_000, 0, 1_000).unwrap();
+        assert_eq!(route.cost_with_cache(1_000, 0, 5_000).unwrap(), all_cached);
+        assert!(all_cached < route.cost(1_000, 0).unwrap());
     }
 
     #[test]

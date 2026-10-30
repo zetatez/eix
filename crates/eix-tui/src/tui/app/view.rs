@@ -293,6 +293,12 @@ impl App {
             .unwrap_or(0);
         let prev_total = prev_history_len + self.views[index].tail.lines.len();
         let prev_end = (prev_scroll + inner_height).min(prev_total);
+        let remote_rev = math_image::remote_revision();
+        if self.views[index].remote_rev != remote_rev {
+            self.views[index].remote_rev = remote_rev;
+            self.views[index].math_rev = self.views[index].math_rev.wrapping_add(1);
+            self.views[index].tail_math_rev = self.views[index].tail_math_rev.wrapping_add(1);
+        }
         self.views[index].bump_math_if_ready(prev_scroll, prev_end, prev_history_len);
         // Stored history is rendered once and cached; only the live tail is
         // rebuilt on each frame. This keeps streaming cheap for long sessions.

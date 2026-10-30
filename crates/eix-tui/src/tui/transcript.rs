@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use eix_core::{
     ApprovalRequiredPayload, AssistantMessagePayload, ContextCompactedPayload,
-    Event as SessionEvent, EventKind, InputRequiredPayload, PatchProposedPayload,
+    Event as SessionEvent, EventKind, ImageAttachment, InputRequiredPayload, PatchProposedPayload,
     PatchResultPayload, ToolCallPayload, ToolResultPayload, UserMessagePayload,
 };
 use ratatui::style::{Color, Modifier, Style};
@@ -203,13 +203,14 @@ enum Block {
     User {
         seq: u64,
         text: String,
-        images: Vec<String>,
+        images: Vec<ImageAttachment>,
     },
     Assistant {
         seq: u64,
         text: String,
         reasoning: Option<String>,
         cancelled: bool,
+        images: Vec<ImageAttachment>,
     },
     Tool(Box<ToolBlock>),
     Note {
@@ -380,6 +381,7 @@ fn render_block(
             text,
             reasoning,
             cancelled,
+            images: attachments,
         } => {
             if let Some(reasoning) = reasoning.as_deref().filter(|r| !r.trim().is_empty()) {
                 thinking(
@@ -393,8 +395,17 @@ fn render_block(
                     images,
                 );
             }
-            if !text.is_empty() {
-                assistant_message(&mut out, text, *cancelled, width, theme, images, base);
+            if !text.is_empty() || !attachments.is_empty() {
+                assistant_message(
+                    &mut out,
+                    text,
+                    attachments,
+                    *cancelled,
+                    width,
+                    theme,
+                    images,
+                    base,
+                );
             }
         }
         Block::Tool(block) => {
@@ -709,9 +720,18 @@ fn append_tail(
             );
         }
         if !live.text.is_empty() {
-            assistant_message(out, live.text, false, width, theme, true, base);
+            assistant_message(out, live.text, &[], false, width, theme, true, base);
         } else if live.reasoning.is_empty() {
-            assistant_message(out, waiting_dots(tick), false, width, theme, true, base);
+            assistant_message(
+                out,
+                waiting_dots(tick),
+                &[],
+                false,
+                width,
+                theme,
+                true,
+                base,
+            );
         }
     }
     if !queued.is_empty() {
@@ -764,7 +784,7 @@ fn collect_into(
                         Block::User {
                             seq: event.seq,
                             text: payload.text,
-                            images: payload.images.into_iter().map(|image| image.path).collect(),
+                            images: payload.images,
                         }
                     );
                 }
@@ -778,6 +798,7 @@ fn collect_into(
                             text: payload.text,
                             reasoning: payload.reasoning,
                             cancelled: payload.cancelled,
+                            images: payload.images,
                         }
                     );
                 }
@@ -1245,7 +1266,7 @@ fn push_bubble(
 fn user_message(
     out: &mut Transcript,
     text: &str,
-    images: &[String],
+    images: &[ImageAttachment],
     width: usize,
     theme: Theme,
     base: Option<&Path>,
@@ -1298,9 +1319,11 @@ fn user_message(
 
 /// Agent output: rendered as Markdown, indented only enough to breathe, with
 /// no role label.
+#[allow(clippy::too_many_arguments)]
 fn assistant_message(
     out: &mut Transcript,
     text: &str,
+    attachments: &[ImageAttachment],
     cancelled: bool,
     width: usize,
     theme: Theme,
@@ -1315,7 +1338,7 @@ fn assistant_message(
         images,
         base,
     );
-    if rendered.lines.is_empty() {
+    if rendered.lines.is_empty() && attachments.is_empty() {
         rendered.lines.push(Line::from("  "));
     }
     if cancelled {
@@ -1324,7 +1347,75 @@ fn assistant_message(
         }
     }
     out.push_rendered(rendered);
+    for attachment in attachments {
+        push_image_attachment(out, attachment, width, theme, base);
+    }
     out.blank();
+}
+
+/// Place a provider-returned or user-attached image outside a chat bubble.
+/// Undrawable images keep a one-line label instead of disappearing.
+fn push_image_attachment(
+    out: &mut Transcript,
+    attachment: &ImageAttachment,
+    width: usize,
+    theme: Theme,
+    base: Option<&Path>,
+) {
+    let prefix_width = BODY_INDENT.len();
+    let avail = width.saturating_sub(prefix_width).max(1);
+    let Some(image) = render_attachment(attachment, avail, base) else {
+        out.push(
+            Line::from(vec![
+                Span::raw(BODY_INDENT),
+                Span::styled(format!("[image] {}", image_label(attachment)), dim(theme)),
+            ]),
+            None,
+        );
+        return;
+    };
+    let start = out.lines.len();
+    let rows = usize::from(image.rows.max(1));
+    let cols = usize::from(image.cols);
+    let pad = avail.saturating_sub(cols) / 2;
+    for _ in 0..rows {
+        out.push(Line::from(Span::raw(BODY_INDENT)), None);
+    }
+    out.math.push(math_image::Placement {
+        line: start,
+        column: (prefix_width + pad).min(u16::MAX as usize) as u16,
+        image,
+    });
+}
+
+/// Resolve one attachment to a thumbnail. Inline payloads are decoded
+/// directly; URLs are downloaded by the image worker and local paths are read
+/// from disk relative to the session cwd.
+fn render_attachment(
+    attachment: &ImageAttachment,
+    width: usize,
+    base: Option<&Path>,
+) -> Option<math_image::MathImage> {
+    let cols = Some(width.min(u16::MAX as usize) as u16);
+    if !attachment.data.is_empty() {
+        math_image::render_base64(&attachment.data, cols, None)
+    } else if attachment.path.starts_with("http://") || attachment.path.starts_with("https://") {
+        math_image::render_remote(&attachment.path, cols, None)
+    } else if attachment.path.starts_with("data:") {
+        math_image::render_data_uri(&attachment.path, cols, None)
+    } else if !attachment.path.is_empty() {
+        math_image::render_file(Path::new(&attachment.path), base, cols, None)
+    } else {
+        None
+    }
+}
+
+fn image_label(attachment: &ImageAttachment) -> &str {
+    if attachment.path.is_empty() {
+        "inline image"
+    } else {
+        &attachment.path
+    }
 }
 
 /// A one-line status note (context changes, errors).
@@ -2310,25 +2401,20 @@ fn push_thumbnail(
     });
 }
 
-/// Thumbnail rows for user attachments inside a chat bubble. Paths that cannot
-/// be decoded keep the old `[image] path` line.
+/// Thumbnail rows for user attachments inside a chat bubble. Attachments that
+/// cannot be decoded keep the old `[image] path` line.
 fn thumbnail_rows(
-    images: &[String],
+    images: &[ImageAttachment],
     width: usize,
     theme: Theme,
     base: Option<&Path>,
 ) -> (Vec<Line<'static>>, Vec<math_image::Placement>) {
     let mut lines = Vec::new();
     let mut placements = Vec::new();
-    for path in images {
-        let Some(image) = math_image::render_file(
-            Path::new(path),
-            base,
-            Some(width.min(u16::MAX as usize) as u16),
-            None,
-        ) else {
+    for attachment in images {
+        let Some(image) = render_attachment(attachment, width, base) else {
             lines.push(Line::from(Span::styled(
-                format!("[image] {path}"),
+                format!("[image] {}", image_label(attachment)),
                 Style::default().fg(theme.comment.unwrap_or(MUTED)),
             )));
             continue;
@@ -2561,6 +2647,81 @@ mod tests {
             .join("\n");
         assert!(text.contains("$$x = 1$$"), "{text}");
         assert!(rich.math.is_empty(), "{text}");
+    }
+
+    #[test]
+    fn assistant_image_parts_keep_a_label_when_undrawable() {
+        let events = vec![SessionEvent {
+            session_id: "s".into(),
+            seq: 1,
+            ts: 0,
+            kind: EventKind::AssistantMessage,
+            payload: serde_json::json!({
+                "text": "",
+                "model": "m",
+                "images": [
+                    {"path": "", "mime": "image/png", "data": "QUJD", "bytes": 3},
+                    {"path": "https://example.test/a.png", "mime": ""}
+                ]
+            }),
+        }];
+        let out = render_events(&events, 60, Theme::default(), None);
+        let text = all_text(&out);
+        // No terminal graphics service in unit tests: both images keep a
+        // one-line label instead of vanishing with the empty text.
+        assert!(text.contains("[image] inline image"), "{text}");
+        assert!(
+            text.contains("[image] https://example.test/a.png"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn user_attachments_accept_inline_payloads() {
+        let attachment = ImageAttachment {
+            path: String::new(),
+            mime: "image/png".into(),
+            data: "QUJD".into(),
+            blob: None,
+            bytes: Some(3),
+        };
+        let mut out = Transcript::new();
+        user_message(
+            &mut out,
+            "",
+            std::slice::from_ref(&attachment),
+            40,
+            Theme::default(),
+            None,
+        );
+        let text = all_text(&out);
+        assert!(text.contains("[image] inline image"), "{text}");
+        assert!(!text.contains("QUJD"), "base64 must stay hidden: {text}");
+    }
+
+    #[test]
+    fn bubble_keeps_image_only_turns() {
+        let mut out = Transcript::new();
+        // User attachments reserve their rows with empty placeholder lines.
+        let content = vec![Line::from(""), Line::from("")];
+        let placement = math_image::Placement {
+            line: 0,
+            column: 0,
+            image: test_image(2, 2),
+        };
+        push_bubble(
+            &mut out,
+            content,
+            Vec::new(),
+            vec![placement],
+            Vec::new(),
+            40,
+            Theme::default(),
+        );
+        let placement = out.math.first().expect("image-only placement");
+        // The top border occupies line 0; both placeholder rows survive.
+        assert_eq!(placement.line, 1);
+        assert_eq!(placement.column, 36);
     }
 
     #[test]

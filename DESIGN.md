@@ -1745,6 +1745,13 @@ subagent-capable agent（模型会在 system prompt 里看到列表）。
 终端 / 粘贴路径后再发送。路径可以是相对/绝对路径、带引号或多个文件，也可以是
 `file://` URI；TUI 只在所有 token 都是存在的图片时才接管粘贴，否则按普通文本处理。
 
+TUI 在 transcript 中把 user 附件、assistant Markdown 里的本地图片、`file://`、
+`data:image/...;base64,...` 内联图片，以及 provider 原生返回的 image part 渲染为终端缩略图
+（Kitty / Sixel / iTerm2）。远程 `http(s)` 图片由后台线程下载（15 秒超时、单张 32 MiB 上限），
+渲染路径只读内存缓存并在下载完成后重排，不会联网阻塞界面；没有图形协议或图片无法解码时
+保留文字占位（`[image] path`，内联图片为 `[image] inline image`）。provider 返回的内联
+base64 直接写入 assistant 事件，URL 形式保留为链接。
+
 图片按 OpenAI 多模态 `content` 数组（`text` + `image_url` data URL）发送。原始字节存在
 `<data>/blobs/<hash 前两位>/<sha256>`（内容寻址、自动去重），user 事件里只保留 hash、
 MIME 和大小，所以回放/重连仍能看到同一张图，即使原文件被移动。旧 session 的内联 base64

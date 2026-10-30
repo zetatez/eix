@@ -18,9 +18,10 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use eix_core::{
-    AssistantMessagePayload, ChatMessage, Config, ContextCompactedPayload, ContextDropPayload,
-    ContextEntryInfo, ContextLedgerResult, ContextPinPayload, ContextSectorInfo, Event, EventKind,
-    ImagePart, Sector, ToolDefinition, ToolResultPayload, UserMessagePayload,
+    AssistantMessagePayload, ChatMessage, Config, ContextCacheInfo, ContextCompactedPayload,
+    ContextDropPayload, ContextEntryInfo, ContextLedgerResult, ContextPinPayload,
+    ContextSectorInfo, Event, EventKind, ImagePart, Sector, ToolDefinition, ToolResultPayload,
+    UserMessagePayload,
 };
 use serde::de::DeserializeOwned;
 use tokio::time::{timeout, Duration};
@@ -63,6 +64,12 @@ pub struct Sections {
     pub memory: Option<String>,
     pub tasks: Option<String>,
     pub goal: Option<String>,
+    /// Operational directives (approval contract, tool notes, worktree
+    /// integration). They depend on the mode, the permission rules and the
+    /// tool list, all of which can change mid-session; keeping them out of the
+    /// head system prompt stops a mode switch from invalidating the cached
+    /// prefix, so they are appended after history instead.
+    pub directives: Option<String>,
     pub environment: Option<String>,
 }
 
@@ -262,7 +269,6 @@ impl Ledger {
     ) -> Self {
         let static_context = StaticContext::load(config, cwd).await;
         Self::build_with_state_and_static(
-            config,
             system,
             &static_context,
             sections,
@@ -270,6 +276,7 @@ impl Ledger {
             blobs,
             tools,
             token_scale,
+            config.context.tool_output_tokens,
             config.context.budget_tokens,
         )
         .await
@@ -280,7 +287,6 @@ impl Ledger {
     /// and to clamp the budget to the selected model's real context window.
     #[allow(clippy::too_many_arguments)]
     pub async fn build_with_state_and_static(
-        config: &Config,
         system: String,
         static_context: &StaticContext,
         sections: Sections,
@@ -288,6 +294,7 @@ impl Ledger {
         blobs: Option<&BlobStore>,
         tools: &[ToolDefinition],
         token_scale: f64,
+        tool_output_tokens: usize,
         budget_tokens: usize,
     ) -> Self {
         let images = load_images(events, blobs).await;
@@ -303,7 +310,7 @@ impl Ledger {
             sections,
             events,
             budget_tokens,
-            config.context.tool_output_tokens,
+            tool_output_tokens,
             static_context.image_tokens(),
             &images,
             tools,
@@ -365,6 +372,7 @@ impl Ledger {
         entries.extend(volatile_entries(
             sections.tasks.as_deref(),
             sections.goal.as_deref(),
+            sections.directives.as_deref(),
             sections.environment.as_deref(),
             &policy,
         ));
@@ -372,7 +380,8 @@ impl Ledger {
         let mut entries = apply_compactions(entries, &policy.compactions);
         prepare_entries(&mut entries, &policy, token_scale);
         let trimmed = trim(&mut entries, budget_tokens);
-        let result = summarize(&entries, budget_tokens, trimmed);
+        let mut result = summarize(&entries, budget_tokens, trimmed);
+        result.cache = cache_info(events, &policy);
 
         Self {
             entries,
@@ -461,6 +470,7 @@ impl Ledger {
         entries.extend(volatile_entries(
             sections.tasks.as_deref(),
             sections.goal.as_deref(),
+            sections.directives.as_deref(),
             sections.environment.as_deref(),
             &policy,
         ));
@@ -468,6 +478,7 @@ impl Ledger {
         prepare_entries(&mut entries, &policy, token_scale);
         let trimmed = trim(&mut entries, budget_tokens);
         self.result = summarize(&entries, budget_tokens, trimmed);
+        self.result.cache = cache_info(all_events, &policy);
         self.entries = entries;
         self.compactions = policy.compactions;
         true
@@ -495,7 +506,9 @@ impl Ledger {
             self.entries.push(entry);
         }
         let trimmed = self.entries.iter().filter(|entry| entry.info.auto).count();
+        let cache = self.result.cache.clone();
         self.result = summarize(&self.entries, budget, trimmed);
+        self.result.cache = cache;
     }
 
     /// Active compaction summaries, used as the starting point for the next
@@ -786,6 +799,7 @@ fn stable_entries(
 fn volatile_entries(
     tasks: Option<&str>,
     goal: Option<&str>,
+    directives: Option<&str>,
     environment: Option<&str>,
     policy: &Policy,
 ) -> Vec<Entry> {
@@ -805,6 +819,18 @@ fn volatile_entries(
             Sector::Memory,
             "goal",
             format!("<goal>\n{text}\n</goal>"),
+            policy,
+        ));
+    }
+    // Directives sit in the system sector so budget trimming never drops the
+    // approval contract, but after history so refreshing them does not rewrite
+    // the cached prefix.
+    if let Some(text) = directives {
+        entries.push(volatile(
+            "directives",
+            Sector::System,
+            "directives",
+            format!("<directives>\n{text}\n</directives>"),
             policy,
         ));
     }
@@ -936,6 +962,9 @@ pub(crate) async fn load_images(
     loaded
 }
 
+/// One decoded tool result: `(seq, tool, output, spill path)`.
+type ClaimedResult = (u64, String, String, Option<String>);
+
 /// Decode history entries from `events`, also returning the sequences of tool
 /// results that were attached to an assistant message in the same batch. An
 /// incremental refresh uses the set to detect results whose call lives in an
@@ -951,7 +980,7 @@ fn event_entries_with_claimed(
     // preceding `tool_calls`. Keep every result for a call id: some providers
     // reuse ids like `call_1` across turns, so matching by id alone would pair
     // a new result with an old assistant message.
-    let mut results: HashMap<String, Vec<(u64, String, String)>> = HashMap::new();
+    let mut results: HashMap<String, Vec<ClaimedResult>> = HashMap::new();
     for event in events {
         if event.kind == EventKind::ToolResult {
             if let Some(payload) = decode::<ToolResultPayload>(event) {
@@ -959,12 +988,13 @@ fn event_entries_with_claimed(
                     event.seq,
                     payload.tool.clone(),
                     payload.output.clone(),
+                    payload.spill.clone(),
                 ));
             }
         }
     }
     for matches in results.values_mut() {
-        matches.sort_by_key(|(seq, _, _)| *seq);
+        matches.sort_by_key(|(seq, _, _, _)| *seq);
     }
 
     let mut claimed: HashSet<u64> = HashSet::new();
@@ -1021,16 +1051,16 @@ fn event_entries_with_claimed(
                 let mut completed = Vec::new();
                 for call in &payload.tool_calls {
                     let matched = results.get_mut(&call.id).and_then(|matches| {
-                        let index = matches.iter().position(|(seq, _, _)| *seq > event.seq)?;
+                        let index = matches.iter().position(|(seq, _, _, _)| *seq > event.seq)?;
                         Some(matches.remove(index))
                     });
-                    if let Some((seq, tool, output)) = matched {
+                    if let Some((seq, tool, output, spill)) = matched {
                         claimed.insert(seq);
                         tool_previews.push(format!("{tool}: {}", first_line(&output)));
                         completed.push(call.clone());
                         tool_messages.push(ChatMessage::tool(
                             call.id.clone(),
-                            truncate_tool_output(&output, tool_output_tokens),
+                            truncate_tool_output(&output, tool_output_tokens, spill.as_deref()),
                         ));
                     } else {
                         // A crash or cancellation can leave an assistant turn
@@ -1116,7 +1146,11 @@ fn event_entries_with_claimed(
                 };
                 let message = ChatMessage::tool(
                     payload.call_id.clone(),
-                    truncate_tool_output(&payload.output, tool_output_tokens),
+                    truncate_tool_output(
+                        &payload.output,
+                        tool_output_tokens,
+                        payload.spill.as_deref(),
+                    ),
                 );
                 let mut entry = make_entry(
                     format!("e{}", event.seq),
@@ -1216,8 +1250,21 @@ fn scale_tokens(tokens: usize, scale: f64) -> usize {
     if tokens == 0 || !scale.is_finite() || (scale - 1.0).abs() <= f64::EPSILON {
         return tokens;
     }
+    // Calibration drifts by a few percent as provider usage arrives. Rounding to
+    // a bucket that grows with the entry size keeps a drifting estimate from
+    // moving an entry across the trim boundary every round: that would rewrite
+    // the request tail each turn and throw away the provider's cached prefix. A
+    // 1% bucket keeps the extra estimate error under half a percent, and small
+    // entries keep an 8-token floor so they are not rounded away. At the default
+    // scale of 1.0 the exact count is kept, so tests and fresh sessions stay
+    // deterministic.
+    const MIN_QUANTUM: f64 = 8.0;
+    const BUCKETS: f64 = 100.0;
     let scale = scale.clamp(0.25, 4.0);
-    (tokens as f64 * scale).ceil() as usize
+    let scaled = tokens as f64 * scale;
+    let quantum = (scaled / BUCKETS).max(MIN_QUANTUM);
+    let quantized = (scaled / quantum).round() * quantum;
+    (quantized as usize).max(1)
 }
 
 /// Re-apply model calibration, pin/drop policy and the `/clear` boundary to a
@@ -1304,6 +1351,30 @@ fn make_entry(
         trimmable,
         summary: false,
     }
+}
+
+/// Provider-reported cache usage for the assistant steps that are still in the
+/// request. Hidden steps (dropped, compacted, cleared) are excluded so the
+/// number describes what the current request could actually reuse. A route
+/// without prompt caching reports zeros, and `hit_rate()` stays `None`.
+fn cache_info(events: &[Event], policy: &Policy) -> ContextCacheInfo {
+    let mut info = ContextCacheInfo::default();
+    for event in events {
+        if event.kind != EventKind::AssistantMessage || policy.hides_seq(event.seq) {
+            continue;
+        }
+        let Some(payload) = decode::<AssistantMessagePayload>(event) else {
+            continue;
+        };
+        let Some(usage) = payload.usage else {
+            continue;
+        };
+        info.prompt_tokens += usage.prompt_tokens;
+        info.cache_read_tokens += usage.cache_read_tokens;
+        info.cache_creation_tokens += usage.cache_creation_tokens;
+        info.steps += 1;
+    }
+    info
 }
 
 fn apply_compactions(entries: Vec<Entry>, compactions: &[Compaction]) -> Vec<Entry> {
@@ -1469,6 +1540,16 @@ fn drop_fixed(entries: &mut [Entry], sector: Sector) -> Option<usize> {
 }
 
 fn trim(entries: &mut [Entry], budget: usize) -> usize {
+    // Quantize the budget to a coarse bucket for the same reason entries are
+    // bucketed: the calibrated budget moves by a few percent as usage feedback
+    // arrives, and an exact boundary made the same entry flip in and out of the
+    // request. Small budgets (tests, tiny windows) stay exact.
+    const QUANTUM: usize = 256;
+    let budget = if budget >= QUANTUM {
+        budget / QUANTUM * QUANTUM
+    } else {
+        budget
+    };
     // Sector shares are a *pressure* policy, not a per-round target. Trimming
     // tools to their share while most of the request budget was free discarded
     // results the model had just read, so it read them again. Only enforce the
@@ -1603,6 +1684,7 @@ fn summarize(entries: &[Entry], budget: usize, trimmed: usize) -> ContextLedgerR
         total_tokens,
         budget_tokens: budget,
         trimmed,
+        cache: ContextCacheInfo::default(),
     }
 }
 
@@ -1870,8 +1952,10 @@ fn is_wide(ch: char) -> bool {
 
 /// Keep a tool result bounded while preserving its beginning (usually the
 /// command/result header) and its end (usually errors or the final summary).
-/// The event log keeps the complete output; only the provider view is elided.
-fn truncate_tool_output(text: &str, max_tokens: usize) -> String {
+/// The event log keeps the complete output and the daemon spills it to a file;
+/// only the provider view is elided. The marker names that file so the model
+/// can re-read the elided middle instead of paying to run the command again.
+fn truncate_tool_output(text: &str, max_tokens: usize, spill: Option<&str>) -> String {
     let max_tokens = max_tokens.max(1);
     if estimate_tokens(text) <= max_tokens {
         return text.to_string();
@@ -1910,17 +1994,34 @@ fn truncate_tool_output(text: &str, max_tokens: usize) -> String {
             .chars()
             .take(max_tokens.saturating_mul(4).max(256))
             .collect();
-        out.push_str("\n… [tool output truncated to fit context]");
+        out.push_str(&truncation_marker(0, spill));
         return out;
     }
 
     let omitted = text[head_end..tail_start].chars().count();
     format!(
-        "{}\n\n… [tool output truncated: {omitted} chars elided to fit context; \
-         full output remains in the session log] …\n\n{}",
+        "{}\n\n{} …\n\n{}",
         &text[..head_end],
+        truncation_marker(omitted, spill),
         &text[tail_start..]
     )
+}
+
+/// The one line that replaces elided tool output. When the daemon spilled the
+/// full text it points at the file, so the model has a recovery path instead of
+/// re-running the command; otherwise it says where the text still lives.
+fn truncation_marker(omitted: usize, spill: Option<&str>) -> String {
+    match spill {
+        Some(path) => format!(
+            "… [tool output truncated: {omitted} chars elided to fit context; the complete \
+             output is at {path}. Read that file with the read tool (offset/limit) or grep it \
+             instead of running the command again] …"
+        ),
+        None => format!(
+            "… [tool output truncated: {omitted} chars elided to fit context; full output \
+             remains in the session log] …"
+        ),
+    }
 }
 
 fn char_quarters(ch: char) -> usize {
@@ -1988,6 +2089,7 @@ mod tests {
                 reasoning_signature: None,
                 cancelled: false,
                 usage: None,
+                images: Vec::new(),
                 tool_calls: Vec::new(),
             }),
         )
@@ -2007,6 +2109,7 @@ mod tests {
                     reasoning_signature: None,
                     cancelled: true,
                     usage: None,
+                    images: Vec::new(),
                     tool_calls: Vec::new(),
                 }),
             ),
@@ -2248,7 +2351,15 @@ mod tests {
             .into_iter()
             .find(|entry| entry.id == "e1")
             .unwrap();
-        assert_eq!(scaled_user.tokens, base_user.tokens * 2);
+        // Calibration is bucketed so a drifting scale does not flip entries
+        // across the trim boundary, so allow a bucket of slack on small entries.
+        let expected = base_user.tokens * 2;
+        let delta = scaled_user.tokens.abs_diff(expected);
+        assert!(
+            delta <= 32,
+            "scaled {} vs expected ~{expected}",
+            scaled_user.tokens
+        );
         assert!(scaled.info().total_tokens > base.info().total_tokens);
     }
 
@@ -2466,6 +2577,7 @@ mod tests {
                     reasoning_signature: None,
                     cancelled: false,
                     usage: None,
+                    images: Vec::new(),
                     tool_calls: vec![eix_core::ToolCall {
                         id: format!("call{index}"),
                         kind: "function".into(),
@@ -2487,6 +2599,7 @@ mod tests {
                     denied: false,
                     output: "x".repeat(4_000),
                     duration_ms: None,
+                    spill: None,
                 }),
             ));
             seq += 1;
@@ -2614,6 +2727,7 @@ mod tests {
                 reasoning_signature: None,
                 cancelled: false,
                 usage: None,
+                images: Vec::new(),
                 tool_calls: calls,
             }),
         )
@@ -2630,6 +2744,7 @@ mod tests {
                 denied: false,
                 output: output.into(),
                 duration_ms: None,
+                spill: None,
             }),
         )
     }
@@ -2872,6 +2987,123 @@ mod tests {
         let original =
             serde_json::from_value::<ToolResultPayload>(events[2].payload.clone()).unwrap();
         assert!(original.output.chars().count() > 20_000);
+    }
+
+    #[test]
+    fn spilled_tool_output_names_the_file_in_the_marker() {
+        let spill = "/data/spill/s1/call_1.txt";
+        let events = vec![
+            user(1, "run it"),
+            tool_step(2, "", vec![call("call_1")]),
+            event(
+                3,
+                EventKind::ToolResult,
+                payload(&ToolResultPayload {
+                    call_id: "call_1".into(),
+                    tool: "exec_command".into(),
+                    ok: true,
+                    denied: false,
+                    output: format!("HEAD\n{}\nTAIL", "x".repeat(20_000)),
+                    duration_ms: None,
+                    spill: Some(spill.into()),
+                }),
+            ),
+        ];
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            Sections::default(),
+            &events,
+            100_000,
+            100,
+            IMAGE_TOKEN_ESTIMATE,
+            &HashMap::new(),
+            &[],
+            1.0,
+        );
+        let tool = ledger
+            .messages()
+            .into_iter()
+            .find(|message| message.role == Role::Tool)
+            .unwrap();
+        // The model needs a way back to the complete output, not just a notice
+        // that something was cut.
+        assert!(tool.content.contains(spill), "{}", tool.content);
+        assert!(tool.content.contains("Read that file"), "{}", tool.content);
+        assert!(!tool.content.contains("remains in the session log"));
+        assert!(tool.content.contains("HEAD"));
+        assert!(tool.content.contains("TAIL"));
+    }
+
+    #[test]
+    fn cache_usage_is_aggregated_over_visible_steps() {
+        let usage = |prompt: u64, read: u64, created: u64| {
+            Some(eix_core::Usage {
+                prompt_tokens: prompt,
+                completion_tokens: 10,
+                total_tokens: prompt + 10,
+                cache_read_tokens: read,
+                cache_creation_tokens: created,
+                ..eix_core::Usage::default()
+            })
+        };
+        let step = |seq: u64, usage| {
+            event(
+                seq,
+                EventKind::AssistantMessage,
+                payload(&AssistantMessagePayload {
+                    text: "ok".into(),
+                    model: "m".into(),
+                    reasoning: None,
+                    reasoning_signature: None,
+                    cancelled: false,
+                    usage,
+                    images: Vec::new(),
+                    tool_calls: Vec::new(),
+                }),
+            )
+        };
+        let events = vec![
+            user(1, "go"),
+            step(2, usage(1_000, 800, 100)),
+            user(3, "more"),
+            step(4, usage(2_000, 1_800, 0)),
+        ];
+        let info = Ledger::assemble("sys".into(), vec![], None, &events, 100_000).info();
+        assert_eq!(info.cache.steps, 2);
+        assert_eq!(info.cache.prompt_tokens, 3_000);
+        assert_eq!(info.cache.cache_read_tokens, 2_600);
+        assert_eq!(info.cache.cache_creation_tokens, 100);
+        assert_eq!(info.cache.hit_rate(), Some(2_600.0 / 3_000.0));
+
+        // A step hidden by a compaction no longer contributes: the current
+        // request cannot reuse its cache any more.
+        let mut compacted = events.clone();
+        compacted.insert(
+            2,
+            event(
+                5,
+                EventKind::ContextCompacted,
+                payload(&eix_core::ContextCompactedPayload {
+                    from_seq: 1,
+                    to_seq: 2,
+                    messages: 2,
+                    tokens: 100,
+                    summary: "earlier".into(),
+                    rolling: false,
+                }),
+            ),
+        );
+        let info = Ledger::assemble("sys".into(), vec![], None, &compacted, 100_000).info();
+        assert_eq!(info.cache.steps, 1);
+        assert_eq!(info.cache.prompt_tokens, 2_000);
+    }
+
+    #[test]
+    fn an_empty_cache_report_has_no_hit_rate() {
+        let info = Ledger::assemble("sys".into(), vec![], None, &[user(1, "hi")], 10_000).info();
+        assert_eq!(info.cache, ContextCacheInfo::default());
+        assert_eq!(info.cache.hit_rate(), None);
     }
 
     #[test]

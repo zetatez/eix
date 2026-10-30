@@ -125,6 +125,31 @@ pub struct ContextSectorInfo {
     pub dropped: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCacheInfo {
+    /// Prompt tokens reported across the assistant steps still in context.
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    /// The subset of `prompt_tokens` served from the provider prefix cache.
+    #[serde(default)]
+    pub cache_read_tokens: u64,
+    /// Prompt tokens written to the provider cache by those steps.
+    #[serde(default)]
+    pub cache_creation_tokens: u64,
+    /// Number of assistant steps that reported usage.
+    #[serde(default)]
+    pub steps: usize,
+}
+
+impl ContextCacheInfo {
+    /// Share of reported prompt tokens that reused the provider cache, in
+    /// `0.0..=1.0`. `None` until a provider reports usage, usually because the
+    /// route has no prompt caching.
+    pub fn hit_rate(&self) -> Option<f64> {
+        (self.prompt_tokens > 0).then(|| self.cache_read_tokens as f64 / self.prompt_tokens as f64)
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ContextLedgerResult {
     pub entries: Vec<ContextEntryInfo>,
@@ -134,6 +159,9 @@ pub struct ContextLedgerResult {
     /// Entries dropped automatically to fit the budget (not a user policy).
     #[serde(default)]
     pub trimmed: usize,
+    /// Provider-reported cache efficiency for the steps still in context.
+    #[serde(default)]
+    pub cache: ContextCacheInfo,
 }
 
 #[cfg(test)]

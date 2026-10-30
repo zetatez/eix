@@ -23,6 +23,7 @@ ratatui = { workspace = true, default-features = false, features = [
 ] }
 ratatui-image = { workspace = true }
 image = { workspace = true }
+reqwest = { workspace = true, features = ["blocking"] }
 sha2 = { workspace = true }
 crossterm = { workspace = true, features = ["event-stream"] }
 futures-util = { workspace = true }

@@ -461,10 +461,17 @@ impl Renderer {
                         // The thumbnail (if the local file could be decoded)
                         // replaced the placeholder text.
                     } else if !cap.dest.is_empty() {
-                        if cap.in_cell || !label.is_empty() {
-                            self.append_styled(&format!(" ({})", cap.dest), dim(self.theme));
+                        // An inline payload can be megabytes long; never spill
+                        // it into the transcript when it cannot be drawn.
+                        let dest = if cap.dest.starts_with("data:") {
+                            "inline image"
                         } else {
-                            self.append_styled(cap.dest.as_str(), dim(self.theme));
+                            cap.dest.as_str()
+                        };
+                        if cap.in_cell || !label.is_empty() {
+                            self.append_styled(&format!(" ({dest})"), dim(self.theme));
+                        } else {
+                            self.append_styled(dest, dim(self.theme));
                         }
                     }
                 }
@@ -682,27 +689,26 @@ impl Renderer {
         self.ensure_blank();
     }
 
-    /// Try to draw a Markdown image as a terminal thumbnail. Only local files
-    /// and `file://` URIs are supported; remote URLs keep the text placeholder
-    /// because the TUI never fetches the network from the render path.
+    /// Try to draw a Markdown image as a terminal thumbnail. Local files,
+    /// `file://` URIs, inline `data:image/...` payloads and remote HTTP(S)
+    /// images are supported. Remote images are downloaded off the render
+    /// thread; the first frame keeps the text placeholder.
     fn image_block(&mut self, dest: &str, inline_start: usize) -> bool {
-        if dest.is_empty()
-            || dest.starts_with("http://")
-            || dest.starts_with("https://")
-            || dest.starts_with("data:")
-        {
+        if dest.is_empty() {
             return false;
         }
         let first_prefix = self.prefix_spans(true);
         let cont_prefix = self.prefix_spans(false);
         let prefix_width = Self::prefix_width(&first_prefix);
         let avail = self.width.saturating_sub(prefix_width).max(1);
-        let image = math_image::render_file(
-            Path::new(dest),
-            self.base.as_deref(),
-            Some(avail.min(u16::MAX as usize) as u16),
-            None,
-        );
+        let cols = Some(avail.min(u16::MAX as usize) as u16);
+        let image = if dest.starts_with("data:") {
+            math_image::render_data_uri(dest, cols, None)
+        } else if dest.starts_with("http://") || dest.starts_with("https://") {
+            math_image::render_remote(dest, cols, None)
+        } else {
+            math_image::render_file(Path::new(dest), self.base.as_deref(), cols, None)
+        };
         let Some(image) = image else {
             return false;
         };
@@ -1621,6 +1627,17 @@ mod tests {
         ));
         assert!(output.contains("the docs (https://example.com/docs)"));
         assert!(output.contains("🖼 diagram (img/flow.png)"));
+    }
+
+    #[test]
+    fn inline_image_fallback_hides_the_payload() {
+        let output = text(&render(
+            "![cat](data:image/png;base64,aGVsbG8=)",
+            80,
+            Theme::default(),
+        ));
+        assert!(output.contains("🖼 cat (inline image)"), "{output}");
+        assert!(!output.contains("aGVsbG8="), "{output}");
     }
 
     #[test]

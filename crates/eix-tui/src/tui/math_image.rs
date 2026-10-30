@@ -17,12 +17,13 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use eix_core::config::MathConfig;
@@ -403,6 +404,7 @@ struct Service {
     settings: Settings,
     cache: Mutex<HashMap<CacheKey, Option<MathImage>>>,
     files: Mutex<HashMap<FileKey, Option<MathImage>>>,
+    remote: Remote,
     shared: Arc<Shared>,
     _workers: Workers,
 }
@@ -837,6 +839,121 @@ fn current_shared() -> Option<Arc<Shared>> {
 const THUMBNAIL_COLS: u16 = 40;
 const THUMBNAIL_ROWS: u16 = 12;
 const MAX_THUMBNAIL_BYTES: u64 = 32 * 1024 * 1024;
+const REMOTE_TIMEOUT: Duration = Duration::from_secs(15);
+/// Keep the raw download cache bounded; a long session may reference hundreds
+/// of distinct images.
+const REMOTE_CACHE_ENTRIES: usize = 64;
+
+/// Download state shared by the renderer and the one HTTP worker. Rendering
+/// never blocks on the network: a miss queues a fetch and keeps the text
+/// placeholder until the next frame sees the cached bytes.
+struct RemoteShared {
+    cache: Mutex<HashMap<String, Option<Arc<Vec<u8>>>>>,
+    queued: Mutex<HashSet<String>>,
+    revision: AtomicU64,
+}
+
+struct Remote {
+    shared: Arc<RemoteShared>,
+    tx: Sender<String>,
+}
+
+impl RemoteShared {
+    fn finish(&self, url: String, bytes: Option<Vec<u8>>) {
+        if let Ok(mut cache) = self.cache.lock() {
+            cache.insert(url.clone(), bytes.map(Arc::new));
+            while cache.len() > REMOTE_CACHE_ENTRIES {
+                let victim = cache
+                    .keys()
+                    .find(|key| key.as_str() != url.as_str())
+                    .cloned();
+                match victim {
+                    Some(victim) => {
+                        cache.remove(&victim);
+                    }
+                    None => break,
+                }
+            }
+        }
+        if let Ok(mut queued) = self.queued.lock() {
+            queued.remove(&url);
+        }
+        self.revision.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+impl Remote {
+    fn new() -> Self {
+        let shared = Arc::new(RemoteShared {
+            cache: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashSet::new()),
+            revision: AtomicU64::new(0),
+        });
+        let (tx, rx) = mpsc::channel();
+        let worker = Arc::clone(&shared);
+        let _ = std::thread::Builder::new()
+            .name("eix-image-http".into())
+            .spawn(move || remote_worker(worker, rx));
+        Self { shared, tx }
+    }
+
+    fn cached(&self, url: &str) -> Option<Option<Arc<Vec<u8>>>> {
+        self.shared.cache.lock().ok()?.get(url).cloned()
+    }
+
+    fn request(&self, url: &str) {
+        let Ok(mut queued) = self.shared.queued.lock() else {
+            return;
+        };
+        if !queued.insert(url.to_string()) {
+            return;
+        }
+        if self.tx.send(url.to_string()).is_err() {
+            queued.remove(url);
+        }
+    }
+}
+
+fn remote_worker(shared: Arc<RemoteShared>, rx: Receiver<String>) {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(format!("eix/{}", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(REMOTE_TIMEOUT)
+        .build();
+    let Ok(client) = client else {
+        while let Ok(url) = rx.recv() {
+            shared.finish(url, None);
+        }
+        return;
+    };
+    while let Ok(url) = rx.recv() {
+        let bytes = fetch_remote(&client, &url);
+        shared.finish(url, bytes);
+    }
+}
+
+fn fetch_remote(client: &reqwest::blocking::Client, url: &str) -> Option<Vec<u8>> {
+    let response = client.get(url).send().ok()?;
+    if !response.status().is_success()
+        || response
+            .content_length()
+            .is_some_and(|len| len > MAX_THUMBNAIL_BYTES)
+    {
+        return None;
+    }
+    // `Content-Length` is advisory; stop reading at the cap even when the
+    // server omits it or lies about it.
+    let mut bytes = Vec::new();
+    response
+        .take(MAX_THUMBNAIL_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    (bytes.len() as u64 <= MAX_THUMBNAIL_BYTES).then_some(bytes)
+}
+
+fn is_remote_url(url: &str) -> bool {
+    url.starts_with("http://") || url.starts_with("https://")
+}
 
 /// Render a local raster image as a thumbnail. Supports png/jpeg/gif/webp when
 /// the corresponding `image` features are enabled. Returns `None` when images
@@ -884,6 +1001,95 @@ pub fn render_file(
     rendered
 }
 
+/// Render an inline `data:image/...;base64,...` URI as a thumbnail. The
+/// decoded bytes stay in the same file cache as disk thumbnails, keyed by a
+/// content hash, so a re-layout does not decode the same image again.
+pub fn render_data_uri(
+    uri: &str,
+    max_cols: Option<u16>,
+    max_rows: Option<u16>,
+) -> Option<MathImage> {
+    let bytes = decode_data_uri(uri)?;
+    render_bytes(&bytes, max_cols, max_rows)
+}
+
+/// Render provider-supplied base64 image bytes (no `data:` prefix).
+pub fn render_base64(
+    data: &str,
+    max_cols: Option<u16>,
+    max_rows: Option<u16>,
+) -> Option<MathImage> {
+    if data.len() as u64 > MAX_THUMBNAIL_BYTES * 3 {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data.trim())
+        .ok()?;
+    render_bytes(&bytes, max_cols, max_rows)
+}
+
+/// Render a remote image from the HTTP cache. A miss queues a background
+/// download and returns `None`, so the caller keeps its placeholder for this
+/// frame; [`remote_revision`] changes once a download finishes.
+pub fn render_remote(url: &str, max_cols: Option<u16>, max_rows: Option<u16>) -> Option<MathImage> {
+    if !is_remote_url(url) {
+        return None;
+    }
+    let slot = SERVICE.get()?.lock().ok()?;
+    let service = slot.as_ref()?;
+    match service.remote.cached(url) {
+        Some(Some(bytes)) => service.render_cached_bytes(&bytes, max_cols, max_rows),
+        Some(None) => None,
+        None => {
+            service.remote.request(url);
+            None
+        }
+    }
+}
+
+/// Monotonic counter bumped whenever a remote download succeeds or fails.
+/// The viewport compares it to decide when a re-layout can replace a
+/// placeholder with the downloaded image.
+pub fn remote_revision() -> u64 {
+    SERVICE
+        .get()
+        .and_then(|slot| slot.lock().ok())
+        .and_then(|slot| {
+            slot.as_ref()
+                .map(|service| service.remote.shared.revision.load(Ordering::Relaxed))
+        })
+        .unwrap_or(0)
+}
+
+fn decode_data_uri(uri: &str) -> Option<Vec<u8>> {
+    let rest = uri.strip_prefix("data:")?;
+    let (meta, payload) = rest.split_once(',')?;
+    if !meta.starts_with("image/") {
+        return None;
+    }
+    // Refuse an oversized payload before allocating its decoded bytes. Base64
+    // is 4/3 of the binary size; percent-encoding is at most 3x.
+    if payload.len() as u64 > MAX_THUMBNAIL_BYTES * 3 {
+        return None;
+    }
+    if meta
+        .split(';')
+        .any(|part| part.eq_ignore_ascii_case("base64"))
+    {
+        base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .ok()
+    } else {
+        Some(percent_decode_bytes(payload))
+    }
+}
+
+fn render_bytes(bytes: &[u8], max_cols: Option<u16>, max_rows: Option<u16>) -> Option<MathImage> {
+    let slot = SERVICE.get()?.lock().ok()?;
+    let service = slot.as_ref()?;
+    service.render_cached_bytes(bytes, max_cols, max_rows)
+}
+
 /// Try the path as written, then relative to `base` (the session cwd) and
 /// finally the process working directory. `file://` URIs from drag-and-drop
 /// are decoded as well.
@@ -910,7 +1116,7 @@ fn resolve_image_path(path: &Path, base: Option<&Path>) -> Option<PathBuf> {
     relative.is_file().then_some(relative)
 }
 
-fn percent_decode(text: &str) -> String {
+fn percent_decode_bytes(text: &str) -> Vec<u8> {
     let bytes = text.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut index = 0;
@@ -925,7 +1131,11 @@ fn percent_decode(text: &str) -> String {
         out.push(bytes[index]);
         index += 1;
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
+}
+
+fn percent_decode(text: &str) -> String {
+    String::from_utf8_lossy(&percent_decode_bytes(text)).into_owned()
 }
 
 fn hex(byte: u8) -> Option<u8> {
@@ -1113,6 +1323,7 @@ impl Service {
             settings,
             cache: Mutex::new(HashMap::new()),
             files: Mutex::new(HashMap::new()),
+            remote: Remote::new(),
             shared,
             _workers: workers,
         })
@@ -1203,8 +1414,57 @@ impl Service {
 
     fn render_file_uncached(&self, path: &Path, max_cols: u16, max_rows: u16) -> Option<MathImage> {
         let bytes = fs::read(path).ok()?;
-        let decoded = image::load_from_memory(&bytes).ok()?;
+        self.render_bytes_uncached(&bytes, max_cols, max_rows)
+    }
+
+    fn render_bytes_uncached(
+        &self,
+        bytes: &[u8],
+        max_cols: u16,
+        max_rows: u16,
+    ) -> Option<MathImage> {
+        let decoded = image::load_from_memory(bytes).ok()?;
         self.fit(decoded, max_cols, max_rows.into(), 0.0, 0.0).ok()
+    }
+
+    /// Decode already-fetched bytes (inline payload or HTTP body) and cache the
+    /// result by content hash. Callers must hold the `SERVICE` lock.
+    fn render_cached_bytes(
+        &self,
+        bytes: &[u8],
+        max_cols: Option<u16>,
+        max_rows: Option<u16>,
+    ) -> Option<MathImage> {
+        let max_cols = max_cols.unwrap_or(THUMBNAIL_COLS).max(1);
+        let max_rows = max_rows.unwrap_or(THUMBNAIL_ROWS).max(1);
+        if bytes.is_empty() || bytes.len() as u64 > MAX_THUMBNAIL_BYTES {
+            return None;
+        }
+        let digest = Sha256::digest(bytes);
+        let path = format!(
+            "data:image:{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        let key = FileKey {
+            path: path.clone(),
+            max_cols,
+            max_rows,
+            modified: None,
+        };
+        if let Some(cached) = self.files.lock().ok()?.get(&key) {
+            return cached.clone();
+        }
+        let rendered = self.render_bytes_uncached(bytes, max_cols, max_rows);
+        if rendered.is_none() {
+            record_error(&path, "could not decode inline image for the terminal");
+        }
+        if let Ok(mut cache) = self.files.lock() {
+            cache.insert(key, rendered.clone());
+        }
+        rendered
     }
 
     /// Scale `decoded` into the cell box. Formula images refuse to shrink below
@@ -1799,6 +2059,71 @@ mod tests {
             panic!("EIX_REQUIRE_TEX is set but none of {tools:?} is installed");
         }
         found
+    }
+
+    #[test]
+    fn remote_images_are_cached_and_bump_the_revision() {
+        assert!(is_remote_url("https://example.test/a.png"));
+        assert!(is_remote_url("http://example.test/a.png"));
+        assert!(!is_remote_url("file:///tmp/a.png"));
+        assert!(!is_remote_url("data:image/png;base64,QUJD"));
+        assert!(!is_remote_url("/tmp/a.png"));
+
+        let shared = RemoteShared {
+            cache: Mutex::new(HashMap::new()),
+            queued: Mutex::new(HashSet::new()),
+            revision: AtomicU64::new(0),
+        };
+        let url = "https://example.test/a.png";
+        assert!(shared.cache.lock().unwrap().get(url).is_none());
+        shared.finish(url.to_string(), Some(b"png".to_vec()));
+        assert_eq!(shared.revision.load(Ordering::Relaxed), 1);
+        assert!(shared.cache.lock().unwrap().get(url).unwrap().is_some());
+        // A failed download is cached too, so the renderer stops retrying.
+        shared.finish(url.to_string(), None);
+        assert_eq!(shared.revision.load(Ordering::Relaxed), 2);
+        assert!(shared.cache.lock().unwrap().get(url).unwrap().is_none());
+
+        // The cache is bounded and never evicts the entry just inserted.
+        for index in 0..REMOTE_CACHE_ENTRIES + 8 {
+            let url = format!("https://example.test/{index}.png");
+            shared.finish(url.clone(), Some(vec![index as u8]));
+            assert!(shared.cache.lock().unwrap().contains_key(&url));
+        }
+        assert_eq!(
+            shared.cache.lock().unwrap().len(),
+            REMOTE_CACHE_ENTRIES,
+            "cache should stay bounded"
+        );
+    }
+
+    #[test]
+    fn render_remote_never_blocks_without_a_service() {
+        // The terminal picker is not initialized in unit tests, so the call
+        // must return immediately instead of trying the network.
+        assert!(render_remote("https://example.test/a.png", Some(10), None).is_none());
+        assert_eq!(remote_revision(), 0);
+    }
+
+    #[test]
+    fn render_base64_rejects_invalid_payloads() {
+        // Invalid base64 never reaches the terminal even with a service.
+        assert!(render_base64("not base64!", Some(10), None).is_none());
+        assert!(render_base64("", Some(10), None).is_none());
+    }
+
+    #[test]
+    fn decodes_base64_and_percent_data_uris() {
+        assert_eq!(
+            decode_data_uri("data:image/png;base64,aGVsbG8=").as_deref(),
+            Some(b"hello".as_slice())
+        );
+        assert_eq!(
+            decode_data_uri("data:image/svg+xml,%3Csvg%3E").as_deref(),
+            Some(b"<svg>".as_slice())
+        );
+        assert!(decode_data_uri("data:text/plain;base64,aGVsbG8=").is_none());
+        assert!(decode_data_uri("https://example.com/a.png").is_none());
     }
 
     #[test]

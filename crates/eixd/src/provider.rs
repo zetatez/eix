@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use eix_core::redact::SecretRedactor;
 use eix_core::{
-    ChatMessage, Config, FunctionCall, ModelRoute, ProviderKind, Role, ToolCall, ToolDefinition,
-    Usage,
+    ChatMessage, Config, FunctionCall, ImageAttachment, ModelRoute, ProviderKind, Role, ToolCall,
+    ToolDefinition, Usage,
 };
 use futures_util::StreamExt;
 use serde_json::{json, Value};
@@ -172,6 +172,19 @@ pub struct Completion {
     pub usage: Option<Usage>,
     pub finish_reason: Option<String>,
     pub tool_calls: Vec<ToolCall>,
+    /// Images returned by the provider: inline base64 or a remote URL.
+    pub images: Vec<ImageAttachment>,
+}
+
+/// Bound provider images so one response cannot pin unbounded memory or bloat
+/// the event log. Prompt attachments use `[images]` limits; provider output has
+/// no config of its own.
+const MAX_IMAGE_PARTS: usize = 8;
+const MAX_INLINE_IMAGE_BASE64: usize = 24 * 1024 * 1024;
+
+fn clip_images(mut images: Vec<ImageAttachment>) -> Vec<ImageAttachment> {
+    images.truncate(MAX_IMAGE_PARTS);
+    images
 }
 
 /// One streamed fragment. Providers like DeepSeek interleave reasoning and
@@ -407,15 +420,12 @@ impl Provider {
                 retry_after_secs: None,
             });
         }
-        let content = value
-            .pointer("/choices/0/message/content")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let reasoning = value
-            .pointer("/choices/0/message")
-            .and_then(extract_reasoning)
+        let message = value.pointer("/choices/0/message");
+        let content = message
+            .and_then(|message| extract_content(message.get("content")))
             .unwrap_or_default();
+        let images = message.map(openai_images).unwrap_or_default();
+        let reasoning = message.and_then(extract_reasoning).unwrap_or_default();
         if !reasoning.is_empty() {
             on_delta(StreamDelta::Reasoning(&reasoning));
         }
@@ -441,6 +451,7 @@ impl Provider {
                 .and_then(Value::as_str)
                 .map(str::to_string),
             tool_calls,
+            images,
         })
     }
 
@@ -706,6 +717,7 @@ struct Accumulator {
     finish_reason: Option<String>,
     saw_event: bool,
     tool_calls: Vec<PartialToolCall>,
+    images: Vec<ImageAttachment>,
     /// Number of leading tool calls already handed to the prefetch callback.
     emitted: usize,
 }
@@ -728,6 +740,7 @@ impl Accumulator {
             finish_reason: None,
             saw_event: false,
             tool_calls: Vec::new(),
+            images: Vec::new(),
             emitted: 0,
         }
     }
@@ -763,6 +776,7 @@ impl Accumulator {
             usage: self.usage,
             finish_reason: self.finish_reason,
             tool_calls,
+            images: clip_images(self.images),
         }
     }
 }
@@ -937,6 +951,7 @@ struct AnthropicAccumulator {
     saw_event: bool,
     done: bool,
     tool_calls: Vec<PartialToolCall>,
+    images: Vec<ImageAttachment>,
 }
 
 impl AnthropicAccumulator {
@@ -954,6 +969,7 @@ impl AnthropicAccumulator {
             saw_event: false,
             done: false,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -1005,6 +1021,7 @@ impl AnthropicAccumulator {
             usage,
             finish_reason: self.finish_reason,
             tool_calls,
+            images: clip_images(self.images),
         }
     }
 }
@@ -1075,6 +1092,8 @@ where
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
+            } else if let Some(image) = anthropic_image(block) {
+                acc.images.push(image);
             }
         }
         "content_block_delta" => {
@@ -1192,6 +1211,11 @@ where
                     .get("input")
                     .map(|input| input.to_string())
                     .unwrap_or_else(|| "{}".to_string());
+            }
+            "image" => {
+                if let Some(image) = anthropic_image(block) {
+                    acc.images.push(image);
+                }
             }
             _ => {}
         }
@@ -1360,6 +1384,7 @@ struct GeminiAccumulator {
     finish_reason: Option<String>,
     saw_event: bool,
     tool_calls: Vec<PartialToolCall>,
+    images: Vec<ImageAttachment>,
 }
 
 impl GeminiAccumulator {
@@ -1372,6 +1397,7 @@ impl GeminiAccumulator {
             finish_reason: None,
             saw_event: false,
             tool_calls: Vec::new(),
+            images: Vec::new(),
         }
     }
 
@@ -1417,6 +1443,7 @@ impl GeminiAccumulator {
             usage: self.usage,
             finish_reason: self.finish_reason,
             tool_calls: finish_tool_calls(self.tool_calls),
+            images: clip_images(self.images),
         }
     }
 }
@@ -1522,6 +1549,9 @@ where
                     name,
                     arguments,
                 });
+            }
+            if let Some(image) = gemini_image(part) {
+                acc.images.push(image);
             }
             if let Some(text) = part.get("text").and_then(Value::as_str) {
                 if text.is_empty() {
@@ -1640,6 +1670,9 @@ where
                 acc.text.push_str(&delta);
                 on_delta(StreamDelta::Content(&delta));
             }
+        }
+        if let Some(delta) = choice.get("delta") {
+            push_openai_images(&mut acc.images, delta);
         }
         if let Some(calls) = choice
             .pointer("/delta/tool_calls")
@@ -1760,6 +1793,153 @@ fn extract_content(value: Option<&Value>) -> Option<String> {
         }
         _ => None,
     }
+}
+
+/// Collect image parts from an OpenAI-style message/delta. Both `content`
+/// parts and the non-standard `images` array are accepted.
+fn push_openai_images(out: &mut Vec<ImageAttachment>, message: &Value) {
+    for key in ["content", "images"] {
+        let Some(parts) = message.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for part in parts {
+            if let Some(image) = image_attachment(part) {
+                out.push(image);
+            }
+        }
+    }
+}
+
+fn openai_images(message: &Value) -> Vec<ImageAttachment> {
+    let mut images = Vec::new();
+    push_openai_images(&mut images, message);
+    clip_images(images)
+}
+
+/// Normalize the image shapes used by OpenAI-compatible endpoints, Anthropic
+/// content blocks and Gemini parts.
+fn image_attachment(value: &Value) -> Option<ImageAttachment> {
+    let kind = value
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !kind.is_empty() && !kind.to_ascii_lowercase().contains("image") {
+        return None;
+    }
+    if let Some(url) = value
+        .pointer("/image_url/url")
+        .and_then(Value::as_str)
+        .or_else(|| value.get("image_url").and_then(Value::as_str))
+    {
+        return image_from_url(url);
+    }
+    if let Some(image) = anthropic_image(value) {
+        return Some(image);
+    }
+    if let Some(image) = gemini_image(value) {
+        return Some(image);
+    }
+    if let Some(url) = value.get("url").and_then(Value::as_str) {
+        return image_from_url(url);
+    }
+    if let Some(data) = value.get("b64_json").and_then(Value::as_str) {
+        return inline_image("image/png", data);
+    }
+    if let Some(data) = value.get("data").and_then(Value::as_str) {
+        let mime = value
+            .get("mime_type")
+            .or_else(|| value.get("mimeType"))
+            .and_then(Value::as_str)
+            .unwrap_or("image/png");
+        if mime.starts_with("image/") {
+            return inline_image(mime, data);
+        }
+    }
+    None
+}
+
+fn anthropic_image(value: &Value) -> Option<ImageAttachment> {
+    let source = value.get("source")?;
+    match source.get("type").and_then(Value::as_str) {
+        Some("base64") => inline_image(
+            source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png"),
+            source.get("data").and_then(Value::as_str)?,
+        ),
+        Some("url") => image_from_url(source.get("url").and_then(Value::as_str)?),
+        _ => None,
+    }
+}
+
+fn gemini_image(value: &Value) -> Option<ImageAttachment> {
+    if let Some(inline) = value.get("inlineData").or_else(|| value.get("inline_data")) {
+        return inline_image(
+            inline
+                .get("mimeType")
+                .or_else(|| inline.get("mime_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("image/png"),
+            inline.get("data").and_then(Value::as_str)?,
+        );
+    }
+    let file = value.get("fileData").or_else(|| value.get("file_data"))?;
+    image_from_url(
+        file.get("fileUri")
+            .or_else(|| file.get("file_uri"))
+            .and_then(Value::as_str)?,
+    )
+}
+
+fn image_from_url(url: &str) -> Option<ImageAttachment> {
+    if let Some(rest) = url.strip_prefix("data:") {
+        let (meta, payload) = rest.split_once(',')?;
+        let mime = meta.split(';').next().unwrap_or("image/png");
+        if !mime.starts_with("image/") {
+            return None;
+        }
+        if meta
+            .split(';')
+            .any(|part| part.eq_ignore_ascii_case("base64"))
+        {
+            return inline_image(mime, payload);
+        }
+        // Keep a non-base64 data URL for the TUI's percent decoder.
+        if url.len() > MAX_INLINE_IMAGE_BASE64 {
+            return None;
+        }
+        return Some(ImageAttachment {
+            path: url.to_string(),
+            mime: mime.to_string(),
+            data: String::new(),
+            blob: None,
+            bytes: None,
+        });
+    }
+    (url.starts_with("http://") || url.starts_with("https://")).then(|| ImageAttachment {
+        path: url.to_string(),
+        mime: String::new(),
+        data: String::new(),
+        blob: None,
+        bytes: None,
+    })
+}
+
+fn inline_image(mime: &str, data: &str) -> Option<ImageAttachment> {
+    let data = data.trim();
+    if data.is_empty() || !mime.starts_with("image/") || data.len() > MAX_INLINE_IMAGE_BASE64 {
+        return None;
+    }
+    Some(ImageAttachment {
+        path: String::new(),
+        mime: mime.to_string(),
+        data: data.to_string(),
+        blob: None,
+        // Base64 is 4/3 of the binary size; an exact count is not needed for
+        // display, and this keeps the event compact.
+        bytes: Some(data.len() as u64 * 3 / 4),
+    })
 }
 
 fn error_message(error: &Value) -> String {
@@ -2262,6 +2442,7 @@ mod tests {
             reasoning_effort: Some("high".into()),
             input_cost: None,
             output_cost: None,
+            cache_read_cost: None,
             context_tokens: None,
         }
     }
@@ -2350,6 +2531,7 @@ mod tests {
             reasoning_effort: None,
             input_cost: None,
             output_cost: None,
+            cache_read_cost: None,
             context_tokens: None,
         };
         let body = anthropic_body(
@@ -2446,6 +2628,107 @@ mod tests {
         assert_eq!(completion.text, "answer");
         assert_eq!(completion.tool_calls[0].function.name, "exec_command");
         assert_eq!(completion.usage.unwrap().total_tokens, 5);
+    }
+
+    #[test]
+    fn collects_provider_image_parts() {
+        // OpenAI-compatible non-streaming content array.
+        let message = json!({
+            "content": [
+                {"type": "text", "text": "here"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,QUJD"}},
+                {"type": "image_url", "image_url": {"url": "https://example.test/a.png"}}
+            ]
+        });
+        assert_eq!(
+            extract_content(message.get("content")).as_deref(),
+            Some("here")
+        );
+        let images = openai_images(&message);
+        assert_eq!(images.len(), 2);
+        assert_eq!(images[0].mime, "image/png");
+        assert_eq!(images[0].data, "QUJD");
+        assert_eq!(images[1].path, "https://example.test/a.png");
+        assert!(images[1].data.is_empty());
+
+        // OpenAI streaming delta carrying the generated image JSON.
+        let mut acc = Accumulator::new("m");
+        let mut on_delta = |_: StreamDelta<'_>| {};
+        apply_data_with_tools(
+            r#"{"choices":[{"delta":{"images":[{"b64_json":"QUJD"}]}}]}"#,
+            &mut acc,
+            &mut on_delta,
+            &mut |_| {},
+        )
+        .unwrap();
+        let completion = acc.finish();
+        assert_eq!(completion.images.len(), 1);
+        assert_eq!(completion.images[0].data, "QUJD");
+
+        let many = (0..MAX_IMAGE_PARTS + 2)
+            .map(|_| ImageAttachment {
+                path: String::new(),
+                mime: "image/png".into(),
+                data: "QUJD".into(),
+                blob: None,
+                bytes: None,
+            })
+            .collect();
+        assert_eq!(clip_images(many).len(), MAX_IMAGE_PARTS);
+        assert!(inline_image("image/png", &"A".repeat(MAX_INLINE_IMAGE_BASE64 + 1)).is_none());
+    }
+
+    #[test]
+    fn applies_anthropic_image_blocks() {
+        let mut acc = AnthropicAccumulator::new("m");
+        let mut on_delta = |_: StreamDelta<'_>| {};
+        apply_anthropic_message(
+            &json!({
+                "model": "claude",
+                "content": [
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "QUJD"}},
+                    {"type": "image", "source": {"type": "url", "url": "https://example.test/a.jpg"}}
+                ],
+                "stop_reason": "end_turn"
+            }),
+            &mut acc,
+            &mut on_delta,
+        )
+        .unwrap();
+        // Streaming `content_block_start` uses the same shape.
+        apply_anthropic_event(
+            r#"{"type":"content_block_start","index":0,"content_block":{"type":"image","source":{"type":"base64","media_type":"image/png","data":"REVG"}}}"#,
+            &mut acc,
+            &mut on_delta,
+        )
+        .unwrap();
+        let completion = acc.finish();
+        assert_eq!(completion.images.len(), 3);
+        assert_eq!(completion.images[0].mime, "image/jpeg");
+        assert_eq!(completion.images[0].data, "QUJD");
+        assert_eq!(completion.images[1].path, "https://example.test/a.jpg");
+        assert_eq!(completion.images[2].data, "REVG");
+    }
+
+    #[test]
+    fn applies_gemini_image_parts() {
+        let mut acc = GeminiAccumulator::new("m");
+        let mut on_delta = |_: StreamDelta<'_>| {};
+        apply_gemini_event(
+            r#"{"candidates":[{"content":{"parts":[
+                {"inlineData":{"mimeType":"image/png","data":"QUJD"}},
+                {"fileData":{"mimeType":"image/jpeg","fileUri":"https://example.test/a.jpg"}},
+                {"text":"done"}
+            ]}}]}"#,
+            &mut acc,
+            &mut on_delta,
+        )
+        .unwrap();
+        let completion = acc.finish();
+        assert_eq!(completion.text, "done");
+        assert_eq!(completion.images.len(), 2);
+        assert_eq!(completion.images[0].data, "QUJD");
+        assert_eq!(completion.images[1].path, "https://example.test/a.jpg");
     }
 
     #[test]
