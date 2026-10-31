@@ -48,6 +48,13 @@ const THINKING_HEADING: &str = "    ▸ ";
 const THINKING_POINT: &str = "    · ";
 const THINKING_HIDDEN: &str = "    ⋮ ";
 
+/// Marker before the Thinking header and activity rows. Unicode only ships a
+/// color brain emoji, so this is the Nerd Font `md-brain` glyph: an outlined
+/// brain whose folds stay visible, monochrome, and inherits the theme's dim
+/// color. Terminals without a Nerd Font show a placeholder, like any other
+/// private-use icon.
+pub(crate) const THINKING_ICON: &str = "\u{f09d1}";
+
 /// Opacity of the outermost, second and third rows of the live window. A
 /// terminal cannot blur glyphs, so the fade is a color blend toward the pane
 /// background; this gives the newest line a soft entrance and lets the oldest
@@ -1574,7 +1581,6 @@ fn thinking(
     // Active thinking opens its fixed window; a finished block starts folded.
     let open = folds.get(&id).copied().unwrap_or(thinking);
     let fold = Fold { id, open };
-    let marker = if open { '▾' } else { '▸' };
     let closed_lines = || {
         text.trim_end()
             .lines()
@@ -1583,13 +1589,13 @@ fn thinking(
             .max(1)
     };
     let header = if thinking {
-        format!("  {marker} 🧠 Thinking…")
+        format!("  {THINKING_ICON} Thinking…")
     } else {
         let lines = closed_lines();
         if lines == 1 {
-            format!("  {marker} 🧠 Thinking · 1 line")
+            format!("  {THINKING_ICON} Thinking · 1 line")
         } else {
-            format!("  {marker} 🧠 Thinking · {lines} lines")
+            format!("  {THINKING_ICON} Thinking · {lines} lines")
         }
     };
     out.push(
@@ -1919,8 +1925,8 @@ fn tool_block(
     let color = status_color(block, theme);
     let status = status_label(block);
     let icon = tool_icon(&block.tool, &block.arguments);
-    // "  ▾ ● " plus a fixed two-cell icon column.
-    let prefix_width = 9;
+    // Two spaces plus a fixed two-cell icon column.
+    let prefix_width = 5;
     let summary = tool_summary(block);
     let room = width.saturating_sub(prefix_width + 1).max(8);
     // Expanded shell calls wrap the command instead of truncating it and then
@@ -1937,15 +1943,7 @@ fn tool_block(
         let first = index == 0;
         let mut spans = Vec::new();
         if first {
-            spans.push(Span::styled(
-                format!("  {} ", if open { "▾" } else { "▸" }),
-                dim(theme),
-            ));
-            spans.push(Span::styled(
-                format!("{} ", status_dot(block)),
-                Style::default().fg(color),
-            ));
-            spans.push(Span::styled(icon_cell(icon), dim(theme)));
+            spans.push(Span::styled(format!("  {}", icon_cell(icon)), dim(theme)));
         } else {
             // Continuation lines align under the summary column (the `$`).
             spans.push(Span::raw(" ".repeat(prefix_width)));
@@ -1959,6 +1957,10 @@ fn tool_block(
     out.push(
         Line::from(vec![
             Span::raw(" ".repeat(prefix_width)),
+            Span::styled(
+                format!("{} ", status_dot(block)),
+                Style::default().fg(color),
+            ),
             Span::styled(status, Style::default().fg(color)),
         ]),
         Some(fold),
@@ -2046,7 +2048,7 @@ fn subagent_block(
     } else {
         subagent.name.as_str()
     };
-    let prefix = format!("  {} {} ↳ ", if open { "▾" } else { "▸" }, dot);
+    let prefix = format!("  {dot} ↳ ");
     let prefix_width = UnicodeWidthStr::width(prefix.as_str());
     let label_width = label.len() + 3; // " · " + label
     let name = truncate(
@@ -2095,7 +2097,7 @@ fn subagent_window(
         .map(|text| (text, false))
         .collect();
     if !subagent.reasoning.trim().is_empty() {
-        rows.push(("🧠 Thinking…".to_string(), true));
+        rows.push((format!("{THINKING_ICON} Thinking…"), true));
         rows.extend(
             wrapped_tail(
                 &subagent.reasoning,
@@ -2295,7 +2297,7 @@ fn activity_lines(event: &SessionEvent) -> Vec<String> {
                     .as_deref()
                     .filter(|text| !text.trim().is_empty())
                 {
-                    lines.push(format!("🧠 {}", first_line(reasoning)));
+                    lines.push(format!("{THINKING_ICON} {}", first_line(reasoning)));
                 }
                 let text = first_line(&payload.text);
                 if !text.is_empty() {
@@ -2306,7 +2308,8 @@ fn activity_lines(event: &SessionEvent) -> Vec<String> {
         EventKind::ToolCall => {
             if let Ok(payload) = ToolCallPayload::deserialize(&event.payload) {
                 lines.push(format!(
-                    "⚙ {}",
+                    "{} {}",
+                    tool_icon(&payload.tool, &payload.arguments),
                     tool_call_summary(&payload.tool, &payload.arguments)
                 ));
             }
@@ -2436,39 +2439,91 @@ fn tool_icon(tool: &str, arguments: &Value) -> &'static str {
                 .unwrap_or_default(),
         ),
         "apply_patch" => "✎",
-        "write_stdin" => "⌨",
+        "write_stdin" => "↵",
         "view_image" => "▣",
-        "use_skill" => "📚",
+        "use_skill" => "❏",
         "update_plan" => "☑",
-        "get_context_remaining" => "📊",
-        "memory" => "💾",
-        "ready" => "✅",
-        "web_fetch" => "🌐",
-        "web_search" => "🔍",
-        "lsp_diagnostics" => "🩺",
-        "spawn_agent" => "🤖",
-        "request_user_input" => "❓",
-        "tool_search" => "🧰",
-        name if name.starts_with("mcp_") => "🔌",
-        name if name.starts_with(eix_core::PLUGIN_TOOL_PREFIX) => "🧩",
-        _ => "⚙",
+        "get_context_remaining" => "◔",
+        "memory" => "▥",
+        "ready" => "✓",
+        "web_fetch" => "⇣",
+        "web_search" => "⌕",
+        "lsp_diagnostics" => "✚",
+        "spawn_agent" => "◈",
+        "request_user_input" => "?",
+        "tool_search" => "⌗",
+        name if name.starts_with("mcp_") => "⊞",
+        name if name.starts_with(eix_core::PLUGIN_TOOL_PREFIX) => "❖",
+        _ => "◇",
     }
 }
 
-/// Classify the first program in a shell command. Pipes and `cd ... && ...`
-/// chains are intentionally ignored: the leading program is the best hint and
-/// anything more would guess at intent.
+/// Classify a shell command by the first program it runs that has a known
+/// icon. Chains are common (`cd repo && rg ...`), and complex commands often
+/// hide the real work inside a `for ...; do ...; done` loop, so the command is
+/// split into segments and shell keywords, wrappers and assignments are
+/// skipped. If nothing is recognized the generic command glyph is used.
 fn command_icon(command: &str) -> &'static str {
-    let program = command.split_whitespace().next().unwrap_or_default();
-    let program = program.rsplit('/').next().unwrap_or(program);
+    for segment in command.split(['|', ';', '&']) {
+        let mut words = segment.split_whitespace();
+        let mut skip_path = false;
+        while let Some(raw) = words.next() {
+            let word = raw.trim_matches(|c: char| {
+                matches!(c, '(' | ')' | '{' | '}' | '!' | ';' | '$' | '\'' | '"')
+            });
+            if word.is_empty() {
+                continue;
+            }
+            if skip_path {
+                skip_path = false;
+                continue;
+            }
+            // Environment assignments (`FOO=bar`) are not the program.
+            if word.contains('=') && !word.starts_with('-') {
+                continue;
+            }
+            let program = word.rsplit('/').next().unwrap_or(word);
+            match program {
+                // A compound header (`for x in ...`) only sets up the body;
+                // the work happens in the following `do ...` segment.
+                "for" | "while" | "until" | "if" | "case" | "select" | "function" | "in" => {
+                    break;
+                }
+                // Compound keywords are punctuation for our purposes.
+                "do" | "then" | "else" | "elif" | "done" | "fi" | "esac" => continue,
+                // `cd repo` only changes directory; the next segment does the
+                // work, so consume the path and keep looking.
+                "cd" | "pushd" | "popd" => {
+                    skip_path = true;
+                    continue;
+                }
+                "sudo" | "env" | "time" | "nohup" | "command" | "exec" | "builtin" | "nice" => {
+                    continue;
+                }
+                _ => {
+                    if let Some(icon) = program_icon(program) {
+                        return icon;
+                    }
+                    // Unknown program: keep scanning, a later segment may be
+                    // the one that actually does the work.
+                }
+            }
+        }
+    }
+    ">_"
+}
+
+fn program_icon(program: &str) -> Option<&'static str> {
     match program {
-        "cat" | "bat" | "sed" | "head" | "tail" | "nl" | "less" | "more" | "awk" => "📄",
-        "rg" | "grep" | "ag" | "ack" => "🔎",
-        "find" | "fd" | "ls" | "tree" | "eza" | "exa" => "📁",
-        "cargo" | "make" | "cmake" | "rustc" | "npm" | "pnpm" | "yarn" | "pytest" | "go" => "🔨",
-        "curl" | "wget" => "🌐",
-        "git" => "⑂",
-        _ => "❯",
+        "cat" | "bat" | "sed" | "head" | "tail" | "nl" | "less" | "more" | "awk" => Some("▤"),
+        "rg" | "grep" | "ag" | "ack" => Some("⌕"),
+        "find" | "fd" | "ls" | "tree" | "eza" | "exa" => Some("▦"),
+        "cargo" | "make" | "cmake" | "rustc" | "npm" | "pnpm" | "yarn" | "pytest" | "go" => {
+            Some("⚒")
+        }
+        "curl" | "wget" => Some("⇄"),
+        "git" => Some("⑂"),
+        _ => None,
     }
 }
 
@@ -3044,34 +3099,54 @@ mod tests {
     #[test]
     fn tool_icons_classify_tools_and_leading_commands() {
         let command = |cmd: &str| tool_icon("exec_command", &serde_json::json!({ "cmd": cmd }));
-        assert_eq!(command("cat src/main.rs"), "📄");
-        assert_eq!(command("sed -n '1,20p' src/lib.rs"), "📄");
-        assert_eq!(command("rg -n TODO src"), "🔎");
-        assert_eq!(command("ls -la"), "📁");
-        assert_eq!(command("cargo test -p eix-tui"), "🔨");
-        assert_eq!(command("curl https://example.com"), "🌐");
+        assert_eq!(command("cat src/main.rs"), "▤");
+        assert_eq!(command("sed -n '1,20p' src/lib.rs"), "▤");
+        assert_eq!(command("rg -n TODO src"), "⌕");
+        assert_eq!(command("ls -la"), "▦");
+        assert_eq!(command("cargo test -p eix-tui"), "⚒");
+        assert_eq!(command("curl https://example.com"), "⇄");
         assert_eq!(command("/usr/bin/git status"), "⑂");
-        assert_eq!(command("./scripts/deploy.sh"), "❯");
-        assert_eq!(command(""), "❯");
+        assert_eq!(command("./scripts/deploy.sh"), ">_");
+        assert_eq!(command(""), ">_");
+        // Chains look past `cd` and wrappers to the program that does the work.
+        assert_eq!(
+            command("cd /home/shiyi/git/eix && rg -n 'pub struct' -A 12 src"),
+            "⌕"
+        );
+        assert_eq!(command("sudo git status"), "⑂");
+        assert_eq!(command("FOO=1 cargo test"), "⚒");
+        // Compound commands: the header clause is skipped and the loop body
+        // decides the icon.
+        assert_eq!(
+            command(
+                "cd docs && for f in context.md http-api.md mcp.md permissions.md; do \
+                 sed -i 's/x/y/g' \"$f\"; done"
+            ),
+            "▤"
+        );
+        assert_eq!(command("if true; then cargo test; fi"), "⚒");
+        // An unclassified program like `echo` does not hide a later command.
+        assert_eq!(command("echo hi && rg TODO src"), "⌕");
 
         assert_eq!(tool_icon("apply_patch", &Value::Null), "✎");
-        assert_eq!(tool_icon("web_search", &Value::Null), "🔍");
-        assert_eq!(tool_icon("web_fetch", &Value::Null), "🌐");
-        assert_eq!(tool_icon("spawn_agent", &Value::Null), "🤖");
-        assert_eq!(tool_icon("mcp__github__create_issue", &Value::Null), "🔌");
+        assert_eq!(tool_icon("web_search", &Value::Null), "⌕");
+        assert_eq!(tool_icon("web_fetch", &Value::Null), "⇣");
+        assert_eq!(tool_icon("spawn_agent", &Value::Null), "◈");
+        assert_eq!(tool_icon("mcp__github__create_issue", &Value::Null), "⊞");
         assert_eq!(
             tool_icon(
                 concat!("plugin__", "demo__deploy"),
                 &serde_json::json!({ "cmd": "cat x" })
             ),
-            "🧩"
+            "❖"
         );
     }
 
     #[test]
     fn icon_cell_keeps_a_two_cell_column() {
-        assert_eq!(UnicodeWidthStr::width(icon_cell("📄").as_str()), 3);
-        assert_eq!(UnicodeWidthStr::width(icon_cell("❯").as_str()), 3);
+        assert_eq!(UnicodeWidthStr::width(THINKING_ICON), 1);
+        assert_eq!(UnicodeWidthStr::width(icon_cell("▤").as_str()), 3);
+        assert_eq!(UnicodeWidthStr::width(icon_cell(">_").as_str()), 3);
         assert_eq!(UnicodeWidthStr::width(icon_cell("⑂").as_str()), 3);
     }
 
@@ -3096,7 +3171,41 @@ mod tests {
             None,
         );
         let header = all_text(&out);
-        assert!(header.contains("▾ ◐ 🔎 $ rg -n TODO src"), "{header}");
+        // Two-space indent, a fixed icon column, then the summary.
+        assert_eq!(
+            header.lines().next(),
+            Some("  ⌕  $ rg -n TODO src"),
+            "{header}"
+        );
+        assert!(header.contains("◐ running"), "{header}");
+        assert!(!header.contains('▾') && !header.contains('▸'), "{header}");
+    }
+
+    #[test]
+    fn command_chain_skips_cd_before_picking_the_icon() {
+        let mut out = Transcript::new();
+        let block = ToolBlock {
+            seq: 1,
+            call_id: "c1".into(),
+            tool: "exec_command".into(),
+            arguments: serde_json::json!({
+                "cmd": "cd /home/shiyi/git/eix && rg -n 'pub struct VoiceConfig' -A 12 crates/eix-core/src/config.rs",
+            }),
+            result: None,
+            approval: None,
+            patch: None,
+        };
+        tool_block(
+            &mut out,
+            &block,
+            120,
+            Theme::default(),
+            &HashMap::new(),
+            None,
+        );
+        let header = all_text(&out);
+        assert!(header.contains("  ⌕  $ cd"), "{header}");
+        assert!(!header.contains('❯'), "{header}");
     }
 
     #[test]
@@ -3115,7 +3224,10 @@ mod tests {
             false,
         );
         let text = all_text(&out);
-        assert!(text.contains("🧠 Thinking…"), "{text}");
+        assert!(
+            text.contains(&format!("{THINKING_ICON} Thinking…")),
+            "{text}"
+        );
     }
 
     #[test]

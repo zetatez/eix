@@ -194,11 +194,9 @@ impl App {
                             .get(line)
                             .map(String::as_str)
                             .unwrap_or_default();
-                        let is_subagent_header = (text.starts_with("  ▾ ")
-                            || text.starts_with("  ▸ "))
-                            && text.contains(" ↳ ");
-                        // The caret remains the fold handle; the rest of the
-                        // subagent header opens the child session.
+                        // A subagent header folds from its status dot and
+                        // opens the child session from the `↳ name` part.
+                        let is_subagent_header = text.starts_with("  ") && text.contains(" ↳ ");
                         if is_subagent_header && column > 3 {
                             jump = view
                                 .subagent_session_for_fold(candidate.id)

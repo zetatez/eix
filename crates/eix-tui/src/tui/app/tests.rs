@@ -1103,8 +1103,8 @@ fn transcript_renders_tool_cards() {
         .position(|line| line.contains("apply_patch out.txt"))
         .expect("summary line");
     assert!(!lines[summary_line].contains("ok"), "{expanded}");
-    assert_eq!(lines[summary_line + 1].trim(), "ok", "{expanded}");
-    assert!(lines[summary_line + 1].starts_with("      "), "{expanded}");
+    assert_eq!(lines[summary_line + 1].trim(), "● ok", "{expanded}");
+    assert!(lines[summary_line + 1].starts_with("     "), "{expanded}");
     assert!(expanded.contains("applied 1 hunk to out.txt"));
     // The raw patch text is not dumped next to the result.
     assert!(!expanded.contains("Begin Patch"), "{expanded}");
@@ -1339,7 +1339,7 @@ fn subagent_card_has_a_fixed_live_window_and_folds() {
         "{rendered}"
     );
     assert!(rendered.contains("▶ inspect the parser"), "{rendered}");
-    assert!(rendered.contains("⚙ $ cat src/parser.rs"), "{rendered}");
+    assert!(rendered.contains("▤ $ cat src/parser.rs"), "{rendered}");
     assert!(
         rendered.contains("✓ exec_command: fn parse() {}"),
         "{rendered}"
@@ -1396,7 +1396,7 @@ fn completed_subagent_shows_only_its_result() {
         &tx,
     );
     let running = render_transcript(&app.views[0], 60);
-    assert!(running.contains("⚙ $ cat src/parser.rs"), "{running}");
+    assert!(running.contains("▤ $ cat src/parser.rs"), "{running}");
 
     app.handle_event(
         Event::Notification(eix_core::Notification::new(
@@ -1493,7 +1493,13 @@ fn subagent_card_shows_streamed_thinking() {
         );
     }
     let running = render_transcript(&app.views[0], 60);
-    assert!(running.contains("🧠 Thinking…"), "{running}");
+    assert!(
+        running.contains(&format!(
+            "{} Thinking…",
+            crate::tui::transcript::THINKING_ICON
+        )),
+        "{running}"
+    );
     assert!(running.contains("reading the parser,"), "{running}");
     assert!(running.contains("then the lexer"), "{running}");
     // Answer text is not mirrored live; it arrives with the stored event.
@@ -1520,9 +1526,18 @@ fn subagent_card_shows_streamed_thinking() {
         &tx,
     );
     let stored = render_transcript(&app.views[0], 60);
-    assert!(!stored.contains("🧠 Thinking…"), "{stored}");
     assert!(
-        stored.contains("🧠 reading the parser, then the lexer"),
+        !stored.contains(&format!(
+            "{} Thinking…",
+            crate::tui::transcript::THINKING_ICON
+        )),
+        "{stored}"
+    );
+    assert!(
+        stored.contains(&format!(
+            "{} reading the parser, then the lexer",
+            crate::tui::transcript::THINKING_ICON
+        )),
         "{stored}"
     );
 }
@@ -1940,18 +1955,18 @@ fn long_command_wraps_in_header_without_repeating_in_body() {
     assert!(!expanded.contains('…'), "{expanded}");
     let status_line = lines
         .iter()
-        .position(|line| line.trim() == "ok")
+        .position(|line| line.trim() == "● ok")
         .expect("status line");
     assert!(status_line > 0, "{expanded}");
     assert!(
-        lines[status_line - 1].starts_with("      ") && lines[status_line - 1].contains('x'),
+        lines[status_line - 1].starts_with("     ") && lines[status_line - 1].contains('x'),
         "{expanded}"
     );
     // The command wraps onto continuation lines aligned under the summary.
     assert!(
         lines
             .iter()
-            .any(|line| line.starts_with("      ") && line.contains('x')),
+            .any(|line| line.starts_with("     ") && line.contains('x')),
         "{expanded}"
     );
     // No truncated header plus a full repeated command line in the body.
@@ -1997,7 +2012,10 @@ fn transcript_renders_chat_turns_and_thinking() {
         user.starts_with(' ') && user.contains("│ hi there │"),
         "user turn should be a right-aligned bubble: {user:?}"
     );
-    assert!(lines.iter().any(|line| line.contains("▸ 🧠 Thinking")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains(crate::tui::transcript::THINKING_ICON)
+            && line.contains("Thinking")));
     // Stored thinking is collapsed by default.
     assert!(!rendered.contains("pondering"));
     let mut view = view;
@@ -2512,7 +2530,10 @@ fn live_thinking_collapses_once_the_answer_starts() {
         reasoning: "thinking out loud".into(),
     });
     let rendered = render_transcript(&view, 40);
-    assert!(rendered.contains("▸ 🧠 Thinking"), "{rendered}");
+    assert!(
+        rendered.contains(crate::tui::transcript::THINKING_ICON) && rendered.contains("Thinking"),
+        "{rendered}"
+    );
     assert!(!rendered.contains("thinking out loud"), "{rendered}");
     assert!(rendered.contains("the answer"), "{rendered}");
 }
@@ -2756,7 +2777,7 @@ fn clicking_a_subagent_card_opens_the_child_session() {
         id: FoldId::Event(1),
         open: true,
     })];
-    view.text_lines = vec!["  ▾ ● ↳ parent/scout-1 · running".into()];
+    view.text_lines = vec!["  ● ↳ parent/scout-1 · running".into()];
     app.views.push(view);
     app.pane_areas = vec![Rect::new(0, 0, 60, 10)];
 

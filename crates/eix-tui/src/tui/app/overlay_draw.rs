@@ -1473,7 +1473,10 @@ fn subagent_preview(
     append_preview(&mut preview, rendered.lines, rendered.math);
     if !agent.reasoning.trim().is_empty() {
         preview.lines.push(Line::from(""));
-        preview.lines.push(Line::from("🧠 Thinking…"));
+        preview.lines.push(Line::from(format!(
+            "{} Thinking…",
+            crate::tui::transcript::THINKING_ICON
+        )));
         append_markdown_preview(&mut preview, &agent.reasoning, width, theme, base);
     }
     if !agent.text.trim().is_empty() {
