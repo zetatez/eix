@@ -162,8 +162,18 @@ snapshots = true
 
 # --- Integration / Worktrees ------------------------------------------------
 [integration]
-auto_ready = false
-auto_commit = true
+enabled = true                       # false: stop the whole queue
+auto_ready = false                   # true: mark idle sessions ready
+idle_secs = 300                      # inactivity before auto_ready fires
+auto_commit = true                   # commit dirty worktree on ready
+test = "auto"                        # or a command, e.g. "cargo nextest run"
+timeout_secs = 1800                  # wall-clock limit per test run
+pull_base = true                     # fetch + pull --ff-only before rebase
+push = false                         # push the base branch after fast-forward
+retry_max_secs = 300                 # max backoff between transient retries
+notify_after = 3                     # alert after N consecutive failures; 0 = off
+pause_after = 0                      # pause after N failures; 0 = never
+conflict_repair = true               # let the agent repair conflicts/test failures
 
 [worktree]
 auto = false                         # true: create one per new session
@@ -172,6 +182,8 @@ base = "auto"                        # or "main"
 # [integration.repos."/home/me/project"]
 # base = "main"
 # test = "cargo test"
+# timeout_secs = 600
+# pull_base = false
 
 # --- Notifications ----------------------------------------------------------
 # [notifications]

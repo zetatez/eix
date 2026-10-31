@@ -223,42 +223,32 @@ impl Default for WorktreeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct IntegrationConfig {
-    #[serde(skip)]
     pub enabled: bool,
     /// Automatically mark idle sessions ready. Off by default; `/ready` is
     /// user-triggered.
     pub auto_ready: bool,
     /// Seconds of no activity before an idle session is marked ready.
-    #[serde(skip)]
     pub idle_secs: u64,
     /// Commit dirty worktree changes when readiness is requested. Enabled by
     /// default so an explicit `ready` does not fail on the agent's edits.
     pub auto_commit: bool,
     /// Test command run in the rebased worktree. `auto` detects Cargo/npm/Go/
     /// Python projects. An empty value is invalid while integration is enabled.
-    #[serde(skip)]
     pub test: String,
     /// Wall-clock limit for one test run.
-    #[serde(skip)]
     pub timeout_secs: u64,
     /// Fetch and `pull --ff-only` the base branch before each rebase.
-    #[serde(skip)]
     pub pull_base: bool,
     /// Push the base branch after a local fast-forward. Off by default.
-    #[serde(skip)]
     pub push: bool,
     /// Maximum backoff between transient retries.
-    #[serde(skip)]
     pub retry_max_secs: u64,
     /// Notify after this many consecutive failures. 0 disables notifications.
-    #[serde(skip)]
     pub notify_after: u32,
     /// Pause automatic retries after this many failures and wait for
     /// `eix integrate continue`. 0 means never pause.
-    #[serde(skip)]
     pub pause_after: u32,
     /// Let the session agent attempt conflict/test repair.
-    #[serde(skip)]
     pub conflict_repair: bool,
     /// Per-repository overrides, keyed by canonical repository root.
     pub repos: BTreeMap<String, RepoIntegrationConfig>,
@@ -288,11 +278,8 @@ impl Default for IntegrationConfig {
 #[serde(default)]
 pub struct RepoIntegrationConfig {
     pub base: Option<String>,
-    #[serde(skip)]
     pub test: Option<String>,
-    #[serde(skip)]
     pub timeout_secs: Option<u64>,
-    #[serde(skip)]
     pub pull_base: Option<bool>,
 }
 
@@ -5495,6 +5482,61 @@ snapshots = false
         for value in [0, 1, 3, 5, 6, 12, 24, 48, 100, 512] {
             assert!(!subagent_concurrency_supported(value), "{value}");
         }
+    }
+
+    #[test]
+    fn integration_policy_is_read_from_toml() {
+        // These keys are executable policy: writing them in the user config
+        // has to change what the integration queue runs, not just serialize.
+        let parsed: Config = toml::from_str(
+            r#"
+[integration]
+enabled = false
+auto_ready = true
+idle_secs = 42
+auto_commit = false
+test = "cargo nextest run"
+timeout_secs = 60
+pull_base = false
+push = true
+retry_max_secs = 7
+notify_after = 0
+pause_after = 2
+conflict_repair = false
+
+[integration.repos."/home/me/project"]
+base = "main"
+test = "npm test"
+timeout_secs = 30
+pull_base = false
+"#,
+        )
+        .expect("integration config");
+        let integration = &parsed.integration;
+        assert!(!integration.enabled);
+        assert!(integration.auto_ready);
+        assert_eq!(integration.idle_secs, 42);
+        assert!(!integration.auto_commit);
+        assert_eq!(integration.test, "cargo nextest run");
+        assert_eq!(integration.timeout_secs, 60);
+        assert!(!integration.pull_base);
+        assert!(integration.push);
+        assert_eq!(integration.retry_max_secs, 7);
+        assert_eq!(integration.notify_after, 0);
+        assert_eq!(integration.pause_after, 2);
+        assert!(!integration.conflict_repair);
+
+        let repo = Path::new("/home/me/project");
+        assert_eq!(integration.repo_test(repo), "npm test");
+        assert_eq!(integration.repo_timeout(repo), 30);
+        assert!(!integration.repo_pull_base(repo));
+        assert_eq!(integration.repo_base(repo), Some("main"));
+        // A repository without an override inherits the global values.
+        let other = Path::new("/home/me/other");
+        assert_eq!(integration.repo_test(other), "cargo nextest run");
+        assert_eq!(integration.repo_timeout(other), 60);
+        assert!(!integration.repo_pull_base(other));
+        assert_eq!(integration.repo_base(other), None);
     }
 
     #[test]
