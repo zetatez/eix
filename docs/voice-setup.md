@@ -1,50 +1,55 @@
-# 语音输入配置指南
+# Voice input setup
 
-这篇讲怎么把 `/voice` 用起来：装哪个引擎、模型放哪、配置怎么改、出问题看什么。
-协议细节（JSON-RPC 方法、事件字段、helper 输出格式）在
-[voice.md](./voice.md)，这里只讲使用。
+This page covers getting `/voice` working: which engine to install, where the models go, which
+settings to change, and what to check when something breaks. Protocol details (JSON-RPC methods,
+event fields, helper output format) live in [voice.md](./voice.md); this is the usage guide.
 
-默认值是可以直接跑的状态：`[voice] enabled = true` 不需要改，静默会话不会占用麦克风。
-真正要做的只有两件事，装识别引擎和它的模型。两件都装好后无需再配置。
+The defaults already run: `[voice] enabled = true` needs no change, and an idle session never
+touches a microphone. Only two things are actually required, a recognition engine and its model.
+Once both are in place, no further configuration is needed.
 
-## 先看清楚边界
+## Boundaries first
 
-- 录音由前端做（TUI 里的 `/voice`），daemon 从不打开音频设备。
-- 识别由 `eix-asr` 子进程做，每说完一句起一个，通过 stdin 收 PCM、stdout 回 JSON。
-- 只有识别出的文字会经过一次可选的模型润色；音频永远不出本机（`backend = "local"` 时）。
-- 模型文件放在数据目录，不进配置文件。数据目录是 `~/.local/share/eix`
-  （macOS 为 `~/Library/Application Support/eix`），`EIX_DATA_DIR` 可整体覆盖。
+- Recording happens in the frontend (`/voice` in the TUI); the daemon never opens an audio device.
+- Recognition runs in an `eix-asr` child process, one per utterance, receiving PCM on stdin and
+  writing JSON to stdout.
+- Only the recognised text goes through an optional model pass that tidies it up; audio never
+  leaves the machine when `backend = "local"`.
+- Model files live in the data directory, not in the config file. The data directory is
+ `~/.local/share/eix` (on macOS `~/Library/Application Support/eix`), and `EIX_DATA_DIR` overrides it
+  wholesale.
 
-## 快速开始
+## Quick start
 
-确认三个前置已就位，然后 `/voice`：
+Confirm the three prerequisites, then type `/voice`:
 
 ```sh
-eix-asr --list-engines          # fake / whisper / command / sherpa
-sherpa-onnx-offline --help      # 或者 whisper-cli --help
+eix-asr --list-engines     # fake / whisper / command / sherpa
+sherpa-onnx-offline --help      # or whisper-cli --help
 ls ~/.local/share/eix/models/sense-voice/   # model.int8.onnx tokens.txt
 ```
 
 ```sh
-cargo build --release -p eix-asr            # make install 不含它
+cargo build --release -p eix-asr            # make install does not include it
 install -m 0755 target/release/eix-asr ~/.local/bin/
 ```
 
-然后输入 `/voice`，状态栏出现 `mic ▮▮▮` 电平条，说话即可。引擎和模型是每次
-`asr.start` 现找的，换了模型或二进制不用重启；改 `config.toml` 用 `/reload` 让 daemon 重新读。
+Then type `/voice`; a `mic ▮▮▮` level meter appears in the status bar and you can start talking.
+The engine and model are resolved fresh on every `asr.start`, so swapping either needs no restart;
+after editing `config.toml`, run `/reload` to make the daemon re-read it.
 
-## 安装识别引擎
+## Installing a recognition engine
 
-两个引擎任选其一；同时装了会优先 SenseVoice。中文场景下这个选择很重要：
-同一段中文，`ggml-base.bin` 会把它转成英文臆想句
-（`Time for the opening. Find 9.3.5.`），SenseVoice 给出正确结果。
+Pick one of the two engines; with both installed, SenseVoice wins. For Chinese this choice matters
+a lot: on the same audio, `ggml-base.bin` invents English sentences
+(`Time for the opening. Find 9.3.5.`) while SenseVoice transcribes it correctly.
 
-### SenseVoice（推荐，中英日韩粤）
+### SenseVoice (recommended; Chinese, English, Japanese, Korean, Cantonese)
 
-需要两样东西：`sherpa-onnx-offline` 可执行文件，和一套 SenseVoice 模型。
+Two pieces are needed: the `sherpa-onnx-offline` executable and a SenseVoice model.
 
-运行时用 pip 包里的 CLI。系统 Python 若受 PEP 668 保护（Arch、新版 Debian 都是），
-装进独立 venv 最省事：
+The runtime comes from the pip package. If the system Python is protected by PEP 668 (Arch and
+recent Debian both are), a dedicated venv is the least painful route:
 
 ```sh
 python3 -m venv ~/.local/share/eix/sherpa-runtime
@@ -60,15 +65,15 @@ ln -sf ~/.local/lib/eix-asr/sherpa-onnx-offline ~/.local/bin/sherpa-onnx-offline
 sherpa-onnx-offline --help >/dev/null && echo runtime ok
 ```
 
-关键在于 `libonnxruntime.so` 必须和二进制同目录：pip 打好的 rpath 里带
-`$ORIGIN`，同目录即可解析，不需要 `patchelf`。分开放会得到
-`error while loading shared libraries: libonnxruntime.so`。
+The important part is that `libonnxruntime.so` sits next to the binary: the pip wheel bakes
+`$ORIGIN` into its rpath, so the same directory resolves it without `patchelf`. Separating them
+yields `error while loading shared libraries: libonnxruntime.so`.
 
-也可以用发行版包或 GitHub release 里的
-`sherpa-onnx-v2.0.1-linux-x64-shared.tar.bz2`，只要能提供
-`sherpa-onnx-offline` 即可。
+A distro package or the GitHub release
+`sherpa-onnx-v2.0.1-linux-x64-shared.tar.bz2` works too, as long as it provides
+`sherpa-onnx-offline`.
 
-模型 228 MiB，两个文件必须同目录，`tokens.txt` 就在模型旁边：
+The model is 228 MiB. Both files must share a directory, with `tokens.txt` next to the model:
 
 ```sh
 mkdir -p ~/.local/share/eix/models/sense-voice
@@ -77,8 +82,8 @@ B=https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024
 curl -fL -O $B/model.int8.onnx -O $B/tokens.txt
 ```
 
-下完必须校验。截断的 ONNX 在加载时报 `Protobuf parsing failed`，
-而它停在这一句之前不会回落到 whisper：
+Always verify after downloading. A truncated ONNX file fails to load with
+`Protobuf parsing failed`, and that failure happens before any fallback to whisper:
 
 ```sh
 sha256sum model.int8.onnx tokens.txt
@@ -87,17 +92,18 @@ sha256sum model.int8.onnx tokens.txt
 wc -c model.int8.onnx   # 239233841
 ```
 
-网络不稳时用可续传的方式拿，别硬等单流：
+On an unreliable network, resume rather than waiting out a single stream:
 
 ```sh
 curl -fL -C - --retry 5 -o model.int8.onnx $B/model.int8.onnx
 ```
 
-### whisper（备选，体积小、中文弱）
+### whisper (fallback: smaller, weak on Chinese)
 
-需要 `whisper-cli` 加一个 `ggml-*.bin`。装法随发行版：Arch 有 `extra/whisper-cpp`，
-其它平台按 [whisper.cpp](https://github.com/ggml-org/whisper.cpp) 的构建说明自己编译
-（它的 release 页只有源码，没有现成二进制）。只要最终 `whisper-cli` 在 `PATH` 上即可。
+Needs `whisper-cli` plus one `ggml-*.bin`. Installation varies by distribution: Arch has
+`extra/whisper-cpp`; elsewhere build it following the
+[whisper.cpp](https://github.com/ggml-org/whisper.cpp) instructions (its release page ships source
+only, no binaries). All that matters is that `whisper-cli` ends up on `PATH`.
 
 ```sh
 mkdir -p ~/.local/share/eix/models
@@ -105,66 +111,70 @@ curl -fL -o ~/.local/share/eix/models/ggml-base.bin \
   https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
 ```
 
-`ggml-base.bin` 是 141 MiB，比 SenseVoice 的 228 MiB 小一半，峰值内存约 285 MB。
-但中文基本不可用，适合当 SenseVoice 没装好时的兜底，或者只做英文。
+`ggml-base.bin` is 141 MiB, half of SenseVoice's 228 MiB, with a peak of roughly 285 MB. Chinese
+output is close to unusable, so treat it as the fallback for a missing SenseVoice install or for
+English-only work.
 
-### fake（不装任何东西）
+### fake (installs nothing)
 
-`backend = "fake"` 或 `--engine fake` 不发音频、不加载模型，final 文本是
-`[voice] <N> ms`。用来确认采集、分段、RPC 通路是否正常，跟真实识别无关。
+With `backend = "fake"` or `--engine fake`, no audio is sent and no model is loaded; the final
+text is `[voice] <N> ms`. Use it to verify capture, segmentation, and the RPC path, independent
+of real recognition.
 
-## 配置
+## Configuration
 
-配置在 `~/.config/eix/config.toml`（`EIX_CONFIG` 可覆盖），全部有默认值，
-下面只列会动到的键：
+Configuration lives in `~/.config/eix/config.toml` (overridable with `EIX_CONFIG`). Everything has a
+default; only the keys you are likely to touch are listed.
 
-| 键 | 默认 | 说明 |
+| Key | Default | Meaning |
 | --- | --- | --- |
-| `[voice] enabled` | `true` | 关掉后 `/voice` 报 `voice is disabled in [voice]`。 |
-| `[voice] backend` | `"local"` | `local`、`cloud`、`fake`。 |
-| `[voice] language` | `""` | 空=自动检测；填 `zh`、`en` 等可强制引擎语言。 |
-| `[voice.local] engine` | `""` | 空=自动：装了 SenseVoice 用 `sherpa`，否则 `whisper`。 |
-| `[voice.local] command` | 未设 | `eix-asr` 的路径。未设时依次找 `PATH`、`eixd` 同目录、`~/.local/bin`。 |
-| `[voice.local] model_dir` | 未设 | 显式指定 `model.int8.onnx` 或 `ggml-*.bin`；`~` 不会展开。 |
-| `[voice.local] args` | `[]` | 逃生口：整段替换推导出的参数，`--model`/`--language` 缺失时仍会补。 |
-| `[voice.capture] command` | `""` | 空=依次找 `parec`、`pw-record`、`arecord`。 |
-| `[voice.capture] threshold` | `0.004` | RMS 门限（0.0–1.0）。背景噪声让一句话关不上时才调高。 |
-| `[voice.capture] silence_ms` | `800` | 静音多久算一句说完。 |
-| `[voice.capture] max_utterance_ms` | `60000` | 单句硬上限，防止噪声环境里一直录。 |
-| `[voice.refine] enabled` | `true` | 用聊天模型修标点、错别字、口癖。只发文本，不发音频。 |
-| `[voice.refine] model` | `""` | `provider/model`；空=默认模型。 |
-| `[voice.refine] timeout_ms` | `8000` | 超时则保留原文，不会卡住输入框。 |
+| `[voice] enabled` | `true` | When off, `/voice` reports `voice is disabled in [voice]`. |
+| `[voice] backend` | `"local"` | `local`, `cloud`, or `fake`. |
+| `[voice] language` | `""` | Empty means auto-detect; `zh`, `en`, and so on force the engine language. |
+| `[voice.local] engine` | `""` | Empty means automatic: `sherpa` when SenseVoice is installed, otherwise `whisper`. |
+| `[voice.local] command` | unset | Path to `eix-asr`. When unset, eix tries `PATH`, then the `eixd` directory, then `~/.local/bin`. |
+| `[voice.local] model_dir` | unset | Explicit `model.int8.onnx` or `ggml-*.bin`; `~` is not expanded. |
+| `[voice.local] args` | `[]` | Escape hatch: replaces the derived arguments wholesale, though a missing `--model`/`--language` is still filled in. |
+| `[voice.capture] command` | `""` | Empty tries `parec`, then `pw-record`, then `arecord`. |
+| `[voice.capture] threshold` | `0.004` | RMS gate (0.0–1.0). Raise it when background noise prevents an utterance from closing. |
+| `[voice.capture] silence_ms` | `800` | How much silence ends an utterance. |
+| `[voice.capture] max_utterance_ms` | `60000` | Hard per-utterance ceiling, so a noisy room cannot record forever. |
+| `[voice.refine] enabled` | `true` | Use a chat model to fix punctuation, typos, and filler words. Text only, never audio. |
+| `[voice.refine] model` | `""` | `provider/model`; empty uses the default model. |
+| `[voice.refine] timeout_ms` | `8000` | On timeout the raw text is kept, so the prompt never stalls. |
 
-自动发现的两条规则值得记住，因为它们解释“为什么没生效”：
+Two discovery rules are worth remembering, since they explain "why did nothing happen":
 
-- SenseVoice 只有在 `tokens.txt` 存在、且 `model.int8.onnx`（或 `model.onnx`）
-  至少 10 MiB 时才算装上；否则按未安装处理，回落 whisper。
-- whisper 取 `<数据目录>/models` 下最大的 `*.bin`，因为更大的模型更准。
+- SenseVoice counts as installed only when `tokens.txt` exists **and** `model.int8.onnx` (or
+ `model.onnx`) is at least 10 MiB. Otherwise it is treated as absent and eix falls back to
+  whisper.
+- whisper picks the largest `*.bin` under `<data dir>/models`, because bigger models are more
+  accurate.
 
-几个常见改法：
+Common edits:
 
 ```toml
-# 中文为主，锁定语言省掉检测
+# Mostly Chinese: pin the language and skip detection
 [voice]
 language = "zh"
 
-# 两个人共用一台机器，模型放在别处
+# Two people share the machine; models live elsewhere
 [voice.local]
 model_dir = "/data/models/sense-voice/model.int8.onnx"
 
-# sherpa 二进制不在 PATH 上，用 args 全量指定
+# The sherpa binary is not on PATH; spell everything out through args
 [voice.local]
 args = ["--engine", "sherpa", "--command", "/opt/sherpa/sherpa-onnx-offline",
         "--model", "/data/models/sense-voice/model.int8.onnx"]
 
-# 不需要润色，想要引擎原样输出
+# No cleanup pass; use the engine's output verbatim
 [voice.refine]
 enabled = false
 ```
 
-`backend = "cloud"` 时音频会离开本机。密钥不写进配置，先让凭据槽成为合法的
-provider（`eix auth login` 只接受 `[providers]` 里已存在的名字，点号要用引号），
-再存 key：
+With `backend = "cloud"`, audio leaves the machine. Keep the key out of the config: first make the
+credential slot a real provider (`eix auth login` only accepts names that exist in `[providers]`,
+and dotted names need quotes), then store the key:
 
 ```toml
 [providers."asr.deepgram"]
@@ -172,83 +182,88 @@ base_url = "https://api.deepgram.com"
 ```
 
 ```sh
-eix auth login asr.deepgram     # 或 asr.openai、asr.custom，同理先配 [providers."..."]
+eix auth login asr.deepgram     # likewise asr.openai or asr.custom, each with its own [providers."…"]
 ```
 
-key 落在 `<数据目录>/auth/asr_deepgram.json`（点号换成下划线），只有属主可读。
-daemon 用到时才读，改完不必重启。
+The key lands in `<data dir>/auth/asr_deepgram.json` (dots become underscores) and is readable only
+by its owner. The daemon reads it when needed, so no restart is required.
 
-## 使用
+## Using it
 
-在 TUI 里，全部入口就这几个：
+In the TUI these are all the entry points:
 
-| 操作 | 效果 |
+| Action | Effect |
 | --- | --- |
-| `/voice` | 开始听，静音 800 ms 自动切句，可以连续说。 |
-| `/voice off`（或 `/voice stop`） | 停止。 |
-| `/voice file PATH` | 转写已有录音，走同一条通路。 |
-| 按住 `Ctrl-g` | 按住说，松开停；终端不支持按键释放事件时变成按一下开、再按一下停。 |
+| `/voice` | Start listening; 800 ms of silence ends an utterance, and you can keep talking. |
+| `/voice off` (or `/voice stop`) | Stop. |
+| `/voice file PATH` | Transcribe an existing recording through the same path. |
+| `F2` | Hold to talk, release to stop; on terminals without key-release events it toggles on and off. |
 
-识别结果写进输入框，不直接发送，可以先改再 `Enter`。
+Results are written into the prompt, not sent directly, so you can edit them before pressing
+`Enter`.
 
-`/voice file` 接受裸 PCM16 小端单声道 16 kHz，或同样布局的 WAV；
-格式不符会明确报出实际读到的格式，而不是偷偷重采样。其它来源先转一遍：
+`/voice file` accepts raw PCM16 little-endian mono 16 kHz, or WAV with the same layout. A
+mismatched format is reported with the actual format read, never silently resampled. Convert other
+sources first:
 
 ```sh
 ffmpeg -i talk.m4a -ar 16000 -ac 1 -c:a pcm_s16le talk.wav
 ffmpeg -i talk.m4a -f s16le -ar 16000 -ac 1 talk.pcm
 ```
 
-不经过 TUI 也能用：`asr.start` / `asr.pcm` / `asr.finish` 三个 RPC，或
-`POST /asr/{utterance_id}/pcm` 直接推音频。方法表和事件在 [voice.md](./voice.md)。
+It also works without the TUI, through the `asr.start` / `asr.pcm` / `asr.finish` RPCs, or by pushing
+audio straight to `POST /asr/{utterance_id}/pcm`. Methods and events are in [voice.md](./voice.md).
 
-## 验证
+## Verifying
 
-先脱离 eix 单独跑通引擎，排错范围会小很多：
+Run the engine on its own first; it narrows the search space considerably:
 
 ```sh
 M=~/.local/share/eix/models/sense-voice
 eix-asr --wav talk.wav --engine sherpa --model $M/model.int8.onnx
-# {"type":"final","text":"开饭时间早上9点至下午5点。","words":[],"engine":"sherpa"}
+# {"type":"final","text":"...","words":[],"engine":"sherpa"}
 
 eix-asr --wav talk.wav --engine sherpa --model $M/model.int8.onnx --format text
-# 开饭时间早上9点至下午5点。
+# ...
 ```
 
-`--format text` 只打文字，适合脚本里用。想看每句耗时加上引擎自己的输出即可：
-`sherpa-onnx-offline` 会打印 `Elapsed seconds` 和 `RTF`。
+`--format text` prints only the text, which suits scripts. For per-utterance timing, read the
+engine's own output: `sherpa-onnx-offline` prints `Elapsed seconds` and `RTF`.
 
-## 排错
+## Troubleshooting
 
-报错文案和对应的原因：
+Messages and their causes:
 
-| 现象 | 原因 | 处理 |
+| Symptom | Cause | Fix |
 | --- | --- | --- |
-| `voice is disabled in [voice]` | `[voice] enabled = false` | 删掉或改 `true` |
-| `no eix-asr helper found: ...` | `eix-asr` 不在三个搜索位置 | `install` 到 `~/.local/bin/`，或设 `[voice.local] command` |
-| `local asr helper /path does not exist` | `command` 写错 | 用绝对路径并确认可执行 |
-| `no recorder found: install parec, ...` | 没有录音程序 | 装 `pulseaudio-utils`/`pipewire`/`alsa-utils`，或设 `[voice.capture] command` |
-| `error while loading shared libraries: libonnxruntime.so` | 运行时和 so 分开放了 | 把 `libonnxruntime.so` 放到二进制同目录 |
-| `Protobuf parsing failed` | 模型下载被截断 | 核对 sha256 后重下 |
-| `the sherpa engine needs --model ...` | 用了 `--engine sherpa` 但没给模型 | 加 `--model`，或删掉 `args` 让 eix 自动补 |
-| `/voice` 无反应、电平条不动 | 录到的是静音，或门限过高 | 检查输入设备；再降 `threshold` |
-| 说出来只识别到每句开头几个字 | 门限偏高，轻声被当成静音，句子被提前切断 | 调低 `threshold`，或加长 `silence_ms` |
-| 文字对了但标点很乱 | 润色没生效 | 看 `asr.final` 的 `degraded` 字段；确认 `[voice.refine] enabled` 和 provider 可达 |
+| `voice is disabled in [voice]` | `[voice] enabled = false` | Remove it or set `true` |
+| `no eix-asr helper found: …` | `eix-asr` is in none of the three search locations | Install into `~/.local/bin/`, or set `[voice.local] command` |
+| `local asr helper /path does not exist` | `command` is wrong | Use an absolute path and confirm it is executable |
+| `no recorder found: install parec, …` | No recording program | Install `pulseaudio-utils`/`pipewire`/`alsa-utils`, or set `[voice.capture] command` |
+| `error while loading shared libraries: libonnxruntime.so` | Runtime and shared object were separated | Put `libonnxruntime.so` next to the binary |
+| `Protobuf parsing failed` | The model download was truncated | Check the sha256 and download again |
+| `the sherpa engine needs --model  …` | `--engine sherpa` without a model | Add `--model`, or drop `args` and let eix fill it in |
+| `/voice` does nothing and the meter stays flat | The capture is silent, or the gate is too high | Check the input device, then lower `threshold` |
+| Speech is cut to the first few characters of each sentence | The gate is high enough to treat quiet speech as silence, ending utterances early | Lower `threshold`, or raise `silence_ms` |
+| Words are right but punctuation is a mess | The refinement pass did not run | Check `degraded` on `asr.final`, and confirm `[voice.refine] enabled` and a reachable provider |
 
-`degraded: true` 不是错：它表示润色那一步失败或超时，你看到的是引擎原文。
+`degraded: true` is not an error: it means the refinement step failed or timed out and you are
+seeing the engine's raw text.
 
-## 资源占用
+## Resource usage
 
-一台笔记本单核实测（`zh.wav` 5.6 s、`en.wav` 7.2 s 官方样本）：
+Single-core measurements on a laptop (official samples: `zh.wav` at 5.6 s, `en.wav` at 7.2 s):
 
-| 引擎 | 解码耗时 | RTF | 峰值 RSS |
+| Engine | Decode time | RTF | Peak RSS |
 | --- | --- | --- | --- |
 | SenseVoice int8 | 120 ms / 165 ms | 0.02 / 0.023 | ~380 MB |
-| whisper `ggml-base` | 相近 | ~0.02 | ~285 MB |
+| whisper `ggml-base` | comparable | ~0.02 | ~285 MB |
 
-`eix-asr` 每句起一个进程，每次都要重新加载模型：SenseVoice 约 0.7 s。
-所以短句的总延迟主要来自加载，而不是解码；连着说话时体会最明显。
-内存也是按句计的峰值，进程退出即释放。
+`eix-asr` starts one process per utterance and reloads the model each time: about 0.7 s for
+SenseVoice. Total latency for short utterances is therefore dominated by loading rather than
+decoding, which is most noticeable when speaking continuously. Memory is a per-utterance peak and
+is released when the process exits.
 
-想更省：只装 `ggml-base` 并接受中文质量下降；或者保持 SenseVoice 但把
-`silence_ms` 调长一点，让一句话包含更多内容，从而减少进程启动次数。
+To cut costs further, install only `ggml-base` and accept the drop in Chinese quality; or keep
+SenseVoice and raise `silence_ms` a little so each utterance holds more content and fewer processes
+start.

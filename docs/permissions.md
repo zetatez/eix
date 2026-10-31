@@ -1,11 +1,12 @@
-# 审批、沙箱与权限规则
+# Approvals, sandboxing, and permission rules
 
-每次工具调用都要先过一遍权限判断。结果只有四种：直接放行、询问用户、直接拒绝、进沙箱
-执行。判断顺序是固定的：先看显式规则，再看工具自身的风险等级。
+Every tool call passes through one permission decision first. There are exactly four outcomes:
+allow, ask the user, deny, or run inside the sandbox. The order is fixed: explicit rules first,
+then the tool's own risk level.
 
-## 1. 一条规则长什么样
+## 1. Anatomy of a rule
 
-规则写在 `[[tools.rules]]`（`config.tmpl.toml` 里有注释示例）：
+Rules live in `[[tools.rules]]` (annotated examples are in `config.tmpl.toml`):
 
 ```toml
 [[tools.rules]]
@@ -15,48 +16,51 @@ command_regex = "^rm "
 action = "deny"
 ```
 
-| 字段 | 说明 |
-|---|---|
-| `id` | 稳定标识，出现在审批载荷和审计日志里 |
-| `tool` | 工具名，`apply_patch`、`exec_command`、`web_fetch`、`mcp__*` 等，或 `"*"` |
-| `path` | workspace 相对 glob，匹配调用的 `path` 参数；`web_fetch` 匹配 URL |
-| `command` | argv 前缀，例如 `["git", "status"]` |
-| `command_regex` | 正则，逃生口；能用 `command` 就别用它 |
-| `signature` | 精确的 JSON 参数，用于没有 path/command 的工具 |
-| `action` | `allow` / `ask` / `deny` / `sandbox`，默认 `ask` |
+| Field | Meaning |
+| --- | --- |
+| `id` | Stable identifier, surfaced in approval payloads and audit logs |
+| `tool` | Tool name such as `apply_patch`, `exec_command`, `web_fetch`, `mcp__*`, or `"*"` |
+| `path` | Workspace-relative glob matched against the call's `path` argument; for `web_fetch` it matches the URL |
+| `command` | argv prefix, for example `["git", "status"]` |
+| `command_regex` | Regular expression, an escape hatch; prefer `command` when it suffices |
+| `signature` | Exact JSON arguments, for tools that have neither path nor command |
+| `action` | `allow` / `ask` / `deny` / `sandbox`; defaults to `ask` |
 
-一条规则里的所有已写字段都必须命中才算匹配。`tool` 之外的字段都是可选的，写得越多越具体。
+Every field you write in a rule must match for the rule to apply. All fields except `tool` are
+optional, and the more you specify, the narrower the rule.
 
-## 2. 优先级
+## 2. Precedence
 
-所有匹配的规则都参与判断，不是“第一条命中就结束”：
+All matching rules take part in the decision; it is not "first match wins":
 
-1. 只要有一条 `deny` 命中，就拒绝。deny 永远优先。
-2. 否则在 `allow` / `ask` / `sandbox` 中取**最具体**的一条。具体程度按写了几个约束字段
-   计算：`tool != "*"`、`path`、`command`、`command_regex`、`signature` 各算一分。
+1. If any `deny` rule matches, the call is denied. Deny always wins.
+2. Otherwise the **most specific** matching `allow` / `ask` / `sandbox` rule applies. Specificity
+   is the number of constraint fields present among `tool != "*"`, `path`, `command`,
+   `command_regex`, and `signature`, one point each.
 
-这意味着“宽泛放行 + 精确收紧”是安全的：`allow` 一条大范围规则，再用更具体的 `deny` 或
-`ask` 覆盖特例即可。
+This makes "broad allow plus narrow tightening" safe: allow a wide range, then override the
+exceptions with more specific `deny` or `ask` rules.
 
-## 3. 命令匹配的两个细节
+## 3. Two details of command matching
 
-`command` 是 argv token 前缀，不是字符串前缀，所以 `["git", "status"]` 不会误伤
-`git statusfoo`。
+`command` is an argv token prefix, not a string prefix, so `["git", "status"]` does not also match
+`git statusfoo`.
 
-**多段命令。** `cargo test && rm -rf x` 会被拆成多个 shell 段；对 `allow`/`ask`/`sandbox`
-规则，只有**每一段**都以该前缀开头才算匹配。这挡住了“先写个合法前缀，后面接危险命令”的
-绕过。
+**Compound commands.** `cargo test && rm -rf x` is split into shell segments. For
+`allow`/`ask`/`sandbox` rules, **every** segment must start with the prefix for the rule to match.
+That blocks the "legal prefix, dangerous tail" bypass.
 
-**动态命令。** 含变量展开、命令替换等无法静态确定的写法，不会被命令前缀规则匹配放行；
-但 `deny` 规则对这类命令仍会尽量匹配。遇到 `eval`、`$(...)` 一类写法，默认落到 `ask`。
+**Dynamic commands.** Anything that cannot be resolved statically, such as variable expansion or
+command substitution, is never allowed by a command-prefix rule. `deny` rules still try to match
+such commands. Constructs like `eval` fall through to `ask` by default.
 
-`command_regex` 在配置加载时编译并校验，写错会直接报
-`tools.rules[N].command_regex is not a valid regex`，而不是静默失效。
+`command_regex` is compiled and validated when the config loads. A bad pattern fails loudly with
+`tools.rules[N].command_regex is not a valid regex` instead of silently doing nothing.
 
-## 4. `sandbox` 动作
+## 4. The `sandbox` action
 
-`action = "sandbox"` 表示“只在沙箱可用时放行，否则降级为询问”。它适合那些本身需要跑、
-但希望被文件系统隔离的命令：
+`action = "sandbox"` means "allow only when a sandbox is available, otherwise fall back to
+asking". It fits commands that should run, but that you want isolated from the filesystem:
 
 ```toml
 [[tools.rules]]
@@ -66,59 +70,61 @@ command = ["cargo", "test"]
 action = "sandbox"
 ```
 
-## 5. 沙箱本身
+## 5. The sandbox itself
 
-沙箱只作用于 `exec_command`，配置在 `[tools]`：
+The sandbox applies to `exec_command` only and is configured under `[tools]`:
 
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `sandbox` | `"auto"` | `auto` 有 bubblewrap 就用、没有就直接跑；`required` 必须沙箱，否则失败；`off` 不用 |
-| `sandbox_network` | `false` | 沙箱内是否允许联网 |
-| `sandbox_read_paths` | 空 | 只读挂载的额外路径，支持 `~`；默认不挂整个 home |
-| `sandbox_writable_roots` | 空 | 额外可写路径，相对路径按 workspace 解析；workspace 本身始终可写 |
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `sandbox` | `"auto"` | `auto` uses bubblewrap when present and runs directly otherwise; `required` fails without a sandbox; `off` disables it |
+| `sandbox_network` | `false` | Whether the sandbox may reach the network |
+| `sandbox_read_paths` | empty | Extra read-only mounts, `~` supported; the whole home directory is not mounted by default |
+| `sandbox_writable_roots` | empty | Extra writable paths, resolved relative to the workspace; the workspace itself is always writable |
 
-`auto` 是“尽力而为”，不等于隔离保证：机器上没装 bubblewrap 时命令直接在宿主上跑。需要硬
-保证时用 `required`，它会选择失败而不是降级。
+`auto` is best effort and not an isolation guarantee: with no bubblewrap installed, commands run
+directly on the host. Use `required` when you need a hard guarantee, since it prefers failing over
+degrading.
 
-工具链缓存（`~/.cargo`、`~/.rustup` 等）默认不可见，需要时显式加进 `sandbox_read_paths`。
+Toolchain caches (`~/.cargo`, `~/.rustup`, and so on) are invisible by default. Add them to
+`sandbox_read_paths` when a build needs them.
 
-## 6. 快照与 diff
+## 6. Snapshots and diffs
 
-权限之外还有两层保护，都在 `[tools]`：
+Two further layers of protection sit outside the permission system, both under `[tools]`:
 
-| 字段 | 默认 | 说明 |
-|---|---|---|
-| `snapshots` | 开 | 变更类工具执行前保存可回滚的快照 |
-| `auto_apply_workspace_edits` | 开 | 低/中风险写入直接落盘，不再逐次审批；快照仍保留 |
-| `turn_diff` | 开 | 每轮结束发 `turn.diff` 通知，给出受跟踪文件的差异 |
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `snapshots` | on | Save a rollback-able snapshot before any mutating tool runs |
+| `auto_apply_workspace_edits` | on | Apply low/medium-risk writes directly instead of approving each one; snapshots still apply |
+| `turn_diff` | on | Emit a `turn.diff` notification at the end of each turn with the diff of tracked files |
 
-把 `auto_apply_workspace_edits` 设为 `false` 就回到“每次文件修改都要看 diff”的模式。
+Setting `auto_apply_workspace_edits = false` restores "review a diff before every file change".
 
-## 7. 常用配方
+## 7. Common recipes
 
 ```toml
-# 只读检查全部放行
+# Allow read-only checks wholesale
 [[tools.rules]]
 id = "read-only-shell"
 tool = "exec_command"
 command = ["cargo", "check"]
 action = "allow"
 
-# 危险命令一律拒绝
+# Never run destructive commands
 [[tools.rules]]
 id = "deny-rm"
 tool = "exec_command"
 command_regex = "^rm "
 action = "deny"
 
-# 只允许读某个目录
+# Only ask about edits under one directory
 [[tools.rules]]
 id = "review-src"
 tool = "apply_patch"
 path = "src/**"
 action = "ask"
 
-# 只放行某个文档站点
+# Allow one documentation site
 [[tools.rules]]
 id = "docs-web"
 tool = "web_fetch"
@@ -126,18 +132,22 @@ path = "https://docs.rs/**"
 action = "allow"
 ```
 
-最后一条说明 `path` 的双重语义：普通工具匹配文件路径，`web_fetch` 匹配 URL。
+The last rule shows the dual meaning of `path`: filesystem paths for ordinary tools, URLs for
+`web_fetch`.
 
-## 8. 排错
+## 8. Troubleshooting
 
-**规则不生效。** 检查 `tool` 是否是模型看到的工具名：MCP 工具是 `mcp__server__tool`，
-不是原工具名。`path` 是 workspace 相对路径，绝对路径匹配不上。
+**A rule has no effect.** Check that `tool` matches the name the model actually sees: MCP tools are
+`mcp__server__tool`, not their bare name. `path` is workspace-relative, so absolute paths never
+match.
 
-**明明写了 allow 还是被问。** 很可能有更具体的规则命中并给出 `ask`，或者根本就是另一条
-deny 命中了。记得 deny 无条件优先，具体度只用于比较 allow/ask/sandbox。
+**An allow rule still prompts.** A more specific rule probably matched with `ask`, or a `deny`
+matched. Deny is unconditional; specificity only ranks `allow` / `ask` / `sandbox`.
 
-**沙箱没起作用。** `auto` 没装 bubblewrap 时会直接跑。用 `required` 验证，或者在沙箱里
-跑一条 `id` 看输出是否来自隔离环境。
+**The sandbox seems inactive.** With `auto` and no bubblewrap, commands simply run on the host.
+Verify with `required`, or run `id` inside the sandbox and check whether the output comes from an
+isolated environment.
 
-**命令被拒但看不出原因。** 多段命令要求每一段都匹配前缀；`cargo test && rm -rf x` 对
-`command = ["cargo", "test"]` 的 allow 规则不匹配，这是有意为之。
+**A command is rejected for no visible reason.** Compound commands require every segment to match
+the prefix, so `cargo test && rm -rf x` does not match an allow rule for
+`command = ["cargo", "test"]`. That is intentional.

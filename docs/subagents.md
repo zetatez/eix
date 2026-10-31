@@ -1,13 +1,15 @@
-# Sub-agent
+# Sub-agents
 
-sub-agent 是一个由主 agent 派生、在后台独立跑一轮（或几轮）的子会话。它有自己的会话 id、
-自己的工具调用记录，最后把结果作为一条工具结果回给父会话。
+A sub-agent is a child session the main agent spawns to run one or more turns on its own in the
+background. It has its own session id and its own tool-call history, and it hands a single result
+back to the parent as a tool result.
 
-适合：一个明确、可独立完成的调查或改造任务，且中间过程不需要人盯着。
+Reach for one when the work is a well-scoped investigation or change that nobody needs to watch
+while it runs.
 
-## 1. 定义 sub-agent
+## 1. Defining a sub-agent
 
-就是普通的 agent 文件，`role` 标成 `subagent`：
+A sub-agent is an ordinary agent file with `role: subagent`:
 
 ```markdown
 ---
@@ -21,58 +23,71 @@ You write tests. Read the module, find the untested branches, add focused tests,
 and run them. Report the command you ran and its result.
 ```
 
-字段与覆盖规则见 `docs/skills.md`。标成 `subagent` 的 agent 不会出现在主 agent 选择里，
-只能被 `spawn_agent` 调用。
+Field semantics and override rules are in [Skills, commands, and agents](./skills.md). An agent
+marked `subagent` never appears in the main agent picker; it can only be reached through
+`spawn_agent`.
 
-内置的 `explore` 可以直接用：只读检索与分析，返回带 `file:line` 的证据，不编辑文件、不跑
-变更命令、不提问。
+The built-in `explore` agent works without setup: read-only search and analysis that returns
+evidence with `file:line` references. It does not edit files, run mutating commands, or ask
+questions.
 
-## 2. 调用
+## 2. Spawning
 
-模型通过 `spawn_agent` 工具发起，参数里用 `agent` 指定名字。没有合适的自定义 agent 时，
-可以省略 `agent` 走默认配置。
+The model calls the `spawn_agent` tool and names the agent in its `agent` argument. When no custom
+agent fits, leave `agent` out to use the default configuration.
 
-一次回复里的多个 `spawn_agent` 会并发启动，上限由 `[tools] max_parallel_subagents`（默认值
-见 `config.tmpl.toml`）控制。运行中可以在 TUI 里临时调整，取值必须是
-2、4、8、16、32、64、128、256 之一；配置重载或 daemon 重启会回到配置里的值。
+Several `spawn_agent` calls in one assistant message start concurrently. The ceiling is
+`[tools] max_parallel_subagents` (defaults are documented in `config.tmpl.toml`). You can adjust
+it temporarily from the TUI while a turn runs; the value must be one of 2, 4, 8, 16, 32, 64, 128,
+or 256. A config reload or daemon restart returns it to the configured value.
 
-## 3. 深度与并发
+## 3. Depth and concurrency
 
-**深度限制为 1。** sub-agent 不能再派生 sub-agent，尝试时会得到明确错误，而不是无限递归。
+**Depth is limited to 1.** A sub-agent cannot spawn another sub-agent. The attempt returns an
+explicit error instead of recursing.
 
-**并发规则。** 同一批工具调用里，`spawn_agent` 一律并行；其他工具只有在被判定为只读时才
-并行，写操作是屏障。屏障保证子 agent 不会看到“改了一半”的工作区。
+**Concurrency follows the batch.** Within one batch of tool calls, `spawn_agent` always runs in
+parallel. Other tools run in parallel only when they are classified as read-only; writes act as a
+barrier. That barrier is what keeps a sub-agent from observing a half-applied working tree.
 
-**结果回填。** 每个子会话的结果作为一条工具结果追加到父会话，父 agent 看到的是结论，不是
-子会话的完整过程。过程留在子会话的事件日志里，需要时可以单独打开。
+**Results are summarised, not streamed.** Each child session's result is appended to the parent as
+one tool result, so the parent sees conclusions rather than the child's whole transcript. The
+transcript stays in the child's event log and can be opened on its own.
 
-## 4. 成本与可观测性
+## 4. Cost and observability
 
-每个 sub-agent 是独立的模型会话，token 与调用次数都单独计费。并发度直接决定峰值成本，
-`max_parallel_subagents` 既是性能旋钮也是预算旋钮。
+Every sub-agent is a separate model session, so its tokens and calls are billed separately.
+Concurrency therefore sets peak cost: `max_parallel_subagents` is a performance knob and a budget
+knob at the same time.
 
-子会话的来源标记为 agent，因此：
+Child sessions are tagged as agent sessions, which means:
 
-- 它们会出现在会话列表里，可以像普通会话一样查看与回放。
-- 子会话不会自己弹出审批；需要人决定的操作在父会话里处理。
-- 取消父轮次会传播到子会话。
+- They appear in the session list and can be inspected and replayed like any other session.
+- They never raise approvals on their own; anything that needs a human decision is handled in the
+  parent session.
+- Cancelling the parent turn propagates to the children.
 
-## 5. 写好一个 sub-agent
+## 5. Writing a good sub-agent
 
-- **一个任务，一个子 agent。** “调查为什么 X 失败”比“看看这个仓库”有效得多。任务越窄，
-  结果越可用。
-- **在 prompt 里写清产出格式。** 要求结论 + 证据（`file:line`）+ 未决问题，父 agent 才能直接
-  用，而不必再问一轮。
-- **明确禁止越界。** 只读调查就写明不编辑、不跑变更命令，避免子 agent 顺手改文件。
-- **别让它读整份 skill。** skill 由父会话按需加载；把需要的片段写进 prompt 更省预算。
+- **One task per sub-agent.** "Find out why this test fails" works far better than "look at this
+  repository". The narrower the task, the more usable the result.
+- **Specify the output format in the prompt.** Ask for a conclusion, the evidence (`file:line`),
+  and open questions, so the parent can act on the answer without another round trip.
+- **State the boundaries.** For a read-only investigation, say explicitly that the agent must not
+  edit files or run mutating commands, so it does not tidy the tree along the way.
+- **Do not make it read a whole skill.** The parent loads skills on demand; pasting the relevant
+  excerpt into the prompt costs less.
 
-## 6. 排错
+## 6. Troubleshooting
 
-**报“depth limit is 1”。** 当前会话已经是 sub-agent，不能再派生。把任务拆到父会话里发起。
+**"depth limit is 1".** The current session is already a sub-agent, so it cannot spawn another.
+Move the task one level up, into the parent session.
 
-**并发没提上去。** 检查 `max_parallel_subagents` 是否被配置重载改回；TUI 里的临时调整
-不持久。
+**Concurrency does not go up.** Check whether `max_parallel_subagents` was reset by a config
+reload. Adjustments made in the TUI are not persisted.
 
-**结果很泛。** 通常是任务描述太宽，或者没有要求证据。收窄问题并在 prompt 里规定输出格式。
+**Results are vague.** The task was probably too broad, or no evidence was requested. Narrow the
+question and pin down the output format in the prompt.
 
-**子会话卡住。** 取消父轮次会一并取消；也可以直接打开子会话查看它停在哪一步。
+**A child session hangs.** Cancelling the parent turn cancels it too. You can also open the child
+session directly to see which step it stopped on.

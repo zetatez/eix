@@ -1,27 +1,29 @@
-# Neovim 插件集成
+# Neovim integration
 
-eix 不内置 Vim/Neovim 前端，也不接管 buffer、窗口、键位或 picker。Neovim 插件是独立的
-daemon client：它读完本文的协议后，自己决定怎么渲染和交互。
+eix ships no Vim/Neovim frontend and does not own buffers, windows, keymaps, or pickers. A Neovim
+plugin is an independent daemon client: it learns the protocol from this page and decides on
+rendering and interaction for itself.
 
-如果你只想快速验证接口，先启动 daemon：
+To sanity-check the interface quickly, start the daemon first:
 
 ```sh
 eix status --json
 ```
 
-输出里的 `daemon.endpoint` 就是当前 socket 路径（TCP 时是 `tcp://...`）。插件也可以读取
-`EIX_SOCKET`，或让用户显式传入 `--socket`。使用 TCP 时对应 `EIX_TCP` / `EIX_TCP_TOKEN`。
+`daemon.endpoint` in that output is the current socket path (`tcp://...` when using TCP). A plugin
+can also read `EIX_SOCKET`, or take an explicit `--socket` from the user. With TCP, use `EIX_TCP`
+and `EIX_TCP_TOKEN`.
 
-## 传输
+## Transport
 
-推荐直接连 Unix socket，使用换行分隔的 JSON-RPC：
+Connecting straight to the Unix socket with newline-delimited JSON-RPC is the recommended path:
 
-- 默认 socket 由 `eix_core::config::socket_path()` 决定：
-  `$XDG_RUNTIME_DIR/eix.sock`；macOS 回退到 `~/Library/Caches/eix/eix.sock`。
-- 每行一个 JSON 对象，UTF-8 编码；不要发送多行 JSON。
-- Unix socket 视为已认证（靠文件系统权限保护）。
+- The default socket comes from `eix_core::config::socket_path()`: `$XDG_RUNTIME_DIR/eix.sock`,
+  with a macOS fallback to `~/Library/Caches/eix/eix.sock`.
+- One JSON object per line, UTF-8 encoded. Never send multi-line JSON.
+- The Unix socket counts as authenticated; filesystem permissions are the boundary.
 
-需要跨机器时使用 TCP：
+For cross-machine use, TCP:
 
 ```toml
 [server]
@@ -29,42 +31,44 @@ tcp = "127.0.0.1:7777"
 token = "..."
 ```
 
-TCP 连接的第一个请求必须是：
+The first request on a TCP connection must be:
 
 ```json
 {"id":1,"method":"auth","params":{"token":"..."}}
 ```
 
-认证成功后才返回其它响应和事件；失败返回 `unauthorized` 并断开。token 可以是配置里的
-`server.token`，也可以是用 `eix pair` 生成的一次性码兑换来的客户端 token（daemon 只保存其
-SHA-256，`eix pair list` / `revoke` 管理）。HTTP/SSE 是另一条可选的
-集成路径，见 [DESIGN.md §19](../DESIGN.md#196-neovim-插件集成)。
+Only after successful authentication do other responses and events flow; failure returns
+`unauthorized` and disconnects. The token can be the configured `server.token`, or a client token
+minted by exchanging a one-time `eix pair` code (the daemon stores only its SHA-256 and manages
+tokens with `eix pair list` / `revoke`). HTTP/SSE is an alternative integration path; see
+[DESIGN.md §19](../DESIGN.md#196-neovim-插件集成).
 
-## 消息格式
+## Message format
 
-请求由客户端发出：
+Requests are sent by the client:
 
 ```json
 {"id":1,"method":"session.list","params":{}}
 ```
 
-响应总是带回同一个 `id`：
+Responses always echo the same `id`:
 
 ```json
 {"id":1,"result":{"sessions":[]}}
 {"id":1,"error":{"code":"bad_request","message":"..."}}
 ```
 
-通知由 daemon 主动推送，没有 `id`：
+Notifications are pushed by the daemon and carry no `id`:
 
 ```json
 {"method":"session.event","params":{"session_id":"...","seq":12,"ts":1730000000000,"kind":"assistant_message","payload":{"text":"...","model":"..."}}}
 ```
 
-`id` 只需在单条连接内单调递增。收到不认识的 notification 时忽略即可；收到 `stream.lagged`
-说明事件队列溢出，插件应通过 `session.events` 拉取缺失的 `seq` 再继续。
+`id` only has to increase monotonically within one connection. Ignore notifications you do not
+recognise; `stream.lagged` means the event queue overflowed, and the plugin should fetch the
+missing `seq` values through `session.events` before continuing.
 
-## 最小调用顺序
+## Minimal call sequence
 
 ```text
 connect
@@ -72,69 +76,73 @@ connect
   -> session.list / session.create
   -> session.subscribe {session_ids: [id]}
   -> prompt.submit {session_id, text}
-  -> 读 session.event / message.delta / tool.* / turn.completed
-  -> prompt.cancel / approval.respond / input.respond（按需）
+  -> read session.event / message.delta / tool.* / turn.completed
+  -> prompt.cancel / approval.respond / input.respond (as needed)
 ```
 
-`session.subscribe` 把广播收窄到指定 session；省略 `session_ids`（或传 `{}`）表示恢复全部，
-传空数组会静默广播。多 pane 插件应为每个连接分别订阅，不要把多个 session 的事件混在一条连接里。
+`session.subscribe` narrows the broadcast to the listed sessions. Omitting `session_ids` (or
+passing `{}`) restores the full broadcast, while an empty array silently broadcasts everything.
+A multi-pane plugin should subscribe per connection rather than mixing several sessions into one
+connection.
 
-## 常用请求
+## Common requests
 
-| method | params | 说明 |
+| method | params | Purpose |
 | --- | --- | --- |
-| `hello` | `null` | 协议版本、daemon 版本、模型等 |
-| `session.list` | `{include_archived?}` | 列出 session |
-| `session.create` | `{name?, cwd?, model?, worktree?, mode?, agent?}` | 新建 session |
-| `session.get` | `{session_id}` | 单个 session 详情 |
-| `session.subscribe` | `{session_ids?: string[] \| null}` | 收窄/恢复广播 |
-| `session.events` | `{session_id, after_seq?, before_seq?, limit?}` | 分页读取持久化事件，用于重连/补洞 |
-| `prompt.submit` | `{session_id, text, images?}` | 提交一轮 prompt；若该 session 已有 turn 在跑则入队并返回 `queued: true` 与空 `turn_id` |
-| `prompt.cancel` | `{session_id}` | 取消当前 turn，同时清空该 session 的排队 prompt |
-| `approval.respond` | `{session_id, approval_id, decision, reason?, hunks?, scope?}` | 审批；`decision` 为 `approve` / `deny` / `always` |
-| `input.respond` | `{session_id, input_id, option_index}` | 回答模型的提问 |
-| `session.mode` | `{session_id, mode, temporary?}` | 切换 plan/build/auto/full |
-| `draft.get` / `draft.set` | `{session_id}` / `{session_id, text}` | 读写未发送输入 |
-| `process.list` / `process.output` / `process.kill` | `{session_id?}` / `{process_id, ...}` / `{process_id}` | 后台进程 |
-| `picker.query` / `picker.preview` | `{kind, session_id?, query?, limit?}` / `{kind, session_id?, value, limit?}` | 文件、图片、git、session、context 选择器数据 |
-| `mcp.list` / `mcp.set_enabled` | `null` / `{name, enabled}` | 列出 MCP server，或启用/停用并在配置中持久化 |
+| `hello` | `null` | Protocol version, daemon version, models |
+| `session.list` | `{include_archived?}` | List sessions |
+| `session.create` | `{name?, cwd?, model?, worktree?, mode?, agent?}` | Create a session |
+| `session.get` | `{session_id}` | Details for one session |
+| `session.subscribe` | `{session_ids?: string[] \| null}` | Narrow or restore the broadcast |
+| `session.events` | `{session_id, after_seq?, before_seq?, limit?}` | Page through persisted events; used for reconnects and gap filling |
+| `prompt.submit` | `{session_id, text, images?}` | Submit a prompt; if a turn is already running it is queued and the reply carries `queued: true` with an empty `turn_id` |
+| `prompt.cancel` | `{session_id}` | Cancel the current turn and clear that session's queued prompts |
+| `approval.respond` | `{session_id, approval_id, decision, reason?, hunks?, scope?}` | Answer an approval; `decision` is `approve` / `deny` / `always` |
+| `input.respond` | `{session_id, input_id, option_index}` | Answer a question the model asked |
+| `session.mode` | `{session_id, mode, temporary?}` | Switch between plan/build/auto/full |
+| `draft.get` / `draft.set` | `{session_id}` / `{session_id, text}` | Read or write unsent input |
+| `process.list` / `process.output` / `process.kill` | `{session_id?}` / `{process_id, $EIX_TCP_TOKEN}` / `{process_id}` | Background processes |
+| `picker.query` / `picker.preview` | `{kind, session_id?, query?, limit?}` / `{kind, session_id?, value, limit?}` | Picker data for files, images, git, sessions, context |
+| `mcp.list` / `mcp.set_enabled` | `null` / `{name, enabled}` | List MCP servers, or enable/disable one and persist it to config |
 
-完整参数以 [`crates/eix-core/src/protocol.rs`](../crates/eix-core/src/protocol.rs) 为准。
+Full parameter definitions are authoritative in
+[`crates/eix-core/src/protocol.rs`](../crates/eix-core/src/protocol.rs).
 
-## 常用通知
+## Common notifications
 
-| method | 说明 |
+| method | Purpose |
 | --- | --- |
-| `turn.started` | 一轮开始，带 `session_id` / `turn_id` / `model` |
-| `message.delta` | 流式正文，带 `delta` |
-| `reasoning.delta` | 流式 reasoning，显示用，不要写回上下文 |
-| `message.reset` | 正文需要清空重放 |
-| `tool.started` / `tool.completed` | 工具调用生命周期 |
-| `tool.approval_required` | 需要审批；用 `approval.respond` 回复 |
-| `input.required` | 模型提问；用 `input.respond` 回复 |
-| `turn.completed` | 一轮结束，带 `cancelled` / `error` / `usage` / `cost` / `rounds` |
-| `prompt.queued` | prompt 已入队，带 `session_id` / `position`（从 1 开始） |
-| `prompt.failed` | 排队 prompt 无法启动，带 `session_id` / `error`；不会静默丢弃 |
-| `prompt.cancelled` | 队列被 `prompt.cancel` 清空，带 `session_id` / `dropped`（丢弃条数） |
-| `session.event` | 持久化事件（transcript 的权威来源），`kind` 为 snake_case |
-| `session.updated` | session 元数据或状态变化 |
-| `process.output` / `process.exited` | 后台进程输出与退出 |
-| `integration.updated` | worktree 集成队列变化 |
-| `stream.lagged` | 广播丢弃了事件，需要补拉 |
-| `config.error` | 配置热重载失败 |
+| `turn.started` | A turn began, with `session_id` / `turn_id` / `model` |
+| `message.delta` | Streaming body text, carrying `delta` |
+| `reasoning.delta` | Streaming reasoning, for display only; never write it back into context |
+| `message.reset` | The body must be cleared and replayed |
+| `tool.started` / `tool.completed` | Tool-call lifecycle |
+| `tool.approval_required` | An approval is needed; answer with `approval.respond` |
+| `input.required` | The model asked a question; answer with `input.respond` |
+| `turn.completed` | The turn ended, with `cancelled` / `error` / `usage` / `cost` / `rounds` |
+| `prompt.queued` | The prompt was queued, with `session_id` / `position` (1-based) |
+| `prompt.failed` | A queued prompt could not start, with `session_id` / `error`; it is never dropped silently |
+| `prompt.cancelled` | The queue was cleared by `prompt.cancel`, with `session_id` / `dropped` (count) |
+| `session.event` | A persisted event, the authoritative transcript source; `kind` is snake_case |
+| `session.updated` | Session metadata or state changed |
+| `process.output` / `process.exited` | Background process output and exit |
+| `integration.updated` | The worktree integration queue changed |
+| `stream.lagged` | The broadcast dropped events; backfill before continuing |
+| `config.error` | A config hot reload failed |
 
-`session.event.params.kind` 常见值：`user_message`、`assistant_message`、`tool_call`、
-`tool_result`、`patch_proposed`、`patch_applied`、`patch_rejected`、`approval_required`、
-`input_required`、`input_answered`、`process_started`、`process_exited`、`status_changed`、
-`context_compacted`、`mode`、`error`。事件 payload 的类型定义在同一 `event.rs` 中。
+Common `session.event.params.kind` values: `user_message`, `assistant_message`, `tool_call`,
+`tool_result`, `patch_proposed`, `patch_applied`, `patch_rejected`, `approval_required`,
+`input_required`, `input_answered`, `process_started`, `process_exited`, `status_changed`,
+`context_compacted`, `mode`, `error`. Payload types are defined in the same `event.rs`.
 
-插件渲染建议：先用 `session.events` 建完整 transcript，再用 `session.event` 追加，最后用
-`message.delta` 做流式刷新。只依赖 `message.delta` 会在断线重连后丢历史。
+Rendering advice: build the full transcript from `session.events`, append with `session.event`,
+then use `message.delta` for streaming refresh. Relying on `message.delta` alone loses history
+after a reconnect.
 
-## 最小 Lua 传输层
+## Minimal Lua transport
 
-下面只是连接和收发，不包含 UI。把它放进插件的 `lua/eix/rpc.lua`，再在上层实现 buffer、
-window、keymap 和 picker。
+This is transport only, with no UI. Put it in the plugin's `lua/eix/rpc.lua` and build buffers,
+windows, keymaps, and pickers on top.
 
 ```lua
 local uv = vim.uv or vim.loop
@@ -220,7 +228,7 @@ end
 return Client
 ```
 
-使用：
+Using it:
 
 ```lua
 local Rpc = require("eix.rpc")
@@ -240,7 +248,7 @@ rpc:request("session.subscribe", { session_ids = { session_id } })
 rpc:request("prompt.submit", { session_id = session_id, text = "hello" })
 ```
 
-TCP 版本把 `uv.new_pipe` 换成 `uv.new_tcp`，并在连接成功后先发 `auth`：
+The TCP variant swaps `uv.new_pipe` for `uv.new_tcp` and sends `auth` first:
 
 ```lua
 rpc:request("auth", { token = token }, function(response)
@@ -248,12 +256,17 @@ rpc:request("auth", { token = token }, function(response)
 end)
 ```
 
-## 注意事项
+## Things to watch
 
-- 同一 session 同时只应有一个 turn；turn 运行期间再次 `prompt.submit` 会由 daemon 入队，
-  返回 `queued: true` 且 `turn_id` 为空。插件不需要自己排队，但应处理 `prompt.queued` /
-  `prompt.failed` / `prompt.cancelled` 通知来更新界面。
-- 每个 Neovim 进程是独立 client；多个窗口共享同一 daemon，不要假设自己是唯一写入者。
-- 不要在 libuv 回调里直接调用 `vim.api.nvim_*`；用 `vim.schedule` 切回主循环（上面的示例已处理）。
-- 插件关闭时关闭 pipe；重连后重新 `hello` + `session.subscribe` + `session.events` 补历史。
-- 协议的权威契约是 `crates/eix-core/src/protocol.rs` 和 `PROTOCOL_VERSION`，不要依赖渲染文本。
+- A session should have only one turn at a time. Submitting a prompt while a turn runs is queued by
+  the daemon, which replies with `queued: true` and an empty `turn_id`. The plugin does not
+  need its own queue, but it should handle the `prompt.queued` / `prompt.failed` / `prompt.cancelled`
+  notifications when updating the UI.
+- Every Neovim process is a separate client. Several windows share one daemon, so never assume you
+  are the only writer.
+- Do not call `vim.api.nvim_*` directly from a libuv callback; switch back to the main loop with
+ `vim.schedule` (the example above already does this).
+- Close the pipe when the plugin shuts down. After reconnecting, call `hello` again, then
+ `session.subscribe`, then backfill history through `session.events`.
+- The authoritative contract is `crates/eix-core/src/protocol.rs` together with
+ `PROTOCOL_VERSION`; never depend on rendered text.

@@ -22,7 +22,8 @@ replaceable frontends. Closing the terminal does not stop a running turn.
 [Skills, commands, agents](./docs/skills.md) · [Sub-agents](./docs/subagents.md) ·
 [HTTP API and SDK](./docs/http-api.md) · [Protocol contract](./crates/eix-core/src/protocol.rs) ·
 [Plugin example](./examples/plugins/echo) · [Plugin design](./docs/plugins.md) ·
-[Worktrees](./docs/worktree.md) · [Neovim integration](./docs/nvim.md) · [Voice](./docs/voice.md)
+[LSP](./docs/lsp.md) · [Worktrees](./docs/worktree.md) ·
+[Neovim integration](./docs/nvim.md) · [Voice](./docs/voice.md)
 
 ## Highlights
 

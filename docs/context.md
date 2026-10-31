@@ -1,22 +1,25 @@
-# Context 与上下文管理
+# Context and context management
 
-每一轮请求都要装下：系统提示词、指令文件、工具定义、skill 目录、对话历史、工具输出。
-`[context]` 决定这个包如何被裁剪，以及什么时候触发压缩。
+Every request has to fit the system prompt, the instruction files, the tool definitions, the skill
+catalog, the conversation history, and tool output. `[context]` decides how that package is
+trimmed and when compaction fires.
 
-## 1. 请求里有什么
+## 1. What a request is made of
 
-按稳定性从高到低：
+Ordered from most to least stable:
 
-1. **系统提示词**：内置部分加上 agent 的 `prompt`。
-2. **指令文件**：`AGENTS.md` 等，见第 3 节。
-3. **工具定义**：内置工具 + MCP 工具 + 插件工具。
-4. **skill 目录**：`<available_skills>`，只有一行描述，正文按需读取。
-5. **工作区摘要**：cwd 与顶层条目（`workspace_summary`），git 状态单独放在环境段。
-6. **对话历史**：用户消息、助手消息、工具调用与结果。
+1. **System prompt**: the built-in text plus the agent's `prompt`.
+2. **Instruction files**: `AGENTS.md` and friends, see section 3.
+3. **Tool definitions**: built-in tools, MCP tools, plugin tools.
+4. **Skill catalog**: `<available_skills>`, one description line each; bodies are read on demand.
+5. **Workspace summary**: cwd and top-level entries (`workspace_summary`); git status lives in the
+   separate environment section.
+6. **Conversation history**: user messages, assistant messages, tool calls and results.
 
-前几项基本是稳定前缀，最后一项持续增长。压缩只动历史，不动前缀。
+The first few items form a stable prefix; only the last one keeps growing. Compaction touches the
+history and nothing else.
 
-## 2. 配置项
+## 2. Settings
 
 ```toml
 [context]
@@ -31,66 +34,72 @@ instructions_files = ["AGENTS.md"]
 workspace_summary = true
 ```
 
-上面是**示范值**，不是出厂默认。改之前先看 `config.tmpl.toml` 的 `[context]` 段注释，
-那里给出的是与你所用模型窗口匹配的默认值。
+Those numbers are **illustrative, not factory defaults**. Before changing anything, read the
+`[context]` comment block in `config.tmpl.toml`; it carries defaults matched to the model window
+you actually use.
 
-| 字段 | 作用 |
-|---|---|
-| `budget_tokens` | 单次请求的软上限，超出时先裁旧工具输出与历史 |
-| `auto_compact` | 是否在溢出前自动摘要旧历史 |
-| `auto_compact_threshold` | 触发比例，取值 (0, 1]；0.8 表示用到 80% 预算时压缩 |
-| `auto_compact_keep_tokens` | 摘要之外**原样保留**的新近对话预算，这是主要的保留控制 |
-| `auto_compact_keep_turns` | 至少保留多少个最新用户轮次，即使它们超了上面的预算 |
-| `tool_output_tokens` | 单条工具结果进入请求的上限；完整输出仍在事件日志里 |
-| `image_tokens` | 一张图片的保守估算，视觉定价因模型而异，可覆盖 |
+| Field | Effect |
+| --- | --- |
+| `budget_tokens` | Soft ceiling for one request; past it, old tool output and history are trimmed first |
+| `auto_compact` | Whether to summarise old history automatically before the window overflows |
+| `auto_compact_threshold` | Trigger ratio in (0, 1]; 0.8 means compact at 80% of the budget |
+| `auto_compact_keep_tokens` | Budget of recent conversation kept **verbatim** outside the summary; this is the primary retention control |
+| `auto_compact_keep_turns` | Minimum number of recent user turns kept even if they exceed that budget |
+| `tool_output_tokens` | Cap on a single tool result entering the request; the full output stays in the event log |
+| `image_tokens` | Conservative per-image estimate, since vision pricing varies by model; overridable |
 
-`auto_compact_keep_tokens` 与 `auto_compact_keep_turns` 的关系是“预算优先、轮次兜底”：
-前者决定摘要后留多少原文，后者保证最近几轮永远不会只以摘要形式存在。
+`auto_compact_keep_tokens` and `auto_compact_keep_turns` relate as "budget first, turns as a
+floor": the former sets how much raw text survives the summary, the latter guarantees the newest
+turns never exist only as a summary.
 
-## 3. 指令文件
+## 3. Instruction files
 
-`instructions_files` 是 workspace 相对路径列表，缺文件就跳过。此外，`AGENTS.md` 还会从
-eix 配置目录（`~/.config/eix/AGENTS.md`）读取一次。
+`instructions_files` is a list of workspace-relative paths; missing files are skipped. In
+addition, `AGENTS.md` is read once from the eix config directory (`~/.config/eix/AGENTS.md`).
 
-层级规则与常见 agent 工具一致：越靠近当前目录的文件越晚加入，冲突时后者生效。全局文件放
-通用偏好，项目文件放仓库约定。
+Precedence matches the usual agent convention: the closer a file is to the current directory, the
+later it is appended, and on conflict the later file wins. Put general preferences in the global
+file and repository conventions in the project file.
 
-这些内容进的是“指令”扇区，优先于对话历史被保留。
+This content lands in the "instructions" sector and is preserved ahead of conversation history.
 
-## 4. 手动控制
+## 4. Manual control
 
-| 命令 | 作用 |
-|---|---|
-| `/context` | 显示当前占用：各扇区估算、预算、剩余空间 |
-| `/compact` | 立刻压缩一次，不等阈值 |
-| `/effort` | 调整推理力度档位，影响每轮产出长度 |
+| Command | Effect |
+| --- | --- |
+| `/context` | Show current usage: per-sector estimates, budget, headroom |
+| `/compact` | Compact once now, without waiting for the threshold |
+| `/effort` | Change the reasoning-effort level, which shifts output length per turn |
 
-自动压缩在每轮开始前检查。压缩会把较旧的历史总结成一段摘要，保留最近
-`auto_compact_keep_tokens` 的原文，并至少保住 `auto_compact_keep_turns` 个用户轮次。
+Automatic compaction is checked before each turn. It folds older history into a summary, keeps the
+most recent `auto_compact_keep_tokens` verbatim, and preserves at least
+`auto_compact_keep_turns` user turns.
 
-压缩是有损的：摘要之后的细节只存在于事件日志里，不在模型上下文中。重要事实应当在对话里
-复述一次，或者写进 `AGENTS.md`。
+Compaction is lossy: detail behind the summary exists only in the event log, not in the model's
+context. Restate important facts in the conversation, or put them in `AGENTS.md`.
 
-## 5. 预算紧张时先牺牲什么
+## 5. What gets sacrificed first
 
-顺序大致是：
+Roughly in this order:
 
-1. 单条工具输出超过 `tool_output_tokens` 的部分（最老的先裁）。
-2. 更旧的历史进入摘要。
-3. skill 目录：先截描述，再去掉描述，最后丢末尾条目。
+1. The part of any tool output beyond `tool_output_tokens`, oldest first.
+2. Older history folded into the summary.
+3. The skill catalog: descriptions are truncated, then dropped, then trailing entries are lost.
 
-工具定义与系统提示词不会被裁掉，所以**装太多 MCP server 会挤占对话空间**，而不是被自动
-缩减。工具很多时用 `allowed_tools`/`denied_tools` 收窄，或者按需禁用 server。
+Tool definitions and the system prompt are never trimmed, so **installing many MCP servers eats
+conversation space** instead of being automatically shrunk. When the tool set grows, narrow it with
+`allowed_tools`/`denied_tools` or disable servers you are not using.
 
-## 6. 排错
+## 6. Troubleshooting
 
-**每轮都很慢、花费高。** 用 `/context` 看是不是工具定义或指令文件吃掉了大半预算；工具输出
-上限设得过大也会让历史膨胀。
+**Every turn is slow and expensive.** Use `/context` to see whether tool definitions or
+instruction files consume most of the budget; an oversized tool-output cap also inflates history.
 
-**压缩后模型“忘了”之前的决定。** 摘要只保留要点。把关键约束写进 `AGENTS.md`，它在压缩中
-不受影响。
+**The model "forgot" earlier decisions after compaction.** A summary keeps only the essentials.
+Put hard constraints in `AGENTS.md`, which compaction leaves untouched.
 
-**刚聊几句就触发压缩。** 检查 `budget_tokens` 是否设得低于模型真实窗口，以及
-`auto_compact_threshold` 是否太小。
+**Compaction fires after a few messages.** Check whether `budget_tokens` is set below the model's
+real window, and whether `auto_compact_threshold` is too small.
 
-**skill 目录里少了几个。** 目录上限是上下文窗口的 2%、最多 8 KiB，超出时按顺序丢弃末尾条目。
+**Some skills are missing from the catalog.** The catalog is capped at 2% of the context window
+and at most 8 KiB; entries at the end are dropped in order once the cap is hit.
