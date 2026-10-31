@@ -1884,9 +1884,11 @@ fn tool_block(
     let id = FoldId::Event(block.seq);
     // File-writing tools keep their vimdiff-style preview visible after the
     // call finishes. Other in-flight calls open so their arguments are visible;
-    // finished ones collapse to the summary line.
-    let default_open =
-        is_file_change_tool(&block.tool) || (block.result.is_none() && block.approval.is_none());
+    // finished ones collapse to the summary line. Command cards stay open even
+    // while an approval is pending, and the app briefly reopens them when the
+    // result lands.
+    let default_open = is_file_change_tool(&block.tool)
+        || (block.result.is_none() && (block.approval.is_none() || is_command_tool(&block.tool)));
     let open = folds.get(&id).copied().unwrap_or(default_open);
     let fold = Fold { id, open };
 

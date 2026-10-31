@@ -213,8 +213,12 @@ impl App {
                     self.views[index].selection = None;
                     self.open_or_focus_session_id(session_id, tx);
                 } else if let Some(fold) = fold {
-                    self.views[index].folds.insert(fold.id, !fold.open);
-                    self.views[index].selection = None;
+                    let view = &mut self.views[index];
+                    view.folds.insert(fold.id, !fold.open);
+                    // The user now owns this fold; do not auto-close it.
+                    view.auto_folds.remove(&fold.id);
+                    view.auto_collapse.remove(&fold.id);
+                    view.selection = None;
                 } else if let Some(text) = copied {
                     self.push_toast(
                         format!("Copied {} chars", text.chars().count()),

@@ -1724,6 +1724,97 @@ fn subagent_picker_enter_opens_the_child_pane() {
 }
 
 #[test]
+fn running_command_with_pending_approval_stays_expanded() {
+    let session = Session::new("s1", "tools", "/workspace");
+    let events = vec![
+        SessionEvent::new(
+            "s1",
+            1,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "exec_command",
+                "arguments": {"cmd": "rm -rf build", "cwd": "/workspace"},
+            }),
+        ),
+        SessionEvent::new(
+            "s1",
+            2,
+            EventKind::ApprovalRequired,
+            serde_json::json!({
+                "approval_id": "a1",
+                "call_id": "c1",
+                "tool": "exec_command",
+                "summary": "exec_command: rm -rf build",
+                "arguments": {"cmd": "rm -rf build", "cwd": "/workspace"},
+            }),
+        ),
+    ];
+    let view = SessionView::new(session, events);
+    let rendered = render_transcript(&view, 60);
+    assert!(rendered.contains("approval required"), "{rendered}");
+    assert!(rendered.contains("cwd: /workspace"), "{rendered}");
+}
+
+#[test]
+fn completed_command_result_stays_open_briefly_then_collapses() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(
+        Session::new("s1", "tools", "/tmp"),
+        vec![SessionEvent::new(
+            "s1",
+            1,
+            EventKind::ToolCall,
+            serde_json::json!({
+                "call_id": "c1",
+                "tool": "exec_command",
+                "arguments": {"cmd": "echo hi"},
+            }),
+        )],
+    ));
+
+    app.handle_event(
+        Event::Notification(eix_core::Notification::new(
+            "session.event",
+            serde_json::to_value(SessionEvent::new(
+                "s1",
+                2,
+                EventKind::ToolResult,
+                serde_json::json!({
+                    "call_id": "c1",
+                    "tool": "exec_command",
+                    "ok": true,
+                    "denied": false,
+                    "output": "hi there",
+                }),
+            ))
+            .expect("event json"),
+        )),
+        &tx,
+    );
+
+    // The result is expanded as soon as it lands, without a click.
+    let open = render_transcript(&app.views[0], 60);
+    assert!(open.contains("hi there"), "{open}");
+    assert_eq!(
+        app.views[0].folds.get(&FoldId::Event(1)),
+        Some(&true),
+        "the result card should be open"
+    );
+
+    // The next tick after the linger closes it again.
+    app.views[0]
+        .auto_collapse
+        .insert(FoldId::Event(1), Instant::now());
+    app.tick(&tx);
+    let closed = render_transcript(&app.views[0], 60);
+    assert!(!closed.contains("hi there"), "{closed}");
+    assert!(closed.contains("echo hi"), "{closed}");
+    assert_eq!(app.views[0].folds.get(&FoldId::Event(1)), None);
+}
+
+#[test]
 fn expanded_command_omits_redundant_labels_and_gutter() {
     let session = Session::new("s1", "tools", "/tmp");
     let events = vec![

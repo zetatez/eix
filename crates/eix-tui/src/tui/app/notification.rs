@@ -306,6 +306,12 @@ impl App {
                         })
                         .flatten()
                         .filter(|payload| payload.tool == "spawn_agent");
+                    let command_result = (event.kind == EventKind::ToolResult)
+                        .then(|| {
+                            serde_json::from_value::<ToolResultPayload>(event.payload.clone()).ok()
+                        })
+                        .flatten()
+                        .filter(|payload| payload.tool == "exec_command");
                     let relevant = matches!(
                         event.kind,
                         EventKind::ToolResult
@@ -350,6 +356,9 @@ impl App {
                     }
                     view.events.push(event);
                     view.events_rev = view.events_rev.wrapping_add(1);
+                    if let Some(result) = command_result {
+                        view.reveal_command_result(&result.call_id);
+                    }
                     if let Some(result) = spawn_result {
                         view.finish_subagent_by_call(&result.call_id, result.ok, &result.output);
                     }

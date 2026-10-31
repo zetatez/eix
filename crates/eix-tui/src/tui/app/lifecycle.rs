@@ -317,6 +317,10 @@ impl App {
 
     pub fn tick(&mut self, tx: &UnboundedSender<Command>) {
         self.tick = self.tick.wrapping_add(1);
+        let now = Instant::now();
+        for view in &mut self.views {
+            view.expire_auto_folds(now);
+        }
         self.refresh_git_branch();
         self.sync_draft(tx);
         self.flush_picker_query(tx);

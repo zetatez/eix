@@ -101,6 +101,10 @@ const SESSION_MODE_WIDTH: usize = 5;
 /// Re-read the focused session's git branch at this interval.
 const GIT_BRANCH_REFRESH: Duration = Duration::from_secs(5);
 
+/// How long a finished `exec_command` card stays expanded so its output is
+/// visible before it folds back to the summary line.
+const COMMAND_RESULT_LINGER: Duration = Duration::from_secs(2);
+
 /// Start loading the previous history page when the viewport is this close to
 /// the top, and wait until it scrolls further down before arming another page.
 const HISTORY_PRELOAD_LINES: usize = 3;
@@ -602,6 +606,10 @@ struct SessionView {
     follow: bool,
     /// Explicit open/closed state for collapsible Thinking and tool blocks.
     folds: HashMap<FoldId, bool>,
+    /// Folds opened automatically to show a just-finished command result.
+    auto_folds: HashSet<FoldId>,
+    /// When each automatic fold should close again.
+    auto_collapse: HashMap<FoldId, Instant>,
     /// Line -> foldable block map from the last draw, used for click-to-fold.
     slots: Vec<Option<transcript::Fold>>,
     /// Plain text for every transcript line from the last draw, used when a
@@ -646,6 +654,8 @@ impl SessionView {
             scroll: 0,
             follow: true,
             folds: HashMap::new(),
+            auto_folds: HashSet::new(),
+            auto_collapse: HashMap::new(),
             slots: Vec::new(),
             text_lines: Vec::new(),
             copy_overrides: HashMap::new(),
@@ -653,6 +663,46 @@ impl SessionView {
             user_lines: Vec::new(),
             selection: None,
             unread: false,
+        }
+    }
+
+    /// A finished command result is worth showing without a click. Open its
+    /// card, remember that the daemon opened it, and fold it back after a
+    /// short linger so chatty commands do not dominate the transcript.
+    pub(super) fn reveal_command_result(&mut self, call_id: &str) {
+        let seq = self.events.iter().rev().find_map(|event| {
+            (event.kind == EventKind::ToolCall
+                && event.payload.get("call_id").and_then(Value::as_str) == Some(call_id)
+                && event.payload.get("tool").and_then(Value::as_str) == Some("exec_command"))
+            .then_some(event.seq)
+        });
+        let Some(seq) = seq else {
+            return;
+        };
+        let id = FoldId::Event(seq);
+        self.folds.insert(id, true);
+        self.auto_folds.insert(id);
+        self.auto_collapse
+            .insert(id, Instant::now() + COMMAND_RESULT_LINGER);
+    }
+
+    /// Close automatic reveals whose linger expired. A manual toggle removes
+    /// the id from `auto_folds`, so user choices are never overridden.
+    pub(super) fn expire_auto_folds(&mut self, now: Instant) {
+        if self.auto_collapse.is_empty() {
+            return;
+        }
+        let expired: Vec<FoldId> = self
+            .auto_collapse
+            .iter()
+            .filter(|(_, deadline)| **deadline <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in expired {
+            self.auto_collapse.remove(&id);
+            if self.auto_folds.remove(&id) {
+                self.folds.remove(&id);
+            }
         }
     }
 
@@ -679,6 +729,8 @@ impl SessionView {
         self.scroll = 0;
         self.follow = true;
         self.folds.clear();
+        self.auto_folds.clear();
+        self.auto_collapse.clear();
         self.slots.clear();
         self.text_lines.clear();
         self.copy_overrides.clear();
