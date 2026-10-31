@@ -352,6 +352,25 @@ impl App {
                                 self.status = "error".into();
                             }
                         }
+                        EventKind::ContextCompacted => {
+                            // Compaction is asynchronous now, so this is the
+                            // completion signal. The transcript block is built
+                            // separately from the same event.
+                            if let Ok(payload) = serde_json::from_value::<ContextCompactedPayload>(
+                                event.payload.clone(),
+                            ) {
+                                let how = if payload.rolling {
+                                    "automatically"
+                                } else {
+                                    "for this request"
+                                };
+                                self.status = format!(
+                                    "context compacted {how} · {} messages summarized",
+                                    payload.messages
+                                );
+                                self.error = None;
+                            }
+                        }
                         _ => {}
                     }
                     view.events.push(event);
@@ -368,6 +387,18 @@ impl App {
                     if relevant_input {
                         self.reload_input(&id);
                     }
+                }
+            }
+            "context.compact_failed" => {
+                // Automatic summaries are best-effort; the daemon logs them and
+                // the turn continues. Only a user-requested compaction should
+                // surface an error banner.
+                if !notification.params["auto"].as_bool().unwrap_or(false) {
+                    let message = notification.params["error"]
+                        .as_str()
+                        .unwrap_or("the summary model failed");
+                    self.error = Some(format!("compaction failed: {message}"));
+                    self.status = "compaction failed".into();
                 }
             }
             "agent.spawned" => {

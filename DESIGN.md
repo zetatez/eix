@@ -384,7 +384,7 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 | `/new` | `/sessions` 的别名：session picker（已打开则聚焦，否则开新 pane，同 `<Space>o`） |
 | `/new-worktree [name]` | 把当前 session 移入独立 git worktree；已有 worktree 时只提示 |
 | `/clear` | 清空模型上下文（事件日志与转录保留），追加 `ContextCleared` 事件 |
-| `/compact [notes]` | 总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要，生成结果在 transcript 中展示 |
+| `/compact [notes]` | 异步总结上下文；省略 from/to 时压缩 `message_range()`，`generate: true` 让模型写摘要，`notes` 作为总结要求（`guidance`）；RPC 仅返回已受理，完成后由 `ContextCompacted` 事件驱动 transcript |
 | `/btw <question>` | 一次性旁支问答，不写事件日志；`btw.delta` / `btw.completed` 通知，`btw.cancel` 中断 |
 | `/cd [path]` | 切换 session cwd（`session.cd`，canonicalize 后校验在 worktree 内）；输入路径前缀时在输入框上方列出匹配的子目录，`Tab` 补全、`Enter` 切换 |
 | `/init` | 生成 AGENTS.md 初始化 prompt 放进输入框，供审阅后发送 |
@@ -722,8 +722,13 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - 自动压缩在每个工具批次后也会检查；provider 报 context-length / 413 时强制压缩并重试。
   压缩只由上下文压力触发，不按轮数定期执行。保留窗口优先按
   `auto_compact_keep_tokens`（默认 8000）计算，`auto_compact_keep_turns` 只作为最少轮数
-  下限；裁剪点只落在 user turn 边界。自动压缩是滚动摘要：新摘要会带上旧摘要继续更新，
-  旧摘要不再重复发送；摘要使用当前 session 模型。
+  下限；裁剪点只落在 user turn 边界。`context.budget_tokens = 0`（默认）按模型窗口减去
+  补全预留来定预算，窗口未知时回退 32000，避免小模型被塞入大 prompt。自动压缩是滚动摘要：
+  新摘要会带上旧摘要继续更新，
+  旧摘要不再重复发送；摘要复用当前 session 模型和同一套工具，以便命中 provider 的 prompt
+  缓存。正常路径下摘要请求在后台运行并立即返回，下一个工具轮次或下一个 turn 重建 ledger
+  时自动加载；只有 provider 已经报 context-length 的恢复路径会同步等待，因为重试前必须
+  先缩小请求。手动 `/compact` 同样异步受理，运行中的重复请求合并为一个 pending job。
 - provider 重试按错误类型分派：瞬时故障使用抖动指数退避（默认 8 次、250ms 起）；429 优先
   `Retry-After`，没有时至少 500ms 起步；quota/auth/config 直接失败。`turn.retrying` 带
   `kind`，TUI 用简短标签显示原因。
@@ -1360,7 +1365,7 @@ normal 模式下的 `:` 命令行接受同样的命令名（不带 `/`），并�
 | `/ready` | 把当前 worktree 交给 daemon 做 rebase / 测试 / ff merge |
 | `/integrate` | 显示当前 session 的集成队列状态与最近错误 |
 | `/clear` | 清空模型上下文（更早的 turn 仍留在转录和事件日志里，只是不再发给模型） |
-| `/compact [notes]` | 让模型总结当前上下文，用摘要替换历史；生成的 summary 会显示在对话中，`notes` 直接作为摘要文本 |
+| `/compact [notes]` | 异步让模型总结当前上下文，用摘要替换历史；生成的 summary 在对话中显示，`notes` 作为总结要求而不是摘要正文 |
 | `/btw <question>` | 用一次性上下文回答旁支问题；不写入事件日志，也不进入主对话；`Esc` 关闭 |
 | `/cd [path]` | 切换当前 session 的 cwd（支持 `~` 和相对路径）；输入路径前缀时列出匹配的子目录，`Tab` 补全、`Enter` 切换；省略时显示当前路径 |
 | `/init` | 生成一份 AGENTS.md 初始化 prompt，放进输入框供你审阅后再发送 |

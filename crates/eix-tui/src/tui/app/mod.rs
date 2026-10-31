@@ -12,10 +12,11 @@ use crossterm::event::{
 };
 use eix_core::{
     theme_preset, ApprovalDecision, ApprovalRequiredPayload, AssistantMessagePayload, AttachResult,
-    Event as SessionEvent, EventKind, HelloResult, HunkInfo, InputAnsweredPayload, InputQuestion,
-    InputRequiredPayload, IntegrationState, IntegrationStatus, ModelInfo, PatchProposedPayload,
-    PickerItem, ProcessInfo, ProcessList, ProcessOutput, ProcessStatus, Session, SessionMode,
-    SessionStatus, SubmitResult, TodoItem, ToolResultPayload, UserMessagePayload, THEME_PRESETS,
+    ContextCompactedPayload, Event as SessionEvent, EventKind, HelloResult, HunkInfo,
+    InputAnsweredPayload, InputQuestion, InputRequiredPayload, IntegrationState, IntegrationStatus,
+    ModelInfo, PatchProposedPayload, PickerItem, ProcessInfo, ProcessList, ProcessOutput,
+    ProcessStatus, Session, SessionMode, SessionStatus, SubmitResult, TodoItem, ToolResultPayload,
+    UserMessagePayload, THEME_PRESETS,
 };
 use ratatui::layout::{Alignment, Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};

@@ -1125,11 +1125,7 @@ impl App {
             Event::Reset { session_id } => {
                 self.session_reset(&session_id);
             }
-            Event::Compacted {
-                session_id,
-                entries,
-                tokens,
-            } => {
+            Event::CompactionStarted { session_id, merged } => {
                 if let Some(view) = self
                     .views
                     .iter_mut()
@@ -1137,8 +1133,11 @@ impl App {
                 {
                     view.follow = true;
                 }
-                self.status =
-                    format!("compacted · context now {tokens} tokens ({entries} entries)");
+                self.status = if merged {
+                    "compaction queued behind the running summary…".into()
+                } else {
+                    "compacting the conversation…".into()
+                };
                 self.error = None;
             }
             Event::BtwStarted { session_id, btw_id } => {

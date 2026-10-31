@@ -972,12 +972,10 @@ impl App {
             self.status = "no session".into();
             return;
         };
-        if self.session_busy(&session_id) {
-            self.error = Some("cancel the running turn before /compact".into());
-            return;
-        }
+        // Compaction is asynchronous, so a running turn is not a blocker: the
+        // summary is appended when ready and the next round reloads it.
         let notes = (!args.is_empty()).then(|| args.to_string());
-        self.status = "summarizing the conversation…".into();
+        self.status = "compacting the conversation…".into();
         let _ = tx.send(Command::CompactContext { session_id, notes });
     }
 

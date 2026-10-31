@@ -193,7 +193,9 @@ base = "auto"                        # or "main"
 
 # --- Context ----------------------------------------------------------------
 # [context]
-# budget_tokens = 32000
+# 0 = fill the model window (minus completion reserve). Without a known
+# window it falls back to 32000. Set an explicit value to cap large models.
+# budget_tokens = 0
 # auto_compact = true
 # auto_compact_threshold = 0.8
 # auto_compact_keep_tokens = 8000
