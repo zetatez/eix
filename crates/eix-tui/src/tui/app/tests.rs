@@ -6857,7 +6857,7 @@ fn session_picker_focuses_open_sessions_and_opens_the_rest_in_new_panes() {
 }
 
 #[test]
-fn new_alias_opens_the_session_picker_instead_of_creating_a_session() {
+fn new_command_creates_a_session_in_a_fresh_pane_instead_of_opening_the_picker() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let mut app = App::new(None);
     app.views.push(session_pane("s1", "one"));
@@ -6866,15 +6866,17 @@ fn new_alias_opens_the_session_picker_instead_of_creating_a_session() {
 
     app.input.set_text("/new");
     app.handle_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &tx);
-    assert!(matches!(
-        app.picker.as_ref().map(|picker| picker.kind),
-        Some(PickerKind::Sessions)
-    ));
-    while let Ok(command) = rx.try_recv() {
-        assert!(
-            !matches!(command, Command::Create { .. }),
-            "/new must not create a session"
-        );
+    assert!(app.picker.is_none(), "/new opens no picker");
+    // Clearing the typed line saves an empty draft first.
+    let created = std::iter::from_fn(|| rx.try_recv().ok())
+        .find(|command| matches!(command, Command::Create { .. }))
+        .expect("create command");
+    match created {
+        Command::Create { worktree, cwd, .. } => {
+            assert_eq!(worktree, Some(false), "must not create a worktree");
+            assert_eq!(cwd.as_deref().and_then(|path| path.to_str()), Some("/tmp"));
+        }
+        _ => panic!("expected a create command"),
     }
 }
 

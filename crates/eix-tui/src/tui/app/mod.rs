@@ -164,7 +164,6 @@ const COMMAND_ALIASES: &[(&str, &str)] = &[
     ("worktrees", "git"),
     ("branches", "git"),
     ("undo", "rewind"),
-    ("new", "sessions"),
     ("files", "fzf"),
 ];
 
@@ -179,6 +178,11 @@ fn command_alias(name: &str) -> Option<&'static str> {
 fn builtin_commands() -> Vec<CommandSpec> {
     vec![
         builtin("help", "[query]", "search the key and command reference"),
+        builtin(
+            "new",
+            "",
+            "create an empty session and open it in a new pane",
+        ),
         builtin(
             "new-worktree",
             "[name]",
@@ -2838,8 +2842,10 @@ fn command_category(name: &str) -> CommandCategory {
         "diff" | "image" => CommandCategory::Files,
         "btw" | "clear" | "compact" | "context" | "goal" | "init" | "loop" | "redo" | "rewind"
         | "schedule" | "timeline" => CommandCategory::Conversation,
-        "new-worktree" | "ready" | "integrate" | "cd" | "projects" | "rename" | "archive"
-        | "delete" | "fork" | "branch" | "close" | "exit" | "quit" => CommandCategory::Sessions,
+        "new" | "new-worktree" | "ready" | "integrate" | "cd" | "projects" | "rename"
+        | "archive" | "delete" | "fork" | "branch" | "close" | "exit" | "quit" => {
+            CommandCategory::Sessions
+        }
         "processes" | "approvals" | "agents" | "mcp" | "plugins" | "skills" | "subagents"
         | "todos" | "voice" => CommandCategory::Tools,
         "code-review" | "security-review" | "simplify" | "verify" => CommandCategory::Review,
@@ -3208,11 +3214,11 @@ const HELP_SECTIONS: &[HelpSection] = &[
             },
             HelpEntry {
                 key: "/new",
-                description: "choose an existing session for a new pane",
+                description: "open an empty session in a new pane",
             },
             HelpEntry {
                 key: "/sessions",
-                description: "switch the focused pane's session",
+                description: "choose an existing session for a new pane",
             },
             HelpEntry {
                 key: "/fzf",

@@ -1275,7 +1275,7 @@ impl App {
         match id {
             "commands" | "palette" => self.open_picker(PickerKind::Commands, tx),
             "keys" => self.open_keys_help(""),
-            "sessions" | "new" => self.open_picker(PickerKind::Sessions, tx),
+            "sessions" => self.open_picker(PickerKind::Sessions, tx),
             "fzf" => self.open_picker(PickerKind::Files, tx),
             "image" | "images" => self.open_picker(PickerKind::Images, tx),
             "grep" => self.open_grep_picker("", tx),

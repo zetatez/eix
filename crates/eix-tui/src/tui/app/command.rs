@@ -359,6 +359,12 @@ impl App {
                 self.open_picker(PickerKind::Sessions, tx);
                 true
             }
+            // Same path as `Space n`: the daemon creates an empty session and
+            // `Event::Created` attaches it into a new pane.
+            "new" => {
+                self.new_session(tx);
+                true
+            }
             "projects" => {
                 self.open_picker(PickerKind::Projects, tx);
                 true
