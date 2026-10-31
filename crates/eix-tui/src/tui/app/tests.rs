@@ -1493,7 +1493,7 @@ fn subagent_card_shows_streamed_thinking() {
         );
     }
     let running = render_transcript(&app.views[0], 60);
-    assert!(running.contains("✳ Thinking…"), "{running}");
+    assert!(running.contains("🧠 Thinking…"), "{running}");
     assert!(running.contains("reading the parser,"), "{running}");
     assert!(running.contains("then the lexer"), "{running}");
     // Answer text is not mirrored live; it arrives with the stored event.
@@ -1520,9 +1520,9 @@ fn subagent_card_shows_streamed_thinking() {
         &tx,
     );
     let stored = render_transcript(&app.views[0], 60);
-    assert!(!stored.contains("✳ Thinking…"), "{stored}");
+    assert!(!stored.contains("🧠 Thinking…"), "{stored}");
     assert!(
-        stored.contains("✳ reading the parser, then the lexer"),
+        stored.contains("🧠 reading the parser, then the lexer"),
         "{stored}"
     );
 }
@@ -1997,7 +1997,7 @@ fn transcript_renders_chat_turns_and_thinking() {
         user.starts_with(' ') && user.contains("│ hi there │"),
         "user turn should be a right-aligned bubble: {user:?}"
     );
-    assert!(lines.iter().any(|line| line.contains("▸ Thinking")));
+    assert!(lines.iter().any(|line| line.contains("▸ 🧠 Thinking")));
     // Stored thinking is collapsed by default.
     assert!(!rendered.contains("pondering"));
     let mut view = view;
@@ -2512,7 +2512,7 @@ fn live_thinking_collapses_once_the_answer_starts() {
         reasoning: "thinking out loud".into(),
     });
     let rendered = render_transcript(&view, 40);
-    assert!(rendered.contains("▸ Thinking"), "{rendered}");
+    assert!(rendered.contains("▸ 🧠 Thinking"), "{rendered}");
     assert!(!rendered.contains("thinking out loud"), "{rendered}");
     assert!(rendered.contains("the answer"), "{rendered}");
 }

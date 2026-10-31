@@ -1559,13 +1559,13 @@ fn thinking(
             .max(1)
     };
     let header = if thinking {
-        format!("  {marker} ✳ Thinking…")
+        format!("  {marker} 🧠 Thinking…")
     } else {
         let lines = closed_lines();
         if lines == 1 {
-            format!("  {marker} Thinking · 1 line")
+            format!("  {marker} 🧠 Thinking · 1 line")
         } else {
-            format!("  {marker} Thinking · {lines} lines")
+            format!("  {marker} 🧠 Thinking · {lines} lines")
         }
     };
     out.push(
@@ -1894,7 +1894,9 @@ fn tool_block(
 
     let color = status_color(block, theme);
     let status = status_label(block);
-    let prefix_width = 6; // "  ▾ ● "
+    let icon = tool_icon(&block.tool, &block.arguments);
+    // "  ▾ ● " plus a fixed two-cell icon column.
+    let prefix_width = 9;
     let summary = tool_summary(block);
     let room = width.saturating_sub(prefix_width + 1).max(8);
     // Expanded shell calls wrap the command instead of truncating it and then
@@ -1919,6 +1921,7 @@ fn tool_block(
                 format!("{} ", status_dot(block)),
                 Style::default().fg(color),
             ));
+            spans.push(Span::styled(icon_cell(icon), dim(theme)));
         } else {
             // Continuation lines align under the summary column (the `$`).
             spans.push(Span::raw(" ".repeat(prefix_width)));
@@ -2068,7 +2071,7 @@ fn subagent_window(
         .map(|text| (text, false))
         .collect();
     if !subagent.reasoning.trim().is_empty() {
-        rows.push(("✳ Thinking…".to_string(), true));
+        rows.push(("🧠 Thinking…".to_string(), true));
         rows.extend(
             wrapped_tail(
                 &subagent.reasoning,
@@ -2268,7 +2271,7 @@ fn activity_lines(event: &SessionEvent) -> Vec<String> {
                     .as_deref()
                     .filter(|text| !text.trim().is_empty())
                 {
-                    lines.push(format!("✳ {}", first_line(reasoning)));
+                    lines.push(format!("🧠 {}", first_line(reasoning)));
                 }
                 let text = first_line(&payload.text);
                 if !text.is_empty() {
@@ -2386,6 +2389,62 @@ fn tool_summary(block: &ToolBlock) -> String {
         }
     } else {
         tool_call_summary(&block.tool, &block.arguments)
+    }
+}
+
+/// Pad an icon to the fixed two-cell column used by tool headers. Emoji and
+/// plain glyphs mix widths, so the padding is measured instead of assumed.
+fn icon_cell(icon: &str) -> String {
+    let pad = 2usize.saturating_sub(UnicodeWidthStr::width(icon));
+    format!("{icon}{} ", " ".repeat(pad))
+}
+
+/// Glyph shown before a tool's summary. A uniform dot hides what the agent is
+/// doing; the tool family is recognizable at a glance, and shell commands are
+/// classified by the program they run.
+fn tool_icon(tool: &str, arguments: &Value) -> &'static str {
+    match tool {
+        "exec_command" => command_icon(
+            arguments
+                .get("cmd")
+                .or_else(|| arguments.get("command"))
+                .and_then(Value::as_str)
+                .unwrap_or_default(),
+        ),
+        "apply_patch" => "✎",
+        "write_stdin" => "⌨",
+        "view_image" => "▣",
+        "use_skill" => "📚",
+        "update_plan" => "☑",
+        "get_context_remaining" => "📊",
+        "memory" => "💾",
+        "ready" => "✅",
+        "web_fetch" => "🌐",
+        "web_search" => "🔍",
+        "lsp_diagnostics" => "🩺",
+        "spawn_agent" => "🤖",
+        "request_user_input" => "❓",
+        "tool_search" => "🧰",
+        name if name.starts_with("mcp_") => "🔌",
+        name if name.starts_with(eix_core::PLUGIN_TOOL_PREFIX) => "🧩",
+        _ => "⚙",
+    }
+}
+
+/// Classify the first program in a shell command. Pipes and `cd ... && ...`
+/// chains are intentionally ignored: the leading program is the best hint and
+/// anything more would guess at intent.
+fn command_icon(command: &str) -> &'static str {
+    let program = command.split_whitespace().next().unwrap_or_default();
+    let program = program.rsplit('/').next().unwrap_or(program);
+    match program {
+        "cat" | "bat" | "sed" | "head" | "tail" | "nl" | "less" | "more" | "awk" => "📄",
+        "rg" | "grep" | "ag" | "ack" => "🔎",
+        "find" | "fd" | "ls" | "tree" | "eza" | "exa" => "📁",
+        "cargo" | "make" | "cmake" | "rustc" | "npm" | "pnpm" | "yarn" | "pytest" | "go" => "🔨",
+        "curl" | "wget" => "🌐",
+        "git" => "⑂",
+        _ => "❯",
     }
 }
 
@@ -2956,6 +3015,83 @@ mod tests {
         // Top border at line 0; the box's left padding precedes the content.
         assert_eq!(link.line, 1);
         assert_eq!((link.start, link.end), (34, 38));
+    }
+
+    #[test]
+    fn tool_icons_classify_tools_and_leading_commands() {
+        let command = |cmd: &str| tool_icon("exec_command", &serde_json::json!({ "cmd": cmd }));
+        assert_eq!(command("cat src/main.rs"), "📄");
+        assert_eq!(command("sed -n '1,20p' src/lib.rs"), "📄");
+        assert_eq!(command("rg -n TODO src"), "🔎");
+        assert_eq!(command("ls -la"), "📁");
+        assert_eq!(command("cargo test -p eix-tui"), "🔨");
+        assert_eq!(command("curl https://example.com"), "🌐");
+        assert_eq!(command("/usr/bin/git status"), "⑂");
+        assert_eq!(command("./scripts/deploy.sh"), "❯");
+        assert_eq!(command(""), "❯");
+
+        assert_eq!(tool_icon("apply_patch", &Value::Null), "✎");
+        assert_eq!(tool_icon("web_search", &Value::Null), "🔍");
+        assert_eq!(tool_icon("web_fetch", &Value::Null), "🌐");
+        assert_eq!(tool_icon("spawn_agent", &Value::Null), "🤖");
+        assert_eq!(tool_icon("mcp__github__create_issue", &Value::Null), "🔌");
+        assert_eq!(
+            tool_icon(
+                concat!("plugin__", "demo__deploy"),
+                &serde_json::json!({ "cmd": "cat x" })
+            ),
+            "🧩"
+        );
+    }
+
+    #[test]
+    fn icon_cell_keeps_a_two_cell_column() {
+        assert_eq!(UnicodeWidthStr::width(icon_cell("📄").as_str()), 3);
+        assert_eq!(UnicodeWidthStr::width(icon_cell("❯").as_str()), 3);
+        assert_eq!(UnicodeWidthStr::width(icon_cell("⑂").as_str()), 3);
+    }
+
+    #[test]
+    fn tool_header_places_the_icon_before_the_summary() {
+        let mut out = Transcript::new();
+        let block = ToolBlock {
+            seq: 1,
+            call_id: "c1".into(),
+            tool: "exec_command".into(),
+            arguments: serde_json::json!({ "cmd": "rg -n TODO src" }),
+            result: None,
+            approval: None,
+            patch: None,
+        };
+        tool_block(
+            &mut out,
+            &block,
+            60,
+            Theme::default(),
+            &HashMap::new(),
+            None,
+        );
+        let header = all_text(&out);
+        assert!(header.contains("▾ ◐ 🔎 $ rg -n TODO src"), "{header}");
+    }
+
+    #[test]
+    fn thinking_header_uses_the_brain_icon() {
+        let mut out = Transcript::new();
+        let mut folds = HashMap::new();
+        folds.insert(FoldId::Live, true);
+        thinking(
+            &mut out,
+            FoldId::Live,
+            "plan",
+            true,
+            60,
+            Theme::default(),
+            &folds,
+            false,
+        );
+        let text = all_text(&out);
+        assert!(text.contains("🧠 Thinking…"), "{text}");
     }
 
     #[test]
