@@ -269,7 +269,13 @@ pi = false                           # $PI_CODING_AGENT_DIR + .pi
 
 # --- LSP --------------------------------------------------------------------
 # Built in: bash, cpp, css, go, html, json, lua, markdown, python, rust, sql,
-# toml, typescript, yaml. Override or add one here.
+# toml, typescript, yaml. Missing built-in servers are installed on first use
+# (npm, pip, go, rustup, or a GitHub release) into the eix data directory.
+# Set false to only use servers already on PATH.
+# [lsp]
+# auto_install = true
+
+# Override or add one here.
 # [lsp.servers.rust]
 # command = "rust-analyzer"
 # extensions = ["rs"]

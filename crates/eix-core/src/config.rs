@@ -1883,12 +1883,17 @@ impl Default for MathConfig {
 /// over them, so a same-named entry replaces the built-in definition.
 #[derive(Debug, Clone, Serialize)]
 pub struct LspConfig {
+    /// Install a missing built-in server on first use, into eix's data
+    /// directory. User-supplied servers with a custom command are never
+    /// replaced.
+    pub auto_install: bool,
     pub servers: BTreeMap<String, LspServerConfig>,
 }
 
 impl Default for LspConfig {
     fn default() -> Self {
         Self {
+            auto_install: true,
             servers: builtin_lsp_servers(),
         }
     }
@@ -1902,13 +1907,18 @@ impl<'de> Deserialize<'de> for LspConfig {
         #[derive(Deserialize, Default)]
         #[serde(default)]
         struct RawLspConfig {
+            #[serde(default = "default_true")]
+            auto_install: bool,
             servers: BTreeMap<String, LspServerConfig>,
         }
 
         let raw = RawLspConfig::deserialize(deserializer)?;
         let mut servers = builtin_lsp_servers();
         servers.extend(raw.servers);
-        Ok(Self { servers })
+        Ok(Self {
+            auto_install: raw.auto_install,
+            servers,
+        })
     }
 }
 
@@ -5660,6 +5670,10 @@ help = "F2"
     fn lsp_defaults_cover_common_languages_and_merge_overrides() {
         let config = Config::default();
         config.validate().expect("built-in LSP config is valid");
+        assert!(
+            config.lsp.auto_install,
+            "missing servers install by default"
+        );
         for (name, extension) in [
             ("bash", "sh"),
             ("cpp", "cpp"),
@@ -5692,14 +5706,28 @@ help = "F2"
 
         let overridden: Config = toml::from_str(
             r#"
+[lsp]
+auto_install = false
+
 [lsp.servers.zig]
 command = "zls"
 extensions = ["zig"]
 "#,
         )
         .expect("parse LSP override");
+        assert!(!overridden.lsp.auto_install);
         assert!(overridden.lsp.servers.contains_key("rust"));
         assert_eq!(overridden.lsp.servers["zig"].command, "zls");
+
+        let merge_only: Config = toml::from_str(
+            r#"
+[lsp.servers.zig]
+command = "zls"
+extensions = ["zig"]
+"#,
+        )
+        .expect("parse LSP override without the install switch");
+        assert!(merge_only.lsp.auto_install);
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! alive for the daemon's lifetime. Only `textDocument/publishDiagnostics` is
 //! consumed; completion, hover and other LSP features are out of scope.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -15,6 +15,52 @@ use eix_core::{Config, LspDiagnosticInfo, LspServerConfig, LspWorkspaceResult};
 use serde_json::{json, Value};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+
+/// Marker for a server whose executable is not on `PATH`. Callers keep this
+/// quiet: optional tooling that is not installed should not add a note to
+/// every write the server's extensions claim.
+#[derive(Debug)]
+struct NotInstalled;
+
+impl std::fmt::Display for NotInstalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("executable not found")
+    }
+}
+
+impl std::error::Error for NotInstalled {}
+
+/// True when the error means the configured executable is missing, either on
+/// the first attempt or from the cached failure of an earlier one.
+pub fn is_not_installed(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<NotInstalled>().is_some()
+}
+
+/// Marker for a one-off install notice worth surfacing in tool output. Quiet
+/// states (an install already running, a failure already reported) use
+/// [`NotInstalled`] instead so notes are not repeated on every write.
+#[derive(Debug)]
+struct InstallNote;
+
+impl std::fmt::Display for InstallNote {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("language server install")
+    }
+}
+
+impl std::error::Error for InstallNote {}
+
+pub fn is_install_note(err: &anyhow::Error) -> bool {
+    err.downcast_ref::<InstallNote>().is_some()
+}
+
+fn install_note(message: String) -> anyhow::Error {
+    anyhow::Error::new(InstallNote).context(message)
+}
+
+fn quiet_note(message: String) -> anyhow::Error {
+    anyhow::Error::new(NotInstalled).context(message)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Diagnostic {
@@ -282,6 +328,12 @@ impl Client {
 pub struct LspSet {
     clients: HashMap<(String, PathBuf), Client>,
     failures: HashMap<(String, PathBuf), String>,
+    /// Installs missing built-in servers on first use.
+    installer: crate::lsp_install::Installer,
+    /// Servers whose executable was not found. Cached so a missing optional
+    /// server is not respawned for every write, and so callers can stay quiet
+    /// about it instead of repeating the error in tool output.
+    missing: HashSet<(String, PathBuf)>,
     /// Recent workspace walks, keyed by root and file cap. Diagnostics are
     /// usually requested in bursts; re-walking a large repo each time is pure
     /// overhead. Cleared on config reload along with the servers.
@@ -316,7 +368,8 @@ impl LspSet {
         };
         let root = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
         let key = (name.to_string(), root.clone());
-        ensure_client(&mut self.clients, &mut self.failures, name, server, &root).await?;
+        self.ensure_client(name, server, &root, config.lsp.auto_install)
+            .await?;
         let client = self.clients.get_mut(&key).expect("inserted above");
         let language_id = language_id(server, path);
         let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -354,14 +407,9 @@ impl LspSet {
             let Some(server) = config.lsp.servers.get(&key.0) else {
                 continue;
             };
-            if let Err(err) = ensure_client(
-                &mut self.clients,
-                &mut self.failures,
-                &key.0,
-                server,
-                &key.1,
-            )
-            .await
+            if let Err(err) = self
+                .ensure_client(&key.0, server, &key.1, config.lsp.auto_install)
+                .await
             {
                 let message = format!("{err:#}");
                 for (path, _) in entries {
@@ -458,14 +506,9 @@ impl LspSet {
             let Some(server) = config.lsp.servers.get(&key.0) else {
                 continue;
             };
-            if let Err(err) = ensure_client(
-                &mut self.clients,
-                &mut self.failures,
-                &key.0,
-                server,
-                &key.1,
-            )
-            .await
+            if let Err(err) = self
+                .ensure_client(&key.0, server, &key.1, config.lsp.auto_install)
+                .await
             {
                 eprintln!("eixd: lsp server {:?}: {err:#}", key.0);
                 continue;
@@ -510,31 +553,100 @@ impl LspSet {
             skipped,
         })
     }
-}
 
-async fn ensure_client(
-    clients: &mut HashMap<(String, PathBuf), Client>,
-    failures: &mut HashMap<(String, PathBuf), String>,
-    name: &str,
-    server: &LspServerConfig,
-    root: &Path,
-) -> Result<()> {
-    let key = (name.to_string(), root.to_path_buf());
-    if let Some(error) = failures.get(&key) {
-        bail!("lsp server {name:?} is unavailable: {error}");
+    async fn ensure_client(
+        &mut self,
+        name: &str,
+        server: &LspServerConfig,
+        root: &Path,
+        auto_install: bool,
+    ) -> Result<()> {
+        let key = (name.to_string(), root.to_path_buf());
+        if self.missing.contains(&key) {
+            return Err(quiet_note(format!(
+                "lsp server {name:?} ({}) is not installed",
+                server.command
+            )));
+        }
+        if let Some(error) = self.failures.get(&key) {
+            bail!("lsp server {name:?} is unavailable: {error}");
+        }
+        if self.clients.contains_key(&key) {
+            return Ok(());
+        }
+        let mut client = match spawn(server, root, self.installer.bin()).await {
+            Ok(client) => client,
+            Err(err) if is_not_installed(&err) && auto_install => {
+                match self.installer.start(name, &server.command).await {
+                    crate::lsp_install::Start::Ready => {
+                        match spawn(server, root, self.installer.bin()).await {
+                            Ok(client) => client,
+                            Err(err) => {
+                                self.missing.insert(key.clone());
+                                self.failures.insert(key, format!("{err:#}"));
+                                return Err(quiet_note(format!(
+                                    "lsp server {name:?} ({}) is still unavailable after install",
+                                    server.command
+                                )));
+                            }
+                        }
+                    }
+                    crate::lsp_install::Start::Started => {
+                        return Err(install_note(format!(
+                            "installing lsp server {name:?} ({}) in the background; \
+                             diagnostics will use it once the install finishes",
+                            server.command
+                        )));
+                    }
+                    crate::lsp_install::Start::Running => {
+                        return Err(quiet_note(format!(
+                            "lsp server {name:?} ({}) is being installed",
+                            server.command
+                        )));
+                    }
+                    crate::lsp_install::Start::Failed { message, notify } => {
+                        self.missing.insert(key.clone());
+                        self.failures.insert(key, message.clone());
+                        return Err(if notify {
+                            install_note(format!(
+                                "cannot install lsp server {name:?} ({server_name}): {message}",
+                                server_name = server.command
+                            ))
+                        } else {
+                            quiet_note(format!(
+                                "lsp server {name:?} ({}) could not be installed",
+                                server.command
+                            ))
+                        });
+                    }
+                    crate::lsp_install::Start::Unavailable => {
+                        self.missing.insert(key.clone());
+                        self.failures.insert(key, format!("{err:#}"));
+                        return Err(err.context(format!(
+                            "cannot start lsp server {name:?} ({})",
+                            server.command
+                        )));
+                    }
+                }
+            }
+            Err(err) => {
+                if is_not_installed(&err) {
+                    self.missing.insert(key.clone());
+                }
+                self.failures.insert(key, format!("{err:#}"));
+                return Err(err.context(format!(
+                    "cannot start lsp server {name:?} ({})",
+                    server.command
+                )));
+            }
+        };
+        if let Err(err) = client.initialize(root, server).await {
+            self.failures.insert(key, format!("{err:#}"));
+            return Err(err);
+        }
+        self.clients.insert(key, client);
+        Ok(())
     }
-    if clients.contains_key(&key) {
-        return Ok(());
-    }
-    let mut client = spawn(server, root)
-        .await
-        .with_context(|| format!("cannot start lsp server {name:?} ({})", server.command))?;
-    if let Err(err) = client.initialize(root, server).await {
-        failures.insert(key, format!("{err:#}"));
-        return Err(err);
-    }
-    clients.insert(key, client);
-    Ok(())
 }
 
 fn workspace_files(root: &Path, config: &Config, max: usize) -> (Vec<PathBuf>, usize) {
@@ -635,7 +747,15 @@ fn language_id(server: &LspServerConfig, path: &Path) -> String {
     .to_string()
 }
 
-async fn spawn(server: &LspServerConfig, root: &Path) -> Result<Client> {
+fn path_with_bin(bin: &Path) -> std::ffi::OsString {
+    let mut paths = vec![bin.to_path_buf()];
+    if let Some(path) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&path));
+    }
+    std::env::join_paths(paths).unwrap_or_else(|_| bin.to_path_buf().into_os_string())
+}
+
+async fn spawn(server: &LspServerConfig, root: &Path, bin: &Path) -> Result<Client> {
     let mut command = Command::new(&server.command);
     command
         .current_dir(root)
@@ -645,7 +765,18 @@ async fn spawn(server: &LspServerConfig, root: &Path) -> Result<Client> {
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .kill_on_drop(true);
-    let mut child = command.spawn().context("spawn failed")?;
+    // Prepend eix's managed install directory unless the user pinned PATH.
+    if !server.env.contains_key("PATH") {
+        command.env("PATH", path_with_bin(bin));
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(anyhow::Error::new(NotInstalled)
+                .context(format!("{} is not installed", server.command)));
+        }
+        Err(err) => return Err(err).context("spawn failed"),
+    };
     let stdin = child.stdin.take().context("lsp server has no stdin")?;
     let stdout = child.stdout.take().context("lsp server has no stdout")?;
     Ok(Client {
@@ -736,6 +867,41 @@ mod tests {
         assert_eq!(
             path_to_uri(Path::new("/tmp/a b#c.rs")),
             "file:///tmp/a%20b%23c.rs"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_server_is_marked_and_not_respawned() {
+        let mut set = LspSet::new();
+        let root = std::env::temp_dir();
+        let server = LspServerConfig {
+            command: "eix-no-such-language-server".into(),
+            extensions: vec!["md".into()],
+            ..LspServerConfig::default()
+        };
+
+        let first = set
+            .ensure_client("markdown", &server, &root, false)
+            .await
+            .unwrap_err();
+        assert!(is_not_installed(&first), "{first:#}");
+        assert!(
+            format!("{first:#}").contains("is not installed"),
+            "{first:#}"
+        );
+        assert!(set
+            .missing
+            .contains(&("markdown".to_string(), root.clone())));
+
+        // The second call comes from the cache: same quiet verdict, no spawn.
+        let second = set
+            .ensure_client("markdown", &server, &root, false)
+            .await
+            .unwrap_err();
+        assert!(is_not_installed(&second), "{second:#}");
+        assert!(
+            format!("{second:#}").contains("is not installed"),
+            "{second:#}"
         );
     }
 

@@ -582,6 +582,7 @@ dependencies = [
  "eix-core",
  "eix-plugin-abi",
  "eix-sdk",
+ "flate2",
  "futures-util",
  "glob",
  "libc",

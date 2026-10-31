@@ -10290,6 +10290,7 @@ impl Daemon {
     /// broken language server is a note, not a lost edit.
     async fn lsp_notes(&self, config: &Config, cwd: &Path, paths: &[PathBuf]) -> String {
         let mut notes = String::new();
+        let mut seen = HashSet::new();
         let mut lsp = self.lsp.lock().await;
         for path in paths {
             if !LspSet::handles(config, path) {
@@ -10304,7 +10305,23 @@ impl Daemon {
                     }
                 }
                 Ok(_) => {}
-                Err(err) => notes.push_str(&format!("\n[lsp: {err:#}]")),
+                // A one-off install notice is useful; quiet states are not.
+                Err(err) if crate::lsp::is_install_note(&err) => {
+                    let note = format!("\n[lsp: {err:#}]");
+                    if seen.insert(note.clone()) {
+                        notes.push_str(&note);
+                    }
+                }
+                // An optional server that is not installed is not a write
+                // problem; repeating it for every file it claims only buries
+                // the actual result.
+                Err(err) if crate::lsp::is_not_installed(&err) => {}
+                Err(err) => {
+                    let note = format!("\n[lsp: {err:#}]");
+                    if seen.insert(note.clone()) {
+                        notes.push_str(&note);
+                    }
+                }
             }
         }
         notes
