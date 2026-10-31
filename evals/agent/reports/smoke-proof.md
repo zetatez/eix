@@ -20,16 +20,16 @@
 
 ## Runs
 
-| task | category | pass | score | time | steps | tools | prompt | completion | cache hit |
-| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| math_proof_sqrt2 | mathematical-reasoning | no | 40 F | 4.5s | 1 | 0 | 5896 | 523 | 87% |
-| math_proof_inf_primes | mathematical-reasoning | yes | 99 A | 6.7s | 1 | 0 | 5905 | 505 | 87% |
-| math_proof_induction_odds | mathematical-reasoning | yes | 99 A | 6.0s | 1 | 0 | 5917 | 404 | 87% |
-| math_def_limit | mathematical-reasoning | yes | 99 A | 4.3s | 1 | 0 | 5917 | 415 | 87% |
-| math_def_continuity | mathematical-reasoning | yes | 99 A | 5.1s | 1 | 0 | 5900 | 478 | 87% |
-| math_def_group | mathematical-reasoning | yes | 99 A | 7.1s | 1 | 0 | 5883 | 970 | 87% |
-| math_theorem_rolle | mathematical-reasoning | yes | 99 A | 4.6s | 1 | 0 | 5912 | 449 | 87% |
-| math_proof_cantor | mathematical-reasoning | no | 40 F | 18.1s | 1 | 0 | 5900 | 2155 | 87% |
+| task                      | category               | pass | score | time  | steps | tools | prompt | completion | cache hit |
+| ---                       | ---                    | ---  | ---   | ---:  | ---:  | ---:  | ---:   | ---:       | ---:      |
+| math_proof_sqrt2          | mathematical-reasoning | no   | 40 F  | 4.5s  | 1     | 0     | 5896   | 523        | 87%       |
+| math_proof_inf_primes     | mathematical-reasoning | yes  | 99 A  | 6.7s  | 1     | 0     | 5905   | 505        | 87%       |
+| math_proof_induction_odds | mathematical-reasoning | yes  | 99 A  | 6.0s  | 1     | 0     | 5917   | 404        | 87%       |
+| math_def_limit            | mathematical-reasoning | yes  | 99 A  | 4.3s  | 1     | 0     | 5917   | 415        | 87%       |
+| math_def_continuity       | mathematical-reasoning | yes  | 99 A  | 5.1s  | 1     | 0     | 5900   | 478        | 87%       |
+| math_def_group            | mathematical-reasoning | yes  | 99 A  | 7.1s  | 1     | 0     | 5883   | 970        | 87%       |
+| math_theorem_rolle        | mathematical-reasoning | yes  | 99 A  | 4.6s  | 1     | 0     | 5912   | 449        | 87%       |
+| math_proof_cantor         | mathematical-reasoning | no   | 40 F  | 18.1s | 1     | 0     | 5900   | 2155       | 87%       |
 
 ## Failures
 

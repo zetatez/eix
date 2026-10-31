@@ -8,15 +8,15 @@ gate; efficiency is only compared between runs that keep it at 100%.
 
 Each run is scored 0-100 on seven axes (`score.py`):
 
-| axis | weight | components |
-| --- | ---: | --- |
-| correctness | 35 | hidden pass + correctness checks |
-| adherence | 15 | clean diff (40%), no scratch writes (30%), adherence checks (30%) |
-| planning | 8 | `update_plan` used and completed (planning tasks only) |
-| loops | 12 | `model_steps` against the task budget |
-| tokens | 12 | prompt + completion tokens against the task budget |
-| time | 10 | wall seconds against the task budget |
-| cache | 8 | overall hit rate (70%), first-step hit rate (30%) |
+| axis        | weight | components                                                        |
+| ---         | ---:   | ---                                                               |
+| correctness | 35     | hidden pass + correctness checks                                  |
+| adherence   | 15     | clean diff (40%), no scratch writes (30%), adherence checks (30%) |
+| planning    | 8      | `update_plan` used and completed (planning tasks only)            |
+| loops       | 12     | `model_steps` against the task budget                             |
+| tokens      | 12     | prompt + completion tokens against the task budget                |
+| time        | 10     | wall seconds against the task budget                              |
+| cache       | 8      | overall hit rate (70%), first-step hit rate (30%)                 |
 
 Budget axes map linearly from the task's `[target, worst]` pair. `planning` is
 dropped and the weights renormalised on non-planning tasks and on old reports.
@@ -28,24 +28,24 @@ A failed run is capped at 40. A delta under 2 points is labelled noise by
 
 ### 3-task suite (pre-scoring, kept for history)
 
-| run | pass | mean time | steps | tools | tokens | cache hit |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| `baseline2` | 6/6 | 21.2s | 5.50 | 4.67 | 230,395 | 63.5% |
-| `iter-final-prompt` | 6/6 | 22.0s | 5.00 | 4.50 | 209,259 | 76.3% |
+| run                 | pass | mean time | steps | tools | tokens  | cache hit |
+| ---                 | ---  | ---:      | ---:  | ---:  | ---:    | ---:      |
+| `baseline2`         | 6/6  | 21.2s     | 5.50  | 4.67  | 230,395 | 63.5%     |
+| `iter-final-prompt` | 6/6  | 22.0s     | 5.00  | 4.50  | 209,259 | 76.3%     |
 
 ### 7-task suite (scored)
 
 `score-baseline2`: 14/14 pass, mean score **93.8**.
 
-| task | pass | score | steps (mean) |
-| --- | --- | ---: | ---: |
-| add_slugify | 2/2 | 93.3 | 5.0 |
-| counter_saturate | 2/2 | 96.6 | 4.5 |
-| fix_pagination | 2/2 | 96.5 | 4.5 |
-| merge_inventory | 2/2 | 93.6 | 6.5 |
-| refactor_dupes | 2/2 | 97.0 | 4.5 |
-| state_machine | 2/2 | 97.6 | 4.5 |
-| validate_config | 2/2 | 81.9 | 11.0 |
+| task             | pass | score | steps (mean) |
+| ---              | ---  | ---:  | ---:         |
+| add_slugify      | 2/2  | 93.3  | 5.0          |
+| counter_saturate | 2/2  | 96.6  | 4.5          |
+| fix_pagination   | 2/2  | 96.5  | 4.5          |
+| merge_inventory  | 2/2  | 93.6  | 6.5          |
+| refactor_dupes   | 2/2  | 97.0  | 4.5          |
+| state_machine    | 2/2  | 97.6  | 4.5          |
+| validate_config  | 2/2  | 81.9  | 11.0         |
 
 Axes: correctness 100, discipline 96, efficiency 86, cache 85.
 
@@ -77,20 +77,20 @@ All arms run all 127 tasks, 1 repeat, in three parallel shards. `iter3` and
 `iter4` were each run twice; only runs with enough free space under `/tmp` are
 listed (see Disk, below).
 
-| arm | what changed | pass | score | steps | secs | tokens/task | cache | first request |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `baseline` | old binary | 125/127 | 90.5 | 4.97 | 55.1 | 33.5k | 82.9% | 5535 |
-| `iter1` | prompt: no re-read/re-diff/re-verify | 125/127 | 91.7 | 4.55 | 53.8 | 30.4k | 82.8% | 5550 |
-| `iter2` | + Full mode advertises only usable tools; optional built-ins deferred | 123/127 | 91.4 | 4.56 | 51.7 | 26.9k | 80.2% | 4691 |
-| `iter3` | + sub-agents, memory, context use deferred; exec descriptions trimmed | 126/127 | 95.7 | 4.50 | 21.8 | 24.4k | 78.8% | **4371** |
-| `iter4` | + "a green run ends the task" | 124/127 | 94.9 | 4.37 | 20.3 | 23.9k | 77.9% | 4394 |
+| arm        | what changed                                                          | pass    | score | steps | secs | tokens/task | cache | first request |
+| ---        | ---                                                                   | ---:    | ---:  | ---:  | ---: | ---:        | ---:  | ---:          |
+| `baseline` | old binary                                                            | 125/127 | 90.5  | 4.97  | 55.1 | 33.5k       | 82.9% | 5535          |
+| `iter1`    | prompt: no re-read/re-diff/re-verify                                  | 125/127 | 91.7  | 4.55  | 53.8 | 30.4k       | 82.8% | 5550          |
+| `iter2`    | + Full mode advertises only usable tools; optional built-ins deferred | 123/127 | 91.4  | 4.56  | 51.7 | 26.9k       | 80.2% | 4691          |
+| `iter3`    | + sub-agents, memory, context use deferred; exec descriptions trimmed | 126/127 | 95.7  | 4.50  | 21.8 | 24.4k       | 78.8% | **4371**      |
+| `iter4`    | + "a green run ends the task"                                         | 124/127 | 94.9  | 4.37  | 20.3 | 23.9k       | 77.9% | 4394          |
 
 `iter3` and `iter4` were each run three times on the final task set. Means:
 
-| arm | pass/run | score | steps | tokens/task | USD/task | git calls | scratch | exec calls |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `iter3` | 125.3/127 | 95.5 | 4.46 | 24.1k | 0.00180 | 0.18 | 0.03 | 2.43 |
-| `iter4` | 124.7/127 | 95.2 | 4.41 | 24.0k | 0.00180 | **0.09** | **0.02** | **2.30** |
+| arm     | pass/run  | score | steps | tokens/task | USD/task | git calls | scratch  | exec calls |
+| ---     | ---:      | ---:  | ---:  | ---:        | ---:     | ---:      | ---:     | ---:       |
+| `iter3` | 125.3/127 | 95.5  | 4.46  | 24.1k       | 0.00180  | 0.18      | 0.03     | 2.43       |
+| `iter4` | 124.7/127 | 95.2  | 4.41  | 24.0k       | 0.00180  | **0.09**  | **0.02** | **2.30**   |
 
 The pass gap is one checker false negative in one `iter4` run (see Checker
 repairs); with the final checkers both arms are at ~126/127 effective. The only
@@ -117,14 +117,14 @@ The suite is weighted toward the two categories that drive most real work:
 agentic coding and math together hold 91 of 127 tasks, so a regression cannot
 hide behind a handful of lucky runs:
 
-| category | tasks |
-| --- | --- |
-| agentic-coding (40) | the 24 from the 81-task suite plus agentic_dijkstra, agentic_bfs_grid, agentic_union_find, agentic_kadane, agentic_quickselect, agentic_merge_inversions, agentic_min_heap, agentic_trie, agentic_lcs, agentic_knapsack, agentic_coin_change, agentic_nqueens, agentic_next_permutation, agentic_kmp, agentic_spiral, agentic_trap_rain |
+| category                    | tasks                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| ---                         | ---                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| agentic-coding (40)         | the 24 from the 81-task suite plus agentic_dijkstra, agentic_bfs_grid, agentic_union_find, agentic_kadane, agentic_quickselect, agentic_merge_inversions, agentic_min_heap, agentic_trie, agentic_lcs, agentic_knapsack, agentic_coin_change, agentic_nqueens, agentic_next_permutation, agentic_kmp, agentic_spiral, agentic_trap_rain                                                                                                                                                                                                                                                            |
 | mathematical-reasoning (51) | the 21 from the 81-task suite plus math_sieve, math_totient, math_fibonacci_fast, math_catalan, math_pythagorean, math_bayes, math_expected_value, math_geometric_series, math_continued_fraction, math_mod_linear, math_set_ops, math_induction_cubes, math_simpson, math_newton, math_binomial_prob, math_derangement, math_proof_sqrt2, math_proof_inf_primes, math_proof_induction_odds, math_def_limit, math_def_continuity, math_def_group, math_theorem_rolle, math_proof_cantor, math_totient_sum, math_binomial_mod, math_matrix_pow, math_mod_sqrt, math_convex_hull, math_partition_mod |
-| scientific-reasoning (8) | science_kinematics, science_temperature, science_ideal_gas, science_dilution, science_ohms_law, science_molarity, science_energy, science_wave |
-| hallucination-control (10) | hallucination_missing_api, hallucination_missing_flag, hallucination_missing_dependency, hallucination_missing_file, hallucination_missing_arg, hallucination_missing_module, hallucination_missing_config, hallucination_missing_trait, hallucination_missing_test, hallucination_fake_std_api |
-| instruction-following (10) | instruction_exact, instruction_no_unsafe, instruction_format_output, instruction_api_shape, instruction_answer_format, instruction_no_files, instruction_exact_constant, instruction_range_check, instruction_doc_comment, instruction_no_mut |
-| task-planning (8) | planning_pipeline, planning_refactor, planning_dependency, planning_debug, planning_feature, planning_migration, planning_testfirst, planning_multifile |
+| scientific-reasoning (8)    | science_kinematics, science_temperature, science_ideal_gas, science_dilution, science_ohms_law, science_molarity, science_energy, science_wave                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| hallucination-control (10)  | hallucination_missing_api, hallucination_missing_flag, hallucination_missing_dependency, hallucination_missing_file, hallucination_missing_arg, hallucination_missing_module, hallucination_missing_config, hallucination_missing_trait, hallucination_missing_test, hallucination_fake_std_api                                                                                                                                                                                                                                                                                                    |
+| instruction-following (10)  | instruction_exact, instruction_no_unsafe, instruction_format_output, instruction_api_shape, instruction_answer_format, instruction_no_files, instruction_exact_constant, instruction_range_check, instruction_doc_comment, instruction_no_mut                                                                                                                                                                                                                                                                                                                                                      |
+| task-planning (8)           | planning_pipeline, planning_refactor, planning_dependency, planning_debug, planning_feature, planning_migration, planning_testfirst, planning_multifile                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 Every code task is verified twice before it enters the suite: the untouched
 template must fail its hidden tests, and a reference solution must pass them.
@@ -158,13 +158,13 @@ proof tasks passed **24/24** across three repeats. So the earlier 75.2 math
 score was a shallow-suite artifact, not a reasoning gap; what remains is cost,
 not correctness:
 
-| task | steps | time | tokens |
-| --- | --- | --- | --- |
-| `math_divisors` | 4 | 150s | 25k |
-| `math_combinatorics` | 10 | 131s | 84k |
-| `math_binomial_mod` | 7 | 116s | 69k |
-| `math_partition_mod` | 6 | 101s | 44k |
-| `math_binomial_prob` | 8 | 73s | 60k |
+| task                 | steps | time | tokens |
+| ---                  | ---   | ---  | ---    |
+| `math_divisors`      | 4     | 150s | 25k    |
+| `math_combinatorics` | 10    | 131s | 84k    |
+| `math_binomial_mod`  | 7     | 116s | 69k    |
+| `math_partition_mod` | 6     | 101s | 44k    |
+| `math_binomial_prob` | 8     | 73s  | 60k    |
 
 These are the tasks that still rewrite their own solution two or three times
 (`verification_runs` 2-3). They are the target for the next prompt iteration, not
@@ -175,13 +175,13 @@ for more tasks.
 Cache reads dominate the token count but not the bill. At list prices for this
 model (input 0.15, output 0.6, cache read 0.003 USD per million), one task costs:
 
-| arm | uncached input | cache read | output (reasoning) | USD/task |
-| --- | ---: | ---: | ---: | ---: |
-| `baseline` | 700.8k | 3.28M | 276.6k | 0.0022 |
-| `iter1` | 637.1k | 2.97M | 253.2k | 0.0020 |
-| `iter2` | 639.2k | 2.53M | 250.8k | 0.0020 |
-| `iter3` | 648.3k | 2.29M | 212.6k | 0.0018 |
-| `iter4` | 624.4k | 2.22M | 198.5k | 0.0017 |
+| arm        | uncached input | cache read | output (reasoning) | USD/task |
+| ---        | ---:           | ---:       | ---:               | ---:     |
+| `baseline` | 700.8k         | 3.28M      | 276.6k             | 0.0022   |
+| `iter1`    | 637.1k         | 2.97M      | 253.2k             | 0.0020   |
+| `iter2`    | 639.2k         | 2.53M      | 250.8k             | 0.0020   |
+| `iter3`    | 648.3k         | 2.29M      | 212.6k             | 0.0018   |
+| `iter4`    | 624.4k         | 2.22M      | 198.5k             | 0.0017   |
 
 Output is 63-65% reasoning tokens (`reasoning_tokens / completion_tokens`), and
 cache reads cost 2% of an input token. So the real split is about 37% uncached

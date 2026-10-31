@@ -49,20 +49,20 @@ pass.
 
 ## Iterations
 
-| arm | change | first request | pass | steps | tokens/task | USD/task |
-| --- | --- | ---: | ---: | ---: | ---: | ---: |
-| baseline | old binary | 5535 | 125/127 | 4.97 | 33.5k | 0.0022 |
-| iter1 | prompt: after a patch, do not re-read, `git diff`/`git status`, or rebuild; run the workspace tests once; stay inside the workspace | 5550 | 125/127 | 4.55 | 30.4k | 0.0020 |
-| iter2 | Full mode advertises only tools that can fire; web/image/LSP move behind `tool_search` | 4691 | 123/127 | 4.56 | 26.9k | 0.0020 |
-| iter3 | sub-agents, memory and context use deferred too; exec descriptions trimmed | **4371** | 126/127 | 4.50 | 24.4k | 0.0018 |
-| iter4 | "a green test run ends the task" | 4394 | 124/127 | 4.37 | 23.9k | 0.0018 |
+ | arm      | change                                                                                                                              | first request | pass    | steps | tokens/task | USD/task |
+ | ---      | ---                                                                                                                                 | ---:          | ---:    | ---:  | ---:        | ---:     |
+ | baseline | old binary                                                                                                                          | 5535          | 125/127 | 4.97  | 33.5k       | 0.0022   |
+ | iter1    | prompt: after a patch, do not re-read, `git diff`/`git status`, or rebuild; run the workspace tests once; stay inside the workspace | 5550          | 125/127 | 4.55  | 30.4k       | 0.0020   |
+ | iter2    | Full mode advertises only tools that can fire; web/image/LSP move behind `tool_search`                                              | 4691          | 123/127 | 4.56  | 26.9k       | 0.0020   |
+ | iter3    | sub-agents, memory and context use deferred too; exec descriptions trimmed                                                          | **4371**      | 126/127 | 4.50  | 24.4k       | 0.0018   |
+ | iter4    | "a green test run ends the task"                                                                                                    | 4394          | 124/127 | 4.37  | 23.9k       | 0.0018   |
 
 iter3 and iter4 numbers are the last clean run; over three runs each:
 
-| arm | pass/run | score | steps | tokens/task | USD/task | git calls | scratch | exec calls |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| iter3 | 125.3/127 | 95.5 | 4.46 | 24.1k | 0.00180 | 0.18 | 0.03 | 2.43 |
-| iter4 | 124.7/127 | 95.2 | 4.41 | 24.0k | 0.00180 | **0.09** | **0.02** | **2.30** |
+ | arm   | pass/run  | score | steps | tokens/task | USD/task | git calls | scratch  | exec calls |
+ | ---   | ---:      | ---:  | ---:  | ---:        | ---:     | ---:      | ---:     | ---:       |
+ | iter3 | 125.3/127 | 95.5  | 4.46  | 24.1k       | 0.00180  | 0.18      | 0.03     | 2.43       |
+ | iter4 | 124.7/127 | 95.2  | 4.41  | 24.0k       | 0.00180  | **0.09**  | **0.02** | **2.30**   |
 
 The pass difference is one checker false negative in one iter4 run, not a
 behavior change. After the final checker repairs both arms are effectively at

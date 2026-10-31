@@ -20,24 +20,24 @@
 
 ## Runs
 
-| task | category | pass | score | time | steps | tools | prompt | completion | cache hit |
-| --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| math_proof_induction_odds | mathematical-reasoning | yes | 99 A | 5.7s | 1 | 0 | 5508 | 418 | 86% |
-| math_proof_induction_odds | mathematical-reasoning | yes | 99 A | 3.0s | 1 | 0 | 5508 | 382 | 86% |
-| math_proof_sqrt2 | mathematical-reasoning | yes | 99 A | 5.7s | 1 | 0 | 5487 | 678 | 86% |
-| math_proof_sqrt2 | mathematical-reasoning | yes | 99 A | 7.0s | 1 | 0 | 5487 | 844 | 86% |
-| math_proof_inf_primes | mathematical-reasoning | yes | 99 A | 5.5s | 1 | 0 | 5496 | 828 | 86% |
-| math_proof_inf_primes | mathematical-reasoning | yes | 99 A | 3.9s | 1 | 0 | 5496 | 366 | 86% |
-| math_def_limit | mathematical-reasoning | no | 40 F | 3.4s | 1 | 0 | 5508 | 329 | 86% |
-| math_def_limit | mathematical-reasoning | no | 40 F | 4.2s | 1 | 0 | 5508 | 408 | 86% |
-| math_def_continuity | mathematical-reasoning | yes | 99 A | 6.2s | 1 | 0 | 5491 | 940 | 86% |
-| math_def_continuity | mathematical-reasoning | no | 40 F | 4.1s | 1 | 0 | 5491 | 561 | 86% |
-| math_def_group | mathematical-reasoning | yes | 99 A | 5.9s | 1 | 0 | 5474 | 639 | 87% |
-| math_def_group | mathematical-reasoning | yes | 99 A | 5.5s | 1 | 0 | 5474 | 794 | 87% |
-| math_theorem_rolle | mathematical-reasoning | yes | 99 A | 3.9s | 1 | 0 | 5503 | 585 | 86% |
-| math_theorem_rolle | mathematical-reasoning | yes | 99 A | 3.6s | 1 | 0 | 5503 | 416 | 86% |
-| math_proof_cantor | mathematical-reasoning | no | 40 F | 23.7s | 1 | 0 | 5491 | 3503 | 86% |
-| math_proof_cantor | mathematical-reasoning | no | 40 F | 14.0s | 1 | 0 | 5491 | 2112 | 86% |
+| task                      | category               | pass | score | time  | steps | tools | prompt | completion | cache hit |
+| ---                       | ---                    | ---  | ---   | ---:  | ---:  | ---:  | ---:   | ---:       | ---:      |
+| math_proof_induction_odds | mathematical-reasoning | yes  | 99 A  | 5.7s  | 1     | 0     | 5508   | 418        | 86%       |
+| math_proof_induction_odds | mathematical-reasoning | yes  | 99 A  | 3.0s  | 1     | 0     | 5508   | 382        | 86%       |
+| math_proof_sqrt2          | mathematical-reasoning | yes  | 99 A  | 5.7s  | 1     | 0     | 5487   | 678        | 86%       |
+| math_proof_sqrt2          | mathematical-reasoning | yes  | 99 A  | 7.0s  | 1     | 0     | 5487   | 844        | 86%       |
+| math_proof_inf_primes     | mathematical-reasoning | yes  | 99 A  | 5.5s  | 1     | 0     | 5496   | 828        | 86%       |
+| math_proof_inf_primes     | mathematical-reasoning | yes  | 99 A  | 3.9s  | 1     | 0     | 5496   | 366        | 86%       |
+| math_def_limit            | mathematical-reasoning | no   | 40 F  | 3.4s  | 1     | 0     | 5508   | 329        | 86%       |
+| math_def_limit            | mathematical-reasoning | no   | 40 F  | 4.2s  | 1     | 0     | 5508   | 408        | 86%       |
+| math_def_continuity       | mathematical-reasoning | yes  | 99 A  | 6.2s  | 1     | 0     | 5491   | 940        | 86%       |
+| math_def_continuity       | mathematical-reasoning | no   | 40 F  | 4.1s  | 1     | 0     | 5491   | 561        | 86%       |
+| math_def_group            | mathematical-reasoning | yes  | 99 A  | 5.9s  | 1     | 0     | 5474   | 639        | 87%       |
+| math_def_group            | mathematical-reasoning | yes  | 99 A  | 5.5s  | 1     | 0     | 5474   | 794        | 87%       |
+| math_theorem_rolle        | mathematical-reasoning | yes  | 99 A  | 3.9s  | 1     | 0     | 5503   | 585        | 86%       |
+| math_theorem_rolle        | mathematical-reasoning | yes  | 99 A  | 3.6s  | 1     | 0     | 5503   | 416        | 86%       |
+| math_proof_cantor         | mathematical-reasoning | no   | 40 F  | 23.7s | 1     | 0     | 5491   | 3503       | 86%       |
+| math_proof_cantor         | mathematical-reasoning | no   | 40 F  | 14.0s | 1     | 0     | 5491   | 2112       | 86%       |
 
 ## Failures
 
