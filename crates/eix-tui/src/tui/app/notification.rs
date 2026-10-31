@@ -918,22 +918,49 @@ impl App {
                     .get("interim")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
+                // The daemon broadcasts every `asr.final` to every client, so
+                // only an utterance this prompt started may write into it.
+                let utterance_id = notification
+                    .params
+                    .get("utterance_id")
+                    .and_then(Value::as_str);
+                let Some(position) = self
+                    .voice_utterances
+                    .iter()
+                    .position(|id| utterance_id.is_some_and(|other| other == id))
+                else {
+                    return;
+                };
+                // A cancelled or failed utterance ends with an interim final
+                // carrying no text. Nothing will be inserted for it, so it
+                // stops being awaited here as well.
+                if !interim || text.is_empty() {
+                    self.voice_utterances.remove(position);
+                }
                 if text.is_empty() {
                     return;
                 }
-                if self.voice_active {
-                    self.focus = Focus::Input;
-                    let spacer = (!self.input.is_empty()).then_some(" ");
-                    self.input
-                        .insert_text(&format!("{}{text}", spacer.unwrap_or_default()));
-                    self.status = if interim {
-                        "voice: partial transcript inserted".into()
-                    } else {
-                        "voice: transcript inserted".into()
-                    };
-                }
+                self.focus = Focus::Input;
+                let spacer = (!self.input.is_empty()).then_some(" ");
+                self.input
+                    .insert_text(&format!("{}{text}", spacer.unwrap_or_default()));
+                self.status = if interim {
+                    "voice: partial transcript inserted".into()
+                } else {
+                    "voice: transcript inserted".into()
+                };
             }
             "asr.error" => {
+                // A failed utterance never produces a transcript, so stop
+                // waiting for it; otherwise the id would block nothing but
+                // linger in the status line.
+                if let Some(utterance_id) = notification
+                    .params
+                    .get("utterance_id")
+                    .and_then(Value::as_str)
+                {
+                    self.voice_utterances.retain(|id| id != utterance_id);
+                }
                 let message = notification
                     .params
                     .get("message")

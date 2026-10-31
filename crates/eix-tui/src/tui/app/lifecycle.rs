@@ -64,7 +64,7 @@ impl App {
             transcript_search: None,
             status: "connecting…".into(),
             voice: None,
-            voice_active: false,
+            voice_utterances: Vec::new(),
             voice_hold: false,
             error: None,
             connected: false,

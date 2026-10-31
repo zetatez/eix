@@ -2212,9 +2212,11 @@ pub struct App {
     status: String,
     /// `/voice` state: `Some(level)` while the microphone is being read.
     voice: Option<f32>,
-    /// A dictation session is running, microphone or file. Transients gate on
-    /// this rather than on `voice`, which is `None` for file transcription.
-    voice_active: bool,
+    /// Utterances this prompt is waiting on: `asr.finish` is acknowledged at
+    /// once and the transcript lands later, so the insert path has to outlive
+    /// the microphone. Matching on the id also keeps another client's
+    /// dictation out, because the daemon broadcasts `asr.final` to everyone.
+    voice_utterances: Vec<String>,
     /// The hold-to-dictate key is down. Cleared by the release, so a terminal
     /// that never reports one cannot leave capture running.
     voice_hold: bool,

@@ -165,11 +165,15 @@ writes into the prompt like typing does.
 
 Capture shells out to the first recorder found on `PATH` (`parec`,
 `pw-record`, then `arecord`), so no audio crate is needed. Override it with
-`[voice.capture] command`. Segmentation is energy based and needs no tuning:
-`threshold` defaults to an RMS of 0.004, which hears a soft voice in a quiet
-room and ignores room hum; an utterance ends after `silence_ms` (800 by
-default) of quiet, and `max_utterance_ms` stops one that never goes quiet.
-Raise `threshold` only if background noise keeps an utterance open.
+`[voice.capture] command`. Segmentation is energy based and needs no tuning.
+`threshold` defaults to an RMS of 0.004 and acts as a floor, not a fixed cut:
+the gate rises to 1.6 times the room level it measures, so a fan or a laptop
+hum cannot open an utterance on its own while a soft voice still can. Sound
+must also hold the gate for 60 ms, which is what keeps a click or a key tap
+from being recorded, and an utterance ends after `silence_ms` (800 by
+default) of quiet; `max_utterance_ms` stops one that never goes quiet. Raise
+`threshold` only if noise still opens an utterance, or lower it if a quiet
+voice is missed.
 
 | Method | Params | Result |
 | --- | --- | --- |

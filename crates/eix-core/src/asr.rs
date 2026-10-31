@@ -354,9 +354,10 @@ pub struct CaptureConfig {
     /// Recorder command line whose stdout is raw PCM16 mono 16 kHz. Empty means
     /// "pick whichever of parec, pw-record, arecord exists".
     pub command: String,
-    /// RMS gate on a 0.0-1.0 scale. The default sits just above a silent room
-    /// and below a soft voice, so a normal laptop microphone needs no tuning.
-    /// Raise it only if background noise keeps an utterance open.
+    /// RMS floor for the speech gate, on a 0.0-1.0 scale. The client raises the
+    /// gate to 1.6x the room level it measures, so this is a lower bound rather
+    /// than a fixed cut: noise has to be louder than this to matter at all.
+    /// Raise it only if background noise still opens an utterance.
     pub threshold: f32,
     /// Silence that closes an utterance.
     pub silence_ms: u32,

@@ -78,21 +78,21 @@ fn holding_the_dictation_key_opens_and_closes_the_microphone() {
         rx.try_recv(),
         Ok(Command::VoiceStart { file: None, .. })
     ));
-    assert!(app.voice_active);
+    assert!(app.voice_hold);
 
     // Auto-repeat while the key stays down must not stop the capture.
     app.handle_key(
         KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::NONE, KeyEventKind::Repeat),
         &tx,
     );
-    assert!(app.voice_active);
+    assert!(app.voice_hold);
     assert!(rx.try_recv().is_err());
 
     app.handle_key(
         KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::NONE, KeyEventKind::Release),
         &tx,
     );
-    assert!(!app.voice_active);
+    assert!(!app.voice_hold);
     assert!(matches!(rx.try_recv(), Ok(Command::VoiceStop)));
 }
 
@@ -107,8 +107,69 @@ fn a_release_without_a_press_does_not_stop_typed_dictation() {
         KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::NONE, KeyEventKind::Release),
         &tx,
     );
-    assert!(app.voice_active);
+    // Typed dictation is not hold-to-dictate, so a stray release must not
+    // close the microphone that `/voice` opened.
+    assert!(app.voice.is_some());
     assert!(rx.try_recv().is_err());
+}
+
+#[test]
+fn a_transcript_that_lands_after_capture_still_reaches_the_prompt() {
+    let mut app = App::new(None);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let key = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+
+    app.handle_key(key, &tx);
+    app.handle_event(
+        Event::Voice(super::super::voice::VoiceEvent::Speech {
+            utterance_id: "u1".into(),
+        }),
+        &tx,
+    );
+    // Release and capture shutdown both precede `asr.final`: `asr.finish` is
+    // acknowledged immediately and the transcript is computed afterwards.
+    app.handle_key(
+        KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::NONE, KeyEventKind::Release),
+        &tx,
+    );
+    app.handle_event(Event::Voice(super::super::voice::VoiceEvent::Done), &tx);
+
+    app.handle_event(
+        Event::Notification(eix_core::Notification::new(
+            "asr.final",
+            serde_json::json!({
+                "utterance_id": "u1",
+                "seq": 1,
+                "text": "run the tests",
+                "interim": false,
+            }),
+        )),
+        &tx,
+    );
+
+    assert_eq!(app.input.text(), "run the tests");
+    assert!(app.voice_utterances.is_empty(), "the id is released");
+}
+
+#[test]
+fn a_transcript_from_another_client_is_ignored() {
+    let mut app = App::new(None);
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+
+    app.handle_event(
+        Event::Notification(eix_core::Notification::new(
+            "asr.final",
+            serde_json::json!({
+                "utterance_id": "someone-else",
+                "seq": 1,
+                "text": "not mine",
+                "interim": false,
+            }),
+        )),
+        &tx,
+    );
+
+    assert_eq!(app.input.text(), "");
 }
 
 #[test]

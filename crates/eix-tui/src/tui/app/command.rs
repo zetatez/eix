@@ -49,9 +49,14 @@ impl App {
     pub(super) fn voice_stop(&mut self, tx: &UnboundedSender<Command>) {
         let _ = tx.send(Command::VoiceStop);
         self.voice = None;
-        self.voice_active = false;
         self.voice_hold = false;
-        self.status = "voice: stopped".into();
+        // `voice_utterances` survives on purpose: the utterance was already
+        // finished, and its transcript arrives after the key is released.
+        self.status = if self.voice_utterances.is_empty() {
+            "voice: stopped".into()
+        } else {
+            "voice: waiting for the transcript".into()
+        };
     }
 
     fn voice_start_with(
@@ -67,7 +72,6 @@ impl App {
         // A file has no live level; the microphone starts at zero until the
         // first frame arrives.
         self.voice = file.is_none().then_some(0.0);
-        self.voice_active = true;
         self.voice_hold = hold && file.is_none();
         self.status = match file {
             Some(path) => format!("voice: transcribing {}", path.display()),
@@ -78,7 +82,10 @@ impl App {
     pub(super) fn voice_event(&mut self, event: super::super::voice::VoiceEvent) {
         use super::super::voice::VoiceEvent;
         match event {
-            VoiceEvent::Speech => self.status = "voice: listening…".into(),
+            VoiceEvent::Speech { utterance_id } => {
+                self.voice_utterances.push(utterance_id);
+                self.status = "voice: listening…".into();
+            }
             VoiceEvent::Level(level) => {
                 if self.voice.is_some() {
                     self.voice = Some(level);
@@ -93,13 +100,19 @@ impl App {
             }
             VoiceEvent::Done => {
                 self.voice = None;
-                self.voice_active = false;
                 self.voice_hold = false;
+                // Capture is over but the transcripts may still be in flight,
+                // so the status must not claim the session is finished.
+                self.status = if self.voice_utterances.is_empty() {
+                    "voice: stopped".into()
+                } else {
+                    "voice: waiting for the transcript".into()
+                };
             }
             VoiceEvent::Error(message) => {
                 self.voice = None;
-                self.voice_active = false;
                 self.voice_hold = false;
+                self.voice_utterances.clear();
                 self.error = Some(message);
                 self.status = "voice failed".into();
             }

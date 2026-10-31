@@ -136,7 +136,7 @@ default; only the keys you are likely to touch are listed.
 | `[voice.local] model_dir` | unset | Explicit `model.int8.onnx` or `ggml-*.bin`; `~` is not expanded. |
 | `[voice.local] args` | `[]` | Escape hatch: replaces the derived arguments wholesale, though a missing `--model`/`--language` is still filled in. |
 | `[voice.capture] command` | `""` | Empty tries `parec`, then `pw-record`, then `arecord`. |
-| `[voice.capture] threshold` | `0.004` | RMS gate (0.0–1.0). Raise it when background noise prevents an utterance from closing. |
+| `[voice.capture] threshold` | `0.004` | RMS floor (0.0–1.0) for the speech gate. The gate itself follows the measured room at 1.6x, so noise alone cannot open an utterance. Raise it when noise still does, lower it when a quiet voice is missed. |
 | `[voice.capture] silence_ms` | `800` | How much silence ends an utterance. |
 | `[voice.capture] max_utterance_ms` | `60000` | Hard per-utterance ceiling, so a noisy room cannot record forever. |
 | `[voice.refine] enabled` | `true` | Use a chat model to fix punctuation, typos, and filler words. Text only, never audio. |
@@ -244,6 +244,7 @@ Messages and their causes:
 | `Protobuf parsing failed` | The model download was truncated | Check the sha256 and download again |
 | `the sherpa engine needs --model  …` | `--engine sherpa` without a model | Add `--model`, or drop `args` and let eix fill it in |
 | `/voice` does nothing and the meter stays flat | The capture is silent, or the gate is too high | Check the input device, then lower `threshold` |
+| Transcripts come back empty or as a stray `.` | The room is loud enough to open an utterance, but no voice follows it | Raise `threshold` above the room level, or quieten the microphone input |
 | Speech is cut to the first few characters of each sentence | The gate is high enough to treat quiet speech as silence, ending utterances early | Lower `threshold`, or raise `silence_ms` |
 | Words are right but punctuation is a mess | The refinement pass did not run | Check `degraded` on `asr.final`, and confirm `[voice.refine] enabled` and a reachable provider |
 

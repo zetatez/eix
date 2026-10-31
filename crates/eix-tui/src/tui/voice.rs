@@ -52,7 +52,11 @@ pub enum CaptureEvent {
 #[derive(Debug, PartialEq)]
 pub enum VoiceEvent {
     /// The user started talking; `asr.start` has been sent.
-    Speech,
+    Speech {
+        /// Identifies the utterance the daemon will answer for. The transcript
+        /// outlives capture, so this is what the prompt matches it on.
+        utterance_id: String,
+    },
     /// An utterance closed and its `asr.finish` was sent.
     End {
         spoken_ms: u32,
@@ -140,8 +144,12 @@ async fn forward(
         match event {
             CaptureEvent::Speech => match start(&requester, session_id.clone()).await {
                 Ok(id) => {
+                    // Reported before the utterance closes so the prompt knows
+                    // which id to expect a transcript for.
+                    let _ = tx.send(VoiceEvent::Speech {
+                        utterance_id: id.clone(),
+                    });
                     utterance = Some(id);
-                    let _ = tx.send(VoiceEvent::Speech);
                 }
                 Err(err) => {
                     let _ = tx.send(VoiceEvent::Error(format!("{err:#}")));
@@ -197,6 +205,18 @@ async fn start(requester: &Requester, session_id: Option<String>) -> Result<Stri
         .context("asr.start returned no utterance_id")
 }
 
+/// Idle frames before the gate starts following the room, about 200 ms.
+const FLOOR_FRAMES: u32 = 10;
+/// How far above the measured room the gate sits. A hum stays under it, a
+/// voice well over it.
+const FLOOR_MARGIN: f32 = 1.6;
+/// Sound must hold the gate this long to count as speech: a click, a key tap or
+/// one noisy frame carries no words.
+const ONSET_MS: u32 = 60;
+/// Once speaking, this much of the gate keeps the utterance open, so an
+/// unstressed syllable is not mistaken for the end of a sentence.
+const RELEASE: f32 = 0.6;
+
 /// Silence gate. Pure energy: speech and noise both pass, so a quiet room is
 /// required, but it needs no model file and never blocks the first word.
 pub struct Vad {
@@ -208,13 +228,24 @@ pub struct Vad {
     spoken: u32,
     /// Frames of pre-roll kept so the first syllable is not clipped.
     preroll: Vec<u8>,
+    /// Frames loud enough to be speech but not yet confirmed as an onset.
+    onset: Vec<u8>,
+    /// Frames above the gate so far; reset by any quieter frame.
+    heard: u32,
+    /// Running estimate of the room, learned only from frames below
+    /// `threshold`, so speech can never raise it.
+    floor: f32,
+    /// Idle frames sampled so far; the estimate is too noisy to trust before
+    /// `FLOOR_FRAMES`.
+    idle_frames: u32,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Step {
-    /// Still silent.
+    /// No utterance yet: silence, or sound too brief to be speech.
     Idle,
-    /// An utterance began with this frame; include the pre-roll.
+    /// An utterance began. `take_preroll` holds the audio that opened it,
+    /// including this frame.
     Start,
     /// Speech continues.
     Speech,
@@ -234,31 +265,44 @@ impl Vad {
             silent: 0,
             spoken: 0,
             preroll: Vec::new(),
+            onset: Vec::new(),
+            heard: 0,
+            floor: 0.0,
+            idle_frames: 0,
         }
     }
 
     pub fn push(&mut self, frame: &[u8], ms: u32) -> Step {
-        let loud = rms(frame) >= self.threshold;
+        let level = rms(frame);
         if !self.active {
-            if !loud {
-                // Keep a short tail of quiet audio so the utterance does not
-                // start mid-word.
-                self.preroll.extend_from_slice(frame);
-                let keep = SEND_BYTES.min(self.preroll.len());
-                if self.preroll.len() > keep {
-                    let drop = self.preroll.len() - keep;
-                    self.preroll.drain(..drop);
+            let gate = self.gate();
+            if level >= gate {
+                self.heard = self.heard.saturating_add(1);
+                self.onset.extend_from_slice(frame);
+                if self.heard.saturating_mul(ms) < ONSET_MS {
+                    return Step::Idle;
                 }
-                return Step::Idle;
+                self.active = true;
+                self.silent = 0;
+                self.spoken = self.heard.saturating_mul(ms);
+                self.heard = 0;
+                return Step::Start;
             }
-            self.active = true;
-            self.silent = 0;
-            self.spoken = ms;
-            self.preroll.clear();
-            return Step::Start;
+            self.learn_floor(level);
+            self.heard = 0;
+            self.onset.clear();
+            // Keep a short tail of quiet audio so the utterance does not start
+            // mid-word.
+            self.preroll.extend_from_slice(frame);
+            let keep = SEND_BYTES.min(self.preroll.len());
+            if self.preroll.len() > keep {
+                let drop = self.preroll.len() - keep;
+                self.preroll.drain(..drop);
+            }
+            return Step::Idle;
         }
         self.spoken = self.spoken.saturating_add(ms);
-        if loud {
+        if level >= self.gate() * RELEASE {
             self.silent = 0;
         } else {
             self.silent = self.silent.saturating_add(ms);
@@ -276,6 +320,39 @@ impl Vad {
 
     pub fn spoken_ms(&self) -> u32 {
         self.spoken
+    }
+
+    /// Audio heard before the utterance was confirmed, oldest first. Sending it
+    /// with the rest is what stops the first syllable from being clipped.
+    pub fn take_preroll(&mut self) -> Vec<u8> {
+        let mut all = std::mem::take(&mut self.preroll);
+        all.extend_from_slice(&self.onset);
+        self.onset.clear();
+        all
+    }
+
+    /// The gate in use: the configured threshold, lifted while the room is
+    /// louder than it. Noise is measured rather than assumed, because the
+    /// threshold that suits a quiet office lets a fan or a laptop hum open an
+    /// utterance and send an empty one for transcription.
+    fn gate(&self) -> f32 {
+        if self.idle_frames < FLOOR_FRAMES {
+            return self.threshold;
+        }
+        (self.floor * FLOOR_MARGIN).max(self.threshold)
+    }
+
+    /// Follow the room without following speech: only frames that did not pass
+    /// the gate are samples, so talking cannot raise the gate out of its own
+    /// reach. Comparing against the gate rather than `threshold` is what lets a
+    /// room noisier than the configured value still lift the gate.
+    fn learn_floor(&mut self, level: f32) {
+        self.floor = if self.idle_frames == 0 {
+            level
+        } else {
+            self.floor * 0.95 + level * 0.05
+        };
+        self.idle_frames = self.idle_frames.saturating_add(1);
     }
 }
 
@@ -324,9 +401,11 @@ pub async fn capture<R>(
         match vad.push(chunk, FRAME_MS) {
             Step::Idle => continue,
             Step::Start => {
-                // The pre-roll is already inside the VAD; nothing to replay.
+                // The VAD held the frames that opened the utterance, including
+                // the ones below the gate; sending them keeps the first
+                // syllable intact.
                 pending.clear();
-                pending.extend_from_slice(chunk);
+                pending.extend_from_slice(&vad.take_preroll());
                 let _ = tx.send(CaptureEvent::Speech);
             }
             Step::Speech => pending.extend_from_slice(chunk),
@@ -447,6 +526,19 @@ mod tests {
         out
     }
 
+    /// Push `frame` until the VAD reports `Start`, returning how many frames it
+    /// took. Sound has to hold the gate for `ONSET_MS` before it counts.
+    fn push_until_start(vad: &mut Vad, frame: &[u8]) -> u32 {
+        for count in 1..=100 {
+            match vad.push(frame, FRAME_MS) {
+                Step::Start => return count,
+                Step::Idle => continue,
+                other => panic!("expected no utterance before the onset, got {other:?}"),
+            }
+        }
+        panic!("never started");
+    }
+
     #[test]
     fn silence_never_starts_an_utterance() {
         let mut vad = Vad::new(&CaptureConfig::default());
@@ -460,7 +552,15 @@ mod tests {
     #[test]
     fn speech_then_silence_closes_the_utterance() {
         let mut vad = Vad::new(&CaptureConfig::default());
-        assert_eq!(vad.push(&frame(4000), FRAME_MS), Step::Start);
+        // 60 ms of onset at 20 ms per frame.
+        assert_eq!(
+            push_until_start(&mut vad, &frame(4000)),
+            ONSET_MS / FRAME_MS
+        );
+        assert!(
+            !vad.take_preroll().is_empty(),
+            "the audio that opened the utterance must be replayed, not dropped"
+        );
         assert_eq!(vad.push(&frame(4000), FRAME_MS), Step::Speech);
         // 800 ms of configured silence, at 20 ms per frame.
         let quiet = frame(0);
@@ -479,7 +579,7 @@ mod tests {
             ..CaptureConfig::default()
         };
         let mut vad = Vad::new(&config);
-        assert_eq!(vad.push(&frame(4000), FRAME_MS), Step::Start);
+        push_until_start(&mut vad, &frame(4000));
         let capped = (0..60)
             .map(|_| vad.push(&frame(4000), FRAME_MS))
             .any(|step| step == Step::Capped);
@@ -498,10 +598,8 @@ mod tests {
         // the old 0.02 default, which missed it entirely.
         let soft = frame(200);
         assert!(rms(&soft) > 0.005 && rms(&soft) < 0.01);
-        assert_eq!(
-            Vad::new(&CaptureConfig::default()).push(&soft, FRAME_MS),
-            Step::Start
-        );
+        let mut vad = Vad::new(&CaptureConfig::default());
+        assert_eq!(push_until_start(&mut vad, &soft), ONSET_MS / FRAME_MS);
     }
 
     #[test]
@@ -511,6 +609,49 @@ mod tests {
         // counts is about -48 dBFS, quieter than any voice reaches the mic.
         for _ in 0..100 {
             assert_eq!(vad.push(&frame(0), FRAME_MS), Step::Idle);
+            assert_eq!(vad.push(&frame(40), FRAME_MS), Step::Idle);
+        }
+    }
+
+    #[test]
+    fn a_humming_microphone_does_not_open_an_utterance() {
+        // Measured on a real laptop microphone at rest: about 0.0030-0.0035
+        // RMS, close enough to the 0.004 default that a single unlucky frame
+        // used to open an utterance and send it for transcription.
+        let hum = frame(115);
+        assert!(rms(&hum) < CaptureConfig::default().threshold);
+        let mut vad = Vad::new(&CaptureConfig::default());
+        for _ in 0..500 {
+            assert_eq!(vad.push(&hum, FRAME_MS), Step::Idle);
+        }
+        // The room did not raise the gate out of a voice's reach either.
+        assert_eq!(
+            push_until_start(&mut vad, &frame(4000)),
+            ONSET_MS / FRAME_MS
+        );
+    }
+
+    #[test]
+    fn a_noisy_room_lifts_the_gate_but_still_hears_speech() {
+        // 0.0037 RMS, below the configured threshold, so it only moves the
+        // running estimate; the gate still opens for a voice well above it.
+        let room = frame(120);
+        let mut vad = Vad::new(&CaptureConfig::default());
+        for _ in 0..100 {
+            assert_eq!(vad.push(&room, FRAME_MS), Step::Idle);
+        }
+        assert_eq!(
+            push_until_start(&mut vad, &frame(4000)),
+            ONSET_MS / FRAME_MS
+        );
+    }
+
+    #[test]
+    fn a_single_loud_frame_is_not_speech() {
+        // A click or a key tap: loud for one frame, then back to the room.
+        let mut vad = Vad::new(&CaptureConfig::default());
+        assert_eq!(vad.push(&frame(6000), FRAME_MS), Step::Idle);
+        for _ in 0..50 {
             assert_eq!(vad.push(&frame(40), FRAME_MS), Step::Idle);
         }
     }

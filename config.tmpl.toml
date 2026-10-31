@@ -507,10 +507,17 @@ language = ""
 [voice.capture]
 # Empty picks the first of parec, pw-record, arecord found on PATH.
 command = ""
-# Speech gate, RMS on a 0.0-1.0 scale. The default hears a soft voice in a
-# quiet room; raise it only if background noise keeps an utterance open, or
-# lower it if the first syllable is being missed.
+# Speech gate, RMS on a 0.0-1.0 scale, and a floor rather than a fixed cut: the
+# gate rises to 1.6x the measured room level, so a fan or a laptop hum cannot
+# open an utterance by itself. Raise it only if noise still does, or lower it if
+# a quiet voice is being missed.
 threshold = 0.004
+# Quiet that closes an utterance, in milliseconds. Shorter cuts faster but
+# splits a sentence at every pause for breath.
+silence_ms = 800
+# Hard ceiling on one utterance, in milliseconds, so a noisy room cannot keep
+# uploading. Hitting it sends what was captured.
+max_utterance_ms = 60000
 
 [voice.local]
 # whisper | sherpa | fake. Empty picks automatically: sherpa (SenseVoice) when
