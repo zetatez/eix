@@ -405,9 +405,10 @@ eix 不内置 Vim/Neovim 前端，也不管理 buffer、窗口或键位。Neovim
 
 转录按对话渲染：用户消息右对齐并包在圆角气泡框中，agent 输出左对齐并保留 2 空格缩进；
 消息正文使用普通文本，不使用 `you>` / `eix>` 前缀。agent 的 reasoning（provider 的 `reasoning_content` / `reasoning`）
-以 `Thinking` 模块流式展开，turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
-call/approval/patch/result 事件，摘要行显示状态圆点、命令或路径摘要，下一行显示状态
-（`ok` / `running` / `needs approval` 等），展开后用四空格左缩进直接显示参数、输出和 diff；
+以 `Thinking` 模块流式展开，标题前用大脑图标；turn 结束后默认保持展开（可点击折叠）；工具调用按 `call_id` 合并
+call/approval/patch/result 事件，摘要行显示状态圆点、工具/命令图标和命令或路径摘要，下一行显示状态
+（`ok` / `running` / `needs approval` 等）；图标按工具区分（读文件、搜索、列目录、构建、git、web、MCP、
+plugin 等），`exec_command` 按命令首个程序归类。展开后用四空格左缩进直接显示参数、输出和 diff；
 diff 采用 Vim 风格左右分栏（左旧右新），按文件扩展名用 syntect 做语法高亮，多文件 patch 在
 正文中保留文件名分隔，窄 pane 回退 unified。`apply_patch` 结束后默认保持展开；
 审批卡片对补丁使用可用的完整 diff 高度，其他工具仍只显示短预览。命令与路径已由
