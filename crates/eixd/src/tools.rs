@@ -212,7 +212,10 @@ pub fn turn_definitions(approvals: bool) -> Vec<ToolDefinition> {
 
 /// Drop the fields that only matter when a call may be shown to the user.
 fn strip_approval_fields(parameters: &mut Value) {
-    if let Some(properties) = parameters.get_mut("properties").and_then(Value::as_object_mut) {
+    if let Some(properties) = parameters
+        .get_mut("properties")
+        .and_then(Value::as_object_mut)
+    {
         for field in [
             "sandbox_permissions",
             "additional_permissions",
@@ -239,7 +242,7 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "exec_command",
-            "Run a shell command; returns output or a session id. Quote paths with spaces; put `--` before names that start with `-`.",
+            "Run a shell command. Finishes within yield_time_ms or returns a session id for write_stdin. Quote paths with spaces; put `--` before names that start with `-`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -261,13 +264,13 @@ fn build_definitions() -> Vec<ToolDefinition> {
         ),
         ToolDefinition::function(
             "write_stdin",
-            "Write characters to an existing exec_command session and return recent output. Empty chars polls.",
+            "Write characters to an existing exec_command session and return recent output. With empty chars it waits until the process exits or the suggested next check, then reports progress/ETA and when to poll again.",
             json!({
                 "type": "object",
                 "properties": {
                     "session_id": {"type": "string", "description": "Running exec_command session id."},
-                    "chars": {"type": "string", "description": "Bytes to write; omit or empty to poll."},
-                    "yield_time_ms": {"type": "integer", "description": "Wait before yielding. Defaults to 5000 ms for an empty poll and 1000 ms for a write (250-30000)."},
+                    "chars": {"type": "string", "description": "Bytes to write; omit or empty to poll. Send input to answer an interactive prompt."},
+                    "yield_time_ms": {"type": "integer", "description": "Upper bound on the wait. Defaults to the suggested check (up to 30000 ms) for an empty poll and 1000 ms for a write (250-30000)."},
                     "max_output_tokens": {"type": "integer", "description": "Output token budget."}
                 },
                 "required": ["session_id"]
@@ -2709,11 +2712,9 @@ mod tests {
         // carries ~1.4k tokens of schema. Growth past this is a regression.
         assert!(full < 1_500, "Full-mode schemas are {full} tokens");
         let full_tools = turn_definitions(false);
-        assert!(
-            !full_tools
-                .iter()
-                .any(|tool| tool.function.name == "request_user_input")
-        );
+        assert!(!full_tools
+            .iter()
+            .any(|tool| tool.function.name == "request_user_input"));
         let exec = full_tools
             .iter()
             .find(|tool| tool.function.name == "exec_command")
@@ -2763,13 +2764,20 @@ mod tests {
         // Deferring is only safe if the tool still runs when it is asked for,
         // and the sub-agent guardrail moved into its schema with it.
         for name in ["spawn_agent", "memory", "get_context_remaining"] {
-            assert!(optional.iter().any(|tool| tool.function.name == name), "{name}");
+            assert!(
+                optional.iter().any(|tool| tool.function.name == name),
+                "{name}"
+            );
         }
         let spawn = optional
             .iter()
             .find(|tool| tool.function.name == "spawn_agent")
             .expect("spawn_agent is optional");
-        assert!(spawn.function.description.to_lowercase().contains("read-only"));
+        assert!(spawn
+            .function
+            .description
+            .to_lowercase()
+            .contains("read-only"));
     }
 
     #[test]

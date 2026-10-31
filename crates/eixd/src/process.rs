@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -47,6 +47,13 @@ const KEEP_FINISHED: usize = 32;
 const MAX_RUNNING: usize = 16;
 /// How long a killed process gets to exit before SIGKILL.
 const KILL_GRACE: Duration = Duration::from_secs(2);
+/// Bounds for the advised delay between empty `write_stdin` polls. The upper
+/// bound keeps a long download from waking the model more than twice a minute.
+const MIN_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const MAX_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// A percentage observation older than this no longer says anything useful
+/// about the current rate (the process may be stuck or waiting for input).
+const ETA_FRESHNESS: Duration = Duration::from_secs(60);
 
 pub struct ProcessRegistry {
     entries: Mutex<HashMap<String, Arc<Entry>>>,
@@ -66,6 +73,109 @@ struct Entry {
     /// Consumed by the monitor to switch it into kill mode.
     killer: Mutex<Option<oneshot::Sender<()>>>,
     log_file: AsyncMutex<tokio::fs::File>,
+    progress: Mutex<Progress>,
+}
+
+/// Cheap completion tracking so an empty `write_stdin` poll can wait until the
+/// process exits or a sensible next-check time instead of returning as soon as
+/// a single progress frame arrives.
+struct Progress {
+    last_output: Instant,
+    /// Latest completion percentage seen in the stream.
+    percent: Option<f64>,
+    /// The percentage and when it was observed, used for the ETA slope.
+    mark: Option<(f64, Instant)>,
+    /// Smoothed estimate of the time left.
+    eta: Option<Duration>,
+    /// Backoff used when the stream has no percentage to extrapolate from.
+    poll_interval: Duration,
+    /// Percentage at the previous empty poll, to detect forward progress.
+    last_poll_percent: Option<f64>,
+}
+
+impl Progress {
+    fn new(now: Instant) -> Self {
+        Self {
+            last_output: now,
+            percent: None,
+            mark: None,
+            eta: None,
+            poll_interval: MIN_POLL_INTERVAL,
+            last_poll_percent: None,
+        }
+    }
+
+    /// Record a percentage parsed from one output chunk. A backwards jump means
+    /// a new phase (the next file in a batch), so the old ETA is discarded.
+    fn observe(&mut self, percent: f64, now: Instant) {
+        let percent = percent.clamp(0.0, 100.0);
+        if let Some(old) = self.percent {
+            if (percent - old).abs() < f64::EPSILON {
+                return;
+            }
+            if percent + 5.0 < old {
+                self.eta = None;
+                self.mark = Some((percent, now));
+                self.percent = Some(percent);
+                return;
+            }
+        }
+        if let Some((old, at)) = self.mark {
+            let elapsed = now.saturating_duration_since(at).as_secs_f64();
+            let advanced = percent - old;
+            if elapsed >= 0.2 && advanced > 0.0 {
+                let rate = advanced / elapsed;
+                let remaining = ((100.0 - percent) / rate).clamp(0.0, 86_400.0);
+                let sample = Duration::from_secs_f64(remaining);
+                // Smooth the estimate so one burst of progress does not
+                // promise an impossibly early finish.
+                self.eta = Some(match self.eta {
+                    Some(old) => Duration::from_secs_f64(
+                        old.as_secs_f64() * 0.6 + sample.as_secs_f64() * 0.4,
+                    ),
+                    None => sample,
+                });
+            }
+        }
+        self.percent = Some(percent);
+        self.mark = Some((percent, now));
+    }
+
+    /// Delay the next empty poll should sleep for.
+    fn suggested_wait(&self) -> Duration {
+        let eta = self
+            .eta
+            .filter(|eta| *eta <= Duration::from_secs(86_400))
+            .filter(|_| {
+                self.mark
+                    .is_some_and(|(_, at)| at.elapsed() <= ETA_FRESHNESS)
+            })
+            .filter(|_| self.percent.is_some_and(|percent| percent < 100.0));
+        let wait = match eta {
+            Some(eta) => eta.max(MIN_POLL_INTERVAL),
+            None => self.poll_interval,
+        };
+        // Silence is itself information: after a quiet stretch, checking less
+        // often is safe and saves a wake-up (and its tokens).
+        let quiet = self.last_output.elapsed();
+        let quiet_wait = quiet.saturating_mul(2).min(MAX_POLL_INTERVAL);
+        wait.max(quiet_wait)
+            .clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL)
+    }
+
+    /// Update the backoff after a poll, and report the next suggested delay.
+    fn finish_poll(&mut self, wrote: bool) -> Duration {
+        if !wrote {
+            if self.percent != self.last_poll_percent {
+                self.poll_interval = MIN_POLL_INTERVAL;
+            } else {
+                self.poll_interval =
+                    (self.poll_interval * 2).clamp(MIN_POLL_INTERVAL, MAX_POLL_INTERVAL);
+            }
+            self.last_poll_percent = self.percent;
+        }
+        self.suggested_wait()
+    }
 }
 
 impl ProcessRegistry {
@@ -135,6 +245,7 @@ impl ProcessRegistry {
             stdin: AsyncMutex::new(stdin),
             killer: Mutex::new(None),
             log_file: AsyncMutex::new(file),
+            progress: Mutex::new(Progress::new(Instant::now())),
         });
         let (kill_tx, kill_rx) = oneshot::channel();
         *entry.killer.lock().expect("process mutex poisoned") = Some(kill_tx);
@@ -266,8 +377,13 @@ impl ProcessRegistry {
     }
 
     /// Write stdin and return the output produced since the previous poll.
-    /// `chars` may be empty to poll without writing. Waits up to `wait` for new
-    /// output or process exit.
+    /// `chars` may be empty to poll without writing.
+    ///
+    /// A write returns as soon as the process answers (or `wait` elapses). An
+    /// empty poll instead waits until the process exits or the progress-derived
+    /// next-check time: waking the model for every progress frame wastes tokens
+    /// without telling it anything new. `wait` remains a ceiling for callers
+    /// that ask for a shorter yield.
     pub async fn write_stdin(
         &self,
         session_id: &str,
@@ -277,7 +393,8 @@ impl ProcessRegistry {
         max_bytes: usize,
     ) -> Result<ProcessOutput> {
         let entry = self.resolve_in(session_id, needle)?;
-        if !chars.is_empty() {
+        let wrote = !chars.is_empty();
+        if wrote {
             let mut stdin = entry.stdin.lock().await;
             let Some(stdin) = stdin.as_mut() else {
                 bail!("process stdin is closed");
@@ -288,27 +405,51 @@ impl ProcessRegistry {
                 .context("cannot write process stdin")?;
             stdin.flush().await.context("cannot flush process stdin")?;
         }
-        let deadline = Instant::now() + wait;
-        loop {
-            let has_output = !entry
-                .pending
+        let wait = if wrote {
+            wait
+        } else {
+            let suggested = entry
+                .progress
                 .lock()
                 .expect("process mutex poisoned")
-                .is_empty();
-            if has_output
-                || !entry
-                    .info
+                .suggested_wait();
+            wait.min(suggested)
+        };
+        let deadline = Instant::now() + wait;
+        loop {
+            let running = entry
+                .info
+                .lock()
+                .expect("process mutex poisoned")
+                .status
+                .is_running();
+            if !running || Instant::now() >= deadline {
+                break;
+            }
+            if wrote
+                && !entry
+                    .pending
                     .lock()
                     .expect("process mutex poisoned")
-                    .status
-                    .is_running()
-                || Instant::now() >= deadline
+                    .is_empty()
             {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
-        Ok(entry_pending(&entry, max_bytes))
+        let mut output = entry_pending(&entry, max_bytes);
+        {
+            let mut progress = entry.progress.lock().expect("process mutex poisoned");
+            let next = progress.finish_poll(wrote);
+            output.percent = progress.percent;
+            output.eta_secs = progress
+                .eta
+                .filter(|_| output.status.is_running())
+                .map(|eta| eta.as_secs().max(1));
+            output.idle_secs = Some(progress.last_output.elapsed().as_secs());
+            output.next_check_secs = Some(next.as_secs().max(1));
+        }
+        Ok(output)
     }
 
     /// Ask a process to stop. Returns `false` if it is not running.
@@ -554,6 +695,14 @@ async fn pump<R: AsyncRead + Unpin>(
             pending.push_str(&chunk);
             trim_front(&mut pending, TAIL_BYTES);
         }
+        {
+            let now = Instant::now();
+            let mut progress = entry.progress.lock().expect("process mutex poisoned");
+            progress.last_output = now;
+            if let Some(percent) = last_percent(&chunk) {
+                progress.observe(percent, now);
+            }
+        }
         if bytes <= LOG_CAP_BYTES {
             let mut file = entry.log_file.lock().await;
             let _ = file.write_all(chunk.as_bytes()).await;
@@ -655,6 +804,19 @@ fn trim_front(text: &mut String, cap: usize) {
     *text = text.split_off(cut);
 }
 
+/// Latest percentage in one output chunk. Progress bars usually separate frames
+/// with `\r`, and the last match is the current state.
+fn last_percent(chunk: &str) -> Option<f64> {
+    static PERCENT: OnceLock<regex::Regex> = OnceLock::new();
+    let re = PERCENT.get_or_init(|| {
+        regex::Regex::new(r"(?:^|[^0-9.])([0-9]{1,3}(?:\.[0-9]+)?)\s*%")
+            .expect("percent regex is valid")
+    });
+    re.captures_iter(chunk)
+        .filter_map(|cap| cap.get(1)?.as_str().parse::<f64>().ok())
+        .last()
+}
+
 /// Drain the output produced since the previous poll.
 fn entry_pending(entry: &Arc<Entry>, max_bytes: usize) -> ProcessOutput {
     let info = entry.info.lock().expect("process mutex poisoned").clone();
@@ -675,6 +837,10 @@ fn entry_pending(entry: &Arc<Entry>, max_bytes: usize) -> ProcessOutput {
         bytes: info.bytes,
         status: info.status,
         exit_code: info.exit_code,
+        percent: None,
+        eta_secs: None,
+        next_check_secs: None,
+        idle_secs: None,
     }
 }
 
@@ -704,6 +870,10 @@ fn entry_output(entry: &Arc<Entry>, max_bytes: usize) -> ProcessOutput {
         bytes: info.bytes,
         status: info.status,
         exit_code: info.exit_code,
+        percent: None,
+        eta_secs: None,
+        next_check_secs: None,
+        idle_secs: None,
     }
 }
 
@@ -871,5 +1041,78 @@ mod tests {
         assert!(format!("{error:#}").contains("unknown process"));
         let error = temp.registry.output("", 100).unwrap_err();
         assert!(format!("{error:#}").contains("must not be empty"));
+    }
+
+    #[test]
+    fn keeps_only_the_latest_percentage_in_a_chunk() {
+        assert_eq!(last_percent("10%\r 55%\r 90%\r"), Some(90.0));
+        assert_eq!(last_percent("no progress here"), None);
+        assert_eq!(last_percent("transfer 12.5%"), Some(12.5));
+    }
+
+    #[test]
+    fn estimates_remaining_time_from_the_progress_slope() {
+        let now = Instant::now();
+        let start = now - Duration::from_secs(10);
+        let mut progress = Progress::new(start);
+        progress.last_output = now;
+        progress.observe(20.0, start + Duration::from_secs(2));
+        progress.observe(30.0, start + Duration::from_secs(4));
+
+        let eta = progress.eta.expect("eta");
+        assert!((12..=16).contains(&eta.as_secs()), "{eta:?}");
+        let wait = progress.suggested_wait();
+        assert!(
+            (12..=16).contains(&wait.as_secs()),
+            "wait should follow the ETA: {wait:?}"
+        );
+    }
+
+    #[test]
+    fn a_backwards_jump_discards_the_stale_eta() {
+        let now = Instant::now();
+        let mut progress = Progress::new(now);
+        progress.observe(20.0, now);
+        progress.observe(80.0, now + Duration::from_secs(2));
+        assert!(progress.eta.is_some());
+        progress.observe(5.0, now + Duration::from_secs(3));
+        assert!(
+            progress.eta.is_none(),
+            "a new phase must not inherit an ETA"
+        );
+    }
+
+    #[test]
+    fn empty_poll_backoff_grows_and_is_bounded() {
+        let mut progress = Progress::new(Instant::now());
+        assert_eq!(progress.poll_interval, MIN_POLL_INTERVAL);
+        progress.finish_poll(false);
+        assert_eq!(progress.poll_interval, Duration::from_secs(4));
+        for _ in 0..8 {
+            progress.finish_poll(false);
+        }
+        assert_eq!(progress.poll_interval, MAX_POLL_INTERVAL);
+    }
+
+    #[tokio::test]
+    async fn empty_poll_waits_instead_of_returning_on_first_output() {
+        let temp = Temp::new("poll");
+        let info = temp.start("s1", "echo early; sleep 0.8; echo late").await;
+        let started = Instant::now();
+        let output = temp
+            .registry
+            .write_stdin("s1", &info.id, "", Duration::from_secs(30), 64 * 1024)
+            .await
+            .expect("poll");
+        // The first line is already pending, but an empty poll must wait for
+        // exit or the next check rather than hand it back immediately.
+        assert!(
+            started.elapsed() >= Duration::from_millis(500),
+            "poll returned too early"
+        );
+        assert!(!output.status.is_running());
+        assert!(output.text.contains("early"), "{:?}", output.text);
+        assert!(output.text.contains("late"), "{:?}", output.text);
+        assert!(output.next_check_secs.is_some());
     }
 }

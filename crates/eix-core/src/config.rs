@@ -1529,6 +1529,10 @@ pub struct ProviderRuntimeConfig {
     pub retry_base_ms: u64,
     /// Upper bound for a single retry delay.
     pub retry_max_secs: u64,
+    /// Keep retrying transient and rate-limited provider failures for this
+    /// long after the normal attempt budget is spent. 0 disables the extended
+    /// automatic-recovery window.
+    pub retry_window_secs: u64,
     /// Completion budget for protocols that require it (Anthropic, Gemini).
     /// OpenAI-compatible servers use their own default when it is unset.
     pub max_output_tokens: u32,
@@ -1559,6 +1563,7 @@ impl Default for ProviderRuntimeConfig {
             retry_attempts: 8,
             retry_base_ms: 250,
             retry_max_secs: 60,
+            retry_window_secs: 600,
             max_output_tokens: 8_192,
             system_prompt: None,
             prompt_profile: PromptProfile::Default,

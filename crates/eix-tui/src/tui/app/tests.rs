@@ -2539,6 +2539,39 @@ fn retry_notification_clears_the_partial_stream() {
 }
 
 #[test]
+fn recovery_retry_hides_the_attempt_denominator() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.views.push(SessionView::new(
+        Session::new("s1", "chat", "/tmp"),
+        Vec::new(),
+    ));
+
+    app.handle_event(
+        Event::Notification(eix_core::Notification::new(
+            "turn.retrying",
+            serde_json::json!({
+                "session_id": "s1",
+                "turn_id": "t1",
+                "attempt": 12,
+                "max_attempts": 0,
+                "delay_ms": 30000,
+                "kind": "transient",
+                "reason": "upstream stream interrupted",
+            }),
+        )),
+        &tx,
+    );
+
+    assert!(
+        app.status.contains("upstream error · retrying 12 in 30.0s"),
+        "{}",
+        app.status
+    );
+    assert!(!app.status.contains("12/0"), "{}", app.status);
+}
+
+#[test]
 fn clicking_a_fold_toggles_it() {
     let mut app = App::new(None);
     let session = Session::new("s1", "tools", "/tmp");
@@ -3567,6 +3600,10 @@ fn process_view_only_appends_output_for_the_shown_process() {
         truncated: false,
         status: ProcessStatus::Running,
         exit_code: None,
+        percent: None,
+        eta_secs: None,
+        next_check_secs: None,
+        idle_secs: None,
     });
     view.append("bbbbbbbb-2", "ignored");
     assert_eq!(view.tail, "one\n");

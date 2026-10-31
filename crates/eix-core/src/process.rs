@@ -87,6 +87,18 @@ pub struct ProcessOutput {
     pub status: ProcessStatus,
     #[serde(default)]
     pub exit_code: Option<i32>,
+    /// Latest completion percentage parsed from the output stream, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub percent: Option<f64>,
+    /// Estimated seconds remaining, derived from the progress slope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub eta_secs: Option<u64>,
+    /// Recommended delay before the next empty poll.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_check_secs: Option<u64>,
+    /// Seconds since the process last produced output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idle_secs: Option<u64>,
 }
 
 fn default_running() -> ProcessStatus {

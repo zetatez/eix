@@ -3545,6 +3545,10 @@ async fn background_process_streams_output_and_can_be_killed() -> anyhow::Result
         let started = tools[0]["content"].as_str().unwrap();
         assert!(started.contains("e2e-process"), "output was: {started:?}");
         assert!(started.contains("still running"), "output was: {started:?}");
+        assert!(
+            started.contains("Check again in"),
+            "the poll hint should schedule the next check: {started:?}"
+        );
         let output = tools[1]["content"].as_str().unwrap();
         assert!(output.contains("still running"), "output was: {output:?}");
     }
@@ -3619,6 +3623,134 @@ async fn background_process_streams_output_and_can_be_killed() -> anyhow::Result
 
     daemon.abort();
     mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn transient_web_fetch_failure_is_retried() -> anyhow::Result<()> {
+    let dir = temp_dir("tool-retry");
+    std::fs::create_dir_all(&dir)?;
+
+    // The first fetch gets a retryable 503; the second succeeds.
+    let flaky = TcpListener::bind("127.0.0.1:0").await?;
+    let flaky_addr = flaky.local_addr()?;
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let hits_server = Arc::clone(&hits);
+    let flaky_task = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = flaky.accept().await else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let _ = socket.read(&mut buf).await;
+            let hit = hits_server.fetch_add(1, Ordering::SeqCst);
+            let (status, body) = if hit == 0 {
+                ("503 Service Unavailable", "busy")
+            } else {
+                ("200 OK", "recovered")
+            };
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+
+    let bodies = Arc::new(Mutex::new(Vec::<String>::new()));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let url = format!("http://{flaky_addr}/data");
+    let provider = tokio::spawn({
+        let bodies = Arc::clone(&bodies);
+        async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let Some(body) = read_http_body(&mut socket).await else {
+                    return;
+                };
+                let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                bodies.lock().await.push(body);
+                let tool_results = value["messages"]
+                    .as_array()
+                    .map(|messages| {
+                        messages
+                            .iter()
+                            .filter(|message| message["role"] == "tool")
+                            .count()
+                    })
+                    .unwrap_or(0);
+                let events = if tool_results == 0 {
+                    let arguments = json!({"url": url}).to_string();
+                    let chunk = json!({
+                        "model": "mock-tools",
+                        "choices": [{
+                            "delta": {
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {"name": "web_fetch", "arguments": arguments},
+                                }]
+                            },
+                            "finish_reason": "tool_calls",
+                        }],
+                    });
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                } else {
+                    let chunk = json!({
+                        "model": "mock-tools",
+                        "choices": [{"delta": {"content": "done"}, "finish_reason": "stop"}],
+                    });
+                    format!("data: {chunk}\n\ndata: [DONE]\n\n")
+                };
+                write_sse(&mut socket, &events).await;
+            }
+        }
+    });
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+    config.tools.sandbox = eix_core::SandboxMode::Off;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request("session.create", json!({"name": "retry", "cwd": dir}))
+        .await?;
+    client
+        .request::<SubmitResult>(
+            "prompt.submit",
+            json!({"session_id": created.session.id, "text": "fetch it"}),
+        )
+        .await?;
+    assert_eq!(wait_turn(&mut client).await?, "done");
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        2,
+        "the transient failure should be retried exactly once"
+    );
+    let saw_recovered = bodies
+        .lock()
+        .await
+        .iter()
+        .any(|body| body.contains("recovered"));
+    assert!(
+        saw_recovered,
+        "the successful retry must reach the model as the tool result"
+    );
+
+    daemon.abort();
+    provider.abort();
+    flaky_task.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
 }
@@ -9562,7 +9694,8 @@ async fn start_provider(listener: TcpListener, bodies: Arc<Mutex<Vec<String>>>) 
                     .map(|(_, rest)| rest.split([' ', ';']).next().unwrap_or_default())
                     .unwrap_or_default()
                     .to_string();
-                let arguments = json!({"session_id": session, "chars": ""}).to_string();
+                let arguments =
+                    json!({"session_id": session, "chars": "", "yield_time_ms": 200}).to_string();
                 let chunk = json!({
                     "model": "mock-tools",
                     "choices": [{

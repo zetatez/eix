@@ -115,6 +115,16 @@ const PARALLEL_TOOL_CONCURRENCY: usize = 8;
 /// rate-limited or overloaded provider needs.
 const TRANSIENT_EXTRA_RETRIES: u32 = 3;
 
+/// Retry budget for transient failures of idempotent tools. Mutating and
+/// interactive tools are never retried automatically.
+const TOOL_RETRY_ATTEMPTS: u32 = 2;
+const TOOL_RETRY_BASE: Duration = Duration::from_millis(250);
+const TOOL_RETRY_MAX: Duration = Duration::from_secs(2);
+
+/// Hard cap for the extended recovery window. With the default 60s maximum
+/// backoff this allows roughly the configured window without unbounded retries.
+const RECOVERY_MAX_ATTEMPTS: u32 = 64;
+
 /// Coalesce provider fragments before they reach the notification bus. A fast
 /// model emits hundreds of tiny deltas per second; sending each one allocates a
 /// JSON value and wakes every subscriber. Flush on size, or after this interval
@@ -239,7 +249,7 @@ fn format_process_output(output: &eix_core::ProcessOutput) -> String {
             output.bytes
         )
     } else {
-        output.text.clone()
+        compact_progress_frames(&output.text)
     };
     if text.is_empty() {
         text = if output.status.is_running() {
@@ -250,9 +260,25 @@ fn format_process_output(output: &eix_core::ProcessOutput) -> String {
     }
     if output.status.is_running() {
         let id = &output.process_id;
-        text.push_str(&format!(
-            "\n\n[session {id} is still running; use write_stdin with session_id {id:?} to poll or send input]"
-        ));
+        let mut hint = format!("\n\n[session {id} is still running");
+        if let Some(percent) = output.percent {
+            hint.push_str(&format!(", {percent:.0}%"));
+        }
+        if let Some(eta) = output.eta_secs {
+            hint.push_str(&format!(", about {} left", human_duration(eta)));
+        } else if let Some(idle) = output.idle_secs.filter(|idle| *idle >= 10) {
+            hint.push_str(&format!(", no output for {}", human_duration(idle)));
+        }
+        match output.next_check_secs {
+            Some(next) if next > 0 => hint.push_str(&format!(
+                ". Check again in ~{next}s or do other work first; don't poll in a loop. Use write_stdin with session_id {id:?}"
+            )),
+            _ => hint.push_str(&format!(
+                "; use write_stdin with session_id {id:?} to poll or send input"
+            )),
+        }
+        hint.push(']');
+        text.push_str(&hint);
     } else {
         let code = output
             .exit_code
@@ -269,6 +295,33 @@ fn format_process_output(output: &eix_core::ProcessOutput) -> String {
         ));
     }
     text
+}
+
+/// Progress bars redraw the same line with `\r`. Keeping every frame floods the
+/// model's context (a single `curl` can emit thousands), so keep the newest
+/// frame on each line and drop the rest.
+fn compact_progress_frames(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            out.push('\n');
+        }
+        let trimmed = line.trim_end_matches('\r');
+        let frame = trimmed.rsplit('\r').next().unwrap_or(trimmed);
+        if !frame.is_empty() || !line.contains('\r') {
+            out.push_str(frame);
+        }
+    }
+    out
+}
+
+/// Short human duration for a progress hint.
+fn human_duration(secs: u64) -> String {
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
 }
 
 /// Index of the last call that can change the workspace or daemon state.
@@ -6246,6 +6299,10 @@ impl Daemon {
             Duration::from_millis(config.provider_runtime.retry_base_ms.max(1)),
             Duration::from_secs(config.provider_runtime.retry_max_secs.max(1)),
         );
+        // After the normal attempt budget, transient and rate-limited errors
+        // keep retrying inside this window so a short upstream outage recovers
+        // without the user resubmitting the prompt.
+        let retry_window = Duration::from_secs(config.provider_runtime.retry_window_secs);
         // Bound expensive summaries and context-window recoveries so a broken
         // provider/model pair cannot loop forever inside one user turn.
         let mut auto_compactions = 0u32;
@@ -6391,6 +6448,9 @@ impl Daemon {
             // that a 429 or a 5xx will need a minute later.
             let mut budgeted_retries = 0u32;
             let mut transient_retries = 0u32;
+            // Once the normal budget is spent, transient/rate-limited errors
+            // may keep retrying until this deadline.
+            let mut recover_until: Option<Instant> = None;
             // Prefetched read-only results for the attempt that succeeds. A
             // retried attempt throws its own map away, so stale results never
             // reach the batch.
@@ -6476,7 +6536,7 @@ impl Daemon {
                     self.observe_prompt_usage(&model, estimated_prompt, completion.usage.as_ref());
                 }
 
-                let (reason, delay, kind) = match outcome {
+                let (reason, delay, kind, recovering) = match outcome {
                     Ok(completion)
                         if completion.tool_calls.is_empty()
                             && completion.text.trim().is_empty()
@@ -6494,6 +6554,7 @@ impl Daemon {
                                 RetryClass::Transient,
                             ),
                             "empty_response",
+                            false,
                         )
                     }
                     Ok(completion) => {
@@ -6566,10 +6627,15 @@ impl Daemon {
                     }
                     Err(err) => {
                         let class = err.retry_class();
-                        let retry = class.is_retryable()
-                            && (budgeted_retries < max_retries
-                                || (class == RetryClass::Transient
-                                    && transient_retries < TRANSIENT_EXTRA_RETRIES));
+                        let normal_budget = budgeted_retries < max_retries
+                            || (class == RetryClass::Transient
+                                && transient_retries < TRANSIENT_EXTRA_RETRIES);
+                        let now = Instant::now();
+                        let recovery = max_retries > 0
+                            && !retry_window.is_zero()
+                            && attempt.saturating_add(1) < RECOVERY_MAX_ATTEMPTS
+                            && recover_until.is_none_or(|deadline| now < deadline);
+                        let retry = class.is_retryable() && (normal_budget || recovery);
                         if !retry {
                             if attempt > 0 {
                                 return Err(anyhow::anyhow!(
@@ -6579,10 +6645,14 @@ impl Daemon {
                             }
                             return Err(anyhow::anyhow!("{err}"));
                         }
-                        if budgeted_retries < max_retries {
-                            budgeted_retries += 1;
+                        if normal_budget {
+                            if budgeted_retries < max_retries {
+                                budgeted_retries += 1;
+                            } else {
+                                transient_retries += 1;
+                            }
                         } else {
-                            transient_retries += 1;
+                            recover_until.get_or_insert(now + retry_window);
                         }
                         let delay = retry_delay_for_class(
                             retry_base,
@@ -6591,7 +6661,7 @@ impl Daemon {
                             err.retry_after(),
                             class,
                         );
-                        (err.to_string(), delay, class.label())
+                        (err.to_string(), delay, class.label(), !normal_budget)
                     }
                 };
 
@@ -6608,19 +6678,32 @@ impl Daemon {
                     );
                 }
                 let reason = truncate_ui(&redact(&reason), 240);
-                eprintln!(
-                    "eixd: turn {turn_id} retry {attempt}/{max_retries} ({kind}) in {}ms: {reason}",
-                    delay.as_millis()
-                );
+                if recovering {
+                    eprintln!(
+                        "eixd: turn {turn_id} retry {attempt} (recovering, {kind}) in {}ms: {reason}",
+                        delay.as_millis()
+                    );
+                } else {
+                    eprintln!(
+                        "eixd: turn {turn_id} retry {attempt}/{max_retries} ({kind}) in {}ms: {reason}",
+                        delay.as_millis()
+                    );
+                }
                 self.emit_value(
                     "turn.retrying",
                     json!({
                         "session_id": session_id,
                         "turn_id": turn_id,
                         "attempt": attempt + 1,
-                        "max_attempts": max_retries
-                            .saturating_add(1)
-                            .saturating_add(TRANSIENT_EXTRA_RETRIES),
+                        // 0 tells the UI this is the extended recovery phase;
+                        // there is no useful fixed denominator to display.
+                        "max_attempts": if recovering {
+                            0
+                        } else {
+                            max_retries
+                                .saturating_add(1)
+                                .saturating_add(TRANSIENT_EXTRA_RETRIES)
+                        },
                         "delay_ms": delay.as_millis() as u64,
                         "kind": kind,
                         "reason": reason,
@@ -8091,6 +8174,9 @@ impl Daemon {
                         }
                     },
                 };
+                let outcome = self
+                    .retry_safe_tool(session_id, tool, &args, outcome, cancel)
+                    .await;
                 (outcome.ok, outcome.output, outcome.duration_ms)
             }
         };
@@ -8298,6 +8384,66 @@ impl Daemon {
             event.payload = payload(&message);
         }
         Ok(())
+    }
+
+    /// Retry transient failures of idempotent, read-only tools with a short
+    /// exponential backoff. Without this the model sees the raw error and often
+    /// calls the tool again immediately, repeating the same outage several
+    /// times and spending tokens on every round. Mutating and interactive
+    /// tools are never retried: a retry could duplicate a side effect.
+    async fn retry_safe_tool(
+        &self,
+        session_id: &str,
+        tool: &str,
+        args: &Value,
+        mut outcome: tools::ToolOutcome,
+        cancel: &AtomicBool,
+    ) -> tools::ToolOutcome {
+        if outcome.ok || !tool_retry_safe(tool) || !tool_error_is_transient(&outcome.output) {
+            return outcome;
+        }
+        let Ok(session) = self.require_session(session_id) else {
+            return outcome;
+        };
+        for attempt in 1..=TOOL_RETRY_ATTEMPTS {
+            let delay = retry_delay_for_class(
+                TOOL_RETRY_BASE,
+                TOOL_RETRY_MAX,
+                attempt,
+                None,
+                RetryClass::Transient,
+            );
+            eprintln!(
+                "eixd: tool {tool} transient failure; retry {attempt}/{TOOL_RETRY_ATTEMPTS} in {}ms: {}",
+                delay.as_millis(),
+                truncate_ui(&redact(&outcome.output), 160)
+            );
+            if sleep_cancellable(delay, cancel).await {
+                break;
+            }
+            outcome = match tool {
+                "mcp_read_resource"
+                | "mcp_list_resources"
+                | "mcp_list_resource_templates"
+                | "mcp_list_prompts"
+                | "mcp_get_prompt" => self.call_mcp_meta(tool, args).await,
+                _ => {
+                    tools::execute_in(
+                        tool,
+                        args,
+                        &session.cwd,
+                        &self.config.load(),
+                        Some(cancel),
+                        session.worktree.as_deref(),
+                    )
+                    .await
+                }
+            };
+            if outcome.ok || !tool_error_is_transient(&outcome.output) {
+                break;
+            }
+        }
+        outcome
     }
 
     /// Rebuild the context ledger for a session. Used by reads and the
@@ -9601,9 +9747,10 @@ impl Daemon {
             };
         };
         let chars = args.get("chars").and_then(Value::as_str).unwrap_or("");
-        // An empty poll is a wait, not a write: 1s made the model spin on
-        // long-running commands. Match Codex's 5s default for empty polls.
-        let wait = yield_time(args, if chars.is_empty() { 5_000 } else { 1_000 });
+        // An empty poll is a wait. The registry waits until the process exits
+        // or the progress-derived next-check time, and uses this value only as
+        // a ceiling; 5s made the model spin on long downloads.
+        let wait = yield_time(args, if chars.is_empty() { 30_000 } else { 1_000 });
         let max_bytes = output_cap(args, self.config.load().tools.max_output_bytes);
         match self
             .processes
@@ -10600,6 +10747,70 @@ async fn wait_for_cancel(cancel: &AtomicBool) {
     }
 }
 
+/// Tools whose repeated invocation is safe and whose failure can be caused by
+/// a transient backend rather than the request itself. `exec_command` is
+/// deliberately absent: a failed or timed-out command may already have changed
+/// the workspace.
+fn tool_retry_safe(tool: &str) -> bool {
+    matches!(
+        tool,
+        "web_fetch"
+            | "web_search"
+            | "lsp_diagnostics"
+            | "view_image"
+            | "mcp_read_resource"
+            | "mcp_list_resources"
+            | "mcp_list_resource_templates"
+            | "mcp_list_prompts"
+            | "mcp_get_prompt"
+    )
+}
+
+/// Transient tool failures worth another attempt. This is intentionally
+/// narrower than the provider matcher: local tool errors are usually
+/// deterministic (missing path, bad arguments), and retrying them only delays
+/// the model's chance to fix the request.
+fn tool_error_is_transient(output: &str) -> bool {
+    let output = output.to_ascii_lowercase();
+    [
+        "timed out",
+        "timeout",
+        "deadline exceeded",
+        "connection reset",
+        "connection refused",
+        "connection aborted",
+        "connection closed",
+        "broken pipe",
+        "reset by peer",
+        "temporarily unavailable",
+        "temporary failure",
+        "resource temporarily unavailable",
+        "try again",
+        "network error",
+        "network is unreachable",
+        "socket hang up",
+        "unexpected eof",
+        "unexpected end",
+        "stream interrupted",
+        "bad gateway",
+        "service unavailable",
+        "server not ready",
+        "not running yet",
+        "still initializing",
+        "econnreset",
+        "econnrefused",
+        "etimedout",
+        "eai_again",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+    ]
+    .iter()
+    .any(|needle| output.contains(needle))
+}
+
 fn retry_delay(
     base: Duration,
     max: Duration,
@@ -10613,9 +10824,12 @@ fn retry_delay(
     base.saturating_mul(factor).min(max)
 }
 
-/// Class-aware backoff. `Retry-After` wins when present; otherwise rate
-/// limits use a one-second floor and transient failures get jitter so a fleet
-/// of agents does not retry in lockstep.
+/// Class-aware backoff. Rate limits use a one-second floor and every class
+/// gets jitter so a fleet of agents does not retry in lockstep.
+///
+/// `Retry-After` is treated as a floor rather than a replacement: gateways that
+/// always answer `Retry-After: 5` used to pin every retry to 5s, so exponential
+/// backoff never grew and a long outage was hammered at a fixed rate.
 fn retry_delay_for_class(
     base: Duration,
     max: Duration,
@@ -10623,11 +10837,10 @@ fn retry_delay_for_class(
     retry_after: Option<Duration>,
     class: RetryClass,
 ) -> Duration {
-    if retry_after.is_some() {
-        return retry_delay(base, max, attempt, retry_after);
-    }
     let base = base.max(class.backoff_floor());
-    jitter(retry_delay(base, max, attempt, None)).min(max)
+    let exponential = retry_delay(base, max, attempt, None);
+    let delay = retry_after.map_or(exponential, |after| exponential.max(after));
+    jitter(delay).min(max)
 }
 
 /// Add up to 25% jitter. UUID v4 is already part of the daemon and gives us a
@@ -12196,7 +12409,7 @@ fn tool_note(tools: &[ToolDefinition]) -> String {
         lines.push("- Edits: `apply_patch` with one patch document. Use shell or Python for bulk rewrites, generated files, and analysis.");
     }
     if has("write_stdin") {
-        lines.push("- Long or interactive work: `write_stdin`; poll with empty `chars` and do not end the turn while it is needed.");
+        lines.push("- Long or interactive work: `exec_command` returns a session id; `write_stdin` with empty `chars` waits until the next check and reports progress/ETA, so poll only when its hint says to. Send input to answer prompts.");
     }
     if has("view_image") {
         lines.push("- Visual checks: `view_image`.");
@@ -13596,17 +13809,17 @@ mod tests {
             "{rate_limited:?}"
         );
 
-        // Retry-After is authoritative and capped by retry_max_secs.
-        assert_eq!(
-            retry_delay_for_class(
-                base,
-                max,
-                1,
-                Some(Duration::from_secs(7)),
-                RetryClass::RateLimited,
-            ),
-            Duration::from_secs(7)
+        // Retry-After is a floor, so a short value cannot suppress the jitter
+        // and is capped by retry_max_secs when the provider asks for too long.
+        let after = retry_delay_for_class(
+            base,
+            max,
+            1,
+            Some(Duration::from_secs(7)),
+            RetryClass::RateLimited,
         );
+        assert!(after >= Duration::from_secs(7), "{after:?}");
+        assert!(after <= Duration::from_millis(8_750), "{after:?}");
         assert_eq!(
             retry_delay_for_class(
                 base,
@@ -13617,6 +13830,43 @@ mod tests {
             ),
             max
         );
+
+        // A gateway that always sends `Retry-After: 5` must not pin every
+        // retry to 5s once exponential backoff has grown past it.
+        let slow_base = Duration::from_secs(1);
+        let overtaken = retry_delay_for_class(
+            slow_base,
+            Duration::from_secs(60),
+            4,
+            Some(Duration::from_secs(5)),
+            RetryClass::Transient,
+        );
+        assert!(overtaken >= Duration::from_secs(8), "{overtaken:?}");
+    }
+
+    #[test]
+    fn retries_only_transient_idempotent_tool_failures() {
+        assert!(tool_retry_safe("web_fetch"));
+        assert!(tool_retry_safe("mcp_read_resource"));
+        assert!(!tool_retry_safe("exec_command"));
+        assert!(!tool_retry_safe("write_stdin"));
+        assert!(!tool_retry_safe("apply_patch"));
+
+        assert!(tool_error_is_transient(
+            "cannot fetch https://example.test: connection reset by peer"
+        ));
+        assert!(tool_error_is_transient(
+            "https://example.test returned HTTP 503 Service Unavailable"
+        ));
+        assert!(tool_error_is_transient(
+            "language server is not running yet"
+        ));
+        assert!(!tool_error_is_transient(
+            "No such file or directory (os error 2)"
+        ));
+        assert!(!tool_error_is_transient(
+            "url must start with http:// or https://"
+        ));
     }
 
     #[test]
@@ -13665,12 +13915,56 @@ mod tests {
             bytes: 13,
             status: eix_core::ProcessStatus::Exited,
             exit_code: Some(0),
+            percent: None,
+            eta_secs: None,
+            next_check_secs: None,
+            idle_secs: None,
         };
         let text = format_process_output(&output);
         assert!(text.contains("binary output"), "{text}");
         assert!(text.contains("od -c"), "{text}");
         assert!(text.contains("exit code: 0"), "{text}");
         assert!(!text.contains("ELF"), "{text}");
+    }
+
+    #[test]
+    fn progress_frames_are_compacted_and_annotated() {
+        let output = eix_core::ProcessOutput {
+            process_id: "p1".into(),
+            truncated: false,
+            text: "Downloading\r  5%\r 50%\r100%\ndone\n".to_string(),
+            bytes: 40,
+            status: eix_core::ProcessStatus::Running,
+            exit_code: None,
+            percent: Some(100.0),
+            eta_secs: Some(0),
+            next_check_secs: Some(2),
+            idle_secs: Some(0),
+        };
+        let text = format_process_output(&output);
+        assert!(!text.contains("  5%"), "{text}");
+        assert!(text.contains("100%\ndone"), "{text}");
+        assert!(text.contains("Check again in ~2s"), "{text}");
+        assert!(text.contains("don't poll in a loop"), "{text}");
+    }
+
+    #[test]
+    fn silent_processes_report_their_next_check() {
+        let output = eix_core::ProcessOutput {
+            process_id: "p1".into(),
+            truncated: false,
+            text: String::new(),
+            bytes: 0,
+            status: eix_core::ProcessStatus::Running,
+            exit_code: None,
+            percent: None,
+            eta_secs: None,
+            next_check_secs: Some(30),
+            idle_secs: Some(45),
+        };
+        let text = format_process_output(&output);
+        assert!(text.contains("no output for 45s"), "{text}");
+        assert!(text.contains("Check again in ~30s"), "{text}");
     }
 
     #[test]
@@ -13682,6 +13976,10 @@ mod tests {
             bytes: 9_000,
             status: eix_core::ProcessStatus::Running,
             exit_code: None,
+            percent: None,
+            eta_secs: None,
+            next_check_secs: None,
+            idle_secs: None,
         };
         let text = format_process_output(&output);
         assert!(text.contains("9000 bytes produced"), "{text}");

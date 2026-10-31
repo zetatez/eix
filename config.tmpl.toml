@@ -87,6 +87,7 @@ timeout_secs = 300
 retry_attempts = 8
 retry_base_ms = 250
 retry_max_secs = 60
+retry_window_secs = 600          # keep auto-recovering transient failures for 10 min
 max_output_tokens = 8192             # required by Anthropic / Gemini
 # context_tokens = 128000
 # system_prompt = "You are eix..."

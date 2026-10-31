@@ -91,6 +91,14 @@ impl ProviderError {
                 if *status == 413 || looks_like_context_length(&body) {
                     return RetryClass::ContextLength;
                 }
+                // Gateways often wrap an upstream 4xx in a 502. Those requests
+                // are deterministic (bad schema, missing key, unknown model),
+                // so backing off just burns the retry budget.
+                if looks_like_deterministic_client_error(&body)
+                    || matches!(*status, 400 | 401 | 403 | 404 | 422)
+                {
+                    return RetryClass::Fatal;
+                }
                 if *status == 429 {
                     return RetryClass::RateLimited;
                 }
@@ -98,7 +106,8 @@ impl ProviderError {
                     return RetryClass::Transient;
                 }
                 // Some providers report overload/rate-limit errors inside a
-                // 200 SSE payload. Treat those as transient too.
+                // 200 SSE payload. Treat those as transient too. This is the
+                // common "stream interrupted" / "overloaded" path.
                 if *status == 200 && looks_like_transient(&body) {
                     return RetryClass::Transient;
                 }
@@ -1966,13 +1975,30 @@ fn truncate(text: &str, max: usize) -> String {
 }
 
 fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
-    if let Some(secs) = headers
+    if let Some(value) = headers
         .get(reqwest::header::RETRY_AFTER)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|secs| secs.is_finite() && *secs >= 0.0)
+        .map(str::trim)
     {
-        return Some(secs.ceil() as u64);
+        if let Ok(secs) = value.parse::<f64>() {
+            if secs.is_finite() && secs >= 0.0 {
+                return Some(secs.ceil() as u64);
+            }
+        }
+        // RFC 7231 allows an HTTP-date instead of a delta. Respect it so a
+        // provider that says "retry after 12:00:05" is not retried too early.
+        for parsed in [
+            chrono::DateTime::parse_from_rfc2822(value),
+            chrono::DateTime::parse_from_rfc3339(value),
+        ] {
+            if let Ok(date) = parsed {
+                let secs = date
+                    .signed_duration_since(chrono::Utc::now())
+                    .num_seconds()
+                    .max(0);
+                return Some(secs as u64);
+            }
+        }
     }
     headers
         .get("retry-after-ms")
@@ -2020,6 +2046,35 @@ fn looks_like_context_length(body: &str) -> bool {
     .any(|needle| body.contains(needle))
 }
 
+/// Errors that cannot improve by waiting: the request itself, the key or the
+/// selected model is wrong. Gateways frequently wrap these in a 5xx status.
+fn looks_like_deterministic_client_error(body: &str) -> bool {
+    [
+        "invalid_request_error",
+        "invalid request",
+        "invalid_params",
+        "invalid params",
+        "reasoning_content",
+        "didn't provide an api key",
+        "no api key",
+        "invalid api key",
+        "incorrect api key",
+        "unauthorized",
+        "forbidden",
+        "no available channel",
+        "channel has no enabled key",
+        "no enabled key",
+        "model not found",
+        "unsupported model",
+        "unsupported parameter",
+        "missing required",
+        "malformed request",
+        "bad request",
+    ]
+    .iter()
+    .any(|needle| body.contains(needle))
+}
+
 fn looks_like_transient(body: &str) -> bool {
     [
         "rate limit",
@@ -2030,9 +2085,32 @@ fn looks_like_transient(body: &str) -> bool {
         "try again",
         "timeout",
         "timed out",
+        "deadline exceeded",
         "capacity",
         "server error",
+        "server_error",
+        "internal error",
         "service unavailable",
+        "unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "interrupted",
+        "connection reset",
+        "connection aborted",
+        "connection closed",
+        "connection refused",
+        "reset by peer",
+        "broken pipe",
+        "unexpected eof",
+        "unexpected end",
+        "stream error",
+        "network error",
+        "network errors",
+        "socket hang up",
+        "econnreset",
+        "econnrefused",
+        "etimedout",
+        "resource_exhausted",
     ]
     .iter()
     .any(|needle| body.contains(needle))
@@ -2384,6 +2462,51 @@ mod tests {
         };
         assert_eq!(quota.retry_class(), RetryClass::Quota);
         assert_eq!(quota.retry_after(), Some(Duration::from_secs(10)));
+    }
+
+    #[test]
+    fn retries_interrupted_streams_and_gateway_failures() {
+        for body in [
+            "upstream stream interrupted",
+            "connection reset by peer",
+            "unexpected EOF from upstream",
+            "network errors, please retry shortly",
+        ] {
+            let err = ProviderError::Api {
+                status: 200,
+                body: body.into(),
+                retry_after_secs: None,
+            };
+            assert_eq!(err.retry_class(), RetryClass::Transient, "{body}");
+        }
+    }
+
+    #[test]
+    fn does_not_retry_deterministic_errors_wrapped_in_5xx() {
+        for body in [
+            r#"channel opencode: channel has no enabled key"#,
+            r#"upstream status 400: {"error":{"type":"invalid_request_error","message":"The reasoning_content in the thinking mode must be passed back"}}"#,
+            r#"no available channel for this model"#,
+        ] {
+            let err = ProviderError::Api {
+                status: 502,
+                body: body.into(),
+                retry_after_secs: None,
+            };
+            assert_eq!(err.retry_class(), RetryClass::Fatal, "{body}");
+        }
+    }
+
+    #[test]
+    fn parses_retry_after_http_date() {
+        let date = chrono::Utc::now() + chrono::Duration::seconds(30);
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            date.to_rfc2822().parse().unwrap(),
+        );
+        let secs = parse_retry_after(&headers).expect("retry-after date");
+        assert!((25..=30).contains(&secs), "{secs}");
     }
 
     #[test]

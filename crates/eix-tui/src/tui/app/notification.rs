@@ -521,16 +521,17 @@ impl App {
                         _ => "",
                     };
                     self.error = None;
-                    self.status = if reason.is_empty() {
-                        format!(
-                            "{kind}retrying {}/{} in {delay:.1}s",
-                            retry.attempt, retry.max_attempts
-                        )
+                    // `max_attempts == 0` marks the extended recovery phase,
+                    // where there is no fixed denominator worth showing.
+                    let progress = if retry.max_attempts == 0 {
+                        format!("retrying {}", retry.attempt)
                     } else {
-                        format!(
-                            "{kind}retrying {}/{} in {delay:.1}s: {reason}",
-                            retry.attempt, retry.max_attempts
-                        )
+                        format!("retrying {}/{}", retry.attempt, retry.max_attempts)
+                    };
+                    self.status = if reason.is_empty() {
+                        format!("{kind}{progress} in {delay:.1}s")
+                    } else {
+                        format!("{kind}{progress} in {delay:.1}s: {reason}")
                     };
                 }
             }
