@@ -1388,12 +1388,12 @@ pub(crate) fn raw_math_lines(source: &str, width: usize) -> Vec<String> {
 /// Text colour for a LaTeX image. The image is painted over the terminal
 /// background, so a transparent theme needs an explicit foreground rather
 /// than `Reset`.
+///
+/// The colour is also part of the compile-cache key, and compiling one formula
+/// costs `latex` plus `dvipng` (roughly 150 ms). Bucketing by lightness keeps
+/// every theme on one of two keys, so switching colorschemes no longer throws
+/// away the whole rendered set.
 pub(super) fn math_text_color(theme: Theme) -> Option<Color> {
-    if let Some(color) = theme.normal {
-        if !matches!(color, Color::Reset) {
-            return Some(color);
-        }
-    }
     if light_background(theme) {
         Some(Color::Rgb(30, 34, 42))
     } else {
@@ -1973,6 +1973,32 @@ mod tests {
         let wrapped = raw_math_lines(&"x+y".repeat(10), 12);
         assert!(wrapped.iter().all(|line| line.width() <= 12), "{wrapped:?}");
         assert_eq!(wrapped.concat(), format!("$${}$$", "x+y".repeat(10)));
+    }
+
+    #[test]
+    fn math_text_color_buckets_by_lightness_so_cache_keys_stay_stable() {
+        // The image colour is part of the LaTeX cache key, so two light themes
+        // must agree and two dark themes must agree; otherwise every
+        // colorscheme switch recompiles every formula.
+        let light = |normal: Color| Theme {
+            background: Some(Color::Rgb(250, 250, 250)),
+            normal: Some(normal),
+            ..Theme::default()
+        };
+        let dark = |normal: Color| Theme {
+            background: Some(Color::Rgb(24, 26, 31)),
+            normal: Some(normal),
+            ..Theme::default()
+        };
+        assert_eq!(
+            math_text_color(light(Color::Rgb(76, 79, 105))),
+            math_text_color(light(Color::Rgb(31, 35, 40)))
+        );
+        assert!(math_text_color(light(Color::Rgb(76, 79, 105))).is_some());
+        assert_eq!(
+            math_text_color(dark(Color::Rgb(205, 214, 244))),
+            math_text_color(dark(Color::Rgb(248, 248, 242)))
+        );
     }
 
     #[test]

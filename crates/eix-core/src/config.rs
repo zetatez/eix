@@ -1246,6 +1246,8 @@ impl<'de> Deserialize<'de> for FormattersConfig {
 #[serde(default)]
 pub struct ContextConfig {
     /// Soft ceiling for one request, used to trim old tool output and history.
+    /// `0` (the default) fills the model window minus room for the completion.
+    /// Without a known window it falls back to a conservative 32k.
     pub budget_tokens: usize,
     /// Workspace-relative files folded into the `instructions` sector. A
     /// missing file is skipped. `AGENTS.md` is read from the eix config
@@ -1282,7 +1284,7 @@ pub struct ContextConfig {
 impl Default for ContextConfig {
     fn default() -> Self {
         Self {
-            budget_tokens: 32_000,
+            budget_tokens: 0,
             instructions_files: vec!["AGENTS.md".to_string()],
             workspace_summary: true,
             auto_compact: true,
@@ -1306,8 +1308,17 @@ impl ContextConfig {
         model_context_tokens: Option<usize>,
         max_output_tokens: usize,
     ) -> usize {
+        // A zero budget means "auto": use the model window. This keeps modern
+        // 128k-1M models from compacting at a legacy 32k ceiling while still
+        // protecting endpoints whose window is unknown.
+        const AUTO_FALLBACK: usize = 32_000;
+        let configured = if self.budget_tokens == 0 {
+            None
+        } else {
+            Some(self.budget_tokens.max(1))
+        };
         let Some(window) = model_context_tokens.filter(|tokens| *tokens > 0) else {
-            return self.budget_tokens.max(1);
+            return configured.unwrap_or(AUTO_FALLBACK);
         };
         // The prompt and the completion share one window. Reserving room for the
         // largest completion the provider may return (plus margin for estimate
@@ -1316,9 +1327,8 @@ impl ContextConfig {
         // room than a large one.
         let reserve = (max_output_tokens as f64 * 1.25) as usize;
         let reserve = reserve.clamp(1_024, (window / 2).max(1_024));
-        self.budget_tokens
-            .min(window.saturating_sub(reserve).max(1))
-            .max(1)
+        let available = window.saturating_sub(reserve).max(1);
+        configured.map_or(available, |budget| budget.min(available).max(1))
     }
 }
 
@@ -3043,11 +3053,6 @@ impl Config {
                 "math.min_scale must be between 0 and 1".into(),
             ));
         }
-        if self.context.budget_tokens == 0 {
-            return Err(ConfigError::Invalid(
-                "context.budget_tokens must be > 0".into(),
-            ));
-        }
         if !(self.context.auto_compact_threshold > 0.0
             && self.context.auto_compact_threshold <= 1.0)
         {
@@ -4175,6 +4180,7 @@ persistent_mode = true
     #[test]
     fn context_compaction_defaults_are_token_first() {
         let context = ContextConfig::default();
+        assert_eq!(context.budget_tokens, 0, "zero means auto");
         assert!(context.auto_compact);
         assert_eq!(context.auto_compact_keep_tokens, 8_000);
         assert_eq!(context.auto_compact_keep_turns, 2);
@@ -4186,7 +4192,7 @@ persistent_mode = true
             budget_tokens: 32_000,
             ..ContextConfig::default()
         };
-        // No known window: keep the configured budget.
+        // An explicit budget with no known window is used as-is.
         assert_eq!(context.effective_budget_tokens(None, 8_192), 32_000);
         assert_eq!(context.effective_budget_tokens(Some(0), 8_192), 32_000);
 
@@ -4203,6 +4209,31 @@ persistent_mode = true
         );
         // Tiny windows never collapse to zero.
         assert_eq!(context.effective_budget_tokens(Some(1), 8_192), 1);
+    }
+
+    #[test]
+    fn auto_budget_fills_large_windows_but_keeps_a_safe_fallback() {
+        let context = ContextConfig {
+            budget_tokens: 0,
+            ..ContextConfig::default()
+        };
+        // No known window: stay conservative instead of sending a huge prompt
+        // to a model that may only accept 8k.
+        assert_eq!(context.effective_budget_tokens(None, 8_192), 32_000);
+        assert_eq!(context.effective_budget_tokens(Some(0), 8_192), 32_000);
+
+        // A known window grows the budget with the model. reserve = 8192 *
+        // 1.25 = 10240.
+        assert_eq!(
+            context.effective_budget_tokens(Some(128_000), 8_192),
+            117_760
+        );
+        assert_eq!(
+            context.effective_budget_tokens(Some(1_000_000), 8_192),
+            989_760
+        );
+        // The output reserve is still capped on a tiny window.
+        assert_eq!(context.effective_budget_tokens(Some(8_000), 8_192), 4_000);
     }
 
     #[test]

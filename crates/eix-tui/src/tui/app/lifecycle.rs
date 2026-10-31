@@ -89,6 +89,7 @@ impl App {
             math_config: eix_core::MathConfig::default(),
             config_path: None,
             theme_picker_backup: None,
+            theme_preview: None,
             keybinds: Keybinds::default(),
             esc_at: None,
             ctrl_w_at: None,
@@ -318,6 +319,7 @@ impl App {
 
     pub fn tick(&mut self, tx: &UnboundedSender<Command>) {
         self.tick = self.tick.wrapping_add(1);
+        self.flush_theme_preview();
         let now = Instant::now();
         for view in &mut self.views {
             view.expire_auto_folds(now);

@@ -104,7 +104,7 @@ type LatexCache = HashMap<LatexKey, Result<Vec<u8>, String>>;
 /// Bump when the generated PNG changes for the same source (preamble layout,
 /// package list, engine flags, ...). The digest is part of every cache file
 /// name, so old entries are simply ignored and pruned later.
-const CACHE_VERSION: u32 = 3;
+const CACHE_VERSION: u32 = 4;
 
 /// Upper bound for `~/.cache/eix/math`. A typical formula PNG is a few KiB,
 /// so this holds thousands of renders.

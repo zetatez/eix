@@ -446,6 +446,11 @@ impl App {
     /// Recolor the TUI for the theme under the picker cursor. The original
     /// palette is restored by Esc, so browsing never leaves a half-applied
     /// theme behind.
+    ///
+    /// The palette is only staged here. A theme change re-renders the whole
+    /// transcript and re-encodes every formula image, so applying it per
+    /// keystroke makes a held arrow key reflow the session once per row. The
+    /// next tick applies whatever the cursor last landed on.
     pub(super) fn preview_theme_selection(&mut self) {
         if self.picker.as_ref().map(|picker| picker.kind) != Some(PickerKind::Themes) {
             return;
@@ -469,15 +474,28 @@ impl App {
                     .map(|item| item.value.clone())
             });
         let Some(value) = value else {
-            self.theme = original;
+            self.theme_preview = Some(original);
             return;
         };
         let mut config = config;
         config.preset = (value != THEME_DEFAULT_VALUE).then_some(value);
-        self.theme = Theme::from_config(&config);
+        self.theme_preview = Some(Theme::from_config(&config));
+    }
+
+    /// Apply the colorscheme staged by the picker. Runs from the tick so a
+    /// burst of arrow keys costs one reflow instead of one per row.
+    pub(super) fn flush_theme_preview(&mut self) {
+        let Some(theme) = self.theme_preview.take() else {
+            return;
+        };
+        if self.picker.as_ref().map(|picker| picker.kind) != Some(PickerKind::Themes) {
+            return;
+        }
+        self.theme = theme;
     }
 
     pub(super) fn cancel_theme_picker(&mut self) {
+        self.theme_preview = None;
         if let Some((config, theme)) = self.theme_picker_backup.take() {
             self.theme_config = config;
             self.theme = theme;
@@ -972,6 +990,7 @@ impl App {
         self.esc_at = None;
         self.picker_query_due = false;
         // Switching from one picker to another must not keep a previewed theme.
+        self.theme_preview = None;
         if let Some((config, theme)) = self.theme_picker_backup.take() {
             self.theme_config = config;
             self.theme = theme;
@@ -1192,6 +1211,7 @@ impl App {
     ) {
         self.esc_at = None;
         self.picker_query_due = false;
+        self.theme_preview = None;
         if let Some((config, theme)) = self.theme_picker_backup.take() {
             self.theme_config = config;
             self.theme = theme;

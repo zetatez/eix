@@ -901,19 +901,52 @@ fn anthropic_body(
         "messages": wire,
         "stream": true,
     });
+    // Anthropic needs explicit breakpoints; OpenAI-compatible providers cache
+    // prefixes automatically. Mark the stable system prompt, the tool schemas
+    // and the newest message. On the following request the previous last
+    // message is still in the prefix, so the provider can read the cache up to
+    // that point even though the breakpoint moved forward.
+    let cache = route.kind == ProviderKind::Anthropic;
     if !system.is_empty() {
-        body["system"] = json!(system.join("\n\n"));
+        let text = system.join("\n\n");
+        body["system"] = if cache {
+            json!([{
+                "type": "text",
+                "text": text,
+                "cache_control": {"type": "ephemeral"},
+            }])
+        } else {
+            json!(text)
+        };
     }
     if !tools.is_empty() {
-        body["tools"] = json!(tools
+        let mut wire_tools = tools
             .iter()
-            .map(|tool| json!({
-                "name": tool.function.name,
-                "description": tool.function.description,
-                "input_schema": tool.function.parameters,
-            }))
-            .collect::<Vec<_>>());
+            .map(|tool| {
+                json!({
+                    "name": tool.function.name,
+                    "description": tool.function.description,
+                    "input_schema": tool.function.parameters,
+                })
+            })
+            .collect::<Vec<_>>();
+        if cache {
+            if let Some(last) = wire_tools.last_mut() {
+                last["cache_control"] = json!({"type": "ephemeral"});
+            }
+        }
+        body["tools"] = json!(wire_tools);
         body["tool_choice"] = json!({"type": "auto"});
+    }
+    if cache {
+        if let Some(last_block) = body["messages"]
+            .as_array_mut()
+            .and_then(|messages| messages.last_mut())
+            .and_then(|message| message["content"].as_array_mut())
+            .and_then(|blocks| blocks.last_mut())
+        {
+            last_block["cache_control"] = json!({"type": "ephemeral"});
+        }
     }
     if route.kind.deepseek_messages() {
         if let Some(effort) = route.reasoning_effort.as_deref() {
@@ -2669,8 +2702,17 @@ mod tests {
             4096,
         )
         .unwrap();
-        assert_eq!(body["system"], "be brief");
+        assert_eq!(body["system"][0]["text"], "be brief");
+        assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["max_tokens"], 4096);
+        assert_eq!(
+            body["tools"][0]["cache_control"]["type"], "ephemeral",
+            "tool schemas share the stable prefix and should be cached"
+        );
+        assert_eq!(
+            body["messages"][2]["content"][1]["cache_control"]["type"], "ephemeral",
+            "the newest block is the next request's cache breakpoint"
+        );
         assert_eq!(body["messages"][0]["role"], "user");
         assert_eq!(body["messages"][1]["role"], "assistant");
         assert_eq!(

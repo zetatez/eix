@@ -2908,9 +2908,23 @@ async fn doctor(cli: &Cli) -> Result<()> {
                 .ok()
                 .map(|cwd| cwd.join("AGENTS.md"))
                 .is_some_and(|path| path.exists());
+            let model = hello
+                .as_ref()
+                .map(|hello| hello.model.clone())
+                .unwrap_or_else(|| config.default_model().to_string());
+            let route = config.route(&model);
+            let budget = config.context.effective_budget_tokens(
+                route.context_tokens,
+                config.provider_runtime.max_output_tokens as usize,
+            );
             lines.push(format!(
-                "context  {} tokens · AGENTS.md {} · workspace summary {}",
-                config.context.budget_tokens,
+                "context  {} tokens{} · AGENTS.md {} · workspace summary {}",
+                budget,
+                if config.context.budget_tokens == 0 {
+                    " (auto)"
+                } else {
+                    ""
+                },
                 if agents { "found" } else { "missing" },
                 if config.context.workspace_summary {
                     "on"

@@ -25,29 +25,30 @@ use eix_core::{
     ApprovalListResult, ApprovalRequiredPayload, ApprovalRespondParams, ApprovalResult,
     ApprovalScope, AttachParams, AttachResult, AuthParams, BtwParams, BtwResult, CancelResult,
     ChatMessage, ClassifierAuditPayload, Config, ContextClearParams, ContextCompactParams,
-    ContextCompactedPayload, ContextInfoParams, CreateSessionParams, DoctorReport, DraftParams,
-    DraftResult, ErrorPayload, Event, EventKind, EventsParams, EventsResult, ForkParams,
-    FunctionCall, GoalParams, GoalResult, HelloResult, ImagePart, InputAnsweredPayload,
-    InputRequiredPayload, InputRespondParams, InputResult, IntegrationContinueParams,
-    IntegrationListParams, IntegrationListResult, IntegrationState, IntegrationStatus,
-    LspWorkspaceParams, McpListResult, McpServerInfo, ModeParams, ModelListResult, ModelRole,
-    ModelUseParams, ModelUseResult, Notification, PatchApplyParams, PatchGetParams, PatchGetResult,
-    PatchProposedPayload, PatchRejectParams, PatchResult, PatchResultPayload, PatchReviseParams,
-    PermissionAction, PermissionRule, PickerParams, PickerPreviewParams, PickerPreviewResult,
-    PluginCommandList, PluginCommandRunParams, PluginListResult, PluginLogsParams,
-    PluginSettingsResult, PluginUiActionParams, PluginUiPickParams, PluginUiRenderParams,
-    ProcessKillParams, ProcessKillResult, ProcessList, ProcessListParams, ProcessOutputParams,
-    ProviderAuthInfo, RenameParams, Request, Response, RewindParams, RewindResult, RewindScope,
-    RewindToParams, RewindToResult, RuleSource, ScheduleAddParams, ScheduleListParams,
-    ScheduleListResult, ScheduleRemoveParams, ScheduleRemoveResult, ServerMessage, Session,
-    SessionAgentParams, SessionArchiveParams, SessionCdParams, SessionExport, SessionExportResult,
-    SessionId, SessionImportParams, SessionList, SessionMode, SessionModelParams, SessionOrigin,
-    SessionReadyParams, SessionRef, SessionResult, SessionStatus, ShellRunParams, ShellRunResult,
-    SnapshotPayload, StatsResult, StatusChangedPayload, SubagentConcurrencyParams, SubmitParams,
-    SubmitResult, SubscribeParams, SubscribeResult, TimelineItem, TimelineResult, ToolCall,
-    ToolCallPayload, ToolDefinition, ToolResultPayload, UndoResult, UserMessagePayload,
-    WorkspaceDiffParams, WorkspaceDiffResult, WorktreeCreateParams, WorktreeRemoveParams,
-    WorktreeRemoveResult, PROTOCOL_VERSION, SESSION_EXPORT_VERSION,
+    ContextCompactResult, ContextCompactedPayload, ContextInfoParams, CreateSessionParams,
+    DoctorReport, DraftParams, DraftResult, ErrorPayload, Event, EventKind, EventsParams,
+    EventsResult, ForkParams, FunctionCall, GoalParams, GoalResult, HelloResult, ImagePart,
+    InputAnsweredPayload, InputRequiredPayload, InputRespondParams, InputResult,
+    IntegrationContinueParams, IntegrationListParams, IntegrationListResult, IntegrationState,
+    IntegrationStatus, LspWorkspaceParams, McpListResult, McpServerInfo, ModeParams,
+    ModelListResult, ModelRole, ModelUseParams, ModelUseResult, Notification, PatchApplyParams,
+    PatchGetParams, PatchGetResult, PatchProposedPayload, PatchRejectParams, PatchResult,
+    PatchResultPayload, PatchReviseParams, PermissionAction, PermissionRule, PickerParams,
+    PickerPreviewParams, PickerPreviewResult, PluginCommandList, PluginCommandRunParams,
+    PluginListResult, PluginLogsParams, PluginSettingsResult, PluginUiActionParams,
+    PluginUiPickParams, PluginUiRenderParams, ProcessKillParams, ProcessKillResult, ProcessList,
+    ProcessListParams, ProcessOutputParams, ProviderAuthInfo, RenameParams, Request, Response,
+    RewindParams, RewindResult, RewindScope, RewindToParams, RewindToResult, RuleSource,
+    ScheduleAddParams, ScheduleListParams, ScheduleListResult, ScheduleRemoveParams,
+    ScheduleRemoveResult, ServerMessage, Session, SessionAgentParams, SessionArchiveParams,
+    SessionCdParams, SessionExport, SessionExportResult, SessionId, SessionImportParams,
+    SessionList, SessionMode, SessionModelParams, SessionOrigin, SessionReadyParams, SessionRef,
+    SessionResult, SessionStatus, ShellRunParams, ShellRunResult, SnapshotPayload, StatsResult,
+    StatusChangedPayload, SubagentConcurrencyParams, SubmitParams, SubmitResult, SubscribeParams,
+    SubscribeResult, TimelineItem, TimelineResult, ToolCall, ToolCallPayload, ToolDefinition,
+    ToolResultPayload, UndoResult, UserMessagePayload, WorkspaceDiffParams, WorkspaceDiffResult,
+    WorktreeCreateParams, WorktreeRemoveParams, WorktreeRemoveResult, PROTOCOL_VERSION,
+    SESSION_EXPORT_VERSION,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -532,6 +533,7 @@ pub async fn run(config: Config, socket: PathBuf, data_dir: PathBuf) -> Result<(
         skill_tools: Mutex::new(HashMap::new()),
         token_scales: std::sync::Mutex::new(HashMap::new()),
         tool_caps: std::sync::Mutex::new(HashMap::new()),
+        compactions: std::sync::Mutex::new(HashMap::new()),
         model_catalog: Mutex::new(ModelCatalogCache::default()),
         classifier_cache: Mutex::new(HashMap::new()),
         prompt_cache: Mutex::new(PromptCache::default()),
@@ -876,6 +878,10 @@ pub(crate) struct Daemon {
     /// pressure-triggered prune. In memory only: a restart rebuilds with the
     /// configured cap, which at worst pays for another prune.
     tool_caps: std::sync::Mutex<HashMap<SessionId, usize>>,
+    /// Background compaction jobs. One model call runs per session; a request
+    /// that arrives meanwhile is merged into the pending slot instead of
+    /// starting a second call against the same conversation.
+    compactions: std::sync::Mutex<HashMap<SessionId, CompactionSlot>>,
     /// Cached merged model catalog. `/model` may be opened repeatedly; don't
     /// hit every provider on each open.
     model_catalog: Mutex<ModelCatalogCache>,
@@ -913,6 +919,54 @@ struct PairingFailures {
     count: u32,
 }
 
+/// One request for the background compaction worker.
+#[derive(Debug, Clone, Default)]
+struct CompactionRequest {
+    /// A user `/compact` (or explicit RPC) rather than automatic pressure
+    /// relief. Manual requests summarize everything currently in context and
+    /// report failures back to the client.
+    manual: bool,
+    /// Context-length recovery: bypass the threshold and summarize even when
+    /// the retention window already covers the conversation.
+    force: bool,
+    /// Minimum number of newest user turns kept verbatim.
+    keep: usize,
+    /// Range selected by the caller. `None` lets the worker choose a range
+    /// from a freshly built ledger, which is the common automatic path.
+    from_seq: Option<u64>,
+    to_seq: Option<u64>,
+    /// Explicit replacement text (API only); when set, no model call runs.
+    summary: Option<String>,
+    /// Extra instructions for the summary model (`/compact <notes>`).
+    guidance: Option<String>,
+    /// Ask the model for the summary. Automatic requests always do; a manual
+    /// request without it writes the mechanical placeholder.
+    generate: bool,
+    /// The turn that triggered an automatic compaction, for the plugin hooks.
+    turn_id: Option<String>,
+    /// Request tools, replayed so the summary call shares the turn's prefix
+    /// cache. Empty means "use the standard tool set".
+    tools: Vec<ToolDefinition>,
+}
+
+impl CompactionRequest {
+    /// A manual request supersedes a pending automatic one: the user asked for
+    /// a full summary, and both would read the same conversation.
+    fn merge(self, next: Self) -> Self {
+        if next.manual {
+            next
+        } else {
+            self
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct CompactionSlot {
+    running: bool,
+    pending: Option<CompactionRequest>,
+}
+
 /// The on-disk parts of the system prompt. They only change when the user edits
 /// a skill/agent file or reloads the config.
 struct PromptResources {
@@ -926,7 +980,11 @@ impl PromptResources {
         let skills = eix_core::load_skills(cwd, &config.compations);
         // 2% of the context budget, capped at 8 KiB. Token estimates are
         // roughly four bytes each, so the byte budget is 4x the token share.
-        let skill_bytes = (config.context.budget_tokens / 50 * 4).clamp(1_024, 8 * 1_024);
+        // No model is available here, so an auto budget uses its safe fallback.
+        let budget = config
+            .context
+            .effective_budget_tokens(None, config.provider_runtime.max_output_tokens as usize);
+        let skill_bytes = (budget / 50 * 4).clamp(1_024, 8 * 1_024);
         Self {
             skill_count: skills.len(),
             skills: eix_core::available_skills_prompt(&skills, skill_bytes),
@@ -2549,9 +2607,19 @@ impl Daemon {
                 compat.join(", ")
             }
         ));
+        let route = config.route(&self.default_model());
+        let budget = config.context.effective_budget_tokens(
+            route.context_tokens,
+            config.provider_runtime.max_output_tokens as usize,
+        );
         lines.push(format!(
-            "context  {} tokens · workspace summary {}",
-            config.context.budget_tokens,
+            "context  {} tokens{} · workspace summary {}",
+            budget,
+            if config.context.budget_tokens == 0 {
+                " (auto)"
+            } else {
+                ""
+            },
             if config.context.workspace_summary {
                 "on"
             } else {
@@ -5928,6 +5996,25 @@ impl Daemon {
             .collect()
     }
 
+    /// Context window used for budgeting. Explicit model/provider config wins;
+    /// otherwise reuse an already-fetched catalog entry. Never fetch here: a
+    /// turn must not wait on the network just to size its prompt budget.
+    async fn context_window_for(&self, model: &str, configured: Option<usize>) -> Option<usize> {
+        if configured.is_some() {
+            return configured;
+        }
+        let base = model
+            .rsplit_once('#')
+            .filter(|(_, variant)| !variant.trim().is_empty())
+            .map_or(model, |(id, _)| id);
+        let cache = self.model_catalog.lock().await;
+        cache
+            .models
+            .iter()
+            .find(|info| info.id == base)
+            .and_then(|info| info.context_tokens)
+    }
+
     async fn model_catalog(&self) -> (Vec<eix_core::ModelInfo>, Vec<String>) {
         const CACHE_TTL: Duration = Duration::from_secs(300);
         const FAILED_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -6279,6 +6366,7 @@ impl Daemon {
                     ledger,
                     false,
                     keep_turns,
+                    false,
                     allowed_tools,
                     &mut events,
                     &mut last_seq,
@@ -6395,7 +6483,8 @@ impl Daemon {
                         ledger,
                         false,
                         keep,
-                        allowed_tools,
+                        false,
+                        &tools,
                         &mut events,
                         &mut last_seq,
                         &static_context,
@@ -6600,6 +6689,7 @@ impl Daemon {
                                 ledger,
                                 true,
                                 keep,
+                                true,
                                 allowed_tools,
                                 &mut events,
                                 &mut last_seq,
@@ -8607,8 +8697,9 @@ impl Daemon {
         let memory = self.memory.read(&session.cwd).await;
         let model = self.model_for_session(&session);
         let route = config.route(&model);
+        let context_tokens = self.context_window_for(&model, route.context_tokens).await;
         let budget = config.context.effective_budget_tokens(
-            route.context_tokens,
+            context_tokens,
             config.provider_runtime.max_output_tokens as usize,
         );
         let resources = self.prompt_resources(&config, &session.cwd).await;
@@ -8689,8 +8780,9 @@ impl Daemon {
         let memory = self.memory.read(&session.cwd).await;
         let model = self.model_for_session(&session);
         let route = config.route(&model);
+        let context_tokens = self.context_window_for(&model, route.context_tokens).await;
         let budget = config.context.effective_budget_tokens(
-            route.context_tokens,
+            context_tokens,
             config.provider_runtime.max_output_tokens as usize,
         );
         let resources = self.prompt_resources(&config, &session.cwd).await;
@@ -8825,17 +8917,16 @@ impl Daemon {
         );
     }
 
+    /// Accept a `/compact` request and return before the summary model runs.
+    /// The worker appends `ContextCompacted`, so the next ledger rebuild (the
+    /// next turn or the next tool round) picks up the summary automatically.
     async fn context_compact(
-        &self,
+        self: &Arc<Self>,
         params: ContextCompactParams,
-    ) -> Result<eix_core::ContextLedgerResult> {
-        let session = self.require_session(&params.session_id)?;
-        if session.status.is_busy() {
-            return Err(rpc(
-                "busy",
-                "wait for the turn to finish before compacting the context",
-            ));
-        }
+    ) -> Result<ContextCompactResult> {
+        // A busy session is fine: the event is appended when the summary is
+        // ready and the running turn reloads its ledger at the next round.
+        let _ = self.require_session(&params.session_id)?;
         let ledger = self.build_ledger(&params.session_id).await?;
         let (from_seq, to_seq) = match (params.from_seq, params.to_seq) {
             (Some(from), Some(to)) => (from, to),
@@ -8859,19 +8950,231 @@ impl Daemon {
         if messages == 0 {
             return Err(rpc("invalid_params", "no messages in the requested range"));
         }
-        let summary = match params
+        let request = CompactionRequest {
+            manual: true,
+            force: false,
+            keep: 1,
+            from_seq: Some(from_seq),
+            to_seq: Some(to_seq),
+            summary: params
+                .summary
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty()),
+            guidance: params
+                .guidance
+                .map(|text| text.trim().to_string())
+                .filter(|text| !text.is_empty()),
+            generate: params.generate,
+            turn_id: None,
+            tools: Vec::new(),
+        };
+        let merged = self.request_compaction(&params.session_id, request);
+        Ok(ContextCompactResult {
+            session_id: params.session_id,
+            accepted: true,
+            merged,
+            from_seq,
+            to_seq,
+            messages,
+            tokens,
+        })
+    }
+
+    /// Start a compaction at most once per session. When one is already
+    /// running, remember the newest request and run it afterwards. Returns
+    /// `true` when the request was merged into the pending slot.
+    fn request_compaction(self: &Arc<Self>, session_id: &str, request: CompactionRequest) -> bool {
+        let (start, merged) = {
+            let mut jobs = self
+                .compactions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let slot = jobs.entry(session_id.to_string()).or_default();
+            if slot.running {
+                slot.pending = Some(match slot.pending.take() {
+                    Some(pending) => pending.merge(request),
+                    None => request,
+                });
+                (None, true)
+            } else {
+                slot.running = true;
+                (Some(request), false)
+            }
+        };
+        if let Some(request) = start {
+            self.spawn_compaction_job(session_id.to_string(), request);
+        }
+        merged
+    }
+
+    fn spawn_compaction_job(self: &Arc<Self>, session_id: String, request: CompactionRequest) {
+        let daemon = Arc::clone(self);
+        tokio::spawn(async move {
+            let manual = request.manual;
+            if let Err(err) = daemon.run_compaction(&session_id, request).await {
+                eprintln!("eixd: compaction failed: {err:#}");
+                daemon.emit_value(
+                    "context.compact_failed",
+                    json!({
+                        "session_id": session_id,
+                        "error": format!("{err:#}"),
+                        "auto": !manual,
+                    }),
+                );
+            }
+            daemon.finish_compaction(&session_id);
+        });
+    }
+
+    /// Run the pending request, if any, after the current job finishes.
+    fn finish_compaction(self: &Arc<Self>, session_id: &str) {
+        let next = {
+            let mut jobs = self
+                .compactions
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match jobs.get_mut(session_id) {
+                Some(slot) => match slot.pending.take() {
+                    Some(next) => Some(next),
+                    None => {
+                        jobs.remove(session_id);
+                        None
+                    }
+                },
+                None => None,
+            }
+        };
+        if let Some(next) = next {
+            self.spawn_compaction_job(session_id.to_string(), next);
+        }
+    }
+
+    /// Summarize one range and append `ContextCompacted`. Returns whether an
+    /// event was written. The caller may await this (context-length recovery)
+    /// or run it in the background (normal automatic and manual compaction).
+    async fn run_compaction(&self, session_id: &str, request: CompactionRequest) -> Result<bool> {
+        let config = self.config.load_full();
+        let ledger = self.build_ledger(session_id).await?;
+        let info = ledger.info();
+        let threshold = config.context.auto_compact_threshold;
+        let over_threshold = info.budget_tokens > 0
+            && (info.total_tokens as f64) > threshold * info.budget_tokens as f64;
+
+        let (from_seq, to_seq) = match (request.from_seq, request.to_seq) {
+            (Some(from), Some(to)) => (from, to),
+            _ if request.manual => match ledger.message_range() {
+                Some(range) => range,
+                None => bail!("there is nothing to compact yet"),
+            },
+            _ => {
+                // The conversation may have changed since the request was
+                // queued. Re-check pressure before paying for a summary.
+                if !request.force && !over_threshold {
+                    return Ok(false);
+                }
+                let keep = request.keep.max(1);
+                let range = ledger
+                    .auto_compact_range_tokens(config.context.auto_compact_keep_tokens, keep)
+                    .or_else(|| {
+                        if request.force {
+                            ledger.auto_compact_range(1)
+                        } else if over_threshold {
+                            ledger.auto_compact_range(keep)
+                        } else {
+                            None
+                        }
+                    });
+                match range {
+                    Some(range) => range,
+                    None => return Ok(false),
+                }
+            }
+        };
+        if from_seq == 0 || to_seq < from_seq {
+            bail!("compaction needs 0 < from_seq <= to_seq");
+        }
+        if ledger.overlaps_compaction(from_seq, to_seq) {
+            // Another compaction (or an explicit RPC) got there first.
+            return Ok(false);
+        }
+        let (messages, tokens) = ledger.range_stats(from_seq, to_seq);
+        if messages == 0 {
+            return Ok(false);
+        }
+
+        let tools = if request.tools.is_empty() {
+            let session = self.require_session(session_id)?;
+            self.standard_tool_definitions(&session).await
+        } else {
+            request.tools.clone()
+        };
+        let explicit = request
             .summary
-            .map(|text| text.trim().to_string())
-            .filter(|text| !text.is_empty())
-        {
-            Some(text) => text,
-            None if params.generate => self.generate_summary(&params.session_id, &ledger).await?,
+            .as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty());
+        let summary = match explicit {
+            Some(text) => text.to_string(),
+            None if request.generate || !request.manual => {
+                // Replay the whole live conversation. This is the same prefix
+                // the turn just sent, so the provider can serve it from its
+                // prompt cache, and the model sees the recent details it needs
+                // to write a coherent summary. Forced recovery keeps the
+                // narrower range: the provider already rejected the full
+                // conversation once, so the auxiliary call must be smaller.
+                let input = if request.force {
+                    let mut input = ledger.prefix_before(from_seq);
+                    input.extend(ledger.messages_in_range(from_seq, to_seq));
+                    input
+                } else {
+                    ledger.messages()
+                };
+                let previous = if request.manual {
+                    None
+                } else {
+                    ledger.latest_summary()
+                };
+                // The summary instruction is appended as the last user turn
+                // by `summarize_messages`.
+                self.summarize_messages(
+                    session_id,
+                    input,
+                    previous.as_deref(),
+                    &tools,
+                    request.guidance.as_deref(),
+                )
+                .await?
+            }
             None => "(the user compacted these messages; their text remains in the event log, \
                      not in this request)"
                 .to_string(),
         };
+
+        // A summary that barely shrinks the history would cost a provider call
+        // every round while freeing almost nothing, so keep the history and let
+        // trimming handle it. Tiny ranges are exempt: there the summary is
+        // dominated by fixed prose, and tests exercise exact compaction on them.
+        if !request.manual {
+            const MIN_SHRINK_TOKENS: usize = 256;
+            let summary_tokens = crate::context::estimate_tokens(&summary);
+            if tokens >= MIN_SHRINK_TOKENS && summary_tokens * 10 >= tokens * 9 {
+                eprintln!(
+                    "eixd: auto-compaction skipped: summary ({summary_tokens} tokens) does not \
+                     shrink {tokens} tokens of history"
+                );
+                return Ok(false);
+            }
+        }
+        let summary = if request.manual {
+            summary
+        } else {
+            let turn_id = request.turn_id.as_deref().unwrap_or_default();
+            self.plugins
+                .run_compact_after(session_id, turn_id, &summary)
+                .await
+        };
         let event = self.store.append_event(
-            &params.session_id,
+            session_id,
             EventKind::ContextCompacted,
             payload(&ContextCompactedPayload {
                 from_seq,
@@ -8879,32 +9182,29 @@ impl Daemon {
                 messages,
                 tokens,
                 summary,
-                rolling: false,
+                rolling: !request.manual,
             }),
         )?;
         self.emit_event(&event);
+        if !request.manual {
+            // The summary freed room; a reduced tool-output cap from an earlier
+            // prune would keep new results unnecessarily small.
+            self.clear_tool_output_cap(session_id);
+        }
         self.emit_value(
             "context.compacted",
             json!({
-                "session_id": params.session_id,
+                "session_id": session_id,
                 "from_seq": from_seq,
                 "to_seq": to_seq,
                 "messages": messages,
                 "tokens": tokens,
+                "auto": !request.manual,
             }),
         );
-        let ledger = self.build_ledger(&params.session_id).await?;
-        self.emit_context(&params.session_id, &ledger);
-        Ok(ledger.info())
-    }
-
-    /// Ask the model to summarize the conversation so far. Used by `/compact`;
-    /// the result replaces the history in the provider request.
-    async fn generate_summary(&self, session_id: &str, ledger: &Ledger) -> Result<String> {
-        let session = self.require_session(session_id)?;
-        let tools = self.standard_tool_definitions(&session).await;
-        self.summarize_messages(session_id, ledger.messages(), None, &tools)
-            .await
+        let ledger = self.build_ledger(session_id).await?;
+        self.emit_context(session_id, &ledger);
+        Ok(true)
     }
 
     /// Summarize the provided prefix + range. The conversation prefix is
@@ -8917,6 +9217,7 @@ impl Daemon {
         mut messages: Vec<ChatMessage>,
         previous: Option<&str>,
         tools: &[ToolDefinition],
+        guidance: Option<&str>,
     ) -> Result<String> {
         let todos = self
             .todos
@@ -8957,16 +9258,27 @@ impl Daemon {
             );
             instruction.push_str(&cap_text(previous, 12_000));
         }
+        // `/compact <notes>` steers the summary; it never replaces the
+        // conversation. Keep the user's wording so specific requests survive.
+        if let Some(guidance) = guidance.map(str::trim).filter(|text| !text.is_empty()) {
+            instruction.push_str("\n\nThe user asked for this compaction to focus on:\n");
+            instruction.push_str(&cap_text(guidance, 4_000));
+        }
         instruction.push_str(
-            "\n\nSummarize the conversation so far for a fresh context window. Write the \
-             compacted summary now. Return only the summary.",
+            "\n\nSummarize the conversation so far for a fresh context window. Do not call tools. \
+             Write the compacted summary now. Return only the summary.",
         );
         // Keep the conversation as the exact prefix and append the instruction
         // as a user turn. This is deliberately not a new system message.
         messages.push(ChatMessage::user(instruction));
         let config = self.config.load();
         let session = self.require_session(session_id)?;
-        let model = self.model_for_background(&session);
+        // Summaries use the session's own model, not the background helper
+        // model. The conversation prefix is replayed above, so the same model
+        // and tool set let the provider reuse the warm prompt cache. A
+        // `model_for_background` pin would miss that cache in plan mode and
+        // whenever `/model` selected a different executor.
+        let model = self.model_for_session(&session);
         let cancel = AtomicBool::new(false);
         let route = config.route(&model);
         let provider = self.provider.load_full();
@@ -8983,21 +9295,25 @@ impl Daemon {
 
     /// Bring the request back under `context.auto_compact_threshold` of the
     /// budget. Pruning tool output is tried first because it is free and
-    /// reversible; only when that fails to relieve the pressure is the oldest
-    /// history summarized. `force` bypasses the threshold after the provider
-    /// reports a context-length error. Summary failures are logged and ignored:
-    /// a provider hiccup must not block the turn.
+    /// reversible. When that is not enough, normal calls queue a background
+    /// summary and return immediately; the next ledger rebuild (the next tool
+    /// round or the next turn) loads the `ContextCompacted` event.
     ///
-    /// The returned flag means "the context was reduced", whether by pruning or
-    /// by a summary.
+    /// `wait` is reserved for provider context-length recovery: the request
+    /// has already failed, so it must be smaller before the retry and there is
+    /// no next loop to defer to. Every other auto-compaction is asynchronous.
+    ///
+    /// The returned flag means "the context was reduced, or a reduction was
+    /// queued".
     #[allow(clippy::too_many_arguments)]
     async fn auto_compact_if_needed(
-        &self,
+        self: &Arc<Self>,
         session_id: &str,
         turn_id: &str,
         ledger: Ledger,
         force: bool,
         keep: usize,
+        wait: bool,
         tools: &[ToolDefinition],
         events: &mut Vec<Event>,
         last_seq: &mut u64,
@@ -9080,74 +9396,52 @@ impl Daemon {
             );
             return (ledger, false);
         }
-        let previous_summary = ledger.latest_summary();
-        let mut summary_input = ledger.prefix_before(from_seq);
-        summary_input.extend(ledger.messages_in_range(from_seq, to_seq));
-        let summary = match self
-            .summarize_messages(
-                session_id,
-                summary_input,
-                previous_summary.as_deref(),
-                tools,
-            )
-            .await
-        {
-            Ok(summary) => summary,
-            Err(err) => {
-                eprintln!("eixd: auto-compaction skipped: {err:#}");
-                return (ledger, false);
-            }
+        let request = CompactionRequest {
+            manual: false,
+            force,
+            keep,
+            from_seq: Some(from_seq),
+            to_seq: Some(to_seq),
+            summary: None,
+            guidance: None,
+            generate: true,
+            turn_id: Some(turn_id.to_string()),
+            tools: tools.to_vec(),
         };
-        // A summary that barely shrinks the history would cost a provider call
-        // every round while freeing almost nothing, so keep the history and let
-        // trimming handle it. Tiny ranges are exempt: there the summary is
-        // dominated by fixed prose, and tests exercise exact compaction on them.
-        const MIN_SHRINK_TOKENS: usize = 256;
-        let summary_tokens = crate::context::estimate_tokens(&summary);
-        if tokens >= MIN_SHRINK_TOKENS && summary_tokens * 10 >= tokens * 9 {
-            eprintln!(
-                "eixd: auto-compaction skipped: summary ({summary_tokens} tokens) does not \
-                 shrink {tokens} tokens of history"
-            );
-            return (ledger, false);
+        if !wait {
+            // Fire and forget: the summary runs beside the turn, and the next
+            // round refreshes events and reloads a smaller ledger. This is the
+            // normal path, so a provider summary never stalls the model.
+            self.request_compaction(session_id, request);
+            return (ledger, true);
         }
-        let summary = self
-            .plugins
-            .run_compact_after(session_id, turn_id, &summary)
-            .await;
-        let event = match self.store.append_event(
-            session_id,
-            EventKind::ContextCompacted,
-            payload(&ContextCompactedPayload {
-                from_seq,
-                to_seq,
-                messages,
-                tokens,
-                summary,
-                rolling: true,
-            }),
-        ) {
-            Ok(event) => event,
+        // Context-length recovery has no next loop: apply it before retrying.
+        match self.run_compaction(session_id, request).await {
+            Ok(true) => {}
+            Ok(false) => {
+                // A background summary may have landed while this request was
+                // waiting, in which case the range now overlaps. Reload before
+                // declaring failure so its smaller ledger can be retried.
+                if let Err(err) = self.refresh_turn_events(session_id, events, last_seq).await {
+                    eprintln!("eixd: auto-compaction event refresh failed: {err:#}");
+                    return (ledger, false);
+                }
+                match self
+                    .build_ledger_from_events(session_id, tools, events, static_context)
+                    .await
+                {
+                    Ok(rebuilt) if rebuilt.info().total_tokens < ledger.info().total_tokens => {
+                        self.emit_context(session_id, &rebuilt);
+                        return (rebuilt, true);
+                    }
+                    _ => return (ledger, false),
+                }
+            }
             Err(err) => {
                 eprintln!("eixd: auto-compaction skipped: {err:#}");
                 return (ledger, false);
             }
-        };
-        self.emit_event(&event);
-        // The summary freed room; a reduced tool-output cap from an earlier
-        // prune would keep new results unnecessarily small.
-        self.clear_tool_output_cap(session_id);
-        self.emit_value(
-            "context.compacted",
-            json!({
-                "session_id": session_id,
-                "from_seq": from_seq,
-                "to_seq": to_seq,
-                "messages": messages,
-                "tokens": tokens,
-                "auto": true,
-            }),
-        );
+        }
         if let Err(err) = self.refresh_turn_events(session_id, events, last_seq).await {
             eprintln!("eixd: auto-compaction event refresh failed: {err:#}");
             return (ledger, true);

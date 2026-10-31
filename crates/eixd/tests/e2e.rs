@@ -1339,17 +1339,24 @@ async fn context_compact_can_generate_a_summary() -> anyhow::Result<()> {
     wait_turn(&mut client).await?;
 
     // No from/to: compact everything that is still in the context. No summary:
-    // ask the provider.
-    let compacted: eix_core::ContextLedgerResult = client
+    // ask the provider. The RPC only acknowledges the request; the summary is
+    // appended when the background task finishes.
+    let accepted: eix_core::ContextCompactResult = client
         .request(
             "context.compact",
-            json!({"session_id": session_id, "generate": true}),
+            json!({
+                "session_id": session_id,
+                "generate": true,
+                // `/compact <notes>` steers the summary instead of replacing
+                // it with literal text.
+                "guidance": "keep the database migration details",
+            }),
         )
         .await?;
-    assert!(compacted
-        .entries
-        .iter()
-        .any(|entry| entry.id.starts_with('c')));
+    assert!(accepted.accepted);
+    let compacted = wait_notification(&mut client, "context.compacted").await?;
+    assert_eq!(compacted["session_id"], session_id);
+    assert_eq!(compacted["auto"], false);
 
     client
         .request::<SubmitResult>(
@@ -1365,6 +1372,13 @@ async fn context_compact_can_generate_a_summary() -> anyhow::Result<()> {
     assert!(summary_request["messages"]
         .to_string()
         .contains("Summarize the conversation"));
+    assert!(
+        summary_request["messages"]
+            .to_string()
+            .contains("keep the database migration details"),
+        "guidance steers the summary: {}",
+        summary_request["messages"]
+    );
     let follow_up: Value = serde_json::from_str(&bodies[2])?;
     let text = follow_up["messages"].to_string();
     assert!(
@@ -1376,6 +1390,75 @@ async fn context_compact_can_generate_a_summary() -> anyhow::Result<()> {
         !text.contains("long discussion"),
         "old turn was compacted: {text}"
     );
+
+    daemon.abort();
+    mock.abort();
+    let _ = tokio::fs::remove_dir_all(&dir).await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn context_compact_is_accepted_while_a_turn_is_running() -> anyhow::Result<()> {
+    let dir = temp_dir("compact-busy");
+    std::fs::create_dir_all(&dir)?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let mock = tokio::spawn(mock_provider_delayed(
+        listener,
+        Arc::new(Mutex::new(Vec::<String>::new())),
+        Duration::from_millis(500),
+    ));
+
+    let mut config = Config::default();
+    config.default_provider_mut().base_url = format!("http://{addr}/v1");
+    config.default_provider_mut().model = "mock-model".to_string();
+    config.default_provider_mut().api_key = None;
+    config.provider_runtime.timeout_secs = 30;
+
+    let socket = dir.join("eix.sock");
+    let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
+    let mut client = connect(&socket).await?;
+    let created: SessionResult = client
+        .request(
+            "session.create",
+            json!({"name": "compact-busy", "cwd": dir}),
+        )
+        .await?;
+    let session_id = created.session.id.clone();
+
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "long discussion"}),
+        )
+        .await?;
+
+    // The turn is still waiting on the provider. Compaction must accept the
+    // request rather than returning `busy`; the summary runs in the
+    // background.
+    let accepted: eix_core::ContextCompactResult = client
+        .request(
+            "context.compact",
+            json!({"session_id": session_id, "generate": true}),
+        )
+        .await?;
+    assert!(accepted.accepted);
+
+    let mut completed = false;
+    let mut compacted = false;
+    while !(completed && compacted) {
+        let notification = client.next_notification().await?;
+        match notification.method.as_str() {
+            "turn.completed" => {
+                assert_eq!(notification.params["turn_id"], submitted.turn_id);
+                assert!(notification.params["error"].is_null());
+                completed = true;
+            }
+            "context.compacted" => compacted = true,
+            _ => {}
+        }
+    }
 
     daemon.abort();
     mock.abort();
@@ -2515,6 +2598,16 @@ async fn btw_answers_without_touching_the_log() -> anyhow::Result<()> {
     mock.abort();
     let _ = tokio::fs::remove_dir_all(&dir).await;
     Ok(())
+}
+
+/// Wait for a specific bus notification, discarding unrelated ones.
+async fn wait_notification(client: &mut TestClient, method: &str) -> anyhow::Result<Value> {
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == method {
+            return Ok(notification.params);
+        }
+    }
 }
 
 async fn wait_turn(client: &mut TestClient) -> anyhow::Result<String> {
@@ -7441,6 +7534,7 @@ async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Resul
         .await?;
     let session_id = created.session.id.clone();
 
+    let mut compacted = None;
     for text in ["one", "two", "three"] {
         let submitted: SubmitResult = client
             .request(
@@ -7450,6 +7544,9 @@ async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Resul
             .await?;
         loop {
             let notification = client.next_notification().await?;
+            if notification.method == "context.compacted" {
+                compacted = Some(notification.params.clone());
+            }
             if notification.method == "turn.completed"
                 && notification.params["turn_id"] == submitted.turn_id.as_str()
             {
@@ -7458,44 +7555,98 @@ async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Resul
             }
         }
     }
+    // The summary runs beside the turn, so it may finish after the last
+    // `turn.completed`. Wait for the completion notification instead of
+    // assuming it already landed.
+    while compacted.is_none() {
+        let notification = client.next_notification().await?;
+        if notification.method == "context.compacted" {
+            compacted = Some(notification.params);
+        }
+    }
+    let compacted = compacted.expect("auto compaction notification");
+    assert_eq!(compacted["auto"], true);
+    assert_eq!(compacted["messages"], 2);
 
     let attached: AttachResult = client
         .request("session.attach", json!({"session_id": session_id}))
         .await?;
-    let compacted = attached
+    let event = attached
         .events
         .iter()
         .find(|event| event.kind == EventKind::ContextCompacted)
         .expect("auto compaction event");
-    assert_eq!(compacted.payload["messages"], 2);
     // The stored summary carries an explicit continuation prefix so the next
     // model does not restart completed work.
-    let summary_text = compacted.payload["summary"].as_str().expect("summary");
+    let summary_text = event.payload["summary"].as_str().expect("summary");
     assert!(
         summary_text.contains("Another model started this task"),
         "{summary_text}"
     );
     assert!(summary_text.ends_with("Hello from mock"), "{summary_text}");
 
+    // The next turn rebuilds its ledger from the event log and must load the
+    // summary that the previous turn queued in the background.
+    let submitted: SubmitResult = client
+        .request(
+            "prompt.submit",
+            json!({"session_id": session_id, "text": "four"}),
+        )
+        .await?;
+    loop {
+        let notification = client.next_notification().await?;
+        if notification.method == "turn.completed"
+            && notification.params["turn_id"] == submitted.turn_id.as_str()
+        {
+            assert!(notification.params["error"].is_null());
+            break;
+        }
+    }
+
     let bodies = bodies.lock().await;
-    assert_eq!(bodies.len(), 4, "three turns plus one summary");
-    let summary: Value = serde_json::from_str(&bodies[2])?;
-    assert!(summary["messages"]
+    let parsed: Vec<Value> = bodies
+        .iter()
+        .map(|body| serde_json::from_str(body))
+        .collect::<Result<_, _>>()?;
+    let summary = parsed
+        .iter()
+        .find(|body| {
+            body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["content"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("Summarize the conversation")
+                })
+            })
+        })
+        .expect("summary request");
+    assert!(summary["messages"].to_string().contains("one"));
+    let fourth = parsed
+        .iter()
+        .find(|body| {
+            body["messages"].as_array().is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message["role"] == "user"
+                        && message["content"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .contains("four")
+                })
+            })
+        })
+        .expect("fourth turn request");
+    assert!(fourth["messages"]
         .as_array()
         .unwrap()
         .iter()
-        .any(|message| message["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("Summarize the conversation")));
-    let third: Value = serde_json::from_str(&bodies[3])?;
-    assert!(third["messages"].as_array().unwrap().iter().any(|message| {
-        message["role"] == "system"
-            && message["content"]
-                .as_str()
-                .unwrap_or_default()
-                .contains("[compacted 2 messages")
-    }));
+        .any(|message| {
+            message["role"] == "system"
+                && message["content"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("[compacted 2 messages")
+        }));
 
     daemon.abort();
     mock.abort();

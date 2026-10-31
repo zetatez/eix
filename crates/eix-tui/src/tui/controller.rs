@@ -427,10 +427,11 @@ pub enum Event {
     Reset {
         session_id: String,
     },
-    Compacted {
+    /// `/compact` was accepted; the summary and trimmed ledger follow as
+    /// `context.compacted` / `session.event` notifications.
+    CompactionStarted {
         session_id: String,
-        entries: usize,
-        tokens: usize,
+        merged: bool,
     },
     BtwStarted {
         session_id: String,
@@ -809,20 +810,17 @@ async fn dispatch(
                     "context.compact",
                     json!({
                         "session_id": session_id,
-                        "summary": notes,
+                        "guidance": notes,
                         "generate": true,
                     }),
                 )
                 .await?;
-            let ledger: eix_core::ContextLedgerResult = decode(value)?;
-            let entries = ledger.entries.len();
-            let tokens = ledger.total_tokens;
+            let result: eix_core::ContextCompactResult = decode(value)?;
             send(
                 events,
-                Event::Compacted {
+                Event::CompactionStarted {
                     session_id,
-                    entries,
-                    tokens,
+                    merged: result.merged,
                 },
             )
         }

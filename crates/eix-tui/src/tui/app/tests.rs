@@ -4716,6 +4716,7 @@ fn colorscheme_command_opens_picker_and_escape_restores() {
     assert!(app.theme_picker_backup.is_some());
 
     app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+    app.tick(&tx);
     assert_ne!(app.theme.preset, Some("dark-github"));
     app.handle_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
     assert!(app.picker.is_none());
@@ -4793,6 +4794,7 @@ fn theme_background_paints_panes_and_dialogs() {
     app.theme = Theme::default();
     app.open_picker(PickerKind::Themes, &tx);
     app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+    app.tick(&tx);
     let first = eix_core::THEME_PRESETS[0].name;
     assert_eq!(app.theme.preset, Some(first));
     terminal.draw(|frame| app.draw(frame)).unwrap();
@@ -4811,6 +4813,7 @@ fn theme_picker_enter_commits_the_preview() {
     let mut app = App::new(None);
     app.open_picker(PickerKind::Themes, &tx);
     app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+    app.tick(&tx);
     let first = eix_core::THEME_PRESETS[0].name;
     assert_eq!(app.theme.preset, Some(first));
 
@@ -4820,6 +4823,48 @@ fn theme_picker_enter_commits_the_preview() {
     assert_eq!(app.theme_config.preset.as_deref(), Some(first));
     assert_eq!(app.theme.preset, Some(first));
     assert!(app.status.contains(&format!("colorscheme → {first}")));
+}
+
+#[test]
+fn theme_preview_waits_for_the_tick_so_a_held_key_reflows_once() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.open_picker(PickerKind::Themes, &tx);
+    let original = app.theme;
+
+    // Rapid navigation must not repaint the transcript per row.
+    for _ in 0..5 {
+        app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+    }
+    assert_eq!(app.theme, original);
+    assert!(app.theme_preview.is_some());
+
+    app.tick(&tx);
+    let landed = app.picker.as_ref().expect("picker open").selected;
+    let expected = theme_picker_items()[landed].value.clone();
+    assert_eq!(
+        app.theme.preset,
+        (expected != THEME_DEFAULT_VALUE).then_some(expected.as_str())
+    );
+    assert!(app.theme_preview.is_none());
+}
+
+#[test]
+fn cancelled_theme_preview_leaves_no_staged_palette() {
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut app = App::new(None);
+    app.theme_config.preset = Some("dark-nord".into());
+    app.theme = Theme::from_config(&app.theme_config);
+    app.open_picker(PickerKind::Themes, &tx);
+    app.handle_picker_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &tx);
+
+    app.handle_picker_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &tx);
+    assert!(app.theme_preview.is_none());
+    assert_eq!(app.theme.preset, Some("dark-nord"));
+
+    // A later tick must not resurrect the abandoned preview.
+    app.tick(&tx);
+    assert_eq!(app.theme.preset, Some("dark-nord"));
 }
 
 #[test]

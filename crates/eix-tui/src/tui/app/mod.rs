@@ -2260,6 +2260,10 @@ pub struct App {
     /// Palette/config captured when the theme picker opened. Esc restores it;
     /// Enter keeps the previewed selection.
     theme_picker_backup: Option<(eix_core::ThemeConfig, Theme)>,
+    /// Colorscheme under the picker cursor, applied on the next tick. Every
+    /// theme change re-renders the whole transcript, so a held arrow key must
+    /// not pay that cost once per row.
+    theme_preview: Option<Theme>,
     /// Transcript-mode key overrides from `[keys]`.
     pub(crate) keybinds: Keybinds,
     /// When the previous `Esc` reached the prompt, for the double-Esc

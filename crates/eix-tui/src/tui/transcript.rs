@@ -671,8 +671,7 @@ impl HistoryCache {
             .iter()
             .map(|collected| block_key(&collected.block, collected.rev, folds, subagents_rev))
             .collect();
-        let mut common = if width != self.width || theme != self.theme || math_rev != self.math_rev
-        {
+        let mut common = if width != self.width || theme != self.theme {
             0
         } else {
             let mut common = 0;
@@ -681,6 +680,15 @@ impl HistoryCache {
                 && self.keys[common] == keys[common]
             {
                 common += 1;
+            }
+            // A formula that just became drawable only changes the block that
+            // held its placeholder. Replaying the whole transcript once per
+            // finished image is what makes a session with several formulas
+            // stutter, so rebuild from that block onward and keep the prefix.
+            if math_rev != self.math_rev {
+                if let Some(first) = self.earliest_pending_block() {
+                    common = common.min(first);
+                }
             }
             common
         };
@@ -723,6 +731,22 @@ impl HistoryCache {
         self.subagents_rev = subagents_rev;
         self.folds = folds.clone();
         self.math_rev = math_rev;
+    }
+
+    /// Index of the first block that still shows a formula placeholder. The
+    /// pending list is line-ordered, so its first entry names the earliest
+    /// block a finished compile can change.
+    fn earliest_pending_block(&self) -> Option<usize> {
+        let first = self.math_pending.first()?.line;
+        let mut block = 0;
+        while self
+            .starts
+            .get(block + 1)
+            .is_some_and(|&start| start <= first)
+        {
+            block += 1;
+        }
+        Some(block)
     }
 }
 

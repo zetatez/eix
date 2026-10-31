@@ -891,6 +891,29 @@ pub struct ContextCompactParams {
     /// mechanical placeholder. Used by the `/compact` command.
     #[serde(default)]
     pub generate: bool,
+    /// Extra instructions for the summary model, for example
+    /// `/compact keep the migration details`. This steers the summary; it does
+    /// not replace the conversation, unlike `summary`.
+    #[serde(default)]
+    pub guidance: Option<String>,
+}
+
+/// Acknowledgement for `context.compact`. Compaction runs in the background;
+/// the trimmed ledger and the generated summary arrive as `context.compacted`
+/// and `session.event` notifications once the model call finishes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextCompactResult {
+    pub session_id: SessionId,
+    pub accepted: bool,
+    /// An already running compaction absorbed this request instead of starting
+    /// a second provider call. The merged request runs when the current one
+    /// finishes.
+    #[serde(default)]
+    pub merged: bool,
+    pub from_seq: u64,
+    pub to_seq: u64,
+    pub messages: usize,
+    pub tokens: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
