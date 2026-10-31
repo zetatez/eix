@@ -1,174 +1,192 @@
-# eix 插件体系设计（v2）
+# eix plugin system design (v2)
 
-- 状态：v2 内核、hooks、UI 视图树、插件间 RPC、细粒度 allowlist、生命周期管理、打包/验签/lockfile、Python/TS SDK 均已实现；WASM 与 hosted 运行时仍是后续里程碑
-- 原生 dylib 扩展：见 [`plugin-dylib.md`](plugin-dylib.md)（P1 已落地：`DylibBackend` 加载器 + `describe` / `tool.call` / `command.run`）
-- 适用范围：`eixd`（host）、`eix-core`（协议与 manifest/打包）、`eix-tui`（UI 贡献的渲染端与 CLI）
-- 关联实现：`crates/eix-core/src/plugin.rs`、`crates/eix-core/src/plugin_package.rs`、`crates/eixd/src/plugin/`、`crates/eixd/src/server.rs`、`crates/eix-tui/src/tui/app/`、`crates/eix-tui/src/main.rs`
+- Status: the v2 kernel, hooks, UI view tree, inter-plugin RPC, fine-grained allowlists,
+  lifecycle management, pack/verify/lockfile, and the Python and TypeScript SDKs are implemented. WASM and a
+  hosted runtime remain future milestones.
+- Native dylib extensions: see [`plugin-dylib.md`](plugin-dylib.md). P1 has landed: the `DylibBackend`
+  loader plus `describe`, `tool.call`, and `command.run`.
+- Scope: `eixd` (host), `eix-core` (protocol, manifest, packaging), and `eix-tui` (UI rendering
+  and CLI).
+- Related code: `crates/eix-core/src/plugin.rs`, `crates/eix-core/src/plugin_package.rs`,
+ `crates/eixd/src/plugin/`, `crates/eixd/src/server.rs`, `crates/eix-tui/src/tui/app/`, and
+ `crates/eix-tui/src/main.rs`.
 
-本文描述 eix 插件体系从 v1（外挂工具 + 提示词命令）演进到 v2（贡献点 + hooks + UI + 细粒度授权）的架构、协议、安全边界和落地状态。v1 协议与 manifest 已废弃，不保留兼容层。
+This document describes how the eix plugin system moved from v1 (sidecar tools plus prompt
+commands) to v2 (contribution points, hooks, UI, and fine-grained authorization): architecture,
+protocol, security boundaries, and implementation status. The v1 protocol and manifest are gone,
+with no compatibility layer.
 
-## 0. 当前实现状态
+## 0. Current implementation status
 
-已落地：
+Implemented:
 
-| 能力       | 实现                                                                                                   |
-| ---        | ---                                                                                                    |
-| Manifest   | `schema = 2`、`api_version = 2`、`[components.server]` / `[components.ui]` / `[components.dylib]`、`abi`、`[[contributes.commands]]`、`[package]` |
-| 原生 dylib | `ExtensionBackend` + `DylibBackend`；`describe` / `tool.call` / `command.run` / `hook.run` / `rpc.call` 已接入，与进程插件共用注册表 |
-| 协议       | JSON-RPC 2.0 over NDJSON；`initialize`、`tools/call`、`commands/run`、`hooks/run`、`rpc.call`、host 反向请求、通知 |
-| 多路复用   | writer task + reader task + 每请求 oneshot；超时发送 `$/cancel`                                        |
-| 注册表     | tools / commands / events / hooks / ui / rpc；启动时做命名空间与能力校验                               |
-| 生命周期   | `disabled` / `starting` / `ready` / `degraded` / `failed` / `stopped`；连续 3 次后端失败进入 `degraded`，成功一次恢复；`lazy` 惰性启动、崩溃退避重启、按配置 diff 的 reload |
-| Host API   | `host.log/info/ping`、`storage.*`、`fs.*`、`net.request`、`secrets.get`、`session.*`、`ui.*`、`notify`、`rpc.call`、`blob.*`、`job.*` |
-| Hooks      | `tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end`，按 priority + 插件名排序                  |
-| Action 命令 | manifest 或运行时 `commands` 的 `action`；host 调用 `commands/run`，可返回 prompt 或文本输出          |
-| 声明式插件 | 仅含 `[[contributes.commands]]` 的包不启动进程                                                         |
-| 工具结果   | content blocks（text/image/resource/diff/json）+ `structured` + `is_error`                             |
-| Settings   | manifest `settings = "schema.json"` 必须是包内、`type: object`、≤256 KiB；`plugin.settings.set` 校验后写回配置并通知插件 |
-| UI 视图树  | `ui/render` / `ui/action` / `ui/pick`；`UiNode` 支持 text/markdown/heading/divider/list/table/form/actions/picker/group；TUI 渲染进文本 overlay 并给出 `/plugins act` 提示 |
-| 可观测性   | 每插件 500 行日志 ring buffer、`plugin.logs {name, since, limit}`、`plugin.logs.clear`、`plugin.doctor`；TUI `/plugins logs|doctor` 与 statusline 健康标记 |
-| 分发       | `eix plugin pack/verify/install/update/uninstall/trust/untrust`；detached Ed25519 + SHA-256 checksums、`plugins.lock`、`require_signature`、`min_host_version`、`target`/`artifact` |
-| SDK        | `eix-plugin-sdk`（Rust）、`sdks/python`、`sdks/typescript`；`sdks/conformance/run.py` 做协议一致性测试 |
-| 示例       | `examples/plugins/echo/` 已迁移到 v2，并演示 action 命令                                               |
+| Capability | Implementation |
+| --- | --- |
+| Manifest | `schema = 2`, `api_version = 2`, `[components.server]` / `[components.ui]` / `[components.dylib]`, `abi`, `[[contributes.commands]]`, `[package]` |
+| Native dylib | `ExtensionBackend` plus `DylibBackend`; `describe`, `tool.call`, `command.run`, `hook.run`, and `rpc.call` are wired in and share the registry with process plugins |
+| Protocol | JSON-RPC 2.0 over NDJSON; `initialize`, `tools/call`, `commands/run`, `hooks/run`, `rpc.call`, host reverse requests, notifications |
+| Multiplexing | Writer task, reader task, one oneshot per request; `$/cancel` on timeout |
+| Registry | tools, commands, events, hooks, ui, rpc; namespace and capability checks at startup |
+| Lifecycle | `disabled` / `starting` / `ready` / `degraded` / `failed` / `stopped`; three consecutive backend failures enter `degraded` and one success restores `ready`; `lazy` startup, backoff restart, and config-diff reload |
+| Host API | `host.log/info/ping`, `storage.*`, `fs.*`, `net.request`, `secrets.get`, `session.*`, `ui.*`, `notify`, `rpc.call`, `blob.*`, `job.*` |
+| Hooks | `tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end`, ordered by priority then plugin name |
+| Action commands | `action` in a manifest or runtime `commands`; the host calls `commands/run`, which may return a prompt or text output |
+| Declarative plugins | A package containing only `[[contributes.commands]]` never starts a process |
+| Tool results | Content blocks (text/image/resource/diff/json) plus `structured` and `is_error` |
+| Settings | Manifest `settings = "schema.json"` must be in-package, `type: object`, and at most 256 KiB; `plugin.settings.set` validates, writes back, and notifies the plugin |
+| UI view tree | `ui/render`, `ui/action`, `ui/pick`; `UiNode` supports text/markdown/heading/divider/list/table/form/actions/picker/group; the TUI renders into a text overlay and prints a `/plugins act` hint |
+| Observability | 500-line ring buffer per plugin, `plugin.logs {name, since, limit}`, `plugin.logs.clear`, `plugin.doctor`; TUI `/plugins logs|doctor` and a statusline health marker |
+| Distribution | `eix plugin pack/verify/install/update/uninstall/trust/untrust`; detached Ed25519 plus SHA-256 checksums, `plugins.lock`, `require_signature`, `min_host_version`, `target`/`artifact` |
+| SDKs | `eix-plugin-sdk` (Rust), `sdks/python`, `sdks/typescript`; `sdks/conformance/run.py` runs the protocol conformance suite |
+| Example | `examples/plugins/echo/` has been migrated to v2 and demonstrates an action command |
 
-尚未实现：
+Not yet implemented:
 
-- dylib 插件的 host API 覆盖同步安全的 `log/info/ping/notify/storage.*/secrets.get/fs.*/session.*/blob.*`；`net` / `ui` / `rpc` / `jobs` 仍返回 `EIX_ERR_DENIED`，详见 [`plugin-dylib.md`](plugin-dylib.md)。
-- TUI 内直接编辑 settings；`plugin.settings.set` 已可用，TUI 仍只读展示。
-- registry、自动升级、WASM / hosted 运行时。
-
----
-
-## 1. 背景与现状
-
-### 1.1 旧体系（已废弃）
-
-v1 使用 `schema = 1`、`PLUGIN_API_VERSION = 1`、顶层 `[server]`，工具结果只有 `{ok, output: String}`。这些字段与旧 JSON 形状已从代码中删除；当前仓库只接受 schema 2 / API v2，旧 manifest 会在加载时被拒绝。
-
-### 1.2 v2 要解决的问题
-
-已在本次内核中解决：
-
-1. 工具结果表达力弱：现在使用 content blocks、`structured` 和 `is_error`。
-2. 单请求串行：改为 writer/reader task + 每请求 oneshot，请求按 `id` 多路复用。
-3. 事件不可靠且不可配置：现在按 `initialize` 的事件模式过滤订阅，队列满仍是 best-effort。
-
-已在后续里程碑解决：
-
-4. hooks：`tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end` 已接入 turn 与工具管线。
-5. UI 贡献：`panel` / `status` / `picker`、`host.notify`、`UiNode` 视图树与 `ui.render` / `ui.action` / `ui.pick` 已接入 TUI。
-6. 包管理：提供 `pack` / `verify` / `install` / `update` / `uninstall`、SHA-256 checksums、Ed25519 签名、本地 trust store 与 `plugins.lock`。
-7. settings schema：manifest 可声明 JSON Schema，`/plugins <name>` 展示 schema 与当前值。
-8. 能力粒度：fs 限定 workspace，网络与 RPC 使用 allowlist，secrets 按环境变量名授权。
-9. 生命周期：`lazy`、退避重启、按配置 diff 的 reload、ring buffer 日志与 `plugin.doctor`。
-10. 安全：`require_signature`、`min_host_version`、平台 `target`/`artifact`、Linux opt-in sandbox。
-11. SDK：Rust `eix-plugin-sdk`、Python 与 TypeScript SDK，以及共享 conformance harness。
-
-仍需后续里程碑：
-
-12. registry、自动升级与持久化 `plugin_audit`。
-13. WASM / hosted 运行时；TUI 内 settings 编辑。
-14. 项目级插件仍被完全禁止；多 workspace 语义不完整。
+- Host API coverage for dylib plugins is limited to the synchronous-safe surface
+ (`log/info/ping/notify/storage.*/secrets.get/fs.*/session.*/blob.*`); `net`, `ui`, `rpc`, and `jobs` still return
+ `EIX_ERR_DENIED`. See [`plugin-dylib.md`](plugin-dylib.md).
+- Editing settings inside the TUI; `plugin.settings.set` works, but the TUI only displays values.
+- A registry, automatic upgrades, and the WASM or hosted runtime.
 
 ---
 
-## 2. 目标与非目标
+## 1. Background
 
-### 2.1 目标
+### 1.1 The old system (removed)
 
-- 插件可以扩展 eix 的模型工具、命令、prompt/context、审批、文件写入、UI、主题、键位、agent、skill、MCP、provider 和后台任务。
-- 声明式插件零代码可用；需要逻辑时再使用子进程。
-- 所有扩展点共享同一套 manifest、授权模型和注册表。
-- 插件崩溃、卡死、超时不会阻塞 turn 或拖垮 daemon。
-- 权限默认拒绝，授权可细到路径、域名、secret 名和 hook 点。
-- 插件作者有稳定的协议、SDK 和一致性测试。
+v1 used `schema = 1`, `PLUGIN_API_VERSION = 1`, a top-level `[server]` table, and tool results of the form
+`{ok, output: String}`. Those fields and the old JSON shapes have been deleted from the code; the
+repository accepts schema 2 / API v2 only, and an old manifest is rejected at load time.
 
-### 2.2 非目标
+### 1.2 Problems v2 solves
 
-- 不做进程内 `dylib` 插件。ABI 不稳定，崩溃会拖垮 daemon，且需要 `unsafe`。
-- 不让插件直接输出 ANSI 或操作终端。
-- 不允许插件绕过审批、直接批准工具调用或静默改写用户消息。
-- 不假设子进程等于 OS 沙箱。能力模型限制的是 host API，不是操作系统权限。
+Solved in this kernel:
 
-### 2.3 设计原则
+1. Weak tool-result expressiveness: now content blocks, `structured`, and `is_error`.
+2. Serial single-request handling: now writer/reader tasks plus a oneshot per request, multiplexed
+  by `id`.
+3. Unreliable, unconfigurable events: subscriptions are now filtered by the event patterns from
+ `initialize`, though a full queue is still best effort.
 
-1. Kernel stable，contributions flexible：内核只认贡献点和能力，不认具体插件。
-2. Deny by default：未授权的贡献启动失败，而不是静默降级。
-3. 不可静默提权：hook 可以否决、标注、请求重新审批，但不能替 host 批准。
-4. Host-rendered UI：插件提交视图模型，host 负责布局、主题、键位和安全。
-5. 声明优先：命令、技能、agent、主题、MCP 等常见扩展不需要写代码。
-6. 失败隔离 + 确定性：hook 有明确顺序、超时和失败策略。
-7. 零成本缺席：没有插件订阅时，热路径不 clone、不加锁、不 spawn。
-8. 前向兼容：未知 host 方法明确 `unsupported`；未知贡献点不静默执行。
+Solved in later milestones:
+
+4. Hooks: `tool.before` / `tool.after` / `prompt.build` / `turn.stop` / `turn.end` are wired into the turn
+  and tool pipelines.
+5. UI contributions: `panel` / `status` / `picker`, `host.notify`, the `UiNode` view tree, and
+ `ui.render` / `ui.action` / `ui.pick` are wired into the TUI.
+6. Packaging: `pack` / `verify` / `install` / `update` / `uninstall`, SHA-256 checksums, Ed25519 signatures, a local
+  trust store, and `plugins.lock`.
+7. Settings schema: a manifest can declare a JSON Schema, and `/plugins <name>` shows the schema
+  and current values.
+8. Capability granularity: filesystem access is limited to the workspace, network and RPC use
+  allowlists, and secrets are authorized by environment variable name.
+9. Lifecycle: `lazy`, backoff restart, config-diff reload, ring-buffer logs, and `plugin.doctor`.
+10. Security: `require_signature`, `min_host_version`, platform `target`/`artifact`, and an opt-in Linux
+   sandbox.
+11. SDKs: Rust `eix-plugin-sdk`, the Python and TypeScript SDKs, and a shared conformance harness.
+
+Still open:
+
+12. A registry, automatic upgrades, and a persistent `plugin_audit` table.
+13. A WASM or hosted runtime; in-TUI settings editing.
+14. Project-level plugins are still forbidden outright; multi-workspace semantics are incomplete.
 
 ---
 
-## 3. 总体架构
+## 2. Goals and non-goals
+
+### 2.1 Goals
+
+- Plugins can extend model tools, commands, prompt and context handling, approvals, file writes,
+  UI, themes, keybindings, agents, skills, MCP, providers, and background jobs.
+- Declarative plugins work with zero code; reach for a child process only when logic is needed.
+- Every extension point shares one manifest, one authorization model, and one registry.
+- A plugin that crashes, hangs, or times out never blocks a turn or takes down the daemon.
+- Permissions deny by default, and grants can be narrowed to a path, domain, secret name, or hook
+  point.
+- Plugin authors get a stable protocol, SDKs, and a conformance test.
+
+### 2.2 Non-goals
+
+- No in-process `dylib` plugins in the default path. The ABI is unstable, a crash takes the daemon
+  down, and it requires `unsafe`. (dylib support exists but is opt-in and fully trusted; see
+  [`plugin-dylib.md`](plugin-dylib.md).)
+- Plugins never emit ANSI directly or drive the terminal.
+- Plugins cannot bypass approvals, approve tool calls on the user's behalf, or silently rewrite user
+  messages.
+- A child process is not treated as an OS sandbox. The capability model constrains the host API,
+  not operating-system permissions.
+
+### 2.3 Design principles
+
+1. Stable kernel, flexible contributions: the kernel knows contribution points and capabilities,
+  never individual plugins.
+2. Deny by default: an unauthorised contribution fails at startup instead of degrading silently.
+3. No silent privilege escalation: a hook may veto, annotate, or request re-approval, but never
+  approve on the host's behalf.
+4. Host-rendered UI: plugins submit a view model; the host owns layout, theme, keys, and safety.
+5. Declarative first: commands, skills, agents, themes, and MCP need no code.
+6. Failure isolation and determinism: hooks have explicit ordering, timeouts, and failure policy.
+7. Zero cost when absent: with no plugin subscribed, hot paths do not clone, lock, or spawn.
+8. Forward compatible: an unknown host method fails as `unsupported`; an unknown contribution point
+  is never executed silently.
+
+---
+
+## 3. Architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────┐
-│ eixd                                                         │
-│                                                              │
-│  turn / tool / prompt / approval pipeline                    │
-│            │                                                 │
-│            ▼                                                 │
-│  ExtensionRegistry                                           │
-│    tools · commands · hooks · events · ui · themes · ...     │
-│            │                                                 │
-│            ├── builtin contributions                         │
-│            ├── declarative package contributions             │
-│            └── service / ui plugin contributions             │
-│                        │                                     │
-│  CapabilityGateway ────┘                                     │
-│    fs · network · secrets · storage · rpc · ui               │
-│                        │                                     │
-│  PluginHost (process per plugin, JSON-RPC, multiplexed)      │
-│  DylibHost  (in-process cdylib, ABI v1 dispatch)             │
-└────────────────────────┬─────────────────────────────────────┘
-                         │ stdio / JSON-RPC 2.0
-          ┌──────────────┼──────────────┐
-          ▼              ▼              ▼
-      server         ui component    declarative
-      component      (view model)     (no process)
+eixd
+   turn / tool / prompt / approval pipeline
+   ExtensionRegistry
+    tools · commands · hooks · events · ui · themes · rpc · jobs
+     builtin contributions
+     declarative package contributions
+     service / ui plugin contributions
+   CapabilityGateway
+    fs · network · secrets · storage · rpc · ui
+   PluginHost (one process per plugin, JSON-RPC, multiplexed)
+   DylibHost (in-process cdylib, ABI v1 dispatch)
 ```
 
-### 3.1 四种插件形态
+### 3.1 Four plugin forms
 
-| 形态 | 是否需要进程 | 适合场景 | 能力 |
+| Form | Needs a process | Good for | Capabilities |
 | --- | --- | --- | --- |
-| 服务（Service） | 是 | 工具、hooks、事件、RPC、网络、文件、secret、后台任务 | host API |
-| 原生（Dylib） | 否（加载进 `eixd`） | 性能敏感的工具/命令、first-party 深度扩展 | ABI v1 + 同步 host API |
-| UI（UI） | 是 | 文本 panel / status / picker、通知、视图树 | 声明式表面 + `UiNode` |
-| 声明式（Declarative） | 否 | 命令、skill、agent、主题、键位、MCP server、权限规则 | 静态贡献 |
+| Service | yes | Tools, hooks, events, RPC, network, files, secrets, background work | Host API |
+| Native (dylib) | no (loaded into `eixd`) | Performance-sensitive tools and commands, first-party deep extensions | ABI v1 plus the synchronous host API |
+| UI | yes | Text panels, status, pickers, notifications, view trees | Declarative surfaces plus `UiNode` |
+| Declarative | no | Commands, skills, agents, themes, keybindings, MCP servers, permission rules | Static contributions |
 
-一个包可以同时包含声明式、server / dylib 和 ui 三类贡献，共用同一个 manifest 和授权。`components.server` 与 `components.dylib` 互斥；本版不会为 `[components.ui]` 单独启动进程，UI 文本表面来自 server 组件的 `initialize.ui` 与 `host.ui.*`。
+A single package may contain declarative, server/dylib, and UI contributions, all sharing one
+manifest and one authorization. `components.server` and `components.dylib` are mutually exclusive.
+This version never starts a separate process for `[components.ui]`; UI text surfaces come from the
+server component's `initialize.ui` and `host.ui.*`.
 
-dylib 是**完全可信代码**：它在 daemon 地址空间内运行，崩溃会带崩 daemon，能力系统只约束 `host.*` 调用，不能阻止插件直接使用 `libc`。设计细节见 [`plugin-dylib.md`](plugin-dylib.md)。
+A dylib is **fully trusted code**: it runs in the daemon's address space, a crash takes the daemon
+with it, and the capability system only constrains `host.*` calls, not direct `libc` use. See
+[`plugin-dylib.md`](plugin-dylib.md).
 
-### 3.2 统一注册表
+### 3.2 One registry
 
-`ExtensionRegistry` 在插件启动时把 manifest 和握手结果解析成 host 侧的强类型结构：
-
-- 热路径只做查表，不在每次调用时解析 JSON 或检查 manifest。
-- 贡献冲突在启动时发现：命名空间冲突、schema 非法、能力未授权。
-- 插件退出时按 `plugin` 字段整体移除其贡献，不影响其他插件。
-
-当前 `PluginManager` 已维护 `tools` / `commands` / `subscriptions` / `statuses` 表；进程插件与 dylib 插件都注册进同一张表。实际调用经 `ExtensionBackend` trait 分发：`ProcessBackend`（JSON-RPC 子进程）与 `DylibBackend`（ABI v1 进程内）只是同一 trait 的两种实现，TUI 和 turn 管线不需要感知 backend 类型。
+The registry is strongly typed and indexed by kind. Built-in features and plugins are treated
+identically, which is what makes the dylib backend feel native: same registry, same permission
+checks, same hook routing, same UI model.
 
 ---
 
-## 4. 包与 Manifest
+## 4. Packages and manifests
 
-### 4.1 目录布局
+### 4.1 Directory layout
+
+A package is a directory containing `eix-plugin.toml`, an optional settings schema, and either a
+server entry point or a dylib:
 
 ```text
-acme/
-  eix-plugin.toml
-  server.py
-  ui.py
-  settings.schema.json
-  skills/review/SKILL.md
-  agents/triage.toml
+plugins/acme/
+   eix-plugin.toml
+   settings.schema.json
+   libacme.so
 ```
 
 ### 4.2 Manifest v2
@@ -177,109 +195,102 @@ acme/
 schema = 2
 name = "acme"
 version = "2.1.0"
-description = "Issue tracking and review helpers"
-api_version = 2              # 整数；必须等于 host 的 PLUGIN_API_VERSION
-min_host_version = "0.9.0"   # 记录但不强制
+description = "Issue cache integration"
+api_version = 2
+capabilities = ["tools", "commands", "hooks", "storage"]
 
-capabilities = [
-  "tools", "commands", "events", "hooks", "ui", "rpc", "jobs",
-  "workspace_read", "network", "secrets", "storage",
-]
-
-# 可选：设置表单 schema；必须是包内相对路径、JSON object、≤256 KiB。
-settings = "settings.schema.json"
+# Optional: a settings form schema; must be an in-package relative path, a JSON object, <=256 KiB.
+# settings = "settings.schema.json"
 
 [components.server]
 command = "python3"
-entry = "server.py"
+args = ["server.py"]
 
-# 原生 dylib 与 components.server 互斥；二选一。
+# A native dylib and components.server are mutually exclusive; pick one.
 # abi = 1
 # [components.dylib]
 # path = "libacme.so"
 
-# UI 组件当前只作为打包声明；文本表面由 server 组件的 initialize.ui 提供。
-[components.ui]
-command = "python3"
-entry = "ui.py"
+# UI components are packaging declarations only for now; text surfaces come from the server
+# component's initialize.ui.
+# [components.ui]
+# entry = "ui.json"
 
-# 可选：分发元数据。`eix plugin pack` 生成 checksums，签名文件覆盖它。
-[package]
-publisher = "acme"
-signature = "eix-plugin.sig"
-checksums = "eix-plugin.sums"
+# Optional: distribution metadata. `eix plugin pack` generates checksums, and the signature covers it.
+# [package]
+# publisher = "acme"
+# signature = "eix-plugin.sig"
+# checksums = "eix-plugin.sums"
 
-[[contributes.commands]]
-name = "triage"
-description = "Triage the current issue"
-prompt = "Read the issue and propose a plan. $ARGUMENTS"
-
-# action 命令需要 server 组件；前端调用 plugin.command.run。
 [[contributes.commands]]
 name = "sync"
 description = "Sync the issue cache"
+args = "[--full]"
+# action commands need a server component; the frontend calls plugin.command.run.
 action = "sync"
 ```
 
-去掉 `hooks` / `rpc` / `jobs` 等能力后仍是合法 manifest；当前支持的能力集合见第 6 节。
+### 4.3 Compatibility policy
 
-本版解析 `contributes.commands`；`skills`、`mcp_servers`、`themes`、`keymaps` 等贡献点仍按第 5 节规划。
+- Only `schema = 2` is accepted; a v1 manifest without `schema` or `api_version` is refused.
+- Only `[components.server]`, `[components.ui]`, and `[components.dylib]` are recognised; a top-level
+  `[server]` is not.
+- `components.dylib` and `components.server` are mutually exclusive; a dylib package declares `abi`
+  and defaults to 1 when omitted.
+- `[components.ui]` is a packaging declaration only; without a server component no UI process is
+  started.
+- Unknown fields are ignored by serde; unknown contribution points are not parsed.
+- A purely declarative package (only `contributes.commands`) may omit server, UI, and dylib
+  components. Action commands are the exception and require a server or dylib.
 
-### 4.3 兼容策略
-
-- 只接受 `schema = 2`；缺少 `schema` 或 `api_version` 的 v1 manifest 拒绝加载。
-- 只识别 `[components.server]` / `[components.ui]` / `[components.dylib]`；顶层 `[server]` 不再识别。
-- `components.dylib` 与 `components.server` 互斥；dylib 包使用 `abi` 声明 ABI 版本，缺省按 1 处理。
-- `[components.ui]` 目前只作为打包声明；没有 server 组件时不会启动 UI 进程。
-- 未知字段由 serde 忽略，未知贡献点暂不解析。
-- 仅声明式（只有 `contributes.commands`）的包允许没有 server / ui / dylib 组件；action 命令除外，它必须有 server 或 dylib。
-
-### 4.4 从 v1 迁移
+### 4.4 Migrating from v1
 
 | v1 | v2 |
 | --- | --- |
-| 顶层 `[server]` | `[components.server]` |
-| 省略 `schema` / `api_version = 1` | `schema = 2` / `api_version = 2` |
-| `{id, result}` / `{id, error: {code: "..."} }` | 增加 `"jsonrpc": "2.0"`；错误码为整数 |
-| `tools/call` 返回 `{ok, output}` | 返回 `{ok, content: [{"type":"text","text":...}], is_error?}` |
-| 只能握手返回命令 | 也可在 `[[contributes.commands]]` 静态声明 |
-| 单请求串行 | 响应按 `id` 关联，可并发 |
+| Top-level `[server]` | `[components.server]` |
+| No `schema` / `api_version = 1` | `schema = 2` / `api_version = 2` |
+| `{id, result}` / `{id, error: {code: "..."}}` | Add `"jsonrpc": "2.0"`; error codes are integers |
+| `tools/call` returning `{ok, output}` | Returns `{ok, content: [{"type":"text","text":"..."}], is_error?}` |
+| Commands only from the handshake | Also statically declared in `[[contributes.commands]]` |
+| Serial requests | Responses are correlated by `id` and may be concurrent |
 
 ---
 
-## 5. 贡献点
+## 5. Contribution points
 
-| 贡献点 | 形态 | 能力 | 说明 |
+| Point | Form | Capability | Notes |
 | --- | --- | --- | --- |
-| `tools` | 服务 | `tools` | 模型工具，暴露为 `plugin__<plugin>__<tool>` |
-| `commands` | 声明/服务 | `commands` | prompt 模板和 action 命令 |
-| `hooks` | 服务 | `hooks` | 管线拦截，见第 7 节 |
-| `events` | 服务 | `events` | 只读通知订阅 |
-| `ui.views` | 服务 | `ui` | 自定义 pane / overlay |
-| `ui.pickers` | 服务/声明 | `ui` | 统一 Picker 的 provider |
-| `ui.status` | 服务 | `ui` | statusline 片段 |
-| `ui.settings` | 声明 | — | 由 JSON Schema 生成表单 |
-| `themes` | 声明 | — | 颜色 token，不可覆盖内置名 |
-| `keymaps` | 声明 | — | 命名空间动作 `plugin.<name>.*` |
-| `agents` | 声明 | `agents` | prompt + 工具集 + 模型偏好 |
-| `skills` | 声明 | `skills` | `SKILL.md` |
-| `mcp_servers` | 声明 | — | 复用现有 MCP |
-| `providers` | 声明/服务 | `network`/`secrets` | 先声明式 OpenAI-compatible，后 adapter |
-| `jobs` | 服务 | `jobs` | 定时/后台任务 |
-| `rpc` | 服务 | `rpc` | 暴露给其他插件的 RPC 方法 |
+| `tools` | Service | `tools` | Model tools, exposed as `plugin__<plugin>__<tool>` |
+| `commands` | Declarative/service | `commands` | Prompt templates and action commands |
+| `hooks` | Service | `hooks` | Pipeline interception, see section 8 |
+| `events` | Service | `events` | Read-only notification subscription |
+| `ui.views` | Service | `ui` | Custom panes and overlays |
+| `ui.pickers` | Service/declarative | `ui` | Providers for the unified picker |
+| `ui.status` | Service | `ui` | Statusline fragments |
+| `ui.settings` | Declarative | — | Form generated from JSON Schema |
+| `themes` | Declarative | — | Colour tokens; built-in names cannot be overridden |
+| `keymaps` | Declarative | — | Namespaced actions `plugin.<name>.*` |
+| `agents` | Declarative | `agents` | Prompt, tool set, model preference |
+| `skills` | Declarative | `skills` | `SKILL.md` |
+| `mcp_servers` | Declarative | — | Reuses the existing MCP client |
+| `providers` | Declarative/service | `network`/`secrets` | Declarative OpenAI-compatible first, adapters later |
+| `jobs` | Service | `jobs` | Scheduled and background work |
+| `rpc` | Service | `rpc` | RPC methods exposed to other plugins |
 
-本版实现 `tools`、`commands`、`events`、`hooks`、文本 `ui` 和 `rpc`。`themes`、`keymaps`、`agents`、`skills`、`mcp_servers`、`providers`、`jobs` 的贡献声明仍保留在设计中；`jobs` 目前通过 host API 注册，不从 manifest 静态声明。
+This version implements `tools`, `commands`, `events`, `hooks`, text `ui`, and `rpc`. The declarations for
+`themes`, `keymaps`, `agents`, `skills`, `mcp_servers`, `providers`, and `jobs` remain design-only; `jobs`
+are registered through the host API rather than declared statically.
 
-### 5.1 命名与冲突规则
+### 5.1 Naming and conflicts
 
-- 工具：`plugin__<plugin>__<tool>`；`<tool>` 不允许包含 `__`。
-- 命令：`plugin/<plugin>/<command>`；不能覆盖内置命令和用户 Markdown 命令。
-- 键位：`plugin.<plugin>.<action>`；用户配置优先于插件。
-- 主题：只能引用或新增 token，不能覆盖内置主题名。
+- Tools: `plugin__<plugin>__<tool>`; a tool name may not contain `__`.
+- Commands: `plugin/<plugin>/<command>`; built-in and user Markdown commands win.
+- Keybindings: `plugin.<plugin>.<action>`; user configuration wins over plugins.
+- Themes: may reference or add tokens but cannot override a built-in theme name.
 
-### 5.2 Action 命令
+### 5.2 Action commands
 
-命令可以只展开 prompt，也可以声明一个 action，由 plugin server 在运行时处理：
+A command can expand a prompt, or declare an action that the plugin server handles at runtime:
 
 ```toml
 [[contributes.commands]]
@@ -289,7 +300,7 @@ args = "[--full]"
 action = "sync"
 ```
 
-运行时命令也可以用 `action` 字段：
+Runtime commands may carry `action` too:
 
 ```json
 {
@@ -300,17 +311,20 @@ action = "sync"
 }
 ```
 
-- `prompt` 和 `action` 必须恰好设置一个；action 需要 server 或 dylib 组件。
-- TUI 的 `/` 菜单和命令面板可以触发；host 调用插件的 `commands/run`。
-- `commands/run` 参数：`{command, arguments, session_id, workspace, cwd}`。
-- 返回值：`{ok, prompt?, output?}`。`prompt` 会作为用户消息提交，`output` 展示在文本面板。
-- 不开放任意 shell；需要执行命令的插件必须通过已授权 host API 或工具审批路径。
+- Exactly one of `prompt` and `action` must be set; an action needs a server or dylib component.
+- The TUI `/` menu and command palette can trigger them; the host calls the plugin's
+ `commands/run`.
+- `commands/run` parameters: `{command, arguments, session_id, workspace, cwd}`.
+- Return value: `{ok, prompt?, output?}`. `prompt` is submitted as a user message; `output` is shown
+  in a text panel.
+- No arbitrary shell is exposed; a plugin that needs to run commands goes through an authorized host
+  API or the tool approval path.
 
 ---
 
-## 6. 授权与作用域
+## 6. Authorization and scope
 
-### 6.1 配置示例
+### 6.1 Configuration
 
 ```toml
 [plugins.acme]
@@ -321,18 +335,18 @@ capabilities = ["tools", "commands", "hooks", "network", "secrets", "storage"]
 allowed_tools = ["search_*"]
 denied_tools = ["delete_*"]
 
-# 主机名或单个前导 `*.` 通配；留空拒绝所有请求。
+# Hostnames, or one leading `*.` wildcard; empty denies every request.
 network_allow = ["api.acme.com", "*.acme-cdn.com"]
-# 只列出可读取的环境变量名；留空拒绝所有 secret。
+# Environment variable names that may be read; empty denies every secret.
 secrets = ["ACME_TOKEN"]
-# 允许调用的其他插件；留空拒绝所有 RPC，`"*"` 允许全部。
+# Other plugins this one may call; empty denies all RPC, "*" allows everything.
 rpc_allow = ["issue-cache"]
 
 [plugins.acme.settings]
 project_key = "ACME"
 ```
 
-原生 dylib 插件改用库入口，其余授权字段相同：
+A native dylib plugin uses a library entry point instead; the authorization fields are identical:
 
 ```toml
 [plugins.acme]
@@ -343,34 +357,44 @@ capabilities = ["tools", "commands"]
 allowed_tools = ["search_*"]
 ```
 
-`library` 不能与 `command` 同时出现；manifest 里的 `[components.dylib]` 等价于配置了 `library`。
+`library` cannot appear together with `command`; a `[components.dylib]` table in the manifest is
+equivalent to configuring `library`.
 
-### 6.2 规则
+### 6.2 Rules
 
-- manifest 的 `capabilities` 是申请，config 的 `capabilities` 是授权；配置只能收窄，不能扩大 manifest 的申请。
-- 能力是开关，allowlist 是作用域：`network` 没有 `network_allow` 时拒绝一切，`secrets` 没有 `secrets` 列表时拒绝一切，`rpc` 没有 `rpc_allow` 时拒绝一切。
-- 网络只允许 `https`；域名精确匹配或单个 `*.` 后缀匹配；不跟随重定向，URL 中不允许凭据。
-- `secrets` 只从插件 `env` 或进程环境读取，值不写日志、不入模型上下文。
-- fs 只能访问 workspace，拒绝 `..`、绝对逃逸和 symlink；单文件读写上限 1 MiB。
-- RPC 目标必须在 `rpc_allow`，目标插件必须导出该方法，调用链深度上限 8，超时 60s。
-- `tools.read_only` 只有在显式信任时才生效；否则插件工具一律按可写工具走审批。
-- 项目层默认不能授权插件；插件只来自可信全局配置。
-- 多个 workspace 共用插件进程时，host 方法按调用时的 workspace 校验。
+- The manifest's `capabilities` are a request; the config's `capabilities` are the grant. Config can
+  only narrow the request, never widen it.
+- A capability is a switch; an allowlist is a scope. With no `network_allow`, `network` denies
+  everything; with no `secrets` list, secrets are denied; with no `rpc_allow`, RPC is denied.
+- Network access is `https` only, matched by exact domain or a single `*.` suffix. Redirects are not
+  followed and credentials in URLs are rejected.
+- Secrets are read only from the plugin's `env` or the process environment; values never enter logs
+  or the model context.
+- Filesystem access is limited to the workspace, rejecting `..`, absolute escapes, and symlinks;
+  a single file is capped at 1 MiB.
+- An RPC target must be in `rpc_allow`, must export the method, and the call chain is capped at depth
+  8 with a 60 s timeout.
+- `tools.read_only` takes effect only with explicit trust; otherwise plugin tools follow the normal
+  approval path as writable tools.
+- The project layer cannot authorize plugins by default; plugins come from the trusted global config
+  only.
+- When several workspaces share one plugin process, host methods are validated against the workspace
+  of the call.
 
 ---
 
-## 7. 协议 v2
+## 7. Protocol v2
 
-### 7.1 传输
+### 7.1 Transport
 
-保留 NDJSON over stdio，并明确约束：
+NDJSON over stdio, with explicit constraints:
 
-- stdout 只允许协议帧；日志必须走 stderr 或 `host.log`。
-- 单帧上限 8 MiB；超限断连并标记 failed。
-- 大二进制不内联，走 `host.blob.put/get` 返回 handle。
-- 后续可协商 `Content-Length` framing，不作为第一版要求。
+- stdout carries protocol frames only; logs go to stderr or `host.log`.
+- A single frame is capped at 8 MiB; exceeding it drops the connection and marks the plugin failed.
+- Large binaries are not inlined; `host.blob.put/get` returns a handle.
+- `Content-Length` framing may be negotiated later and is not a first-version requirement.
 
-### 7.2 握手
+### 7.2 Handshake
 
 ```json
 {"jsonrpc":"2.0","id":1,"method":"initialize","params":{
@@ -401,27 +425,28 @@ allowed_tools = ["search_*"]
 }}
 ```
 
-- `features` 协商：host 只调用双方都支持的扩展方法。
-- `api_version` 当前是整数，必须与 host 完全一致；不匹配拒绝启动。
-- 非空 `hooks` 需要 `hooks` 能力；非空 `ui` 需要 `ui` 能力；非空 `rpc` 需要 `rpc` 能力，否则启动失败。
-- 事件列表使用 `*` / `?` 通配符，例如 `session.*`。
+- `features` is negotiated: the host calls only extension methods both sides support.
+- `api_version` is an integer and must match the host exactly; a mismatch refuses startup.
+- A non-empty `hooks` needs the `hooks` capability, a non-empty `ui` needs `ui`, and a non-empty
+  `rpc` needs `rpc`; otherwise startup fails.
+- Event patterns use `*` / `?` wildcards, for example `session.*`.
 
-### 7.3 多路复用
+### 7.3 Multiplexing
 
 ```text
-writer task  <-- mpsc<Frame>
-reader task  --> BTreeMap<id, oneshot::Sender<Response>>
-dispatcher   --> 每个 in-flight 请求一个 task，max_inflight 默认 8
+writer task <-- mpsc<Frame>
+reader task --> BTreeMap<id, oneshot::Sender<Response>>
+dispatcher  --> one task per in-flight request, max_inflight defaults to 8
 ```
 
-效果：
+Effects:
 
-- 工具调用和 host 回调可以并发。
-- 支持 `$/cancel`：host 超时后发取消通知。
-- `$/progress` 仍预留在协议中，host 当前不消费。
-- 超时按请求粒度，而不是整个插件。
+- Tool calls and host callbacks run concurrently.
+- `$/cancel` is supported; the host sends it after a timeout.
+- `$/progress` is reserved in the protocol but not consumed by the host yet.
+- Timeouts apply per request, not per plugin.
 
-### 7.4 工具结果
+### 7.4 Tool results
 
 ```json
 {"ok": true,
@@ -435,37 +460,40 @@ dispatcher   --> 每个 in-flight 请求一个 task，max_inflight 默认 8
  "is_error": false}
 ```
 
-配套限制：
+Limits:
 
-- 工具输出按 `tools.max_output_bytes` 截断，插件侧上限 1 MiB；单项大小与图片 MIME 白名单仍是后续工作。
-- `structured` 当前只在 `content` 为空时作为文本回退。
-- 当前 TUI 只渲染文本：image / resource / diff / json 会先变成短占位文本。
-- v1 的 `output: String` 已移除，不再自动包装。
+- Tool output is truncated per `tools.max_output_bytes`, with a 1 MiB ceiling on the plugin side;
+  per-item caps and an image MIME allowlist remain future work.
+- `structured` is currently used only as a text fallback when `content` is empty.
+- The TUI renders text only: image, resource, diff, and json become short placeholder text.
+- The v1 `output: String` field is gone and is no longer wrapped automatically.
 
 ### 7.5 Host API
 
-统一 `host.*` 命名空间，每个方法先检查能力：
+A single `host.*` namespace, with a capability check before every method:
 
-| 方法 | 能力 | 说明 |
+| Method | Capability | Notes |
 | --- | --- | --- |
-| `host.log` | — | 写 stderr，支持请求和通知两种形式 |
-| `host.info` | — | 返回插件名、API 版本、能力、workspace 与 allowlist |
-| `host.ping` | — | 返回 `{"pong":true}` |
-| `host.storage.get/set/delete/list` | `storage` | 复用现有 KV，按 global/workspace 分区；key ≤512 B，value ≤1 MB |
-| `host.fs.read` / `list` | `workspace_read` | 只能访问 workspace，拒绝 `..`、逃逸与 symlink；单文件 ≤1 MiB |
-| `host.fs.write` | `workspace_write` | 同上；父目录必须已存在 |
-| `host.net.request` | `network` | 仅 `https`，域名 allowlist，禁止重定向与 URL 凭据；请求 ≤1 MiB，响应最多 4 MiB |
-| `host.secrets.get` | `secrets` | 只读取 `plugins.<name>.secrets` 列出的环境变量 |
-| `host.session.get` / `list` | `sessions_read` | 只读 session 元数据 |
-| `host.notify` | `ui` | 发送 `plugin.notify`，TUI 显示 toast |
-| `host.ui.open` / `update` / `close` | `ui` | 面板/状态事件；可带 `body` 文本或 `node` 视图树，正文 ≤256 KiB |
-| `host.rpc.call` | `rpc` | 调用 allowlist 内其他插件导出的方法 |
-| `host.blob.put` / `get` | `storage` | 内容寻址（SHA-256），存在插件数据目录，单个 ≤8 MiB |
-| `host.job.register/trigger/unregister` | `jobs` | 最多 32 个 job，间隔 1..=86400s，通过 `job.run` 通知插件 |
+| `host.log` | — | Writes to stderr; supports both requests and notifications |
+| `host.info` | — | Returns plugin name, API version, capabilities, workspace, and allowlists |
+| `host.ping` | — | Returns `{"pong":true}` |
+| `host.storage.get/set/delete/list` | `storage` | Reuses the KV store, partitioned by global/workspace; key <=512 B, value <=1 MB |
+| `host.fs.read` / `list` | `workspace_read` | Workspace only; rejects `..`, escapes, and symlinks; single file <=1 MiB |
+| `host.fs.write` | `workspace_write` | Same rules; the parent directory must exist |
+| `host.net.request` | `network` | `https` only, domain allowlist, no redirects or URL credentials; request <=1 MiB, response <=4 MiB |
+| `host.secrets.get` | `secrets` | Reads only the environment variables listed in `plugins.<name>.secrets` |
+| `host.session.get` / `list` | `sessions_read` | Read-only session metadata |
+| `host.notify` | `ui` | Emits `plugin.notify`; the TUI shows a toast |
+| `host.ui.open` / `update` / `close` | `ui` | Panel and status events; may carry `body` text or a `node` view tree, body <=256 KiB |
+| `host.rpc.call` | `rpc` | Calls a method exported by another plugin in the allowlist |
+| `host.blob.put` / `get` | `storage` | Content-addressed (SHA-256) in the plugin data directory, <=8 MiB each |
+| `host.job.register/trigger/unregister` | `jobs` | At most 32 jobs, interval 1..=86400 s, delivered as a `job.run` notification |
 
-错误码统一：`-32601 method_not_found`、`-32602 invalid_params`、`-32001 unauthorized`。超时与取消由 client 层处理，使用 `-32003 timeout` / `-32004 cancelled` 的预留在协议中。
+Error codes are shared: `-32601 method_not_found`, `-32602 invalid_params`, `-32001 unauthorized`. Timeouts and
+cancellation are handled by the client layer, with `-32003 timeout` / `-32004 cancelled` reserved in the
+protocol.
 
-### 7.6 插件间 RPC
+### 7.6 Inter-plugin RPC
 
 ```text
 plugin A -> host.rpc.call {plugin:"acme", method:"issues.search", arguments:{...}}
@@ -474,38 +502,44 @@ plugin B -> host: result
 host     -> plugin A: result
 ```
 
-- 调用方必须获得 `rpc` 能力，且目标在 `plugins.<caller>.rpc_allow` 中。
-- 目标插件必须在 `initialize.rpc` 中导出该方法；方法名使用插件内命名空间。
-- 调用链深度上限 8；每次调用超时 60s。
-- 目标插件若要继续调用其他插件，应把收到的 `depth` 原样传回 `host.rpc.call`（Rust SDK 用 `Ctx::rpc_call_with_depth`）。
-- 进程与 dylib 后端都实现了 `rpc.call`；dylib 侧由 `Plugin::rpc` 处理 `RpcCall { method, arguments, caller, depth }`。
-- 每次调用记录 caller / callee 与失败原因到 daemon 日志（不记录参数内容）。
+- The caller needs the `rpc` capability and the target must appear in
+  `plugins.<caller>.rpc_allow`.
+- The target must export the method in `initialize.rpc`; method names live in the plugin's own
+  namespace.
+- Call depth is capped at 8 and each call times out after 60 s.
+- A plugin that calls further must pass the received `depth` through to `host.rpc.call` unchanged
+  (the Rust SDK offers `Ctx::rpc_call_with_depth`).
+- Both the process and dylib backends implement `rpc.call`; on the dylib side `Plugin::rpc` handles
+ `RpcCall { method, arguments, caller, depth }`.
+- Each call logs caller, callee, and the failure reason to the daemon log, without arguments.
 
 ---
 
 ## 8. Hooks
 
-事件是只读通知，hook 是可参与决策的请求，两者不混用。
+Events are read-only notifications; hooks are requests that participate in a decision. The two are
+never mixed.
 
-### 8.1 Hook 点
+### 8.1 Hook points
 
-| Hook | 时机 | 能做什么 | 失败策略 |
+| Hook | When | Can do | Failure policy |
 | --- | --- | --- | --- |
-| `tool.before` | 正常权限判定之后、审批与执行之前 | 返回 `deny` 否决工具；不能批准 | `on_error` = `allow` / `deny` / `ignore` |
-| `tool.after` | 工具执行完成、记录结果之前 | 用 `output` 替换工具输出 | 记录错误并继续 |
-| `prompt.build` | 用户 prompt 提交、写入事件之前 | 用 `prompt` 替换用户消息 | 记录错误并继续 |
-| `turn.stop` | 模型给出最终回答、turn 完成之前 | 返回 `block` 阻止完成，`reason` 会作为提醒进入下一轮 | `on_error` = `allow` / `deny` / `ignore`；`deny` 视为阻塞 |
-| `turn.end` | turn 成功或失败之后 | 只读通知；作为 `hooks/run` 请求发送 | 记录错误并继续 |
+| `tool.before` | After normal permission checks, before approval and execution | Return `deny` to veto the tool; cannot approve | `on_error` = `allow` / `deny` / `ignore` |
+| `tool.after` | After the tool ran, before the result is recorded | Replace the tool output with `output` | Log the error and continue |
+| `prompt.build` | After the user submits, before the event is written | Replace the user message with `prompt` | Log the error and continue |
+| `turn.stop` | After the model's final answer, before the turn completes | Return `block` to prevent completion; `reason` becomes a reminder for the next round | `on_error` = `allow` / `deny` / `ignore`; `deny` counts as blocking |
+| `turn.end` | After the turn succeeds or fails | Read-only notification, sent as a `hooks/run` request | Log the error and continue |
 
-hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力：
+Hooks are declared in `initialize.hooks`, and a non-empty declaration requires the `hooks`
+capability:
 
 ```json
 {"point":"tool.before","priority":10,"timeout_ms":500,"on_error":"deny"}
 ```
 
-`timeout_ms` 为 0 时使用插件的请求超时，最大 300000ms。
+`timeout_ms` of 0 means the plugin's request timeout; the maximum is 300000 ms.
 
-### 8.2 返回值
+### 8.2 Return values
 
 ```json
 {"action":"deny","reason":"missing issue id"}
@@ -515,440 +549,529 @@ hook 在 `initialize.hooks` 中声明；声明非空必须获得 `hooks` 能力�
 {"block":true,"reason":"tests are still failing"}
 ```
 
-规则：
+Rules:
 
-- `tool.before` 的 `deny` / `action: "deny"` / `decision: "deny"` / `allow: false` 都表示否决；`reason` 会进入工具结果。
-- `tool.after` 的 `output` 替换当前输出，并受插件输出上限约束。
-- `prompt.build` 的 `prompt` 为空或超限时忽略；其余 hook 看到的是上一条 hook 的结果。
-- `turn.stop` 的 `block` / `action: "block"` / `decision: "block"` 会阻止 turn 结束；`reason` 作为系统提醒注入下一轮。同一 turn 最多阻塞 2 次，避免插件把 turn 永久挂起。子 agent 的 turn 不运行该 hook。
-- `turn.end` 的返回值被忽略，hooks 不能改变 turn 结果。
+- For `tool.before`, `deny` / `action:"deny"` / `decision:"deny"` / `allow: false` all mean veto;
+  `reason` is surfaced in the tool result.
+- For `tool.after`, `output` replaces the current output and is subject to the plugin output cap.
+- For `prompt.build`, an empty or oversized `prompt` is ignored; every other hook sees the previous
+  hook's result.
+- For `turn.stop`, `block` / `action:"block"` / `decision:"block"` prevents the turn from ending, and
+  `reason` is injected as a system reminder into the next round. A turn can be blocked at most
+  twice, so a plugin cannot hang it forever. Sub-agent turns do not run this hook.
+- For `turn.end`, the return value is ignored; hooks cannot change the outcome.
 
-### 8.3 顺序、超时与并发
+### 8.3 Ordering, timeouts, and concurrency
 
-- 顺序：按 `(priority, plugin_name)` 升序串行执行。
-- 超时：每个 hook 可单独设置；超时后按 `on_error` 处理，`tool.before` 的 `deny` 策略会否决工具。
-- 预算：没有跨 hook 的总预算；每个插件受自身请求超时与 hook 超时约束。
-- `turn.end` 在后台任务中发送，不阻塞 turn 完成。
-- `turn.stop` 会阻塞 turn 完成，因此超时会计入用户等待；保持 hook 快速。
-- hook 内触发的工具调用不会再触发同类 hook（调用来自插件进程，不进入 turn 工具管线）。
+- Ordering: serial, ascending by `(priority, plugin_name)`.
+- Timeouts: each hook sets its own; on timeout the `on_error` policy applies, and a `tool.before`
+  hook with `deny` vetoes the tool.
+- Budget: there is no budget shared across hooks; each plugin is bounded by its request and hook
+  timeouts.
+- `turn.end` is dispatched on a background task and never blocks completion.
+- `turn.stop` does block completion, so its timeout counts against the user's wait; keep it fast.
+- A hook that triggers a tool call must not recurse into the same hook.
 
-### 8.4 审批权
+### 8.4 Approval authority
 
-审批权只属于 host 和用户。hook 最多能否决或改写输出，不能返回 `allow` 绕过审批。`tool.before` 在正常权限判定之后运行，因此不会把 `ask` 降级为自动允许。
+A hook may veto, annotate, and request re-approval, but it can never approve a tool call. Approval
+remains the host's decision, made through the normal approval path with the user as the authority.
 
 ---
 
-## 9. UI 贡献
+## 9. UI contributions
 
-### 9.1 已实现的表面
+### 9.1 Implemented surfaces
 
-- 插件不输出 ANSI、不直接操作终端。
-- `initialize.ui` 可声明 `panel` / `status` / `picker`；`plugin.ui.list` 把它们暴露给前端。
-- `host.ui.open` / `update` 发送 `{plugin, id, surface, title, body, node?}`，TUI 打开或更新面板。
-- `host.ui.close {id}` 关闭匹配的插件面板；TUI 也会在面板被其他 overlay 替换时清掉本地引用。
-- `host.notify` 发送 `{plugin, level, message}`，TUI 显示 toast。
-- `body` 是纯文本或字符串数组；`node` 是可选的结构化视图树。两者都给时 TUI 优先渲染 `node`，`body` 作为无节点渲染器的回退。整帧 ≤256 KiB。
+The UI event payload is `{in, level, message}`, shown by the TUI as a toast. `body` is plain text or
+an array of strings; `node` is an optional structured view tree. When both are present the TUI
+renders `node` and falls back to `body` when no node renderer applies. A whole frame is capped at
+256 KiB.
 
-### 9.2 Surface
+### 9.2 Surfaces
 
-| Surface | 现状 | 说明 |
+| Surface | Status | Notes |
 | --- | --- | --- |
-| `panel` | 已实现 | 全屏文本 overlay，Esc 关闭 |
-| `status` | 已实现 | 作为面板打开，不常驻 statusline |
-| `picker` | 已实现 | `ui/render` 返回 `picker` 节点或声明 picker 表面；`ui/pick` 提供搜索行，TUI 打开插件选择器 |
-| `notification` | 已实现 | `host.notify` toast |
+| `panel` | Implemented | Full-screen text overlay, closed with Esc |
+| `status` | Implemented | Opens as a panel rather than living in the statusline |
+| `picker` | Implemented | `ui/render` returns a `picker` node or declares a picker surface; `ui/pick` serves the search line and the TUI opens the plugin picker |
+| `notification` | Implemented | `host.notify` toast |
 
-`plugin.ui.list` 返回 `{surfaces: [{plugin, surface, id, title}]}`。TUI `/plugins [name]` 展示声明，并可用：
+`plugin.ui.list` returns `{surfaces: [{plugin, surface, id, title}]}`. The TUI `/plugins [name]`
+shows declarations and supports:
 
 ```text
-/plugins open <plugin> <id> [surface]      # 调用 plugin.ui.render
-/plugins action <plugin> <id> <action> [k=v]…
-/plugins act <action> [k=v]…               # 对当前面板执行
-/plugins pick <plugin> <id> [query]        # 打开 ui/pick 选择器
+/plugins open <plugin> <id> [surface]     # calls plugin.ui.render
+/plugins action <plugin> <id> <action> [k=v]...
+/plugins act <action> [k=v]...            # acts on the current panel
+/plugins pick <plugin> <id> [query]       # opens the ui/pick picker
 ```
 
-TUI 把视图树渲染到文本 overlay；按钮与表单提交会显示对应的 `/plugins act <action>` 提示，因此同一棵树在键盘、脚本和测试里都可驱动。
+The TUI renders the view tree into a text overlay; buttons and form submissions print the matching
+`/plugins act <action>` hint, so the same tree is drivable from the keyboard, scripts, and tests.
 
-### 9.3 视图树
+### 9.3 View tree
 
 ```json
 {
-  "kind": "group",
-  "title": "Issues",
-  "children": [
-    {"kind": "heading", "text": "Open", "level": 2},
-    {"kind": "list", "items": ["#42 Fix parser", "#43 Add tests"]},
-    {"kind": "actions", "actions": [
-      {"id": "refresh", "label": "Refresh", "kind": "primary"}
-    ]},
-    {"kind": "picker", "id": "issues", "title": "Issues", "items": [
-      {"id": "42", "title": "#42 Fix parser", "subtitle": "bug"}
-    ]}
-  ]
+ "kind": "group",
+ "title": "Issues",
+ "children": [
+  {"kind": "heading", "text": "Open", "level": 2},
+  {"kind": "list", "items": ["#42 Fix parser", "#43 Add tests"]},
+  {"kind": "actions", "actions": [
+   {"id": "refresh", "label": "Refresh", "kind": "primary"}
+  ]},
+  {"kind": "picker", "id": "issues", "title": "Issues", "items": [
+   {"id": "42", "title": "#42 Fix parser", "subtitle": "bug"}
+  ]}
+ ]
 }
 ```
 
-节点：`text`、`markdown`、`heading`、`divider`、`list`、`table`、`form`、`actions`、`picker`、`group`。限制：最多 2000 节点、深度 16、单文本 64 KiB、表格 64 列/1000 行、picker 1000 项；未知 `kind` 反序列化失败。`UiNode::validate()` 在 daemon 侧执行，host 不会把非法树送到 TUI。
+Nodes: `text`, `markdown`, `heading`, `divider`, `list`, `table`, `form`, `actions`, `picker`, `group`.
+Limits: 2000 nodes, depth 16, 64 KiB of text per node, 64 columns and 1000 rows per table, 1000
+picker items; an unknown `kind` fails deserialisation. `UiNode::validate()` runs daemon-side, so an
+invalid tree never reaches the TUI.
 
-`ui/render` 返回 `{title, node?, body}`；`ui/action` 返回 `{ok, node?, body?, prompt?, close?, error?}`，其中 `prompt` 会提交为用户消息，`close` 关闭面板。`ui/pick {id, query}` 返回 `{items:[{id,title,subtitle}]}`；TUI 的插件 picker 在输入后 200ms 防抖查询，回车把选中项作为 `ui/action {action:"picked", values:{item}}` 回传。
+`ui/render` returns `{title, node?, body}`. `ui/action` returns
+`{ok, node?, body?, prompt?, close?, error?}`, where `prompt` is submitted as a user message and
+`close` closes the panel. `ui/pick {id, query}` returns
+`{items:[{id,title,subtitle}]}`; the TUI's plugin picker debounces queries by 200 ms and, on Enter,
+sends the selection back as `ui/action {action:"picked", values:{item}}`.
 
-dylib 后端目前不实现 `ui/render` / `ui/action` / `ui/pick`，调用会返回 unknown method。
+The dylib backend does not implement `ui/render`, `ui/action`, or `ui/pick`; calls return unknown
+method.
 
-### 9.4 设置表单
+### 9.4 Settings form
 
-插件在 manifest 中声明 `settings = "settings.schema.json"`：
+A plugin declares `settings = "settings.schema.json"` in its manifest:
 
 ```json
 {
-  "type": "object",
-  "properties": {
-    "project_key": {"type": "string", "title": "Project key"},
-    "auto_sync": {"type": "boolean", "default": true}
-  },
-  "required": ["project_key"]
+ "type": "object",
+ "properties": {
+  "project_key": {"type": "string", "title": "Project key"},
+  "auto_sync": {"type": "boolean", "default": true}
+ },
+ "required": ["project_key"]
 }
 ```
 
-- schema 必须位于插件目录内、`type: object`、≤256 KiB。
-- `/plugins <name>` 调用 `plugin.settings`，展示 schema、当前值、类型、必填项与 enum 选项。
-- `plugin.settings.set {name, values}` 做浅合并（`null` 删除键），按 schema 校验后写回全局/显式配置文件；注释与无关键由 `toml_edit` 保留。
-- 写入成功后运行中的插件收到 `config.changed`（dylib 走 `Plugin::config_changed`），daemon 自身写文件不会触发全量 `/reload`。
-- 当前不提供 TUI 内编辑；修改仍可通过 `plugin.settings.set` 或直接编辑 `[plugins.<name>.settings]`。
-- 设置值随 `initialize` 传给插件；`config.changed` 让运行中的插件立即看到新值。
+- The schema must live inside the plugin directory, be `type: object`, and be at most 256 KiB.
+- `/plugins <name>` calls `plugin.settings` and shows the schema, current values, types, required
+  fields, and enum options.
+- `plugin.settings.set {name, values}` shallow-merges (`null` deletes a key), validates against the
+  schema, and writes back to the global or explicit config file; `toml_edit` preserves comments and
+  unrelated keys.
+- After a successful write, running plugins receive `config.changed` (via
+ `Plugin::config_changed` on the dylib path), and the daemon's own write does not trigger a full
+  `/reload`.
+- There is no in-TUI editing yet; change values through `plugin.settings.set` or by editing
+ `[plugins.<name>.settings]` directly.
+- Settings travel to the plugin in `initialize`; `config.changed` makes new values visible
+  immediately.
 
 ---
 
-## 10. 安全模型
+## 10. Security model
 
-### 10.1 信任分层
+### 10.1 Trust tiers
 
-| 层 | 默认 | 说明 |
+| Tier | Default | Notes |
 | --- | --- | --- |
-| 内置工具 | 可信 | 现有风险分类 |
-| dylib 插件 | 完全可信 | 在 `eixd` 地址空间内运行；仅加载签名/受信任的库 |
-| 声明式插件 | 可信但受路径约束 | 只能贡献静态内容 |
-| 服务插件 | 不可信 | 工具默认审批；hook 不能批准 |
-| UI 插件 | 不可信 | host 渲染，节点受限 |
-| 项目级插件 | 默认禁止 | 需显式 trust 或签名 |
+| Built-in tools | Trusted | Existing risk classification |
+| dylib plugins | Fully trusted | Run in the `eixd` address space; only signed or explicitly trusted libraries are loaded |
+| Declarative plugins | Trusted but path-constrained | Static content only |
+| Service plugins | Untrusted | Tools need approval by default; hooks cannot approve |
+| UI plugins | Untrusted | Host-rendered, bounded nodes |
+| Project-level plugins | Forbidden | Require explicit trust or a signature |
 
-### 10.2 能力边界
+### 10.2 Capability boundaries
 
-- `workspace_read` / `workspace_write`：workspace root，拒绝 `..`、绝对逃逸和 symlink；单文件 ≤1 MiB。
-- `network`：只允许 `https`，域名 allowlist，host 代理请求；不跟随重定向，URL 不含凭据。
-- `secrets`：按环境变量名授权，值不写日志、不进入模型上下文。
-- `tools.read_only`：只有显式信任才生效。
-- `hooks`：按 hook 点授权；hook 不能批准工具。
-- `rpc`：调用方与目标双向受 allowlist/导出方法约束。
-- `storage` / `blob`：按插件名隔离；blob 存在插件自己的数据目录。
-- `jobs`：最多 32 个，间隔 1..=86400s。
+- `workspace_read` / `workspace_write`: the workspace root, rejecting `..`, absolute escapes, and
+  symlinks; a single file is capped at 1 MiB.
+- `network`: `https` only, domain allowlist, host-proxied requests, no redirects, no credentials in
+  URLs.
+- `secrets`: authorized by environment variable name; values never enter logs or model context.
+- `tools.read_only`: effective only under explicit trust.
+- `hooks`: authorized per hook point; a hook can never approve a tool.
+- `rpc`: both caller and target are constrained by the allowlist and exported methods.
+- `storage` / `blob`: isolated per plugin name; blobs live in the plugin's own data directory.
+- `jobs`: at most 32, interval 1..=86400 s.
 
-能力限制的是 host API，不是操作系统。插件进程仍以 daemon 用户身份运行，可以直接读写该用户可访问的文件和网络。需要强隔离时必须启用 sandbox，或使用单独用户 / 容器运行 daemon。
+Capabilities constrain the host API, not the operating system. The plugin process still runs as the
+daemon user and can read and write anything that user can, and reach the network directly. Strong
+isolation requires the sandbox or running the daemon as a separate user or container.
 
-dylib 插件尤其如此：它与 daemon 同进程，可以直接 `libc::open` / 发网络 / 读环境变量，绕过所有 `host.*` 检查。因此 dylib 必须视为完全可信代码，安全边界只能放在加载前（签名、安装路径、ABI/平台校验）。
+This is especially true for dylib plugins: sharing an address space with the daemon, they can call
+`libc::open`, open sockets, and read the environment, bypassing every `host.*` check. They must be
+treated as fully trusted, and the boundary belongs before loading: signature, install path, ABI,
+and platform checks.
 
-### 10.3 审计
+### 10.3 Audit
 
-新增 `plugin_audit`：
+A `plugin_audit` table is planned:
 
 ```text
 id, ts, plugin, method, capability, session_id, workspace,
 ok, duration_ms, detail_hash, error
 ```
 
-记录所有 host API 调用、hook 决策、工具调用和审批交互。参数只存 hash 或摘要，避免 secret 落库。TUI `/plugins` 可查看最近审计与错误。
+It records host API calls, hook decisions, tool calls, and approval interactions. Arguments are
+stored only as hashes or summaries, so secrets never reach the database. Until it lands, the
+per-plugin ring buffer and `plugin.doctor` provide the audit trail.
 
-### 10.4 可选 OS sandbox
+### 10.4 Optional OS sandbox
 
 ```toml
 [plugins.acme]
-sandbox = true        # 默认 false；Linux 上 opt-in
+sandbox = true   # false by default; opt-in on Linux
 require_signature = true
 ```
 
-- Linux：`PR_SET_NO_NEW_PRIVS`、`PR_SET_PDEATHSIG`、rlimits 与 Landlock 路径白名单；白名单包含 workspace、插件数据目录与系统运行库路径。
-- macOS / 其他平台：当前为 no-op，只保留进程隔离，不假装有沙箱。
-- sandbox 只限制进程能触达的文件与系统调用；host API 的能力校验仍然是主要边界。
-- `require_signature = true` 时拒绝未签名或没有 `[package]` 的包；默认 false 便于本地开发。
+- Linux: `PR_SET_NO_NEW_PRIVS`, `PR_SET_PDEATHSIG`, rlimits, and a Landlock path allowlist covering
+  the workspace, the plugin data directory, and system runtime paths.
+- macOS and other platforms: a no-op. Process isolation remains, but no sandbox is pretended.
+- The sandbox constrains reachable files and system calls; host API capability checks remain the
+  primary boundary.
+- `require_signature = true` refuses unsigned packages or packages without `[package]`. The default
+  is false to keep local development easy.
 
-### 10.5 供应链
+### 10.5 Supply chain
 
-- `eix plugin pack <dir>` 生成 `eix-plugin.sums`：每行 `<sha256>\t<relative/path>`，覆盖除 checksums / 签名以外的全部文件。
-- `eix plugin verify <dir> [--allow-unsigned]` 校验 checksums，并在存在 `eix-plugin.sig` 时用 trust store 验证 detached Ed25519 签名。
-- 签名覆盖 `eix-plugin.sums` 的原始字节；默认签名文件为 `eix-plugin.sig`，可用 `[package] signature` 覆盖。
-- `eix plugin trust <publisher> <base64-public-key>` / `untrust` 管理全局 `plugin-trust.toml`。
-- `eix plugin install <dir> [--force] [--allow-unsigned]` 先验签再复制到 `~/.config/eix/plugins/<name>`，并把 `[plugins.<name>]` 直接写入配置。
-- `--allow-unsigned` 会为没有 `[package]` 的本地目录补表并重新 `pack`，便于开发；生产分发仍应签名。
-- `target`（`linux-x86_64`、`x86_64-unknown-linux-gnu`、`amd64` 等别名）与 `artifact`/`path` 让一个 manifest 指向正确的平台库；`artifact` 优先。
-- manifest 的 `min_host_version` 在 daemon 加载时强制校验，host 版本通过 `PLUGIN_HOST_VERSION` 暴露。
-- 安装拒绝 symlink、路径逃逸和未列入 checksums 的额外文件。
-- `~/.config/eix/plugins/plugins.lock` 记录已安装插件的 version/publisher/checksums；`eix plugin verify-lock`（库函数 `verify_lock`）检测漂移，失败时返回非零。
-- 尚无 registry 与自动升级；`eix plugin update <dir>` 重新验证并覆盖安装，然后写回配置。
+- `eix plugin pack <dir>` writes `eix-plugin.sums`: one `<sha256>\t<relative/path>` line per file,
+  covering everything except the checksums and signature files.
+- `eix plugin verify <dir> [--allow-unsigned]` checks the sums and, when `eix-plugin.sig` exists,
+  verifies the detached Ed25519 signature against the trust store.
+- The signature covers the raw bytes of `eix-plugin.sums`; the default signature file is
+ `eix-plugin.sig`, overridable in `[package] signature`.
+- `eix plugin trust <publisher> <base64-public-key>` and `untrust` manage the global
+ `plugin-trust.toml`.
+- `eix plugin install <dir> [--force] [--allow-unsigned]` verifies first, copies into
+ `~/.config/eix/plugins/<name>`, then writes `[plugins.<name>]` into the config.
+- `--allow-unsigned` backfills `[package]` for a local directory and repacks it, which helps during
+  development; production distribution should still be signed.
+- `target` (aliases such as `linux-x86_64`, `x86_64-unknown-linux-gnu`, `amd64`) together with `artifact` and `path`
+  lets one manifest point at the right platform library; `artifact` wins.
+- `min_host_version` in the manifest is enforced when the daemon loads it; the host version is
+  exposed through `PLUGIN_HOST_VERSION`.
+- Installation refuses symlinks, path escapes, and extra files absent from the checksums.
+- `~/.config/eix/plugins/plugins.lock` records version, publisher, and checksums of installed
+  plugins; `eix plugin verify-lock` (library function `verify_lock`) detects drift and exits
+  non-zero on failure.
+- There is no registry and no automatic upgrade yet; `eix plugin update <dir>` re-verifies and
+  overwrites the install, then writes the config back.
 
 ---
 
-## 11. 生命周期与运行时
+## 11. Lifecycle and runtime
 
-### 11.1 状态机
+### 11.1 State machine
 
 ```text
 disabled -> installed -> starting -> ready
-                         |  ^         |
-                         v  |         v
-                       failed      degraded
-                         |
-                      stopped
+                  failed
+                  degraded
+            stopped
 ```
 
-- `degraded`：连续 3 次后端调用失败（工具 / 命令 / hook），插件仍可用，成功一次自动回到 `ready`；`plugin.list` 暴露 `failures` 计数与最后一次错误。
-- `failed`：启动失败或崩溃，保留错误并允许 restart。
-- `stopped`：用户禁用或 daemon 退出。
+- `degraded`: three consecutive backend failures (tool, command, or hook). The plugin stays usable,
+  one success returns it to `ready`, and `plugin.list` exposes the `failures` count and the last
+  error.
+- `failed`: startup failed or the plugin crashed; the error is kept and a restart is allowed.
+- `stopped`: the user disabled it, or the daemon exited.
 
-### 11.2 启动与重启
+### 11.2 Startup and restart
 
-- `lazy = true`：启动/重载时只登记 spec 与状态，不 spawn；首次 `plugin.start` 或 TUI `/plugins start <name>` 才启动。
-- 启动失败标记 `failed` 并保留 `error`；`plugin.restart` / `/plugins restart` 显式重试。
-- 崩溃检测基于 `exit_reason`；1s supervisor 发现进程退出后按 1s/2s/4s/8s/16s 退避重启，最多 6 次，超限进入 `gave_up`，需显式 restart。
-- `/reload` 按 `PluginConfig` 的序列化指纹做 diff：只重启新增或配置变化的插件；未变化的 failed 插件不会因为 reload 被自动重试。
-- `plugin.stop/start/enable/disable/uninstall/forget` 覆盖手动生命周期；uninstall 只删除受管理的安装目录并要求 canonical path 在插件根内。
+- `lazy = true`: startup and reload only register the spec and state, without spawning; the first
+  `plugin.start` or TUI `/plugins start <name>` starts it.
+- A failed start marks the plugin `failed` and keeps `error`; `plugin.restart` and
+ `/plugins restart` retry explicitly.
+- Crash detection uses `exit_reason`; a 1 s supervisor notices the exit and restarts with 1/2/4/8/16 s
+  backoff, up to six attempts, after which it enters `gave_up` and needs an explicit restart.
+- `/reload` diffs the serialised `PluginConfig` fingerprint: only new or changed plugins restart, and
+  an unchanged failed plugin is not retried by the reload.
+- `plugin.stop/start/enable/disable/uninstall/forget` cover manual lifecycle. Uninstall removes only
+  a managed install directory and requires the canonical path to sit inside the plugin root.
 
-### 11.3 并发与背压
+### 11.3 Concurrency and backpressure
 
-- 每插件 `max_inflight` 默认 8，超出排队或拒绝。
-- 事件投递按订阅者策略：`drop`（观察型）/ `coalesce`（UI 状态）/ `queue`（有限队列）。
-- hook 永远走请求-响应，不走事件队列。
-- 大输出截断，保留头尾和长度提示。
+- `max_inflight` defaults to 8 per plugin; excess requests queue or are rejected.
+- Event delivery follows a per-subscriber policy: `drop` (observational), `coalesce` (UI state), or
+ `queue` (bounded queue).
+- Hooks always use request/response and never the event queue.
+- Large output is truncated with head, tail, and a length notice.
 
-### 11.4 多 workspace
+### 11.4 Multiple workspaces
 
-- 默认一个插件进程服务多个 workspace，所有 host 调用带 `workspace` 并校验。
-- 插件应按 workspace 分区状态，或声明 `per_workspace = true` 启动独立进程。
-- hook / event payload 必须包含 `workspace`，避免跨项目泄漏。
+- By default one plugin process serves several workspaces, and every host call carries and validates
+  a `workspace`.
+- A plugin should partition state by workspace, or declare `per_workspace = true` to get one process
+  per workspace.
+- Hook and event payloads must include `workspace`, so nothing leaks across projects.
 
 ---
 
-## 12. 数据模型与配置
+## 12. Data model and configuration
 
-### 12.1 Rust 类型
+### 12.1 Rust types
 
 ```rust
 pub struct PluginManifest {
-    pub schema: u32,                 // 只接受 2
-    pub name: String,
-    pub version: String,
-    pub description: String,
-    pub api_version: u32,            // 必须等于 PLUGIN_API_VERSION
-    pub min_host_version: Option<String>,
-    pub capabilities: Vec<PluginCapability>,
-    pub components: PluginComponents,
-    pub contributes: PluginContributions,
-    pub settings: Option<PathBuf>,
-    pub package: Option<PluginPackage>,
+  pub schema: u32,                    // only 2 is accepted
+  pub name: String,
+  pub version: String,
+  pub description: String,
+  pub api_version: u32,               // must equal PLUGIN_API_VERSION
+  pub min_host_version: Option<String>,
+  pub capabilities: Vec<PluginCapability>,
+  pub components: PluginComponents,
+  pub contributes: PluginContributions,
+  pub settings: Option<PathBuf>,
+  pub package: Option<PluginPackage>,
 }
 
 pub struct PluginPackage {
-    pub publisher: Option<String>,
-    pub signature: Option<PathBuf>,  // 默认 eix-plugin.sig
-    pub checksums: Option<PathBuf>,  // 默认 eix-plugin.sums
+  pub publisher: Option<String>,
+  pub signature: Option<PathBuf>,     // defaults to eix-plugin.sig
+  pub checksums: Option<PathBuf>,     // defaults to eix-plugin.sums
 }
 
 pub struct PluginContributions {
-    pub commands: Vec<ManifestCommand>,
+  pub commands: Vec<ManifestCommand>,
 }
 
 pub struct ManifestCommand {
-    pub name: String,
-    pub description: String,
-    pub args: String,
-    pub prompt: String,              // prompt 与 action 二选一
-    pub action: Option<String>,
+  pub name: String,
+  pub description: String,
+  pub args: String,
+  pub prompt: String,                 // prompt or action, never both
+  pub action: Option<String>,
 }
 
 pub struct PluginConfig {
-    pub command: String,
-    pub args: Vec<String>,
-    pub library: Option<PathBuf>,    // 原生 dylib；与 command 互斥
-    pub require_signature: bool,     // 拒绝未签名/无 [package] 的包
-    pub sandbox: bool,               // Linux opt-in 进程硬化
-    pub env: BTreeMap<String, String>,
-    pub enabled: bool,
-    pub lazy: bool,                  // 延迟到 plugin.start
-    pub timeout_secs: u64,
-    pub cwd: Option<PathBuf>,
-    pub manifest: Option<PathBuf>,
-    pub capabilities: Vec<PluginCapability>,
-    pub allowed_tools: Vec<String>,
-    pub denied_tools: Vec<String>,
-    pub settings: BTreeMap<String, serde_json::Value>,
-    pub network_allow: Vec<String>,
-    pub secrets: Vec<String>,
-    pub rpc_allow: Vec<String>,
+  pub command: String,
+  pub args: Vec<String>,
+  pub library: Option<PathBuf>,       // native dylib; exclusive with command
+  pub require_signature: bool,        // refuse unsigned packages or packages without [package]
+  pub sandbox: bool,                  // opt-in process hardening on Linux
+  pub env: BTreeMap<String, String>,
+  pub enabled: bool,
+  pub lazy: bool,                     // defer to plugin.start
+  pub timeout_secs: u64,
+  pub cwd: Option<PathBuf>,
+  pub manifest: Option<PathBuf>,
+  pub capabilities: Vec<PluginCapability>,
+  pub allowed_tools: Vec<String>,
+  pub denied_tools: Vec<String>,
+  pub settings: BTreeMap<String, serde_json::Value>,
+  pub network_allow: Vec<String>,
+  pub secrets: Vec<String>,
+  pub rpc_allow: Vec<String>,
 }
 ```
 
-握手结果中的 `hooks` / `ui` / `rpc` 使用强类型 `PluginHook` / `PluginUi` / `PluginRpc`；manifest 只声明能力，具体 hook 点、UI 表面和 RPC 方法在 `initialize` 返回。
+The handshake's `hooks`, `ui`, and `rpc` use the strongly typed `PluginHook`, `PluginUi`, and
+`PluginRpc`. The manifest only declares capabilities; the actual hook points, UI surfaces, and RPC
+methods come back from `initialize`.
 
-### 12.2 配置
+### 12.2 Configuration
 
-当前 `[plugins.<name>]` 支持：
+`[plugins.<name>]` supports:
 
-- `command` / `args` / `env` / `cwd`：进程入口；与 `manifest` 二选一或组合。
-- `library`：原生 dylib 路径；相对路径按 config cwd 解析，与 `command` / `components.server` 互斥。使用 dylib 时必须同时授予它实际调用的能力（如 `tools` / `commands`）。
-- `enabled` / `timeout_secs`：启停与请求超时（秒）。
-- `lazy`：延迟启动，首次 `plugin.start` / `/plugins start` 才 spawn。
-- `require_signature`：拒绝未签名或没有 `[package]` 的包；默认 false。
-- `sandbox`：Linux 上启用 no_new_privs / PDEATHSIG / rlimits / Landlock；其他平台 no-op。默认 false。
-- `manifest`：`eix-plugin.toml`，相对路径按 config cwd 解析；manifest 的 `name` 必须与配置 key 一致。manifest 含 `components.dylib` 时等价于配置了 `library`。
-- `capabilities`：只能收窄 manifest 的申请；留空表示采用 manifest 的申请或 `[tools, commands]`。
-- `allowed_tools` / `denied_tools`：`*` / `?` 通配符，deny 优先。
-- `settings`：任意 JSON 值，随 `initialize` 传给插件。
-- `network_allow`：精确域名或单个前导 `*.` 通配；空列表拒绝所有网络请求。
-- `secrets`：可读取的环境变量名；空列表拒绝所有 secret。
-- `rpc_allow`：可调用的其他插件名；`"*"` 允许全部，空列表拒绝所有 RPC。
+- `command` / `args` / `env` / `cwd`: the process entry point; use it alone or together with `manifest`.
+- `library`: the native dylib path, resolved relative to the config cwd and exclusive with
+  `command` / `components.server`. A dylib must also be granted the capabilities it actually uses, such
+  as `tools` and `commands`.
+- `enabled` / `timeout_secs`: enablement and request timeout in seconds.
+- `lazy`: defer startup until the first `plugin.start` or `/plugins start`.
+- `require_signature`: refuse unsigned packages or packages without `[package]`; default false.
+- `sandbox`: enable no_new_privs, PDEATHSIG, rlimits, and Landlock on Linux; a no-op elsewhere.
+  Default false.
+- `manifest`: `eix-plugin.toml`, resolved relative to the config cwd; its `name` must match the
+  config key. A manifest with `components.dylib` is equivalent to configuring `library`.
+- `capabilities`: can only narrow the manifest's request; empty means adopt the request or
+ `[tools, commands]`.
+- `allowed_tools` / `denied_tools`: `*` and `?` wildcards; deny wins.
+- `settings`: arbitrary JSON values, passed to the plugin in `initialize`.
+- `network_allow`: exact domains or a single leading `*.` wildcard; an empty list denies all network
+  requests.
+- `secrets`: readable environment variable names; an empty list denies every secret.
+- `rpc_allow`: callable plugin names; `"*"` allows all, and an empty list denies all RPC.
 
-项目级配置仍然不能添加或修改插件。
+Project-level configuration still cannot add or modify plugins.
 
-### 12.3 数据库
+### 12.3 Database
 
-- `plugin_kv`：已用于 storage，按插件名与 global/workspace scope 隔离。
-- `plugin_audit`、`plugin_installs`：规划中，尚未实现；当前审计用每插件日志 ring buffer 与 `plugin.doctor`。
-- 安装状态存在 `plugins/plugins.lock`（TOML），不写入 SQLite。
-- secrets 只从配置选择的环境变量读取，不落 SQLite。
-
----
-
-## 13. 可观测性与开发体验
-
-### 13.1 运维
-
-- 每插件内存 ring buffer 保留最近 500 行；`plugin.logs {name?, since?, limit?}` 用单调 `seq` 分页，不落库。`plugin.logs.clear` 清空，`plugin.doctor` 汇总状态、最近错误、日志尾部和 lockfile 漂移。
-- 日志写入前统一 `redact`，并统计 `error_count` 与 `last`；daemon 生命周期、stderr 与 `host.log` 都进入同一缓冲区。
-- `plugin.list` 返回 state / tools / commands / hooks / ui / rpc / events / capabilities / failures / error / lazy。
-- `plugin.settings {name}` 返回 schema 与当前值；`plugin.settings.set {name, values}` 校验并写回配置。
-- `plugin.ui.list` 返回已声明的 `{plugin, surface, id, title}` 表面，供 TUI 预知面板与 picker。
-- TUI `/plugins [name]`：列表、贡献计数、错误、settings schema；`/plugins logs [name]`、`/plugins doctor [name]`、`/plugins restart|start|stop|enable|disable|uninstall <name>`、`/plugins set <name> <key>=<json>…`。
-- TUI 还支持 `/plugins open|action|act|pick` 驱动视图树与插件 picker。
-- `/reload` 只重启配置指纹变化的插件；statusline 在 failed/degraded 时显示标记，启动与每次插件操作后静默刷新健康状态。
-
-### 13.2 开发
-
-- `eix plugin new <name> [--python|--dylib]` 生成 Python 插件或 dylib manifest 脚手架；`eix plugin run` 前台运行，`eix plugin test` 做 10s initialize 握手检查。
-- `eix plugin pack/verify/install/update/uninstall/verify-lock/trust/untrust` 已实现；install/update 直接写回 `[plugins.<name>]` 与 `plugins.lock`。
-- SDK：`crates/eix-plugin-sdk`（Rust）、`sdks/python/eix_plugin.py`、`sdks/typescript/`（ESM + `.d.ts`）。`eix-sdk` 仍是 daemon HTTP client，不是插件 SDK。
-- 一致性测试：`sdks/conformance/run.py` 启动插件并覆盖 initialize、tools/call、commands/run、hooks/run、ui/render 与 shutdown；Python 与 TS fixture 都有测试入口（见各 SDK README）。
-- 文档：本文件与 `crates/eix-core/src/plugin.rs` 的类型定义。
-- 示例：`examples/plugins/echo/` 覆盖 tools、commands、action、events、storage；`sdks/*/examples/` 覆盖 SDK。
+- `plugin_kv`: used for storage, isolated per plugin name and global/workspace scope.
+- `plugin_audit` and `plugin_installs`: planned, not implemented; observability currently uses the
+  per-plugin ring buffer and `plugin.doctor`.
+- Install state lives in `plugins/plugins.lock` (TOML), not in SQLite.
+- Secrets are read only from the configured environment variables and never stored in SQLite.
 
 ---
 
-## 14. 兼容与版本策略
+## 13. Observability and developer experience
 
-1. 当前 `PLUGIN_API_VERSION = 2` 是整数；握手双方必须完全一致。
-2. 每个贡献点未来可带独立 schema 版本，UI 树单独 `ui_schema`。
-3. v1 manifest / 旧 JSON 协议已删除，不提供兼容层；迁移方式是按第 4、7 节改写 manifest 与响应。
-4. 未知贡献点与未知 host 方法：明确失败或 `unsupported`，不静默降级。
-5. 未来协议升级流程：文档标记 → warning 期 → 提升 `PLUGIN_API_VERSION`；不同 major 不混跑。
+### 13.1 Operations
 
----
+- Each plugin keeps the last 500 lines in an in-memory ring buffer; `plugin.logs {name?, since?,
+  limit?}` pages by monotonic `seq` and never touches the database. `plugin.logs.clear` empties
+  it, and `plugin.doctor` summarises state, the last error, the log tail, and lockfile drift.
+- Logs are redacted before they are written, and `error_count` plus `last` are tracked. Daemon
+  lifecycle messages, stderr, and `host.log` all land in the same buffer.
+- `plugin.list` returns state, tools, commands, hooks, ui, rpc, events, capabilities, failures, error,
+  and lazy.
+- `plugin.settings {name}` returns the schema and current values; `plugin.settings.set {name, values}`
+  validates and writes the config back.
+- `plugin.ui.list` returns the declared `{plugin, surface, id, title}` surfaces, so the TUI knows the
+  panels and pickers in advance.
+- TUI `/plugins [name]` lists contributions, errors, and the settings schema; `/plugins logs [name]`,
+ `/plugins doctor [name]`, `/plugins restart|start|stop|enable|disable|uninstall <name>`, and
+ `/plugins set <name> <key>=<json>...` cover day-to-day operations.
+- The TUI also supports `/plugins open|action|act|pick` to drive view trees and the plugin picker.
+- `/reload` restarts only plugins whose config fingerprint changed; the statusline marks failed and
+  degraded plugins and silently refreshes health after startup and every plugin action.
 
-## 15. 落地路线
+### 13.2 Development
 
-### Phase 0：内核重构（已完成）
-
-- 把 `PluginManager` 拆成 `mod` / `client` / `host_api`。
-- 统一 tools / commands / events 注册表与启动时校验。
-- 加入状态枚举、声明式命令、工具名过滤、事件订阅。
-- 验收：`cargo test -p eixd plugin` 与插件 e2e 覆盖新协议。
-
-### Phase 1：协议 v2 + SDK（已完成）
-
-- JSON-RPC 2.0 帧、多路复用、取消、content blocks 已落地。
-- Python / TypeScript SDK 与共享 conformance harness 已落地；Rust 侧为 `eix-plugin-sdk`。
-- 验收：一个慢工具不阻塞同插件的第二个调用；取消能生效。
-
-### Phase 2：Hooks + 声明式插件 + Action 命令（核心已完成）
-
-- hook 点、顺序、超时、失败策略已落地；审计表尚未实现。
-- `commands` 支持 action。
-- 声明式 themes / keymaps / agents / skills / mcp_servers 仍未实现。
-- settings schema 已解析，`plugin.settings.set` 校验后写回配置并通过 `config.changed` 热更新；TUI 仍只读展示。
-- 连续失败 3 次进入 `degraded`，成功一次恢复。
-
-### Phase 3：UI 贡献（已完成）
-
-- `panel` / `status` / `notification` / `picker` 已落地；`UiNode` 视图树、`ui.render` / `ui.action` / `ui.pick` 已实现。
-- TUI 把节点渲染进文本 overlay，并提供 `/plugins open|action|act|pick`；插件 picker 支持 200ms 防抖查询。
-- `/plugins [name]` 管理器已落地，并展示插件声明的 UI 表面。
-- 验收：插件能打开/更新/关闭面板与选择器，JSON 不被当作 ANSI 执行。
-
-### Phase 4：安全与分发（已完成，registry 除外）
-
-- fs / network / secrets / RPC 的 allowlist 已落地。
-- `require_signature`、`min_host_version`、平台 `target`/`artifact`、Linux opt-in sandbox 与 `plugins.lock` 已落地。
-- `pack` / `verify` / `install` / `update` / `uninstall` / Ed25519 签名 / trust store 已落地；registry 与自动升级未实现。
-
-### Phase 5：高级扩展（部分完成）
-
-- 插件间 RPC 与 jobs 已落地；provider adapter、WASM 可选层未实现。
+- `eix plugin new <name> [--python|--dylib]` scaffolds a Python plugin or a dylib manifest;
+ `eix plugin run` runs it in the foreground, and `eix plugin test` performs a 10 s initialize
+  handshake check.
+- `eix plugin pack/verify/install/update/uninstall/verify-lock/trust/untrust` are implemented;
+  install and update write `[plugins.<name>]` and `plugins.lock` directly.
+- SDKs: `crates/eix-plugin-sdk` (Rust), `sdks/python/eix_plugin.py`, and `sdks/typescript/`
+  (ESM plus `.d.ts`). Note that `eix-sdk` is the daemon HTTP client, not a plugin SDK.
+- Conformance: `sdks/conformance/run.py` starts a plugin and covers initialize, tools/call,
+  commands/run, hooks/run, ui/render, and shutdown. The Python and TypeScript fixtures both have
+  entry points; see each SDK README.
+- Documentation: this file plus the type definitions in `crates/eix-core/src/plugin.rs`.
+- Examples: `examples/plugins/echo/` covers tools, commands, actions, events, and storage;
+ `sdks/*/examples/` covers the SDKs.
 
 ---
 
-## 16. 关键决策
+## 14. Compatibility and versioning
 
-| 决策                | 结论     | 理由                                     |
-| ---                 | ---      | ---                                      |
-| 进程内 dylib        | 可信 opt-in | 用 C 边界 + 5 个符号 + JSON dispatch 保持演进；只加载受信任库，默认仍用进程后端 |
-| 进程外 JSON         | 默认     | 语言无关、调试简单、崩溃隔离             |
-| WASM                | 后续可选 | 真正沙箱，但 UI/网络/文件能力要重做一遍  |
-| 原始 ANSI UI        | 不做     | 破坏主题、键位、布局和可访问性           |
-| 插件直接改消息历史  | 限制     | 只允许追加 context / 标注，避免绕过审批  |
-| hook 批准工具       | 禁止     | 安全边界必须留在 host                    |
-| 每 workspace 一进程 | 默认不做 | 进程数膨胀；用 per-call scope + 可选开关 |
-| 项目级插件          | 默认禁止 | 克隆仓库不能自动执行代码                 |
-| 插件工具自动批准    | 禁止     | 维持 `RiskCategory::Plugin` 策略         |
+1. `PLUGIN_API_VERSION = 2` is an integer, and both sides of the handshake must match exactly.
+2. Each contribution point may later carry its own schema version, with a separate `ui_schema` for
+  the view tree.
+3. v1 manifests and the old JSON protocol are removed with no compatibility layer; migrate by
+  rewriting the manifest and responses per sections 4 and 7.
+4. Unknown contribution points and unknown host methods fail explicitly or report `unsupported`;
+  there is no silent degradation.
+5. Future upgrades: document the change, keep it in a warning period, then bump
+ `PLUGIN_API_VERSION`. Different majors never run mixed.
 
 ---
 
-## 17. 开放问题
+## 15. Roadmap
 
-1. 插件生态主语言：Python、TypeScript/Node、Rust 的优先级。
-2. UI 插件范围：先做 picker/status/settings，还是直接做自定义 pane。
-3. 项目级插件是否允许，以及 trust / 签名的具体形式。
-4. 是否要 WASM 层；这会显著增加协议和运行时复杂度。
-5. 是否允许插件贡献 model provider（涉及 network、secrets、streaming）。
-6. 多 workspace daemon 下默认共享进程还是按 workspace 隔离。
+### Phase 0: kernel refactor (done)
+
+- Split `PluginManager` into `mod`, `client`, and `host_api`.
+- Unify the tools, commands, and events registries with startup validation.
+- Add state enums, declarative commands, tool-name filtering, and event subscriptions.
+- Acceptance: `cargo test -p eixd plugin` and the plugin e2e suite cover the new protocol.
+
+### Phase 1: protocol v2 and SDKs (done)
+
+- JSON-RPC 2.0 frames, multiplexing, cancellation, and content blocks have landed.
+- The Python and TypeScript SDKs plus the shared conformance harness have landed; Rust uses
+ `eix-plugin-sdk`.
+- Acceptance: a slow tool does not block a second call on the same plugin, and cancellation works.
+
+### Phase 2: hooks, declarative plugins, action commands (core done)
+
+- Hook points, ordering, timeouts, and failure policy have landed; the audit table has not.
+- `commands` supports actions.
+- Declarative themes, keymaps, agents, skills, and mcp_servers are not implemented.
+- The settings schema is parsed, and `plugin.settings.set` validates, writes back, and hot-reloads
+  through `config.changed`; the TUI still displays values read-only.
+- Three consecutive failures enter `degraded`, and one success restores `ready`.
+
+### Phase 3: UI contributions (done)
+
+- `panel`, `status`, `notification`, and `picker` have landed; the `UiNode` view tree,
+ `ui.render`, `ui.action`, and `ui.pick` are implemented.
+- The TUI renders nodes into a text overlay and offers `/plugins open|action|act|pick`; the plugin
+  picker debounces queries by 200 ms.
+- The `/plugins [name]` manager has landed and shows the UI surfaces a plugin declares.
+- Acceptance: a plugin can open, update, and close panels and pickers, and JSON is never executed as
+  ANSI.
+
+### Phase 4: security and distribution (done, except the registry)
+
+- Filesystem, network, secrets, and RPC allowlists have landed.
+- `require_signature`, `min_host_version`, platform `target`/`artifact`, the opt-in Linux sandbox, and
+ `plugins.lock` have landed.
+- `pack` / `verify` / `install` / `update` / `uninstall`, Ed25519 signatures, and the trust store have
+  landed; the registry and automatic upgrades have not.
+
+### Phase 5: advanced extensions (partial)
+
+- Inter-plugin RPC and jobs have landed; provider adapters and the optional WASM layer have not.
 
 ---
 
-## 18. 与现有代码的映射
+## 16. Key decisions
 
-| 位置                                 | 现状                                                                     |
-| ---                                  | ---                                                                      |
-| `crates/eix-core/src/plugin.rs`      | manifest v2、配置、JSON-RPC、content blocks、hooks/ui/rpc、UiNode、action/settings 类型 |
-| `crates/eix-core/src/plugin_package.rs` | `pack` / `verify` / `install` / `update`、checksums、Ed25519、trust store、`plugins.lock` / `verify_lock` |
-| `crates/eixd/src/plugin/mod.rs`      | `PluginManager`、注册表、生命周期与 supervisor、日志/doctor、hooks 管线、RPC 路由、声明式/action 命令、UI 渲染、backend 选择、`degraded` 计数、settings 写入 |
-| `crates/eixd/src/plugin/logs.rs`     | 每插件 500 行 ring buffer、seq 分页、脱敏、error_count/last |
-| `crates/eixd/src/plugin/backend.rs`  | `ExtensionBackend` trait 与 `BackendFuture`                                |
-| `crates/eixd/src/plugin/process.rs`  | `ProcessBackend`：JSON-RPC 子进程适配器                                    |
-| `crates/eixd/src/plugin/dylib.rs`    | `DylibBackend`、ABI 校验、方法翻译、超时、dylib host API                    |
-| `crates/eixd/src/plugin/client.rs`   | 进程 spawn、sandbox、writer/reader、请求多路复用、超时取消、事件投递、features |
-| `crates/eixd/src/plugin/host_api.rs` | `HostContext`、共享 `WorkspaceFs`/blob、fs/net/secrets/session/ui/rpc/job 与能力校验 |
-| `crates/eixd/src/server.rs`          | `plugin.command.run` / `plugin.settings[.set]` / `plugin.ui.list|render|action|pick` / `plugin.logs[.clear]` / `plugin.doctor`、watcher 自写抑制、turn/tool/prompt hook 接入 |
-| `crates/eixd/src/classifier.rs`      | `RiskCategory::Plugin` 保留；插件工具默认审批                              |
-| `crates/eix-tui/src/main.rs`         | `eix plugin new/run/test/pack/verify/install/update/uninstall/trust/untrust` CLI |
-| `crates/eix-tui/src/tui/app/`        | `/plugins [name|logs|doctor|start|stop|restart|enable|disable|uninstall|set|open|action|act|pick]`、`plugin.ui.*`、`plugin_ui.rs` 视图树渲染 |
-| `crates/eix-core/src/config.rs`      | `plugins` 解析与 allowlist 校验、`register_plugin` / `remove_plugin_config`；项目级 `plugins` 仍被删除 |
-| `crates/eix-plugin-sdk/`             | Rust 插件 SDK                                                             |
-| `sdks/python/`、`sdks/typescript/`   | Python 与 TS/JS 插件 SDK、示例与测试                                      |
-| `sdks/conformance/`                  | 共享协议一致性 harness                                                    |
-| `examples/plugins/echo/`             | v2 示例：JSON-RPC 2.0、content blocks、storage、events、action              |
-| `examples/plugins/hello-dylib/`      | dylib 示例：ABI v1、`echo` 工具、`sync` action 命令                          |
+| Decision | Outcome | Rationale |
+| --- | --- | --- |
+| In-process dylib | Trusted opt-in | A C boundary with five symbols and JSON dispatch keeps it evolvable; only trusted libraries load, and the process backend stays the default |
+| Out-of-process JSON-RPC | Default | Language-agnostic, easy to debug, isolates crashes |
+| Capability gateway | Every host call | The capability model is the enforcement point, independent of the backend |
+| Host-rendered UI | Always | Plugins never drive the terminal, so rendering stays safe and themeable |
+| Two-tier manifests | Declarative first | Most extensions need no code, and code is opt-in |
+| Integer API version | Exact match | A mismatch fails loudly rather than half-working |
 
-hooks / UI / RPC 的接入点见第 7、8、9 节；未实现的只有 registry、自动升级、WASM/hosted 与 TUI 内 settings 编辑。
+---
 
-## 19. 后续最小步骤
+## 17. Open questions
 
-1. registry 与签名分发的自动升级流程。
-2. 更多声明式贡献：skills / agents / themes / keymaps / MCP。
-3. TUI 内 settings 编辑与更丰富的视图节点（tree/tabs/progress/diff）。
-4. WASM 或 hosted 插件运行时（真正强隔离）。
-5. 持久化 `plugin_audit`（当前使用内存 ring buffer 与 `plugin.doctor`）。
+1. When to require signatures by default, and how to make local development pleasant.
+2. Whether to add a registry service, or stay with directory installs plus a lockfile.
+3. Which contribution points deserve first-class declarative forms next (skills, agents, themes,
+  keymaps, MCP).
+4. How much of the async host API can be exposed to dylib plugins through a bridging worker.
+5. Whether the audit trail belongs in SQLite, the event log, or both.
+6. With a multi-workspace daemon, whether to share one process by default or isolate per workspace.
+
+---
+
+## 18. Mapping to existing code
+
+| Location | Status |
+| --- | --- |
+| `crates/eix-core/src/plugin.rs` | Manifest v2, config, JSON-RPC, content blocks, hooks/ui/rpc, `UiNode`, action and settings types |
+| `crates/eix-core/src/plugin_package.rs` | `pack` / `verify` / `install` / `update`, checksums, Ed25519, trust store, `plugins.lock` / `verify_lock` |
+| `crates/eixd/src/plugin/mod.rs` | `PluginManager`, registry, lifecycle and supervisor, logs/doctor, hook pipeline, RPC routing, declarative and action commands, UI rendering, backend selection, `degraded` counters, settings writes |
+| `crates/eixd/src/plugin/logs.rs` | 500-line ring buffer per plugin, seq paging, redaction, error_count and last |
+| `crates/eixd/src/plugin/backend.rs` | `ExtensionBackend` trait and `BackendFuture` |
+| `crates/eixd/src/plugin/process.rs` | `ProcessBackend`: the JSON-RPC child-process adapter |
+| `crates/eixd/src/plugin/dylib.rs` | `DylibBackend`, ABI checks, method translation, timeouts, dylib host API |
+| `crates/eixd/src/plugin/client.rs` | Process spawn, sandbox, writer/reader, request multiplexing, timeout cancellation, event delivery, features |
+| `crates/eixd/src/plugin/host_api.rs` | `HostContext`, shared `WorkspaceFs`/blob, fs/net/secrets/session/ui/rpc/job, capability checks |
+| `crates/eixd/src/server.rs` | `plugin.command.run`, `plugin.settings[.set]`, `plugin.ui.list|render|action|pick`, `plugin.logs[.clear]`, `plugin.doctor`, watcher self-write suppression, turn/tool/prompt hook wiring |
+| `crates/eixd/src/classifier.rs` | `RiskCategory::Plugin` retained; plugin tools need approval by default |
+| `crates/eix-tui/src/main.rs` | `eix plugin new/run/test/pack/verify/install/update/uninstall/trust/untrust` CLI |
+| `crates/eix-tui/src/tui/app/` | `/plugins [name|logs|doctor|start|stop|restart|enable|disable|uninstall|set|open|action|act|pick]`, `plugin.ui.*`, and view-tree rendering in `plugin_ui.rs` |
+| `crates/eix-core/src/config.rs` | `plugins` parsing and allowlist validation, `register_plugin` / `remove_plugin_config`; a project-level `plugins` table is still dropped |
+| `crates/eix-plugin-sdk/` | The Rust plugin SDK |
+| `sdks/python/`, `sdks/typescript/` | Python and TS/JS plugin SDKs, examples, and tests |
+| `sdks/conformance/` | The shared protocol conformance harness |
+| `examples/plugins/echo/` | A v2 example covering JSON-RPC 2.0, content blocks, storage, events, and an action |
+| `examples/plugins/hello-dylib/` | A dylib example: ABI v1, an `echo` tool, and a `sync` action command |
+
+The hook, UI, and RPC wiring points are covered in sections 7, 8, and 9. The only pieces still
+missing are a registry, automatic upgrades, the WASM or hosted runtime, and in-TUI settings
+editing.
+
+## 19. Next minimal steps
+
+1. A registry, plus automatic upgrades for signed distributions.
+2. More declarative contributions: skills, agents, themes, keymaps, and MCP.
+3. In-TUI settings editing and richer view nodes (tree, tabs, progress, diff).
+4. A WASM or hosted plugin runtime for real isolation.
+5. A persistent `plugin_audit` table, replacing the in-memory ring buffer and `plugin.doctor`.

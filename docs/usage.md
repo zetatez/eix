@@ -11,7 +11,10 @@ eix doctor  # environment check: config, paths, daemon state
 ```
 
 This page is the entry-level overview; each topic has its own document:
-[Worktrees](./worktree.md) · [Voice](./voice.md) · [Voice setup](./voice-setup.md) ·
+[Configuration](./config.md) · [Worktrees](./worktree.md) · [Voice](./voice.md) ·
+[Voice setup](./voice-setup.md) · [Plugins](./plugins.md) ·
+[dylib plugins](./plugin-dylib.md) · [Neovim](./nvim.md) ·
+[LSP](./lsp.md) · [Design](../DESIGN.md)
 [Plugins](./plugins.md) · [dylib plugins](./plugin-dylib.md) · [Neovim](./nvim.md) ·
 [LSP](./lsp.md) · [Design](../DESIGN.md)
 
@@ -138,7 +141,7 @@ as `new_session = "leader n"`.
 | `/doctor`  `/voice` | Self-check / voice input |
 | `/code-review`  `/security-review`  `/simplify`  `/verify` | Built-in prompt templates |
 
-The complete list is in the `F1` help panel or in [DESIGN.md](../DESIGN.md#19-实现参考).
+The complete list is in the `F1` help panel or in `DESIGN.md` (section 19).
 
 ### Approvals and diffs
 

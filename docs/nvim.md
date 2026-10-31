@@ -41,7 +41,7 @@ Only after successful authentication do other responses and events flow; failure
 `unauthorized` and disconnects. The token can be the configured `server.token`, or a client token
 minted by exchanging a one-time `eix pair` code (the daemon stores only its SHA-256 and manages
 tokens with `eix pair list` / `revoke`). HTTP/SSE is an alternative integration path; see
-[DESIGN.md §19](../DESIGN.md#196-neovim-插件集成).
+[DESIGN.md](../DESIGN.md), section 19.6.
 
 ## Message format
 
