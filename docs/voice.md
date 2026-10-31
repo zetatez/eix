@@ -1,9 +1,11 @@
 # Voice input
 
-Speech-to-text is off by default. When enabled, the client captures audio, the
-daemon owns the recognition session, and text arrives as ordinary events. The
-split is deliberate: capture needs a device the daemon must not touch, and the
-engine choice should not change the client.
+Speech-to-text is available by default, but nothing happens on its own: audio
+is only captured after the user asks for `/voice`, and an idle session never
+opens a microphone. Once asked, the client captures audio, the daemon owns the
+recognition session, and text arrives as ordinary events. The split is
+deliberate: capture needs a device the daemon must not touch, and the engine
+choice should not change the client.
 
 ```toml
 [voice]
@@ -23,7 +25,7 @@ eix auth login asr.deepgram
 
 ### `local`
 
-The daemon spawns `[voice.local] command` once per utterance, writes raw PCM16
+The daemon spawns the helper once per utterance, writes raw PCM16
 little-endian mono 16 kHz to its stdin, and reads one JSON object per line from
 its stdout:
 
@@ -37,6 +39,46 @@ its stdout:
 agreed on. The UI renders that prefix normally and the rest dimmer; a helper
 that cannot report it sends `0`, and the client replaces the whole line each
 time.
+
+Nothing needs configuring beyond `[voice] enabled = true`. The helper is found
+on `PATH`, next to `eixd`, or in `~/.local/bin`. The engine follows what is
+installed: SenseVoice (`<data-dir>/models/sense-voice/model.int8.onnx`) when
+present, because it is far stronger on Chinese than a whisper model small
+enough to dictate with, otherwise the largest `ggml-*.bin` in
+`<data-dir>/models`. The language is detected. `[voice.local] command`,
+`model_dir`, `engine` and `args` each override one of those guesses. `args`
+replaces the arguments derived from `engine`, but `--model` and `--language`
+are still appended when missing, so a stale `args` cannot leave the helper
+without a model.
+
+SenseVoice is the stronger engine for Chinese. It needs `sherpa-onnx-offline`
+on `PATH` plus one download:
+
+```sh
+mkdir -p ~/.local/share/eix/models/sense-voice
+cd ~/.local/share/eix/models/sense-voice
+B=https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main
+curl -L -O $B/model.int8.onnx -O $B/tokens.txt
+```
+
+`model.int8.onnx` is 239 MB and the ONNX runtime rejects a truncated one with
+`Protobuf parsing failed`, so verify the checksum before relying on it:
+
+```sh
+sha256sum model.int8.onnx
+# c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51
+```
+
+Until both files are present the engine stays on whisper. A file that exists but
+is short is treated as missing, so a broken download degrades to whisper instead
+of failing at the first utterance.
+
+Measured on the published `zh.wav` / `en.wav` test clips on one laptop core:
+SenseVoice decodes at about 0.02 RTF (120 ms for 5.6 s of speech) and peaks
+around 380 MB RSS; `ggml-base.bin` peaks around 285 MB. The process is spawned
+per utterance, so the first syllable of a session also pays model load, roughly
+0.7 s for SenseVoice. Whisper-base transcribes the Chinese clip as English
+word salad; SenseVoice gets it right.
 
 The daemon passes `--protocol eix-asr/1 --rate 16000`, plus `--language` when
 `[voice] language` is set. Keeping ONNX Runtime and whisper out of this binary
@@ -60,6 +102,45 @@ There are no partials; the capability flags returned by `asr.start` say so.
 No device, model or network. The final text is `[voice] <N> ms`, enough to
 exercise a client end to end.
 
+## Rewriting the transcript
+
+A small local engine is fast and cheap but mishears identifiers, file names and
+punctuation, and dictation itself repeats words, abandons sentences and jumps
+between topics. `[voice.refine] enabled = true` sends each finished transcript
+through a chat model before `asr.final` is published, so the input box receives
+cleaned text without a bigger acoustic model:
+
+```toml
+[voice.refine]
+enabled = true
+model = "openai/gpt-4o-mini"   # empty uses the default model
+timeout_ms = 8000
+prompt = "Prefer British spelling, and spell the product as eix."
+```
+
+`model` and `prompt` are both optional: an empty `model` uses the configured
+default model, and `prompt` is appended to the built-in instructions rather than
+replacing them, so it is the place for domain vocabulary, naming rules and tone.
+
+The built-in instructions fix misheard words from context, restore punctuation,
+drop fillers and stutters, collapse pause-induced repetitions, and join the
+fragments of a broken train of thought into complete sentences. They forbid
+answering a question, adding facts, dropping a request or summarising, and
+keep the speaker's language and order of ideas.
+
+The rewrite is one non-streaming completion with no tools, and it is the only
+part of dictation that touches the provider. It never blocks correctness: on
+timeout, provider error, empty output, or output that is unusable as an edit
+(fenced or quoted wrapping, more than three times the transcript length, or a
+summary that keeps under a quarter of a long transcript), the raw transcript is
+published instead and `asr.final` carries `degraded: true`. Output identical to
+the transcript means it was already clean: that is a successful pass, not a
+degraded one. Partial hypotheses are never rewritten, so interim text stays
+exactly what the engine heard.
+
+`degraded` is thus about the edit, not about what was heard: `false` means the
+text you see is either the model's edit or the transcript it agreed with.
+
 ## Protocol
 
 ## Dictation in the TUI
@@ -76,10 +157,11 @@ microphone and writes into the prompt like typing does.
 
 Capture shells out to the first recorder found on `PATH` (`parec`,
 `pw-record`, then `arecord`), so no audio crate is needed. Override it with
-`[voice.capture] command`. Segmentation is energy based: `threshold` is the
-RMS that counts as speech, `silence_ms` ends an utterance, and
-`max_utterance_ms` stops one that never goes quiet. A quiet room matters;
-raise `threshold` if background noise keeps the utterance open.
+`[voice.capture] command`. Segmentation is energy based and needs no tuning:
+`threshold` defaults to an RMS of 0.004, which hears a soft voice in a quiet
+room and ignores room hum; an utterance ends after `silence_ms` (800 by
+default) of quiet, and `max_utterance_ms` stops one that never goes quiet.
+Raise `threshold` only if background noise keeps an utterance open.
 
 | Method | Params | Result |
 | --- | --- | --- |

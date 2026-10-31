@@ -491,4 +491,27 @@ mod tests {
         assert!(rms(&frame(0)) < 0.001);
         assert!(rms(&frame(8000)) > 0.2);
     }
+
+    #[test]
+    fn the_default_gate_hears_quiet_speech() {
+        // About -45 dBFS: a soft voice across a laptop microphone, well under
+        // the old 0.02 default, which missed it entirely.
+        let soft = frame(200);
+        assert!(rms(&soft) > 0.005 && rms(&soft) < 0.01);
+        assert_eq!(
+            Vad::new(&CaptureConfig::default()).push(&soft, FRAME_MS),
+            Step::Start
+        );
+    }
+
+    #[test]
+    fn the_default_gate_ignores_a_quiet_room() {
+        let mut vad = Vad::new(&CaptureConfig::default());
+        // Digital silence and a faint room hum both stay below the gate; 0.04
+        // counts is about -48 dBFS, quieter than any voice reaches the mic.
+        for _ in 0..100 {
+            assert_eq!(vad.push(&frame(0), FRAME_MS), Step::Idle);
+            assert_eq!(vad.push(&frame(40), FRAME_MS), Step::Idle);
+        }
+    }
 }

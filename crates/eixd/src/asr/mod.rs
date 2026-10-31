@@ -15,7 +15,7 @@
 //!   REST endpoint, which both Deepgram and OpenAI-compatible gateways expose.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,11 +23,15 @@ use eix_core::asr::{
     AsrError, AsrErrorKind, AsrEvent, BackendKind, Caps, CloudProvider, PcmFormat, Support,
     VoiceConfig, Word, MAX_UTTERANCE_SECS, SAMPLE_RATE,
 };
+use eix_core::config::ModelRoute;
+use eix_core::ChatMessage;
 use eix_core::Notification;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::{broadcast, mpsc, Mutex};
+
+use crate::provider::Provider;
 
 /// Audio queued ahead of the engine. 32 chunks of 100 ms covers a hiccup of
 /// about three seconds before audio has to be dropped.
@@ -72,6 +76,145 @@ pub struct Manager {
     sessions: Mutex<HashMap<String, Handle>>,
 }
 
+/// Optional second pass over a finished transcript by a chat model.
+///
+/// Small ASR models mishear identifiers and drop punctuation, so the raw text
+/// is sent through the configured chat model before it reaches the client.
+/// Every failure keeps the raw transcript: dictation must never lose words to
+/// a model that is slow, down, or answers the text instead of cleaning it.
+#[derive(Clone)]
+pub struct Refiner {
+    provider: Arc<Provider>,
+    route: ModelRoute,
+    timeout: Duration,
+    prompt: String,
+}
+
+impl Refiner {
+    pub fn new(
+        provider: Arc<Provider>,
+        route: ModelRoute,
+        config: &eix_core::asr::RefineConfig,
+    ) -> Self {
+        Self {
+            provider,
+            route,
+            timeout: Duration::from_millis(u64::from(config.timeout_ms.clamp(500, 60_000))),
+            prompt: config.prompt.clone(),
+        }
+    }
+
+    async fn rewrite(&self, text: &str) -> Rewrite {
+        let messages = refine_messages(text, &self.prompt);
+        let cancel = AtomicBool::new(false);
+        let completion = tokio::time::timeout(
+            self.timeout,
+            self.provider
+                .stream_chat(&messages, &self.route, &[], &cancel, |_| {}, |_| {}),
+        )
+        .await;
+        let Ok(Ok(completion)) = completion else {
+            return Rewrite::Failed;
+        };
+        clean_refined(text, &completion.text)
+    }
+}
+
+/// Outcome of one rewrite pass over a finished transcript.
+#[derive(Debug, PartialEq, Eq)]
+enum Rewrite {
+    /// The model returned edited text to publish instead of the raw transcript.
+    Edited(String),
+    /// The model judged the transcript already correct. Not a failure.
+    Unchanged,
+    /// Timeout, provider error, or output unusable as an edit.
+    Failed,
+}
+
+fn refine_messages(raw: &str, extra: &str) -> Vec<ChatMessage> {
+    let mut system = String::from(
+        "You edit raw speech-to-text into what the speaker meant to type into a coding agent's input box.\n\
+Return only the edited transcript: no explanation, no quotes, no code fences.\n\
+\n\
+Accuracy:\n\
+- Fix misheard words using the surrounding context: identifiers, file paths, CLI flags, product and API names.\n\
+- Restore punctuation, capitalisation and spacing. Start a new paragraph only when the topic changes.\n\
+- Keep the speaker's language. Never translate.\n\
+\n\
+Fluency:\n\
+- Remove fillers (um, uh, er, like, you know, 嗯, 呃, 那个, 就是) and stutters.\n\
+- Drop false starts the speaker abandoned mid-word, and collapse repetitions caused by a pause or by a\n\
+  recogniser loop (\"the the config config\") into one copy.\n\
+- Join fragments left by a broken train of thought into complete sentences, adding the connectives the\n\
+  speaker left out (and, then, but, so), so each point reads as one coherent thought.\n\
+\n\
+Organisation:\n\
+- Group points that belong together, and split unrelated topics into separate paragraphs.\n\
+- When the speaker said the qualification before the request, put the main request first and the\n\
+  qualification after it. Drop or reword nothing to do so.\n\
+- Prefer reordering to rewriting: the speaker's own words are the safest carrier of intent.\n\
+\n\
+Meaning is fixed:\n\
+- Do not answer questions, add facts, drop requests, weaken instructions, or invent detail.\n\
+- Do not summarise: every distinct request and constraint must survive. Stay close to the original length.\n\
+- When a word is ambiguous and the context does not resolve it, keep what the speaker said.\n\
+- If nothing needs fixing, return the text unchanged.",
+    );
+    if !extra.trim().is_empty() {
+        system.push_str("\n\nAdditional instructions:\n");
+        system.push_str(extra.trim());
+    }
+    vec![ChatMessage::system(system), ChatMessage::user(raw)]
+}
+
+/// Accept a rewrite only when it plausibly is one: output that is empty, long
+/// enough to be a model replying to the transcript, or short enough to be a
+/// summary of it is a failure, and unchanged text is a pass with no edit.
+fn clean_refined(raw: &str, output: &str) -> Rewrite {
+    let mut text = output.trim();
+    if let Some(rest) = text.strip_prefix("```") {
+        // Drop an optional language tag and the closing fence.
+        let rest = rest.split_once('\n').map(|(_, body)| body).unwrap_or(rest);
+        text = rest.trim_end_matches("```").trim();
+    }
+    let text = text.trim().trim_matches('"').trim();
+    let raw_len = raw.trim().chars().count();
+    let edited_len = text.chars().count();
+    if text.is_empty() {
+        return Rewrite::Failed;
+    }
+    if text == raw.trim() {
+        return Rewrite::Unchanged;
+    }
+    if edited_len > raw_len * 3 + 120 {
+        return Rewrite::Failed;
+    }
+    // Tidying invites summarising, so a rewrite that keeps under a quarter of a
+    // long transcript is treated as a summary and rejected. Short inputs are
+    // exempt: a stutter-heavy fragment can legitimately shrink that far.
+    if raw_len >= 80 && edited_len * 4 < raw_len {
+        return Rewrite::Failed;
+    }
+    Rewrite::Edited(text.to_string())
+}
+
+/// Clean the finished transcript, returning the text to publish and whether the
+/// rewrite failed. A failure keeps the raw text and is reported as `degraded`,
+/// so a client can tell "heard correctly" from "heard correctly, not edited".
+async fn finalize(refiner: Option<&Refiner>, text: String) -> (String, bool) {
+    let Some(refiner) = refiner else {
+        return (text, false);
+    };
+    if text.trim().is_empty() {
+        return (text, false);
+    }
+    match refiner.rewrite(&text).await {
+        Rewrite::Edited(edited) => (edited, false),
+        Rewrite::Unchanged => (text, false),
+        Rewrite::Failed => (text, true),
+    }
+}
+
 impl Manager {
     pub fn new(bus: broadcast::Sender<Notification>) -> Self {
         Self {
@@ -90,6 +233,7 @@ impl Manager {
         config: &VoiceConfig,
         session_id: Option<String>,
         api_key: Option<String>,
+        refiner: Option<Refiner>,
     ) -> Result<StartInfo, AsrError> {
         config.validate()?;
         let caps = caps_for(config.backend);
@@ -115,7 +259,7 @@ impl Manager {
         let client = self.client.clone();
         let drops = Arc::clone(&pending_drop);
         tokio::spawn(async move {
-            drive(engine, rx, emitter, caps, client, drops).await;
+            drive(engine, rx, emitter, caps, client, drops, refiner).await;
         });
         self.sessions.lock().await.insert(
             utterance_id.clone(),
@@ -344,9 +488,10 @@ struct LocalConfig {
 
 impl LocalConfig {
     fn from_voice(config: &VoiceConfig) -> Result<Self, AsrError> {
-        let command = config.local.command.clone().ok_or_else(|| {
-            AsrError::unavailable("local backend needs [voice.local] command (see docs/voice.md)")
-        })?;
+        let command = match config.local.command.clone() {
+            Some(command) => command,
+            None => discover_helper()?,
+        };
         if !command.exists() {
             return Err(AsrError::unavailable(format!(
                 "local asr helper {} does not exist",
@@ -354,23 +499,31 @@ impl LocalConfig {
             )));
         }
         let mut args = config.local.args.clone();
-        if args.is_empty() && !config.local.engine.is_empty() {
+        let engine = if config.local.engine.trim().is_empty() {
+            // Auto: SenseVoice when it is installed, because it is far better
+            // on Chinese than a whisper model small enough to dictate with.
+            match sense_voice_model() {
+                Some(_) => "sherpa",
+                None => "whisper",
+            }
+        } else {
+            config.local.engine.trim()
+        };
+        if args.is_empty() {
             args.push("--engine".into());
-            args.push(config.local.engine.clone());
+            args.push(engine.to_string());
         }
-        // Independent of `--engine`: a model directory is useful with or
-        // without it, and silently dropping it would leave whisper without a
-        // model file.
-        if !args.iter().any(|arg| arg == "--model") && config.local.model_dir.is_some() {
-            args.push("--model".into());
-            args.push(
-                config
-                    .local
-                    .model_dir
-                    .as_ref()
-                    .map(|dir| dir.display().to_string())
-                    .unwrap_or_default(),
-            );
+        // Independent of `--engine`: a model is useful with or without it, and
+        // silently dropping it would leave the engine without a model file.
+        if !args.iter().any(|arg| arg == "--model") {
+            let model = config.local.model_dir.clone().or_else(|| match engine {
+                "sherpa" | "sherpa-onnx" => sense_voice_model(),
+                _ => discover_model(),
+            });
+            if let Some(model) = model {
+                args.push("--model".into());
+                args.push(model.display().to_string());
+            }
         }
         if !config.language.trim().is_empty() {
             args.push("--language".into());
@@ -378,6 +531,79 @@ impl LocalConfig {
         }
         Ok(Self { command, args })
     }
+}
+
+/// Locate the local helper the way a shipped install lays it out: `PATH` first
+/// (covers `cargo install` and distro packages), then next to the daemon (a
+/// build tree), then the per-user bin directory.
+fn discover_helper() -> Result<std::path::PathBuf, AsrError> {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(paths) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&paths) {
+            candidates.push(dir.join("eix-asr"));
+        }
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("eix-asr"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".local/bin/eix-asr"));
+    }
+    candidates
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            AsrError::unavailable(
+                "no eix-asr helper found: build it with `cargo build -p eix-asr` \
+                 and put it on PATH, or set [voice.local] command",
+            )
+        })
+}
+
+/// Best installed model when none is configured: the largest `ggml-*.bin` in
+/// `<data-dir>/models`. Larger whisper models are more accurate, so "largest"
+/// is the right guess without asking the user to name one.
+fn discover_model() -> Option<std::path::PathBuf> {
+    let dir = eix_core::config::data_dir().join("models");
+    let mut best: Option<(u64, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path();
+        if path.extension().is_some_and(|ext| ext == "bin") {
+            let size = entry.metadata().ok().map(|meta| meta.len()).unwrap_or(0);
+            if best.as_ref().is_none_or(|(largest, _)| size > *largest) {
+                best = Some((size, path));
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// The SenseVoice model, if one is installed. Its `tokens.txt` sits next to it,
+/// which is the layout the published archive uses.
+///
+/// A truncated download leaves a file that exists but cannot load, so require
+/// a plausible size and the vocabulary beside it. Missing either means "not
+/// installed" and the engine falls back to whisper instead of failing at the
+/// first utterance.
+fn sense_voice_model() -> Option<std::path::PathBuf> {
+    let dir = eix_core::config::data_dir().join("models/sense-voice");
+    const MIN_BYTES: u64 = 10 * 1024 * 1024;
+    if !dir.join("tokens.txt").is_file() {
+        return None;
+    }
+    for name in ["model.int8.onnx", "model.onnx"] {
+        let path = dir.join(name);
+        if path
+            .metadata()
+            .is_ok_and(|meta| meta.is_file() && meta.len() >= MIN_BYTES)
+        {
+            return Some(path);
+        }
+    }
+    None
 }
 
 struct CloudConfig {
@@ -459,11 +685,12 @@ async fn drive(
     caps: Caps,
     client: reqwest::Client,
     drops: Arc<AtomicU64>,
+    refiner: Option<Refiner>,
 ) {
     match engine {
-        Engine::Fake => run_fake(rx, emitter, drops).await,
-        Engine::Local(config) => run_local(config, rx, emitter, caps, drops).await,
-        Engine::Cloud(config) => run_cloud(config, rx, emitter, client, drops).await,
+        Engine::Fake => run_fake(rx, emitter, drops, refiner).await,
+        Engine::Local(config) => run_local(config, rx, emitter, caps, drops, refiner).await,
+        Engine::Cloud(config) => run_cloud(config, rx, emitter, client, drops, refiner).await,
     }
 }
 
@@ -472,7 +699,12 @@ fn take_dropped(drops: &AtomicU64) -> usize {
     drops.swap(0, Ordering::Relaxed) as usize
 }
 
-async fn run_fake(mut rx: mpsc::Receiver<Cmd>, emitter: Emitter, drops: Arc<AtomicU64>) {
+async fn run_fake(
+    mut rx: mpsc::Receiver<Cmd>,
+    emitter: Emitter,
+    drops: Arc<AtomicU64>,
+    refiner: Option<Refiner>,
+) {
     let mut seq = 0;
     let mut total = 0usize;
     while let Some(command) = rx.recv().await {
@@ -488,7 +720,9 @@ async fn run_fake(mut rx: mpsc::Receiver<Cmd>, emitter: Emitter, drops: Arc<Atom
             Cmd::Finish => {
                 seq += 1;
                 let ms = bytes_to_ms(total);
-                emitter.final_(seq, format!("[voice] {ms} ms"), Vec::new(), false, false);
+                let (text, downgraded) =
+                    finalize(refiner.as_ref(), format!("[voice] {ms} ms")).await;
+                emitter.final_(seq, text, Vec::new(), false, downgraded);
                 return;
             }
             Cmd::Cancel => {
@@ -514,6 +748,7 @@ async fn run_local(
     emitter: Emitter,
     _caps: Caps,
     drops: Arc<AtomicU64>,
+    refiner: Option<Refiner>,
 ) {
     let mut child = match Command::new(&config.command)
         .args(&config.args)
@@ -618,7 +853,8 @@ async fn run_local(
                 let words = serde_json::from_value(value["words"].clone()).unwrap_or_default();
                 let degraded = value["degraded"].as_bool().unwrap_or(false);
                 seq += 1;
-                emitter.final_(seq, text, words, false, degraded);
+                let (text, downgraded) = finalize(refiner.as_ref(), text).await;
+                emitter.final_(seq, text, words, false, degraded || downgraded);
                 finished = true;
                 break;
             }
@@ -651,6 +887,7 @@ async fn run_cloud(
     emitter: Emitter,
     client: reqwest::Client,
     drops: Arc<AtomicU64>,
+    refiner: Option<Refiner>,
 ) {
     let mut audio = Vec::new();
     let mut seq = 0;
@@ -674,7 +911,10 @@ async fn run_cloud(
     }
     seq += 1;
     match transcribe(&client, &config, audio).await {
-        Ok((text, words)) => emitter.final_(seq, text, words, false, false),
+        Ok((text, words)) => {
+            let (text, downgraded) = finalize(refiner.as_ref(), text).await;
+            emitter.final_(seq, text, words, false, downgraded)
+        }
         Err(err) => emitter.error(seq, err),
     }
 }
@@ -779,7 +1019,7 @@ mod tests {
         let (bus, mut events) = broadcast::channel(16);
         let manager = Manager::new(bus);
         let start = manager
-            .start(&config(BackendKind::Fake), Some("s1".into()), None)
+            .start(&config(BackendKind::Fake), Some("s1".into()), None, None)
             .await
             .expect("start");
         assert_eq!(start.format, PcmFormat::CANONICAL);
@@ -806,7 +1046,7 @@ mod tests {
         let (bus, _events) = broadcast::channel(16);
         let manager = Manager::new(bus);
         let start = manager
-            .start(&config(BackendKind::Fake), None, None)
+            .start(&config(BackendKind::Fake), None, None, None)
             .await
             .expect("start");
         let err = manager
@@ -821,7 +1061,7 @@ mod tests {
         let (bus, mut events) = broadcast::channel(16);
         let manager = Manager::new(bus);
         let start = manager
-            .start(&config(BackendKind::Fake), None, None)
+            .start(&config(BackendKind::Fake), None, None, None)
             .await
             .expect("start");
         manager.cancel(&start.utterance_id).await.expect("cancel");
@@ -839,7 +1079,7 @@ mod tests {
         let (bus, _events) = broadcast::channel(16);
         let manager = Manager::new(bus);
         let err = manager
-            .start(&config(BackendKind::Cloud), None, None)
+            .start(&config(BackendKind::Cloud), None, None, None)
             .await
             .expect_err("missing key");
         assert_eq!(err.kind, AsrErrorKind::Unavailable);
@@ -868,5 +1108,63 @@ mod tests {
         assert!(!caps_for(BackendKind::Fake).partials);
         assert!(caps_for(BackendKind::Local).stable_prefix);
         assert!(caps_for(BackendKind::Cloud).word_timestamps);
+    }
+
+    #[test]
+    fn refined_text_replaces_the_raw_transcript() {
+        let raw = "so we need to edit the vox config";
+        assert_eq!(
+            clean_refined(raw, "So we need to edit the [voice] config."),
+            Rewrite::Edited("So we need to edit the [voice] config.".to_string())
+        );
+        // Fenced output is unwrapped rather than pasted with backticks.
+        assert_eq!(
+            clean_refined(raw, "```text\nSo we need to edit the [voice] config.\n```"),
+            Rewrite::Edited("So we need to edit the [voice] config.".to_string())
+        );
+    }
+
+    #[test]
+    fn unusable_rewrites_fall_back_to_the_raw_text() {
+        let raw = "run cargo test";
+        // "Already correct" is a successful pass, not a degraded one.
+        assert_eq!(clean_refined(raw, raw), Rewrite::Unchanged);
+        assert_eq!(clean_refined(raw, "\"run cargo test\""), Rewrite::Unchanged);
+        assert_eq!(clean_refined(raw, "   "), Rewrite::Failed);
+        // A model that answers the transcript instead of editing it is
+        // rejected: dictation never grows into a paragraph.
+        let answer = "Sure, I can help with that. ".repeat(20);
+        assert_eq!(clean_refined(raw, &answer), Rewrite::Failed);
+    }
+
+    #[test]
+    fn a_summarised_transcript_is_rejected() {
+        // 100 chars in, 20 out: tidying a rambling dictation must not become a
+        // summary of the requests it contained.
+        let raw = "so the idea is that we add a flag to the config, and also we should \
+                   document it, and then make sure the tests cover the fallback";
+        assert_eq!(
+            clean_refined(raw, "Add a flag and document it."),
+            Rewrite::Failed
+        );
+        // The same collapse is allowed on a short fragment, where it is just a
+        // stutter being removed.
+        assert_eq!(
+            clean_refined("Run run the the test", "Run the test."),
+            Rewrite::Edited("Run the test.".to_string())
+        );
+    }
+
+    #[test]
+    fn refine_prompt_keeps_extra_instructions() {
+        let messages = refine_messages("hello wrold", "Prefer British spelling.");
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].content.contains("Prefer British spelling."));
+        assert!(messages[0].content.contains("speech-to-text"));
+        assert_eq!(messages[1].content, "hello wrold");
+
+        // Empty extras do not leave an empty heading behind.
+        let messages = refine_messages("hi", "  ");
+        assert!(!messages[0].content.contains("Additional instructions"));
     }
 }

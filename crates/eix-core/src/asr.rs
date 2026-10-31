@@ -255,24 +255,31 @@ impl CloudProvider {
 
 /// Local models run in a helper process, so the daemon never links ONNX
 /// Runtime or CUDA. The helper protocol is documented in `docs/voice.md`.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalAsrConfig {
-    /// `sherpa` | `whisper` | `custom`. Only selects default arguments; the
-    /// helper binary is what actually understands them.
+    /// `whisper` | `sherpa` | `fake`, or empty to pick automatically: sherpa
+    /// (SenseVoice) when a model is installed, whisper otherwise. Only selects
+    /// default arguments; the helper binary is what understands them.
     pub engine: String,
+    /// Empty searches `PATH`, then the daemon's own directory, then
+    /// `~/.local/bin` for `eix-asr`.
     pub command: Option<std::path::PathBuf>,
+    /// Replaces the derived arguments wholesale. Advanced escape hatch; leave
+    /// empty unless the helper needs flags eix does not know about.
     pub args: Vec<String>,
+    /// A `ggml-*.bin` (whisper) or `model.int8.onnx` (sherpa). Empty picks the
+    /// most accurate installed model, preferring SenseVoice over whisper.
     pub model_dir: Option<std::path::PathBuf>,
-    pub threads: usize,
 }
 
-impl LocalAsrConfig {
-    pub fn threads_or_default(&self) -> usize {
-        if self.threads == 0 {
-            4
-        } else {
-            self.threads
+impl Default for LocalAsrConfig {
+    fn default() -> Self {
+        Self {
+            engine: String::new(),
+            command: None,
+            args: Vec::new(),
+            model_dir: None,
         }
     }
 }
@@ -289,21 +296,53 @@ pub struct CloudAsrConfig {
     pub credential: Option<String>,
 }
 
+/// Optional second pass over a finished transcript by a chat model.
+///
+/// A small local ASR model mishears names and drops punctuation, and dictation
+/// itself repeats words, abandons sentences and jumps between topics. With this
+/// enabled the final transcript makes one extra provider call before it reaches
+/// the client; the raw text is always the fallback.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RefineConfig {
+    /// On by default: raw dictation is repetitive and mistyped, and a chat
+    /// pass is what makes it usable. Set `false` to send the transcript
+    /// exactly as the engine heard it.
+    pub enabled: bool,
+    /// Model selection id (`provider/model`). Empty uses the default model.
+    pub model: String,
+    /// Extra instruction appended to the built-in rewrite prompt.
+    pub prompt: String,
+    /// Hard cap; past this the raw transcript is kept, so a slow model can
+    /// never hold the text hostage.
+    pub timeout_ms: u32,
+}
+
+impl Default for RefineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            model: String::new(),
+            prompt: String::new(),
+            timeout_ms: 8_000,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VoiceConfig {
-    /// Off by default: enabling voice can send audio off the machine.
+    /// On by default, but inert: nothing is captured and nothing is sent until
+    /// the user asks for `/voice`, so an idle session never touches a
+    /// microphone. Set `false` to make `/voice` report that it is disabled.
     pub enabled: bool,
     pub backend: BackendKind,
     /// Empty means "let the engine detect it".
     pub language: String,
-    /// Keep the PCM next to the transcript for debugging. Off by default.
-    pub retain_audio: bool,
     pub local: LocalAsrConfig,
     pub cloud: CloudAsrConfig,
+    pub refine: RefineConfig,
     pub capture: CaptureConfig,
-    /// Silence before the daemon closes an utterance on its own.
-    pub silence_ms: u32,
 }
 
 /// Client-side microphone settings. The daemon never reads a device, but the
@@ -315,7 +354,9 @@ pub struct CaptureConfig {
     /// Recorder command line whose stdout is raw PCM16 mono 16 kHz. Empty means
     /// "pick whichever of parec, pw-record, arecord exists".
     pub command: String,
-    /// RMS below this counts as silence, on a 0.0-1.0 scale.
+    /// RMS gate on a 0.0-1.0 scale. The default sits just above a silent room
+    /// and below a soft voice, so a normal laptop microphone needs no tuning.
+    /// Raise it only if background noise keeps an utterance open.
     pub threshold: f32,
     /// Silence that closes an utterance.
     pub silence_ms: u32,
@@ -327,7 +368,7 @@ impl Default for CaptureConfig {
     fn default() -> Self {
         Self {
             command: String::new(),
-            threshold: 0.02,
+            threshold: 0.004,
             silence_ms: 800,
             max_utterance_ms: 60_000,
         }
@@ -392,14 +433,13 @@ fn on_path(program: &str) -> bool {
 impl Default for VoiceConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             backend: BackendKind::Local,
             language: String::new(),
-            retain_audio: false,
             local: LocalAsrConfig::default(),
             cloud: CloudAsrConfig::default(),
+            refine: RefineConfig::default(),
             capture: CaptureConfig::default(),
-            silence_ms: 800,
         }
     }
 }
@@ -411,9 +451,6 @@ impl VoiceConfig {
         PcmFormat::CANONICAL.validate()?;
         if !self.enabled {
             return Err(AsrError::unavailable("voice is disabled in [voice]"));
-        }
-        if self.silence_ms > 5_000 {
-            return Err(AsrError::format("silence_ms must be <= 5000"));
         }
         if self.backend == BackendKind::Cloud {
             let endpoint = self
@@ -480,14 +517,11 @@ mod tests {
     }
 
     #[test]
-    fn voice_config_is_off_and_local_by_default() {
+    fn voice_config_is_on_and_local_by_default() {
         let config = VoiceConfig::default();
-        assert!(!config.enabled);
+        assert!(config.enabled);
         assert_eq!(config.backend, BackendKind::Local);
-        assert_eq!(
-            config.validate().unwrap_err().kind,
-            AsrErrorKind::Unavailable
-        );
+        assert!(config.validate().is_ok());
     }
 
     #[test]

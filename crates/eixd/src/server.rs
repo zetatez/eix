@@ -3668,9 +3668,15 @@ impl Daemon {
                     .ok()
                     .flatten()
                     .and_then(|credential| credential.api_key);
+                // The rewrite pass is opt-in and separate from the ASR backend:
+                // a local engine plus a cloud model is the usual combination.
+                let refiner = voice.refine.enabled.then(|| {
+                    let route = config.route(voice.refine.model.trim());
+                    crate::asr::Refiner::new(self.provider.load_full(), route, &voice.refine)
+                });
                 let started = self
                     .asr
-                    .start(voice, session_id, api_key)
+                    .start(voice, session_id, api_key, refiner)
                     .await
                     .map_err(asr_error)?;
                 Ok(json!({

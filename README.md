@@ -54,8 +54,8 @@ cargo build --release
 ./target/release/eix doctor
 ```
 
-The build produces `eix` (TUI + CLI) and `eixd` (daemon). The daemon starts on the first connection,
-runs in its own process group, and survives terminal exit.
+The build produces `eix` (TUI + CLI), `eixd` (daemon), and `eix-asr` (the optional speech helper).
+The daemon starts on the first connection, runs in its own process group, and survives terminal exit.
 
 ### Configure a provider
 
@@ -211,6 +211,85 @@ that support the Agent Client Protocol, `eix acp` runs a stdio adapter:
 Sessions, tools, worktrees, MCP, and approvals stay in the daemon. Images, audio, terminal
 proxying, and editor-supplied `mcpServers` are not supported yet.
 
+### Voice input
+
+`/voice` dictates into the prompt, `/voice off` stops, and `/voice file PATH` transcribes an existing
+16 kHz mono PCM16 or WAV recording. Voice is enabled by default but never records on its own: the
+microphone opens only after `/voice`, so an idle session never touches it.
+
+Recognition runs locally. The daemon spawns `eix-asr` once per utterance and picks an engine from
+what is installed, so neither needs configuring:
+
+```sh
+cargo build --release -p eix-asr   # not covered by `make install`
+install -m 0755 target/release/eix-asr ~/.local/bin/
+```
+
+Without it, `/voice` reports `no eix-asr helper found`. The daemon searches `PATH`, its own
+directory, then `~/.local/bin`, so any of those locations works.
+
+| Engine    | Requires                                              | Notes                                                                                                     |
+| ---       | ---                                                   | ---                                                                                                       |
+| `sherpa`  | `sherpa-onnx-offline`, `model.int8.onnx`, `tokens.txt` | Recommended. SenseVoice is multilingual by design and far stronger on Chinese than a dictation-sized whisper. |
+| `whisper` | `whisper-cli`, a `ggml-*.bin`                          | Fallback; the largest installed model is used. Weaker on Chinese.                                          |
+| `fake`    | nothing                                                | Prints `[voice] <N> ms`, for tests and for checking the pipe without a model.                              |
+
+With both installed SenseVoice wins. Install it first, plus a CPU build of `sherpa-onnx-offline` from
+[sherpa-onnx releases](https://github.com/k2-fsa/sherpa-onnx/releases) or a distro package, then the
+model (239 MB):
+
+```sh
+mkdir -p ~/.local/share/eix/models/sense-voice
+cd ~/.local/share/eix/models/sense-voice
+B=https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main
+curl -fL -O $B/model.int8.onnx -O $B/tokens.txt
+```
+
+`tokens.txt` must sit beside the model. Verify the download: a truncated ONNX file does not fall back
+to whisper, it fails at load time with `Protobuf parsing failed`.
+
+```sh
+sha256sum model.int8.onnx  # c71f0ce00bec95b07744e116345e33d8cbbe08cef896382cf907bf4b51a2cd51
+```
+
+Whisper is the lighter alternative, and needs `whisper-cli` on `PATH`:
+
+```sh
+mkdir -p ~/.local/share/eix/models
+curl -fL -o ~/.local/share/eix/models/ggml-base.bin \
+  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+```
+
+Models are discovered without configuration: SenseVoice under `<data-dir>/models/sense-voice/`,
+whisper as the largest `ggml-*.bin` in `<data-dir>/models/`. The data directory is
+`~/.local/share/eix` on Linux, `~/Library/Application Support/eix` on macOS, and `$EIX_DATA_DIR` wins
+over both. Until both SenseVoice files are present the daemon stays on whisper. Check the helper
+outside eix before relying on it, with any 16 kHz mono WAV or raw PCM16 file:
+
+```sh
+eix-asr --wav sample.wav --engine whisper \
+  --model ~/.local/share/eix/models/ggml-base.bin
+# {"type":"final","text":"…","words":[],"engine":"whisper"}
+```
+
+Every guess can be overridden in `~/.config/eix/config.toml`:
+
+| Key                     | Default  | Meaning                                                                              |
+| ---                     | ---      | ---                                                                                  |
+| `[voice] enabled`       | `true`   | Keep voice available; `false` makes `/voice` report that it is disabled.             |
+| `[voice] language`      | `""`     | Force an engine language (`zh`, `en`); empty lets the engine detect it.              |
+| `[voice] backend`       | `"local"`| `local`, `cloud`, or `fake`.                                                         |
+| `[voice.local] engine`  | `""`     | `sherpa`, `whisper`, or `fake`; empty picks from what is installed.                  |
+| `[voice.local] model_dir` | unset  | Absolute path to a `model.int8.onnx` or `ggml-*.bin`. `~` is not expanded.           |
+| `[voice.local] command` | unset    | Path to `eix-asr`; unset searches `PATH`, the `eixd` directory, then `~/.local/bin`.  |
+| `[voice.local] args`    | `[]`     | Explicit helper arguments; `--model` and `--language` are still appended when missing. |
+
+`[voice.refine]` is on by default: each finished transcript, never the audio, goes through the chat
+model to restore punctuation and fix misheard identifiers; `enabled = false` keeps the raw text.
+Capture needs no tuning either, since it finds `parec`, `pw-record`, or `arecord` on `PATH` and
+segments on energy. See [docs/voice.md](./docs/voice.md) for the helper protocol, RPC methods, and
+events.
+
 ## Configuration
 
 Global files live in `~/.config/eix/`: `config.toml`, `AGENTS.md`, `skills/`, `cmds/`, and
@@ -230,7 +309,7 @@ add plugins, enable compatibility resources, or widen sandbox/network access. Re
 appear in `security_warnings` (`eix doctor`).
 
 Main sections: `providers` / `provider_runtime`, `models` / `model_roles`, `tools`, `context`,
-`worktree` / `integration`, `compations`, `mcp` / `plugins`, `images` / `formatter` / `lsp`,
+`worktree` / `integration`, `compations`, `voice`, `mcp` / `plugins`, `images` / `formatter` / `lsp`,
 `theme` / `keys` / `notifications`, and `server`. See
 [config.tmpl.toml](./config.tmpl.toml) for defaults and comments.
 

@@ -163,6 +163,13 @@ enum Engine {
         command: PathBuf,
         model: Option<PathBuf>,
     },
+    /// SenseVoice through `sherpa-onnx-offline`. Multilingual by design, and
+    /// far stronger on Chinese than a whisper model small enough to run on a
+    /// laptop: on the same clip whisper-base returned word salad.
+    Sherpa {
+        command: PathBuf,
+        model: Option<PathBuf>,
+    },
     Shell {
         template: String,
         model: Option<PathBuf>,
@@ -180,7 +187,14 @@ impl Engine {
                     .unwrap_or_else(|| PathBuf::from("whisper-cli")),
                 model: args.model.clone(),
             }),
-            "command" | "sherpa" | "sherpa-onnx" | "custom" => {
+            "sherpa" | "sherpa-onnx" => Ok(Self::Sherpa {
+                command: args
+                    .command
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("sherpa-onnx-offline")),
+                model: args.model.clone(),
+            }),
+            "command" | "custom" => {
                 let template = args.command.as_ref().map(|path| path.display().to_string());
                 match template {
                     Some(template) if !template.trim().is_empty() => Ok(Self::Shell {
@@ -198,7 +212,7 @@ impl Engine {
             }
             other => Err(Failure::new(
                 "unavailable",
-                format!("unknown engine {other:?}; try fake, whisper, command or sherpa"),
+                format!("unknown engine {other:?}; try fake, whisper, sherpa or command"),
             )),
         }
     }
@@ -207,6 +221,7 @@ impl Engine {
         match self {
             Self::Fake => "fake",
             Self::Whisper { .. } => "whisper",
+            Self::Sherpa { .. } => "sherpa",
             Self::Shell { .. } => "command",
         }
     }
@@ -270,8 +285,117 @@ impl Engine {
                 cleanup(&wav, args);
                 Ok(clean(&String::from_utf8_lossy(&output)))
             }
+            Self::Sherpa { command, model } => {
+                let model = model.as_ref().ok_or_else(|| {
+                    Failure::new(
+                        "unavailable",
+                        "the sherpa engine needs --model <model.int8.onnx>",
+                    )
+                })?;
+                if !model.exists() {
+                    return Err(Failure::new(
+                        "unavailable",
+                        format!("model {} does not exist", model.display()),
+                    ));
+                }
+                // SenseVoice ships tokens.txt next to the model, which is how
+                // the download lays it out and how we resolve it here.
+                let tokens = model.with_file_name("tokens.txt");
+                let wav = temp_wav(args, audio)?;
+                let mut cmd = Command::new(command);
+                cmd.arg(format!("--sense-voice-model={}", model.display()))
+                    .arg(format!("--tokens={}", tokens.display()))
+                    // Inverse text normalization turns spoken numbers and dates
+                    // into digits and punctuation, which is what dictating into
+                    // a prompt needs.
+                    .arg("--sense-voice-use-itn=true")
+                    // Two threads: measured ~0.02 RTF, so decoding a 5 s
+                    // utterance costs about 120 ms. Loading the model costs
+                    // far more, which is why one process per utterance is not
+                    // free and the daemon reuses the helper per session.
+                    .arg("--num-threads=2");
+                if !args.language.is_empty() {
+                    cmd.arg(format!("--sense-voice-language={}", args.language));
+                }
+                cmd.arg(&wav);
+                let output = run_command(&mut cmd, "sherpa")?;
+                cleanup(&wav, args);
+                let stdout = String::from_utf8_lossy(&output);
+                match sense_voice_text(&stdout) {
+                    Some(text) => Ok(text),
+                    // Models that are not SenseVoice print plain text, so an
+                    // output without a result object is still readable.
+                    None if !stdout
+                        .lines()
+                        .any(|line| line.trim_start().starts_with('{')) =>
+                    {
+                        Ok(clean(&stdout))
+                    }
+                    // Anything else would put a JSON blob into the prompt.
+                    None => Err(Failure::new(
+                        "provider",
+                        "sherpa printed a result object without a \"text\" field",
+                    )),
+                }
+            }
         }
     }
+}
+
+/// The transcript from `sherpa-onnx-offline` result lines.
+///
+/// SenseVoice prints one JSON object per utterance, carrying metadata (language,
+/// emotion, token timings) around the field we want. Its banner goes to stderr,
+/// but an invocation over several files prints several objects, so the last one
+/// wins rather than the first.
+fn sense_voice_text(stdout: &str) -> Option<String> {
+    let mut transcript = None;
+    for line in stdout.lines() {
+        let line = line.trim();
+        if !line.starts_with('{') {
+            continue;
+        }
+        if let Some(text) = json_string_field(line, "text") {
+            transcript = Some(text);
+        }
+    }
+    transcript
+}
+
+/// Value of a top-level string field, for the flat objects this reads. Enough
+/// JSON to avoid a dependency; `serde_json` would drag in a registry the helper
+/// is built without.
+fn json_string_field(object: &str, name: &str) -> Option<String> {
+    let needle = format!("\"{name}\":");
+    let rest = &object[object.find(&needle)? + needle.len()..];
+    unescape_json_string(rest.trim_start().strip_prefix('"')?)
+}
+
+fn unescape_json_string(input: &str) -> Option<String> {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                '/' => out.push('/'),
+                'b' => out.push('\u{8}'),
+                'f' => out.push('\u{c}'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let hex: String = chars.by_ref().take(4).collect();
+                    out.push(char::from_u32(u32::from_str_radix(&hex, 16).ok()?)?);
+                }
+                _ => return None,
+            },
+            ch => out.push(ch),
+        }
+    }
+    None
 }
 
 fn fake_text(rate: u32, bytes: usize) -> String {
@@ -620,5 +744,33 @@ mod tests {
         let err = Args::parse(["--protocol", "eix-asr/2"].into_iter().map(str::to_string))
             .expect_err("mismatched protocol");
         assert!(err.contains("eix-asr/1"));
+    }
+
+    #[test]
+    fn sense_voice_result_keeps_only_the_text() {
+        let output = "\
+Decoding method: greedy_search
+{\"lang\": \"<|zh|>\", \"emotion\": \"<|NEUTRAL|>\", \"text\": \"开饭时间早上9点至下午5点。\", \"tokens\": [\"开\"]}
+";
+        assert_eq!(
+            sense_voice_text(output).as_deref(),
+            Some("开饭时间早上9点至下午5点。")
+        );
+    }
+
+    #[test]
+    fn sense_voice_result_unescapes_quotes_and_newlines() {
+        let line = r#"{"text": "say \"hi\"\nthen stop", "tokens": []}"#;
+        assert_eq!(
+            sense_voice_text(line).as_deref(),
+            Some("say \"hi\"\nthen stop")
+        );
+    }
+
+    #[test]
+    fn sense_voice_result_without_text_is_rejected() {
+        // A changed result shape must not reach the prompt as a JSON blob.
+        assert_eq!(sense_voice_text(r#"{"lang": "<|en|>"}"#), None);
+        assert_eq!(sense_voice_text("plain text output"), None);
     }
 }
