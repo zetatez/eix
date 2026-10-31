@@ -316,6 +316,9 @@ quit = "Ctrl-c, Ctrl-d, Z"
 help = "F1"
 models = "Ctrl-/, Ctrl-_, Ctrl-7"
 cycle_reasoning = "Ctrl-t"
+# Hold to dictate, release to stop. Needs a terminal that reports key release
+# events (kitty keyboard protocol); elsewhere the second press stops instead.
+voice = "F2"
 palette = "Ctrl-p"
 page_up = "PageUp, Ctrl-b, Ctrl-u"
 page_down = "PageDown, Ctrl-f"

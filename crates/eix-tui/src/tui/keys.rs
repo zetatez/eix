@@ -47,6 +47,9 @@ pub enum KeyAction {
     CycleMode,
     CycleModeBack,
     CycleReasoning,
+    /// Hold to dictate: the press opens the microphone, the release closes the
+    /// utterance.
+    Voice,
     FocusTab(u8),
 }
 
@@ -98,6 +101,7 @@ impl KeyAction {
             "cycle_mode" | "toggle_mode" => Self::CycleMode,
             "cycle_mode_back" => Self::CycleModeBack,
             "cycle_reasoning" | "reasoning" => Self::CycleReasoning,
+            "voice" | "dictate" => Self::Voice,
             _ => return None,
         })
     }
@@ -113,6 +117,7 @@ impl KeyAction {
             | Self::Models
             | Self::Timeline
             | Self::CycleReasoning
+            | Self::Voice
             | Self::FocusTab(_) => KeyScope::Global,
             _ => KeyScope::Normal,
         }
@@ -250,6 +255,10 @@ fn default_bindings() -> Vec<Binding> {
     }
 
     push_direct(&mut bindings, KeyAction::Palette, "C-p", KeyScope::Normal);
+    // Hold to dictate. F2 is unbound everywhere else (F1 is help) and, unlike a
+    // Ctrl letter, cannot collide with a normal-mode command such as `g` or the
+    // `<leader>g` chord.
+    push_direct(&mut bindings, KeyAction::Voice, "F2", KeyScope::Global);
     push_direct(&mut bindings, KeyAction::PageUp, "PageUp", KeyScope::Normal);
     push_direct(&mut bindings, KeyAction::PageUp, "C-b", KeyScope::Normal);
     push_direct(&mut bindings, KeyAction::PageUp, "C-u", KeyScope::Normal);
@@ -519,11 +528,11 @@ mod tests {
             Some(KeyAction::Quit)
         );
         assert_eq!(
-            binds.global_action(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
-            None
+            binds.global_action(key(KeyCode::F(2), KeyModifiers::NONE)),
+            Some(KeyAction::Voice)
         );
         assert_eq!(
-            binds.global_action(key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
+            binds.global_action(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
             None
         );
         assert_eq!(
@@ -624,7 +633,7 @@ mod tests {
             Some(KeyAction::Sessions)
         );
         assert_eq!(
-            binds.global_action(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            binds.global_action(key(KeyCode::Char('h'), KeyModifiers::CONTROL)),
             None
         );
     }

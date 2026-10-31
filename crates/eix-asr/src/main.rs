@@ -310,9 +310,9 @@ impl Engine {
                     // a prompt needs.
                     .arg("--sense-voice-use-itn=true")
                     // Two threads: measured ~0.02 RTF, so decoding a 5 s
-                    // utterance costs about 120 ms. Loading the model costs
-                    // far more, which is why one process per utterance is not
-                    // free and the daemon reuses the helper per session.
+                    // utterance costs about 120 ms. The daemon spawns one
+                    // helper per utterance, so each sentence also pays model
+                    // load (~0.7 s), which dominates on short speech.
                     .arg("--num-threads=2");
                 if !args.language.is_empty() {
                     cmd.arg(format!("--sense-voice-language={}", args.language));

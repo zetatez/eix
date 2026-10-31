@@ -68,6 +68,50 @@ fn app_starts_in_normal_mode() {
 }
 
 #[test]
+fn holding_the_dictation_key_opens_and_closes_the_microphone() {
+    let mut app = App::new(None);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let key = KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE);
+
+    app.handle_key(key, &tx);
+    assert!(matches!(
+        rx.try_recv(),
+        Ok(Command::VoiceStart { file: None, .. })
+    ));
+    assert!(app.voice_active);
+
+    // Auto-repeat while the key stays down must not stop the capture.
+    app.handle_key(
+        KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::NONE, KeyEventKind::Repeat),
+        &tx,
+    );
+    assert!(app.voice_active);
+    assert!(rx.try_recv().is_err());
+
+    app.handle_key(
+        KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::NONE, KeyEventKind::Release),
+        &tx,
+    );
+    assert!(!app.voice_active);
+    assert!(matches!(rx.try_recv(), Ok(Command::VoiceStop)));
+}
+
+#[test]
+fn a_release_without_a_press_does_not_stop_typed_dictation() {
+    let mut app = App::new(None);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    app.handle_prompt_command("/voice", &tx);
+    rx.try_recv().expect("VoiceStart");
+
+    app.handle_key(
+        KeyEvent::new_with_kind(KeyCode::F(2), KeyModifiers::NONE, KeyEventKind::Release),
+        &tx,
+    );
+    assert!(app.voice_active);
+    assert!(rx.try_recv().is_err());
+}
+
+#[test]
 fn startup_attaches_the_session_for_the_launch_directory() {
     let cwd = std::env::current_dir().expect("cwd");
     let mut app = App::new(None);

@@ -17,9 +17,10 @@
 approvals, and context live in the daemon; the TUI, CLI, HTTP/SDK clients, and Neovim are
 replaceable frontends. Closing the terminal does not stop a running turn.
 
-[Design](./DESIGN.md) · [Config template](./config.tmpl.toml) ·
+[Usage guide](./docs/usage.md) · [Design](./DESIGN.md) · [Config template](./config.tmpl.toml) ·
 [Plugin example](./examples/plugins/echo) · [Plugin design](./docs/plugins.md) ·
-[Neovim integration](./docs/nvim.md) · [Protocol contract](./crates/eix-core/src/protocol.rs)
+[Worktrees](./docs/worktree.md) · [Neovim integration](./docs/nvim.md) ·
+[Protocol contract](./crates/eix-core/src/protocol.rs)
 
 ## Highlights
 
@@ -117,6 +118,7 @@ kept). Higher-risk patches show a full diff with hunk-level approval. `exec_comm
 before execution, and every tool decision is audited.
 
 **Worktrees:** use `eix new --worktree` or `Space W` to isolate a session in `.worktrees/<name>`.
+See [docs/worktree.md](./docs/worktree.md) for integration, rebase recovery and removal.
 `ready` runs rebase → test → fast-forward merge and resumes the session if it fails.
 
 **Context** is rebuilt from the event log on every request, with per-sector budgets and automatic
@@ -135,6 +137,7 @@ eix [--session ID]
 | ---                               | ---                                                          |
 | `F1`                              | Searchable help                                              |
 | `Ctrl-t`                          | Cycle reasoning effort                                       |
+| `F2` (hold)                       | Dictate while held; release stops and transcribes            |
 | `Ctrl-/` / `Ctrl-_` / `Ctrl-7`    | Model picker                                                 |
 | `Ctrl-p`                          | Command palette                                              |
 | `Space o` / `Space h`             | Session picker / input timeline                              |
@@ -213,9 +216,14 @@ proxying, and editor-supplied `mcpServers` are not supported yet.
 
 ### Voice input
 
-`/voice` dictates into the prompt, `/voice off` stops, and `/voice file PATH` transcribes an existing
-16 kHz mono PCM16 or WAV recording. Voice is enabled by default but never records on its own: the
-microphone opens only after `/voice`, so an idle session never touches it.
+Holding `F2` dictates for as long as the key is down and stops on release; `/voice` starts the
+same capture without a key to hold, `/voice off` stops it, and `/voice file PATH` transcribes an
+existing 16 kHz mono PCM16 or WAV recording. Voice is enabled by default but never records on its
+own: the microphone opens only after one of those, so an idle session never touches it.
+
+Release events come from the kitty keyboard protocol, which every terminal in the kitty/modern-xterm
+lineage can send. Where they are missing, `F2` behaves as a toggle: the second press stops, and
+the one-minute utterance cap bounds a forgotten session.
 
 Recognition runs locally. The daemon spawns `eix-asr` once per utterance and picks an engine from
 what is installed, so neither needs configuring:
@@ -287,8 +295,9 @@ Every guess can be overridden in `~/.config/eix/config.toml`:
 `[voice.refine]` is on by default: each finished transcript, never the audio, goes through the chat
 model to restore punctuation and fix misheard identifiers; `enabled = false` keeps the raw text.
 Capture needs no tuning either, since it finds `parec`, `pw-record`, or `arecord` on `PATH` and
-segments on energy. See [docs/voice.md](./docs/voice.md) for the helper protocol, RPC methods, and
-events.
+segments on energy. Step-by-step setup, model download and troubleshooting live in
+[docs/voice-setup.md](./docs/voice-setup.md); [docs/voice.md](./docs/voice.md) has the helper
+protocol, RPC methods, and events.
 
 ## Configuration
 

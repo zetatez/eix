@@ -1,5 +1,9 @@
 # Voice input
 
+For installation, model download, configuration and troubleshooting, see
+[voice-setup.md](./voice-setup.md). This page is the reference for the helper
+protocol, RPC methods and event shapes.
+
 Speech-to-text is available by default, but nothing happens on its own: audio
 is only captured after the user asks for `/voice`, and an idle session never
 opens a microphone. Once asked, the client captures audio, the daemon owns the
@@ -145,9 +149,13 @@ text you see is either the model's edit or the transcript it agreed with.
 
 ## Dictation in the TUI
 
-There is no separate voice client: `/voice` in the normal TUI owns the
-microphone and writes into the prompt like typing does.
+There is no separate voice client: the normal TUI owns the microphone and
+writes into the prompt like typing does.
 
+- Holding `F2` dictates while the key is down and stops on release. It
+  needs the kitty keyboard protocol's event-type reporting; without it the key
+  falls back to a toggle (second press stops) and `max_utterance_ms` bounds a
+  session left running by accident.
 - `/voice` starts listening. Speech opens an utterance (`asr.start`), audio is
   sent in 100 ms batches (`asr.pcm`), silence closes it (`asr.finish`), and the
   next sentence starts a new one without re-arming.

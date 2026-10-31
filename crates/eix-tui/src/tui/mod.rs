@@ -333,8 +333,12 @@ fn init_terminal() -> Result<Terminal<Backend>> {
         EnableMouseCapture,
         Hide,
         // The alternate screen has its own keyboard-mode stack, so push only
-        // after switching screens.
-        PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        // after switching screens. Event types are needed for hold-to-dictate:
+        // without key-up reports there is no way to know the key was released.
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+        )
     )
     .context("cannot enter alternate screen")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;

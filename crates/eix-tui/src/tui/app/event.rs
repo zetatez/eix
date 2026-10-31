@@ -1301,6 +1301,20 @@ impl App {
 
     pub fn handle_key(&mut self, key: KeyEvent, tx: &UnboundedSender<Command>) {
         if key.kind == KeyEventKind::Release {
+            // Hold-to-dictate ends on key-up. Terminals that do not report
+            // release events never reach this branch; there the second press
+            // stops instead, and the utterance cap bounds it either way.
+            if self.voice_hold && self.keybinds.global_action(key) == Some(KeyAction::Voice) {
+                self.voice_stop(tx);
+            }
+            return;
+        }
+        // Holding the key auto-repeats; only the first press may start, or the
+        // second press may stop. Repeats would otherwise toggle capture off
+        // immediately.
+        if key.kind == KeyEventKind::Repeat
+            && self.keybinds.global_action(key) == Some(KeyAction::Voice)
+        {
             return;
         }
         // Any other key breaks the double-Ctrl-W gesture, so a later Ctrl-W
@@ -1921,6 +1935,15 @@ impl App {
             KeyAction::CycleMode => self.toggle_mode(tx),
             KeyAction::CycleModeBack => self.cycle_mode(-1, tx),
             KeyAction::CycleReasoning => self.cycle_reasoning(tx),
+            // Press opens the microphone, the release (handled in
+            // `handle_key`) closes the utterance.
+            KeyAction::Voice => {
+                if self.voice_hold {
+                    self.voice_stop(tx);
+                } else {
+                    self.voice_start(tx);
+                }
+            }
             KeyAction::FocusTab(index) => self.focus_tab(index as usize - 1),
         }
     }

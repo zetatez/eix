@@ -2214,6 +2214,9 @@ pub struct App {
     /// A dictation session is running, microphone or file. Transients gate on
     /// this rather than on `voice`, which is `None` for file transcription.
     voice_active: bool,
+    /// The hold-to-dictate key is down. Cleared by the release, so a terminal
+    /// that never reports one cannot leave capture running.
+    voice_hold: bool,
     error: Option<String>,
     connected: bool,
     tick: u64,

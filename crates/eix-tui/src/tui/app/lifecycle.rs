@@ -65,6 +65,7 @@ impl App {
             status: "connecting…".into(),
             voice: None,
             voice_active: false,
+            voice_hold: false,
             error: None,
             connected: false,
             tick: 0,

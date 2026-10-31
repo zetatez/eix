@@ -20,10 +20,7 @@ impl App {
     pub(super) fn command_voice(&mut self, args: &str, tx: &UnboundedSender<Command>) {
         let args = args.trim();
         if matches!(args, "off" | "stop") || (args.is_empty() && self.voice.is_some()) {
-            let _ = tx.send(Command::VoiceStop);
-            self.voice = None;
-            self.voice_active = false;
-            self.status = "voice: stopped".into();
+            self.voice_stop(tx);
             return;
         }
         let file = if args == "file" || args.starts_with("file ") {
@@ -39,6 +36,30 @@ impl App {
             self.status = "usage: /voice [on|off|file PATH]".into();
             return;
         };
+        let hold = false;
+        self.voice_start_with(file, hold, tx);
+    }
+
+    /// Open the microphone and keep it open until the key is released or
+    /// `/voice off` arrives.
+    pub(super) fn voice_start(&mut self, tx: &UnboundedSender<Command>) {
+        self.voice_start_with(None, true, tx);
+    }
+
+    pub(super) fn voice_stop(&mut self, tx: &UnboundedSender<Command>) {
+        let _ = tx.send(Command::VoiceStop);
+        self.voice = None;
+        self.voice_active = false;
+        self.voice_hold = false;
+        self.status = "voice: stopped".into();
+    }
+
+    fn voice_start_with(
+        &mut self,
+        file: Option<std::path::PathBuf>,
+        hold: bool,
+        tx: &UnboundedSender<Command>,
+    ) {
         let _ = tx.send(Command::VoiceStart {
             session_id: self.focused_session_id(),
             file: file.clone(),
@@ -47,9 +68,10 @@ impl App {
         // first frame arrives.
         self.voice = file.is_none().then_some(0.0);
         self.voice_active = true;
+        self.voice_hold = hold && file.is_none();
         self.status = match file {
             Some(path) => format!("voice: transcribing {}", path.display()),
-            None => "voice: listening".into(),
+            None => "voice: listening (release to stop)".into(),
         };
     }
 
@@ -72,10 +94,12 @@ impl App {
             VoiceEvent::Done => {
                 self.voice = None;
                 self.voice_active = false;
+                self.voice_hold = false;
             }
             VoiceEvent::Error(message) => {
                 self.voice = None;
                 self.voice_active = false;
+                self.voice_hold = false;
                 self.error = Some(message);
                 self.status = "voice failed".into();
             }
