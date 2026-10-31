@@ -1246,9 +1246,14 @@ impl<'de> Deserialize<'de> for FormattersConfig {
 #[serde(default)]
 pub struct ContextConfig {
     /// Soft ceiling for one request, used to trim old tool output and history.
-    /// `0` (the default) fills the model window minus room for the completion.
+    /// `0` (the default) fills the model window minus `reserve_tokens`.
     /// Without a known window it falls back to a conservative 32k.
     pub budget_tokens: usize,
+    /// Tokens held back from the model window for the completion and estimate
+    /// error. The default matches the fixed reserve other harnesses use; the
+    /// reserve is raised when `provider_runtime.max_output_tokens` needs more
+    /// room and is clamped to half of very small windows.
+    pub reserve_tokens: usize,
     /// Workspace-relative files folded into the `instructions` sector. A
     /// missing file is skipped. `AGENTS.md` is read from the eix config
     /// directory as well, when present.
@@ -1260,14 +1265,14 @@ pub struct ContextConfig {
     /// `budget_tokens`.
     pub auto_compact: bool,
     /// Fraction of `budget_tokens` that triggers auto-compaction (0, 1].
+    /// `1.0` (the default) compacts when the untrimmed request reaches the
+    /// budget, which is the model window minus `reserve_tokens`. Lower values
+    /// compact earlier.
     pub auto_compact_threshold: f64,
     /// Approximate token budget for the newest conversation kept verbatim
     /// beside the summary. This is the primary retention control, matching
     /// OpenCode's `compaction.keep.tokens`.
     pub auto_compact_keep_tokens: usize,
-    /// Minimum number of newest user turns to keep even when their estimated
-    /// token cost exceeds `auto_compact_keep_tokens`.
-    pub auto_compact_keep_turns: usize,
     /// Maximum estimated tokens kept for one tool result in provider context.
     /// The full output remains in the event log; older/short results are left
     /// untouched. This prevents one noisy command from crowding out the task.
@@ -1285,12 +1290,12 @@ impl Default for ContextConfig {
     fn default() -> Self {
         Self {
             budget_tokens: 0,
+            reserve_tokens: 16_384,
             instructions_files: vec!["AGENTS.md".to_string()],
             workspace_summary: true,
             auto_compact: true,
-            auto_compact_threshold: 0.8,
-            auto_compact_keep_tokens: 8_000,
-            auto_compact_keep_turns: 2,
+            auto_compact_threshold: 1.0,
+            auto_compact_keep_tokens: 16_000,
             tool_output_tokens: 4_000,
             image_tokens: 1_024,
             max_tool_schema_tokens: 12_000,
@@ -1302,7 +1307,8 @@ impl ContextConfig {
     /// Budget actually used for one request. A configured model window always
     /// wins over the static default so a 32k budget cannot be sent to an 8k
     /// model. The reserve leaves room for the completion and provider-side
-    /// tokenization differences.
+    /// tokenization differences. The window is looked up per model, so a 128k
+    /// and a 1M model get different budgets from the same configuration.
     pub fn effective_budget_tokens(
         &self,
         model_context_tokens: Option<usize>,
@@ -1320,13 +1326,16 @@ impl ContextConfig {
         let Some(window) = model_context_tokens.filter(|tokens| *tokens > 0) else {
             return configured.unwrap_or(AUTO_FALLBACK);
         };
-        // The prompt and the completion share one window. Reserving room for the
-        // largest completion the provider may return (plus margin for estimate
-        // error) stops a request that the ledger says fits from dying with a
-        // context-length error. A small output budget therefore buys more input
-        // room than a large one.
-        let reserve = (max_output_tokens as f64 * 1.25) as usize;
-        let reserve = reserve.clamp(1_024, (window / 2).max(1_024));
+        // The prompt and the completion share one window. Reserve a fixed
+        // amount (16k by default), raised only when the configured output
+        // budget needs more room. On very small windows the reserve is capped
+        // at half the window so the request never collapses to zero.
+        let output_reserve = max_output_tokens.saturating_mul(5) / 4;
+        let reserve = self
+            .reserve_tokens
+            .max(output_reserve)
+            .max(1_024)
+            .min((window / 2).max(1_024));
         let available = window.saturating_sub(reserve).max(1);
         configured.map_or(available, |budget| budget.min(available).max(1))
     }
@@ -3060,11 +3069,6 @@ impl Config {
                 "context.auto_compact_threshold must be in (0, 1]".into(),
             ));
         }
-        if self.context.auto_compact_keep_turns == 0 {
-            return Err(ConfigError::Invalid(
-                "context.auto_compact_keep_turns must be > 0".into(),
-            ));
-        }
         if self.context.tool_output_tokens == 0 {
             return Err(ConfigError::Invalid(
                 "context.tool_output_tokens must be > 0".into(),
@@ -4181,9 +4185,10 @@ persistent_mode = true
     fn context_compaction_defaults_are_token_first() {
         let context = ContextConfig::default();
         assert_eq!(context.budget_tokens, 0, "zero means auto");
+        assert_eq!(context.reserve_tokens, 16_384);
         assert!(context.auto_compact);
-        assert_eq!(context.auto_compact_keep_tokens, 8_000);
-        assert_eq!(context.auto_compact_keep_turns, 2);
+        assert_eq!(context.auto_compact_threshold, 1.0);
+        assert_eq!(context.auto_compact_keep_tokens, 16_000);
     }
 
     #[test]
@@ -4197,11 +4202,10 @@ persistent_mode = true
         assert_eq!(context.effective_budget_tokens(Some(0), 8_192), 32_000);
 
         // A high configured budget is clamped below a small real window. The
-        // reserve follows the completion budget: 8192 * 1.25 = 10240, capped at
-        // half the window (4000) here.
+        // fixed reserve is capped at half the window (4000) here.
         assert_eq!(context.effective_budget_tokens(Some(8_000), 8_192), 4_000);
-        // A small completion budget leaves more room for the prompt.
-        assert_eq!(context.effective_budget_tokens(Some(8_000), 1_024), 6_720);
+        // A small completion budget does not raise the fixed reserve.
+        assert_eq!(context.effective_budget_tokens(Some(8_000), 1_024), 4_000);
         // A large window still uses the configured budget.
         assert_eq!(
             context.effective_budget_tokens(Some(1_000_000), 8_192),
@@ -4212,7 +4216,7 @@ persistent_mode = true
     }
 
     #[test]
-    fn auto_budget_fills_large_windows_but_keeps_a_safe_fallback() {
+    fn auto_budget_uses_a_fixed_16k_reserve_per_model_window() {
         let context = ContextConfig {
             budget_tokens: 0,
             ..ContextConfig::default()
@@ -4222,18 +4226,37 @@ persistent_mode = true
         assert_eq!(context.effective_budget_tokens(None, 8_192), 32_000);
         assert_eq!(context.effective_budget_tokens(Some(0), 8_192), 32_000);
 
-        // A known window grows the budget with the model. reserve = 8192 *
-        // 1.25 = 10240.
+        // A known window grows the budget with the model: window - 16384.
         assert_eq!(
             context.effective_budget_tokens(Some(128_000), 8_192),
-            117_760
+            111_616
+        );
+        assert_eq!(
+            context.effective_budget_tokens(Some(200_000), 8_192),
+            183_616
         );
         assert_eq!(
             context.effective_budget_tokens(Some(1_000_000), 8_192),
-            989_760
+            983_616
         );
-        // The output reserve is still capped on a tiny window.
+        // A model with a larger output budget raises the reserve so the
+        // completion still fits: 32768 * 1.25 = 40960.
+        assert_eq!(
+            context.effective_budget_tokens(Some(200_000), 32_768),
+            159_040
+        );
+        // The reserve is still capped on a tiny window.
         assert_eq!(context.effective_budget_tokens(Some(8_000), 8_192), 4_000);
+    }
+
+    #[test]
+    fn auto_compaction_triggers_when_untrimmed_usage_reaches_the_budget() {
+        let context = ContextConfig::default();
+        let budget = context.effective_budget_tokens(Some(200_000), 8_192);
+        assert_eq!(budget, 183_616);
+        // The default trigger is the budget itself, matching "window - 16k".
+        let trigger = (context.auto_compact_threshold * budget as f64) as usize;
+        assert_eq!(trigger, 183_616);
     }
 
     #[test]

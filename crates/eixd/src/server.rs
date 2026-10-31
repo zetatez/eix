@@ -929,8 +929,6 @@ struct CompactionRequest {
     /// Context-length recovery: bypass the threshold and summarize even when
     /// the retention window already covers the conversation.
     force: bool,
-    /// Minimum number of newest user turns kept verbatim.
-    keep: usize,
     /// Range selected by the caller. `None` lets the worker choose a range
     /// from a freshly built ledger, which is the common automatic path.
     from_seq: Option<u64>,
@@ -6357,7 +6355,6 @@ impl Daemon {
         let ledger = self
             .build_ledger_from_events(session_id, allowed_tools, &events, &static_context)
             .await?;
-        let keep_turns = config.context.auto_compact_keep_turns;
         let (mut ledger, _) =
             if config.context.auto_compact && session.origin != SessionOrigin::Agent {
                 self.auto_compact_if_needed(
@@ -6365,7 +6362,6 @@ impl Daemon {
                     turn_id,
                     ledger,
                     false,
-                    keep_turns,
                     false,
                     allowed_tools,
                     &mut events,
@@ -6418,9 +6414,6 @@ impl Daemon {
         // rewrite can drop reuse from ~99% to near zero.
         let mut cache_cold_reported = false;
         let mut tool_calls_run = 0usize;
-        // The budget notice is advisory: one per turn, so it nudges the model
-        // to stay compact without becoming repeated prompt noise.
-        let mut budget_notice_sent = false;
         // A `turn.stop` hook may block completion; cap how many times it can
         // do so to keep a misbehaving plugin from pinning the turn open.
         let mut stop_blocks = 0u32;
@@ -6475,14 +6468,12 @@ impl Daemon {
                 }
                 let auto_compact = self.config.load().context.auto_compact
                     && session.origin != SessionOrigin::Agent;
-                let keep = self.config.load().context.auto_compact_keep_turns;
                 let (refreshed, compacted) = if auto_compact && auto_compactions < 2 {
                     self.auto_compact_if_needed(
                         session_id,
                         turn_id,
                         ledger,
                         false,
-                        keep,
                         false,
                         &tools,
                         &mut events,
@@ -6499,23 +6490,6 @@ impl Daemon {
                 }
                 messages = ledger.messages();
                 self.emit_context(session_id, &ledger);
-            }
-
-            // Warn once when the request is close to the configured budget.
-            // Trimming drops the oldest tool output first, so the model should
-            // know before a result it still needs disappears.
-            if !budget_notice_sent {
-                let info = ledger.info();
-                if info.budget_tokens > 0 && info.total_tokens * 4 >= info.budget_tokens * 3 {
-                    budget_notice_sent = true;
-                    let percent = (info.total_tokens * 100 / info.budget_tokens).min(100);
-                    notices.push(format!(
-                        "Context is at {percent}% of the {} token budget. Older tool output may be \
-                         trimmed soon; keep results narrow, summarize before moving on, and avoid \
-                         re-reading files you already inspected.",
-                        info.budget_tokens
-                    ));
-                }
             }
 
             // The model stops by returning an answer without tool calls, and
@@ -6675,20 +6649,14 @@ impl Daemon {
                                 &static_context,
                             )
                             .await?;
-                        // The first recovery keeps the configured recent turns;
-                        // the second is deliberately aggressive.
-                        let keep = if context_recoveries == 1 {
-                            self.config.load().context.auto_compact_keep_turns
-                        } else {
-                            1
-                        };
+                        // Recovery is deliberately aggressive: keep only the
+                        // newest turn so the request can be retried.
                         let (ledger, compacted) = self
                             .auto_compact_if_needed(
                                 session_id,
                                 turn_id,
                                 ledger,
                                 true,
-                                keep,
                                 true,
                                 allowed_tools,
                                 &mut events,
@@ -8741,7 +8709,10 @@ impl Daemon {
         )
         .await;
         if config.context.auto_compact {
-            ledger.set_context_pressure(pressure_threshold(&config));
+            ledger.set_context_pressure(
+                pressure_threshold(&config),
+                context_tokens.is_some_and(|tokens| tokens > 0),
+            );
         }
         Ok(ledger)
     }
@@ -8826,7 +8797,10 @@ impl Daemon {
             budget,
         );
         if extended && config.context.auto_compact {
-            ledger.set_context_pressure(pressure_threshold(&config));
+            ledger.set_context_pressure(
+                pressure_threshold(&config),
+                context_tokens.is_some_and(|tokens| tokens > 0),
+            );
         }
         Ok(extended)
     }
@@ -8953,7 +8927,6 @@ impl Daemon {
         let request = CompactionRequest {
             manual: true,
             force: false,
-            keep: 1,
             from_seq: Some(from_seq),
             to_seq: Some(to_seq),
             summary: params
@@ -9058,7 +9031,7 @@ impl Daemon {
         let info = ledger.info();
         let threshold = config.context.auto_compact_threshold;
         let over_threshold = info.budget_tokens > 0
-            && (info.total_tokens as f64) > threshold * info.budget_tokens as f64;
+            && (info.untrimmed_tokens as f64) > threshold * info.budget_tokens as f64;
 
         let (from_seq, to_seq) = match (request.from_seq, request.to_seq) {
             (Some(from), Some(to)) => (from, to),
@@ -9072,19 +9045,14 @@ impl Daemon {
                 if !request.force && !over_threshold {
                     return Ok(false);
                 }
-                let keep = request.keep.max(1);
-                let range = ledger
-                    .auto_compact_range_tokens(config.context.auto_compact_keep_tokens, keep)
-                    .or_else(|| {
-                        if request.force {
-                            ledger.auto_compact_range(1)
-                        } else if over_threshold {
-                            ledger.auto_compact_range(keep)
-                        } else {
-                            None
-                        }
-                    });
-                match range {
+                // Recovery keeps only the newest turn; normal pressure keeps
+                // roughly `auto_compact_keep_tokens` verbatim.
+                let keep_tokens = if request.force {
+                    0
+                } else {
+                    config.context.auto_compact_keep_tokens
+                };
+                match ledger.auto_compact_range_tokens(keep_tokens) {
                     Some(range) => range,
                     None => return Ok(false),
                 }
@@ -9312,7 +9280,6 @@ impl Daemon {
         turn_id: &str,
         ledger: Ledger,
         force: bool,
-        keep: usize,
         wait: bool,
         tools: &[ToolDefinition],
         events: &mut Vec<Event>,
@@ -9325,7 +9292,7 @@ impl Daemon {
         if info.budget_tokens == 0 {
             return (ledger, false);
         }
-        let over_threshold = (info.total_tokens as f64) > threshold * info.budget_tokens as f64;
+        let over_threshold = (info.untrimmed_tokens as f64) > threshold * info.budget_tokens as f64;
         if !force && !over_threshold {
             return (ledger, false);
         }
@@ -9343,9 +9310,9 @@ impl Daemon {
             {
                 Ok(pruned) => {
                     let pruned_info = pruned.info();
-                    let relieved = (pruned_info.total_tokens as f64)
+                    let relieved = (pruned_info.untrimmed_tokens as f64)
                         <= threshold * pruned_info.budget_tokens as f64;
-                    if pruned_info.total_tokens < info.total_tokens && relieved {
+                    if pruned_info.untrimmed_tokens < info.untrimmed_tokens && relieved {
                         self.set_tool_output_cap(session_id, cap);
                         self.emit_context(session_id, &pruned);
                         return (pruned, true);
@@ -9354,25 +9321,14 @@ impl Daemon {
                 Err(err) => eprintln!("eixd: pressure prune failed: {err:#}"),
             }
         }
-        // Forced recovery may have only two user turns, in which case the
-        // retention window leaves nothing to summarize. Fall back to keeping
-        // one turn rather than giving up on the request.
-        let range = ledger
-            .auto_compact_range_tokens(config.context.auto_compact_keep_tokens, keep.max(1))
-            .or_else(|| {
-                if force {
-                    ledger.auto_compact_range(1)
-                } else if over_threshold {
-                    // A tiny test budget or a huge token retention window can
-                    // make the whole live conversation fit in the window while
-                    // still exceeding the request budget. Fall back to the
-                    // turn-based minimum so the request can proceed.
-                    ledger.auto_compact_range(keep.max(1))
-                } else {
-                    None
-                }
-            });
-        let Some((from_seq, to_seq)) = range else {
+        // Recovery keeps only the newest turn; normal pressure keeps roughly
+        // `auto_compact_keep_tokens` verbatim.
+        let keep_tokens = if force {
+            0
+        } else {
+            config.context.auto_compact_keep_tokens
+        };
+        let Some((from_seq, to_seq)) = ledger.auto_compact_range_tokens(keep_tokens) else {
             return (ledger, false);
         };
         if ledger.overlaps_compaction(from_seq, to_seq) {
@@ -9399,7 +9355,6 @@ impl Daemon {
         let request = CompactionRequest {
             manual: false,
             force,
-            keep,
             from_seq: Some(from_seq),
             to_seq: Some(to_seq),
             summary: None,
@@ -12901,10 +12856,11 @@ fn network_allowed(config: &Config) -> bool {
     }
 }
 
-/// Warn before auto-compaction rather than after: leave ten points of headroom
-/// so the model can finish the current step instead of starting a large read.
+/// Warn only just before the compaction trigger. Auto-compaction now fires
+/// when the untrimmed request reaches the budget (window minus the reserve), so
+/// this note is a last reminder rather than a signal to wrap up.
 fn pressure_threshold(config: &Config) -> f64 {
-    (config.context.auto_compact_threshold - 0.1).clamp(0.5, 0.9)
+    (config.context.auto_compact_threshold - 0.02).clamp(0.5, 0.98)
 }
 
 /// Approval contract for the active mode. Mirrors codex's split between
@@ -13039,6 +12995,20 @@ fn describe_rule(rule: &PermissionRule) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pressure_notice_waits_until_the_budget_is_nearly_exhausted() {
+        let config = Config::default();
+        let threshold = pressure_threshold(&config);
+        assert!(threshold <= config.context.auto_compact_threshold);
+        assert!((0.5..=0.98).contains(&threshold));
+
+        let mut config = Config::default();
+        config.context.auto_compact_threshold = 0.5;
+        assert_eq!(pressure_threshold(&config), 0.5);
+        config.context.auto_compact_threshold = 0.9;
+        assert_eq!(pressure_threshold(&config), 0.88);
+    }
 
     #[test]
     fn model_roles_route_plan_and_execute() {

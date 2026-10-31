@@ -380,7 +380,7 @@ impl Ledger {
         let mut entries = apply_compactions(entries, &policy.compactions);
         prepare_entries(&mut entries, &policy, token_scale);
         let trimmed = trim(&mut entries, budget_tokens);
-        let mut result = summarize(&entries, budget_tokens, trimmed);
+        let mut result = summarize(&entries, budget_tokens, trimmed.0, trimmed.1);
         result.cache = cache_info(events, &policy);
 
         Self {
@@ -477,29 +477,38 @@ impl Ledger {
         let mut entries = apply_compactions(entries, &policy.compactions);
         prepare_entries(&mut entries, &policy, token_scale);
         let trimmed = trim(&mut entries, budget_tokens);
-        self.result = summarize(&entries, budget_tokens, trimmed);
+        self.result = summarize(&entries, budget_tokens, trimmed.0, trimmed.1);
         self.result.cache = cache_info(all_events, &policy);
         self.entries = entries;
         self.compactions = policy.compactions;
         true
     }
 
-    /// Add a short pressure notice just before auto-compaction would trigger.
+    /// Add a short notice only when the request is close to the hard budget
+    /// edge and the model window is actually known. Auto-compaction already
+    /// queues earlier, and the 32k fallback is not a real window: warning
+    /// against it made models abandon work that still had ample room.
     /// It is volatile (appended after history) and replaced on every call, so
     /// it never rewrites the cached prefix.
-    pub fn set_context_pressure(&mut self, fraction: f64) {
+    pub fn set_context_pressure(&mut self, fraction: f64, known_window: bool) {
         self.entries.retain(|entry| entry.info.kind != "pressure");
         let budget = self.result.budget_tokens;
+        // Pressure describes the request that will actually be sent, so use
+        // the trimmed total. Auto-compaction separately watches the untrimmed
+        // total; trim can hide a large prefix from this notice.
         let total = active_tokens(&self.entries);
-        if budget > 0 && total as f64 >= fraction * budget as f64 {
-            let percent = ((total as f64 / budget as f64) * 100.0).round() as usize;
+        if known_window && budget > 0 && total as f64 >= fraction * budget as f64 {
+            let percent = ((total as f64 / budget as f64) * 100.0).round().min(100.0) as usize;
+            let remaining = budget.saturating_sub(total);
             let entry = volatile(
                 "pressure",
                 Sector::System,
                 "pressure",
                 format!(
-                    "<context>Context is at ~{percent}% of the window. Prefer targeted reads, \
-                     finish the current step, and avoid re-reading files.</context>"
+                    "<context>Context usage is ~{percent}% of the {budget}-token budget \
+                     ({remaining} tokens left before trimming). Automatic compaction preserves \
+                     recent turns, so continue the current task unless it is already complete. \
+                     Prefer targeted reads over re-reading files.</context>"
                 ),
                 &Policy::default(),
             );
@@ -507,7 +516,8 @@ impl Ledger {
         }
         let trimmed = self.entries.iter().filter(|entry| entry.info.auto).count();
         let cache = self.result.cache.clone();
-        self.result = summarize(&self.entries, budget, trimmed);
+        let untrimmed = self.result.untrimmed_tokens.max(total);
+        self.result = summarize(&self.entries, budget, trimmed, untrimmed);
         self.result.cache = cache;
     }
 
@@ -582,7 +592,7 @@ impl Ledger {
     pub fn message_range(&self) -> Option<(u64, u64)> {
         let mut range: Option<(u64, u64)> = None;
         for entry in &self.entries {
-            if entry.info.dropped || entry.info.compacted {
+            if !in_conversation(entry) {
                 continue;
             }
             if let Some(seq) = entry.seq {
@@ -654,72 +664,51 @@ impl Ledger {
     }
 
     /// Range an auto-compaction should summarize, keeping roughly
-    /// `keep_tokens` of the newest conversation and at least `keep_turns` user
-    /// turns. Cutting happens on a user-turn boundary so a tool call is never
-    /// separated from its result.
-    pub fn auto_compact_range_tokens(
-        &self,
-        keep_tokens: usize,
-        keep_turns: usize,
-    ) -> Option<(u64, u64)> {
-        let keep_turns = keep_turns.max(1);
+    /// `keep_tokens` of the newest conversation. The cut lands on a user-turn
+    /// boundary so a tool call is never separated from its result. When the
+    /// retention budget covers the whole conversation, everything before the
+    /// newest turn is summarized.
+    pub fn auto_compact_range_tokens(&self, keep_tokens: usize) -> Option<(u64, u64)> {
         let users: Vec<u64> = self
             .entries
             .iter()
-            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
+            .filter(|entry| in_conversation(entry))
             .filter(|entry| entry.info.kind == "user")
             .filter_map(|entry| entry.seq)
             .collect();
-        if users.len() <= keep_turns {
+        // The newest turn must stay in context, so there is nothing to
+        // summarize when it is the only turn.
+        if users.len() < 2 {
             return None;
         }
-        let turn_cutoff = users[users.len() - keep_turns].saturating_sub(1);
 
         let mut kept_tokens = 0usize;
         let mut token_cutoff = None;
         for entry in self.entries.iter().rev() {
-            if entry.info.dropped || entry.info.compacted || entry.seq.is_none() {
+            if !in_conversation(entry) {
                 continue;
             }
+            let Some(seq) = entry.seq else {
+                continue;
+            };
             if entry.info.kind == "user" && kept_tokens >= keep_tokens {
-                token_cutoff = entry.seq;
+                token_cutoff = Some(seq);
                 break;
             }
             kept_tokens = kept_tokens.saturating_add(entry.info.tokens);
         }
-        // The whole live conversation fits in the retention window.
-        if token_cutoff.is_none() && kept_tokens < keep_tokens {
-            return None;
-        }
-        let to = token_cutoff
-            .map(|seq| turn_cutoff.min(seq.saturating_sub(1)))
-            .unwrap_or(turn_cutoff);
+        // A retention budget larger than the live conversation still has to
+        // free room when the request is over budget, so keep the newest turn.
+        let cutoff = token_cutoff.unwrap_or(users[users.len() - 1]);
+        let mut to = cutoff.saturating_sub(1);
         let (from, _) = self.message_range()?;
+        if to < from {
+            // The token budget would cut before the first message. Reclaim the
+            // oldest turn instead, keeping the two newest turns, so one
+            // oversized early turn cannot block compaction entirely.
+            to = users[users.len() - 2].saturating_sub(1);
+        }
         (to >= from).then_some((from, to))
-    }
-
-    /// Range an auto-compaction should summarize: everything before the last
-    /// `keep_turns` user messages. `None` when there is not enough history.
-    pub fn auto_compact_range(&self, keep_turns: usize) -> Option<(u64, u64)> {
-        let keep_turns = keep_turns.max(1);
-        let mut users: Vec<u64> = self
-            .entries
-            .iter()
-            .filter(|entry| !entry.info.dropped && !entry.info.compacted)
-            .filter(|entry| entry.info.kind == "user")
-            .filter_map(|entry| entry.seq)
-            .collect();
-        users.sort_unstable();
-        users.dedup();
-        if users.len() <= keep_turns {
-            return None;
-        }
-        let cutoff = users[users.len() - keep_turns];
-        let (from, _) = self.message_range()?;
-        if cutoff <= from {
-            return None;
-        }
-        Some((from, cutoff - 1))
     }
 }
 
@@ -1516,6 +1505,14 @@ fn active_tokens(entries: &[Entry]) -> usize {
         .sum()
 }
 
+/// Entries that still belong to the logical conversation. User-policy drops
+/// and compaction summaries are excluded, but automatic budget trims are not:
+/// compaction must be able to summarize that prefix instead of losing it to
+/// trimming forever.
+fn in_conversation(entry: &Entry) -> bool {
+    !entry.info.compacted && (!entry.info.dropped || entry.info.auto)
+}
+
 fn drop_at(entries: &mut [Entry], index: usize, total: &mut usize) {
     entries[index].info.dropped = true;
     entries[index].info.auto = true;
@@ -1539,7 +1536,7 @@ fn drop_fixed(entries: &mut [Entry], sector: Sector) -> Option<usize> {
     Some(entries[index].info.tokens)
 }
 
-fn trim(entries: &mut [Entry], budget: usize) -> usize {
+fn trim(entries: &mut [Entry], budget: usize) -> (usize, usize) {
     // Quantize the budget to a coarse bucket for the same reason entries are
     // bucketed: the calibrated budget moves by a few percent as usage feedback
     // arrives, and an exact boundary made the same entry flip in and out of the
@@ -1554,7 +1551,8 @@ fn trim(entries: &mut [Entry], budget: usize) -> usize {
     // tools to their share while most of the request budget was free discarded
     // results the model had just read, so it read them again. Only enforce the
     // shares when the whole request is over budget.
-    let mut total = active_tokens(entries);
+    let untrimmed = active_tokens(entries);
+    let mut total = untrimmed;
     if total > budget {
         trim_sector(
             entries,
@@ -1619,7 +1617,8 @@ fn trim(entries: &mut [Entry], budget: usize) -> usize {
         }
     }
 
-    entries.iter().filter(|entry| entry.info.auto).count()
+    let trimmed = entries.iter().filter(|entry| entry.info.auto).count();
+    (trimmed, untrimmed)
 }
 
 fn latest_user_seq(entries: &[Entry]) -> Option<u64> {
@@ -1658,7 +1657,12 @@ fn emergency_trim(entries: &mut [Entry], budget: usize, total: &mut usize) {
     }
 }
 
-fn summarize(entries: &[Entry], budget: usize, trimmed: usize) -> ContextLedgerResult {
+fn summarize(
+    entries: &[Entry],
+    budget: usize,
+    trimmed: usize,
+    untrimmed: usize,
+) -> ContextLedgerResult {
     let mut sectors = Vec::new();
     for sector in Sector::ALL {
         let selected: Vec<&Entry> = entries
@@ -1682,6 +1686,7 @@ fn summarize(entries: &[Entry], budget: usize, trimmed: usize) -> ContextLedgerR
         entries: entries.iter().map(|entry| entry.info.clone()).collect(),
         sectors,
         total_tokens,
+        untrimmed_tokens: untrimmed.max(total_tokens),
         budget_tokens: budget,
         trimmed,
         cache: ContextCacheInfo::default(),
@@ -2208,24 +2213,69 @@ mod tests {
             &[],
             1.0,
         );
-        ledger.set_context_pressure(0.0);
+        ledger.set_context_pressure(0.0, true);
         assert!(ledger
             .info()
             .entries
             .iter()
             .any(|entry| entry.id == "pressure"));
         let last = ledger.messages().pop().expect("pressure message");
-        assert!(last.content.contains("Context is at ~"));
-        assert!(last.content.contains("avoid re-reading files"));
+        assert!(last.content.contains("Context usage is ~"));
+        assert!(last.content.contains("continue the current task"));
+        assert!(last
+            .content
+            .contains("Prefer targeted reads over re-reading files"));
 
-        // Below the threshold the notice is removed again, so the ledger keeps
-        // matching a fresh build.
-        ledger.set_context_pressure(2.0);
+        // An unknown window uses the 32k fallback; it is not a real limit, so
+        // the notice is removed instead of warning against it.
+        ledger.set_context_pressure(0.0, false);
         assert!(!ledger
             .info()
             .entries
             .iter()
             .any(|entry| entry.id == "pressure"));
+
+        // Below the threshold the notice is removed again, so the ledger keeps
+        // matching a fresh build.
+        ledger.set_context_pressure(2.0, true);
+        assert!(!ledger
+            .info()
+            .entries
+            .iter()
+            .any(|entry| entry.id == "pressure"));
+    }
+
+    #[test]
+    fn untrimmed_tokens_expose_pressure_hidden_by_trimming() {
+        let filler = "x".repeat(2_000);
+        let mut events = Vec::new();
+        for turn in 0..8u64 {
+            events.push(user(turn * 2 + 1, &format!("u{turn} {filler}")));
+            events.push(assistant(turn * 2 + 2, &format!("a{turn} {filler}")));
+        }
+        let ledger = Ledger::assemble_full(
+            "sys".into(),
+            vec![],
+            Sections::default(),
+            &events,
+            1_500,
+            4_000,
+            IMAGE_TOKEN_ESTIMATE,
+            &HashMap::new(),
+            &[],
+            1.0,
+        );
+        let info = ledger.info();
+        // The request is trimmed to fit, but the raw history is what the
+        // auto-compaction trigger must see.
+        assert!(info.total_tokens <= info.budget_tokens);
+        assert!(info.untrimmed_tokens > info.budget_tokens);
+        // Trimming must not hide the prefix from compaction: the range still
+        // starts at the oldest event, so it can be reclaimed into a summary.
+        let (from, _) = ledger
+            .auto_compact_range_tokens(100)
+            .expect("compaction range");
+        assert_eq!(from, 1);
     }
 
     #[test]
@@ -2910,30 +2960,29 @@ mod tests {
     }
 
     #[test]
-    fn auto_compact_keeps_the_newest_user_turns() {
+    fn auto_compact_keeps_recent_tokens_without_a_turn_floor() {
+        let filler = "x".repeat(4_000);
         let events = vec![
-            user(1, "one"),
-            assistant(2, "a1"),
-            user(3, "two"),
-            assistant(4, "a2"),
-            user(5, "three"),
-            assistant(6, "a3"),
-            user(7, "four"),
-            assistant(8, "a4"),
+            user(1, &format!("one {filler}")),
+            assistant(2, &format!("a1 {filler}")),
+            user(3, &format!("two {filler}")),
+            assistant(4, &format!("a2 {filler}")),
+            user(5, &format!("three {filler}")),
+            assistant(6, &format!("a3 {filler}")),
+            user(7, &format!("four {filler}")),
+            assistant(8, &format!("a4 {filler}")),
         ];
-        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 100_000);
-        // Keep the two newest user turns (seq 5 and 7).
-        assert_eq!(ledger.auto_compact_range(2), Some((1, 4)));
-        assert_eq!(ledger.auto_compact_range(3), Some((1, 2)));
-        // Nothing to compact when every turn must be kept.
-        assert_eq!(ledger.auto_compact_range(4), None);
+        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 1_000_000);
+        // Keep roughly the two newest turns (seq 5..8); there is no minimum
+        // turn count any more.
+        assert_eq!(ledger.auto_compact_range_tokens(2_500), Some((1, 4)));
+
+        // A retention budget larger than the live conversation still keeps the
+        // newest turn and summarizes everything before it.
+        assert_eq!(ledger.auto_compact_range_tokens(usize::MAX), Some((1, 6)));
 
         let range = ledger.messages_in_range(1, 4);
         assert_eq!(range.len(), 4, "two user/assistant pairs");
-        // A tiny token budget keeps the same minimum turns; a budget larger
-        // than the live conversation disables compaction entirely.
-        assert_eq!(ledger.auto_compact_range_tokens(0, 2), Some((1, 4)));
-        assert_eq!(ledger.auto_compact_range_tokens(usize::MAX, 2), None);
 
         // After a compaction, the next range starts after the summary.
         let mut events = events;
@@ -2952,7 +3001,26 @@ mod tests {
         events.push(user(10, "five"));
         events.push(assistant(11, "a5"));
         let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 100_000);
-        assert_eq!(ledger.auto_compact_range(2), Some((5, 6)));
+        assert_eq!(ledger.auto_compact_range_tokens(0), Some((5, 9)));
+    }
+
+    #[test]
+    fn auto_compact_falls_back_when_the_token_cut_lands_before_the_first_turn() {
+        let filler = "x".repeat(4_000);
+        let events = vec![
+            user(1, "one"),
+            assistant(2, "a1"),
+            user(3, &format!("two {filler}")),
+            assistant(4, &format!("a2 {filler}")),
+            user(5, &format!("three {filler}")),
+            assistant(6, &format!("a3 {filler}")),
+            user(7, &format!("four {filler}")),
+            assistant(8, &format!("a4 {filler}")),
+        ];
+        let ledger = Ledger::assemble("sys".into(), vec![], None, &events, 1_000_000);
+        // The token cut would land on the first user turn (nothing before it),
+        // so reclaim the two oldest turns instead and keep the newest two.
+        assert_eq!(ledger.auto_compact_range_tokens(6_000), Some((1, 4)));
     }
 
     #[test]

@@ -10506,6 +10506,7 @@ fn context_command_requests_the_ledger_and_renders_it() {
             dropped: 0,
         }],
         total_tokens: 12,
+        untrimmed_tokens: 12,
         budget_tokens: 100,
         trimmed: 0,
         cache: eix_core::ContextCacheInfo::default(),

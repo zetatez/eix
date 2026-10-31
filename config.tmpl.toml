@@ -193,13 +193,19 @@ base = "auto"                        # or "main"
 
 # --- Context ----------------------------------------------------------------
 # [context]
-# 0 = fill the model window (minus completion reserve). Without a known
-# window it falls back to 32000. Set an explicit value to cap large models.
+# 0 = fill the model window minus reserve_tokens. Without a known window it
+# falls back to 32000. Set an explicit value to cap large models.
 # budget_tokens = 0
+# Fixed headroom for the completion and estimate error. The reserve is raised
+# when provider_runtime.max_output_tokens needs more and is capped at half of
+# very small windows.
+# reserve_tokens = 16384
 # auto_compact = true
-# auto_compact_threshold = 0.8
-# auto_compact_keep_tokens = 8000
-# auto_compact_keep_turns = 2
+# 1.0 compacts when the request reaches the budget (window - reserve); lower
+# values compact earlier.
+# auto_compact_threshold = 1.0
+# Recent tokens kept verbatim beside the summary.
+# auto_compact_keep_tokens = 16000
 # tool_output_tokens = 4000
 # image_tokens = 1024
 # max_tool_schema_tokens = 12000

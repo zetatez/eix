@@ -24,10 +24,10 @@ history and nothing else.
 ```toml
 [context]
 budget_tokens = 0                 # 0 = use the model window
+reserve_tokens = 16384            # fixed headroom for the completion
 auto_compact = true
-auto_compact_threshold = 0.8
-auto_compact_keep_tokens = 20000
-auto_compact_keep_turns = 2
+auto_compact_threshold = 1.0      # 1.0 = compact at the budget
+auto_compact_keep_tokens = 16000
 tool_output_tokens = 6000
 image_tokens = 1500
 instructions_files = ["AGENTS.md"]
@@ -40,17 +40,18 @@ factory defaults**. Before changing anything, read the `[context]` comment block
 
 | Field | Effect |
 | --- | --- |
-| `budget_tokens` | Soft ceiling for one request; `0` (default) uses the model window minus the completion reserve, falling back to 32k when the window is unknown |
+| `budget_tokens` | Soft ceiling for one request; `0` (default) uses the model window minus `reserve_tokens`, falling back to 32k when the window is unknown |
+| `reserve_tokens` | Fixed headroom for the completion and estimate error (default 16,384); raised when the output budget needs more, capped at half of tiny windows |
 | `auto_compact` | Whether to summarise old history automatically before the window overflows |
-| `auto_compact_threshold` | Trigger ratio in (0, 1]; 0.8 means compact at 80% of the budget |
-| `auto_compact_keep_tokens` | Budget of recent conversation kept **verbatim** outside the summary; this is the primary retention control |
-| `auto_compact_keep_turns` | Minimum number of recent user turns kept even if they exceed that budget |
+| `auto_compact_threshold` | Trigger ratio in (0, 1]; `1.0` (default) compacts when the untrimmed request reaches the budget, i.e. `window - reserve_tokens`; lower it to compact earlier |
+| `auto_compact_keep_tokens` | Budget of recent conversation kept **verbatim** outside the summary (default 16,000); this is the primary retention control |
 | `tool_output_tokens` | Cap on a single tool result entering the request; the full output stays in the event log |
 | `image_tokens` | Conservative per-image estimate, since vision pricing varies by model; overridable |
 
-`auto_compact_keep_tokens` and `auto_compact_keep_turns` relate as "budget first, turns as a
-floor": the former sets how much raw text survives the summary, the latter guarantees the newest
-turns never exist only as a summary.
+The cut point is token-based: eix walks backwards until it has kept roughly
+`auto_compact_keep_tokens` of the newest conversation, and always keeps the newest user turn. There
+is no separate minimum-turn setting; a single oversized turn is kept whole rather than split across
+the summary boundary.
 
 ## 3. Instruction files
 
@@ -72,8 +73,8 @@ This content lands in the "instructions" sector and is preserved ahead of conver
 | `/effort` | Change the reasoning-effort level, which shifts output length per turn |
 
 Automatic compaction is checked before each turn and after every tool batch. It folds older history
-into a summary, keeps the most recent `auto_compact_keep_tokens` verbatim, and preserves at least
-`auto_compact_keep_turns` user turns.
+into a summary and keeps the most recent `auto_compact_keep_tokens` verbatim, with the newest user
+turn always retained.
 
 Both automatic and manual compaction are **asynchronous**. The turn keeps running while the summary
 model works; the `ContextCompacted` event is appended when it finishes, and the next ledger rebuild
@@ -86,17 +87,24 @@ context. Restate important facts in the conversation, or put them in `AGENTS.md`
 
 By default `budget_tokens` is `0`, which means "use the model window": the request budget grows
 with a 128k or 1M model instead of compacting at a fixed 32k ceiling. The effective budget is the
-window minus a reserve for the completion and tokenizer differences. The window comes from the
-model entry, `[provider_runtime].context_tokens`, or a provider catalog entry that has already been
-fetched. When it is unknown, eix keeps a conservative 32k fallback so an 8k local model is not sent
-a 1M prompt. Set an explicit `budget_tokens` to cap spending or to compact earlier; a value above
-the window is clamped automatically.
+window minus a fixed `reserve_tokens` (16,384 by default), so a 200k model gets 183,616 tokens and
+a 1M model gets 983,616. The window comes from the model entry,
+`[provider_runtime].context_tokens`, or a provider catalog entry that has already been fetched, so
+the budget adapts to each model's maximum. When the window is unknown, eix keeps a conservative 32k
+fallback so an 8k local model is not sent a 1M prompt. Set an explicit `budget_tokens` to cap
+spending or to compact earlier; a value above the window is clamped automatically.
 
-The trigger compares usage with the effective budget, not with the model's full window. A small
-`budget_tokens` therefore compacts earlier and more often than a harness that waits for the model
-window to fill; raise it (within the model's window) if you prefer fewer, larger compactions.
+Auto-compaction compares the **untrimmed** request size with the effective budget. With the default
+`auto_compact_threshold = 1.0`, it starts when usage reaches `window - reserve_tokens` — the same
+threshold pi uses with its 16k reserve — and keeps the most recent 16k tokens verbatim. Lower the
+threshold to compact earlier, or raise `reserve_tokens` to leave more generation headroom.
 Summaries reuse the session model and the conversation prefix, which keeps provider prompt-cache
 hits high when the provider supports them.
+
+A short pressure note is added just before the compaction trigger (98% of the budget by default) and
+only when the model window is known. It states that automatic compaction preserves recent turns, so
+it does not ask the model to stop or shrink the task while there is still room. The 32k fallback for
+unknown windows never triggers the note.
 
 ## 5. What gets sacrificed first
 

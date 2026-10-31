@@ -709,8 +709,8 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   （无 `spawn_agent` 就不提子代理），权限说明按模式渲染 workspace/read-only/writable roots、
   network allowlist、显式 allow/deny 规则，以及命令分段匹配规则；`persistent_mode` 打开时
   再追加“无新用户消息时如何续接”的契约。
-- 接近 `auto_compact_threshold`（默认提前 0.1）时追加一条 `<context>` 压力提示，提醒模型收敛
-  读取范围；压缩摘要带续接前缀，说明这是既有任务的延续。
+- 用量接近压缩触发点（预算的 98%）时追加一条 `<context>` 压力提示，提醒模型收敛读取范围；
+  压缩摘要带续接前缀，说明这是既有任务的延续。
 - 条目的 token 成本只用于内部预算和自动裁剪。
 - 工具结果先按 `tools.max_output_bytes` 截断，再按 `context.tool_output_tokens` 对 provider
   视图做 head/tail 省略；完整输出保留在事件日志。
@@ -723,10 +723,13 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
   emergency trim 只保护当前 user 消息和最新工具结果，避免一轮大输出让后续请求永久失败。
 - 压缩是**显式事件**：历史里出现 `compacted 12 messages → summary`，可展开查看原文。
 - 自动压缩在每个工具批次后也会检查；provider 报 context-length / 413 时强制压缩并重试。
-  压缩只由上下文压力触发，不按轮数定期执行。保留窗口优先按
-  `auto_compact_keep_tokens`（默认 8000）计算，`auto_compact_keep_turns` 只作为最少轮数
-  下限；裁剪点只落在 user turn 边界。`context.budget_tokens = 0`（默认）按模型窗口减去
-  补全预留来定预算，窗口未知时回退 32000，避免小模型被塞入大 prompt。自动压缩是滚动摘要：
+  压缩只由上下文压力触发，不按轮数定期执行。保留窗口按
+  `auto_compact_keep_tokens`（默认 16000）计算，裁剪点只落在 user turn 边界并始终保留最新
+  user turn；不再有最少轮数下限。`context.budget_tokens = 0`（默认）按模型窗口减去固定
+  预留 `context.reserve_tokens`（默认 16384）来定预算，因此 200k 模型得到 183616、1M 模型
+  得到 983616；窗口未知时回退 32000，避免小模型被塞入大 prompt。自动压缩比较的是**裁剪前**
+  的 ledger 用量，触发点为预算的 `auto_compact_threshold`（默认 1.0，即窗口减 16k），
+  避免 trim 悄悄丢掉旧输出后反而看不到压力。自动压缩是滚动摘要：
   新摘要会带上旧摘要继续更新，
   旧摘要不再重复发送；摘要复用当前 session 模型和同一套工具，以便命中 provider 的 prompt
   缓存。正常路径下摘要请求在后台运行并立即返回，下一个工具轮次或下一个 turn 重建 ledger
@@ -791,8 +794,9 @@ context ledger 是 daemon 内部机制，不提供用户命令或全屏编辑界
 - **`turn.stop` 插件钩子**：模型给出最终回答后、`turn.completed` 之前运行；返回
   `block` 时把 `reason` 作为提醒注入下一轮，同一 turn 最多阻塞 2 次，子 agent 不运行。
   用于“测试必须通过才能停”这类团队策略。
-- **预算软提醒**：ledger 用量达到 `context.budget_tokens` 的 75% 时，每 turn 注入一次提醒，
-  让模型在旧工具输出被裁剪前主动收敛。
+- **预算软提醒**：只在 ledger 用量接近压缩触发点（预算的 98%）且模型窗口已知时注入一次
+  提醒；32k 回退值不触发。自动压缩在预算处触发，过早提醒会让模型提前放弃或重组仍有充足
+  空间的任务；提醒文案明确说明压缩会保留最近 turn，让模型继续当前任务。
 - **`turn.diff`**：turn 开始时用 `git stash create` 生成一个 dangling commit 作为基线（不修改
   index 与工作区；干净树退回 HEAD），结束时广播相对基线的 tracked 文件 unified diff，
   超过 256 KiB 截断。untracked 文件不在其中。

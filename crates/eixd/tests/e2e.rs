@@ -7524,7 +7524,6 @@ async fn auto_compaction_summarizes_old_turns_before_overflow() -> anyhow::Resul
     config.context.budget_tokens = 100_000;
     // Force the path without depending on how many tokens the prompt has.
     config.context.auto_compact_threshold = 0.0001;
-    config.context.auto_compact_keep_turns = 2;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));
@@ -10629,7 +10628,6 @@ async fn context_length_error_forces_compaction_and_retries() -> anyhow::Result<
     config.context.budget_tokens = 100_000;
     config.context.auto_compact = true;
     config.context.auto_compact_threshold = 0.99;
-    config.context.auto_compact_keep_turns = 2;
 
     let socket = dir.join("eix.sock");
     let daemon = tokio::spawn(eixd::run(config, socket.clone(), dir.join("data")));

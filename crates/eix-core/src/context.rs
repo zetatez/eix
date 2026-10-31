@@ -155,6 +155,10 @@ pub struct ContextLedgerResult {
     pub entries: Vec<ContextEntryInfo>,
     pub sectors: Vec<ContextSectorInfo>,
     pub total_tokens: usize,
+    /// Active tokens before budget trimming. Auto-compaction uses this so the
+    /// trimmer cannot hide pressure by silently dropping old output.
+    #[serde(default)]
+    pub untrimmed_tokens: usize,
     pub budget_tokens: usize,
     /// Entries dropped automatically to fit the budget (not a user policy).
     #[serde(default)]
