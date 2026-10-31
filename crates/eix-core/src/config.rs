@@ -4033,6 +4033,10 @@ mod tests {
         let path = root.join("config.tmpl.toml");
         let config = Config::load_for(Some(&path), &root).expect("parse config.tmpl.toml");
         config.validate().expect("config.tmpl.toml validates");
+        // The template spells out every built-in server and leaves them on.
+        assert_eq!(config.lsp.servers.len(), 14);
+        assert!(config.lsp.servers.values().all(|server| server.enabled));
+        assert!(config.lsp.auto_install);
     }
 
     #[test]

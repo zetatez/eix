@@ -268,18 +268,99 @@ pi = false                           # $PI_CODING_AGENT_DIR + .pi
 # preamble = "\newcommand{\R}{\mathbb{R}}"
 
 # --- LSP --------------------------------------------------------------------
-# Built in: bash, cpp, css, go, html, json, lua, markdown, python, rust, sql,
-# toml, typescript, yaml. Missing built-in servers are installed on first use
-# (npm, pip, go, rustup, or a GitHub release) into the eix data directory.
-# Set false to only use servers already on PATH.
-# [lsp]
-# auto_install = true
+# Every built-in server is listed here explicitly and enabled. Missing
+# executables are installed on first use (npm, pip, go, rustup, or a GitHub
+# release) into the eix data directory; set auto_install = false to only use
+# servers already on PATH. Edit an entry or set enabled = false to opt out.
+[lsp]
+auto_install = true
 
-# Override or add one here.
-# [lsp.servers.rust]
-# command = "rust-analyzer"
-# extensions = ["rs"]
+[lsp.servers.bash]
+command = "bash-language-server"
+args = ["start"]
+extensions = ["sh", "bash"]
+enabled = true
+
+[lsp.servers.cpp]
+command = "clangd"
+extensions = ["c", "h", "cc", "cpp", "cxx", "hpp"]
+enabled = true
+
+[lsp.servers.css]
+command = "vscode-css-language-server"
+args = ["--stdio"]
+extensions = ["css", "scss", "less"]
+enabled = true
+
+[lsp.servers.go]
+command = "gopls"
+extensions = ["go"]
+enabled = true
+
+[lsp.servers.html]
+command = "vscode-html-language-server"
+args = ["--stdio"]
+extensions = ["html", "htm"]
+enabled = true
+
+[lsp.servers.json]
+command = "vscode-json-language-server"
+args = ["--stdio"]
+extensions = ["json", "jsonc"]
+enabled = true
+
+[lsp.servers.lua]
+command = "lua-language-server"
+extensions = ["lua"]
+enabled = true
+
+[lsp.servers.markdown]
+command = "marksman"
+args = ["server"]
+extensions = ["md"]
+enabled = true
+
+[lsp.servers.python]
+command = "pyright-langserver"
+args = ["--stdio"]
+extensions = ["py"]
+enabled = true
+
+[lsp.servers.rust]
+command = "rust-analyzer"
+extensions = ["rs"]
+enabled = true
+# First index of a large repository is slow; raise the collection timeout.
 # timeout_secs = 30
+
+[lsp.servers.sql]
+command = "sqls"
+extensions = ["sql"]
+enabled = true
+
+[lsp.servers.toml]
+command = "taplo"
+args = ["lsp", "stdio"]
+extensions = ["toml"]
+enabled = true
+
+[lsp.servers.typescript]
+command = "typescript-language-server"
+args = ["--stdio"]
+extensions = ["js", "jsx", "mjs", "cjs", "ts", "tsx", "mts", "cts"]
+enabled = true
+
+[lsp.servers.yaml]
+command = "yaml-language-server"
+args = ["--stdio"]
+extensions = ["yaml", "yml"]
+enabled = true
+
+# Add a language with no built-in entry, e.g. Java:
+# [lsp.servers.java]
+# command = "jdtls"
+# extensions = ["java"]
+# timeout_secs = 60
 
 # --- Formatters -------------------------------------------------------------
 # Built-in per-extension table; entries here override it.

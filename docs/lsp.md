@@ -74,7 +74,8 @@ because matching calls `trim_start_matches('.')`.
 
 ## 4. The 14 built-in servers
 
-These entries exist without any `[lsp]` configuration:
+These entries exist without any `[lsp]` configuration, and `config.tmpl.toml` writes all of them
+out explicitly with `enabled = true`:
 
 | Name | command | args | extensions |
 | --- | --- | --- | --- |
