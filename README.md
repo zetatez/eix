@@ -18,9 +18,11 @@ approvals, and context live in the daemon; the TUI, CLI, HTTP/SDK clients, and N
 replaceable frontends. Closing the terminal does not stop a running turn.
 
 [Usage guide](./docs/usage.md) · [Design](./DESIGN.md) · [Config template](./config.tmpl.toml) ·
+[Permissions](./docs/permissions.md) · [Context](./docs/context.md) · [MCP](./docs/mcp.md) ·
+[Skills, commands, agents](./docs/skills.md) · [Sub-agents](./docs/subagents.md) ·
+[HTTP API and SDK](./docs/http-api.md) · [Protocol contract](./crates/eix-core/src/protocol.rs) ·
 [Plugin example](./examples/plugins/echo) · [Plugin design](./docs/plugins.md) ·
-[Worktrees](./docs/worktree.md) · [Neovim integration](./docs/nvim.md) ·
-[Protocol contract](./crates/eix-core/src/protocol.rs)
+[Worktrees](./docs/worktree.md) · [Neovim integration](./docs/nvim.md) · [Voice](./docs/voice.md)
 
 ## Highlights
 
